@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:4293447b93648829",
+  "digest": "sha256:aa4ebfe389889bb8",
   "keys": {
     "by_section": {
       "acquire": 9,
@@ -10,7 +10,7 @@
       "client": 21,
       "dest": 8,
       "general": 8,
-      "indexers": 11,
+      "indexers": 16,
       "logging_sink": 5,
       "recovery": 5,
       "remote": 3,
@@ -20,8 +20,8 @@
       "transfer": 12,
       "watch": 5
     },
-    "defaulted": 19,
-    "explicit": 141,
+    "defaulted": 14,
+    "explicit": 146,
     "model": 147,
     "unknown": []
   },
@@ -47,7 +47,7 @@
       "activity_upspeed_bps": 65536,
       "burst_arrivals_per_hour": 8.0,
       "burst_janitor_interval_seconds": 300,
-      "burst_per_run_cap": 25,
+      "burst_per_run_cap": 12,
       "calm_arrivals_per_hour": 2.0,
       "critical_watermark_free_bytes": 8589934592,
       "delete_files": true,
@@ -57,14 +57,14 @@
       "fill_lookahead_hours": 2.0,
       "high_watermark_free_bytes": 42949672960,
       "idle_confirm_minutes": 45.0,
-      "janitor_interval_seconds": 1800,
+      "janitor_interval_seconds": 600,
       "janitor_startup_delay_seconds": 300.0,
       "low_watermark_free_bytes": 16106127360,
       "max_grace_hours": 72.0,
       "min_grace_hours": 2.0,
       "min_ratio": 0.0,
       "min_seed_hours": 0.0,
-      "per_run_cap": 10,
+      "per_run_cap": 5,
       "protected_patterns": []
     },
     "cross_seed": {
@@ -95,7 +95,7 @@
     },
     "general": {
       "client_rpc_timeout_seconds": 30,
-      "dest_poll_interval": 60,
+      "dest_poll_interval": 30,
       "disk_safety_margin_bytes": 1073741824,
       "download_check_stall_seconds": 3600,
       "download_max_check_wait_seconds": 43200,
@@ -226,7 +226,7 @@
       "skip_movie_larger_than_bytes": 42949672960
     },
     "telegram": {
-      "active_repost_interval_seconds": 15,
+      "active_repost_interval_seconds": 10,
       "admin_user_ids": [],
       "bot_token": "***",
       "chat_id": "",
