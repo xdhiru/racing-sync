@@ -42,6 +42,32 @@ class _FakeSource:
         self.deleted.append((h.lower(), delete_files))
 
 
+class _FakeDest:
+    """Dest entries the fuse-seed verifier inspects."""
+
+    def __init__(self, entries: list[Torrent] | None = None, *, fail: bool = False):
+        self.entries = entries or []
+        self.fail = fail
+
+    async def list_torrents(self, *, category=None, hashes=None):
+        if self.fail:
+            raise RuntimeError("dest unreachable")
+        want = {h.lower() for h in hashes} if hashes is not None else None
+        return [t for t in self.entries if want is None or t.hash.lower() in want]
+
+
+def _fuse_seed(h: str, save_path: str = "/mnt/fuse") -> Torrent:
+    return Torrent(
+        hash=h,
+        name=NAME,
+        category="",
+        save_path=save_path,
+        size_bytes=SIZE,
+        state="seeding",
+        progress=1.0,
+    )
+
+
 def _member(h: str = H) -> Torrent:
     return Torrent(
         hash=h,
@@ -84,12 +110,13 @@ def _cleanup_cfg(*, dry_run: bool = False) -> CleanupConfig:
     )
 
 
-def _coord(store: StateStore, src: _FakeSource, cfg: CleanupConfig):
+def _coord(store: StateStore, src: _FakeSource, cfg: CleanupConfig, dest=None):
     """Coordinator wired for the delete loop (fuse verdict stubbed)."""
     app = AppConfig.from_toml(FIXTURES / "minimal.toml")
     app.cleanup = cfg
     coord = make_coordinator(store=store, cfg=app)
     coord.source_client = src
+    coord.dest_client = dest if dest is not None else _FakeDest([])
     coord.sftp = None
     coord._stop = False
     coord._source_free_bytes = AsyncMock(return_value=None)
@@ -140,12 +167,17 @@ async def test_unavailable_blob_keeps_vps1_and_warns(tmp_path: Path, caplog):
 
 
 @pytest.mark.anyio
-async def test_injected_members_skip_fetch_and_delete_proceeds(tmp_path: Path):
-    """A fully injected group costs no blob I/O and deletes as before."""
+async def test_fuse_seeded_member_skips_fetch_and_delete_proceeds(tmp_path: Path):
+    """A member proven to seed from fuse costs no blob I/O and deletes."""
     store = StateStore(tmp_path / "state.db")
     try:
         _row(store, injected=H)
-        coord = _coord(store, _FakeSource([_member()]), _cleanup_cfg())
+        coord = _coord(
+            store,
+            _FakeSource([_member()]),
+            _cleanup_cfg(),
+            dest=_FakeDest([_fuse_seed(H)]),
+        )
         coord._load_racing_torrent_bytes = AsyncMock(return_value=BLOB)
         store.set_racing_blob = MagicMock(wraps=store.set_racing_blob)
 
@@ -154,6 +186,83 @@ async def test_injected_members_skip_fetch_and_delete_proceeds(tmp_path: Path):
         coord._load_racing_torrent_bytes.assert_not_awaited()
         store.set_racing_blob.assert_not_called()
         coord._delete_source_group.assert_awaited_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_recorded_injected_but_not_seeding_preserves_bytes(tmp_path: Path, caplog):
+    """Bookkeeping alone is not evidence: a missing fuse seed preserves first."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        _row(store, injected=H)
+        coord = _coord(store, _FakeSource([_member()]), _cleanup_cfg())
+        coord._load_racing_torrent_bytes = AsyncMock(return_value=BLOB)
+        store.set_racing_blob = MagicMock(wraps=store.set_racing_blob)
+
+        with caplog.at_level("WARNING", logger="racing_sync.coordinator"):
+            await coord._run_source_cleanup(coord.rt.cleanup.config)
+
+        store.set_racing_blob.assert_called_once_with(H, BLOB)
+        coord._delete_source_group.assert_awaited_once()
+        assert "recorded as injected but does not seed" in caplog.text
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_ssd_placed_entry_is_not_a_fuse_seed(tmp_path: Path):
+    """An SSD save_path is a download in progress, not a VPS2 seed."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        _row(store)
+        dest = _FakeDest([_fuse_seed(H, save_path="/downloads")])
+        coord = _coord(store, _FakeSource([_member()]), _cleanup_cfg(), dest=dest)
+        coord._load_racing_torrent_bytes = AsyncMock(return_value=BLOB)
+        store.set_racing_blob = MagicMock(wraps=store.set_racing_blob)
+
+        await coord._run_source_cleanup(coord.rt.cleanup.config)
+
+        store.set_racing_blob.assert_called_once_with(H, BLOB)
+        coord._delete_source_group.assert_awaited_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_unverifiable_fuse_lookup_preserves_before_delete(tmp_path: Path):
+    """A dest lookup failure counts as "not seeded": preserve, never assume."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        _row(store, injected=H)
+        dest = _FakeDest(fail=True)
+        coord = _coord(store, _FakeSource([_member()]), _cleanup_cfg(), dest=dest)
+        coord._load_racing_torrent_bytes = AsyncMock(return_value=BLOB)
+        store.set_racing_blob = MagicMock(wraps=store.set_racing_blob)
+
+        await coord._run_source_cleanup(coord.rt.cleanup.config)
+
+        store.set_racing_blob.assert_called_once_with(H, BLOB)
+        coord._delete_source_group.assert_awaited_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_unverifiable_fuse_lookup_without_bytes_keeps_vps1(tmp_path: Path):
+    """Fail-closed chain: no seed proof and no bytes means no delete."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        _row(store, injected=H)
+        dest = _FakeDest(fail=True)
+        coord = _coord(store, _FakeSource([_member()]), _cleanup_cfg(), dest=dest)
+        coord._load_racing_torrent_bytes = AsyncMock(return_value=None)
+        store.set_racing_blob = MagicMock(wraps=store.set_racing_blob)
+
+        await coord._run_source_cleanup(coord.rt.cleanup.config)
+
+        store.set_racing_blob.assert_not_called()
+        coord._delete_source_group.assert_not_awaited()
     finally:
         store.close()
 

@@ -87,6 +87,9 @@ def _stagger_pair(tmp_path: Path, db_name: str = "s.db", **cleanup_over):
     coord.store = store
     coord.source_client = _FakeSource(members)
     coord.dest_client = MagicMock()
+    # The blob guard has its own tests: every member is treated as a
+    # verified fuse seed so these tests measure staggering only.
+    coord._cleanup_fuse_seeded_hashes = AsyncMock(return_value={m.hash.lower() for m in members})
     coord.sftp = None
     coord._stop = False
     return coord, store

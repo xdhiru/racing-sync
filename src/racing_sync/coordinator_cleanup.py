@@ -1560,22 +1560,56 @@ class CleanupMixin:
             )
         return ok
 
+    async def _cleanup_fuse_seeded_hashes(self, hashes: set[str]) -> set[str] | None:
+        """Hashes with a live fuse seed on VPS2 (non-SSD placement).
+
+        The cleanup verifier's evidence: a dest entry carrying the *same*
+        hash and serving from the mount (an SSD-placed entry is a download,
+        not a seed). Batched and RPC-bounded. Returns None when the lookup
+        itself failed — callers must treat that as "unproven", preserve the
+        .torrent bytes and never assume the bookkeeping is right.
+        """
+        if not hashes:
+            return set()
+        try:
+            entries: list = []
+            for _chunk in chunked(sorted(hashes)):
+                entries.extend(
+                    await rpc(
+                        self.dest_client.list_torrents(hashes=_chunk),
+                        getattr(self, "cfg", None),
+                        "dest cleanup racing lookup",
+                    )
+                    or []
+                )
+            seeded, _missing = self._fuse_entry_split(entries, set(hashes))
+            return set(seeded)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "cleanup: cannot verify fuse seeds for %d racing torrent(s): %s",
+                len(hashes),
+                e,
+            )
+            return None
+
     async def _cleanup_preserve_racing_blobs(
         self, ts: TorrentState, group: list[Torrent], dry_run: bool
     ) -> bool:
-        """Persist .torrent bytes for every racing member not yet injected.
+        """Make every racing hash in the group survive the VPS1 delete.
 
-        The group-coverage complement of `_cleanup_fuse_healthy` (which only
-        proves the row's own hashes): a member that was never re-injected
-        loses its only source of .torrent bytes when VPS1 is deleted —
-        `_re_inject_racing_torrents` and the late-seed repair would have
-        nothing left to fetch. So, per un-injected member, prefer the row's
-        own blob (source hash), then the DB, then a live VPS1 fetch.
+        Per member, the same hash must be *provably* seeding from the VPS2
+        fuse mount. `injected_private_hashes` is only a hint: a stale or
+        optimistic stamp must not let a hash vanish before it actually
+        serves from VPS2, so the live dest entries are the evidence. A hash
+        without a verified fuse seed — a MOVING row cleaned early, a
+        never-injected cross-seed, or a lost injection — first gets its
+        .torrent bytes persisted (row blob -> DB -> live VPS1 fetch) so the
+        re-inject loop and the late-seed repair can still rebuild the seed.
 
-        Returns True when every un-injected member is covered. Any member
-        whose bytes cannot be preserved (or cannot be written) returns
-        False: fail-closed, keep VPS1 this run. Dry-run fetches to prove
-        readability but performs zero writes.
+        Returns True when every hash is either fuse-seeded or durably
+        preserved. Any hash that cannot be preserved returns False:
+        fail-closed, keep VPS1 this run. Dry-run verifies and fetches to
+        prove readability but performs zero writes.
         """
         try:
             injected = {h.lower() for h in ts.injected_private_hashes.split(",") if h}
@@ -1583,10 +1617,27 @@ class CleanupMixin:
             injected = set()
         src_low = (ts.source_infohash or "").lower()
         store = getattr(self, "store", None)
+        member_hashes = {str(getattr(m, "infohash", "") or "").lower() for m in (group or [])}
+        member_hashes.discard("")
+        seeded = await self._cleanup_fuse_seeded_hashes(member_hashes)
+        unverified = seeded is None
+        seeded = seeded or set()
+        if unverified:
+            log.info(
+                "cleanup: could not verify fuse seeds for %s; preserving every "
+                "racing .torrent before deleting VPS1",
+                (ts.source_name or "")[:60],
+            )
         for m in group or []:
             h = str(getattr(m, "infohash", "") or "").lower()
-            if h and h in injected:
+            if h and h in seeded:
                 continue
+            if h and h in injected and not unverified:
+                log.warning(
+                    "cleanup: %s is recorded as injected but does not seed from "
+                    "fuse; preserving its .torrent before deleting VPS1",
+                    h[:10],
+                )
             blob: bytes | None = None
             # The row's own bytes are the authoritative copy for its source
             # hash (and lighter than a fan-out fetch per group member).
