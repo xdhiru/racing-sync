@@ -524,7 +524,12 @@ async def test_empty_source_with_remote_bytes_skips_move(tmp_path: Path):
     cfg.rclone.extra_move_flags = []
 
     async def _fake_run(cfg_, cmd, **kwargs):
-        assert cmd[0] == "lsf"
+        # argv[0] is the rclone binary: run_rclone execs the list verbatim,
+        # so a command that started with the "lsf" SUBCOMMAND (as it once did)
+        # never spawned anything and the verify silently always answered
+        # "nothing on the remote". See tests/test_rclone_remote_verify.py.
+        assert cmd[0] == str(cfg.rclone.binary)
+        assert cmd[1:4] == ["lsf", "-R", "--files-only"]
         from racing_sync.rclone_ops import RcloneResult
 
         return RcloneResult(returncode=0, stdout="Top/a.mkv\n", stderr="", duration=0.1)

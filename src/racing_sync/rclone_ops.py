@@ -1018,12 +1018,24 @@ async def _remote_has_bytes(
     relative paths. With ``files_from`` the verify only succeeds when EVERY
     wanted file is present in the listing; a non-empty recursive listing means
     bytes exist when no explicit file list is given.
+
+    argv[0] is the rclone BINARY, like every other `run_rclone` caller
+    (`build_move_cmd`): `run_rclone` execs the list verbatim, so a command
+    that starts with "lsf" would be a failed spawn, swallowed by the
+    `except` below, and the check would answer "nothing on the remote"
+    forever — which is exactly the lie that made the move stage's
+    "bytes already on remote" short-circuit and the push preflight no-ops.
     """
     try:
         res = await run_rclone(
-            cfg, ["lsf", "-R", "--files-only", dest_remote], timeout=120.0, tree=None
+            cfg,
+            [str(Runtime(cfg).transfer.binary), "lsf", "-R", "--files-only", dest_remote],
+            timeout=120.0,
+            tree=None,
         )
     except Exception as e:  # noqa: BLE001
+        # Fail closed: an unlistable remote must never read as "already
+        # transferred" (that would skip a move and lose data).
         log.warning("rclone lsf verify of %s failed: %s", dest_remote, e)
         return False
     if res.returncode != 0:
