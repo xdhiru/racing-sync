@@ -89,10 +89,13 @@ enabled = true
 dry_run = true
 # Space out deletions: remove_torrent(+data) stalls a shared Deluge daemon.
 delete_stagger_seconds = 60
+# Calm cadence: 5 groups every 10 minutes (~20/h at that stagger).
+janitor_interval_seconds = 600
+per_run_cap = 5
 # Burst mode while intake outruns VPS1 free space: shorter cadence + bigger
 # per-run cap (must be <= janitor_interval_seconds / >= per_run_cap).
 burst_janitor_interval_seconds = 300
-burst_per_run_cap = 25
+burst_per_run_cap = 12
 # Burst when recent arrival bytes/hour project a full disk within N hours
 # (0 disables the projected-fill trigger).
 fill_lookahead_hours = 2.0
@@ -143,7 +146,7 @@ STARTER = """\
 state_db = "/var/lib/racing-sync/state.db"
 log_dir = "/var/log/racing-sync"
 source_poll_interval = 120
-dest_poll_interval = 60
+dest_poll_interval = 30
 client_rpc_timeout_seconds = 30
 
 [client]
