@@ -25,10 +25,11 @@ from racing_sync.state import State, StateStore, TorrentState
 GiB = 1024**3
 FNAME = "Sample.Show.S01E01.mkv"
 FSIZE = 700
-# Below the 15 GiB low watermark: the janitor's own pressure signal.
+# Below the 15 GiB reclaim trigger: the janitor's own pressure signal.
 TIGHT = 5 * GiB
-# Between the low (15 GiB) and high (40 GiB) watermarks: roomy, but the
-# calm-and-roomy short-circuit does not fire, so the scan really runs.
+# At/above the trigger: no space is needed, so a real run skips before scanning
+# (the headroom guarantee tests/test_cleanup_headroom.py pins). Verdict-level
+# tests still use it to say "this row reads as unpressured".
 ROOMY = 20 * GiB
 
 
@@ -196,7 +197,7 @@ async def _scan(coord, cfg, *, free: int | None, bursting: bool) -> dict:
 
 
 def _leeching_setup(tmp_path: Path, **cleanup_over):
-    """DONE row, fuse-proven on VPS2, past grace, one leecher pulling from VPS1."""
+    """DONE row, fuse-proven on VPS2, with one leecher pulling from VPS1."""
     h = "a" * 40
     store = StateStore(tmp_path / "s.db")
     cfg = _base_cfg(tmp_path, **cleanup_over)
@@ -244,13 +245,23 @@ async def test_override_on_under_pressure_deletes_the_leeching_row(tmp_path: Pat
 
 @pytest.mark.anyio
 async def test_override_on_without_pressure_still_keeps(tmp_path: Path):
-    """The switch alone is not permission: a roomy disk keeps the old rule."""
+    """The switch alone is not permission: no real pressure keeps the row.
+
+    Measured at the verdict (a run that needs no space never gets this far — it
+    skips before scanning, see tests/test_cleanup_headroom.py), so this isolates
+    the override's second half: the keep lifts only while THIS run reads
+    pressure from the janitor's own signal.
+    """
     store, cfg, src, dest, h = _leeching_setup(tmp_path, ignore_activity_under_pressure=True)
     try:
         coord = _coord(store, src, dest, cfg)
-        summary = await _scan(coord, cfg, free=ROOMY, bursting=False)
+        row = store.get(h)
+        group = [m for m in src.members if m.hash.lower() == h]
+        verdict = await coord._cleanup_verdict(
+            row, group, dt.datetime.now(dt.UTC), False, ROOMY, bursting=False
+        )
+        assert verdict is None
         assert src.deleted == []
-        assert "activity 1" in summary["reason"]
     finally:
         store.close()
 
@@ -389,35 +400,34 @@ async def test_manual_clean_without_pressure_still_keeps(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_nothing_eligible_breakdown_separates_activity_from_grace(tmp_path: Path, caplog):
-    """ "activity 1, grace 1": the two keeps are distinguishable without a report."""
-    held, waiting = "a" * 40, "d" * 40
+async def test_nothing_eligible_breakdown_separates_activity_from_verification(
+    tmp_path: Path, caplog
+):
+    """ "activity 1, verification 1": the two keeps are distinguishable without a report."""
+    held, unverifiable = "a" * 40, "d" * 40
     other = "Sample.Show.S01E02.mkv"
     store = StateStore(tmp_path / "s.db")
     cfg = _base_cfg(tmp_path)
     _mounts(tmp_path)
-    for d in (tmp_path / "fuse", tmp_path / "fuse_u"):
-        (d / other).write_bytes(b"\x00" * FSIZE)
-    src = _Source([_member(held, leechers=2), _member(waiting, name=other)])
-    coord = _coord(store, src, _Dest([held, waiting]), cfg)
+    src = _Source([_member(held, leechers=2), _member(unverifiable, name=other)])
+    coord = _coord(store, src, _Dest([held, unverifiable]), cfg)
     _row(store, held)
-    # `held` finished long ago (grace served); `waiting` finished an hour ago
-    # (grace floor is 2 h) and was seen active a minute ago, so neither the
-    # age nor the idle fast lane lets it go.
-    _row(store, waiting, name=other, completed_h_ago=1.0, activity_h_ago=1 / 60)
+    # `unverifiable` has a complete-looking fuse ENTRY but no bytes on the
+    # mount: the two keeps the operator has to tell apart, now that no timing
+    # keep exists at all.
+    _row(store, unverifiable, name=other)
     assert store.set_blob(held, _blob()) is True
-    assert store.set_blob(waiting, _blob(other)) is True
+    # Deliberately no blob for `unverifiable`: entries alone are not proof.
     try:
         with caplog.at_level(logging.INFO, logger="racing_sync.coordinator"):
-            # 10 GiB: below the 15 GiB low watermark, ABOVE the 8 GiB critical
-            # one. At `TIGHT` the same scan is an emergency, where a verified
-            # row skips the grace wait (see tests/test_cleanup_emergency.py);
-            # this test measures the two keeps, so it stays out of emergency.
+            # 10 GiB: below the 15 GiB reclaim trigger, so the pass really
+            # scans (an idle-day run says "no space needed" and stops).
             summary = await _scan(coord, cfg, free=10 * GiB, bursting=False)
         assert summary["deleted"] == 0
         assert summary["reason"].startswith("nothing eligible (")
         assert "activity 1" in summary["reason"]
-        assert "grace 1" in summary["reason"]
+        assert "verification 1" in summary["reason"]
+        assert "grace" not in summary["reason"]
         assert "emergency" not in summary["reason"]
         assert "cleanup janitor: nothing eligible" in caplog.text
     finally:
@@ -436,7 +446,7 @@ async def test_missing_fuse_file_warning_names_the_file(tmp_path: Path, caplog):
     assert store.set_blob(h, _blob()) is True
     try:
         with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
-            await _scan(coord, cfg, free=ROOMY, bursting=False)
+            await _scan(coord, cfg, free=TIGHT, bursting=False)
         text = caplog.text
         assert "fuse file(s) missing" in text
         assert FNAME in text
@@ -460,7 +470,7 @@ async def test_missing_fuse_entries_warning_lists_hashes(tmp_path: Path, caplog)
     # `injected` has no dest entry at all: the list has to name it.
     try:
         with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
-            await _scan(coord, cfg, free=ROOMY, bursting=False)
+            await _scan(coord, cfg, free=TIGHT, bursting=False)
         assert "fuse entry missing" in caplog.text
         assert injected[:10] in caplog.text
     finally:
@@ -472,12 +482,12 @@ def test_blocked_breakdown_is_bounded_and_one_line():
     coord = make_coordinator()
     blocked = {
         "activity": 17,
-        "grace": 3,
+        "waiting for space": 3,
         "verification": 1,
         "x" * 400: 9,
     }
     text = coord._cleanup_blocked_text(blocked)
-    assert text.startswith("grace 3, activity 17, verification 1")
+    assert text.startswith("waiting for space 3, activity 17, verification 1")
     assert "\n" not in text
     assert len(text) <= 160
     assert coord._cleanup_blocked_reason({}) == "nothing eligible"
@@ -490,13 +500,12 @@ def test_summary_text_keeps_its_contract():
             "deleted": 0,
             "candidates": 0,
             "dry_run": False,
-            "grace_s": 7200.0,
             "free": TIGHT,
             "bursting": True,
-            "reason": "nothing eligible (activity 17, grace 3)",
+            "reason": "nothing eligible (activity 17, verification 3)",
         }
     )
-    assert line == "🧹 Cleanup: nothing deleted — nothing eligible (activity 17, grace 3)."
+    assert line == "🧹 Cleanup: nothing deleted — nothing eligible (activity 17, verification 3)."
 
 
 # ----------------------------------------------------------------- defaults

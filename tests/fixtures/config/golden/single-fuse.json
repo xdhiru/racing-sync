@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:584bb64e81154a3d",
+  "digest": "sha256:e44830cc28ce2453",
   "keys": {
     "by_section": {
       "dest": 4,
@@ -9,9 +9,9 @@
       "source": 5,
       "ssd": 3
     },
-    "defaulted": 141,
+    "defaulted": 138,
     "explicit": 19,
-    "model": 160,
+    "model": 157,
     "unknown": []
   },
   "resolved": {
@@ -45,13 +45,10 @@
       "enabled": false,
       "fill_lookahead_hours": 2.0,
       "high_watermark_free_bytes": 42949672960,
-      "idle_confirm_minutes": 45.0,
       "ignore_activity_under_pressure": false,
       "janitor_interval_seconds": 3600,
       "janitor_startup_delay_seconds": 300.0,
       "low_watermark_free_bytes": 16106127360,
-      "max_grace_hours": 72.0,
-      "min_grace_hours": 2.0,
       "min_ratio": 0.0,
       "min_seed_hours": 0.0,
       "per_run_cap": 10,

@@ -1,10 +1,10 @@
 """Stateless content helpers extracted from coordinator.py.
 
 Pure functions with no Coordinator dependency: release-name
-normalization, cross-seed verification, adaptive cleanup grace,
-Telegram notify filter and public-tracker detection. Kept in a
-separate module so coordinator.py stays focused on orchestration;
-all names are re-exported from coordinator for backwards compat.
+normalization, cross-seed verification, the Telegram notify filter and
+public-tracker detection. Kept in a separate module so coordinator.py stays
+focused on orchestration; all names are re-exported from coordinator for
+backwards compat.
 """
 
 from __future__ import annotations
@@ -169,57 +169,6 @@ def _verified_cross_seed_blob(
         )
         return None
     return blob, (real_hash or "").lower(), announce or ""
-
-
-def _lerp(x: float, x0: float, x1: float, y0: float, y1: float) -> float:
-    """Linear interpolation of y over [x0, x1], clamped to [y0, y1]."""
-    if x1 <= x0:
-        return y1
-    t = min(1.0, max(0.0, (x - x0) / (x1 - x0)))
-    return y0 + t * (y1 - y0)
-
-
-def cleanup_grace_seconds(cfg: object, free_bytes: int | None, arrivals_per_hour: float) -> float:
-    """Adaptive VPS1-cleanup grace: the worse the pressure, the shorter the wait.
-
-    `grace = max(min_grace, min(space_curve, velocity_curve))` where the
-    space curve interpolates free bytes between the low/high watermarks and
-    the velocity curve interpolates intake arrivals/hour between the
-    calm/burst rates. Unknown free space degrades to the velocity curve
-    alone (never to zero grace).
-    """
-    try:
-        min_g = max(0.0, float(getattr(cfg, "min_grace_hours", 2.0) or 0.0)) * 3600.0
-    except (TypeError, ValueError):
-        min_g = 2.0 * 3600.0
-    try:
-        max_g = max(0.0, float(getattr(cfg, "max_grace_hours", 72.0) or 0.0)) * 3600.0
-    except (TypeError, ValueError):
-        max_g = 72.0 * 3600.0
-    if max_g < min_g:
-        max_g = min_g
-    try:
-        low = float(getattr(cfg, "low_watermark_free_bytes", 0) or 0)
-        high = float(getattr(cfg, "high_watermark_free_bytes", 0) or 0)
-    except (TypeError, ValueError):
-        low, high = 0.0, 0.0
-    try:
-        calm = float(getattr(cfg, "calm_arrivals_per_hour", 2.0) or 0.0)
-        burst = float(getattr(cfg, "burst_arrivals_per_hour", 8.0) or 0.0)
-    except (TypeError, ValueError):
-        calm, burst = 2.0, 8.0
-    try:
-        rate = max(0.0, float(arrivals_per_hour or 0.0))
-    except (TypeError, ValueError):
-        rate = 0.0
-    try:
-        free_f = float(free_bytes) if free_bytes is not None else None
-    except (TypeError, ValueError):
-        free_f = None
-
-    space_curve = _lerp(free_f, low, high, min_g, max_g) if free_f is not None else max_g
-    velocity_curve = _lerp(rate, calm, burst, max_g, min_g)
-    return max(min_g, min(space_curve, velocity_curve, max_g))
 
 
 @dataclass(slots=True)

@@ -90,18 +90,46 @@ def test_removed_keys_are_registered_under_both_spellings():
 
     `config_alias._reject_removed` runs before `_move_new_to_internal`, so a
     key registered under one spelling only would be pruned as unknown on the
-    other path — a warning where the operator asked for a hard error.
+    other path — a warning where the operator asked for a hard error. A
+    section the rename never touches (`[cleanup]`) has exactly one spelling,
+    shared by both sides, so a single entry is the complete pair.
     """
+    from racing_sync.config_alias import NEW_SECTIONS
+
     heads = {p.split(".", 1)[0] for p in REMOVED}
     assert "cross_seed" in heads and "acquire" in heads
+    assert "cleanup" in heads, "the removed [cleanup] timers must be refused"
     twins = dict(_CHAIN_TWIN)
     twins.update({new: old for old, new in _CHAIN_TWIN.items()})
     for path in REMOVED:
-        tail = path.split(".", 1)[1]
-        head = path.split(".", 1)[0]
+        head, tail = path.split(".", 1)
         counterpart = twins.get(head)
-        assert counterpart, f"{path!r} has no known twin table"
+        if counterpart is None:
+            assert head not in RENAMES, f"{path!r} sits under a renamed section"
+            assert head not in NEW_SECTIONS, f"{path!r} is a chain-only table"
+            continue
         assert f"{counterpart}.{tail}" in REMOVED, f"{path!r} is missing its twin entry"
+
+
+def test_removed_cleanup_timers_refuse_both_file_spellings():
+    """The three dead [cleanup] keys fail the load, loudly, with the new rule.
+
+    `[cleanup]` is spelled the same in the internal and the capability-chain
+    file, so the same table has to be refused from either origin: the loader
+    reports the replacement instead of silently dropping the operator's knob.
+    """
+    import pytest
+
+    from racing_sync.config_alias import normalize_config
+
+    for key in ("min_grace_hours", "max_grace_hours", "idle_confirm_minutes"):
+        raw = {"cleanup": {key: 2.0}}
+        with pytest.raises(ValueError) as exc:
+            normalize_config(raw)
+        message = str(exc.value)
+        assert f"`cleanup.{key}` is no longer supported" in message
+        assert "free-space target, not a timer" in message
+        assert "low_watermark_free_bytes" in message
 
 
 def test_new_only_keys_live_outside_the_internal_namespace():

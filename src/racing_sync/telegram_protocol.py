@@ -114,11 +114,12 @@ ADD_CMD_RE = re.compile(r"^/add(?:@[\w_]+)?\b")
 TICK_RE = re.compile(r"^/tick(?:@[\w_]+)?\s*$")
 
 #: `/cleanup` — run one VPS1 cleanup pass now (no argument). Skips only
-#: the startup-delay/cadence gates; every safety/grace rule still applies.
+#: the startup-delay/cadence gates; every safety/verification rule still
+#: applies, including the free-space trigger.
 CLEANUP_RE = re.compile(r"^/cleanup(?:@[\w_]+)?\s*$")
 
 #: `/clean <target>` — clean one completed (DONE) row's VPS1 copy now.
-#: Manual intent bypasses grace/idle but keeps every safety check.
+#: Manual intent skips the free-space trigger but keeps every safety check.
 CLEAN_RE = re.compile(r"^/clean(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 #: `/active` — send a fresh Active Tasks card now (recovery when the

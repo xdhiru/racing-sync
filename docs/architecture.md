@@ -32,7 +32,7 @@ src/racing_sync/
     coordinator_watchdog.py    dead-torrent watchdog + tracker-death cascade
     coordinator_inject.py      manual inject-to-fuse flow
     coordinator_picker.py      cross-seed source picker
-    coordinator_content.py     stateless helpers (names, grace, notify)
+    coordinator_content.py     stateless helpers (names, notify)
     coordinator_push.py        VPS1 push lane (copy, suppression, handoff)
     coordinator_racing_blobs.py bulk warm-up of the racing .torrent cache
   content_keys.py     One same-content rule (explicit size modes)
@@ -281,34 +281,52 @@ on the next worker tick through the existing fail-closed gates. `POST
 safe against a live daemon because row writes are state/version-guarded and
 adoption re-reads ownership before inserting.
 
-The hourly janitor deletes a VPS1 copy only when the row is `DONE` past its
-grace period (or verifiably idle), the swarm is quiet, the fuse entry is
-present, and the bytes verify; under disk pressure `MOVING` rows go early,
-and bytes on the SSD count as secured because VPS2 never pulls content from
-VPS1. Every racing hash in the group must also be proven to seed from the
-VPS2 mount, otherwise its `.torrent` is cached first (VPS1 is kept when even
-that fails). It re-reads the row and version right before each delete. With
-`[cleanup].ignore_activity_under_pressure`, a run that reads pressure the
-same way the cadence does (bursting, or free space below the low watermark)
-skips only the activity keep — a full scratch disk outranks a leecher, and
-VPS2 takes over serving — while verification, protection, unknown stats and
-`.torrent` preservation stay fail-closed. A pass that finds nothing
-eligible reports why in one line (`nothing eligible (activity 17, grace 3)`).
+The janitor deletes a VPS1 copy only when the row is `DONE`, the swarm is
+quiet, the fuse entry is present, and the bytes verify — and only while the
+disk actually needs the room: `[cleanup].low_watermark_free_bytes` is the
+reclaim TRIGGER and `high_watermark_free_bytes` the TARGET, so a pass reclaims
+biggest-first until free is back at the target, the verified rows run out, or
+`per_run_cap` stops it (a cap that stops short logs the numbers and reports the
+shortfall instead of claiming success). Time leaves the policy entirely: no
+elapsed period and no idle fast lane makes a `DONE` row eligible, so a quiet
+day deletes nothing however old the rows are. Eligibility is proof, not age.
+Under disk pressure `MOVING` rows still go early — their content is NOT
+secured yet, so that path keeps its own settle window (a quiet swarm for
+`_MOVING_IDLE_CONFIRM_S`, with a cross-host `added_on` sanity check on the
+fallback evidence) — and bytes on the SSD count as secured because VPS2 never
+pulls content from VPS1. Every racing hash in the group must also be proven to
+seed from the VPS2 mount, otherwise its `.torrent` is cached first (VPS1 is
+kept when even that fails). It re-reads the row and version right before each
+delete. With `[cleanup].ignore_activity_under_pressure`, a run that reads
+pressure the same way the cadence does (bursting, or free space below the low
+watermark) skips only the activity keep — a full scratch disk outranks a
+leecher, and VPS2 takes over serving — while verification, protection, unknown
+stats and `.torrent` preservation stay fail-closed. A pass that finds nothing
+eligible reports why in one line (`nothing eligible (activity 17,
+verification 3)`), and a pass that needed nothing says so before scanning
+(`no space needed yet: ... (waiting for space 12)`).
 An EMERGENCY — free space at/below `critical_watermark_free_bytes`, or a
 release that arrived too big to fit — is a third, separately-named signal above
 `pressured`/`bursting` and changes timing only: the janitor runs on its
 emergency wake (bounded to `burst_janitor_interval_seconds / 5`, floor 15 s)
-instead of the next cadence tick, and a `DONE` row whose bytes already verify
-on fuse becomes eligible without the grace wait or the idle fast lane.
-Unverified rows, rows adopted without `completed_at` and rows with peers
-attached are still kept exactly as before, and the report line says
-`... ; emergency on` when the state is live.
+instead of the next cadence tick, because the next race cannot land.
+Unverified rows, protected rows and rows with peers attached are still kept
+exactly as before, and the report line says `... ; emergency on` when the
+state is live.
+A VPS1 whose free space cannot be measured at all (no `core.get_free_space`,
+dead statvfs probe) is never read as roomy — that would silence the janitor
+forever. Such a pass falls back to the proof-gated reclaim, bounded by
+`per_run_cap`, and invents nothing: no target, no projected free space (both
+report `unknown`), no pressure (so `ignore_activity_under_pressure` cannot
+unlock), no emergency, and no early `MOVING` delete unless a release actually
+failed to fit.
 
 ## Telegram
 
 One `racing-sync online` message on startup, one long-lived Active Tasks card
 (paginated, status filters — including the `🗄` tab of `DONE` rows whose files
-the cached VPS1 listing still reports, awaiting the janitor's grace), and one
+the cached VPS1 listing still reports, each labelled secured/reclaiming/not
+verifiable rather than counted down), and one
 detail card per torrent. Every command
 is registered in the `/` popup with a description; targets use a space
 (`/cancel 3`) or an underscore (`/cancel_3`). Full list:

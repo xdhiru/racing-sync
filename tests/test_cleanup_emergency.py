@@ -1,17 +1,18 @@
-"""Cleanup EMERGENCY: a starving VPS1 acts now and skips the politeness delay.
+"""Cleanup EMERGENCY: a starving VPS1 acts now, on the same headroom rule.
 
 A 13.5 h busy day landed 9-13 releases/hour on a small VPS1 scratch disk while
-cleanup reclaimed less than it took: 19 rows were fuse-VERIFIED (safe to delete
-by the project's own rule) and blocked purely by the 2 h grace floor, at 16 GiB
-free, and the janitor only woke on its burst cadence. An emergency — free space
-at/below `critical_watermark_free_bytes`, or a newly discovered release that
-cannot fit — therefore (1) lets a fuse-VERIFIED DONE row become eligible without
-waiting out grace or the idle fast lane, and (2) runs the next pass promptly
-instead of up to a burst interval late, bounded so it never becomes a hot loop.
+cleanup reclaimed less than it took: rows sat on VPS1 at 16 GiB free and the
+janitor only woke on its burst cadence. An emergency — free space at/below
+`critical_watermark_free_bytes`, or a newly discovered release that cannot fit —
+therefore (1) runs the next pass promptly instead of up to a burst interval late,
+bounded so it never becomes a hot loop, and (2) counts as "space needed", so the
+pass reclaims toward the free-space target immediately.
 
-Both change TIMING only. Verification, protection, unknown stats, H&R minimums,
-`.torrent` preservation, the `completed_at is None` adoption keep, the MOVING
-early path and the activity gate (still owned by
+Change 1 (skipping a grace period) is gone: elapsed time left the policy when
+the janitor started reclaiming to a target (see
+tests/test_cleanup_headroom.py). Both remaining halves change TIMING only.
+Verification, protection, unknown stats, H&R minimums, `.torrent` preservation,
+the MOVING early path and the activity gate (still owned by
 `ignore_activity_under_pressure`) behave exactly as before.
 
 Release names here are invented; no real log or config file is read.
@@ -50,7 +51,6 @@ def _cleanup_cfg(**over) -> CleanupConfig:
         dry_run=False,
         janitor_startup_delay_seconds=0.0,
         delete_stagger_seconds=0.0,
-        min_grace_hours=2.0,
     )
     base.update(over)
     return CleanupConfig(**base)
@@ -132,9 +132,9 @@ def _row(
 ) -> TorrentState:
     """Default shape: DONE 10 minutes ago, swarm seen active 1 minute ago.
 
-    Both timing lanes are closed on purpose: grace is 2 h (`min_grace_hours`)
-    and `idle_confirm_minutes = 45` cannot confirm a swarm observed a minute
-    ago — so without an emergency this row is kept.
+    The shape the 13.5 h report described: the content is secured today, so
+    this row is a candidate the moment the disk needs the room — and it is kept
+    by the activity gate alone when the switch is off.
     """
     now = dt.datetime.now(dt.UTC)
     ts = TorrentState(
@@ -282,12 +282,12 @@ def test_emergency_is_not_bursting_and_not_pressured():
     assert coord._cleanup_emergency_trigger(cfg, CRITICAL, urgent2) == "critical"
 
 
-# ------------------------------------------------------- grace bypass (CHANGE 1)
+# ------------------------------------------- an emergency means "space needed"
 
 
 @pytest.mark.anyio
-async def test_critical_watermark_rescues_a_verified_row(tmp_path: Path, caplog):
-    """The 13.5 h report: verified rows held by a 2 h politeness delay."""
+async def test_critical_watermark_reclaims_a_verified_row(tmp_path: Path, caplog):
+    """The 13.5 h report: a starving disk takes the space it needs, now."""
     store, cfg, src, dest, h = _setup(tmp_path)
     coord = _coord(store, src, dest, cfg)
     try:
@@ -296,35 +296,34 @@ async def test_critical_watermark_rescues_a_verified_row(tmp_path: Path, caplog)
         assert [d[0] for d in src.deleted] == [h]
         assert summary["deleted"] == 1
         text = caplog.text
-        assert f"emergency: deleting {FNAME} " in text
-        assert "after 600s of a 7200s grace" in text
-        assert f"VPS1 free={CRITICAL} B" in text
-        assert "trigger=critical" in text
-        assert "fuse-verified, grace and idle-confirm skipped" in text
+        # One headroom line for the pass, naming the band it is reclaiming to.
+        assert "cleanup janitor: deleted 1 content group(s)" in text
+        assert "target 40.0 GiB" in text
+        assert "VPS1 disk CRITICAL" in text
     finally:
         store.close()
 
 
 @pytest.mark.anyio
-async def test_above_critical_without_urgency_still_waits_out_grace(tmp_path: Path, caplog):
-    """The same row, the same second, no emergency: today's keep, unchanged."""
+async def test_free_space_above_the_trigger_reclaims_nothing(tmp_path: Path, caplog):
+    """The same row, the same second, room on the disk: it keeps seeding."""
     store, cfg, src, dest, _h = _setup(tmp_path)
     coord = _coord(store, src, dest, cfg)
     try:
         with caplog.at_level(logging.INFO, logger="racing_sync.coordinator"):
-            summary = await _scan(coord, cfg, free=ABOVE_CRIT)
+            summary = await _scan(coord, cfg, free=NO_PRESSURE)
         assert src.deleted == []
         assert summary["deleted"] == 0
-        assert "grace 1" in summary["reason"]
-        assert "emergency" not in summary["reason"]
-        assert "emergency: deleting" not in caplog.text
+        assert "no space needed" in summary["reason"]
+        assert "grace" not in summary["reason"]
+        assert "cleanup: deleting" not in caplog.text
     finally:
         store.close()
 
 
 @pytest.mark.anyio
-async def test_arrival_that_did_not_fit_rescues_a_verified_row(tmp_path: Path, caplog):
-    """The `_cleanup_urgent` trigger, above every free-space watermark."""
+async def test_arrival_that_did_not_fit_makes_space_now(tmp_path: Path, caplog):
+    """The `_cleanup_urgent` trigger: roomy by watermark, needed by the next race."""
     store, cfg, src, dest, h = _setup(tmp_path)
     coord = _coord(store, src, dest, cfg)
     try:
@@ -332,15 +331,15 @@ async def test_arrival_that_did_not_fit_rescues_a_verified_row(tmp_path: Path, c
             summary = await _scan(coord, cfg, free=NO_PRESSURE, urgent=True)
         assert [d[0] for d in src.deleted] == [h]
         assert summary["deleted"] == 1
-        assert "trigger=arrival-did-not-fit" in caplog.text
-        assert f"VPS1 free={NO_PRESSURE} B" in caplog.text
+        assert "no space needed" not in summary["reason"]
+        assert f"cleanup janitor: VPS1 free={NO_PRESSURE} B" in caplog.text
     finally:
         store.close()
 
 
 @pytest.mark.anyio
-async def test_calm_run_above_the_watermarks_is_unchanged(tmp_path: Path):
-    """No emergency and no burst: the row waits, exactly as before."""
+async def test_calm_run_above_the_trigger_skips_the_scan(tmp_path: Path):
+    """No emergency and no burst: the pass says so without touching a client."""
     store, cfg, src, dest, _h = _setup(tmp_path)
     coord = _coord(store, src, dest, cfg)
     try:
@@ -354,7 +353,7 @@ async def test_calm_run_above_the_watermarks_is_unchanged(tmp_path: Path):
             urgent=False,
         )
         assert src.deleted == []
-        assert "grace 1" in summary["reason"]
+        assert "no space needed" in summary["reason"]
     finally:
         store.close()
 
@@ -369,22 +368,21 @@ async def test_emergency_never_rescues_an_unverified_row(tmp_path: Path, caplog)
             summary = await _scan(coord, cfg, free=CRITICAL)
         assert src.deleted == []
         assert "verification 1" in summary["reason"]
-        assert "emergency: deleting" not in caplog.text
+        assert "cleanup: deleting" not in caplog.text
     finally:
         store.close()
 
 
 @pytest.mark.anyio
-async def test_emergency_keeps_an_adopted_row_without_completed_at(tmp_path: Path, caplog):
-    """Recovery-adopted DONE rows: no proof VPS2 ever served them."""
-    store, cfg, src, dest, _h = _setup(tmp_path, completed_min_ago=None)
+async def test_adopted_row_without_completed_at_is_eligible(tmp_path: Path, caplog):
+    """Recovery-adopted DONE rows clear on the same fuse proof as any other."""
+    store, cfg, src, dest, h = _setup(tmp_path, completed_min_ago=None)
     coord = _coord(store, src, dest, cfg)
     try:
         with caplog.at_level(logging.INFO, logger="racing_sync.coordinator"):
             summary = await _scan(coord, cfg, free=CRITICAL)
-        assert src.deleted == []
-        assert "grace 1" in summary["reason"]
-        assert "emergency: deleting" not in caplog.text
+        assert [d[0] for d in src.deleted] == [h]
+        assert summary["deleted"] == 1
     finally:
         store.close()
 
@@ -458,8 +456,8 @@ async def test_unknown_stats_and_protection_still_keep_under_emergency(tmp_path:
 
 
 @pytest.mark.anyio
-async def test_rescue_logs_exactly_one_line_per_row(tmp_path: Path, caplog):
-    """Bounded output: three rescued rows, three INFO lines, no per-scan spam."""
+async def test_reclaim_logs_exactly_one_line_per_row(tmp_path: Path, caplog):
+    """Bounded output: three reclaimed rows, three delete lines, no per-scan spam."""
     store = StateStore(tmp_path / "s.db")
     cfg = _base_cfg(tmp_path)
     _mounts(tmp_path)
@@ -479,9 +477,11 @@ async def test_rescue_logs_exactly_one_line_per_row(tmp_path: Path, caplog):
         with caplog.at_level(logging.INFO, logger="racing_sync.coordinator"):
             summary = await _scan(coord, cfg, free=CRITICAL)
         assert summary["deleted"] == 3
-        rescue_lines = [r for r in caplog.records if "emergency: deleting" in r.getMessage()]
+        rescue_lines = [r for r in caplog.records if "cleanup: deleting" in r.getMessage()]
         assert len(rescue_lines) == 3
         assert all("\n" not in r.getMessage() for r in rescue_lines)
+        # One headroom line for the whole pass, not one per row.
+        assert len([r for r in caplog.records if "content group(s)" in r.getMessage()]) == 1
     finally:
         store.close()
 
@@ -491,21 +491,45 @@ async def test_rescue_logs_exactly_one_line_per_row(tmp_path: Path, caplog):
 
 @pytest.mark.anyio
 async def test_moving_row_still_needs_the_idle_confirm_under_emergency(tmp_path: Path):
-    """Emergency skips the DONE grace wait; the MOVING early path is untouched."""
+    """Emergency reclaims DONE rows at once; the MOVING early path is untouched."""
     store, cfg, src, dest, _h = _setup(tmp_path, state=State.MOVING)
     coord = _coord(store, src, dest, cfg)
     try:
         summary = await _scan(coord, cfg, free=CRITICAL)
         assert src.deleted == []
-        # Idle-confirm failed (swarm seen a minute ago): kept by grace, as before.
-        assert "grace 1" in summary["reason"]
+        # Idle-confirm failed (swarm seen a minute ago): kept by `idle`, as before.
+        # This is the one time-based rule that survived the headroom refactor —
+        # MOVING content is not secured yet, so it still has its settle window.
+        assert "idle 1" in summary["reason"]
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_row_goes_once_its_own_idle_window_elapsed(tmp_path: Path):
+    """The MOVING settle window is a window, not a ban: past it, the row goes.
+
+    The counterpart of the keep above, so the surviving time rule is pinned in
+    both directions. The SSD byte check is stubbed (it has its own suite); the
+    idle confirmation — the rule under test — runs for real against a stamp
+    older than `_MOVING_IDLE_CONFIRM_S`.
+    """
+    store, cfg, src, dest, h = _setup(
+        tmp_path, state=State.MOVING, activity_min_ago=60.0, completed_min_ago=None
+    )
+    coord = _coord(store, src, dest, cfg)
+    coord._cleanup_ssd_bytes_present = AsyncMock(return_value=True)
+    try:
+        summary = await _scan(coord, cfg, free=CRITICAL)
+        assert [d[0] for d in src.deleted] == [h.lower()]
+        assert summary["deleted"] == 1
     finally:
         store.close()
 
 
 @pytest.mark.anyio
 async def test_moving_row_without_pressure_is_still_kept(tmp_path: Path):
-    """No pressure, no urgency: MOVING keeps its own `not pressured` keep."""
+    """No need for room at all: the pass stops before the MOVING path is reached."""
     store, cfg, src, dest, _h = _setup(
         tmp_path, state=State.MOVING, activity_min_ago=None, completed_min_ago=None
     )
@@ -521,7 +545,22 @@ async def test_moving_row_without_pressure_is_still_kept(tmp_path: Path):
             urgent=False,
         )
         assert src.deleted == []
-        assert "not pressured 1" in summary["reason"]
+        assert "no space needed" in summary["reason"]
+
+        # The disk says there is room, but the row is mid-pipeline and a release
+        # did not fit: the pass scans, and MOVING keeps its own `not pressured`
+        # keep because the content is not secured yet.
+        summary = await coord._run_source_cleanup(
+            cfg.cleanup,
+            free_bytes=NO_PRESSURE,
+            arrivals=0.0,
+            bytes_rate=0.0,
+            projected=None,
+            bursting=False,
+            urgent=True,
+        )
+        assert src.deleted == []
+        assert "idle 1" in summary["reason"]
     finally:
         store.close()
 
@@ -555,20 +594,22 @@ async def test_moving_early_path_still_works_under_urgency(tmp_path: Path):
 
 def test_blocked_reason_appends_emergency_state():
     coord = make_coordinator()
-    blocked = {"grace": 19}
-    assert coord._cleanup_blocked_reason(blocked) == "nothing eligible (grace 19)"
+    blocked = {"verification": 19}
+    assert coord._cleanup_blocked_reason(blocked) == "nothing eligible (verification 19)"
     line = coord._cleanup_blocked_reason(blocked, emergency=True)
-    assert line == "nothing eligible (grace 19; emergency on)"
+    assert line == "nothing eligible (verification 19; emergency on)"
     assert "\n" not in line
     # No keeps at all: still one honest line.
     assert coord._cleanup_blocked_reason({}, emergency=True) == "nothing eligible (emergency on)"
     assert coord._cleanup_blocked_reason({}, emergency=False) == "nothing eligible"
     # A wide breakdown stays one bounded line with the suffix on.
-    wide = {"grace": 19, "activity": 17, "verification": 9, "x" * 300: 4}
+    wide = {"verification": 19, "activity": 17, "waiting for space": 9, "x" * 300: 4}
     capped = coord._cleanup_blocked_reason(wide, emergency=True)
     assert capped.startswith("nothing eligible (") and capped.endswith("; emergency on)")
     assert len(capped) <= 160 + len("nothing eligible ()")
     assert "\n" not in capped
+    # The old timing keep is gone from the report vocabulary.
+    assert "grace" not in coord._CLEANUP_BLOCK_ORDER
 
 
 @pytest.mark.anyio
@@ -586,7 +627,7 @@ async def test_report_line_names_the_starving_state(tmp_path: Path, caplog):
 
 
 @pytest.mark.anyio
-async def test_critical_disk_warning_states_the_bypass(tmp_path: Path, caplog):
+async def test_critical_disk_warning_states_the_headroom_rule(tmp_path: Path, caplog):
     """The CRITICAL line promises what the emergency actually does."""
     store, cfg, src, dest, _h = _setup(tmp_path)
     coord = _coord(store, src, dest, cfg)
@@ -594,7 +635,7 @@ async def test_critical_disk_warning_states_the_bypass(tmp_path: Path, caplog):
         with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
             await _scan(coord, cfg, free=CRITICAL)
         assert "VPS1 disk CRITICAL" in caplog.text
-        assert "fuse-verified DONE rows skip the grace wait" in caplog.text
+        assert "reclaiming toward the free-space target" in caplog.text
     finally:
         store.close()
 

@@ -407,7 +407,7 @@ class StartActionsMixin:
                 _text, _rows = self._sheet_text_and_rows(
                     members, title, getattr(members[0], "total_bytes", 0) if members else 0, notes
                 )
-                # Cleanup ETA for the group leader: only meaningful for a
+                # VPS1 headroom status for the group leader: only meaningful for a
                 # DONE row in an enabled deployment (`_cleanup_hint` returns
                 # "" otherwise), so the sheet stays unchanged everywhere else.
                 try:

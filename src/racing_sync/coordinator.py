@@ -44,7 +44,6 @@ from .coordinator_content import (
     _matches_release,
     _should_notify_telegram,
     _verified_cross_seed_blob,
-    cleanup_grace_seconds,
     normalize_content_name,
 )
 from .coordinator_download import DownloadMixin, LiveItem
@@ -127,7 +126,6 @@ __all__ = [
     "_matches_release",
     "_should_notify_telegram",
     "_verified_cross_seed_blob",
-    "cleanup_grace_seconds",
     "normalize_content_name",
     "pick_ssd_source_for_racing",
 ]
@@ -141,7 +139,8 @@ __all__ = [
 # (moved to coordinator_content.py; re-exported above)
 
 
-# (_lerp / cleanup_grace_seconds moved to coordinator_content.py; re-exported above)
+# (the adaptive cleanup grace helper is gone: VPS1 reclaims to a free-space
+# band, not to a timer — see coordinator_cleanup.py)
 
 
 # (cross-seed picker lives in coordinator_picker.py; path guard in
@@ -227,7 +226,8 @@ class Coordinator(
     _fuse_healthy_until: dict[str, float] = field(default_factory=dict, init=False)
     # VPS1 cleanup janitor ([cleanup]): monotonic timestamp of the last run
     # plus one monotonic timestamp per newly discovered racing release
-    # (rolling intake-velocity signal for spam-burst grace shortening).
+    # (rolling intake-velocity signal: it drives the burst cadence, the
+    # projected fill and the indexer-wait collapse, never a delete gate).
     _cleanup_last_run: float = field(default=0.0, init=False)
     _arrival_times: list = field(default_factory=list, init=False)
     # Parallel arrival sizes [(monotonic, bytes)]: the janitor turns them

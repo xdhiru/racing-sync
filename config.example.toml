@@ -663,7 +663,7 @@ auto_retry_failed = true
 max_failed_retries = 3
 
 # ============================================================
-# VPS1 cleanup — reclaim racing-client disk after VPS2 owns it
+# VPS1 cleanup — reclaim racing-client disk when the space is needed
 # ============================================================
 
 [cleanup]
@@ -672,29 +672,27 @@ max_failed_retries = 3
 enabled = false
 # Log candidates without deleting anything.
 dry_run = true
-# Grace bounds (hours) after VPS2 marks a row DONE. The janitor
-# interpolates between them from live pressure (see below), so full
-# autobrr days clear in ~min_grace and quiet days seed up to max_grace.
-min_grace_hours = 2
-max_grace_hours = 72
-# VPS1 free-space watermarks (bytes). At/below low -> min grace and
-# biggest-first ordering; at/above high -> max grace, oldest-first.
-# Calibrate to the VPS1 disk (example: 80 GiB disk -> 15/40 GiB).
-low_watermark_free_bytes = 16106127360    # 15 GiB
-high_watermark_free_bytes = 42949672960   # 40 GiB
+# Reclaim band, in bytes: low is the TRIGGER (below it the janitor reclaims),
+# high is the TARGET (it reclaims until free is back there, the verified rows
+# run out, or per_run_cap stops it). Time plays no part: a quiet day deletes
+# nothing however old the rows are, a busy day reclaims exactly as much as the
+# next arrivals need. A VPS1 whose free space cannot be measured is never
+# treated as roomy: that pass reclaims on verification alone up to
+# per_run_cap and reports the free space and target as "unknown" instead of
+# guessing them. Calibrate to the VPS1 disk (example: 80 GiB disk ->
+# 15/40 GiB).
+low_watermark_free_bytes = 16106127360    # 15 GiB trigger
+high_watermark_free_bytes = 42949672960   # 40 GiB target
 # Emergency watermark. At/below this VPS1 cannot land the next race: the
-# janitor acts on its emergency wake (not a cadence tick later) and DONE rows
-# whose bytes are fuse-VERIFIED skip the grace wait. Timing only — unverified
-# rows, rows adopted without a completion stamp and the activity keep are
-# unchanged; grace itself stays floored at min (never zero).
+# janitor acts on its emergency wake (not a cadence tick later) and the pass
+# treats the space as needed. Timing only — unverified rows, protected rows
+# and rows with unknown stats are kept whatever the disk says.
 critical_watermark_free_bytes = 8589934592  # 8 GiB
-# Intake-velocity bounds (new racing releases/hour, rolling). At/above
-# burst -> min grace (spam-uploader dumps); at/below calm -> no effect.
+# Intake-velocity bounds (new racing releases/hour, rolling). They drive the
+# burst cadence and the projected-fill signal (and the indexer-wait collapse +
+# pressure-push valve); they never gate a delete.
 burst_arrivals_per_hour = 8
 calm_arrivals_per_hour = 2
-# A race counts as finished after this many minutes with ~zero upload
-# AND zero leechers. Verified-idle rows skip the grace wait (fast lane).
-idle_confirm_minutes = 45
 # Upload rate at/below this (B/s) counts as quiet for idle detection.
 activity_upspeed_bps = 65536
 # Disk pressure overrides the activity gate above (off = a leecher on VPS1
@@ -706,8 +704,8 @@ activity_upspeed_bps = 65536
 # VPS2's fuse seed stands in. When on, the keep lifts only while this run
 # reads pressure the janitor already computes (bursting, or free below
 # low_watermark_free_bytes); verification, .torrent preservation, protected
-# patterns, unknown stats and grace still gate every delete. A live peer's
-# download gets cut short and VPS2 takes over serving it.
+# patterns, unknown stats and the free-space trigger still gate every delete.
+# A live peer's download gets cut short and VPS2 takes over serving it.
 ignore_activity_under_pressure = false
 # Optional H&R minimums, checked on every group member (0 = disabled).
 # Only enable with per-account needs; both clients must seed the SAME

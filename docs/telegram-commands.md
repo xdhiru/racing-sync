@@ -38,8 +38,8 @@ All commands accept an optional `@bot` suffix in group chats
 | `/cancel_all <text>` | Cancel every live group whose title contains `<text>`. |
 | `/cancel_lane` | Cancel a whole lane (DL/MV/RD/QD) — a sheet with live counts. |
 | `/cancel_stalled` | Cancel every download with no seeders and no progress. |
-| `/clean <hash>` | Clean one completed (DONE) task's VPS1 copy now — skips grace/idle but keeps every safety check. |
-| `/cleanup` | Run the VPS1 cleanup pass now — skips only the startup delay and the hourly cadence. |
+| `/clean <hash>` | Clean one completed (DONE) task's VPS1 copy now — skips the free-space trigger but keeps every safety check. |
+| `/cleanup` | Run the VPS1 cleanup pass now — skips only the startup delay and the cadence; deletes nothing while VPS1 has room. |
 | `/files <target>` | Read-only file listing for one torrent/group. |
 | `/find <text>` | Read-only Prowlarr search over the download-target indexers. |
 | `/force <target>` | Start a queued/moving row past the lane caps (in-memory; disarms on lane exit or restart). |
@@ -72,7 +72,8 @@ nothing (a bare known verb answers with its usage line instead).
   client still lists: `DONE` rows with at least one hash (source, dest,
   cross-seed or `injected_private_hashes`) present in the cached VPS1
   listing, oldest completion first, each line carrying the `🗄 still on
-  VPS1` badge and the janitor's own ETA (`clean ~5h` / `clean ready`).
+  VPS1` badge and the janitor's own headroom status (`secured · reclaiming`,
+  `secured · waiting for space`, `not verifiable yet`).
   `DONE` shows in this tab only — `All` and every lane exclude it, and
   `cancel_lane` refuses it. The button disappears with
   `[cleanup].enabled = false` (a stored `🗄` filter then falls back to
@@ -108,13 +109,15 @@ two questions once for the whole scope.
 - `🧹 Clean VPS1 copies` — shown only for a completed (DONE) group when
   `[cleanup].enabled` is on. Runs the same per-task cleanup as
   `/clean_<hash>`: fuse bytes verified, H&R minimums met, no race
-  activity, un-injected `.torrent` bytes preserved; grace/idle are
+  activity, un-injected `.torrent` bytes preserved; the free-space trigger is
   skipped on purpose (operator intent). With `dry_run = true` nothing is
   deleted and the reply says what would have been.
-- The sheet also prints the janitor's estimate (`Cleanup: clean ready`,
-  `Cleanup: clean ~5h`). The same hint follows a DONE row's stage text in
-  the Active Tasks card: `clean ready` means the timing gates are
-  satisfied, `clean ~5h` is an estimate based on the adaptive grace.
+- The sheet also prints the row's headroom status (`Cleanup: secured ·
+  waiting for space`, `Cleanup: not verifiable yet`). The same line follows a
+  DONE row's stage text in the Active Tasks card: `secured` means the fuse
+  copy verified and the row is kept until the space is needed, `reclaiming`
+  means a pass is taking that space now, and `not verifiable yet` means the
+  janitor will not delete it whatever the disk says.
 
 ### Act sheet — push from VPS1
 
@@ -152,9 +155,11 @@ two questions once for the whole scope.
   "Already working on it" instead of executing twice.
 - `/find`, `/files` and `/stats` are read-only: they never queue or
   download anything.
-- **Cleanup** — the automatic janitor deletes VPS1 copies on its own
-  cadence once grace/idle allow. `/cleanup` and `/clean_<hash>` only
-  bypass the waiting (cadence, grace, idle): fuse verification, H&R
+- **Cleanup** — the automatic janitor keeps every secured VPS1 copy seeding
+  until the space is needed, then reclaims toward
+  `[cleanup].high_watermark_free_bytes`. `/cleanup` and `/clean_<hash>` only
+  bypass the waiting (cadence, and `/clean` the free-space trigger): fuse
+  verification, H&R
   minimums, activity, and `.torrent` preservation always run — activity
   unless `[cleanup].ignore_activity_under_pressure` is on and this run
   reads real disk pressure, when VPS2 takes over serving the peer. `/clean`
@@ -162,4 +167,4 @@ two questions once for the whole scope.
   disk pressure. Both commands do nothing when `[cleanup].enabled` is
   false (or the chain adds no seed entry to verify against). A pass with
   nothing to delete answers `🧹 Cleanup: nothing deleted — nothing eligible
-  (activity 17, grace 3)`, naming what held the rows back.
+  (activity 17, verification 3)`, naming what held the rows back.

@@ -1350,14 +1350,17 @@ class RecoveryConfig(BaseModel):
 
 
 class CleanupConfig(BaseModel):
-    """VPS1 racing-client cleanup: reclaim disk after VPS2 owns the content.
+    """VPS1 racing-client cleanup: reclaim disk when space is actually needed.
 
-    Disabled by default (destructive — opt in deliberately). When enabled, an
-    hourly janitor deletes racing-client torrents (+data) whose content VPS2
-    has fully secured, oldest-eligible-first, capped per run:
+    Disabled by default (destructive — opt in deliberately). When enabled, the
+    janitor keeps every race seeding on VPS1 until the space is needed, then
+    deletes racing-client torrents (+data) whose content VPS2 has secured,
+    biggest-first, until VPS1 is back at the free-space target:
 
-    - Normal path: row DONE + fuse entries re-verified + adaptive grace
-      elapsed (or race verifiably idle past `idle_confirm_minutes`).
+    - Normal path: row DONE + fuse entries re-verified + the row's content
+      bytes verified on the mount. Elapsed time is NOT part of eligibility —
+      a quiet day reclaims nothing, a busy day reclaims exactly as much as the
+      next arrivals need.
     - Early pressure path: row in MOVING/RE_ADDING (bytes 100% on VPS2 SSD,
       pipeline mid-flight) + VPS1 group idle + free space under the low
       watermark. VPS2 never pulls content bytes from VPS1 (SFTP carries only
@@ -1369,45 +1372,40 @@ class CleanupConfig(BaseModel):
 
     EMERGENCY (`critical_watermark_free_bytes` reached, or an arrival that did
     not fit at all) changes TIMING only: the janitor runs on its emergency wake
-    instead of the next cadence tick, and a DONE row whose bytes are already
-    fuse-VERIFIED becomes eligible without waiting out grace or the idle fast
-    lane. Rows verification cannot prove, rows adopted without `completed_at`,
-    and the activity keep (still gated by `ignore_activity_under_pressure`)
-    behave exactly as before.
+    instead of the next cadence tick, and the pass treats the space as needed
+    because the next race genuinely cannot land. Rows verification cannot
+    prove, protected rows, rows with unknown stats and the activity keep (still
+    gated by `ignore_activity_under_pressure`) behave exactly as before.
 
-    Grace adapts to pressure so full autobrr days clear fast and quiet days
-    keep seeding: `grace = max(min_grace, min(space_curve, velocity_curve))`
-    where space_curve interpolates free space between the low/high
-    watermarks and velocity_curve interpolates intake arrivals/hour between
-    the calm/burst rates. Minimums (min_ratio/min_seed_hours) default to 0
-    (disabled) — valid only when both clients seed the SAME tracker account,
-    so VPS2's long-term fuse seeding keeps the account compliant.
+    The two watermarks are one hysteresis band: `low_watermark_free_bytes` is
+    the TRIGGER (below it, reclaim) and `high_watermark_free_bytes` the TARGET
+    (reclaim until free is back at it, or the eligible inventory runs out).
+    Minimums (min_ratio/min_seed_hours) default to 0 (disabled) — a genuine
+    belt-and-braces opt-in, valid only when both clients seed the SAME tracker
+    account, so VPS2's long-term fuse seeding keeps the account compliant.
     """
 
     enabled: bool = False
     # Log what would be deleted without deleting anything. Run with true
     # for a while and review before allowing real deletes.
     dry_run: bool = True
-    # Grace bounds (hours) after VPS2 marks DONE.
-    min_grace_hours: float = Field(default=2.0, ge=0)
-    max_grace_hours: float = Field(default=72.0, ge=0)
-    # Free-space watermarks on VPS1 (bytes). At/below low -> min grace and
-    # biggest-first ordering; at/above high -> max grace, oldest-first.
+    # VPS1 free-space band (bytes): `low` is the reclaim TRIGGER, `high` is the
+    # reclaim TARGET. At/above `low` nothing is deleted automatically; below
+    # `low` a pass reclaims biggest-first until free reaches `high`, the
+    # eligible rows run out, or `per_run_cap` stops it.
     low_watermark_free_bytes: int = Field(default=16106127360, ge=0)  # 15 GiB
     high_watermark_free_bytes: int = Field(default=42949672960, ge=0)  # 40 GiB
     # Emergency watermark. At/below this VPS1 cannot land the next race, so the
-    # janitor acts on its emergency wake instead of the next cadence tick, and
-    # fuse-VERIFIED DONE rows skip the grace wait (timing only: unverified rows
-    # and adoption rows without completed_at still wait; grace itself stays
-    # floored at min, never zero).
+    # janitor runs on its emergency wake instead of the next cadence tick, and
+    # the space counts as needed even where the plain trigger alone would not
+    # have said so. Timing only: unverified rows, protected rows and unknown
+    # stats are still kept whatever the disk says.
     critical_watermark_free_bytes: int = Field(default=8589934592, ge=0)  # 8 GiB
-    # Intake-velocity bounds (new racing releases/hour). At/above burst ->
-    # min grace; at/below calm -> no shortening.
+    # Intake-velocity bounds (new racing releases/hour). They drive
+    # `_cleanup_pressure` (burst cadence, projected fill, the indexer-wait
+    # collapse and the pressure-push valve); they never gate a delete.
     burst_arrivals_per_hour: float = Field(default=8.0, ge=0)
     calm_arrivals_per_hour: float = Field(default=2.0, ge=0)
-    # A race counts as finished after this many minutes with ~zero upload
-    # AND zero leechers. Fast-lanes deletion past the grace wait.
-    idle_confirm_minutes: float = Field(default=45.0, ge=0)
     # Upload rate at/below this (B/s) counts as quiet for idle detection.
     activity_upspeed_bps: int = Field(default=65536, ge=0)
     # Let disk pressure override the activity gate (off = today's behaviour:
@@ -1435,7 +1433,11 @@ class CleanupConfig(BaseModel):
     # Remove data files as well as client entries (required to free disk).
     # False = remove entries only (frees no space; useful for testing).
     delete_files: bool = True
-    # Max content groups deleted per janitor run.
+    # Max content groups deleted per janitor run. The pass aims at
+    # `high_watermark_free_bytes`; this cap is the safety valve that keeps one
+    # sweep from wiping the box, so a run stopped by it reports the shortfall
+    # (free before/after, target, rows still eligible) instead of pretending
+    # the target was reached.
     per_run_cap: int = Field(default=10, ge=1)
     # Settle pause (seconds) between real group deletions in one run.
     # Back-to-back remove_torrent(+data) calls spike daemon teardown and
@@ -1472,8 +1474,6 @@ class CleanupConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_bounds(self) -> CleanupConfig:
-        if self.max_grace_hours < self.min_grace_hours:
-            raise ValueError("cleanup: max_grace_hours must be >= min_grace_hours")
         if self.high_watermark_free_bytes <= self.low_watermark_free_bytes:
             raise ValueError(
                 "cleanup: high_watermark_free_bytes must be > low_watermark_free_bytes"

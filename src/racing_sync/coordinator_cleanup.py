@@ -1,16 +1,23 @@
-"""VPS1 cleanup janitor mixin (disk pressure + grace).
+"""VPS1 cleanup janitor (disk headroom + verification).
 
 Split out of the coordinator god-file. Deletes racing torrents from VPS1
-once VPS2 has secured the content (DONE past adaptive grace and idle, or
-MOVING under disk pressure with bytes verified on SSD). Fail-closed
+once VPS2 has secured the content (a DONE row whose fuse entries and bytes
+verify, reclaimed toward a free-space target, or MOVING rows early under disk
+pressure with bytes verified on SSD). Fail-closed
 throughout: any doubt keeps VPS1 — except, when the operator opts in, the
 activity keep alone lifts under real pressure (VPS1 is a scratch disk and
 VPS2 takes over serving the peer).
 
+There is NO eligibility clock: a race keeps seeding on VPS1 until the space is
+actually needed. `[cleanup].low_watermark_free_bytes` is the TRIGGER (below it
+the pass reclaims) and `high_watermark_free_bytes` the TARGET (it reclaims
+until free is back there, the eligible inventory runs out, or `per_run_cap`
+stops it — which is reported as a shortfall, never hidden).
+
 Under an EMERGENCY (free space at/below `critical_watermark_free_bytes`, or a
-newly discovered release that cannot fit) a fuse-VERIFIED DONE row stops
-waiting out the grace period, and the janitor acts on its next wake instead of
-its next cadence: timing only, never a safety gate.
+newly discovered release that cannot fit) the janitor acts on its next wake
+instead of its next cadence, because the next race cannot land: timing only,
+never a safety gate.
 """
 
 from __future__ import annotations
@@ -23,7 +30,6 @@ from pathlib import Path
 from typing import Any
 
 from .clients.abstract import Torrent
-from .coordinator_content import cleanup_grace_seconds
 from .coordinator_paths import _safe_ssd_join
 
 # The 1 s wake slice the racing-blob warm-up loop already uses: reused here so
@@ -50,6 +56,14 @@ _VPS1_LISTING_MAX_AGE_S = 120.0
 #: number, so an emergency wake can never degrade into a hot loop.
 _EMERGENCY_WAKE_MIN_FLOOR_S = 15.0
 
+#: How long a MOVING row's swarm must have been quiet before the early
+#: pressure path may take it (seconds). Content NOT yet moved to the remote is
+#: not secured, so this path keeps its own settle window — it is not an
+#: eligibility clock for DONE rows (those are gated by verification alone).
+#: Fixed since `idle_confirm_minutes` left the config: the knob it used to read
+#: is now a REMOVED key, and the rule it served still applies.
+_MOVING_IDLE_CONFIRM_S = 45 * 60.0
+
 
 class CleanupMixin:
     """VPS1 janitor (duck-typed ``self``: cfg/store/source_client/dest_client)."""
@@ -57,8 +71,9 @@ class CleanupMixin:
     def _cleanup_arrival_rates(self, now_mono: float) -> tuple[float, float]:
         """Rolling intake velocity: (releases/hour, bytes/hour) over 1 h.
 
-        Spam-uploader bursts raise the rate; the janitor shortens deletion
-        grace and switches to burst cadence/cap accordingly. Both arrival
+        Spam-uploader bursts raise the rate; the janitor switches to burst
+        cadence/cap accordingly and the indexer-wait collapse and the
+        pressure-push valve read the same numbers. Both arrival
         lists are pruned with the SAME cutoff so counts and bytes always
         describe the same window (bounded memory either way). Tolerant of
         object.__new__ test doubles (missing attributes).
@@ -184,8 +199,8 @@ class CleanupMixin:
           - `bursting` answers "tighten the cadence and the per-run cap";
           - `pressured` answers "lift the activity keep (opt-in)";
           - an EMERGENCY answers "VPS1 cannot land the next race right now" —
-            the only state in which a fuse-VERIFIED DONE row skips the grace
-            wait (and the idle-confirm fast lane that stands in for it).
+            the state in which the janitor runs immediately and in which space
+            counts as needed even above the plain reclaim trigger.
 
         An emergency changes TIMING only: verification, protection, unknown
         stats, H&R minimums and the activity gate (still governed by
@@ -283,8 +298,11 @@ class CleanupMixin:
             remaining -= step
 
     # Report order for the "nothing eligible" breakdown (`_cleanup_blocked_reason`).
+    # "waiting for space" is a HEALTHY state (secured, nothing needed yet);
+    # "verification" is the doubt case (the janitor will not touch it until the
+    # fuse copy proves out). There is no time-based keep any more.
     _CLEANUP_BLOCK_ORDER = (
-        "grace",
+        "waiting for space",
         "activity",
         "verification",
         "unknown stats",
@@ -323,6 +341,76 @@ class CleanupMixin:
             low = 0
         return bool(low and free_bytes is not None and free_bytes < low)
 
+    # ----------------------------------------------------------------- headroom
+
+    @staticmethod
+    def _cleanup_band(cfg: object) -> tuple[int, int]:
+        """The reclaim band: (trigger, target) free bytes from `[cleanup]`.
+
+        `low_watermark_free_bytes` is the TRIGGER (below it the pass reclaims)
+        and `high_watermark_free_bytes` the TARGET (it reclaims until free is
+        back there). One reading of two numbers that already exist — no new
+        knob and no second clock. Never raises: an unreadable section reads
+        (0, 0), which reclaims nothing rather than guessing.
+        """
+        try:
+            trigger = int(getattr(cfg, "low_watermark_free_bytes", 0) or 0)
+            target = int(getattr(cfg, "high_watermark_free_bytes", 0) or 0)
+        except (TypeError, ValueError):
+            return 0, 0
+        return max(0, trigger), max(0, target)
+
+    @staticmethod
+    def _cleanup_blind_auto_skip(free_bytes: int | None, force: bool) -> bool:
+        """Would this pass skip because the disk cannot be measured and nobody asked?
+
+        One definition, used by the caller (which must not spend its run stamp,
+        urgency flag or wake signal on a pass that will delete nothing) and by
+        `_run_source_cleanup` itself. `force` is the operator's `/cleanup`, the
+        only caller allowed to reclaim on an unmeasurable disk.
+        """
+        return bool(free_bytes is None and not force)
+
+    def _cleanup_reclaim_needed(
+        self, cfg: object, free_bytes: int | None, urgent: bool, emergency: str | None
+    ) -> bool:
+        """Is VPS1 space actually needed for new content right now?
+
+        The one question that decides whether a secured DONE row may go: free
+        below the trigger, a release that arrived too big to fit, or a critical
+        disk. Seeding forever is the default — a quiet day deletes nothing,
+        however old the rows are.
+
+        `free_bytes is None` means the reading does not exist, which is NOT an
+        answer: this returns False because it cannot say True, and callers must
+        treat that separately from "roomy": an automatic pass skips a blind
+        disk outright (`_cleanup_blind_auto_skip`) rather than guessing either
+        way, and only an operator-forced pass reclaims on proof alone.
+        `_cleanup_reclaiming` reports no reclaim for a disk it cannot measure.
+        """
+        if free_bytes is None:
+            return False
+        if urgent or emergency is not None:
+            return True
+        trigger, _target = self._cleanup_band(cfg)
+        return bool(trigger > 0 and free_bytes < trigger)
+
+    @staticmethod
+    def _cleanup_bytes_compact(value: object) -> str:
+        """Human byte size for the operator lines ("18.2 GiB"), "unknown" else."""
+        try:
+            if value is None:
+                return "unknown"
+            b = float(value)
+        except (TypeError, ValueError):
+            return "unknown"
+        if b < 0:
+            return "unknown"
+        for unit, size in (("TiB", 1024**4), ("GiB", 1024**3), ("MiB", 1024**2)):
+            if b >= size:
+                return f"{b / size:.1f} {unit}"
+        return f"{int(b)} B"
+
     def _cleanup_note_pressure_override(
         self, ts: TorrentState, lively: list[Torrent], group_size: int, free_bytes: int | None
     ) -> None:
@@ -341,31 +429,6 @@ class CleanupMixin:
             len(lively),
             group_size,
             f"{free_bytes} B" if free_bytes is not None else "unknown",
-        )
-
-    def _cleanup_note_emergency_rescue(
-        self,
-        ts: TorrentState,
-        free_bytes: int | None,
-        trigger: str,
-        age_s: float,
-        grace_s: float,
-    ) -> None:
-        """One INFO line per row the emergency rescued from the grace wait.
-
-        Same shape as the pressure-override note (one line per row, emitted
-        only once the row really is a candidate), and it says exactly what was
-        skipped so an operator reading the log can tell a politeness bypass
-        from a lost safety gate.
-        """
-        log.info(
-            "emergency: deleting %s after %ds of a %ds grace (VPS1 free=%s, trigger=%s); "
-            "fuse-verified, grace and idle-confirm skipped",
-            (ts.source_name or "")[:60],
-            int(age_s),
-            int(grace_s),
-            f"{free_bytes} B" if free_bytes is not None else "unknown",
-            trigger,
         )
 
     def _source_probe_path(self) -> str | None:
@@ -389,8 +452,8 @@ class CleanupMixin:
         janitor exactly when disk pressure made deletions urgent). The
         SFTP statvfs/df probe stays as the fallback for daemons without
         the method. Unknown covers qBittorrent sources, reconnect
-        failures and stat errors — callers degrade to time-only grace,
-        never to zero.
+        failures and stat errors — a pass without a reading reclaims
+        nothing (no target to compare against), never guesses.
         """
         path = self._source_probe_path()
         if path is not None:
@@ -484,7 +547,8 @@ class CleanupMixin:
         value is cached for the oversized-arrival check.
 
         `force` (operator `/cleanup`) skips ONLY the startup-delay and
-        cadence gates: every safety, grace, H&R and blob-preservation rule
+        cadence gates: every safety, verification, H&R and blob-preservation
+        rule
         in `_run_source_cleanup` still applies. An EMERGENCY (free space at or
         below `critical_watermark_free_bytes`, or an arrival that did not fit)
         also skips the cadence gate — bounded by `_cleanup_emergency_spacing_*`
@@ -577,15 +641,23 @@ class CleanupMixin:
                 int(effective),
                 int(since_last),
             )
-        self._remember_cleanup_run(now_wall)
-        # A run is starting: it consumes the urgency flag (a still-cramped
-        # disk re-trips the watermark trigger next tick) and with it the wake
-        # signal, so no second pass is scheduled for the same pressure.
-        try:
-            self._cleanup_urgent = False
-            self._cleanup_emergency_wake = False
-        except Exception:
-            pass
+        # A blind disk is skipped by the pass itself unless the operator asked.
+        # Skip the bookkeeping here in that case — stamping the run would pay a
+        # whole cadence for a pass that deleted nothing, and consuming the
+        # urgency flag would swallow an arrival-too-big emergency that never
+        # got its reclaim. The pass is still invoked, so the summary (and its
+        # reason line) stays the single source of truth for callers.
+        blind_skip = self._cleanup_blind_auto_skip(free_bytes, force)
+        if not blind_skip:
+            self._remember_cleanup_run(now_wall)
+            # A run is starting: it consumes the urgency flag (a still-cramped
+            # disk re-trips the watermark trigger next tick) and with it the
+            # wake signal, so no second pass is scheduled for the same pressure.
+            try:
+                self._cleanup_urgent = False
+                self._cleanup_emergency_wake = False
+            except Exception:
+                pass
         return await self._run_source_cleanup(
             cfg,
             free_bytes=free_bytes,
@@ -594,6 +666,7 @@ class CleanupMixin:
             projected=projected,
             bursting=bursting,
             urgent=urgent,
+            force=force,
         )
 
     async def _run_source_cleanup(
@@ -606,14 +679,28 @@ class CleanupMixin:
         projected: float | None = None,
         bursting: bool | None = None,
         urgent: bool | None = None,
+        force: bool = False,
     ) -> dict:
         """Delete VPS1 racing torrents whose content VPS2 fully secured.
 
-        Two deletion classes (see [cleanup] docs): normal DONE rows past
-        adaptive grace (or verifiably idle), and early MOVING rows under disk
-        pressure (or when an arrival did not fit). Dry-run only logs.
-        Fail-closed throughout: any doubt about bytes, health, identity or
-        activity skips the row for this run.
+        Two deletion classes (see [cleanup] docs): DONE rows whose fuse entries
+        AND content bytes verify (nothing else — there is no eligibility clock),
+        and early MOVING rows under disk pressure (bytes verified on SSD).
+        Dry-run only logs. Fail-closed throughout: any doubt about bytes,
+        health, identity or activity skips the row for this run.
+
+        Space, not time, decides WHEN: the pass runs only while VPS1 actually
+        needs room (`_cleanup_reclaim_needed`: free below the trigger, an
+        arrival that did not fit, or a critical disk) and then reclaims
+        biggest-first TOWARD the target (`high_watermark_free_bytes`), stopping
+        at the target, at the eligible inventory, or at `per_run_cap` — a cap
+        that stops short is logged and carried in the summary, never hidden. A
+        disk whose free space cannot be measured is NOT treated as roomy and
+        NOT treated as needing room either: an automatic pass skips it outright
+        (a probe that is not answering is a bad reason to spend seed time), and
+        only `_maybe_cleanup_source(force=True)` — the operator's /cleanup —
+        reclaims on proof alone up to the cap, inventing no number (target and
+        projected free space stay `unknown` in the report).
 
         With `[cleanup].ignore_activity_under_pressure` the activity keep is
         skipped while THIS run reads pressure (bursting, or free below the low
@@ -623,21 +710,16 @@ class CleanupMixin:
 
         The pressure values are optional so direct callers/tests can pass
         only `cfg`; the janitor passes its single probe down so this method
-        never re-probes.
-
-        Under an EMERGENCY (`_cleanup_emergency_trigger`: free space at/below
-        `critical_watermark_free_bytes`, or an arrival that did not fit) a
-        DONE row whose bytes are already fuse-VERIFIED becomes a candidate
-        without waiting out the grace period or the idle-confirm fast lane —
-        timing only; verification still runs first and the activity keep still
-        needs `ignore_activity_under_pressure`.
+        never re-probes, and the target arithmetic works off that one reading.
 
         Returns a one-line-friendly summary (also on every early-return
-        path): `{"deleted", "candidates", "dry_run", "grace_s", "free",
-        "bursting", "reason"}` where `reason` is only set when nothing ran
-        ("no rows", "nothing eligible (activity 17, grace 3)", ...; while an
-        emergency is on the breakdown line says so:
-        "nothing eligible (grace 19; emergency on)").
+        path): `{"deleted", "candidates", "dry_run", "free", "free_after",
+        "trigger", "target", "target_reached", "shortfall_bytes",
+        "eligible_remaining", "cap", "bursting", "reason"}` where `reason` is
+        only set when nothing ran ("no rows", "nothing eligible (activity 17,
+        verification 3)", "no space needed yet: ... (waiting for space 12)"),
+        and `free`/`free_after`/`target` are None wherever the disk gave no
+        reading (never a guessed byte count).
         """
         now_utc = dt.datetime.now(dt.UTC)
         if arrivals is None:
@@ -659,64 +741,108 @@ class CleanupMixin:
         # (never a second probe): None = no emergency, else the trigger name.
         emergency = self._cleanup_emergency_trigger(cfg, free_bytes, urgent)
         dry_run = bool(getattr(cfg, "dry_run", True))
-        grace_s = cleanup_grace_seconds(cfg, free_bytes, arrivals)
-
-        def _summary(**over: Any) -> dict:
-            out = {
-                "deleted": 0,
-                "candidates": 0,
-                "dry_run": dry_run,
-                "grace_s": float(grace_s),
-                "free": free_bytes,
-                "bursting": bursting,
-                "reason": "",
-            }
-            out.update(over)
-            return out
-
-        # Calm-and-roomy short-circuit: plenty of free space and a quiet
-        # intake mean no deletion could help anything — skip the scan and
-        # the deletes entirely (next tick re-evaluates). Unknown free space
-        # never skips (fail-closed), and active H&R minimums still enforce
-        # regardless of pressure. Never short-circuits a burst (projected
-        # fill or a just-arrived release would otherwise be ignored).
-        try:
-            _high = float(getattr(cfg, "high_watermark_free_bytes", 0) or 0)
-            _calm = float(getattr(cfg, "calm_arrivals_per_hour", 2.0) or 0.0)
-            _min_ratio = float(getattr(cfg, "min_ratio", 0.0) or 0.0)
-            _min_hours = float(getattr(cfg, "min_seed_hours", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            _high, _calm, _min_ratio, _min_hours = 0.0, 2.0, 0.0, 0.0
-        if (
-            free_bytes is not None
-            and _high > 0
-            and free_bytes >= _high
-            and arrivals <= _calm
-            and not urgent
-            and not bursting
-            and _min_ratio <= 0
-            and _min_hours <= 0
-        ):
-            log.info(
-                "cleanup janitor: skipping run (VPS1 free=%d B >= high "
-                "watermark, arrivals=%.1f/h calm)",
-                free_bytes,
-                arrivals,
-            )
-            return _summary(reason="VPS1 roomy and intake calm")
-        low_free = int(getattr(cfg, "low_watermark_free_bytes", 0) or 0)
-        if emergency == "critical":
-            log.warning(
-                "cleanup: VPS1 disk CRITICAL (%d bytes free); grace floored at minimum "
-                "and fuse-verified DONE rows skip the grace wait",
-                free_bytes,
-            )
+        # The band is computed ONCE per pass from the tick's single reading and
+        # passed down: the trigger decides whether this pass may delete at all,
+        # the target is where it stops. No per-row probe, no second clock.
+        trigger, target = self._cleanup_band(cfg)
+        reclaim = self._cleanup_reclaim_needed(cfg, free_bytes, urgent, emergency)
+        # An UNMEASURABLE disk is not a roomy one. Without a reading the band
+        # cannot be evaluated at all, and answering "no space needed" from a
+        # probe that never ran would silence the janitor forever (a source
+        # without `get_free_space`, one dead statvfs call). So the pass falls
+        # back to the old proof-gated reclaim. "Fails closed (never guess)"
+        # keeps every meaning it had, it just does not mean "assume roomy":
+        # no number is invented (no target, no projected free space, the
+        # report says `unknown`), `_cleanup_pressured` stays False so
+        # `ignore_activity_under_pressure` cannot unlock on a blind disk, the
+        # critical/arrival emergency is never guessed, the MOVING early path
+        # stays shut unless `urgent`, and `per_run_cap` still bounds the sweep.
+        blind = free_bytes is None
+        if blind:
+            target = 0
         try:
             cap_field = "burst_per_run_cap" if bursting else "per_run_cap"
             cap_default = 25 if bursting else 10
             cap = max(1, int(getattr(cfg, cap_field, cap_default) or cap_default))
         except (TypeError, ValueError):
             cap = 10
+
+        def _summary(**over: Any) -> dict:
+            out = {
+                "deleted": 0,
+                "candidates": 0,
+                "dry_run": dry_run,
+                "free": free_bytes,
+                "free_after": free_bytes,
+                "trigger": trigger or None,
+                "target": target or None,
+                "target_reached": not bool(target),
+                "shortfall_bytes": 0,
+                "eligible_remaining": 0,
+                "cap": cap,
+                "bursting": bursting,
+                "reason": "",
+            }
+            out.update(over)
+            return out
+
+        # No need for room, nothing to do: seeding VPS1 copies costs the disk
+        # and buys the swarm time, so an idle day deletes nothing however old
+        # the rows are. The two counters come from the state only — the
+        # `fuse_verified` memo the last real verification left — so this line
+        # never probes a client or reads the mount.
+        #
+        # An UNMEASURABLE disk skips too, unless the operator asked: guessing
+        # "room needed" on a box whose free-space probe is not answering would
+        # spend real seed time on an invented claim, and this VPS1's SSH probe
+        # fails routinely. A blind pass is therefore opt-in (`/cleanup`), never
+        # automatic; the proof gates still decide every row it does delete.
+        if self._cleanup_blind_auto_skip(free_bytes, force) or (not reclaim and not blind):
+            secured = unverifiable = 0
+            try:
+                for _ts in await offload(self.store.all) or []:
+                    if getattr(_ts, "state", None) != State.DONE:
+                        continue
+                    if getattr(_ts, "fuse_verified", 0):
+                        secured += 1
+                    else:
+                        unverifiable += 1
+            except Exception:
+                pass
+            _skip_blocked: dict[str, int] = {}
+            if secured:
+                _skip_blocked["waiting for space"] = secured
+            if unverifiable:
+                _skip_blocked["verification"] = unverifiable
+            text = self._cleanup_blocked_text(_skip_blocked)
+            detail = f" ({text})" if text else ""
+            if blind:
+                head = (
+                    "VPS1 free space unknown — not reclaiming automatically "
+                    "(run /cleanup for a proof-gated pass)"
+                )
+            elif trigger <= 0:
+                head = "reclaim trigger disabled ([cleanup].low_watermark_free_bytes = 0)"
+            else:
+                head = (
+                    f"no space needed yet: VPS1 free {self._cleanup_bytes_compact(free_bytes)}"
+                    f" >= trigger {self._cleanup_bytes_compact(trigger)}"
+                )
+            log.info("cleanup janitor: skipping run — %s%s", head, detail)
+            return _summary(reason=f"{head}{detail}")
+        if blind:
+            log.warning(
+                "cleanup janitor: VPS1 free space unknown (forced pass) — no reading, no "
+                "free-space target; reclaiming only rows whose content verifies, bounded by "
+                "the per-run cap (%d)",
+                cap,
+            )
+        if emergency == "critical":
+            log.warning(
+                "cleanup: VPS1 disk CRITICAL (%d bytes free); reclaiming toward the "
+                "free-space target as fast as the cap allows",
+                free_bytes,
+            )
         try:
             eff_interval = max(
                 60,
@@ -728,12 +854,14 @@ class CleanupMixin:
         except (TypeError, ValueError):
             eff_interval = 300
         log.info(
-            "cleanup janitor: VPS1 free=%s arrivals=%.1f/h bytes=%.1f MB/h projected=%s grace=%ds",
+            "cleanup janitor: VPS1 free=%s arrivals=%.1f/h bytes=%.1f MB/h projected=%s "
+            "trigger=%s target=%s",
             f"{free_bytes} B" if free_bytes is not None else "unknown",
             arrivals,
             bytes_rate / (1024 * 1024),
             f"{projected / 3600.0:.1f}h" if projected is not None else "unknown",
-            int(grace_s),
+            self._cleanup_bytes_compact(trigger),
+            self._cleanup_bytes_compact(target) if target else "no target (0 = drain the cap)",
         )
         if bursting:
             log.info(
@@ -800,13 +928,11 @@ class CleanupMixin:
                     return await self._cleanup_verdict(
                         ts,
                         group,
-                        grace_s,
                         now_utc,
                         dry_run,
                         free_bytes,
                         urgent=urgent,
                         bursting=bursting,
-                        emergency=emergency,
                         blocked=blocked,
                     )
                 except asyncio.CancelledError:
@@ -828,14 +954,13 @@ class CleanupMixin:
             reason = self._cleanup_blocked_reason(blocked, emergency=emergency is not None)
             log.info("cleanup janitor: %s", reason)
             return _summary(reason=reason)
-        pressured = bool(free_bytes is not None and low_free and free_bytes < low_free)
-        # Under disk pressure (or any burst) DONE rows go first: their
-        # content is fully secured and normally already re-added, so they
-        # reclaim space with the least risk. Within a class, biggest-first
-        # (a finished 50GB pack beats ten 3GB episodes when the next race
-        # needs a landing zone), then oldest. Calm and roomy keeps today's
-        # oldest-first.
-        candidates = self._cleanup_sort_candidates(candidates, pressured or bursting)
+        # Every pass that reaches here is reclaiming, so the pressure order is
+        # always the right one: DONE rows before MOVING rows (their content is
+        # fully secured and normally already re-added), then biggest-first (a
+        # finished 50 GB pack beats ten 3 GB episodes when the next race needs
+        # a landing zone), then oldest completed. The same order that already
+        # served disk pressure is what drives the headroom pass.
+        candidates = self._cleanup_sort_candidates(candidates, True)
 
         deleted = 0
         try:
@@ -848,11 +973,27 @@ class CleanupMixin:
         if _stagger < 0:
             _stagger = 0.0
         _cands = list(candidates)
-        for _i, (_, _, ts, group) in enumerate(_cands):
+        # ONE free-space reading for the whole pass: the target comparison
+        # projects the bytes this pass freed onto the tick's probe instead of
+        # asking the daemon again per row. `free_after` is therefore an
+        # estimate the next tick re-measures, never a second measurement — and
+        # on a blind disk there is nothing to project onto, so it stays None
+        # and the report says "unknown" instead of inventing a number.
+        free_after: int | None = None if blind else int(free_bytes or 0)
+        cap_stopped = False
+        target_met = False
+        _i = len(_cands)
+        for _i, (_, size, ts, group) in enumerate(_cands):
             # The cap bounds real deletions; dry-run logs every candidate
             # so rehearsal output matches a live run instead of stopping
             # at phantom counts.
             if not dry_run and deleted >= cap:
+                cap_stopped = True
+                break
+            if target and free_after is not None and free_after >= target:
+                # Headroom restored: the rest keeps seeding until space is
+                # needed again. This is the pass succeeding, not failing.
+                target_met = True
                 break
             # The verdict ran on a snapshot, and the stagger below leaves
             # time for a cancel, a retry or an operator re-add. Re-read
@@ -892,6 +1033,8 @@ class CleanupMixin:
                 continue
             if ok:
                 deleted += 1
+                if free_after is not None:
+                    free_after += max(0, int(size or 0))
                 _more = not dry_run and _i + 1 < len(_cands) and deleted < cap
                 if _more and _stagger > 0:
                     # Spread load: back-to-back remove_torrent(+data) calls
@@ -904,27 +1047,46 @@ class CleanupMixin:
                         await asyncio.sleep(_stagger)
                     except asyncio.CancelledError:
                         raise
+        if target and free_after is not None and free_after >= target:
+            target_met = True
+        shortfall = max(0, target - free_after) if target and free_after is not None else 0
+        if cap_stopped or target_met:
+            # The row the loop stopped ON was never attempted: it is still
+            # secured on VPS1, which is exactly what `eligible_remaining` means.
+            eligible_remaining = len(_cands) - _i
+        else:
+            eligible_remaining = 0
         log.info(
-            "cleanup janitor: %s %d content group(s)%s",
+            "cleanup janitor: %s %d content group(s)%s · free %s -> %s (target %s)",
             "would delete" if dry_run else "deleted",
             deleted,
             f" (cap {cap})" if deleted >= cap else "",
+            self._cleanup_bytes_compact(free_bytes),
+            self._cleanup_bytes_compact(free_after),
+            self._cleanup_bytes_compact(target) if target else "none",
         )
-        return _summary(deleted=deleted, candidates=len(candidates))
+        if cap_stopped and shortfall > 0:
+            # The pass could not reach the target because of the safety valve:
+            # say so with the numbers instead of reporting a clean sweep.
+            log.info(
+                "cleanup janitor: per-run cap %d stopped the pass short of the free-space "
+                "target (free %s -> %s, target %s, %d eligible row(s) still secured on VPS1)",
+                cap,
+                self._cleanup_bytes_compact(free_bytes),
+                self._cleanup_bytes_compact(free_after),
+                self._cleanup_bytes_compact(target),
+                eligible_remaining,
+            )
+        return _summary(
+            deleted=deleted,
+            candidates=len(candidates),
+            free_after=free_after,
+            target_reached=shortfall <= 0,
+            shortfall_bytes=shortfall,
+            eligible_remaining=eligible_remaining,
+        )
 
-    # ---- operator commands + cleanup ETA -------------------------------
-
-    @staticmethod
-    def _cleanup_eta_compact(seconds: float) -> str:
-        """Compact remaining time for the hint (``45m`` / ``5h``)."""
-        try:
-            s = max(0, int(seconds))
-        except (TypeError, ValueError):
-            return ""
-        # Stay in minutes up to ~59m so a rounding edge never prints "60m".
-        if s < 3540:
-            return f"{max(1, round(s / 60))}m"
-        return f"{max(1, round(s / 3600))}h"
+    # ---- operator commands + VPS1 headroom status ----------------------
 
     @staticmethod
     def _cleanup_error_text(e: object) -> str:
@@ -979,6 +1141,9 @@ class CleanupMixin:
             dry = bool(summary.get("dry_run"))
             reason = str(summary.get("reason") or "")
             free = summary.get("free")
+            shortfall = int(summary.get("shortfall_bytes") or 0)
+            left = int(summary.get("eligible_remaining") or 0)
+            cap = int(summary.get("cap") or 0)
         except Exception:
             return "Cleanup ran."
         if reason:
@@ -988,16 +1153,20 @@ class CleanupMixin:
             f"🧹 Cleanup ({'dry-run' if dry else 'live'}): {verb} "
             f"{deleted} of {candidates} candidate(s)"
         )
-        try:
-            if free is not None:
-                line += f" · VPS1 free {int(free) // (1024 * 1024)} MB"
-        except (TypeError, ValueError):
-            pass
+        line += f" · VPS1 free {CleanupMixin._cleanup_bytes_compact(free)}"
+        if shortfall > 0:
+            # The pass ran out of cap, not of work: say what is still missing
+            # rather than letting "deleted N" read as "the disk is fine now".
+            line += (
+                f" · {CleanupMixin._cleanup_bytes_compact(shortfall)} short of the "
+                f"{CleanupMixin._cleanup_bytes_compact(summary.get('target'))} target "
+                f"({left} eligible left, cap {cap})"
+            )
         return line
 
     @classmethod
     def _cleanup_blocked_text(cls, blocked: dict[str, int]) -> str:
-        """`activity 17, grace 3` from the keep counters; empty when nothing counted.
+        """`activity 17, verification 3` from the keep counters; empty when nothing counted.
 
         Reported in `_CLEANUP_BLOCK_ORDER` (stable wording, not dict order) and
         length-capped: this travels into a Telegram reply, so it stays a
@@ -1019,11 +1188,11 @@ class CleanupMixin:
         The summary contract is untouched — `reason` stays one plain string
         the operator line prints verbatim; the breakdown only adds to it.
 
-        While an emergency is on, the line says so (`nothing eligible (grace
-        19; emergency on)`): that exact report — verified rows held by the
-        grace floor on a 16 GiB-free disk — used to be indistinguishable from
-        "nothing was ready", so the state has to be readable from the one line
-        it appears in. Still one line, still capped.
+        While an emergency is on, the line says so (`nothing eligible
+        (verification 19; emergency on)`): that exact report — rows the fuse
+        copy cannot prove on a starving disk — used to be indistinguishable
+        from "nothing was ready", so the state has to be readable from the one
+        line it appears in. Still one line, still capped.
         """
         text = self._cleanup_blocked_text(blocked)
         if emergency:
@@ -1031,82 +1200,69 @@ class CleanupMixin:
             text = f"{text[: 160 - len(tail)]}{tail}" if text else "emergency on"
         return f"nothing eligible ({text})" if text else "nothing eligible"
 
-    def _cleanup_remaining_seconds(self, ts: object) -> tuple[bool, float | None] | None:
-        """(ready, seconds_left) for a DONE row, or None when not applicable.
+    def _cleanup_reclaiming(self) -> bool:
+        """Is a reclaim running (or owed) right now? Display-only.
 
-        Mirrors the janitor's timing: adaptive grace from the last free-space
-        probe plus the idle fast lane (an old `vps1_last_activity_at` stamp).
-        Purely cosmetic — the authoritative gates still run at deletion.
+        Reads the janitor's cached free-space reading — never a fresh probe —
+        so a Telegram refresh cannot add a VPS1 round trip. With no reading
+        the badge says nothing is being reclaimed, because an automatic pass
+        will not delete on an unmeasurable disk either way.
+        """
+        try:
+            cfg = getattr(self.rt.cleanup, "config", None)
+            if cfg is None or not getattr(cfg, "enabled", False):
+                return False
+            free = getattr(self, "_last_source_free_bytes", None)
+            if free is None:
+                # No reading, no claim: the automatic pass skips a blind disk
+                # (see `_run_source_cleanup`), so promising "reclaiming" here
+                # would be a badge the janitor will not act on.
+                return False
+            urgent = bool(getattr(self, "_cleanup_urgent", False))
+            emergency = self._cleanup_emergency_trigger(cfg, free, urgent)
+            return self._cleanup_reclaim_needed(cfg, free, urgent, emergency)
+        except Exception:
+            return False
+
+    def _cleanup_hint(self, ts: object) -> str:
+        """Best-effort "why is this still on VPS1" line for a DONE row.
+
+        No countdown any more, because there is no timer: a secured copy stays
+        until the space is needed. The three honest states are
+
+          - `secured · reclaiming` — verified, and this disk needs the room now;
+          - `secured · waiting for space` — verified, healthy, deliberately kept
+            while VPS1 has room for the next race;
+          - `not verifiable yet` — the fuse copy has never been proven, so the
+            janitor will NOT delete it however tight the disk gets.
+
+        Reads only the row's verification memo and the cached free-space
+        reading: no RPC, no mount read, never raises.
         """
         try:
             if getattr(ts, "state", None) != State.DONE:
-                return None
+                return ""
             cfg = getattr(self.rt.cleanup, "config", None)
             if cfg is None or not getattr(cfg, "enabled", False):
-                return None
+                return ""
             if not self.rt.chain.adds_seed_entry:
-                return None
-        except Exception:
-            return None
-        try:
-            arrivals = float(self._cleanup_arrival_rates(time.monotonic())[0] or 0.0)
-        except Exception:
-            arrivals = 0.0
-        try:
-            free = getattr(self, "_last_source_free_bytes", None)
-        except Exception:
-            free = None
-        try:
-            grace_s = float(cleanup_grace_seconds(cfg, free, arrivals))
-        except Exception:
-            return None
-        completed = getattr(ts, "completed_at", None)
-        anchor = completed or getattr(ts, "created_at", None)
-        if anchor is None:
-            return None
-        now = dt.datetime.now(dt.UTC)
-        try:
-            age_s = (now - anchor).total_seconds()
-        except Exception:
-            return None
-        if age_s >= grace_s:
-            return (True, 0.0)
-        # Idle fast lane: an old activity stamp proves the race finished.
-        # Rows without a completion stamp are never fast-laned (matching
-        # `_cleanup_verdict`: adoption age alone is not seed-time proof).
-        if completed is not None:
-            last = getattr(ts, "vps1_last_activity_at", None)
-            if last is not None:
-                try:
-                    window_s = float(getattr(cfg, "idle_confirm_minutes", 45) or 0) * 60.0
-                except (TypeError, ValueError):
-                    window_s = 45.0 * 60.0
-                try:
-                    if window_s <= 0 or (now - last).total_seconds() >= window_s:
-                        return (True, 0.0)
-                except Exception:
-                    pass
-        return (False, max(0.0, grace_s - age_s))
-
-    def _cleanup_hint(self, ts: object) -> str:
-        """Best-effort "when will VPS1 lose this copy" line for a DONE row."""
-        try:
-            remaining = self._cleanup_remaining_seconds(ts)
+                return ""
         except Exception:
             return ""
-        if remaining is None:
-            return ""
-        ready, seconds_left = remaining
-        if ready:
-            return "clean ready"
-        eta = self._cleanup_eta_compact(seconds_left or 0.0)
-        return f"clean ~{eta}" if eta else "clean pending"
+        secured = bool(getattr(ts, "fuse_verified", 0))
+        if not secured:
+            return "not verifiable yet"
+        return (
+            "secured · reclaiming"
+            if self._cleanup_reclaiming()
+            else ("secured · waiting for space")
+        )
 
     def cleanup_tab_enabled(self) -> bool:
         """True when the "still on VPS1" (🗄) category is meaningful.
 
         With `[cleanup].enabled` off the janitor never reclaims anything, so
-        the tab would promise a countdown that cannot arrive: the button,
+        the tab would promise a status that can never change: the button,
         the rows and a stored `vc` filter all go away instead. Returns a
         real bool so the Telegram side can fail closed on bare doubles.
         """
@@ -1184,7 +1340,7 @@ class CleanupMixin:
         no persisted "cleaned" marker and adding one would be a claim, so
         a row disappears the moment the source listing stops showing it.
 
-        Sorted oldest grace anchor (`completed_at`, falling back to
+        Sorted oldest completed first (`completed_at`, falling back to
         `created_at`) first, i.e. what the janitor reclaims next.
 
         Returns `(rows, listing_unavailable)`; with no fresh listing the
@@ -1214,12 +1370,12 @@ class CleanupMixin:
             except Exception:
                 continue
             out.append(ts)
-        out.sort(key=self._cleanup_grace_anchor_key)
+        out.sort(key=self._cleanup_age_anchor_key)
         return out, False
 
     @staticmethod
-    def _cleanup_grace_anchor_key(ts: object) -> float:
-        """Epoch of the row's grace anchor; unknown stamps sort last."""
+    def _cleanup_age_anchor_key(ts: object) -> float:
+        """Epoch of the row's completion anchor; unknown stamps sort last."""
         try:
             anchor = getattr(ts, "completed_at", None) or getattr(ts, "created_at", None)
             if anchor is None:
@@ -1231,10 +1387,11 @@ class CleanupMixin:
             return float("inf")
 
     async def _cleanup_pending_summary(self) -> str:
-        """One-line footer for the active card: completed rows awaiting VPS1 removal.
+        """One-line footer for the active card: completed rows still on VPS1.
 
-        The pinned list intentionally shows only in-flight rows; this keeps
-        the cleanup countdown visible there without listing every DONE row.
+        The pinned list intentionally shows only in-flight rows; this keeps the
+        headroom state visible there without listing every DONE row. No
+        countdown: the rows wait for space, not for a clock.
         """
         try:
             cfg = getattr(self.rt.cleanup, "config", None)
@@ -1248,31 +1405,25 @@ class CleanupMixin:
             rows = await asyncio.to_thread(self.store.list_by_state, State.DONE)
         except Exception:
             return ""
-        ready = 0
-        pending = 0
-        soon: float | None = None
+        secured = 0
+        unverifiable = 0
         for ts in rows or []:
-            remaining = self._cleanup_remaining_seconds(ts)
-            if remaining is None:
+            if getattr(ts, "state", None) != State.DONE:
                 continue
-            is_ready, seconds_left = remaining
-            if is_ready:
-                ready += 1
-                continue
-            pending += 1
-            if seconds_left is not None and (soon is None or seconds_left < soon):
-                soon = seconds_left
-        total = ready + pending
+            if getattr(ts, "fuse_verified", 0):
+                secured += 1
+            else:
+                unverifiable += 1
+        total = secured + unverifiable
         if not total:
             return ""
-        parts = []
-        if ready:
-            parts.append(f"{ready} ready")
-        if soon is not None:
-            eta = self._cleanup_eta_compact(soon)
-            if eta:
-                parts.append(f"next in ~{eta}")
-        return f"🧹 VPS1 cleanup: {total} done · " + " · ".join(parts)
+        parts = [f"{total} done"]
+        if secured:
+            parts.append(f"{secured} secured")
+        if unverifiable:
+            parts.append(f"{unverifiable} not verifiable")
+        parts.append("reclaiming" if self._cleanup_reclaiming() else "waiting for space")
+        return "🧹 VPS1 cleanup: " + " · ".join(parts)
 
     async def _cleanup_resolve_row(self, norm: str) -> tuple[object | None, str]:
         """Resolve one tracked row by full hash or 6+ hex prefix.
@@ -1315,10 +1466,11 @@ class CleanupMixin:
         """Run one VPS1 cleanup pass now (operator `/cleanup`).
 
         Serialized with the janitor loop via `_janitor_lock`. `force`
-        bypasses only the startup-delay/cadence gates: every safety, grace,
-        H&R and blob-preservation rule still applies. Returns the reply
-        text (`message` is accepted for handler-signature symmetry; the
-        Telegram bot sends the reply).
+        bypasses only the startup-delay/cadence gates: every safety,
+        verification, H&R and blob-preservation rule still applies — including
+        the free-space trigger, so forcing a pass on a roomy disk deletes
+        nothing. Returns the reply text (`message` is accepted for
+        handler-signature symmetry; the Telegram bot sends the reply).
         """
         try:
             cfg = getattr(self.rt.cleanup, "config", None)
@@ -1358,8 +1510,8 @@ class CleanupMixin:
     async def _clean_task_command(self, target: str, message: Any = None) -> str:
         """Clean one completed row's VPS1 copy now (operator `/clean_<hash>`).
 
-        Bypasses grace/idle on purpose (the operator asked for it) but keeps
-        every safety check: DONE only, protected patterns, usable swarm
+        Ignores the free-space trigger on purpose (the operator asked for it)
+        but keeps every safety check: DONE only, protected patterns, usable swarm
         stats, fuse byte verification, H&R minimums, no live race activity,
         and .torrent preservation for un-injected copies. The activity keep
         obeys `[cleanup].ignore_activity_under_pressure` exactly like the
@@ -1659,13 +1811,11 @@ class CleanupMixin:
         self,
         ts: TorrentState,
         group: list[Torrent],
-        grace_s: float,
         now_utc: dt.datetime,
         dry_run: bool,
         free_bytes: int | None,
         urgent: bool | None = None,
         bursting: bool = False,
-        emergency: str | None = None,
         blocked: dict[str, int] | None = None,
     ) -> tuple[float, float, TorrentState, list[Torrent]] | None:
         """Decide deletion for one row; None = keep this run.
@@ -1685,14 +1835,12 @@ class CleanupMixin:
         and VPS2 takes over serving it. `blocked` (optional) counts which
         keep fired, for the one-line "nothing eligible" breakdown.
 
-        `emergency` is this run's `_cleanup_emergency_trigger` name (None =
-        no emergency). It changes TIMING and nothing else: a fuse-VERIFIED
-        DONE row stops waiting out the grace period (and no longer needs the
-        idle-confirm fast lane) because the bytes are provably served by VPS2
-        already and VPS1 has to land the next race. Rows that verification
-        cannot prove are never rescued by it, the activity keep stays under
-        `ignore_activity_under_pressure`, and MOVING keeps its own
-        early-pressure logic untouched.
+        There is no clock here. A DONE row is eligible when its content is
+        secured and verified — fuse entries present, seeding off the SSD, and
+        the bytes proven on the mount — because that is exactly what this
+        function already proves before anything is deleted. Whether the space
+        is NEEDED is the caller's question (`_cleanup_reclaim_needed`), asked
+        once per pass against the same free-space reading.
         """
         cfg = self.rt.cleanup.config
 
@@ -1721,7 +1869,7 @@ class CleanupMixin:
                     # makes the row look quieter to the next pass.
                     log.warning(
                         "cleanup: could not stamp VPS1 activity for %s "
-                        "(grace window may look stale): %s",
+                        "(idle window may look stale): %s",
                         ts.source_infohash[:10],
                         e,
                     )
@@ -1758,43 +1906,19 @@ class CleanupMixin:
         if not self._cleanup_minimums_met(group, cfg):
             _keep("minimums")
             return None
-        # 3. State-specific safety + timing.
+        # 3. State-specific safety. No clock anywhere: what makes a row
+        #    eligible is the proof below, never how long it has been around.
         completed = ts.completed_at
-        # Rows adopted without completed_at must still serve the grace period;
-        # age them from created_at (the adoption instant).
-        age_s = (
-            (now_utc - (completed or ts.created_at)).total_seconds()
-            if (completed or ts.created_at)
-            else 0.0
-        )
-        # Set when the emergency (not the idle lane) is what made this row
-        # eligible: the INFO belongs to the moment the row really becomes a
-        # candidate, same as the pressure-override note below.
-        emergency_rescued = False
         if ts.state == State.DONE:
+            # Secured means the fuse entries are present, seed off the SSD and
+            # the content bytes verify on the mount — the whole rule. A row
+            # that verifies is eligible the moment it verifies (the caller only
+            # asks when space is needed); a row that cannot verify is never
+            # rescued by a tight disk. Rows recovery adopted without a
+            # `completed_at` are covered by the same proof, not an age.
             if not await self._cleanup_fuse_healthy(ts, dry_run):
                 _keep("verification")
                 return None
-            if age_s < grace_s:
-                # Without a completion stamp the idle fast lane proves only
-                # that VPS1 has been quiet, not that the seed has served the
-                # grace period on VPS2 (recovery adopts DONE rows this way).
-                # The same proof is missing for an emergency bypass — an
-                # adopted row was never observed racing on VPS2 at all — so it
-                # stays blocked by grace whatever the disk says.
-                if completed is None:
-                    _keep("grace")
-                    return None
-                if emergency is not None:
-                    # Emergency: the box cannot land the next race. The bytes
-                    # are fuse-VERIFIED (the gate above passed), so VPS2 already
-                    # serves them; only the politeness delay is dropped. The
-                    # activity, unknown-stats, minimums and protection keeps
-                    # ran above and are NOT bypassed.
-                    emergency_rescued = True
-                elif not self._cleanup_idle_confirmed(ts, group, now_utc, cfg):
-                    _keep("grace")
-                    return None
         elif ts.state == State.MOVING:
             # Early pressure path: bytes are 100% on the VPS2 SSD (MOVING is
             # only entered after full completion) but not yet moved. Allowed
@@ -1815,7 +1939,7 @@ class CleanupMixin:
                 _keep("not pressured")
                 return None
             if not self._cleanup_idle_confirmed(ts, group, now_utc, cfg):
-                _keep("grace")
+                _keep("idle")
                 return None
             if not await self._cleanup_ssd_bytes_present(ts):
                 _keep("verification")
@@ -1830,8 +1954,6 @@ class CleanupMixin:
         size = float(ts.total_bytes or 0)
         if rescued:
             self._cleanup_note_pressure_override(ts, rescued, len(group), free_bytes)
-        if emergency_rescued and emergency is not None:
-            self._cleanup_note_emergency_rescue(ts, free_bytes, emergency, age_s, grace_s)
         return (sort_key, size, ts, group)
 
     def _cleanup_idle_confirmed(
@@ -1839,21 +1961,27 @@ class CleanupMixin:
         ts: TorrentState,
         group: list[Torrent],
         now_utc: dt.datetime,
-        cfg: object,
+        cfg: object | None = None,
     ) -> bool:
-        """Fast lane: swarm quiet now (checked by caller) AND quiet long enough.
+        """MOVING fast lane: swarm quiet now (checked by caller) AND quiet long enough.
 
-        Primary evidence is a previously recorded activity stamp older than
-        the confirm window. Fallback for rows that were never observed
+        The early path's own settle window (`_MOVING_IDLE_CONFIRM_S`): MOVING
+        content is NOT secured yet, so it keeps a rule the DONE path no longer
+        has. Primary evidence is a previously recorded activity stamp older
+        than the window. Fallback for rows that were never observed
         active (e.g. pre-existing idle backlog): every member's client
         `added_on` predates the window — a torrent cannot have raced before
         it existed, so old + quiet now means finished. Unknown `added_on`
-        (<=0) fails closed and waits out the grace period instead.
+        (<=0) fails closed and keeps the row.
+
+        `cfg` is accepted for call-site symmetry with `_cleanup_verdict` and is
+        deliberately NOT read: the window used to be
+        `[cleanup].idle_confirm_minutes`, that key is removed (fail-loud in
+        `config_disposition.REMOVED`), and no config value may re-open a
+        time-based lane on the DONE path.
         """
-        try:
-            window_s = float(getattr(cfg, "idle_confirm_minutes", 45) or 0) * 60.0
-        except (TypeError, ValueError):
-            window_s = 45.0 * 60.0
+        _ = cfg  # unused on purpose: the window is a module constant now
+        window_s = _MOVING_IDLE_CONFIRM_S
         if window_s <= 0:
             return True
         last = ts.vps1_last_activity_at

@@ -596,12 +596,13 @@ class RefreshMixin:
                 _flt = "all"
             except Exception:
                 pass
-        # Cleanup ETA per displayed DONE row (display-only): the coordinator
-        # mirrors the janitor's adaptive grace + idle fast lane. Strict
+        # Headroom status per displayed DONE row (display-only): the
+        # coordinator mirrors the janitor's secured / waiting-for-space /
+        # not-verifiable state. Strict
         # string check so a bare/MagicMock coordinator degrades to no hints.
         # Iterating `shown` is what makes this path live at all: the
         # inflight list never contains a DONE row, so only the 🗄 tab can
-        # carry the hint the janitor already computes.
+        # carry the status the janitor already computes.
         cleanup: dict[str, str] = {}
         try:
             _hint_fn = getattr(self._coord, "_cleanup_hint", None)

@@ -13,6 +13,13 @@ from racing_sync.clients.abstract import Torrent
 from racing_sync.config import CleanupConfig
 from racing_sync.state import State, StateStore, TorrentState
 
+GiB = 1024**3
+# Staggering only happens inside a real reclaim pass, and an automatic pass
+# reclaims only when it can MEASURE the disk below the trigger: a reading under
+# the 15 GiB trigger (target 40 GiB stays above it) with 700-byte rows means the
+# pass drains its inventory toward the target instead of skipping a blind disk.
+NEEDED = 5 * GiB
+
 
 def _stagger_member(h: str) -> Torrent:
     """Group member carrying a real hash (the blob guard inspects members)."""
@@ -92,6 +99,11 @@ def _stagger_pair(tmp_path: Path, db_name: str = "s.db", **cleanup_over):
     coord._cleanup_fuse_seeded_hashes = AsyncMock(return_value={m.hash.lower() for m in members})
     coord.sftp = None
     coord._stop = False
+    # WHY the reading is set here: an AUTOMATIC pass skips a blind disk by
+    # design — it will not delete on a free-space claim it cannot measure — so
+    # without a real reading below the trigger these tests would never reach the
+    # delete loop whose staggering / re-check behaviour they pin.
+    coord._source_free_bytes = AsyncMock(return_value=NEEDED)
     return coord, store
 
 

@@ -511,8 +511,9 @@ class OpsMixin:
         )
         # Intake-velocity signal for the VPS1 cleanup janitor: one
         # timestamp per newly discovered racing release (spam bursts
-        # shorten deletion grace) plus its byte size (bytes/hour intake
-        # rate and projected fill drive burst cadence/cap). Hard-capped so
+        # tighten the cadence and the per-run cap) plus its byte size
+        # (bytes/hour intake rate and projected fill drive burst
+        # cadence/cap). Hard-capped so
         # a disabled janitor can't grow them without bound; the janitor
         # prunes hourly.
         size = 0

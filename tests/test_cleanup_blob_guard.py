@@ -28,6 +28,11 @@ H = "a" * 40
 NAME = "Show.S01E01.mkv"
 SIZE = 700
 BLOB = b"fake-torrent-bytes"
+GiB = 1024**3
+# Every test here drives the DELETE loop, which only runs when the disk needs
+# room: a reading below the 15 GiB reclaim trigger (target 40 GiB, so the pass
+# really aims past it) and above zero, so it is a measured disk, not a blind one.
+NEEDED = 5 * GiB
 
 
 class _FakeSource:
@@ -141,7 +146,11 @@ def _coord(store: StateStore, src: _FakeSource, cfg: CleanupConfig, dest=None):
     coord.dest_client = dest if dest is not None else _FakeDest([])
     coord.sftp = None
     coord._stop = False
-    coord._source_free_bytes = AsyncMock(return_value=None)
+    # WHY this reading is set: an AUTOMATIC pass reclaims only when it can
+    # measure the disk below the trigger and deliberately skips a blind one
+    # (`None` here would delete nothing and test nothing), so the shared harness
+    # reads a measured, space-needing disk.
+    coord._source_free_bytes = AsyncMock(return_value=NEEDED)
     # The guard is what is under test; fuse health has its own tests.
     coord._cleanup_fuse_healthy = AsyncMock(return_value=True)
     coord._delete_source_group = AsyncMock(wraps=coord._delete_source_group)

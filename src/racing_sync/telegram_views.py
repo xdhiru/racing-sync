@@ -356,7 +356,7 @@ def render_detail(
 
     `note` is an optional one-line extra (e.g. why a NEW row is waiting)
     rendered after the state-specific lines. `cleanup` is the janitor's
-    "clean ready"/"clean ~2h" hint for DONE rows.
+    "secured · waiting for space" status line for DONE rows.
     """
     icon = _STATE_ICON.get(ts.state, ts.state.value.upper())
     name, size, full_hash = _row_text_bits(ts)
@@ -812,8 +812,9 @@ def render_active(
     maps source_infohash -> one-line extra shown on that tracker's line.
     `move_progress` maps lowercase infohash -> RcloneProgress for MOVING
     rows (live rclone line); absent/stale entries render plainly.
-    `cleanup` maps lowercase infohash -> cleanup hint (``clean ~5h`` /
-    ``clean ready``) appended to that row's stage text; empty/absent
+    `cleanup` maps lowercase infohash -> VPS1 headroom status (``secured ·
+    reclaiming`` / ``secured · waiting for space`` / ``not verifiable yet``)
+    appended to that row's stage text; empty/absent
     leaves the output unchanged.
 
     `footer` is an optional trailing line (e.g. storage stats) appended
@@ -898,8 +899,9 @@ def render_active(
             if getattr(ts, "state", None) == State.DONE:
                 # The 🗄 tab's evidence badge: a DONE row only reaches the
                 # renderer through it, and it is there because the cached
-                # VPS1 listing still lists the copy's files. The ETA comes
-                # from `cleanup` (the janitor's own hint), untouched.
+                # VPS1 listing still lists the copy's files. The headroom
+                # status comes from `cleanup` (the janitor's own hint),
+                # untouched.
                 state_text += " · 🗄 still on VPS1"
             if domain_full:
                 lines.append(f"▸ {_esc(domain_full)} {state_text}")

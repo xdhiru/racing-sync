@@ -54,8 +54,10 @@ async def test_cleanup_logs_failed_activity_stamp(caplog):
     ts = TorrentState(source_infohash="c" * 40, source_name="Show", state=State.DONE)
 
     with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
+        # (ts, group, now_utc, dry_run, free_bytes): the verdict carries no
+        # grace argument any more — eligibility is proof, not elapsed time.
         verdict = await coord._cleanup_verdict(
-            ts, [MagicMock()], 0.0, dt.datetime.now(dt.UTC), False, None
+            ts, [MagicMock()], dt.datetime.now(dt.UTC), False, None
         )
 
     assert verdict is None, "a lively swarm still vetoes deletion this run"

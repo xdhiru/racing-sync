@@ -905,11 +905,13 @@ class _SFTPConnection:
     def disk_free_bytes(self, path: str) -> int | None:
         """Free bytes on the remote filesystem containing `path`.
 
-        Used by the VPS1 cleanup janitor to scale grace with real disk
-        pressure. Prefers SFTP statvfs, falling back to `df -kP` over the
-        SSH channel (some paramiko versions lack SFTPClient.statvfs).
+        Used by the VPS1 cleanup janitor as the fallback free-space probe
+        (the Deluge `core.get_free_space` RPC is preferred). Prefers SFTP
+        statvfs, falling back to `df -kP` over the SSH channel (some
+        paramiko versions lack SFTPClient.statvfs).
         Returns None when unknown (disconnected, unsupported, any error) —
-        callers degrade to time-only grace, never to zero.
+        a janitor pass with no reading invents no headroom figure: it skips
+        the target arithmetic and reclaims on content proof alone.
         """
         if not self._acquire_or_busy(self._lock, f"disk-free {path}"):
             return None  # unreachable: helper raises; kept for clarity

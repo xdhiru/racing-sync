@@ -24,8 +24,10 @@ FIXTURES = Path(__file__).parent / "fixtures" / "config"
 # key renames of the config-surface cleanup (same values, new names, so the
 # digest moves again while every resolved number stays put), then for
 # [cleanup].ignore_activity_under_pressure plus the new burst-cap/stagger
-# defaults (one more modelled key, and two resolved numbers moved).
-_FULL = "sha256:605ec7378a014427"
+# defaults (one more modelled key, and two resolved numbers moved), then for
+# the headroom change: min_grace_hours / max_grace_hours / idle_confirm_minutes
+# left the model (three keys fewer), while every watermark keeps its value.
+_FULL = "sha256:1f39025eda4bc4a2"
 
 _DOWNLOAD_ONLY = """
 [general]

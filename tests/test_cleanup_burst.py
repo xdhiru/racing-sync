@@ -280,13 +280,14 @@ async def test_burst_cap_used_when_bursting(tmp_path: Path):
         )
         assert coord._delete_source_group.await_count == 4
 
-        # Calm run (mid disk, so no calm-and-roomy short-circuit) falls
-        # back to per_run_cap.
+        # Same pressured disk, calm cadence: the run falls back to per_run_cap.
+        # (A disk at/above the trigger would skip the pass entirely — that is
+        # the headroom rule, pinned by tests/test_cleanup_headroom.py.)
         coord._delete_source_group.reset_mock()
         coord._cleanup_verdict = AsyncMock(side_effect=_verdicts())
         await coord._run_source_cleanup(
             cfg,
-            free_bytes=MID,
+            free_bytes=LOW,
             arrivals=0.0,
             bytes_rate=0.0,
             projected=None,
@@ -387,23 +388,16 @@ async def test_moving_verdict_allowed_under_urgent_above_low_watermark():
 
     # Roomy disk: the early path needs the urgent signal.
     assert (
-        await coord._cleanup_verdict(
-            row, group, 0.0, now, dry_run=True, free_bytes=ROOMY, urgent=False
-        )
+        await coord._cleanup_verdict(row, group, now, dry_run=True, free_bytes=ROOMY, urgent=False)
         is None
     )
     assert (
-        await coord._cleanup_verdict(
-            row, group, 0.0, now, dry_run=True, free_bytes=ROOMY, urgent=True
-        )
+        await coord._cleanup_verdict(row, group, now, dry_run=True, free_bytes=ROOMY, urgent=True)
         is not None
     )
     # The live flag is honoured when the caller does not pass one.
     coord._cleanup_urgent = True
-    assert (
-        await coord._cleanup_verdict(row, group, 0.0, now, dry_run=True, free_bytes=ROOMY)
-        is not None
-    )
+    assert await coord._cleanup_verdict(row, group, now, dry_run=True, free_bytes=ROOMY) is not None
 
 
 # ---------------------------------------------------------- dry run

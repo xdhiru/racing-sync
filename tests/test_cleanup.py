@@ -1,7 +1,8 @@
 """VPS1 cleanup janitor ([cleanup]) tests.
 
-Covers grace math, eligibility gates (DONE normal path, MOVING early
-pressure path), dry-run purity, atomic group deletes, and the hourly gate.
+Covers the free-space headroom rule (a DONE row is eligible when its content
+verifies — never on a clock), the eligibility gates, dry-run purity, atomic
+group deletes, and the hourly gate.
 """
 
 from __future__ import annotations
@@ -15,10 +16,13 @@ from conftest import make_coordinator
 
 from racing_sync.clients.abstract import Torrent, TorrentFile
 from racing_sync.config import CleanupConfig
-from racing_sync.coordinator import Coordinator, cleanup_grace_seconds
+from racing_sync.coordinator import Coordinator
 from racing_sync.state import State, StateStore, TorrentState
 
 GiB = 1024**3
+# Every janitor test that expects deletes reads a disk BELOW the 15 GiB reclaim
+# trigger; a roomy disk must delete nothing (tests/test_cleanup_headroom.py).
+NEEDED = 5 * GiB
 
 
 def _cleanup_cfg(**over) -> CleanupConfig:
@@ -35,6 +39,10 @@ def _make_coord(ssd: Path, store: StateStore, src, dest, cfg) -> Coordinator:
     coord.dest_client = dest
     coord.sftp = None
     coord._stop = False
+    # Reclaiming only happens when the space is needed, so the shared harness
+    # reads a pressured disk. Individual tests override it (or the probe itself)
+    # when they measure the roomy / unknown cases.
+    coord._source_free_bytes = AsyncMock(return_value=NEEDED)
     return coord
 
 
@@ -174,34 +182,22 @@ class _FakeDest:
         return list(self.files)
 
 
-# ---- grace math ----
+# ---- the band, not a clock ----
 
 
-def test_grace_calm_and_roomy_is_max():
-    cfg = _cleanup_cfg()
-    assert cleanup_grace_seconds(cfg, 100 * GiB, 0.0) == 72 * 3600
-
-
-def test_grace_critical_and_burst_is_min():
-    cfg = _cleanup_cfg()
-    assert cleanup_grace_seconds(cfg, 1 * GiB, 50.0) == 2 * 3600
-
-
-def test_grace_interpolates_and_unknown_free_uses_velocity():
-    cfg = _cleanup_cfg()
-    mid_free = (15 + 40) / 2 * GiB
-    mid = cleanup_grace_seconds(cfg, mid_free, 0.0)
-    assert 2 * 3600 < mid < 72 * 3600
-    # Unknown disk never degrades below the velocity curve.
-    assert cleanup_grace_seconds(cfg, None, 0.0) == 72 * 3600
-    assert cleanup_grace_seconds(cfg, None, 50.0) == 2 * 3600
+def test_cleanup_config_band_and_no_timer_keys():
+    """The two watermarks are trigger + target; the timers are gone."""
+    cfg = CleanupConfig()
+    assert cfg.low_watermark_free_bytes == 16106127360
+    assert cfg.high_watermark_free_bytes == 42949672960
+    assert cfg.high_watermark_free_bytes > cfg.low_watermark_free_bytes
+    for gone in ("min_grace_hours", "max_grace_hours", "idle_confirm_minutes"):
+        assert gone not in CleanupConfig.model_fields, gone
 
 
 def test_cleanup_config_rejects_bad_bounds():
     import pydantic
 
-    with pytest.raises(pydantic.ValidationError):
-        CleanupConfig(min_grace_hours=10, max_grace_hours=2)
     with pytest.raises(pydantic.ValidationError):
         CleanupConfig(low_watermark_free_bytes=99, high_watermark_free_bytes=1)
     with pytest.raises(pydantic.ValidationError):
@@ -262,7 +258,8 @@ async def test_done_idle_and_old_gets_deleted(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_done_recent_and_quiet_is_kept(tmp_path: Path):
+async def test_done_unverified_is_kept_even_when_space_is_needed(tmp_path: Path):
+    """No clock buys a delete: an unproven fuse copy is never enough."""
     pub = "a" * 40
     store = StateStore(tmp_path / "s.db")
     _row(store, pub, State.DONE, completed_h_ago=1.0, activity_h_ago=None, injected="")
@@ -382,18 +379,15 @@ async def test_dry_run_deletes_nothing(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_done_old_quiet_no_stamp_uses_added_on_fallback(tmp_path: Path):
-    """Pre-existing idle backlog clears on the first run, no grace wait.
+async def test_adopted_done_row_is_eligible_on_verification(tmp_path: Path):
+    """A DONE row without `completed_at` clears on proof, not on age.
 
-    No activity stamp was ever recorded, but every member was added days
-    ago and the swarm is quiet now: the race is verifiably over. The row
-    is a legacy one (old created_at), so it has already served the grace
-    period even without a completed_at stamp.
+    Recovery adopts fuse seeds as DONE with no completion stamp. Under the
+    headroom rule the verification itself is the evidence (entries, off-SSD
+    placement, bytes on the mount), so the row is eligible the moment space
+    is needed — the `added_on` fallback no longer decides anything here.
     """
-    import time
-
     pub = "a" * 40
-    added = int(time.time()) - 5 * 24 * 3600
     store = StateStore(tmp_path / "s.db")
     _row(
         store,
@@ -404,7 +398,7 @@ async def test_done_old_quiet_no_stamp_uses_added_on_fallback(tmp_path: Path):
         injected="",
         created_h_ago=5 * 24,
     )
-    src = _FakeSource([_member(pub, added_on=added)])
+    src = _FakeSource([_member(pub, added_on=0)])
     dest = _FakeDest([pub])
     cfg = _base_cfg(tmp_path)
     _healthy_fuse(tmp_path, store, [pub], cfg)
@@ -416,21 +410,20 @@ async def test_done_old_quiet_no_stamp_uses_added_on_fallback(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_done_fresh_torrent_no_stamp_waits_grace(tmp_path: Path):
-    """A torrent added minutes ago with no stamp can't prove idleness yet."""
-    import time
-
+async def test_done_row_just_completed_is_deleted_when_space_is_needed(tmp_path: Path):
+    """Sixty seconds after DONE is as deletable as sixty hours — no timer."""
     pub = "a" * 40
-    added = int(time.time()) - 120
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.DONE, completed_h_ago=None, activity_h_ago=None, injected="")
-    src = _FakeSource([_member(pub, added_on=added)])
+    _row(store, pub, State.DONE, completed_h_ago=1 / 60, activity_h_ago=None, injected="")
+    src = _FakeSource([_member(pub)])
     dest = _FakeDest([pub])
-    coord = _make_coord(tmp_path, store, src, dest, _base_cfg(tmp_path))
+    cfg = _base_cfg(tmp_path)
+    _healthy_fuse(tmp_path, store, [pub], cfg)
+    coord = _make_coord(tmp_path, store, src, dest, cfg)
 
     await coord._maybe_cleanup_source()
 
-    assert src.deleted == []
+    assert [h for h, _ in src.deleted] == [pub]
 
 
 @pytest.mark.anyio

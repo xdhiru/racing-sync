@@ -164,16 +164,29 @@ async def test_missing_fuse_files_short_circuits_dead_mount(tmp_path):
 
 
 def test_cleanup_idle_rejects_skewed_added_on():
+    """The surviving MOVING idle lane still distrusts a cross-host `added_on`.
+
+    The DONE-row idle fast lane is gone with the grace timer, but the early
+    pressure path still uses `_cleanup_idle_confirmed`, so its clock-skew
+    guard has to stay armed. The window is a module constant now:
+    `[cleanup].idle_confirm_minutes` was removed (fail-loud), and a config
+    double carrying that key must not be able to shorten the lane.
+    """
     import time
 
     from racing_sync.clients.abstract import Torrent
+    from racing_sync.coordinator_cleanup import _MOVING_IDLE_CONFIRM_S
     from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     cfg = MagicMock()
-    cfg.idle_confirm_minutes = 45.0
+    # The removed knob, re-armed on a double: must be ignored.
+    cfg.idle_confirm_minutes = 1.0
+    assert _MOVING_IDLE_CONFIRM_S == 45 * 60.0
     now = dt.datetime.now(dt.UTC)
-    ts = TorrentState(source_infohash="h", source_name="S", state=State.DONE)
+    # MOVING: the state that still owns this lane (no activity stamp, so the
+    # `added_on` fallback is the evidence under test).
+    ts = TorrentState(source_infohash="h", source_name="S", state=State.MOVING)
 
     def _member(added):
         return Torrent(
@@ -191,6 +204,8 @@ def test_cleanup_idle_rejects_skewed_added_on():
     assert coord._cleanup_idle_confirmed(ts, [_member(int(time.time()) + 3600)], now, cfg) is False
     # Near-epoch bogus timestamp fails closed.
     assert coord._cleanup_idle_confirmed(ts, [_member(1)], now, cfg) is False
+    # Inside the settle window: kept (and NOT fast-laned by the dead config key).
+    assert coord._cleanup_idle_confirmed(ts, [_member(int(time.time()) - 1800)], now, cfg) is False
     # Genuinely old + quiet passes.
     assert coord._cleanup_idle_confirmed(ts, [_member(int(time.time()) - 7200)], now, cfg) is True
 

@@ -193,9 +193,11 @@ class TorrentState:
     # Sticky across restarts like force_direct.
     skipped: int = 0
     # VPS1 cleanup bookkeeping (see [cleanup]):
-    # - completed_at: last time the row entered DONE (grace anchor).
+    # - completed_at: last time the row entered DONE (the pressure-order
+    #   anchor, "then oldest"; never an eligibility clock).
     # - vps1_last_activity_at: last time the VPS1 swarm showed upload
-    #   activity (idle detection for fast-lane deletion).
+    #   activity (the keep for a live race, and the settle-window evidence
+    #   for the MOVING early-pressure path).
     completed_at: dt.datetime | None = None
     vps1_last_activity_at: dt.datetime | None = None
     # Lifecycle

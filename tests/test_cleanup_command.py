@@ -1,10 +1,10 @@
-"""Manual VPS1 cleanup commands (`/cleanup`, `/clean_`) and cleanup ETA hints.
+"""Manual VPS1 cleanup commands (`/cleanup`, `/clean_`) and cleanup status.
 
 Covers the two operator entry points (global pass + per-task), the act-sheet
-button, and the display-only "clean ready / clean ~5h" hint shown in the
-active list and act sheet. Automatic cleanup semantics are covered by
-test_cleanup*.py; here the safety checks are exercised through the manual
-path (which intentionally bypasses only grace/idle).
+button, and the display-only "secured · reclaiming / not verifiable yet" status
+shown in the active list and act sheet. Automatic cleanup semantics are covered
+by test_cleanup*.py; here the safety checks are exercised through the manual
+path (which intentionally skips only the free-space trigger).
 """
 
 from __future__ import annotations
@@ -193,7 +193,7 @@ async def test_cleanup_now_force_bypasses_startup_and_cadence(tmp_path):
                 "deleted": 0,
                 "candidates": 0,
                 "dry_run": False,
-                "grace_s": 7200.0,
+                "shortfall_bytes": 0,
                 "free": None,
                 "bursting": False,
                 "reason": "no rows",
@@ -221,7 +221,7 @@ async def test_cleanup_now_dry_run_summary(tmp_path):
                 "deleted": 2,
                 "candidates": 3,
                 "dry_run": True,
-                "grace_s": 7200.0,
+                "shortfall_bytes": 0,
                 "free": 12 * GiB,
                 "bursting": False,
                 "reason": "",
@@ -246,7 +246,7 @@ async def test_cleanup_now_live_summary_reports_counts(tmp_path):
                 "deleted": 3,
                 "candidates": 4,
                 "dry_run": False,
-                "grace_s": 7200.0,
+                "shortfall_bytes": 0,
                 "free": 12 * GiB,
                 "bursting": False,
                 "reason": "",
@@ -265,9 +265,10 @@ async def test_run_source_cleanup_summary_on_empty_table(tmp_path):
     try:
         cfg = _cfg()
         coord = _coord(store, _Source([]), cfg)
+        # 12 GiB is below the 15 GiB trigger: the pass scans, then finds no rows.
         summary = await coord._run_source_cleanup(
             cfg.cleanup,
-            free_bytes=None,
+            free_bytes=12 * GiB,
             arrivals=0.0,
             bytes_rate=0.0,
             projected=None,
@@ -278,12 +279,23 @@ async def test_run_source_cleanup_summary_on_empty_table(tmp_path):
         assert summary["deleted"] == 0
         assert summary["candidates"] == 0
         assert summary["dry_run"] is False
+        assert summary["trigger"] == cfg.cleanup.low_watermark_free_bytes
+        assert summary["target"] == cfg.cleanup.high_watermark_free_bytes
+        assert summary["free"] == 12 * GiB
+        assert summary["target_reached"] is False
+        assert summary["shortfall_bytes"] == 0
         assert set(summary) == {
             "deleted",
             "candidates",
             "dry_run",
-            "grace_s",
             "free",
+            "free_after",
+            "trigger",
+            "target",
+            "target_reached",
+            "shortfall_bytes",
+            "eligible_remaining",
+            "cap",
             "bursting",
             "reason",
         }
@@ -424,7 +436,7 @@ async def test_clean_reports_ambiguous_prefix(tmp_path):
 # -------------------------------------------------------------- act sheet
 
 
-def _sheet_bot(*, enabled: bool = True, hint: str = "clean ~5h") -> TelegramBot:
+def _sheet_bot(*, enabled: bool = True, hint: str = "secured · waiting for space") -> TelegramBot:
     bot = object.__new__(TelegramBot)
     bot._coord = SimpleNamespace(
         cfg=SimpleNamespace(cleanup=SimpleNamespace(enabled=enabled)),
@@ -513,7 +525,7 @@ async def test_act_command_appends_cleanup_hint(tmp_path):
         bot._last_rendered_groups = 0
         await bot._act_command_entry(H, MagicMock())
         text = bot._bot.send_message.call_args[0][1]
-        assert "Cleanup: clean ~5h" in text
+        assert "Cleanup: secured · waiting for space" in text
         keyboard = bot._bot.send_message.call_args[1]["reply_markup"].inline_keyboard
         assert "🧹 Clean VPS1 copies" in [b.text for row in keyboard for b in row]
     finally:
@@ -530,15 +542,28 @@ async def test_router_routes_clean_button_to_task_cleaner():
     bot._refresh_active_message.assert_awaited_once()
 
 
-# ----------------------------------------------------------- cleanup hint
+# ----------------------------------------------------------- cleanup status
 
 
-def _hint_coord(**over) -> object:
+def _hint_coord(free: int | None = 10 * GiB, **over) -> object:
+    """Hint harness: below the 15 GiB trigger by default, so the disk needs room."""
     coord = make_coordinator()
     coord.cfg = _cfg(**over)
-    # At the low watermark -> minimum grace (2 h by default).
-    coord._last_source_free_bytes = 15 * GiB
+    coord._last_source_free_bytes = free
     return coord
+
+
+def _done_row(*, verified: bool = False, completed_h_ago: float = 1.0) -> TorrentState:
+    now = dt.datetime.now(dt.UTC)
+    return TorrentState(
+        source_infohash=H,
+        source_name=FNAME,
+        dest_infohash=H,
+        total_bytes=FSIZE,
+        state=State.DONE,
+        completed_at=now - dt.timedelta(hours=completed_h_ago),
+        fuse_verified=1 if verified else 0,
+    )
 
 
 def test_hint_empty_for_non_done_and_disabled():
@@ -553,13 +578,7 @@ def test_hint_empty_for_non_done_and_disabled():
     )
     assert coord._cleanup_hint(moving) == ""
 
-    done = TorrentState(
-        source_infohash=H,
-        source_name=FNAME,
-        total_bytes=FSIZE,
-        state=State.DONE,
-        completed_at=now - dt.timedelta(hours=1),
-    )
+    done = _done_row(verified=True)
     assert _hint_coord(enabled=False)._cleanup_hint(done) == ""
 
     no_seed = _hint_coord()
@@ -567,49 +586,34 @@ def test_hint_empty_for_non_done_and_disabled():
     assert no_seed._cleanup_hint(done) == ""
 
 
-def test_hint_ready_past_grace():
-    coord = _hint_coord()
-    now = dt.datetime.now(dt.UTC)
-    ts = TorrentState(
-        source_infohash=H,
-        source_name=FNAME,
-        total_bytes=FSIZE,
-        state=State.DONE,
-        completed_at=now - dt.timedelta(hours=100),
+def test_hint_says_secured_while_space_is_not_needed():
+    """At/above the trigger a secured row is deliberately kept: not a countdown."""
+    coord = _hint_coord(free=90 * GiB)
+    assert coord._cleanup_hint(_done_row(verified=True)) == "secured · waiting for space"
+
+
+def test_hint_says_reclaiming_below_the_trigger():
+    coord = _hint_coord(free=10 * GiB)
+    assert coord._cleanup_hint(_done_row(verified=True, completed_h_ago=1 / 60)) == (
+        "secured · reclaiming"
     )
-    assert coord._cleanup_hint(ts) == "clean ready"
 
 
-def test_hint_ready_by_idle_fast_lane():
-    coord = _hint_coord()
-    now = dt.datetime.now(dt.UTC)
-    ts = TorrentState(
-        source_infohash=H,
-        source_name=FNAME,
-        total_bytes=FSIZE,
-        state=State.DONE,
-        completed_at=now - dt.timedelta(hours=1),
-        vps1_last_activity_at=now - dt.timedelta(hours=2),
-    )
-    assert coord._cleanup_hint(ts) == "clean ready"
+def test_hint_names_a_row_the_janitor_will_not_touch():
+    """Never "clean ready" for something the janitor will not delete."""
+    for free in (10 * GiB, 90 * GiB):
+        assert _hint_coord(free=free)._cleanup_hint(_done_row(verified=False)) == (
+            "not verifiable yet"
+        )
 
 
-def test_hint_estimates_remaining_grace():
-    coord = _hint_coord()
-    now = dt.datetime.now(dt.UTC)
-    ts = TorrentState(
-        source_infohash=H,
-        source_name=FNAME,
-        total_bytes=FSIZE,
-        state=State.DONE,
-        completed_at=now - dt.timedelta(hours=1),
-    )
-    hint = coord._cleanup_hint(ts)
-    assert hint.startswith("clean ~")
-    assert hint == "clean ~1h"
-
-
-# -------------------------------------------------------- active-list hint
+def test_hint_prints_no_age_estimate_at_any_elapsed_time():
+    """1 minute and 400 days old read identically: the clock is gone."""
+    coord = _hint_coord(free=90 * GiB)
+    fresh = _done_row(verified=True, completed_h_ago=1 / 60)
+    ancient = _done_row(verified=True, completed_h_ago=24 * 400)
+    assert coord._cleanup_hint(fresh) == coord._cleanup_hint(ancient)
+    assert "~" not in coord._cleanup_hint(fresh)
 
 
 def test_render_active_appends_cleanup_hint():
@@ -621,34 +625,37 @@ def test_render_active_appends_cleanup_hint():
         source_announce_url="https://alpha.cc/announce/xyz",
     )
     base, _, _ = render_active([(ts, None)])
-    hinted, _, _ = render_active([(ts, None)], cleanup={H: "clean ~5h"})
-    assert "✅ Done · clean ~5h" in hinted
-    assert "clean ~5h" not in base
+    hinted, _, _ = render_active([(ts, None)], cleanup={H: "secured · waiting for space"})
+    assert "✅ Done · secured · waiting for space · 🗄 still on VPS1" in hinted
+    assert "waiting for space" not in base
     # Empty/absent dict leaves the render byte-identical.
     assert render_active([(ts, None)], cleanup={})[0] == base
     assert render_active([(ts, None)], cleanup=None)[0] == base
 
 
 @pytest.mark.anyio
-async def test_pending_summary_counts_ready_and_next(tmp_path):
-    """The active-card footer shows completed rows awaiting VPS1 removal."""
+async def test_pending_summary_counts_secured_and_unverifiable(tmp_path):
+    """The active-card footer shows what is still on VPS1 and why."""
     store = StateStore(tmp_path / "state.db")
     try:
         now = dt.datetime.now(dt.UTC)
-        _row(store, h="a" * 40)  # completed 100h ago -> grace elapsed
-        _row(
-            store,
-            h="b" * 40,
-            completed_at=now,
-            vps1_last_activity_at=None,
-        )
+        _row(store, h="a" * 40)  # DONE 100 h ago, verified memo set below
+        _row(store, h="b" * 40, completed_at=now, vps1_last_activity_at=None)
+        store.set_fuse_verified("a" * 40, True)
         coord = _coord(store, _Source([]), _cfg())
+        coord._last_source_free_bytes = 10 * GiB  # below the trigger
 
         text = await coord._cleanup_pending_summary()
 
         assert text.startswith("🧹 VPS1 cleanup: 2 done")
-        assert "1 ready" in text
-        assert "next in ~" in text
+        assert "1 secured" in text
+        assert "1 not verifiable" in text
+        assert "reclaiming" in text
+        assert "~" not in text
+
+        # Roomy disk: same counts, no reclaim.
+        coord._last_source_free_bytes = 90 * GiB
+        assert "waiting for space" in await coord._cleanup_pending_summary()
     finally:
         store.close()
 
@@ -663,7 +670,7 @@ def test_detail_card_shows_cleanup_hint():
         state=State.DONE,
     )
 
-    assert "VPS1 cleanup: clean ~2h" in render_detail(ts, cleanup="clean ~2h")
+    assert "VPS1 cleanup: secured · reclaiming" in render_detail(ts, cleanup="secured · reclaiming")
     assert "VPS1 cleanup" not in render_detail(ts)
 
 

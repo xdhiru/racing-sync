@@ -75,13 +75,15 @@ DEPRECATED: dict[str, str] = {
 
 #: Refused at load with the hint as the message.
 #:
-#: Every entry is listed under BOTH spellings — the internal table name and
-#: the capability-chain one — because `config_alias._reject_removed` runs
-#: *before* the rename absorbs the table (`normalize_config` line order). A
-#: key registered under one spelling only would pass the reject step and then
-#: be pruned as an unknown key, i.e. a warning instead of the hard error the
-#: operator edits the live file by hand and expects. The two entries of a
-#: pair share one message constant so the text cannot drift apart.
+#: A key that lives under a RENAMED section is listed under BOTH spellings —
+#: the internal table name and the capability-chain one — because
+#: `config_alias._reject_removed` runs *before* the rename absorbs the table
+#: (`normalize_config` line order). A key registered under one spelling only
+#: would pass the reject step and then be pruned as an unknown key, i.e. a
+#: warning instead of the hard error the operator edits the live file by hand
+#: and expects. The two entries of a pair share one message constant so the
+#: text cannot drift apart. A section the rename never touches (`[cleanup]`)
+#: has only one spelling to reach, so one entry covers it.
 _RENAMED_INDEXER_WAIT = (
     "renamed to indexer_wait_seconds — write indexer_wait_seconds in "
     "[acquire] (or [cross_seed]) instead. It is the wait window after which the "
@@ -98,6 +100,13 @@ _RENAMED_PUSH_POLL = (
     "[client.rclone_push] (or [source.rclone_push]) table; same meaning, the "
     "cadence of the metadata-only progress poll"
 )
+_REMOVED_CLEANUP_TIMER = (
+    "removed — VPS1 reclaims to a free-space target, not a timer: "
+    "[cleanup].low_watermark_free_bytes is the trigger (below it the janitor "
+    "reclaims) and high_watermark_free_bytes the target (it reclaims until "
+    "free is back there). Delete this key; a secured row waits for space, "
+    "never for a clock"
+)
 REMOVED: dict[str, str] = {
     "cross_seed.prowlarr_max_age_seconds": _RENAMED_INDEXER_WAIT,
     "acquire.prowlarr_max_age_seconds": _RENAMED_INDEXER_WAIT,
@@ -105,6 +114,12 @@ REMOVED: dict[str, str] = {
     "client.rclone_push.deadline_seconds": _RENAMED_PUSH_TIMEOUT,
     "source.rclone_push.check_interval_seconds": _RENAMED_PUSH_POLL,
     "client.rclone_push.check_interval_seconds": _RENAMED_PUSH_POLL,
+    # `[cleanup]` keeps its name across both spellings (no rename touches the
+    # section), so one entry per key IS the pair: `_reject_removed` matches the
+    # raw table, and the internal model has no field to fall back to.
+    "cleanup.min_grace_hours": _REMOVED_CLEANUP_TIMER,
+    "cleanup.max_grace_hours": _REMOVED_CLEANUP_TIMER,
+    "cleanup.idle_confirm_minutes": _REMOVED_CLEANUP_TIMER,
 }
 
 #: Provider names each link's file surface knows (the full chain vocabulary).
