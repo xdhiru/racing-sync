@@ -5,16 +5,26 @@ Extracted from coordinator_admit.py; `AdmitMixin` composes this mixin."""
 import asyncio
 import datetime as dt
 import logging
+import os
 import time
 from pathlib import Path
 
-from .coordinator_content import WATCH_ORIGIN_LABELS
-from .coordinator_paths import _safe_ssd_join
+from .coordinator_content import WATCH_ORIGIN_LABELS, normalize_content_name
+from .coordinator_paths import _safe_ssd_join, fuse_stat_cached
 from .io_bounds import chunked, offload, rpc
 from .state import State, TorrentState
 
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
+
+#: How long a mount's child listing stays usable (seconds). The deep
+#: probe needs the release folders under a mount; one listing per mount
+#: per window keeps the metadata cost off every poll.
+_FUSE_CHILD_CACHE_TTL_S = 300.0
+#: Hard cap on the entries one mount listing contributes.
+_FUSE_CHILD_SCAN_CAP = 2000
+#: Waiting rows probed for a manual move per sweep.
+_MANUAL_MOVE_SWEEP_ROWS = 10
 
 
 class FuseAdmitMixin:
@@ -261,6 +271,7 @@ class FuseAdmitMixin:
         except Exception:
             pass
         hit_mount: Path | None = None
+        hit_base: Path | None = None
         try:
             from .fuse_gate import missing_under
 
@@ -276,7 +287,27 @@ class FuseAdmitMixin:
         except Exception:
             hit_mount = None
         if hit_mount is None:
-            return "absent", None, 0, 0
+            # One level deep: the operator moved the content into a
+            # release folder, so the torrent's file sits inside a child
+            # directory of the mount instead of at its root.
+            hit_mount, hit_base = await self._fuse_deep_content_root(mounts, probe_name)
+            if hit_mount is None:
+                return "absent", None, 0, 0
+            # Record the physical top so the later checks (fully-remote
+            # shortcut, re-add gate, injection save_path) look in the same
+            # place the operator's copy actually sits.
+            try:
+                _sub = hit_base.name if hit_base is not None else ""
+                if _sub and getattr(ts, "seed_subdir", "") != _sub:
+                    ts.seed_subdir = _sub
+                    try:
+                        rev = self.store.update_columns(ts.source_infohash, {"seed_subdir": _sub})
+                        if rev:
+                            ts.version = rev
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception:  # noqa: BLE001
+                pass
 
         try:
             if not blob:
@@ -309,7 +340,11 @@ class FuseAdmitMixin:
                 return "absent", None, 0, 0
             from .fuse_gate import verify_blob_on_mount
 
-            check = await verify_blob_on_mount(hit_mount, blob, expected=expected, confirm=True)
+            # The expected names are torrent-relative: they resolve under
+            # the mount (flat/wrapped) or under the release folder when the
+            # content was moved one level deep.
+            base = hit_base or hit_mount
+            check = await verify_blob_on_mount(base, blob, expected=expected, confirm=True)
             if check.verified:
                 return "present", bytes(blob), len(expected), len(expected)
             if check.expected is None or check.unverifiable:
@@ -413,6 +448,170 @@ class FuseAdmitMixin:
             if isinstance(raw, (str, Path)) and str(raw).strip():
                 return True
         return False
+
+    async def _fuse_mount_children(self, mount: Path) -> list[str]:
+        """Directory names directly under a mount (cached, bounded).
+
+        The deep probe needs the release folders under a mount to find
+        content the operator moved into one. One listing per mount per
+        TTL keeps the metadata cost off every poll.
+        """
+        key = str(mount)
+        cache: dict = {}
+        try:
+            got = getattr(self, "_fuse_children_cache", None)
+            if isinstance(got, dict):
+                cache = got
+            else:
+                self._fuse_children_cache = cache  # type: ignore[attr-defined]
+        except Exception:
+            cache = {}
+        now = time.monotonic()
+        hit = cache.get(key)
+        if isinstance(hit, tuple) and len(hit) == 2:
+            try:
+                if (now - float(hit[0])) < _FUSE_CHILD_CACHE_TTL_S:
+                    return list(hit[1])
+            except Exception:
+                pass
+        names: list[str] = []
+
+        def _scan() -> list[str]:
+            out: list[str] = []
+            try:
+                with os.scandir(key) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                out.append(entry.name)
+                        except OSError:
+                            continue
+                        if len(out) >= _FUSE_CHILD_SCAN_CAP:
+                            break
+            except OSError:
+                return []
+            return out
+
+        try:
+            names = await asyncio.to_thread(_scan)
+        except Exception as e:  # noqa: BLE001
+            log.debug("fuse child scan failed for %s: %s", key, e)
+            names = []
+        try:
+            cache[key] = (now, list(names))
+        except Exception:
+            pass
+        return names
+
+    @staticmethod
+    def _child_matches_release(child: str, torrent_name: str) -> bool:
+        """True when a mount child looks like the torrent's release folder.
+
+        Folder and file names usually differ only by the media extension
+        and the release-group suffix, so compare the normalized names and
+        accept a common prefix (a group suffix on one side only).
+        """
+        try:
+            a = normalize_content_name(child)
+            b = normalize_content_name(torrent_name)
+        except Exception:
+            return False
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        short, long = (a, b) if len(a) <= len(b) else (b, a)
+        return len(short) >= 8 and long.startswith(short)
+
+    async def _fuse_deep_content_root(
+        self, mounts: list[Path], probe_name: str
+    ) -> tuple[Path | None, Path | None]:
+        """Find the content one level below a mount (inside a release folder).
+
+        Returns (mount, base) where `base` is the directory holding the
+        torrent's file, or (None, None) when nothing matches.
+        """
+        for mount in mounts:
+            try:
+                children = await self._fuse_mount_children(mount)
+            except Exception:
+                children = []
+            for child in children:
+                if not self._child_matches_release(child, probe_name):
+                    continue
+                try:
+                    target = _safe_ssd_join(mount / child, probe_name)
+                except Exception:
+                    target = None
+                if target is None:
+                    continue
+                try:
+                    exists, _size = await asyncio.to_thread(fuse_stat_cached, target)
+                except Exception:
+                    exists = False
+                if not exists:
+                    continue
+                return mount, mount / child
+        return None, None
+
+    async def _sweep_manual_moved_content(self) -> None:
+        """Adopt waiting rows whose content was moved to the remote by hand.
+
+        A row parked on the indexer retry timer only wakes every
+        `prowlarr_retry_interval_seconds`; a manual rclone move in between
+        is noticed on the next wake. This sweep probes a bounded number of
+        waiting rows per poll, so a moved release is adopted (and injected)
+        within one poll interval instead of one retry window. The probe is
+        presence-only until a name matches, so a miss costs one stat.
+        """
+        try:
+            store = getattr(self, "store", None)
+            if store is None:
+                return
+            rows = await offload(store.list_by_state, State.WAITING_INDEXER)
+        except Exception:
+            return
+        if not rows:
+            return
+        try:
+            rows = sorted(
+                rows,
+                key=lambda t: (
+                    0 if getattr(t, "fuse_wait_first_at", None) else 1,
+                    getattr(t, "updated_at", None) or dt.datetime.min.replace(tzinfo=dt.UTC),
+                ),
+            )
+        except Exception:
+            pass
+        running = getattr(self, "_running_infohashes", None)
+        checked = 0
+        for ts in rows:
+            if checked >= _MANUAL_MOVE_SWEEP_ROWS:
+                break
+            try:
+                h = (ts.source_infohash or "").lower()
+                if not h:
+                    continue
+                if isinstance(running, set) and h in running:
+                    continue
+                if getattr(ts, "skipped", 0):
+                    continue
+                checked += 1
+                status, blob, _present, _total = await self._fuse_content_evidence(ts)
+            except Exception:
+                continue
+            if status != "present" or not blob:
+                continue
+            log.info(
+                "manual move detected for %s; admitting straight to the seed path",
+                (ts.source_name or "")[:60],
+            )
+            try:
+                await self._admit_fuse_existing(ts, bytes(blob))
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "manual move adoption failed for %s: %s", (ts.source_name or "")[:60], e
+                )
 
     def _manual_move_wait_limits(self) -> tuple[float, float]:
         """(check_seconds, timeout_seconds); timeout 0 disables the wait."""

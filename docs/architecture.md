@@ -218,7 +218,13 @@ bounds, the racing set.
 Before any pick, a cheap pre-check probes the torrent-name root on the fuse
 target (both configured mounts — a fresh row has no kind yet, and
 `mount_unsorted` is usually nested inside `mount`) with one stat per mount
-and no RPC. Fully present bytes admit straight from the row's own blob
+and no RPC. The probe also looks one level deep: content moved into a
+release folder is matched by normalized folder name (extension and group
+suffix ignored), and the folder is recorded as the row's physical top so
+every later check looks in the same place. A per-poll sweep probes a bounded
+number of waiting rows, so a manual move is adopted within one poll
+interval instead of the row's indexer retry timer. Fully present bytes admit
+straight from the row's own blob
 (QUEUED, no SSD reservation); a *partly* present copy — an operator's manual
 rclone move in progress, or fuse index lag — parks the row without injecting
 and re-checks every `[rclone.fuse].manual_move_check_seconds` (default 1800)

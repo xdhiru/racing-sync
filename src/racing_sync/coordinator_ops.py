@@ -594,6 +594,14 @@ class OpsMixin:
         except Exception as e:  # noqa: BLE001
             log.warning("manual fuse sweep failed: %s", e)
 
+        # 2b-2. Manual-move sweep: content the operator moved to the remote
+        # by hand is adopted (and injected) within one poll interval, not on
+        # the row's indexer retry timer. Bounded, presence-first probing.
+        try:
+            await self._sweep_manual_moved_content()
+        except Exception as e:  # noqa: BLE001
+            log.warning("manual move sweep failed: %s", e)
+
         # 2c. Intake handoff: freshly discovered NEW rows start work now
         # instead of waiting out the next scheduler tick (racing is
         # time-sensitive). Production only (the scheduler remains the
