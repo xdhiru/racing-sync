@@ -82,6 +82,7 @@ from .coordinator_ops import (
     _elect_primary_torrent as _elect_primary_torrent,  # noqa: F401  (re-exported API)
 )
 from .coordinator_picker import pick_ssd_source_for_racing
+from .coordinator_racing_blobs import RacingBlobMixin
 from .coordinator_readd import ReaddMixin
 from .coordinator_schedule import (
     _LATE_SEED_FAILURE_WINDOW as _LATE_SEED_FAILURE_WINDOW,  # noqa: F401  (re-exported API)
@@ -188,6 +189,7 @@ class Coordinator(
     InjectMixin,
     ReaddMixin,
     FuseMixin,
+    RacingBlobMixin,
     DownloadMixin,
     MoveMixin,
     AdmitMixin,

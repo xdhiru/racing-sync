@@ -33,6 +33,7 @@ src/racing_sync/
     coordinator_inject.py      manual inject-to-fuse flow
     coordinator_picker.py      cross-seed source picker
     coordinator_content.py     stateless helpers (names, grace, notify)
+    coordinator_racing_blobs.py bulk warm-up of the racing .torrent cache
   content_keys.py     One same-content rule (explicit size modes)
   fuse_gate.py        One fuse verifier (mount probe, expected files, confirm)
   path_ownership.py   One save-path rule: FUSE / SSD / FOREIGN / UNKNOWN
@@ -42,7 +43,7 @@ src/racing_sync/
   local_transfer.py   verified move to a mounted local dir/NAS (local_move)
   io_bounds.py        RPC/thread deadlines and chunking
   safety.py           Delete guards, daemon lock, reset refusals
-  sftp_source.py      Pooled .torrent export over SFTP
+  sftp_source.py      Pooled .torrent export + bulk tar fetch over SSH
   prowlarr.py         Indexer search + validated download
   watchdir.py         Watch-dir scanner + the one bencoded parser
   telegram_*.py       Control plane (commands, actions, routing, views)
@@ -130,7 +131,11 @@ grouping (name-only evidence never deletes). `watchdir.parse_torrent` is the
 one `.torrent` parser (v1 SHA-1, v2 SHA-256, hybrid; v2-only is refused
 because the pipeline is v1-keyed). Racing bytes are hash-validated against
 the requested infohash before use: the row blob is the download torrent, so
-returning it unvalidated would re-add the wrong hash.
+returning it unvalidated would re-add the wrong hash. Deluge has no export
+RPC, so the bytes come over SSH: one `tar` stream carries every racing
+`.torrent` in a pass (`bulk_fetch_interval_seconds`), and the validated ones
+are cached in the DB, so injection no longer depends on a per-torrent round
+trip. Per-file SFTP reads stay as the fallback.
 
 **Fuse verification.** `fuse_gate.verify_blob_on_mount` returns
 `mount_ok` / `expected` / `missing`, with `confirm=True` re-probing once

@@ -603,14 +603,15 @@ class LifecycleMixin:
             return False
 
     async def run(self) -> int:
-        """Supervise the poller, scheduler, janitor and qb-listener loops.
+        """Supervise the poller, scheduler, janitor, qb-listener and
+        racing-blob loops.
 
-        Four independent loops with separate locks and clocks (a wedged
-        source poll, wedged scheduler, slow janitor, or dead dest poll
-        degrades only its own lane). Each loop guards its own iterations
-        and never raises; the supervisor just waits for stop and cancels
-        them on shutdown. `_tick()` remains the single-pass equivalent
-        for tests.
+        Five independent loops with separate locks and clocks (a wedged
+        source poll, wedged scheduler, slow janitor, dead dest poll or a
+        slow bulk torrent fetch degrades only its own lane). Each loop
+        guards its own iterations and never raises; the supervisor just
+        waits for stop and cancels them on shutdown. `_tick()` remains
+        the single-pass equivalent for tests.
         """
         await self.start()
         try:
@@ -626,6 +627,7 @@ class LifecycleMixin:
                 self._scheduler_loop,
                 self._janitor_loop,
                 self._qb_listener_loop,
+                self._racing_blob_loop,
             )
             owned: dict[asyncio.Task, object] = {}
             for factory in factories:
