@@ -137,6 +137,15 @@ before a cached absence counts. `_fuse_entry_split` decides entry placement
 while the remote is busy, so "accepted but not yet visible" parks — it is
 never a failure and never `DONE`.
 
+**Seed layout.** The download torrent and racing torrents can disagree on a
+top-level folder. The move fixes the physical layout and records its top in
+`seed_subdir`; a wrapped blob seeds at the mount root, while a flat blob is
+re-added with its save_path one level inside that folder. A flat download
+with folder-shaped racing siblings is moved into the folder, so every copy
+can seed from one layout (movies and episodes alike). Paths stay exact on
+POSIX: case-only folder variants are different layouts (logged at move), and
+the fuse gate keeps VPS1 rather than accepting a seed qB cannot open.
+
 **Retries and deadlines.** `retry.py` is the read-retry policy (bounded,
 fatal errnos excluded). Every worker handler runs under a per-state budget
 (`_STATE_WORK_BUDGET_S`); DOWNLOADING and MOVING own their poll deadlines

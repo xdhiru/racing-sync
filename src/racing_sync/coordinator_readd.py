@@ -341,7 +341,7 @@ class ReaddMixin(ReaddHealMixin, ReinjectMixin):
             )
             gate_expected = []
         if gate_expected:
-            gate_target = self._target_mount_for_blob(gate_blob, self._target_mount_for(ts))
+            gate_target = self._target_mount_for_ts_blob(ts, gate_blob)
             from .fuse_gate import verify_blob_on_mount as _verify
 
             gate_missing = (await _verify(gate_target, gate_blob, expected=gate_expected)).missing
@@ -515,7 +515,7 @@ class ReaddMixin(ReaddHealMixin, ReinjectMixin):
             log.info("cross-seed torrent %s already injected on fuse in step 1", target_hash[:10])
             return
 
-        target_mount = self._target_mount_for_blob(blob, self._target_mount_for(ts))
+        target_mount = self._target_mount_for_ts_blob(ts, blob)
         ok, detail = await self._ensure_fuse_entry(
             blob=blob,
             infohash=target_hash,
