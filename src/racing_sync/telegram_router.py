@@ -267,6 +267,26 @@ class RouterMixin:
                 await _say(result[:300])
                 await _refresh()
                 return
+            if cmd == "push" and _h and not _choice:
+                # Act-sheet tap: ask first, exactly like inject. Nothing has
+                # changed yet — the Yes answer is what starts the copy.
+                try:
+                    await self._push_ask_send(_h, None)
+                except Exception as e:  # noqa: BLE001
+                    await _say(_action_error_text(e))
+                return
+            if cmd == "push" and _choice in ("yes", "no"):
+                if _choice != "yes":
+                    await _say("Not pushed — nothing changed.")
+                    await _refresh()
+                    return
+                # Confirmed: the command body claims, pushes, replies and
+                # refreshes (the SSH work runs as a task, never on the tap).
+                try:
+                    await self._push_source_command(_h, "", None)
+                except Exception as e:  # noqa: BLE001
+                    await _say(_action_error_text(e))
+                return
             if cmd == "skip" and _all and _h:
                 _hashes = await _group_of(_h)
                 if not _hashes:
@@ -528,6 +548,7 @@ class RouterMixin:
             or data.startswith("forget:")
             or data.startswith("abort")
             or data.startswith("inject:")
+            or data.startswith("push:")
             or data.startswith("go:")
             or data.startswith("cancel:")
             or data.startswith("skip:")

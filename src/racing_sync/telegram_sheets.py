@@ -8,8 +8,10 @@ the one live lookup (`_now_eligible_hashes`).
 
 from __future__ import annotations
 
+from .coordinator_push import _PUSH_ADMITTABLE, _PUSH_PREEMPTABLE
 from .state import State
 from .telegram_buttons import ButtonMaker
+from .telegram_protocol import _push_enabled
 from .telegram_views import (
     _member_button_labels,
     _safe_display_name,
@@ -89,6 +91,30 @@ class SheetsMixin:
                     break
         except Exception:
             pass
+        # Manual push from VPS1: offered only when the operator opted in
+        # ([source.rclone_push].enabled read exactly like the backend does)
+        # and only for a group VPS2 has not already started working on —
+        # the states `PushMixin.start_source_push` can actually take over.
+        # A live copy for this group hides the button (the backend refuses a
+        # second one; the operator should not be invited to tap it).
+        _push_ok = False
+        _push_on = False
+        try:
+            _pcfg = getattr(self, "cfg", None)
+            if _pcfg is None:
+                _pcfg = getattr(getattr(self, "_coord", None), "cfg", None)
+            _push_on = _push_enabled(_pcfg)
+        except Exception:
+            _push_on = False
+        if _push_on:
+            _push_states = _PUSH_ADMITTABLE | _PUSH_PREEMPTABLE
+            try:
+                for _ts in members or []:
+                    if getattr(_ts, "state", None) in _push_states:
+                        _push_ok = True
+                        break
+            except Exception:
+                _push_ok = False
         _maker = ButtonMaker()
         # One row per copy: start and cancel side by side stay readable
         # while keeping the copy context shared.
@@ -102,6 +128,17 @@ class SheetsMixin:
             _maker.add(f"✖ Cancel all {_n} copies…", f"cancel:all:{_leader}").newline()
         if _inject_ok and _leader:
             _maker.add("💉 Inject all to fuse…", f"inject:all:{_leader}").newline()
+        # `push_live_for` is queried only with the switch on, so a coordinator
+        # double that knows nothing about pushes is never asked.
+        _push_live = False
+        if _push_ok and _leader:
+            try:
+                probe = getattr(getattr(self, "_coord", None), "push_live_for", None)
+                _push_live = (probe(_leader) is True) if callable(probe) else False
+            except Exception:
+                _push_live = False
+        if _push_ok and _leader and not _push_live:
+            _maker.add("📤 Push from VPS1…", f"push:all:{_leader}").newline()
         if _free_any and _leader:
             _maker.add("⏭ Skip release (pause downloads)", f"skip:all:{_leader}").newline()
         if _held_any and _leader:
@@ -109,11 +146,16 @@ class SheetsMixin:
         if _done_any and _cleanup_on and _leader:
             _maker.add("🧹 Clean VPS1 copies", f"clean:{_leader}").newline()
         _maker.add("Close", "abort")
+        # The blurb only names actions the sheet actually offers, so a
+        # switch-off sheet reads exactly as it did before this verb existed.
+        _ask_verb = (
+            "Cancel/Inject/Push" if (_push_ok and _leader and not _push_live) else ("Cancel/Inject")
+        )
         _text = (
             f"{_tspec}"
             + (f" · {_size}" if _size else "")
             + (f" · {_n} cop{'y' if _n == 1 else 'ies'} tracked" if _n else "")
-            + "\nStart downloads now. Cancel/Inject ask first. "
+            + f"\nStart downloads now. {_ask_verb} ask first. "
             "Skip pauses, Resume restarts."
         )
         return _text, _maker.rows()

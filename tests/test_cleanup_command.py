@@ -460,6 +460,37 @@ def test_act_sheet_offers_clean_button_only_for_done_groups():
     assert "🧹 Clean VPS1 copies" not in _sheet_labels(rows3)
 
 
+def _push_sheet_bot(*, enabled: bool = True) -> TelegramBot:
+    """The same sheet bot with `[source.rclone_push]` present (on or off)."""
+    bot = _sheet_bot(enabled=False)
+    bot._coord.cfg = SimpleNamespace(
+        cleanup=SimpleNamespace(enabled=False),
+        source=SimpleNamespace(rclone_push=SimpleNamespace(enabled=enabled)),
+    )
+    bot._coord.push_live_for = lambda _h: False
+    return bot
+
+
+def test_act_sheet_offers_push_button_only_with_the_switch_on():
+    """`📤 Push from VPS1…` obeys its own switch, never the cleanup one."""
+    waiting = TorrentState(
+        source_infohash=H, source_name=FNAME, total_bytes=FSIZE, state=State.WAITING_INDEXER
+    )
+    _text, rows = _push_sheet_bot()._sheet_text_and_rows([waiting], FNAME, FSIZE, {})
+    assert "📤 Push from VPS1…" in _sheet_labels(rows)
+    assert f"push:all:{H}" in _sheet_datas(rows)
+    assert all(len(d.encode("utf-8")) <= 64 for d in _sheet_datas(rows))
+
+    _t2, rows2 = _push_sheet_bot(enabled=False)._sheet_text_and_rows([waiting], FNAME, FSIZE, {})
+    assert "📤 Push from VPS1…" not in _sheet_labels(rows2)
+    # VPS2 already works the bytes: a copy behind its back is wasted traffic.
+    downloading = TorrentState(
+        source_infohash=H, source_name=FNAME, total_bytes=FSIZE, state=State.DOWNLOADING
+    )
+    _t3, rows3 = _push_sheet_bot()._sheet_text_and_rows([downloading], FNAME, FSIZE, {})
+    assert "📤 Push from VPS1…" not in _sheet_labels(rows3)
+
+
 @pytest.mark.anyio
 async def test_act_command_appends_cleanup_hint(tmp_path):
     store = StateStore(tmp_path / "s.db")

@@ -46,6 +46,7 @@ All commands accept an optional `@bot` suffix in group chats
 | `/hold <target>` | Hold a release: no workers, no Prowlarr queries, no downloads, no moves until it is unheld. |
 | `/inject <hash>` | Manual fuse seeding — you moved the bytes to the remote yourself. |
 | `/pause` | Pause intake — no new downloads start until `/resume`. |
+| `/push_source <target>` | Copy that release from the racing box straight onto the seed remote VPS2 seeds from, instead of downloading a second copy. Needs `[source.rclone_push].enabled = true`. |
 | `/resume` | Resume intake of new downloads. |
 | `/start <target>` | Start now instead of waiting: a waiting row uses its starting torrent, a grace-held row starts at once. |
 | `/stats` | Pipeline snapshot: rows by state, workers, intake, ignored count, storage footer. |
@@ -104,6 +105,28 @@ two questions once for the whole scope.
   `Cleanup: clean ~5h`). The same hint follows a DONE row's stage text in
   the Active Tasks card: `clean ready` means the timing gates are
   satisfied, `clean ~5h` is an estimate based on the adaptive grace.
+
+### Act sheet — push from VPS1
+
+- `📤 Push from VPS1…` — shown only when `[source.rclone_push].enabled =
+  true` **and** a copy of the group is still in a state the push can take
+  over (`NEW`, `WAITING_INDEXER`, `WAITING_DISK`, `QUEUED`), and only while
+  no push for that group is already running. With the switch off the
+  button is absent and the sheet looks exactly as it did before.
+- Like Inject, it **asks first**: `✔ Yes, push from VPS1` starts the copy,
+  `✖ No` and `Close` change nothing.
+- One tap means **one push per group**: the command and the button both
+  address the group, and the copy runs for its elected primary torrent —
+  three tracker copies of the same release still transfer the bytes once.
+- VPS1 runs one detached `rclone copy` of the files it already holds into
+  the same remote VPS2 seeds from, so the bytes cross the internet once
+  instead of twice. VPS2 never re-downloads them, and nothing is read or
+  hashed on the mount or the SSD — names and sizes only.
+- While the copy runs, the pipeline suppresses its own competing work for
+  that group and parks the row; if the copy fails or passes its deadline,
+  the row falls back to the normal path untouched. `/push_source` refuses
+  (with the reason on one line) when VPS2 is already downloading, moving
+  or seeding the content.
 
 ## Notes
 

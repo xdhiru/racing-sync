@@ -166,6 +166,7 @@ command with a description — the full list is in
 /start 3       start now (no Prowlarr wait, no grace wait)
 /hold 3        hold it;  /unhold <hash> resumes
 /inject <hash> manual fuse seeding after you moved the bytes
+/push_source 3 copy it from VPS1 straight to the seed remote (opt-in switch)
 /active /stats /tick /find <text> /files 3   dashboard + read-only tools
 /pause /resume                               intake pause/resume
 ```

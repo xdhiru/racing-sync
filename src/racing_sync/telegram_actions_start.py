@@ -40,6 +40,13 @@ class StartActionsMixin:
         if kind == "injectfuse":
             await self._start_injectfuse_single(full_hash, message)
             return
+        if kind == "pushsource":
+            # Pushed by hash, never by prefix: the executor re-resolves the
+            # live VPS1 group and picks its elected primary, so an
+            # untracked hash still works and a short prefix only answers
+            # with the usage line (no store read, no state touched).
+            await self._push_source_command(full_hash, "", message)
+            return
         try:
             row = await asyncio.to_thread(self._store.get, full_hash)
         except Exception as e:  # noqa: BLE001
@@ -570,6 +577,27 @@ class StartActionsMixin:
             except Exception:
                 _resolved_for_ask = resolved
             await self._inject_ask_send(_resolved_for_ask, message)
+            return
+        # pushsource: whole group, one copy of the work. The button/command
+        # path always addresses the display group's leader; the executor
+        # resolves the live VPS1 group and pushes its elected primary, so
+        # three tracker copies still mean one `rclone copy`.
+        if kind == "pushsource":
+            _lead_hashes = []
+            for _m in members or []:
+                try:
+                    _mh = _member_hash(_m)
+                except Exception:
+                    _mh = ""
+                if _mh:
+                    _lead_hashes.append(_mh)
+            if not _lead_hashes:
+                try:
+                    await self._reply("Already gone from tracking", reply_to=message)
+                except Exception:
+                    pass
+                return
+            await self._push_source_command(_lead_hashes[0], title, message)
             return
         # skip/unskip: whole group, all-or-nothing — no member pick
         # (a hold covers the release, every copy of it). Even one

@@ -538,6 +538,7 @@ async def test_bot_command_menu_lists_add(tmp_path):
         "hold",
         "inject",
         "pause",
+        "push_source",
         "resume",
         "start",
         "stats",

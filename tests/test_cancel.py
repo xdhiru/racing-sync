@@ -1195,7 +1195,7 @@ def test_chat_command_registry_covers_all_verbs():
     from racing_sync.telegram_bot import _CHAT_COMMANDS
 
     names = [c.name for c in _CHAT_COMMANDS]
-    assert len(names) == len(set(names)) == 21
+    assert len(names) == len(set(names)) == 22
     for c in _CHAT_COMMANDS:
         assert callable(c.pattern.match)
         assert callable(c.handle)
@@ -1225,6 +1225,10 @@ def test_chat_command_registry_covers_all_verbs():
         "/unignore_abc123": ["unignore"],
         "/inject abc123": ["inject"],
         "/inject_2": ["inject"],
+        "/push_source 3": ["push_source"],
+        "/push_source_3": ["push_source"],
+        "/push_source_" + "c" * 40: ["push_source"],
+        "/push_source 3@my_bot": ["push_source"],
         "/act 1": ["act"],
         "/act_1": ["act"],
         "/pause": ["pause"],
@@ -1277,6 +1281,13 @@ def test_chat_command_registry_covers_all_verbs():
         "/cancel_status",
         "/pause_intake",
         "/resume_intake",
+        # The push verb has exactly one spelling: a bare verb (no target),
+        # an empty target and the near-misses must not dispatch.
+        "/push_source",
+        "/push_source_",
+        "/push",
+        "/pushsource 3",
+        "/push_sourcex 3",
     ):
         assert [c.name for c in _CHAT_COMMANDS if c.pattern.match(text)] == [], text
 
@@ -1306,6 +1317,7 @@ def test_bare_verb_answers_with_its_usage_line():
 
     assert "/start" in _command_usage_for("/start")
     assert "/start" in _command_usage_for("/start@my_bot")
+    assert "/push_source" in _command_usage_for("/push_source")
     assert _command_usage_for("/start abc123") is None
     assert _command_usage_for("/nonsense") is None
     assert _command_usage_for("") is None

@@ -80,6 +80,13 @@ UNIGNORE_CMD_RE = re.compile(r"^/unignore(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 #: remote yourself. Legacy alias: `/inject`.
 INJECT_CMD_RE = re.compile(r"^/inject(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
+#: `/push_source <target>` — copy the release VPS1 already holds straight
+#: onto the seed remote VPS2 seeds from (one `rclone copy`, no second
+#: download on VPS2). Only meaningful with `[source.rclone_push].enabled
+#: = true`; the command refuses and names the switch otherwise. There is
+#: no legacy spelling and no alias: one name for one new verb.
+PUSH_SOURCE_RE = re.compile(r"^/push_source(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
 #: `/act <target>` — action sheet for a content group: one entry point
 #: showing only the currently eligible actions (hash-direct buttons).
 ACT_CMD_RE = re.compile(r"^/act(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
@@ -203,6 +210,30 @@ async def _cmd_inject(bot, match, message):
         await bot._start_group_command("injectfuse", token, message)
         return
     await bot._start_single_command("injectfuse", token, message)
+
+
+async def _cmd_push_source(bot, match, message):
+    """`/push_source <target>`: copy it from VPS1 straight to the seed remote.
+
+    Same entry shape as `/inject`: a tracked group (positional number,
+    group id, hash or prefix) resolves through the shared ladder, so the
+    number addresses the displayed (filtered) list; anything that resolves
+    to no group is passed on as a full hash. The switch check and the
+    push itself live in `PushActionsMixin`.
+    """
+    token = (match.group(1) or "").strip().lower()
+    try:
+        rows = await asyncio.to_thread(bot._store.list_active_inflight)
+    except Exception:
+        rows = []
+    try:
+        members, _live_n, _by_number = bot._resolve_group_token(rows, token)
+    except Exception:
+        members = []
+    if members:
+        await bot._start_group_command("pushsource", token, message)
+        return
+    await bot._start_single_command("pushsource", token, message)
 
 
 async def _cmd_act(bot, match, message):
@@ -541,6 +572,9 @@ _COMMAND_USAGE: dict[str, str] = {
     "unhold": "/unhold <hash> — resume a held release",
     "unignore": "/unignore <full hash> — track a cancelled release again",
     "inject": "/inject <hash> — inject a torrent you moved to the remote",
+    "push_source": (
+        "/push_source <group number or hash> — copy it from VPS1 straight to the seed remote"
+    ),
     "act": "/act <group number or hash> — open the action sheet",
     "files": "/files <group number or hash> — list its files (read-only)",
     "cancel_all": "/cancel_all <text> — cancel every group whose title contains the text",
@@ -584,6 +618,7 @@ _CHAT_COMMANDS: tuple = (
     _ChatCommand("unhold", UNHOLD_CMD_RE, _cmd_resume),
     _ChatCommand("unignore", UNIGNORE_CMD_RE, _cmd_resume),
     _ChatCommand("inject", INJECT_CMD_RE, _cmd_inject),
+    _ChatCommand("push_source", PUSH_SOURCE_RE, _cmd_push_source),
     _ChatCommand("act", ACT_CMD_RE, _cmd_act),
     _ChatCommand("files", FILES_RE, _cmd_group("files")),
     _ChatCommand("find", FIND_RE, _cmd_find),
@@ -844,11 +879,15 @@ def _slow_tap(data: str) -> bool:
     verifications, and wipes (10s+ against a flaky client) while their
     sheet stays live with working buttons — the operator needs a
     working state on screen, or they re-tap into the in-flight guard
-    (or worse, before it existed, into a duplicate execution).
+    (or worse, before it existed, into a duplicate execution). A
+    confirmed push is in the same class: the SSH preflight and launch
+    run under the tap.
     """
     try:
-        return (data.startswith("keep:") and data.endswith(":no")) or (
-            data.startswith("inject:") and data.endswith(":yes")
+        return (
+            (data.startswith("keep:") and data.endswith(":no"))
+            or (data.startswith("inject:") and data.endswith(":yes"))
+            or (data.startswith("push:") and data.endswith(":yes"))
         )
     except Exception:
         return False
@@ -1011,11 +1050,30 @@ def _is_hex40(s: object) -> bool:
     return len(t) == 40 and all(c in "0123456789abcdef" for c in t)
 
 
+def _push_enabled(cfg: object) -> bool:
+    """`[source.rclone_push].enabled` read as the CONFIGURED bool only.
+
+    Mirrors `PushMixin._push_switch_on` exactly — the raw field must read
+    literally ``True``, never a truthy stand-in. Test doubles hand out
+    `MagicMock` configs whose attributes are truthy, and an absent section
+    is `None`; both mean "off", so the push surface (act-sheet button and
+    command) stays inert unless the operator opted in.
+    """
+    try:
+        section = getattr(getattr(cfg, "source", None), "rclone_push", None)
+    except Exception:
+        return False
+    return getattr(section, "enabled", None) is True
+
+
 def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
     """Parse a hash-protocol callback into (cmd, all, hash, choice, remember).
 
     Shapes: `<cmd>:<40hex>`, `<cmd>:all:<40hex>`,
     `<cmd>:<40hex>:yes|no`, `<cmd>:all:<40hex>:yes|no` (keep/inject),
+    `push:<40hex>`, `push:all:<40hex>`, `push:<40hex>:yes|no`,
+    `push:all:<40hex>:yes|no` (a push carries no remember choice, so those
+    two shapes keep `remember` None),
     `forget:<scope>`, `forget:<scope>:<0|1>`,
     `keep:<scope>:<0|1>:<yes|no>`, `clean:<40hex>`, `abort`, bulk-match scopes
     `forget:match:<tok>:<0|1>` / `keep:match:<tok>:<0|1>:<yes|no>`
@@ -1036,6 +1094,7 @@ def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
             "go",
             "cancel",
             "inject",
+            "push",
             "skip",
             "resume",
             "forget",
@@ -1045,7 +1104,7 @@ def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
                 return (parts[0], False, parts[1].lower(), "", None)
         if (
             len(parts) == 3
-            and parts[0] in ("cancel", "keep", "inject", "skip", "resume", "go", "forget")
+            and parts[0] in ("cancel", "keep", "inject", "push", "skip", "resume", "go", "forget")
             and parts[1] == "all"
         ):
             if _is_hex40(parts[2]):
@@ -1053,6 +1112,14 @@ def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
         if len(parts) == 3 and parts[0] in ("keep", "inject"):
             if _is_hex40(parts[1]) and parts[2] in ("yes", "no"):
                 return (parts[0], False, parts[1].lower(), parts[2], True)
+        # A push confirms the same way but forgets nothing, so the remember
+        # slot stays None: there is no Q1 answer to carry.
+        if len(parts) == 3 and parts[0] == "push":
+            if _is_hex40(parts[1]) and parts[2] in ("yes", "no"):
+                return (parts[0], False, parts[1].lower(), parts[2], None)
+        if len(parts) == 4 and parts[0] == "push":
+            if parts[1] == "all" and _is_hex40(parts[2]) and parts[3] in ("yes", "no"):
+                return (parts[0], True, parts[2].lower(), parts[3], None)
         if len(parts) == 4 and parts[0] in ("keep", "inject"):
             if _is_hex40(parts[1]) and parts[2] in ("0", "1") and parts[3] in ("yes", "no"):
                 return (parts[0], False, parts[1].lower(), parts[3], parts[2] == "1")
@@ -1189,6 +1256,11 @@ def _bot_command_menu() -> list:
             BotCommand(
                 "pause",
                 "Pause intake — no new downloads start until /resume",
+            ),
+            BotCommand(
+                "push_source",
+                "Copy a release from the racing box straight to the seed remote — "
+                "/push_source <group number or hash>",
             ),
             BotCommand(
                 "resume",
