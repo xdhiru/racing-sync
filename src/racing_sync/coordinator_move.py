@@ -25,6 +25,7 @@ from pathlib import Path
 
 from .classifier import Classification
 from .clients.abstract import TorrentFile
+from .content_keys import same_content
 from .coordinator_content import route_kind_is_sorted
 from .coordinator_errors import (
     AbandonedError,
@@ -46,6 +47,7 @@ from .coordinator_paths import _safe_ssd_join
 from .io_bounds import rpc
 from .rclone_ops import _tree_key, rclone_progress_map
 from .state import State, TorrentState
+from .torrent_layout import common_top, is_flat, join_remote, looks_like_single_file
 from .transfer import build_transfer
 
 # Keep the historic logger name so log output is unchanged by the split.
@@ -216,13 +218,23 @@ class MoveMixin(CheckpointMixin, MoveShapesMixin):
             mount = self._target_mount_for(ts)
         except Exception:
             return False
+        sub = ""
         try:
-            target = _safe_ssd_join(mount, norm)
-            if target is None:
-                return False
-            return target.stat().st_size == (match.size_bytes or 0)
-        except OSError:
-            return False
+            sub = self._seed_subdir_for(ts)
+        except Exception:
+            sub = ""
+        bases = [mount / sub] if sub else []
+        bases.append(mount)
+        for base in bases:
+            try:
+                target = _safe_ssd_join(base, norm)
+                if target is None:
+                    continue
+                if target.stat().st_size == (match.size_bytes or 0):
+                    return True
+            except OSError:
+                continue
+        return False
 
     def _release_recheck_holder(self, ts) -> None:
         """Clear the global settle-recheck hold when it is this row.
@@ -450,12 +462,52 @@ class MoveMixin(CheckpointMixin, MoveShapesMixin):
         else:
             remote = self.rt.transfer.remote_unsorted
 
+        # 4b. Fix the physical seed layout before anything moves. A wrapped
+        # target already keeps its own top folder; a flat target whose racing
+        # siblings are folder-shaped is moved into that folder, so wrapped
+        # blobs seed at the mount root and flat blobs one level inside it.
+        target_names = [getattr(f, "name", "") or "" for f in cls_files]
+        target_top = common_top(target_names)
+        wrapper = ""
+        if ts.batches_total > 1:
+            # Batches were already moved under the target's own layout;
+            # adding a wrapper now would split the files across two roots.
+            seed_subdir = target_top or ""
+        elif target_top:
+            seed_subdir = target_top
+        elif is_flat(target_names):
+            # A replayed attempt must keep the layout chosen before the
+            # crash; a fresh row derives it from its racing siblings.
+            wrapper = str(getattr(ts, "seed_subdir", "") or "").strip()
+            if not wrapper:
+                wrapper = await self._racing_wrapper_folder(ts)
+            seed_subdir = wrapper
+        else:
+            seed_subdir = ""
+        await self._pin_seed_subdir(ts, seed_subdir)
+        move_remote = join_remote(remote, wrapper)
+        if wrapper:
+            try:
+                if self.rt.transfer.provider == "local_move":
+                    # local_move refuses a missing destination root; rclone
+                    # creates the remote folder on its own.
+                    await asyncio.to_thread(Path(move_remote).mkdir, parents=True, exist_ok=True)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "seed layout: cannot create %s for %s: %s",
+                    move_remote,
+                    ts.source_name[:60],
+                    e,
+                )
+                self._park_moving(ts, f"cannot create seed folder {move_remote}: {e}")
+                return
+
         # 5. Move completed files via rclone
         # (per-file --files-from-raw lists preserve the top dir so the
         # remote layout matches torrent-relative names.)
         if ts.batches_total > 1:
             if not await self._move_multi_batch_leftovers(
-                ts, src_dir, folder, completed_files, remote
+                ts, src_dir, folder, completed_files, move_remote
             ):
                 return
         elif branch_kind in ("movie", "episode", "season", "unknown"):
@@ -469,13 +521,13 @@ class MoveMixin(CheckpointMixin, MoveShapesMixin):
                 completed_files,
                 incomplete_files,
                 uncertain_files,
-                remote,
+                move_remote,
                 branch_kind,
             ):
                 return
         else:
             if not await self._move_mixed_batches(
-                ts, cls, src_dir, completed_files, remote, branch_kind
+                ts, cls, src_dir, completed_files, move_remote, branch_kind
             ):
                 return
         # 5b. Uncertain-file guard.
@@ -604,6 +656,83 @@ class MoveMixin(CheckpointMixin, MoveShapesMixin):
         # (episodes/single_file/sizes) below.
         branch_kind = pinned_kind if pinned_kind not in ("", "unknown") else cls.kind
         return cls, pinned_kind, branch_kind
+
+    async def _racing_wrapper_folder(self, ts: TorrentState) -> str:
+        """Folder a flat download must be wrapped in for its racing seeds.
+
+        A multi-file racing torrent's client name is its top folder, while a
+        single-file one is the media file itself. When the target downloaded
+        flat but any racing sibling is folder-shaped, moving the bytes into
+        that folder lets every sibling seed: wrapped blobs at the mount
+        root, flat blobs one level inside it. The row's own source torrent
+        wins when several names qualify.
+        """
+        try:
+            racing = await self._list_source_torrents()
+        except Exception as e:  # noqa: BLE001
+            log.debug("seed layout: cannot list racing torrents for %s: %s", ts.source_name, e)
+            return ""
+        try:
+            want_size = int(ts.total_bytes or 0)
+        except (TypeError, ValueError):
+            want_size = 0
+        source_low = (ts.source_infohash or "").lower()
+        candidates: list[tuple[int, str]] = []
+        for t in racing or []:
+            try:
+                t_size = int(getattr(t, "size_bytes", 0) or 0)
+                name = str(getattr(t, "name", "") or "").strip().replace("\\", "/").strip("/")
+                if not name or "/" in name or looks_like_single_file(name):
+                    continue
+                if not same_content(name, t_size, ts.source_name or "", want_size):
+                    continue
+                own = 0 if (getattr(t, "infohash", "") or "").lower() == source_low else 1
+                candidates.append((own, name))
+            except Exception:
+                continue
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda item: item[0])
+        chosen = candidates[0][1]
+        others = {name for _own, name in candidates} - {chosen}
+        if others:
+            # One remote copy can carry one top folder: a sibling whose
+            # torrent names a different folder cannot seed from it.
+            case_only = {name.casefold() for name in others} == {chosen.casefold()}
+            log.warning(
+                "seed layout: multiple racing top folders for %s (%s); using %r%s",
+                ts.source_name[:60],
+                ", ".join(sorted(others)),
+                chosen,
+                " (case-only variants cannot share a case-sensitive fuse mount)"
+                if case_only
+                else "",
+            )
+        return chosen
+
+    async def _pin_seed_subdir(self, ts: TorrentState, subdir: str) -> None:
+        """Persist the physical top folder under the seed mount ("" = root)."""
+        sub = str(subdir or "").strip().replace("\\", "/").strip("/")
+        if "/" in sub or sub in (".", ".."):
+            sub = ""
+        if getattr(ts, "seed_subdir", "") == sub:
+            return
+        ts.seed_subdir = sub
+        try:
+            rev = self.store.update_columns(
+                ts.source_infohash, {"seed_subdir": sub}, expected_version=ts.version
+            )
+            if rev:
+                ts.version = rev
+            elif sub:
+                log.warning(
+                    "seed layout: could not persist subdir %r for %s; "
+                    "a restart may need to re-derive it",
+                    sub,
+                    ts.source_infohash[:10],
+                )
+        except Exception as e:  # noqa: BLE001
+            log.warning("seed layout: persist failed for %s: %s", ts.source_infohash[:10], e)
 
     async def _read_pre_move_state(self, h: str) -> tuple[list | None, str]:
         try:

@@ -251,6 +251,25 @@ class InjectMixin:
             except Exception:
                 fallback = Path(".")
             target = self._target_mount_for_kind(kind, fallback)
+            # The racing hash's own row knows the physical top folder under
+            # the seed mount; a flat blob seeds one level inside it.
+            hint = ""
+            try:
+                store = getattr(self, "store", None)
+                if store is not None:
+                    row = await asyncio.to_thread(store.get, h)
+                    if row is not None:
+                        hint = self._seed_subdir_for(row)
+            except Exception:
+                hint = ""
+            try:
+                from .torrent_layout import is_flat
+
+                flat_names = [name for name, _size in expected]
+            except Exception:
+                flat_names = []
+            if hint and is_flat(flat_names):
+                target = target / hint
             if not self._save_path_is_on_fuse(str(target)):
                 # Never stat the SSD dir as fuse: bytes present on SSD
                 # are not on fuse, and a false "present" would pass

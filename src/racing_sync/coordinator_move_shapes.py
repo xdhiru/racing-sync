@@ -1197,6 +1197,7 @@ class MoveShapesMixin:
             skip = await self._fuse_skipped(
                 [(e.file_name, e.size_bytes) for e in batch.episodes],
                 branch_kind,
+                subdir=self._seed_subdir_for(ts),
             )
             skip_norm = {(s or "").replace("\\", "/").strip("/") for s in skip}
             # Same guarantee as the strict branch: only a file the client

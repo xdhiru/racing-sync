@@ -277,7 +277,10 @@ class LateSeedMixin:
                 self._late_seed_memoize(_row_key, _injected_before, _save_before, ts, changed=False)
             return
 
-        ts_fallback_mount = self._target_mount_for(ts)
+        try:
+            self._target_mount_for(ts)
+        except Exception:  # noqa: BLE001
+            return
         changed = False
 
         for t in new_torrents:
@@ -310,7 +313,7 @@ class LateSeedMixin:
             # Per-torrent mount: ts.kind may be stale "unknown" (fresh
             # adoption) which routes movies/seasons to unsorted. The blob's
             # own layout is authoritative.
-            target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
+            target_mount = self._target_mount_for_ts_blob(ts, blob)
 
             # Fuse gate (fail-closed): a DONE row proves the original content
             # moved, not that this late arrival's bytes did — verify before
@@ -588,10 +591,10 @@ class LateSeedMixin:
             self._note_seed_uninjectable(ts, source_low)
             return
         try:
-            fallback = self._target_mount_for(ts)
+            self._target_mount_for(ts)
         except Exception:  # noqa: BLE001
             return
-        target_mount = self._target_mount_for_blob(blob, fallback)
+        target_mount = self._target_mount_for_ts_blob(ts, blob)
         expected = self._expected_fuse_files(blob)
         if not expected:
             log.warning(
@@ -917,7 +920,7 @@ class LateSeedMixin:
             # instead of paying an export every tick.
             self._note_fuse_outage(h)
             return
-        target = self._target_mount_for_blob(blob, fallback_mount)
+        target = self._target_mount_for_ts_blob(ts, blob)
         expected = self._expected_fuse_files(blob)
         if not expected:
             self._late_seed_defer(h)

@@ -311,6 +311,53 @@ class FuseEntryMixin:
 
         return classify_save_path(getattr(self, "cfg", None), save_path) is PathOwner.FUSE
 
+    def _seed_subdir_for(self, ts: TorrentState) -> str:
+        """Physical top folder under the seed mount for this row ("" = root).
+
+        Set at move time for new rows; older rows derive it from their own
+        download blob (a wrapped target already lives under its top folder).
+        Only a single safe segment is ever returned.
+        """
+        from .torrent_layout import blob_common_top
+
+        try:
+            sub = str(getattr(ts, "seed_subdir", "") or "").strip().replace("\\", "/").strip("/")
+            if sub and "/" not in sub and sub not in (".", ".."):
+                return sub
+        except Exception:
+            sub = ""
+        try:
+            blob = getattr(ts, "_blob", None) or getattr(ts, "cross_seed_blob", None)
+            return blob_common_top(blob) or ""
+        except Exception:
+            return ""
+
+    def _seed_root_for(self, ts: TorrentState, blob: bytes | None, base: Path) -> Path:
+        """Seed root for these blob bytes, given the row's physical layout.
+
+        A wrapped blob already carries its top folder in every relative
+        name, so it seeds at the mount root. A flat blob needs the row's
+        physical top folder as its save_path — that is the one-level
+        adjustment that lets a flat racing torrent seed beside a wrapped
+        download (and vice versa).
+        """
+        from .torrent_layout import blob_files, is_flat
+
+        try:
+            files = blob_files(blob)
+            names = [getattr(f, "name", "") or "" for f in files]
+        except Exception:
+            return Path(base)
+        if not names or not is_flat(names):
+            return Path(base)
+        sub = self._seed_subdir_for(ts)
+        return Path(base) / sub if sub else Path(base)
+
+    def _target_mount_for_ts_blob(self, ts: TorrentState, blob: bytes | None) -> Path:
+        """Kind mount + the row's physical top folder for this blob."""
+        base = self._target_mount_for_blob(blob, self._target_mount_for(ts))
+        return self._seed_root_for(ts, blob, base)
+
     def _target_mount_for_kind(self, kind: str, fallback: Path) -> Path:
         """Fuse mount for a classification kind; fallback on error/unknown-cfg."""
         try:
@@ -350,7 +397,8 @@ class FuseEntryMixin:
                 return Path(sp)
         except Exception:
             pass
-        return self._target_mount_for_blob(blob, fallback)
+        base = self._target_mount_for_blob(blob, fallback)
+        return self._seed_root_for(ts, blob, base)
 
     def _save_path_points_at_target(self, save_path: object, target_mount: object) -> bool:
         """Does an existing client entry point at the fuse target we inject to?

@@ -45,7 +45,6 @@ class ReinjectMixin:
                 watch_cross_dir,
             )
             return
-        ts_fallback_mount = self._target_mount_for(ts)
         injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
         injected_set = set(injected)
 
@@ -72,7 +71,7 @@ class ReinjectMixin:
                 return (p, None, "undecodable .torrent")
             # Fuse gate (fail-closed): never point a re-added torrent at
             # missing/unverifiable data.
-            target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
+            target_mount = self._target_mount_for_ts_blob(ts, blob)
             watch_expected = self._expected_fuse_files(blob)
             if not watch_expected:
                 return (p, (h_low, None, None), "cannot decode file list; skipping blind injection")
@@ -172,7 +171,6 @@ class ReinjectMixin:
         """Re-add every racing-client torrent matching this content onto VPS2
         pointing at the fuse mount with skip_check=True.
         """
-        ts_fallback_mount = self._target_mount_for(ts)
         injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
         injected_set = set(injected)
         added = 0
@@ -256,7 +254,7 @@ class ReinjectMixin:
                 )
             # Per-torrent mount: ts.kind may be stale "unknown" (fresh
             # adoption); the blob's own layout is authoritative.
-            target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
+            target_mount = self._target_mount_for_ts_blob(ts, blob)
             # Per-match fuse gate (fail-closed): only inject torrents
             # whose content is actually available at the target (same
             # release name does not guarantee the bytes were moved).
@@ -523,7 +521,7 @@ class ReinjectMixin:
             except Exception:
                 known = set()
             try:
-                ts_fallback_mount = self._target_mount_for(ts)
+                self._target_mount_for(ts)
             except Exception:
                 return
             added = 0
@@ -627,7 +625,7 @@ class ReinjectMixin:
                 if not match_expected:
                     continue
                 try:
-                    match_mount = self._target_mount_for_blob(_blob, ts_fallback_mount)
+                    match_mount = self._target_mount_for_ts_blob(ts, _blob)
                     match_missing = await self._missing_fuse_files(match_mount, match_expected)
                 except Exception:
                     continue

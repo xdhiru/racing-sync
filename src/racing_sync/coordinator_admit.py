@@ -245,7 +245,9 @@ class AdmitMixin(FuseAdmitMixin, WatchAdmitMixin, QueueAdmitMixin, LaneAdmitMixi
         leaked budget can never strand waiters.
         """
         try:
-            _fully_remote = await self._blob_fully_remote(blob, cache_key=ts.source_infohash)
+            _fully_remote = await self._blob_fully_remote(
+                blob, cache_key=ts.source_infohash, subdir=self._seed_subdir_for(ts)
+            )
         except Exception:
             _fully_remote = None
         if _fully_remote is True:

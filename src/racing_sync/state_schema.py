@@ -140,6 +140,9 @@ class TorrentState:
     total_bytes: int = 0
     # SSD-side state
     save_path: str = ""
+    # Physical top-level folder under the fuse seed mount ("" = mount root);
+    # seeded rows keep their real layout instead of the flat default.
+    seed_subdir: str = ""
     # Cross-seed bookkeeping
     cross_seed_infohash: str = ""  # prowlarr / SFTP-fetched torrent used on SSD
     cross_seed_source: str = ""  # "prowlarr" | "sftp" | "self"
@@ -239,6 +242,7 @@ class TorrentState:
             "classification_kind": self.classification_kind,
             "total_bytes": self.total_bytes,
             "save_path": self.save_path,
+            "seed_subdir": self.seed_subdir,
             "cross_seed_infohash": self.cross_seed_infohash,
             "cross_seed_source": self.cross_seed_source,
             "cross_seed_blob": self.cross_seed_blob,
@@ -316,6 +320,7 @@ _TORRENT_STATE_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
     ("classification_kind", "TEXT NOT NULL DEFAULT 'unknown'"),
     ("total_bytes", "INTEGER NOT NULL DEFAULT 0"),
     ("save_path", "TEXT NOT NULL DEFAULT ''"),
+    ("seed_subdir", "TEXT NOT NULL DEFAULT ''"),
     ("cross_seed_infohash", "TEXT NOT NULL DEFAULT ''"),
     ("cross_seed_source", "TEXT NOT NULL DEFAULT ''"),
     ("cross_seed_blob", "BLOB NOT NULL DEFAULT ''"),
@@ -361,7 +366,7 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = ", ".join(
 #: Bumped whenever a column spec or a data migration changes. Recorded in
 #: `meta` so an upgraded or downgraded DB shows up in the log; the column
 #: diff at open is the actual migration mechanism.
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 #: Persisted TorrentState fields: everything except the transient blob copy.
 _PERSISTED_FIELDS = frozenset(f.name for f in dataclass_fields(TorrentState)) - {"_blob"}

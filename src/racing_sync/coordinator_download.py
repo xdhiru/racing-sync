@@ -283,6 +283,7 @@ class DownloadMixin:
                         cur_skip = await self._fuse_skipped(
                             [(e.file_name, e.size_bytes) for e in cur_batch.episodes],
                             ts.classification_kind or "unknown",
+                            subdir=self._seed_subdir_for(ts),
                         )
                         expected_files = [
                             ep.file_name
@@ -964,6 +965,7 @@ class DownloadMixin:
         skip = await self._fuse_skipped(
             [(e.file_name, e.size_bytes) for e in cur.episodes],
             kind,
+            subdir=self._seed_subdir_for(ts),
         )
         prio_map = {f.name: 0 for f in files}
         for ep in cur.episodes:
@@ -1086,6 +1088,7 @@ class DownloadMixin:
             skip = await self._fuse_skipped(
                 [(e.file_name, e.size_bytes) for e in nxt.episodes],
                 kind,
+                subdir=self._seed_subdir_for(ts),
             )
         except Exception as e:
             # Fail closed: an unknown remote set must park, never

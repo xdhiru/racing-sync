@@ -343,7 +343,9 @@ class QueueAdmitMixin:
         # the SSD add entirely and go fuse-gated RE_ADDING, which
         # re-verifies before injecting. Fail-open: any doubt adds normally.
         try:
-            _fully_remote = await self._blob_fully_remote(blob, cache_key=ts.source_infohash)
+            _fully_remote = await self._blob_fully_remote(
+                blob, cache_key=ts.source_infohash, subdir=self._seed_subdir_for(ts)
+            )
         except Exception:
             _fully_remote = None
         if _fully_remote is True:
@@ -570,7 +572,9 @@ class QueueAdmitMixin:
         except Exception:
             return None
 
-    async def _blob_fully_remote(self, blob: bytes | None, *, cache_key: str = "") -> bool | None:
+    async def _blob_fully_remote(
+        self, blob: bytes | None, *, cache_key: str = "", subdir: str = ""
+    ) -> bool | None:
         """True iff every file in the .torrent bytes already sits verified on fuse.
 
         Admit-time shortcut so already-remote content never queues behind
@@ -598,14 +602,16 @@ class QueueAdmitMixin:
                 kind = _coordinator.classify(parsed, self.cfg).kind
             except Exception:
                 kind = "unknown"
-            skipped = await self._fuse_skipped(names, kind or "unknown")
+            skipped = await self._fuse_skipped(names, kind or "unknown", subdir=subdir)
             if not skipped:
                 return False
             return all(n in skipped for n, _ in names)
         except Exception:
             return None
 
-    async def _fuse_skipped(self, items: list[tuple[str, int]], kind: str) -> set[str]:
+    async def _fuse_skipped(
+        self, items: list[tuple[str, int]], kind: str, *, subdir: str = ""
+    ) -> set[str]:
         """Subset of torrent-relative names already complete on the fuse target.
 
         Lets reprocessing skip re-downloading batches a previous run already
@@ -614,6 +620,8 @@ class QueueAdmitMixin:
         final fuse gate re-verifies everything before injection).
         Returns the input names (exact strings) to skip.
         Delegates to fuse_gate.skipped_present (single implementation).
+        `subdir` is the row's physical top folder: flat names live one level
+        inside it, while wrapped names already carry their own top.
         """
         if not items:
             return set()
@@ -621,6 +629,13 @@ class QueueAdmitMixin:
             mount = self._target_mount_for_kind(kind, Path(self.rt.storage.save_path))
         except Exception:
             return set()
+        try:
+            from .torrent_layout import is_flat
+
+            if subdir and is_flat([name for name, _size in items]):
+                mount = Path(mount) / subdir
+        except Exception:
+            pass
         try:
             from .fuse_gate import skipped_present as _skipped_present
 
@@ -713,7 +728,11 @@ class QueueAdmitMixin:
             # need, no oversize failure — straight to MOVING (its branch
             # tolerates already-remote singles) for the fuse-gated finish.
             only = files[0]
-            if await self._fuse_skipped([(only.name, only.size_bytes)], cls.kind):
+            if await self._fuse_skipped(
+                [(only.name, only.size_bytes)],
+                cls.kind,
+                subdir=self._seed_subdir_for(ts),
+            ):
                 log.info("single file %s already on remote; skipping SSD download", only.name)
                 # No SSD footprint — free the admission estimate for waiters.
                 try:
@@ -851,6 +870,7 @@ class QueueAdmitMixin:
                 skip0 = await self._fuse_skipped(
                     [(e.file_name, e.size_bytes) for e in first.episodes],
                     cls.kind,
+                    subdir=self._seed_subdir_for(ts),
                 )
                 prio_map = {f.name: 0 for f in files}
                 first_need = {e.file_name for e in first.episodes} - skip0
@@ -906,6 +926,7 @@ class QueueAdmitMixin:
                 skip0 = await self._fuse_skipped(
                     [(e.file_name, e.size_bytes) for e in first.episodes],
                     cls.kind,
+                    subdir=self._seed_subdir_for(ts),
                 )
                 first_need = wanted - skip0
                 prio_map = {f.name: (1 if f.name in first_need else 0) for f in files}
@@ -940,6 +961,7 @@ class QueueAdmitMixin:
                     skip0 = await self._fuse_skipped(
                         [(e.file_name, e.size_bytes) for e in first.episodes],
                         cls.kind,
+                        subdir=self._seed_subdir_for(ts),
                     )
                     first_need = wanted - skip0
                     prio_map = {f.name: (1 if f.name in first_need else 0) for f in files}
