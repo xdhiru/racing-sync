@@ -1911,3 +1911,39 @@ async def test_public_branch_rejects_bytes_of_another_torrent():
     )
 
     assert decision is None or decision.source_label != "public-racing"
+
+
+@pytest.mark.anyio
+async def test_rate_limited_indexer_cools_down_for_other_rows():
+    """One 429 parks the indexer so every other parked row stops hammering it."""
+    from racing_sync.prowlarr import ProwlarrError
+
+    client = _refresh_client()
+    idx = Indexer(1, "indexer1", "torrent", True, [])
+    client._session.get.side_effect = [_err_cm(429, retry_after="0")] * 3
+
+    with pytest.raises(ProwlarrError):
+        await client.search_indexer(idx, "Show.S01E01.1080p")
+
+    assert client._session.get.call_count == 3
+    hits = await client.search_indexer(idx, "Other.Show.S02E02.1080p")
+    assert hits == []
+    assert client._session.get.call_count == 3
+
+
+@pytest.mark.anyio
+async def test_indexer_cooldown_clears_after_a_success():
+    import time
+
+    client = _refresh_client()
+    idx = Indexer(1, "indexer1", "torrent", True, [])
+    key = idx.name.lower()
+    client._cooldown_until[key] = time.monotonic() - 1
+    client._rate_limit_hits[key] = 3
+    client._session.get.side_effect = [_search_cm(_XML_ONE_HIT)]
+
+    hits = await client.search_indexer(idx, "Show.S01E01.1080p")
+
+    assert len(hits) == 1
+    assert key not in client._cooldown_until
+    assert key not in client._rate_limit_hits
