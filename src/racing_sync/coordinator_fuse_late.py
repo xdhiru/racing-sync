@@ -295,7 +295,8 @@ class LateSeedMixin:
                 t.name[:40],
             )
             try:
-                blob = await self._fetch_racing_torrent_bytes(t.infohash)
+                # DB first: the janitor may already have deleted VPS1.
+                blob = await self._load_racing_torrent_bytes(t.infohash)
             except Exception as e:  # noqa: BLE001
                 log.warning("late cross-seed: fetch %s failed: %s", t.infohash[:10], e)
                 self._failed_late_cross_seeds[h_low] = now_utc
@@ -572,7 +573,8 @@ class LateSeedMixin:
             ts.source_name[:40],
         )
         try:
-            blob = await self._fetch_racing_torrent_bytes(ts.source_infohash)
+            # DB first: VPS1 may already be cleaned for this row.
+            blob = await self._load_racing_torrent_bytes(ts.source_infohash)
         except Exception as e:  # noqa: BLE001
             log.warning("late cross-seed: repair fetch %s failed: %s", source_low[:10], e)
             self._failed_late_cross_seeds[source_low] = now_utc

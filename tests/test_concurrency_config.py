@@ -301,7 +301,8 @@ async def test_late_cross_seeds_handles_none_detail_and_expires_failures(tmp_pat
     coord.cfg.rclone.fuse.mount_unsorted = str(fuse_dir)
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord.dest_client = MagicMock()
-    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
+    # Late-seed/repair paths load racing bytes through the DB-first loader.
+    coord._load_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord._failed_late_cross_seeds = {}
 
     # add_torrent returns accepted=False and detail=None

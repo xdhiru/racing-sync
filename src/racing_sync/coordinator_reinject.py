@@ -241,12 +241,13 @@ class ReinjectMixin:
             if _group_is_ignored([t], getattr(self, "store", None)):
                 return (t, None, "cancelled; skipping")
             try:
-                blob = await self._fetch_racing_torrent_bytes(t.infohash)
+                # DB first: VPS1 may already be cleaned for this row.
+                blob = await self._load_racing_torrent_bytes(t.infohash)
             except Exception as e:  # noqa: BLE001
                 return (t, None, f"fetch failed ({e})")
             if not blob:
-                # SFTP clean-miss + no export endpoint (Deluge has no
-                # core.get_torrent_file) surface nowhere else — log
+                # DB miss + SFTP clean-miss + no export endpoint (Deluge has
+                # no core.get_torrent_file) surface nowhere else — log
                 # loudly so a skipped racing seed is visible.
                 return (
                     t,

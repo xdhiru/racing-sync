@@ -271,7 +271,8 @@ async def test_check_and_inject_late_cross_seeds(tmp_path: Path):
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord._save_path_points_at_target = MagicMock(return_value=True)
     coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path="x"))
-    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
+    # Late-seed/repair paths load racing bytes through the DB-first loader.
+    coord._load_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord.dest_client.add_torrent.return_value = AddResult(hash="newhash", accepted=True)
 
     ts = TorrentState(
@@ -350,7 +351,8 @@ async def test_check_and_inject_late_cross_seeds_recognizes_existing_torrent(tmp
     coord = make_coordinator()
     coord.dest_client = AsyncMock()
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
-    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
+    # Late-seed/repair paths load racing bytes through the DB-first loader.
+    coord._load_racing_torrent_bytes = AsyncMock(return_value=blob)
     # qBittorrent returns "Fails." because torrent is already in qBittorrent
     coord.dest_client.add_torrent.return_value = AddResult(
         hash=None, accepted=False, detail="Fails."
@@ -1585,7 +1587,8 @@ async def test_injected_hashes_capped_at_fifty(tmp_path: Path):
     target = coord._target_mount_for_blob(blob, fuse)
     (Path(target) / "Late.Arrival.mkv").write_bytes(b"l" * 100)
     new_h = "n" * 40
-    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
+    # Late-seed/repair paths load racing bytes through the DB-first loader.
+    coord._load_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord.dest_client.add_torrent = AsyncMock(
         return_value=AddResult(hash=new_h, accepted=True, detail="Ok.")
     )
@@ -1652,7 +1655,8 @@ async def test_fuse_outage_short_defers_never_30m_backoff(tmp_path: Path):
     target = coord._target_mount_for_blob(blob, fuse)
     (Path(target) / "Outage.Arrival.mkv").write_bytes(b"o" * 100)
     new_h = "e" * 40
-    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
+    # Late-seed/repair paths load racing bytes through the DB-first loader.
+    coord._load_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord.dest_client.add_torrent = AsyncMock(
         return_value=AddResult(hash=new_h, accepted=True, detail="Ok.")
     )

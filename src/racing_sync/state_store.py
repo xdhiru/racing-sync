@@ -1256,6 +1256,48 @@ class StateStore:
             )
             return (cur.rowcount or 0) > 0
 
+    def set_racing_blob(self, infohash: str, blob: bytes) -> bool:
+        """Persist a racing-client .torrent by hash (no torrent_state row needed).
+
+        Companion to `set_blob` (which is row-scoped): sibling racing
+        torrents of a content group have no row, but the janitor must
+        preserve their bytes before deleting the VPS1 copy.
+        """
+        self._ensure_open()
+        norm = (infohash or "").strip().lower()
+        if not norm or not blob:
+            return False
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO torrent_blob (infohash, blob, updated_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT(infohash) DO UPDATE SET "
+                    "blob = excluded.blob, updated_at = excluded.updated_at",
+                    (norm, bytes(blob), dt.datetime.now(dt.UTC).isoformat()),
+                )
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("state DB: could not cache .torrent for %s: %s", norm[:10], e)
+            return False
+
+    def get_racing_blob(self, infohash: str) -> bytes:
+        """Cached racing-client .torrent bytes, b"" when absent."""
+        self._ensure_open()
+        norm = (infohash or "").strip().lower()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT blob FROM torrent_blob WHERE infohash = ?", (norm,)
+            ).fetchone()
+            if row and row["blob"]:
+                return bytes(row["blob"])
+            return b""
+
+    def delete_racing_blob(self, infohash: str) -> None:
+        self._ensure_open()
+        norm = (infohash or "").strip().lower()
+        with self._lock:
+            self._conn.execute("DELETE FROM torrent_blob WHERE infohash = ?", (norm,))
+
     # Columns a narrow update may touch (everything but identity,
     # creation, and the tombstone stamp itself).
     _UPDATABLE_COLUMNS = frozenset(

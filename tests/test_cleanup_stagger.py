@@ -14,6 +14,19 @@ from racing_sync.config import CleanupConfig
 from racing_sync.state import State, StateStore, TorrentState
 
 
+def _stagger_member(h: str) -> Torrent:
+    """Group member carrying a real hash (the blob guard inspects members)."""
+    return Torrent(
+        hash=h,
+        name="x",
+        category="",
+        save_path="/vps1/data",
+        size_bytes=700,
+        state="seeding",
+        progress=1.0,
+    )
+
+
 def _stagger_pair(tmp_path: Path, db_name: str = "s.db", **cleanup_over):
     """Two eligible DONE rows with matching source members."""
     store = StateStore(tmp_path / db_name)
@@ -29,6 +42,9 @@ def _stagger_pair(tmp_path: Path, db_name: str = "s.db", **cleanup_over):
             state=State.DONE,
             completed_at=now - dt.timedelta(hours=100),
             vps1_last_activity_at=now - dt.timedelta(hours=10),
+            # Mark the racing copy injected so the pre-delete blob guard
+            # has nothing to preserve (these tests drive staggering only).
+            injected_private_hashes=h,
         )
         store.upsert(ts)
         rows.append(ts)
@@ -83,8 +99,8 @@ async def test_stagger_sleeps_between_group_deletes(tmp_path: Path):
     try:
         coord._cleanup_verdict = AsyncMock(
             side_effect=[
-                (0.0, 700.0, store.get("a" * 40), ["g1"]),
-                (1.0, 701.0, store.get("b" * 40), ["g2"]),
+                (0.0, 700.0, store.get("a" * 40), [_stagger_member("a" * 40)]),
+                (1.0, 701.0, store.get("b" * 40), [_stagger_member("b" * 40)]),
             ]
         )
         coord._delete_source_group = AsyncMock(return_value=True)
@@ -105,8 +121,8 @@ async def test_stagger_skipped_on_dry_run(tmp_path: Path):
     try:
         coord._cleanup_verdict = AsyncMock(
             side_effect=[
-                (0.0, 700.0, store.get("a" * 40), ["g1"]),
-                (1.0, 701.0, store.get("b" * 40), ["g2"]),
+                (0.0, 700.0, store.get("a" * 40), [_stagger_member("a" * 40)]),
+                (1.0, 701.0, store.get("b" * 40), [_stagger_member("b" * 40)]),
             ]
         )
         coord._delete_source_group = AsyncMock(return_value=True)
@@ -127,8 +143,8 @@ async def test_stagger_zero_disables_pause(tmp_path: Path):
     try:
         coord._cleanup_verdict = AsyncMock(
             side_effect=[
-                (0.0, 700.0, store.get("a" * 40), ["g1"]),
-                (1.0, 701.0, store.get("b" * 40), ["g2"]),
+                (0.0, 700.0, store.get("a" * 40), [_stagger_member("a" * 40)]),
+                (1.0, 701.0, store.get("b" * 40), [_stagger_member("b" * 40)]),
             ]
         )
         coord._delete_source_group = AsyncMock(return_value=True)
@@ -153,8 +169,8 @@ async def test_row_moved_since_verdict_keeps_vps1_copy(tmp_path: Path):
     coord, store = _stagger_pair(tmp_path, delete_stagger_seconds=0.0)
     try:
         verdicts = [
-            (0.0, 700.0, store.get("a" * 40), ["g1"]),
-            (1.0, 701.0, store.get("b" * 40), ["g2"]),
+            (0.0, 700.0, store.get("a" * 40), [_stagger_member("a" * 40)]),
+            (1.0, 701.0, store.get("b" * 40), [_stagger_member("b" * 40)]),
         ]
         calls = {"n": 0}
 
@@ -184,8 +200,8 @@ async def test_unchanged_rows_still_delete_after_recheck(tmp_path: Path):
     try:
         coord._cleanup_verdict = AsyncMock(
             side_effect=[
-                (0.0, 700.0, store.get("a" * 40), ["g1"]),
-                (1.0, 701.0, store.get("b" * 40), ["g2"]),
+                (0.0, 700.0, store.get("a" * 40), [_stagger_member("a" * 40)]),
+                (1.0, 701.0, store.get("b" * 40), [_stagger_member("b" * 40)]),
             ]
         )
         coord._delete_source_group = AsyncMock(return_value=True)
