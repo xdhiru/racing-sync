@@ -1,22 +1,43 @@
 # Racing Sync
 
-Two-VPS torrent synchroniser for racing workflows.
+Win the race on one client, keep seeding from another — automatically.
 
-- **VPS1** (source) — fast racing client (qBittorrent or Deluge) with autobrr.
-- **VPS2** (destination) — long-term seed client (qBittorrent) with SSD cap + rclone offload to remote storage.
+- **VPS1 / source** — fast racing client (qBittorrent or Deluge, usually
+  driven by autobrr).
+- **VPS2 / dest** — long-term seed client (qBittorrent) with SSD staging
+  and rclone offload to remote storage.
 
-Race on VPS1, seed forever from VPS2: racing-sync copies what matters
-to the VPS2 SSD, offloads it to remote storage with rclone, and keeps
-seeding from a fuse mount — automatically, with crash recovery.
+racing-sync watches the racing client, stages completed content on the
+destination SSD, offloads it to remote storage, and re-adds the torrents on
+the destination pointing at a fuse mount. Racing space can then be cleaned
+up on its own schedule while the long-term copy keeps seeding.
+
+## What it can do for you
+
+The pipeline is a chain — observe → acquire → stage → transfer → seed — and
+each link is pluggable, so the same daemon fits different setups:
+
+| Shape | What it does | Main config |
+| --- | --- | --- |
+| **Two boxes** (default) | Downloads via a download-target indexer or VPS1's own export, rclone-moves to remote, seeds from fuse | `[transfer] provider = "rclone"`, `[seed] provider = "path"` |
+| **One box** | Race and seed from one client; the racing copy is the staged copy, no second download | same host in `[client]` and `[dest]`, `[acquire] provider = "local"` |
+| **NAS / HDD** | Verified move into a mounted directory instead of rclone | `[transfer] provider = "local_move"` + `path` / `unsorted` |
+| **Adopt-only** | You place the bytes; the daemon verifies them at the seed path and never downloads | `[acquire] provider = "external"`, `[transfer] provider = "none"`, `[seed] provider = "existing"` |
+| **Short chain** | Stop after the download or the move | `[transfer] provider = "none"` / `[seed] provider = "none"` |
+
+Independent of the shape, optional pieces flip on with `config enable`:
+Prowlarr lookup for a private download target, watch-directory intake, the
+Telegram control plane, the HTTP API, and the VPS1 cleanup janitor.
 
 ## How it works
 
-1. **Spot it:** a new torrent appears on VPS1.
+1. **Spot it:** a new torrent appears on the racing client (polling or a
+   watch directory).
 2. **Find the best copy:** prefer a public copy when one exists, otherwise
    look the release up on private indexers via Prowlarr, otherwise
    export it directly from VPS1.
-3. **Stage it on SSD:** download it to the VPS2 SSD (big season packs in
-   small batches, so a 40 GB SSD can handle a 100 GB season).
+3. **Stage it on SSD:** download it to the destination SSD (big season
+   packs in small batches, so a 40 GB SSD can handle a 100 GB season).
 4. **Offload it:** `rclone move` verified files to the remote
    (movies/seasons to `remote:qbittorrent/`, single episodes to
    `.../unsorted/`).
@@ -26,14 +47,15 @@ seeding from a fuse mount — automatically, with crash recovery.
 Only verified-complete files reach the remote; every fuse re-add is
 confirmed visible before marking done; anything already on fuse skips
 straight to seeding. State lives in SQLite, so restarts resume
-mid-pipeline. Public torrents land paused by default. Full design in
-`docs/architecture.md`.
+mid-pipeline. Public torrents land paused by default. When a link is
+missing the chain simply ends there — a finished download or move becomes
+`DONE`. Full design in `docs/architecture.md`.
 
 ## Quickstart
 
-Requires Python 3.11+, plus system `rclone` binary (absolute path, probed by
-`check-config`) and `sqlite3` CLI for manual DB inspection. Install into a
-virtualenv — system-wide `pip install`
+Requires Python 3.11+. Rclone shapes also need the system `rclone` binary
+(absolute path, probed by `check-config`); the `sqlite3` CLI is handy for
+manual DB inspection. Install into a virtualenv — system-wide `pip install`
 fails on modern distros (`externally-managed-environment`, don't bypass it
 with `--break-system-packages`):
 
@@ -52,15 +74,32 @@ API, `-e ".[test]"` for tests) — same packages, installed editable.
 
 Run straight from source — no install step beyond that, so `git pull` +
 restart is the upgrade (re-run `pip install -r requirements.txt` only when
-dependencies change):
+dependencies change).
+
+### 1. Write and shape the config
 
 ```bash
-python3 run.py config init --config config.toml   # one-screen single-box starter
-# edit the hosts and three paths
+python3 run.py config init --config config.toml
+```
+
+The starter is a one-screen single-box config. For the usual two-box setup,
+point `[dest]` at VPS2, then fill the paths in `[storage]` (SSD staging),
+`[remote]` (rclone destinations) and `[seed]` (fuse mount or plain seed
+directory). For NAS/HDD or adopt-only, set the providers from the table
+above — `config.example.toml` documents every key and provider.
+
+### 2. Check, then run
+
+```bash
 python3 run.py check-config --config config.toml  # chain report + pre-flight
 python3 run.py run --config config.toml
 # Ctrl+C stops gracefully
 ```
+
+`check-config` prints the resolved chain and warns on unknown config keys
+(typo catcher) and on legal-but-foggy setups: an unmounted fuse path, a
+watch glob that cannot match a `.torrent`, relative paths, a cap above the
+disk, or a shared remote path.
 
 There is no config reload: restart the daemon after editing `config.toml`.
 `config.example.toml` remains the full reference for every key.
@@ -134,18 +173,6 @@ command with a description — the full list is in
 Targets accept a space (`/cancel 3`) or an underscore (`/cancel_3`).
 Nothing is deleted without an explicit choice; fuse/remote copies are never
 touched.
-
-`check-config` also warns on unknown config keys (typo catcher) and on
-legal-but-foggy setups: an unmounted fuse path, a watch glob that cannot
-match a `.torrent`, relative paths, a cap above the disk, or a shared
-remote path.
-
-## Status
-
-The correctness/robustness audit is closed: every finding in
-`docs/code-audit.md` is implemented or resolved by design, with the status
-ledger at the end of that document. Throughput tuning was explicitly out of
-scope for that pass.
 
 ## Layout
 
