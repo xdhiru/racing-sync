@@ -19,6 +19,7 @@ from racing_sync.config_disposition import (
     REMOVED,
     RENAMES,
     SUPPORTED_PROVIDERS,
+    canonical_leaves,
     disposition,
     extras_prefixes,
     model_leaves,
@@ -26,6 +27,9 @@ from racing_sync.config_disposition import (
 )
 
 FIELDS = {".".join(path) for path in model_leaves(AppConfig) | extras_prefixes(AppConfig)}
+CANONICAL, _CANONICAL_PREFIXES = canonical_leaves(AppConfig)
+#: Top-level internal table -> its capability-chain spelling.
+_CHAIN_TWIN = {old: new for old, new in RENAMES.items() if "." not in old}
 
 
 def _covers(prefix: str, path: str) -> bool:
@@ -73,8 +77,31 @@ def test_deprecated_and_removed_keys_exist():
         assert path in FIELDS, f"deprecated key {path!r} is not a schema field"
         assert hint.strip(), f"deprecated key {path!r} has no replacement hint"
     for path, hint in REMOVED.items():
-        assert path in FIELDS, f"removed key {path!r} is not a schema field"
         assert hint.strip(), f"removed key {path!r} has no migration hint"
+        # A removed key is history. It must not be a live field of EITHER
+        # spelling, or `_reject_removed` would refuse a valid file: the
+        # check runs on the raw data, before the rename absorbs the table.
+        assert path not in FIELDS, f"removed key {path!r} is still a schema field"
+        assert path not in CANONICAL, f"removed key {path!r} is still a canonical key"
+
+
+def test_removed_keys_are_registered_under_both_spellings():
+    """Every rename is refused on the internal AND the chain path.
+
+    `config_alias._reject_removed` runs before `_move_new_to_internal`, so a
+    key registered under one spelling only would be pruned as unknown on the
+    other path — a warning where the operator asked for a hard error.
+    """
+    heads = {p.split(".", 1)[0] for p in REMOVED}
+    assert "cross_seed" in heads and "acquire" in heads
+    twins = dict(_CHAIN_TWIN)
+    twins.update({new: old for old, new in _CHAIN_TWIN.items()})
+    for path in REMOVED:
+        tail = path.split(".", 1)[1]
+        head = path.split(".", 1)[0]
+        counterpart = twins.get(head)
+        assert counterpart, f"{path!r} has no known twin table"
+        assert f"{counterpart}.{tail}" in REMOVED, f"{path!r} is missing its twin entry"
 
 
 def test_new_only_keys_live_outside_the_internal_namespace():

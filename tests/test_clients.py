@@ -16,6 +16,54 @@ def test_instantiate_qbittorrent_client():
     assert client._add_lock is not None
 
 
+def test_http_pool_shape_is_http_base_default_of_record(monkeypatch):
+    """The unreachable pool knobs are gone; the numbers they carried are not.
+
+    `HTTPClientConfig` used to declare `pool_limit` / `pool_per_host` /
+    `dns_cache_ttl_seconds`, but `from_source`/`from_dest` never set them and
+    neither `[source]` nor `[dest]` carries such a key, so every instance
+    simply held the field defaults (100 / 20 / 300) — an operator could not
+    have changed them. Deleting the fields hands those three numbers to
+    `clients/http_base._connector_for`, whose own fallbacks are the same
+    literals, so the connector an actual config produces is exactly what it
+    was. `[indexers]` keeps its real, settable pool keys.
+    """
+    from racing_sync.clients import http_base
+    from racing_sync.config import HTTPClientConfig, ProwlarrConfig
+
+    seen: list[dict] = []
+
+    class _Recording:
+        def __init__(self, **kwargs):
+            seen.append(kwargs)
+
+    monkeypatch.setattr(http_base.aiohttp, "TCPConnector", _Recording)
+
+    def shape(cfg) -> tuple:
+        built = http_base._connector_for(cfg)
+        assert built is not None
+        kwargs = seen[-1]
+        return kwargs["limit"], kwargs["limit_per_host"], kwargs["ttl_dns_cache"]
+
+    for built in (
+        HTTPClientConfig.from_source(
+            SourceConfig(type="qbittorrent", host="http://127.0.0.1:8080")
+        ),
+        HTTPClientConfig.from_dest(
+            DestConfig(type="qbittorrent", host="http://127.0.0.1:8080", save_path="/downloads")
+        ),
+    ):
+        assert not hasattr(built, "pool_limit")
+        assert not hasattr(built, "pool_per_host")
+        assert not hasattr(built, "dns_cache_ttl_seconds")
+        assert shape(built) == (100, 20, 300)
+
+    # The section the operator CAN set still reaches the client untouched.
+    tuned = ProwlarrConfig(pool_limit=64, pool_per_host=8, dns_cache_ttl_seconds=45)
+    assert (tuned.pool_limit, tuned.pool_per_host, tuned.dns_cache_ttl_seconds) == (64, 8, 45)
+    assert shape(tuned) == (64, 8, 45)
+
+
 def test_instantiate_deluge_client():
     cfg = SourceConfig(
         type="deluge",

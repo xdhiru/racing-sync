@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:eeda25a320612077",
+  "digest": "sha256:046b37d0af6125f2",
   "keys": {
     "by_section": {
       "acquire": 9,
@@ -71,9 +71,9 @@
       "allow_prowlarr_cross_seed": true,
       "allow_ssh_export": true,
       "fallback_to_racing_torrent_on_prowlarr_timeout": false,
+      "indexer_wait_seconds": 28800,
       "inject_racing_torrents_to_fuse": true,
       "pause_public_torrents_on_fuse": true,
-      "prowlarr_max_age_seconds": 28800,
       "prowlarr_retry_interval_seconds": 900,
       "public_export_retry_interval_seconds": 1800,
       "refetch_public_via_prowlarr": false
@@ -220,13 +220,13 @@
       "rclone_push": {
         "auto_on_prowlarr_timeout": false,
         "bwlimit": "",
-        "check_interval_seconds": 120,
-        "deadline_seconds": 21600,
         "enabled": false,
         "max_concurrent_pushes": 1,
+        "poll_seconds": 120,
         "push_on_janitor_pressure": false,
         "rclone_bin": "rclone",
         "remote_name": "",
+        "timeout_seconds": 21600,
         "transfers": 4
       },
       "type": "qbittorrent",

@@ -111,11 +111,15 @@ the bytes, so VPS1 can run a detached `rclone copy` onto the same remote
 VPS2 seeds from instead of leeching them a second time. It is a copy, never
 a move: deleting VPS1's files mid-race would cost the ratio, and deletion
 stays the janitor's job. A live push parks its row — no SSD reservation, no
-timeout leech, no max-age `FAILED` — and same-content siblings defer to it,
-so one copy serves the group. Progress is one metadata listing per check
-interval (never a content read), and the existing fuse-evidence path admits
-the row and injects. `/push_source` or the act-sheet button starts one by
-hand; `auto_on_prowlarr_timeout` makes the timeout prefer it over the VPS2
+timeout leech, no `FAILED` for an expired indexer wait — and same-content
+siblings defer to it, so one copy serves the group. Two of the section's own
+timers bound it: `timeout_seconds` is the ceiling for one push (same verb as
+`[transfer].timeout_seconds`, never the same value) and `poll_seconds` is the
+cadence of the metadata-only progress listing — never a content read. The
+existing fuse-evidence path then admits the row and injects. `/push_source`
+or the act-sheet button starts one by hand; `auto_on_prowlarr_timeout` makes
+the timeout — `[acquire].indexer_wait_seconds` counted from the first query,
+a wait window rather than a staleness bound — prefer the push over the VPS2
 leech, which stays as the fallback. `push_on_janitor_pressure` adds a third
 trigger that invents no clock: it consumes the cleanup janitor's existing
 verdict (`bursting`/`urgent` from `[cleanup]`'s low watermark and arrival-rate

@@ -1096,7 +1096,7 @@ def test_config_strategy_rejects():
     assert ProwlarrConfig(skip_query_substrings=["ab"]).skip_query_substrings == ["ab"]
     # Retry must fit inside the max-age window.
     with pytest.raises(ValidationError, match="must be less than"):
-        CrossSeedConfig(prowlarr_retry_interval_seconds=86400, prowlarr_max_age_seconds=3600)
+        CrossSeedConfig(prowlarr_retry_interval_seconds=86400, indexer_wait_seconds=3600)
     # Refetch without Prowlarr queries is a silent no-op.
     with pytest.raises(ValidationError, match="silent no-op"):
         CrossSeedConfig(refetch_public_via_prowlarr=True, allow_prowlarr_cross_seed=False)

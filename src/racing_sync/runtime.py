@@ -305,8 +305,8 @@ class PushSettings:
         return sftp if sftp is not None and getattr(sftp, "enabled", False) else None
 
     @property
-    def deadline_seconds(self) -> int:
-        return int(self._field("deadline_seconds", 21600) or 0)
+    def timeout_seconds(self) -> int:
+        return int(self._field("timeout_seconds", 21600) or 0)
 
     @property
     def remote_name(self) -> str:
@@ -330,8 +330,8 @@ class PushSettings:
         return int(self._field("max_concurrent_pushes", 1) or 1)
 
     @property
-    def check_interval_seconds(self) -> int:
-        return int(self._field("check_interval_seconds", 120) or 120)
+    def poll_seconds(self) -> int:
+        return int(self._field("poll_seconds", 120) or 120)
 
 
 class SeedSettings:
@@ -464,16 +464,18 @@ class AcquireSettings:
         return self._cfg.cross_seed.prowlarr_retry_interval_seconds
 
     @property
-    def prowlarr_max_age_seconds(self) -> int:
-        return self._cfg.cross_seed.prowlarr_max_age_seconds
+    def indexer_wait_seconds(self) -> int:
+        return self._cfg.cross_seed.indexer_wait_seconds
 
     @property
     def public_export_retry_interval_seconds(self) -> int:
         return self._cfg.cross_seed.public_export_retry_interval_seconds
 
-    @property
-    def preferred_copy_grace_seconds(self) -> int:
-        return self._cfg.general.preferred_copy_grace_seconds
+    # No `preferred_copy_grace_seconds` view: `coordinator_admit_watch
+    # ._preferred_grace_seconds` reads `cfg.general` directly because it
+    # fails closed (any non-numeric or negative value reads 0, so a
+    # half-built config double never delays admission). A plain delegating
+    # property could not carry that guard, so it was dead surface.
 
 
 class LimitsSettings:
@@ -498,9 +500,11 @@ class LimitsSettings:
     def dest_poll_interval(self) -> int:
         return self._cfg.general.dest_poll_interval
 
-    @property
-    def rpc_timeout_seconds(self) -> int:
-        return self._cfg.general.client_rpc_timeout_seconds
+    # No `rpc_timeout_seconds` view: the budget is read by
+    # `io_bounds.rpc_timeout_seconds(cfg)`, which takes `AppConfig` (or
+    # None) and clamps it into [5, 300] with a fail-safe default. The call
+    # sites are outside the coordinator and hold no Runtime, so a
+    # delegating property here was dead surface.
 
     @property
     def download_stall_timeout_seconds(self) -> int:

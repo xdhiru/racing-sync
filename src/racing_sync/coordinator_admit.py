@@ -154,8 +154,8 @@ class AdmitMixin(FuseAdmitMixin, WatchAdmitMixin, QueueAdmitMixin, LaneAdmitMixi
                     _skip_title = self.rt.indexers.should_skip_title(st.name) is True
                 except Exception:
                     _skip_title = False
-                # Skipped titles park on the public (max-age-free) schedule:
-                # no query will ever run for them, so the indexer max-age
+                # Skipped titles park on the public (wait-free) schedule:
+                # no query will ever run for them, so the indexer wait
                 # clock must not FAILED them for it.
                 park_reason = (
                     "source export miss"
@@ -200,7 +200,7 @@ class AdmitMixin(FuseAdmitMixin, WatchAdmitMixin, QueueAdmitMixin, LaneAdmitMixi
                 and not self._push_is_live(ts.source_infohash)
             ):
                 # Automatic fallback (opt-in): the download-target indexers
-                # never produced this release within prowlarr_max_age_seconds.
+                # never produced this release within indexer_wait_seconds.
                 # Use the racing client's own bytes instead of FAILED — VPS2
                 # then leeches the private swarm (counts toward ratio).
                 log.info(
@@ -491,7 +491,7 @@ class AdmitMixin(FuseAdmitMixin, WatchAdmitMixin, QueueAdmitMixin, LaneAdmitMixi
         # later windows skip the scan while it is live) instead of a
         # second Prowlarr search + duplicate download. The WAITING_INDEXER
         # retry clock still bounds the wait: owner death hands back
-        # control, max-age fails eventually. Fail-open: any doubt picks.
+        # control, the indexer wait fails eventually. Fail-open: any doubt picks.
         try:
             _new_leader = self._inflight_same_content(ts)
         except Exception:
@@ -761,7 +761,7 @@ class AdmitMixin(FuseAdmitMixin, WatchAdmitMixin, QueueAdmitMixin, LaneAdmitMixi
         # copy racing the Prowlarr search) — skip this window's search and
         # stay parked instead of polling Prowlarr for duplicate bytes. The
         # existing retry timer is pushed one quiet interval (attempts and
-        # the max-age clock untouched), so a stalled/failed sibling hands
+        # the indexer-wait clock untouched), so a stalled/failed sibling hands
         # back control on a later window. Fail-open: any doubt picks.
         try:
             _leader = self._inflight_same_content(ts)

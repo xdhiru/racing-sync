@@ -18,10 +18,12 @@ from racing_sync.state import State
 
 FIXTURES = Path(__file__).parent / "fixtures" / "config"
 
-# Re-baselined for the prowlarr_max_age_seconds default (86400 -> 28800),
-# then for the optional [source.rclone_push] section (149 -> 158 modelled
-# keys; every digest moves because the resolved model gained a field).
-_FULL = "sha256:f9f0b32cf83aabf8"
+# Re-baselined for the indexer-wait default (86400 -> 28800), then for the
+# optional [source.rclone_push] section (149 -> 158 modelled keys; every
+# digest moves because the resolved model gained a field), then for the
+# key renames of the config-surface cleanup (same values, new names, so the
+# digest moves again while every resolved number stays put).
+_FULL = "sha256:b652d9dd290a99cc"
 
 _DOWNLOAD_ONLY = """
 [general]

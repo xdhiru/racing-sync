@@ -21,6 +21,7 @@ from racing_sync.config_disposition import (
     DEFAULT_PROVIDER,
     LINK_PROVIDERS,
     NEW_ONLY,
+    REMOVED,
     SUPPORTED_PROVIDERS,
 )
 from racing_sync.config_summary import summarize
@@ -615,15 +616,15 @@ _PUSH_TEMPLATES = {"client": _PUSH_NEW, "source": _PUSH_OLD}
 
 # (field, TOML value, expected value, a sibling left alone, that sibling's default)
 _PUSH_FIELDS = [
-    ("deadline_seconds", "900", 900, "transfers", 4),
+    ("timeout_seconds", "900", 900, "transfers", 4),
     ("remote_name", '"other-remote"', "other-remote", "rclone_bin", "rclone"),
     ("rclone_bin", '"/opt/local/bin/rclone"', "/opt/local/bin/rclone", "transfers", 4),
     ("transfers", "9", 9, "max_concurrent_pushes", 1),
-    ("bwlimit", '"42M"', "42M", "check_interval_seconds", 120),
+    ("bwlimit", '"42M"', "42M", "poll_seconds", 120),
     ("max_concurrent_pushes", "3", 3, "transfers", 4),
-    ("check_interval_seconds", "45", 45, "deadline_seconds", 21600),
-    ("auto_on_prowlarr_timeout", "true", True, "deadline_seconds", 21600),
-    ("push_on_janitor_pressure", "true", True, "deadline_seconds", 21600),
+    ("poll_seconds", "90", 90, "timeout_seconds", 21600),
+    ("auto_on_prowlarr_timeout", "true", True, "timeout_seconds", 21600),
+    ("push_on_janitor_pressure", "true", True, "timeout_seconds", 21600),
 ]
 
 
@@ -676,6 +677,83 @@ def test_unknown_push_sibling_is_pruned_loudly(spelling: str, path: str, tmp_pat
     messages = [r.getMessage() for r in caplog.records if "possible typo" in r.getMessage()]
     assert any("rclone_push" in m and "hots" in m for m in messages), messages
     assert path in summarize(cfg, cfg_file)["keys"]["unknown"]
+
+
+# ---------------------------------------------------------------------------
+# Renamed keys: the old spelling must REFUSE, under both table spellings.
+#
+# `_reject_removed` runs *before* the rename absorbs the table, so every
+# renamed key is registered twice (internal `cross_seed.` / `source.` and
+# chain `acquire.` / `client.`). Registered under one spelling only, the
+# other path would fall through to `_prune_unknown` and the operator would
+# get a warning instead of the hard error — they edit the live file by hand
+# and asked for fail-loud.
+
+_RENAMED_KEYS = (
+    # (old key, new key, value legal for the new bounds)
+    ("prowlarr_max_age_seconds", "indexer_wait_seconds", 28800),
+    ("deadline_seconds", "timeout_seconds", 900),
+    ("check_interval_seconds", "poll_seconds", 90),
+)
+
+_REMOVED_PAIRS = (
+    ("cross_seed.prowlarr_max_age_seconds", "acquire.prowlarr_max_age_seconds"),
+    ("source.rclone_push.deadline_seconds", "client.rclone_push.deadline_seconds"),
+    ("source.rclone_push.check_interval_seconds", "client.rclone_push.check_interval_seconds"),
+)
+
+
+def _renamed_text(spelling: str, key: str, value: int) -> str:
+    """A complete config carrying `key` in the tables `spelling` names them."""
+    if key.endswith("_max_age_seconds") or key == "indexer_wait_seconds":
+        # The wait window lives in its own table, outside the push template.
+        table = "acquire" if spelling == "client" else "cross_seed"
+        base = _PUSH_TEMPLATES[spelling].format(push="")
+        return f"{base}\n[{table}]\n{key} = {value}\n"
+    return _PUSH_TEMPLATES[spelling].format(push=f"{key} = {value}")
+
+
+@pytest.mark.parametrize(("old", "new", "value"), _RENAMED_KEYS)
+@pytest.mark.parametrize("spelling", ["client", "source"])
+def test_old_spelling_of_a_renamed_key_refuses_the_whole_load(
+    spelling: str, old: str, new: str, value: int, tmp_path: Path
+):
+    """Both spellings raise, and the message names the replacement key."""
+    cfg_file = _config_file(tmp_path, _renamed_text(spelling, old, value))
+
+    with pytest.raises(ValueError) as refused:
+        AppConfig.from_toml(cfg_file)
+    message = str(refused.value)
+    assert old in message, message
+    assert "renamed to" in message, message
+    assert new in message, message
+
+    # The same file with the new name loads, and nothing is pruned as unknown.
+    loaded = AppConfig.from_toml(_config_file(tmp_path, _renamed_text(spelling, new, value)))
+    if old == "prowlarr_max_age_seconds":
+        assert loaded.cross_seed.indexer_wait_seconds == value
+    else:
+        assert getattr(loaded.source.rclone_push, new) == value
+
+
+@pytest.mark.parametrize(("internal", "chain"), _REMOVED_PAIRS)
+def test_each_rename_is_registered_under_both_spellings_with_one_message(internal: str, chain: str):
+    """The pair shares one message object, so the two paths cannot drift."""
+    assert REMOVED[internal] == REMOVED[chain], (internal, chain)
+    assert "renamed to" in REMOVED[internal], internal
+
+
+def test_the_push_poll_floor_is_the_model_bound_not_a_second_clamp(tmp_path: Path):
+    """`poll_seconds` refuses below its model floor instead of being clamped.
+
+    The cadence used to carry two floors — `ge=30` on the field, `max(60)` in
+    the reader — so a file asking for 30 silently ran at 60. One source of
+    truth now: the bound rejects it and the reader takes the value as given.
+    """
+    text = _PUSH_TEMPLATES["client"].format(push="poll_seconds = 30")
+
+    with pytest.raises(ValueError, match="poll_seconds"):
+        AppConfig.from_toml(_config_file(tmp_path, text))
 
 
 def test_push_preferring_the_timeout_needs_the_master_switch(tmp_path: Path):

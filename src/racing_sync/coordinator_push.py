@@ -61,7 +61,7 @@ log = logging.getLogger("racing_sync.coordinator")
 
 #: Park reason while a push owns the content (see `_push_park_row`). The
 #: indexer park path recognises it only through `push_is_live`, so the row
-#: re-arms on the push check cadence instead of hitting the max-age FAILED.
+#: re-arms on the push poll cadence instead of hitting the indexer-wait FAILED.
 PUSH_PARK_REASON = "push from VPS1 in flight"
 
 #: Row states a push may never take over: VPS2 is already working on the
@@ -80,12 +80,13 @@ _PUSH_ADMITTABLE = frozenset({State.NEW, State.WAITING_INDEXER, State.WAITING_DI
 #: long-lived process cannot grow with the number of pushes ever run.
 _PUSH_WANTED_CAP = 500
 
-#: Fallback for a corrupt/absent cadence value (seconds).
-_DEFAULT_CHECK_S = 120.0
-_DEFAULT_DEADLINE_S = 21600
+#: Fallback for a corrupt/absent push cadence or ceiling (seconds).
+#: Both equal the documented model defaults of [source.rclone_push] / [client.rclone_push].
+_DEFAULT_POLL_S = 120.0
+_DEFAULT_TIMEOUT_S = 21600
 
 #: How long a refused pressure push is left alone, as a MULTIPLE of the push
-#: check cadence (no new duration knob — the cadence is already the push's
+#: poll cadence (no new duration knob — the cadence is already the push's
 #: clock). Long enough that a push which can never run (VPS1 holds nothing
 #: complete) does not hot-loop every poll; short enough that a refusal which
 #: was only "cap full" / a preflight blip is retried within minutes.
@@ -217,17 +218,19 @@ class PushMixin:
 
     # ---- typed settings (each guarded) ---------------------------------- #
 
-    def _push_check_interval(self) -> float:
+    def _push_poll_seconds(self) -> float:
+        """Progress-poll cadence; `[...rclone_push].poll_seconds` is the floor."""
         try:
-            return max(60.0, float(self.rt.push.check_interval_seconds))
+            return float(self.rt.push.poll_seconds)
         except Exception:
-            return _DEFAULT_CHECK_S
+            return _DEFAULT_POLL_S
 
-    def _push_deadline(self) -> dt.timedelta:
+    def _push_timeout(self) -> dt.timedelta:
+        """The push's own ceiling; `[...rclone_push].timeout_seconds` bounds it."""
         try:
-            return dt.timedelta(seconds=max(600, int(self.rt.push.deadline_seconds)))
+            return dt.timedelta(seconds=int(self.rt.push.timeout_seconds))
         except Exception:
-            return dt.timedelta(seconds=_DEFAULT_DEADLINE_S)
+            return dt.timedelta(seconds=_DEFAULT_TIMEOUT_S)
 
     def _push_max_concurrent(self) -> int:
         try:
@@ -352,7 +355,7 @@ class PushMixin:
             target_remote=target_remote,
             files=tuple(files),
         )
-        deadline_at = dt.datetime.now(dt.UTC) + self._push_deadline()
+        deadline_at = dt.datetime.now(dt.UTC) + self._push_timeout()
         try:
             claimed = await offload(
                 store.claim_push,
@@ -417,7 +420,7 @@ class PushMixin:
         except Exception as e:  # noqa: BLE001
             log.warning("push: could not stamp the checkpoint for %s: %s", h[:10], e)
         self._remember_wanted(h, files)
-        # Hand the row to the push (parked, on the check cadence). If the row
+        # Hand the row to the push (parked, on the poll cadence). If the row
         # cannot be parked cleanly the copy still runs on VPS1, but nothing
         # may be suppressed for it: settle the checkpoint as abandoned so the
         # pipeline picks up exactly where it was today.
@@ -797,7 +800,7 @@ class PushMixin:
         all while the switch is off. Progress is one metadata-only
         ``rclone lsf -R --files-only`` per push against the seed remote —
         never the fuse mount, never VPS2's SSD, never a content read — so at
-        most one remote listing per push per `check_interval_seconds`. When
+        most one remote listing per push per `poll_seconds`. When
         the remote holds every expected file the push goes `verifying` and
         the EXISTING evidence path (`_fuse_content_evidence` ->
         `_admit_fuse_existing` -> the all-remote shortcut) admits the row
@@ -818,7 +821,7 @@ class PushMixin:
             return
         if not isinstance(pushes, list) or not pushes:
             return
-        interval = self._push_check_interval()
+        interval = self._push_poll_seconds()
         now = dt.datetime.now(dt.UTC)
         for push in pushes:
             try:
@@ -1087,9 +1090,9 @@ class PushMixin:
     def _push_pressure_backoff_seconds(self) -> float:
         """TTL for a refused pressure push: a multiple of the push cadence."""
         try:
-            return max(60.0, float(self._push_check_interval()) * _PRESSURE_BACKOFF_MULTIPLIER)
+            return max(60.0, float(self._push_poll_seconds()) * _PRESSURE_BACKOFF_MULTIPLIER)
         except Exception:
-            return _DEFAULT_CHECK_S * _PRESSURE_BACKOFF_MULTIPLIER
+            return _DEFAULT_POLL_S * _PRESSURE_BACKOFF_MULTIPLIER
 
     def _push_pressure_backed_off(self, infohash: str) -> bool:
         """True while a refusal for this hash is still being deferred."""
@@ -1137,7 +1140,7 @@ class PushMixin:
         row listing) unless `push_on_janitor_pressure` is on next to the
         master switch. Why this exists: a release that found no cross-seed
         parks on the indexer window (up to
-        `[acquire].prowlarr_max_age_seconds`), so a burst of arrivals fills
+        `[acquire].indexer_wait_seconds`), so a burst of arrivals fills
         VPS1 while every one of those rows calmly waits for a Prowlarr hit
         that may never come, and the automation stalls until a human taps
         `/push_source`. The janitor already decides when space is critical —
@@ -1188,8 +1191,8 @@ class PushMixin:
     def _park_behind_push(self, ts: TorrentState) -> None:
         """Park a row on the push cadence instead of admitting it to SSD.
 
-        Rides the indexer park, whose max-age branch re-arms on
-        `check_interval_seconds` while a push is live, and keeps
+        Rides the indexer park, whose expired-window branch re-arms on
+        `poll_seconds` while a push is live, and keeps
         `indexer_first_queried_at` untouched so a push that dies still hits
         the normal ceiling on the very next park. Anything the transition
         schema forbids degrades to a narrow same-state park — this must never

@@ -114,9 +114,9 @@ def _push_cfg(
     cfg.source.rclone_push = RclonePushConfig(
         enabled=enabled,
         auto_on_prowlarr_timeout=auto and enabled,
-        deadline_seconds=deadline,
+        timeout_seconds=deadline,
         max_concurrent_pushes=cap,
-        check_interval_seconds=check_s,
+        poll_seconds=check_s,
     )
     cfg.rclone.remote.default = SORTED_REMOTE
     cfg.rclone.remote.unsorted = UNSORTED_REMOTE
@@ -705,7 +705,7 @@ async def test_live_push_blocks_the_timeout_leech_and_the_reservation(tmp_path):
         h = _hash_of(blob)
         _live_push(store, h, expires_in=dt.timedelta(minutes=30))
         past = dt.datetime.now(dt.UTC) - dt.timedelta(
-            seconds=cfg.cross_seed.prowlarr_max_age_seconds + 60
+            seconds=cfg.cross_seed.indexer_wait_seconds + 60
         )
         _row(
             store,
@@ -796,7 +796,7 @@ async def test_live_push_does_not_fail_the_row_at_max_age(tmp_path):
         blob = _single_blob(EPISODE_NAME, 2000)
         h = _hash_of(blob)
         past = dt.datetime.now(dt.UTC) - dt.timedelta(
-            seconds=cfg.cross_seed.prowlarr_max_age_seconds + 60
+            seconds=cfg.cross_seed.indexer_wait_seconds + 60
         )
         _live_push(store, h, expires_in=dt.timedelta(minutes=30))
         _row(
@@ -1015,7 +1015,7 @@ async def test_deadline_fails_the_checkpoint_and_today_resumes(tmp_path, transpo
         blob = _single_blob(EPISODE_NAME, 2000)
         h = _hash_of(blob)
         past = dt.datetime.now(dt.UTC) - dt.timedelta(
-            seconds=cfg.cross_seed.prowlarr_max_age_seconds + 60
+            seconds=cfg.cross_seed.indexer_wait_seconds + 60
         )
         # A live-in-state, expired-in-fact checkpoint (what a copy that never
         # finished leaves behind): the record is RUNNING but the deadline is
@@ -1195,7 +1195,7 @@ async def test_auto_off_never_pushes_and_the_leech_still_runs(tmp_path):
         blob = _single_blob(EPISODE_NAME, 2000)
         h = _hash_of(blob)
         past = dt.datetime.now(dt.UTC) - dt.timedelta(
-            seconds=cfg.cross_seed.prowlarr_max_age_seconds + 60
+            seconds=cfg.cross_seed.indexer_wait_seconds + 60
         )
         _row(
             store,
@@ -1230,7 +1230,7 @@ async def test_auto_on_pushes_before_leeching(tmp_path):
         blob = _single_blob(EPISODE_NAME, 2000)
         h = _hash_of(blob)
         past = dt.datetime.now(dt.UTC) - dt.timedelta(
-            seconds=cfg.cross_seed.prowlarr_max_age_seconds + 60
+            seconds=cfg.cross_seed.indexer_wait_seconds + 60
         )
         _row(
             store,
@@ -1266,7 +1266,7 @@ async def test_auto_on_falls_back_to_the_leech_when_the_push_refuses(tmp_path):
         blob = _single_blob(EPISODE_NAME, 2000)
         h = _hash_of(blob)
         past = dt.datetime.now(dt.UTC) - dt.timedelta(
-            seconds=cfg.cross_seed.prowlarr_max_age_seconds + 60
+            seconds=cfg.cross_seed.indexer_wait_seconds + 60
         )
         _row(
             store,

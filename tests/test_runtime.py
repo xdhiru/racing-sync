@@ -19,9 +19,11 @@ from racing_sync.config import (
     RclonePushConfig,
     WatchDirConfig,
 )
+from racing_sync.config_disposition import REMOVED
 from racing_sync.runtime import Runtime
 
 FIXTURES = Path(__file__).parent / "fixtures" / "config"
+REPO = Path(__file__).parent.parent
 
 
 def _load(name: str) -> AppConfig:
@@ -69,10 +71,8 @@ _COMMON = {
     "acquire.inject_racing_torrents_to_fuse": True,
     "acquire.pause_public_torrents_on_fuse": True,
     "acquire.public_export_retry_interval_seconds": 1800,
-    "acquire.preferred_copy_grace_seconds": 3600,
     "limits.max_active_downloads": 3,
     "limits.max_concurrent_moves": 3,
-    "limits.rpc_timeout_seconds": 30,
     "limits.download_stall_timeout_seconds": 7200,
     "limits.download_max_stall_parks": 3,
     "limits.download_max_check_wait_seconds": 43200,
@@ -91,13 +91,13 @@ _COMMON = {
     "push.auto_on_prowlarr_timeout": False,
     "push.push_on_janitor_pressure": False,
     "push.ssh_dial": None,
-    "push.deadline_seconds": 21600,
+    "push.timeout_seconds": 21600,
     "push.remote_name": "",
     "push.rclone_bin": "rclone",
     "push.transfers": 4,
     "push.bwlimit": "",
     "push.max_concurrent_pushes": 1,
-    "push.check_interval_seconds": 120,
+    "push.poll_seconds": 120,
 }
 
 _MINIMAL = {
@@ -115,7 +115,7 @@ _MINIMAL = {
     "indexers.enabled": False,
     "indexers.download_indexer_names": [],
     "indexers.tracker_map_entries": [],
-    "acquire.prowlarr_max_age_seconds": 28800,
+    "acquire.indexer_wait_seconds": 28800,
     "acquire.prowlarr_retry_interval_seconds": 1800,
     "limits.source_poll_interval": 120,
     "limits.dest_poll_interval": 30,
@@ -139,7 +139,7 @@ _SPLIT = {
     "indexers.enabled": True,
     "indexers.download_indexer_names": ["Crosssite (API)", "Leechbox"],
     "indexers.tracker_map_entries": ["Alpha (API)", "Beta"],
-    "acquire.prowlarr_max_age_seconds": 86400,
+    "acquire.indexer_wait_seconds": 86400,
     "acquire.prowlarr_retry_interval_seconds": 900,
     "limits.source_poll_interval": 75,
     "limits.dest_poll_interval": 60,
@@ -156,6 +156,29 @@ def test_views_delegate_every_attribute(name: str, expected: dict[str, object]):
     for path, value in expected.items():
         view, attr = path.split(".", 1)
         assert getattr(getattr(rt, view), attr) == value, path
+
+
+@pytest.mark.parametrize(
+    ("view", "attr"),
+    [("acquire", "preferred_copy_grace_seconds"), ("limits", "rpc_timeout_seconds")],
+)
+def test_views_nobody_read_are_deleted_not_kept_as_aliases(view: str, attr: str):
+    """Dead guarded views are gone; the config keys they mirrored stay live.
+
+    Both readers deliberately fail closed in ways a plain delegating
+    property cannot carry: `coordinator_admit_watch._preferred_grace_seconds`
+    turns any non-numeric or negative value into 0 (grace must never delay
+    admission on doubt), and `io_bounds.rpc_timeout_seconds` takes a bare
+    `AppConfig` or `None` and clamps into [5, 300] — its call sites hold no
+    Runtime at all. Keeping the property would have been an alias that lies
+    about being the source of truth.
+    """
+    cfg = _load("minimal")
+    rt = Runtime(cfg)
+
+    assert not hasattr(getattr(rt, view), attr), f"{view}.{attr} has no reader"
+    assert cfg.general.preferred_copy_grace_seconds == 3600
+    assert cfg.general.client_rpc_timeout_seconds == 30
 
 
 def test_views_read_through_after_config_mutation():
@@ -311,8 +334,8 @@ def test_push_view_follows_the_optional_section():
     assert rt.push.transfers == 9
     assert rt.push.remote_name == "media-cloud"
     assert rt.push.bwlimit == "42M"
-    assert rt.push.deadline_seconds == 21600
-    assert rt.push.check_interval_seconds == 120
+    assert rt.push.timeout_seconds == 21600
+    assert rt.push.poll_seconds == 120
     assert rt.push.ssh_dial is cfg.source.deluge_sftp
     # Off unless the operator says so, even with the push itself enabled.
     assert rt.push.push_on_janitor_pressure is False
@@ -327,6 +350,49 @@ def test_push_view_follows_the_optional_section():
     assert rt.push.push_on_janitor_pressure is False
     assert rt.push.ssh_dial is None
     assert rt.push.transfers == 9
+
+
+@pytest.mark.parametrize("name", ["minimal", "split", "config-example"])
+def test_the_renames_carried_no_value_change(name: str, tmp_path: Path):
+    """The whole point of the naming pass, pinned.
+
+    A config that spells none of the three renamed keys must resolve to
+    exactly the numbers it resolved to before the rename (28800 / 21600 /
+    120 — `split` opts into 86400 for the wait window, which is the value it
+    already carried under the old name), and a file that still uses an old
+    name must refuse instead of loading with a warning. The digitals moved
+    into goldens; the numbers did not.
+    """
+    path = REPO / "config.example.toml" if name == "config-example" else FIXTURES / f"{name}.toml"
+    cfg = AppConfig.from_toml(path)
+    rt = Runtime(cfg)
+
+    expected_wait = 86400 if name == "split" else 28800
+    assert rt.acquire.indexer_wait_seconds == expected_wait
+    assert cfg.cross_seed.indexer_wait_seconds == expected_wait
+    # `minimal`/`split` never carry the push section at all; the view answers
+    # with the documented defaults, exactly as it did under the old names.
+    assert rt.push.timeout_seconds == 21600
+    assert rt.push.poll_seconds == 120
+
+    for old in (
+        "cross_seed.prowlarr_max_age_seconds",
+        "acquire.prowlarr_max_age_seconds",
+        "source.rclone_push.deadline_seconds",
+        "client.rclone_push.deadline_seconds",
+        "source.rclone_push.check_interval_seconds",
+        "client.rclone_push.check_interval_seconds",
+    ):
+        assert old in REMOVED, old
+
+    stale = tmp_path / "stale.toml"
+    stale.write_text(
+        (FIXTURES / "minimal.toml").read_text(encoding="utf-8")
+        + "\n[cross_seed]\nprowlarr_max_age_seconds = 28800\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="renamed to indexer_wait_seconds"):
+        AppConfig.from_toml(stale)
 
 
 def test_coordinator_rt_follows_a_swapped_cfg():

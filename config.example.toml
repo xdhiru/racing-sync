@@ -197,7 +197,7 @@ bulk_fetch_interval_seconds = 900
 [client.rclone_push]
 # Master switch. Nothing here runs until it is on.
 enabled = false
-# When the indexer wait window ([acquire].prowlarr_max_age_seconds) expires,
+# When the indexer wait window ([acquire].indexer_wait_seconds) expires,
 # prefer the push over the VPS2 leech of the private swarm
 # ([acquire].fallback_to_racing_torrent_on_prowlarr_timeout). The leech stays
 # as the backup, so this can only save ratio — it never strands a release
@@ -209,10 +209,11 @@ auto_on_prowlarr_timeout = false
 # immediately instead of waiting out their indexer window. Needs enabled = true.
 push_on_janitor_pressure = false
 # The push's own ceiling (seconds, default 21600 = 6 h, minimum 600).
-# Deliberately independent of the manual-move wait and of the indexer clock:
-# a multi-GB remote copy fails differently and must not inherit either
-# timer's tuning.
-deadline_seconds = 21600
+# Same verb as [transfer].timeout_seconds — how long one rclone operation
+# may take — but a separate value: deliberately independent of the
+# manual-move wait and of the indexer clock, because a multi-GB remote copy
+# fails differently and must not inherit either timer's tuning.
+timeout_seconds = 21600
 # The rclone remote to copy into, spelled as VPS1's rclone.conf names it.
 # Empty = derive it from [remote].path / [remote].unsorted (the part before
 # the `:`). Only the NAME is reused, never the path, and the same remote has
@@ -230,10 +231,10 @@ bwlimit = ""
 # Pushes running at once (1-4, default 1). Each is a bulk copy on the link
 # the races depend on; above 1 a burst of arrivals divides one uplink.
 max_concurrent_pushes = 1
-# Seconds between progress polls (minimum 30). A poll is metadata-only —
-# it compares the remote listing against the torrent's file sizes and never
-# reads content bytes — but listing a remote is not free.
-check_interval_seconds = 120
+# Seconds between progress polls (default 120, minimum 60). A poll is
+# metadata-only — it compares the remote listing against the torrent's file
+# sizes and never reads content bytes — but listing a remote is not free.
+poll_seconds = 120
 
 # ============================================================
 # Destination (VPS2) — long-term seed client (qbittorrent)
@@ -595,26 +596,28 @@ allow_ssh_export = true
 pause_public_torrents_on_fuse = true
 # req #2 follow-up: when no configured download-target indexer returns a
 # cross-seed for a brand-new release, re-query every
-# prowlarr_retry_interval_seconds. After prowlarr_max_age_seconds
-# (counted from the FIRST attempt), give up and mark the torrent FAILED
-# for manual handling — unless fallback_to_racing_torrent_on_prowlarr_timeout
-# below is true.
+# prowlarr_retry_interval_seconds. After indexer_wait_seconds
+# (counted from the FIRST attempt) stop asking the download-target indexers
+# and mark the torrent FAILED for manual handling — unless
+# fallback_to_racing_torrent_on_prowlarr_timeout below is true.
+# indexer_wait_seconds is a WAIT window, not a staleness bound: it says how
+# long the daemon keeps asking, nothing about how old an answer may be.
 # Lifecycle of one private non-preferred row, end to end:
 #   birth:  preferred_copy_grace_seconds ([general]) holds NEW rows from
 #           non-download swarms so a preferred copy can preempt them.
 #   middle: re-query on this interval.
-#   end:    after max_age (counted from the first attempt, so the grace
-#           shifts the deadline by up to its own length), FAILED — or the
-#           racing-torrent fallback below when enabled.
+#   end:    after the wait window (counted from the first attempt, so the
+#           grace shifts the deadline by up to its own length), FAILED — or
+#           the racing-torrent fallback below when enabled.
 prowlarr_retry_interval_seconds = 900    # 15 minutes
-prowlarr_max_age_seconds        = 28800  # 8 hours
+indexer_wait_seconds            = 28800  # 8 hours
 # Retry cadence when a VPS1 public .torrent can't be exported (transient
-# SFTP/export glitch). No max-age clock here: the source torrent still
+# SFTP/export glitch). No indexer-wait clock here: the source torrent still
 # exists on VPS1, so giving up would kill a recoverable row (a vanished
 # source still fails via the consecutive source-miss guard instead).
 # Default 1800 (30 minutes).
 # public_export_retry_interval_seconds = 1800
-# When true, a private torrent with no Prowlarr hit after prowlarr_max_age_seconds
+# When true, a private torrent with no Prowlarr hit after indexer_wait_seconds
 # uses the racing client's own .torrent for the SSD download instead of FAILED.
 # The fallback opens a fresh retry window for the direct attempts (a single
 # SFTP blip at the deadline must not fail the row), then FAILEDs if VPS1 stays

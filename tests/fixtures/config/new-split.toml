@@ -71,7 +71,7 @@ provider = "auto"
 allow_prowlarr_cross_seed = true
 allow_ssh_export = true
 prowlarr_retry_interval_seconds = 900
-prowlarr_max_age_seconds = 86400
+indexer_wait_seconds = 86400
 
 [watch]
 path = "/srv/qbittorrent/watch"

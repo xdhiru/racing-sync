@@ -32,7 +32,7 @@ class RetryAdmitMixin:
         """True when the opt-in racing-torrent fallback may fire.
 
         Requires the config flag plus an exhausted prowlarr retry window
-        (first attempt older than prowlarr_max_age_seconds). Fail-closed:
+        (first attempt older than indexer_wait_seconds). Fail-closed:
         any doubt returns False and the row keeps retrying / fails as before.
         """
         try:
@@ -41,8 +41,8 @@ class RetryAdmitMixin:
             first = ts.indexer_first_queried_at
             if first is None:
                 return False
-            max_age = dt.timedelta(seconds=self.rt.acquire.prowlarr_max_age_seconds)
-            return (dt.datetime.now(dt.UTC) - first) >= max_age
+            window = dt.timedelta(seconds=self.rt.acquire.indexer_wait_seconds)
+            return (dt.datetime.now(dt.UTC) - first) >= window
         except Exception:
             return False
 
@@ -105,13 +105,13 @@ class RetryAdmitMixin:
         Subsequent attempts: same interval (fixed, not exponential — we
         expect the download-target indexers to catch up shortly for racing
         releases).
-        Hard cap: prowlarr_max_age_seconds since the FIRST attempt. If
+        Hard cap: indexer_wait_seconds since the FIRST attempt. If
         that ceiling is reached, mark FAILED for manual handling.
 
         A "source export miss" (public racing torrent whose .torrent
         can't be exported right now) never queries the download-target
         indexers, so it parks on the separate public-export schedule
-        with no max-age clock instead — see _park_for_public_retry.
+        with no indexer-wait clock instead — see _park_for_public_retry.
         """
         if reason == "source export miss":
             self._park_for_public_retry(ts)
@@ -125,11 +125,11 @@ class RetryAdmitMixin:
         except (TypeError, ValueError):
             _retry_gap = 1800.0
         try:
-            _max_age_s = float(self.rt.acquire.prowlarr_max_age_seconds or 28800)
+            _wait_s = float(self.rt.acquire.indexer_wait_seconds or 28800)
         except (TypeError, ValueError):
-            _max_age_s = 28800.0
+            _wait_s = 28800.0
         next_retry = self._schedule_retry(ts, "indexer", _retry_gap)
-        max_age = dt.timedelta(seconds=max(60.0, _max_age_s))
+        window = dt.timedelta(seconds=max(60.0, _wait_s))
         elapsed = now - ts.indexer_first_queried_at
 
         log.info(
@@ -139,24 +139,24 @@ class RetryAdmitMixin:
             ts.source_name,
             next_retry.isoformat(timespec="seconds"),
             int(elapsed.total_seconds()),
-            int(max_age.total_seconds()),
+            int(window.total_seconds()),
         )
 
-        if elapsed >= max_age:
+        if elapsed >= window:
             if self._push_is_live(ts.source_infohash):
                 # A live VPS1 push owns this content. The indexer window is
                 # spent, but failing the row while bytes are still landing on
                 # the seed remote throws the race away, so re-arm on the push
-                # check cadence instead of escalating. `indexer_first_queried_at`
+                # poll cadence instead of escalating. `indexer_first_queried_at`
                 # stays exactly as it is: the moment the push dies (deadline
                 # passed -> not live) the next park hits the normal ceiling.
                 log.info(
                     "%s: indexer window expired but the VPS1 push is running; "
                     "re-arming on the push cadence instead of failing (%ds)",
                     ts.source_name[:60],
-                    int(self._push_check_interval()),
+                    int(self._push_poll_seconds()),
                 )
-                self._schedule_retry(ts, "indexer", self._push_check_interval())
+                self._schedule_retry(ts, "indexer", self._push_poll_seconds())
                 self._park_waiting_indexer(ts, reason="indexer")
                 return
             if reason == "source vanished from VPS1":
@@ -178,13 +178,13 @@ class RetryAdmitMixin:
                     ts.source_name,
                     ts.indexer_attempts,
                     int(elapsed.total_seconds()),
-                    int(max_age.total_seconds()),
+                    int(window.total_seconds()),
                 )
                 # From WAITING_INDEXER → FAILED is legal (see ALLOWED).
                 self.transition(
                     ts,
                     State.FAILED,
-                    error=(f"Prowlarr cross-seed not found within {int(max_age.total_seconds())}s"),
+                    error=(f"Prowlarr cross-seed not found within {int(window.total_seconds())}s"),
                 )
                 return
 
@@ -198,7 +198,7 @@ class RetryAdmitMixin:
 
         Same WAITING_INDEXER state (the Telegram row keeps offering
         Fetch), but the retry runs on public_export_retry_interval_seconds
-        with no max-age FAILED: a transient VPS1 export glitch heals on a
+        with no indexer-wait FAILED: a transient VPS1 export glitch heals on a
         later window, and the source torrent's continued presence is the
         liveness proof. A vanished source still fails via the consecutive
         source-miss guard in _fetch_source_or_fail, so a dead torrent
@@ -215,9 +215,9 @@ class RetryAdmitMixin:
         # The row runs the public schedule now: a leftover indexer timer
         # (e.g. from a misclassified retry of a public row) would make
         # list_waiting_ready wake this row every tick, inflating attempts
-        # until the 8h max-age FAILED a public row.
+        # until the 8h indexer-wait FAILED a public row.
         self._schedule_retry(ts, "public", interval)
-        # Unbounded schedule by design (no max-age FAILED), so rotate
+        # Unbounded schedule by design (no indexer-wait FAILED), so rotate
         # verbosity: first misses log loudly, the long tail at debug —
         # a wedged export must not fill the log disk with its own lines.
         _n = ts.public_export_attempts
@@ -434,7 +434,7 @@ class RetryAdmitMixin:
 
         Same schedule the row is parked on (public-export rows keep the
         public timer, everything else the indexer timer), attempts and
-        max-age untouched so a dead owner hands back control. Silent
+        indexer-wait untouched so a dead owner hands back control. Silent
         when the row is gone (no upsert-resurrect).
         """
         try:

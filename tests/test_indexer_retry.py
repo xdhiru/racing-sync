@@ -44,7 +44,7 @@ def test_first_attempt_sets_first_queried_at():
 
 def test_retry_window_is_8_hours():
     cfg = _cfg()
-    assert cfg.cross_seed.prowlarr_max_age_seconds == 28800
+    assert cfg.cross_seed.indexer_wait_seconds == 28800
     assert cfg.cross_seed.prowlarr_retry_interval_seconds == 900
 
 
@@ -62,7 +62,7 @@ async def test_vanished_source_grants_fresh_window(tmp_path):
         coord.cfg = cfg
         coord.store = store
         _old = dt.datetime.now(dt.UTC) - dt.timedelta(
-            seconds=cfg.cross_seed.prowlarr_max_age_seconds + 60
+            seconds=cfg.cross_seed.indexer_wait_seconds + 60
         )
         for h, reason, final in (
             ("a" * 40, "source vanished from VPS1", State.WAITING_INDEXER),
@@ -118,13 +118,13 @@ def test_expired_max_age_marks_failed():
         source_infohash="a" * 40,
         state=State.WAITING_INDEXER,
         indexer_first_queried_at=dt.datetime.now(dt.UTC)
-        - dt.timedelta(seconds=cfg.cross_seed.prowlarr_max_age_seconds + 1),
+        - dt.timedelta(seconds=cfg.cross_seed.indexer_wait_seconds + 1),
         indexer_next_retry_at=dt.datetime.now(dt.UTC),
         indexer_attempts=10,
     )
     now = dt.datetime.now(dt.UTC)
     elapsed = now - ts.indexer_first_queried_at
-    assert elapsed > dt.timedelta(seconds=cfg.cross_seed.prowlarr_max_age_seconds)
+    assert elapsed > dt.timedelta(seconds=cfg.cross_seed.indexer_wait_seconds)
 
 
 @pytest.mark.anyio
@@ -806,7 +806,7 @@ async def test_public_export_failure_parks_as_source_export_miss(caplog):
     cfg.cross_seed.refetch_public_via_prowlarr = False
     cfg.cross_seed.allow_prowlarr_cross_seed = True
     cfg.cross_seed.prowlarr_retry_interval_seconds = 1800
-    cfg.cross_seed.prowlarr_max_age_seconds = 86400
+    cfg.cross_seed.indexer_wait_seconds = 86400
     cfg.dest.save_path = "/ssd"
 
     torrent = Torrent(
@@ -861,7 +861,7 @@ async def test_waiting_indexer_retry_republishes_public_schedule(tmp_path: Path,
     cfg.cross_seed.refetch_public_via_prowlarr = False
     cfg.cross_seed.allow_prowlarr_cross_seed = True
     cfg.cross_seed.prowlarr_retry_interval_seconds = 1800
-    cfg.cross_seed.prowlarr_max_age_seconds = 86400
+    cfg.cross_seed.indexer_wait_seconds = 86400
     cfg.cross_seed.public_export_retry_interval_seconds = 1800
     cfg.cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout = False
     cfg.dest.save_path = "/ssd"
@@ -1009,7 +1009,7 @@ def _pick_coord(**cross_seed_over):
     cfg.cross_seed.allow_prowlarr_cross_seed = True
     cfg.cross_seed.refetch_public_via_prowlarr = False
     cfg.cross_seed.prowlarr_retry_interval_seconds = 1800
-    cfg.cross_seed.prowlarr_max_age_seconds = 86400
+    cfg.cross_seed.indexer_wait_seconds = 86400
     cfg.cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout = False
     cfg.dest.save_path = "/ssd"
     for k, v in cross_seed_over.items():
@@ -1051,9 +1051,7 @@ def _decision():
 
 
 def _past_max_age(cfg):
-    return dt.datetime.now(dt.UTC) - dt.timedelta(
-        seconds=cfg.cross_seed.prowlarr_max_age_seconds + 10
-    )
+    return dt.datetime.now(dt.UTC) - dt.timedelta(seconds=cfg.cross_seed.indexer_wait_seconds + 10)
 
 
 @pytest.mark.anyio

@@ -73,8 +73,39 @@ DEPRECATED: dict[str, str] = {
     "rclone.reinject_delay_seconds": "[seed].reinject_delay_seconds",
 }
 
-#: Refused at load with the hint as the message. Empty today.
-REMOVED: dict[str, str] = {}
+#: Refused at load with the hint as the message.
+#:
+#: Every entry is listed under BOTH spellings — the internal table name and
+#: the capability-chain one — because `config_alias._reject_removed` runs
+#: *before* the rename absorbs the table (`normalize_config` line order). A
+#: key registered under one spelling only would pass the reject step and then
+#: be pruned as an unknown key, i.e. a warning instead of the hard error the
+#: operator edits the live file by hand and expects. The two entries of a
+#: pair share one message constant so the text cannot drift apart.
+_RENAMED_INDEXER_WAIT = (
+    "renamed to indexer_wait_seconds — write indexer_wait_seconds in "
+    "[acquire] (or [cross_seed]) instead. It is the wait window after which the "
+    "daemon stops asking the download-target indexers and falls back or fails, "
+    "not a bound on how old a result may be"
+)
+_RENAMED_PUSH_TIMEOUT = (
+    "renamed to timeout_seconds — write timeout_seconds in the "
+    "[client.rclone_push] (or [source.rclone_push]) table; same meaning, the "
+    "ceiling for one rclone push operation, matching [transfer].timeout_seconds"
+)
+_RENAMED_PUSH_POLL = (
+    "renamed to poll_seconds — write poll_seconds in the "
+    "[client.rclone_push] (or [source.rclone_push]) table; same meaning, the "
+    "cadence of the metadata-only progress poll"
+)
+REMOVED: dict[str, str] = {
+    "cross_seed.prowlarr_max_age_seconds": _RENAMED_INDEXER_WAIT,
+    "acquire.prowlarr_max_age_seconds": _RENAMED_INDEXER_WAIT,
+    "source.rclone_push.deadline_seconds": _RENAMED_PUSH_TIMEOUT,
+    "client.rclone_push.deadline_seconds": _RENAMED_PUSH_TIMEOUT,
+    "source.rclone_push.check_interval_seconds": _RENAMED_PUSH_POLL,
+    "client.rclone_push.check_interval_seconds": _RENAMED_PUSH_POLL,
+}
 
 #: Provider names each link's file surface knows (the full chain vocabulary).
 #: Later phases enable the rest — see `SUPPORTED_PROVIDERS`.

@@ -70,11 +70,13 @@ class HTTPClientConfig(BaseModel):
     # False (default) forces IPv4 for the WebUI session — intentional, see
     # [source].use_ipv6. Plumb-through only; set it on [source]/[dest].
     use_ipv6: bool = False
-    # HTTP pool shape (previously hardcoded in http_base): connection
-    # pool size, per-host connections, DNS cache TTL seconds.
-    pool_limit: int = Field(default=100, ge=1, le=1000)
-    pool_per_host: int = Field(default=20, ge=1, le=200)
-    dns_cache_ttl_seconds: int = Field(default=300, ge=0, le=86400)
+    # No pool knobs here on purpose. `from_source`/`from_dest` build this
+    # view from `[source]`/`[dest]`, which carry no pool keys, so fields
+    # for `pool_limit` / `pool_per_host` / `dns_cache_ttl_seconds` could
+    # only ever hold their defaults — an operator could not reach them.
+    # `clients/http_base._connector_for` supplies those values (100 / 20 /
+    # 300) itself; `[indexers]` (ProwlarrConfig) still exposes its own,
+    # because that section is read straight from the file.
 
     def has_nginx(self) -> bool:
         return self.nginx_mode in ("basic", "form_post")
@@ -195,7 +197,7 @@ class RclonePushConfig(BaseModel):
     # rclone on VPS1 (or configured the identical remote there) must not
     # end up with half-finished pushes.
     enabled: bool = False
-    # When the indexer wait window (cross_seed.prowlarr_max_age_seconds)
+    # When the indexer wait window (cross_seed.indexer_wait_seconds)
     # expires, prefer this push over the VPS2 leech of the private swarm
     # (fallback_to_racing_torrent_on_prowlarr_timeout). The leech stays as
     # the backup, so opting in can only save ratio and download time — it
@@ -215,9 +217,11 @@ class RclonePushConfig(BaseModel):
     # The push's OWN ceiling, deliberately independent of the manual-move
     # wait (seed.manual_move_timeout_seconds) and of the indexer clock: a
     # multi-GB remote copy fails differently from a seed-path scan, so it
-    # must not inherit either timer's tuning. Floored at 10 minutes — a
-    # box set on a capped home link is still copying long past that.
-    deadline_seconds: int = Field(default=21600, ge=600)  # 6 h
+    # must not inherit either timer's tuning. `ge=600` is the floor — a
+    # box set on a capped home link is still copying long past 10 minutes.
+    # Same verb as `[transfer].timeout_seconds`: how long one rclone
+    # operation may take; the two never share a value.
+    timeout_seconds: int = Field(default=21600, ge=600)  # 6 h
     # The rclone remote to copy into, spelled exactly as VPS1's rclone.conf
     # names it. Empty = derive it from the configured remote prefix (the
     # part before `:` in the remote path / unsorted path), which is the
@@ -246,8 +250,9 @@ class RclonePushConfig(BaseModel):
     # Cadence of the progress poll while a push runs. The poll is
     # metadata-only (does the remote listing match the torrent's file
     # sizes) — it never reads bytes — but a remote listing is not free,
-    # hence 30 s as the floor.
-    check_interval_seconds: int = Field(default=120, ge=30)
+    # hence 60 s as the floor. `ge` here is the ONLY floor: the reader
+    # takes the value as given instead of clamping it again.
+    poll_seconds: int = Field(default=120, ge=60)
 
     @model_validator(mode="after")
     def _check_switches(self) -> RclonePushConfig:
@@ -1205,18 +1210,21 @@ class CrossSeedConfig(BaseModel):
     refetch_public_via_prowlarr: bool = False
     # req #2 follow-up: if no download-target indexer returns a hit
     # (release too new), retry the query every
-    # `prowlarr_retry_interval_seconds`. Give up after
-    # `prowlarr_max_age_seconds` since the FIRST query attempt and mark
-    # the torrent FAILED for manual handling.
+    # `prowlarr_retry_interval_seconds`. Stop asking the download-target
+    # indexers once `indexer_wait_seconds` has elapsed since the FIRST
+    # query attempt, and mark the torrent FAILED for manual handling (or
+    # fall back, see `fallback_to_racing_torrent_on_prowlarr_timeout`).
     #
-    # The names use "prowlarr_" because the search runs through Prowlarr;
-    # the *indexers* queried are whatever the user configured under
-    # [[prowlarr.download_indexers]], tried in priority order.
+    # The name is a wait window, not a staleness bound: it says how long
+    # the daemon is willing to keep asking, counted from its own first
+    # attempt, and nothing more. The *indexers* queried are whatever the
+    # user configured under `[[prowlarr.download_indexers]]`, tried in
+    # priority order; only the search that asks them runs through Prowlarr.
     prowlarr_retry_interval_seconds: int = Field(default=1800, ge=60)  # 30 min
-    prowlarr_max_age_seconds: int = Field(default=28800, ge=3600)  # 8 h
+    indexer_wait_seconds: int = Field(default=28800, ge=3600)  # 8 h
     # VPS1 public-torrent export retry cadence: a public racing torrent
     # whose .torrent can't be exported (transient SFTP/export glitch)
-    # retries on its own schedule with NO max-age clock — the source
+    # retries on its own schedule with NO indexer-wait clock — the source
     # torrent still exists on VPS1, so giving up after 8h would kill a
     # recoverable row. A vanished source still fails via the consecutive
     # source-miss guard, so this cannot spin forever on a dead torrent.
@@ -1267,7 +1275,7 @@ class CrossSeedConfig(BaseModel):
     allow_ssh_export: bool = True
     pause_public_torrents_on_fuse: bool = True
     # When true, a private torrent that still has no Prowlarr cross-seed
-    # after prowlarr_max_age_seconds falls back to the racing client's own
+    # after indexer_wait_seconds falls back to the racing client's own
     # .torrent (SFTP / export endpoint) for the SSD download instead of
     # FAILED. VPS2 then leeches the private swarm, which counts toward
     # ratio — opt in deliberately. Default false (fail for manual handling).
@@ -1290,14 +1298,13 @@ class CrossSeedConfig(BaseModel):
                 "requires allow_ssh_export=true (the fallback fetches the "
                 "racing torrent's own bytes via SFTP / export endpoint)."
             )
-        if int(self.prowlarr_retry_interval_seconds or 0) >= int(
-            self.prowlarr_max_age_seconds or 0
-        ):
+        if int(self.prowlarr_retry_interval_seconds or 0) >= int(self.indexer_wait_seconds or 0):
             raise ValueError(
                 "cross_seed: prowlarr_retry_interval_seconds "
                 f"({self.prowlarr_retry_interval_seconds}) must be less than "
-                f"prowlarr_max_age_seconds ({self.prowlarr_max_age_seconds}) — "
-                "otherwise the retry clock never fires before the max-age FAIL"
+                f"indexer_wait_seconds ({self.indexer_wait_seconds}) — "
+                "otherwise the retry clock never fires before the indexer "
+                "wait window closes"
             )
         if self.refetch_public_via_prowlarr and not self.allow_prowlarr_cross_seed:
             raise ValueError(
