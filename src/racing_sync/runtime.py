@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .chain import Chain, provider_name
-from .config import AppConfig, CleanupConfig, DelugeSFTPConfig, WatchDirConfig
+from .config import AppConfig, CleanupConfig, DelugeSFTPConfig, RclonePushConfig, WatchDirConfig
 
 
 class Runtime:
@@ -74,6 +74,10 @@ class Runtime:
     @property
     def cleanup(self) -> CleanupSettings:
         return CleanupSettings(self._cfg)
+
+    @property
+    def push(self) -> PushSettings:
+        return PushSettings(self._cfg)
 
     @property
     def chain(self) -> Chain:
@@ -232,6 +236,92 @@ class TransferSettings:
     @property
     def timeout_seconds(self) -> float:
         return self._cfg.rclone.move_timeout_seconds
+
+
+class PushSettings:
+    """VPS1 -> remote rclone push: an optional shortcut around the SSD detour.
+
+    Every accessor is guarded because the section is optional: a deployment
+    without `[source.rclone_push]` (or a partially built config double in a
+    test) reads as "push off, documented defaults" rather than raising.
+    """
+
+    def __init__(self, cfg: AppConfig) -> None:
+        self._cfg = cfg
+
+    @property
+    def config(self) -> RclonePushConfig | None:
+        """The section itself, or None when it was never configured."""
+        try:
+            return getattr(self._cfg.source, "rclone_push", None)
+        except Exception:
+            return None
+
+    def _field(self, name: str, default: object) -> object:
+        """One push field, falling back to the model default when absent."""
+        try:
+            return getattr(self.config, name, default)
+        except Exception:
+            return default
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._field("enabled", False))
+
+    @property
+    def auto_on_prowlarr_timeout(self) -> bool:
+        """Prefer the push over the VPS2 leech once the indexer wait expires.
+
+        Rides the master switch: a disabled push cannot be preferred, so the
+        leech keeps the timeout behaviour even if the section stays written
+        in the file with `enabled = false`.
+        """
+        return bool(self.enabled and self._field("auto_on_prowlarr_timeout", False))
+
+    @property
+    def ssh_dial(self) -> DelugeSFTPConfig | None:
+        """The SSH dial the command travels on, or None when there isn't one.
+
+        Validation ties `enabled` to an enabled `deluge_sftp`; re-checking
+        here keeps a late-mutated config from handing out a dial nobody can
+        connect with.
+        """
+        if not self.enabled:
+            return None
+        try:
+            sftp = getattr(self._cfg.source, "deluge_sftp", None)
+        except Exception:
+            return None
+        return sftp if sftp is not None and getattr(sftp, "enabled", False) else None
+
+    @property
+    def deadline_seconds(self) -> int:
+        return int(self._field("deadline_seconds", 21600) or 0)
+
+    @property
+    def remote_name(self) -> str:
+        """Explicit remote name; empty means derive it from the remote prefix."""
+        return str(self._field("remote_name", "") or "")
+
+    @property
+    def rclone_bin(self) -> str:
+        return str(self._field("rclone_bin", "rclone") or "rclone")
+
+    @property
+    def transfers(self) -> int:
+        return int(self._field("transfers", 4) or 4)
+
+    @property
+    def bwlimit(self) -> str:
+        return str(self._field("bwlimit", "") or "")
+
+    @property
+    def max_concurrent_pushes(self) -> int:
+        return int(self._field("max_concurrent_pushes", 1) or 1)
+
+    @property
+    def check_interval_seconds(self) -> int:
+        return int(self._field("check_interval_seconds", 120) or 120)
 
 
 class SeedSettings:
@@ -499,6 +589,7 @@ __all__ = [
     "IntakeSettings",
     "LimitsSettings",
     "PathsSettings",
+    "PushSettings",
     "RecoverySettings",
     "Runtime",
     "SeedSettings",

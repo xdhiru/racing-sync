@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:6eeea418514f44ce",
+  "digest": "sha256:422d226b39ad98ff",
   "keys": {
     "by_section": {
       "dest": 4,
@@ -9,9 +9,9 @@
       "source": 5,
       "ssd": 3
     },
-    "defaulted": 130,
+    "defaulted": 139,
     "explicit": 19,
-    "model": 149,
+    "model": 158,
     "unknown": []
   },
   "resolved": {
@@ -167,6 +167,7 @@
         "user_field": "username"
       },
       "password": "***",
+      "rclone_push": null,
       "type": "qbittorrent",
       "use_ipv6": false,
       "username": "admin"

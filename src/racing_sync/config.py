@@ -173,6 +173,83 @@ class DelugeSFTPConfig(BaseModel):
         return self
 
 
+class RclonePushConfig(BaseModel):
+    """Push content VPS1 already holds straight onto the remote VPS2 seeds from.
+
+    The normal chain downloads a fresh copy on VPS2's SSD and rclone-moves it
+    to the remote, which means the same bytes travel over the internet twice
+    when VPS1 has them complete already. This section lets the daemon tell
+    VPS1 to run `rclone copy` into the *same* remote instead: VPS2 then seeds
+    the content without ever re-downloading it.
+
+    Nothing here needs new credentials — the command travels over the SSH
+    dial already configured under `source.deluge_sftp`, which is why an
+    enabled section requires that one (checked on `SourceConfig`). What it
+    does need is rclone installed on VPS1 with the same remote name in its
+    own rclone.conf; that cannot be verified at load time, so the whole
+    feature stays opt-in.
+    """
+
+    # Master switch. Off means no push is ever attempted and every other
+    # field in this section is inert — an operator who has not installed
+    # rclone on VPS1 (or configured the identical remote there) must not
+    # end up with half-finished pushes.
+    enabled: bool = False
+    # When the indexer wait window (cross_seed.prowlarr_max_age_seconds)
+    # expires, prefer this push over the VPS2 leech of the private swarm
+    # (fallback_to_racing_torrent_on_prowlarr_timeout). The leech stays as
+    # the backup, so opting in can only save ratio and download time — it
+    # never strands a release that the push cannot deliver in time.
+    auto_on_prowlarr_timeout: bool = False
+    # The push's OWN ceiling, deliberately independent of the manual-move
+    # wait (seed.manual_move_timeout_seconds) and of the indexer clock: a
+    # multi-GB remote copy fails differently from a seed-path scan, so it
+    # must not inherit either timer's tuning. Floored at 10 minutes — a
+    # box set on a capped home link is still copying long past that.
+    deadline_seconds: int = Field(default=21600, ge=600)  # 6 h
+    # The rclone remote to copy into, spelled exactly as VPS1's rclone.conf
+    # names it. Empty = derive it from the configured remote prefix (the
+    # part before `:` in the remote path / unsorted path), which is the
+    # common single-remote deployment. Only the NAME is reused, never the
+    # path: the same remote has to exist on VPS1 anyway, and a wrong name
+    # fails the preflight instead of writing into a bucket nobody seeds.
+    remote_name: str = ""
+    # Path to the binary ON VPS1 (this daemon never runs it locally). Plain
+    # "rclone" is whatever VPS1's login shell resolves — right for a distro
+    # package; name an absolute path when it sits outside the default PATH.
+    rclone_bin: str = "rclone"
+    # rclone --transfers for a single push. VPS1's uplink is also carrying
+    # the racing swarms and this daemon's own SSH session, so the default is
+    # small; the cap keeps one release from saturating the shared link.
+    transfers: int = Field(default=4, ge=1, le=16)
+    # rclone --bwlimit syntax, passed through verbatim ("42M", or a schedule
+    # like "8M,24:00-08:00"). Empty = unset, i.e. rclone runs flat out. A
+    # string rather than a number because schedules are the common case
+    # here and parsing them into fields would only lose information.
+    bwlimit: str = ""
+    # Pushes allowed to run at once. Each is a bulk copy on the link the
+    # racing client needs to stay competitive, so this stays far below the
+    # move concurrency; 1 means a burst of arrivals queues instead of
+    # dividing one uplink four ways.
+    max_concurrent_pushes: int = Field(default=1, ge=1, le=4)
+    # Cadence of the progress poll while a push runs. The poll is
+    # metadata-only (does the remote listing match the torrent's file
+    # sizes) — it never reads bytes — but a remote listing is not free,
+    # hence 30 s as the floor.
+    check_interval_seconds: int = Field(default=120, ge=30)
+
+    @model_validator(mode="after")
+    def _check_switches(self) -> RclonePushConfig:
+        if self.auto_on_prowlarr_timeout and not self.enabled:
+            raise ValueError(
+                "rclone_push: auto_on_prowlarr_timeout=true requires enabled=true "
+                "(it only chooses which path runs after the indexer wait expires, "
+                "and with the push off the VPS2 leech is the only one there is) — "
+                "enable [source.rclone_push] or drop the switch"
+            )
+        return self
+
+
 class SourceConfig(BaseModel):
     type: Literal["qbittorrent", "deluge"]
     host: str
@@ -223,6 +300,9 @@ class SourceConfig(BaseModel):
     # nginx is not used.
     nginx: NginxAuthConfig = NginxAuthConfig()
     deluge_sftp: DelugeSFTPConfig | None = None
+    # VPS1 -> remote rclone push (see RclonePushConfig). Optional: absent
+    # means the feature does not exist for this deployment.
+    rclone_push: RclonePushConfig | None = None
     # Network family for the WebUI session. False (default) forces IPv4:
     # intentional — tracker allowlists, split-horizon DNS and jail/VPN
     # egress on seedboxes are overwhelmingly v4, and dual-stack happy-eyeballs
@@ -233,6 +313,28 @@ class SourceConfig(BaseModel):
     def _deluge_needs_sftp(self) -> SourceConfig:
         if self.type == "deluge" and (self.deluge_sftp is None or not self.deluge_sftp.enabled):
             raise ValueError("Deluge source requires [source.deluge_sftp] enabled")
+        return self
+
+    @model_validator(mode="after")
+    def _push_needs_the_ssh_dial(self) -> SourceConfig:
+        """The push has no transport of its own — it borrows the SFTP dial.
+
+        Checking here (not inside `RclonePushConfig`) because only this
+        model can see both sections; a push configured without the dial
+        would fail at the first copy instead of at load.
+        """
+        push = self.rclone_push
+        if (
+            push is not None
+            and push.enabled
+            and (self.deluge_sftp is None or not self.deluge_sftp.enabled)
+        ):
+            raise ValueError(
+                "source: [source.rclone_push].enabled=true requires "
+                "[source.deluge_sftp] enabled — the push runs its rclone command "
+                "on the SSH dial that section holds (host/port/user/credentials), "
+                "so without it there is nothing to send the command over"
+            )
         return self
 
     @model_validator(mode="after")

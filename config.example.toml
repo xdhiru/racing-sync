@@ -177,6 +177,59 @@ bulk_fetch_enabled = true
 # How often the bulk fetch runs (seconds, default 900). 0 = never.
 bulk_fetch_interval_seconds = 900
 
+# --- Optional: let VPS1 push finished content straight to the remote ---
+# Normally VPS2 downloads a fresh copy on SSD and rclone-moves it to the
+# remote, so content VPS1 already holds complete crosses the internet
+# twice. With this on, the daemon tells VPS1 to run `rclone copy` into the
+# SAME remote VPS2 seeds from, and VPS2 never re-downloads it — no SSD
+# detour, no second transfer, no leech of the private swarm.
+#
+# Requirements (this is why it is opt-in):
+#   - rclone installed on VPS1
+#   - the identical remote (same name, same bucket, same credentials)
+#     configured in VPS1's own rclone.conf
+#   - [client.deluge_sftp] enabled: the command travels over that SSH dial,
+#     this section carries no credentials of its own. Validation refuses
+#     enabled = true without it.
+#
+# Leaving the section out (or enabled = false) keeps today's
+# download-on-SSD-then-move path for every release.
+[client.rclone_push]
+# Master switch. Nothing here runs until it is on.
+enabled = false
+# When the indexer wait window ([acquire].prowlarr_max_age_seconds) expires,
+# prefer the push over the VPS2 leech of the private swarm
+# ([acquire].fallback_to_racing_torrent_on_prowlarr_timeout). The leech stays
+# as the backup, so this can only save ratio — it never strands a release
+# the push cannot deliver in time. Requires enabled = true.
+auto_on_prowlarr_timeout = false
+# The push's own ceiling (seconds, default 21600 = 6 h, minimum 600).
+# Deliberately independent of the manual-move wait and of the indexer clock:
+# a multi-GB remote copy fails differently and must not inherit either
+# timer's tuning.
+deadline_seconds = 21600
+# The rclone remote to copy into, spelled as VPS1's rclone.conf names it.
+# Empty = derive it from [remote].path / [remote].unsorted (the part before
+# the `:`). Only the NAME is reused, never the path, and the same remote has
+# to exist on VPS1 either way.
+remote_name = ""
+# Path to the rclone binary ON VPS1 (this daemon never runs it locally).
+# Plain "rclone" = whatever VPS1's login shell resolves.
+rclone_bin = "rclone"
+# rclone --transfers per push (1-16, default 4). VPS1's uplink also carries
+# the racing swarms and this daemon's SSH session, so keep it modest.
+transfers = 4
+# rclone --bwlimit, passed through verbatim ("42M", or a schedule like
+# "8M,24:00-08:00"). Empty = unset (rclone runs flat out).
+bwlimit = ""
+# Pushes running at once (1-4, default 1). Each is a bulk copy on the link
+# the races depend on; above 1 a burst of arrivals divides one uplink.
+max_concurrent_pushes = 1
+# Seconds between progress polls (minimum 30). A poll is metadata-only —
+# it compares the remote listing against the torrent's file sizes and never
+# reads content bytes — but listing a remote is not free.
+check_interval_seconds = 120
+
 # ============================================================
 # Destination (VPS2) — long-term seed client (qbittorrent)
 # ============================================================

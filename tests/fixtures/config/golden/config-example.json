@@ -1,13 +1,13 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:aaf3c3c6fd5a6696",
+  "digest": "sha256:179a113af57d43ef",
   "keys": {
     "by_section": {
       "acquire": 9,
       "api": 8,
       "classifier": 1,
       "cleanup": 21,
-      "client": 23,
+      "client": 32,
       "dest": 8,
       "general": 8,
       "indexers": 16,
@@ -21,8 +21,8 @@
       "watch": 5
     },
     "defaulted": 14,
-    "explicit": 148,
-    "model": 149,
+    "explicit": 157,
+    "model": 158,
     "unknown": []
   },
   "resolved": {
@@ -217,6 +217,17 @@
         "user_field": "username"
       },
       "password": "***",
+      "rclone_push": {
+        "auto_on_prowlarr_timeout": false,
+        "bwlimit": "",
+        "check_interval_seconds": 120,
+        "deadline_seconds": 21600,
+        "enabled": false,
+        "max_concurrent_pushes": 1,
+        "rclone_bin": "rclone",
+        "remote_name": "",
+        "transfers": 4
+      },
       "type": "qbittorrent",
       "use_ipv6": false,
       "username": "admin"

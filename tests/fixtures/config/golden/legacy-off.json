@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:d5a5bdb22f4c5427",
+  "digest": "sha256:13aa45e42d1d8db7",
   "keys": {
     "by_section": {
       "api": 2,
@@ -12,9 +12,9 @@
       "ssd": 3,
       "telegram": 3
     },
-    "defaulted": 126,
+    "defaulted": 135,
     "explicit": 23,
-    "model": 149,
+    "model": 158,
     "unknown": []
   },
   "resolved": {
@@ -177,6 +177,7 @@
         "user_field": "username"
       },
       "password": "***",
+      "rclone_push": null,
       "type": "qbittorrent",
       "use_ipv6": false,
       "username": ""

@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:2b8b9a1b90801a8b",
+  "digest": "sha256:7964ff50121acf22",
   "keys": {
     "by_section": {
       "api": 5,
@@ -15,9 +15,9 @@
       "telegram": 3,
       "watch_dir": 2
     },
-    "defaulted": 96,
+    "defaulted": 105,
     "explicit": 55,
-    "model": 149,
+    "model": 158,
     "unknown": []
   },
   "resolved": {
@@ -203,6 +203,7 @@
         "user_field": "username"
       },
       "password": "***",
+      "rclone_push": null,
       "type": "deluge",
       "use_ipv6": false,
       "username": "admin"

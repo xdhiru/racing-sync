@@ -534,3 +534,182 @@ def test_bulk_fetch_keys_survive_both_spellings(
     else:
         assert sftp.bulk_fetch_interval_seconds == 300
         assert sftp.bulk_fetch_enabled is True
+
+
+# --- VPS1 rclone push: the new section survives both spellings ---
+#
+# Same trap as above: the alias layer prunes keys its model inventory does
+# not know, so a nested section that only exists under one spelling would
+# vanish with a "possible typo" warning. These pin every push field under
+# `[client.rclone_push]` AND `[source.rclone_push]`, and that the two
+# switches that need a partner are refused without one.
+
+_PUSH_NEW = """\
+[general]
+
+[client]
+type = "deluge"
+host = "http://127.0.0.1:8080"
+
+[client.deluge_sftp]
+enabled = true
+ssh_password = "push-test-pass"
+state_dir = "/home/deluge/.config/deluge/state"
+
+[client.rclone_push]
+enabled = true
+{push}
+
+[dest]
+host = "http://127.0.0.1:8080"
+
+[storage]
+path = "/downloads"
+save_path = "/downloads"
+max_inflight_bytes = 1000000000
+skip_movie_larger_than_bytes = 1000000000
+
+[remote]
+path = "remote:movies/"
+unsorted = "remote:unsorted/"
+
+[seed]
+path = "/mnt/fuse"
+"""
+
+_PUSH_OLD = """\
+[general]
+
+[source]
+type = "deluge"
+host = "http://127.0.0.1:8080"
+
+[source.deluge_sftp]
+enabled = true
+ssh_password = "push-test-pass"
+state_dir = "/home/deluge/.config/deluge/state"
+
+[source.rclone_push]
+enabled = true
+{push}
+
+[dest]
+host = "http://127.0.0.1:8080"
+save_path = "/downloads"
+
+[ssd]
+path = "/downloads"
+max_inflight_bytes = 1000000000
+skip_movie_larger_than_bytes = 1000000000
+
+[rclone.remote]
+default = "remote:movies/"
+unsorted = "remote:unsorted/"
+
+[rclone.fuse]
+mount = "/mnt/fuse"
+mount_unsorted = "/mnt/fuse/unsorted"
+"""
+
+_PUSH_TEMPLATES = {"client": _PUSH_NEW, "source": _PUSH_OLD}
+
+# (field, TOML value, expected value, a sibling left alone, that sibling's default)
+_PUSH_FIELDS = [
+    ("deadline_seconds", "900", 900, "transfers", 4),
+    ("remote_name", '"other-remote"', "other-remote", "rclone_bin", "rclone"),
+    ("rclone_bin", '"/opt/local/bin/rclone"', "/opt/local/bin/rclone", "transfers", 4),
+    ("transfers", "9", 9, "max_concurrent_pushes", 1),
+    ("bwlimit", '"42M"', "42M", "check_interval_seconds", 120),
+    ("max_concurrent_pushes", "3", 3, "transfers", 4),
+    ("check_interval_seconds", "45", 45, "deadline_seconds", 21600),
+    ("auto_on_prowlarr_timeout", "true", True, "deadline_seconds", 21600),
+]
+
+
+@pytest.mark.parametrize("spelling", ["client", "source"])
+@pytest.mark.parametrize(("key", "value", "expected", "sibling", "sibling_default"), _PUSH_FIELDS)
+def test_rclone_push_keys_survive_both_spellings(
+    spelling: str,
+    key: str,
+    value: str,
+    expected: object,
+    sibling: str,
+    sibling_default: object,
+    tmp_path: Path,
+):
+    """Every push field is a known key under either table name."""
+    text = _PUSH_TEMPLATES[spelling].format(push=f"{key} = {value}")
+    cfg_file = _config_file(tmp_path, text)
+
+    normalized = normalize_config(tomllib.loads(text))
+    assert normalized.unknown == ()
+
+    cfg = AppConfig.from_toml(cfg_file)
+    push = cfg.source.rclone_push
+    assert push is not None
+    assert getattr(push, key) == expected
+    assert getattr(push, sibling) == sibling_default
+    assert push.enabled is True
+
+
+@pytest.mark.parametrize(
+    ("spelling", "path"),
+    [("client", "client.rclone_push.hots"), ("source", "source.rclone_push.hots")],
+)
+def test_unknown_push_sibling_is_pruned_loudly(spelling: str, path: str, tmp_path: Path, caplog):
+    """A typo inside the section is reported and dropped, either spelling.
+
+    The new spelling is pruned by the alias layer (so the summary sees the
+    written path); the old one by the schema walker (same path, internal
+    spelling). Both must warn — a silently ignored push knob would read as
+    "the feature is configured".
+    """
+    text = _PUSH_TEMPLATES[spelling].format(push="hots = true")
+    cfg_file = _config_file(tmp_path, text)
+
+    with caplog.at_level(logging.WARNING):
+        cfg = AppConfig.from_toml(cfg_file)
+
+    assert cfg.source.rclone_push is not None
+    assert not hasattr(cfg.source.rclone_push, "hots")
+    messages = [r.getMessage() for r in caplog.records if "possible typo" in r.getMessage()]
+    assert any("rclone_push" in m and "hots" in m for m in messages), messages
+    assert path in summarize(cfg, cfg_file)["keys"]["unknown"]
+
+
+def test_push_preferring_the_timeout_needs_the_master_switch(tmp_path: Path):
+    """auto_on_prowlarr_timeout alone (push off) is a switch with no path."""
+    text = _PUSH_NEW.replace("enabled = true\n{push}", "auto_on_prowlarr_timeout = true\n{push}")
+    cfg_file = _config_file(tmp_path, text.format(push=""))
+
+    with pytest.raises(ValueError, match="auto_on_prowlarr_timeout=true requires enabled=true"):
+        AppConfig.from_toml(cfg_file)
+
+
+@pytest.mark.parametrize("dial", ["disabled", "absent"])
+def test_push_needs_the_ssh_dial_it_runs_on(dial: str, tmp_path: Path):
+    """The push borrows [source.deluge_sftp]'s SSH connection: no dial, no push.
+
+    A qbittorrent source keeps this about the push — a deluge one would
+    already fail for missing SFTP, which is a different rule.
+    """
+    text = _PUSH_NEW.replace('type = "deluge"', 'type = "qbittorrent"')
+    if dial == "disabled":
+        text = text.replace("enabled = true\nssh_password", "enabled = false\nssh_password")
+    else:
+        text = text.replace(
+            """[client.deluge_sftp]
+enabled = true
+ssh_password = "push-test-pass"
+state_dir = "/home/deluge/.config/deluge/state"
+
+""",
+            "",
+        )
+    cfg_file = _config_file(tmp_path, text.format(push=""))
+
+    assert "rclone_push" in cfg_file.read_text(encoding="utf-8")
+    with pytest.raises(
+        ValueError, match=r"\[source\.rclone_push\]\.enabled=true requires \[source\.deluge_sftp\]"
+    ):
+        AppConfig.from_toml(cfg_file)

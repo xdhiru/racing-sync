@@ -13,7 +13,12 @@ from pathlib import Path
 import pytest
 from conftest import make_coordinator
 
-from racing_sync.config import AppConfig, DelugeSFTPConfig, WatchDirConfig
+from racing_sync.config import (
+    AppConfig,
+    DelugeSFTPConfig,
+    RclonePushConfig,
+    WatchDirConfig,
+)
 from racing_sync.runtime import Runtime
 
 FIXTURES = Path(__file__).parent / "fixtures" / "config"
@@ -79,6 +84,19 @@ _COMMON = {
     "paths.state_db": Path("/var/lib/racing-sync/state.db"),
     "paths.log_dir": Path("/var/log/racing-sync"),
     "paths.log_retention_days": 14,
+    # The push section is optional: both fixtures leave it out, so every
+    # accessor has to answer with the documented default instead of raising.
+    "push.config": None,
+    "push.enabled": False,
+    "push.auto_on_prowlarr_timeout": False,
+    "push.ssh_dial": None,
+    "push.deadline_seconds": 21600,
+    "push.remote_name": "",
+    "push.rclone_bin": "rclone",
+    "push.transfers": 4,
+    "push.bwlimit": "",
+    "push.max_concurrent_pushes": 1,
+    "push.check_interval_seconds": 120,
 }
 
 _MINIMAL = {
@@ -182,6 +200,7 @@ def test_views_refuse_writes_and_leave_the_config_untouched():
         "control",
         "paths",
         "cleanup",
+        "push",
     ):
         getattr(rt, view)
 
@@ -269,6 +288,40 @@ def test_intake_optional_intakes_follow_the_source_model():
     assert isinstance(split.intake.blob_source, DelugeSFTPConfig)
     assert split.intake.blob_source is split_cfg.source.deluge_sftp
     assert split.intake.sftp_state_dir == Path("/home/deluge/.config/deluge/state")
+
+
+def test_push_view_follows_the_optional_section():
+    """The push view reads the section, and reads off when it is switched off."""
+    cfg = _load("minimal")
+    rt = Runtime(cfg)
+    assert rt.push.enabled is False
+    assert rt.push.ssh_dial is None
+
+    cfg.source.deluge_sftp = DelugeSFTPConfig(
+        enabled=True,
+        ssh_password="push-test-pass",
+        state_dir=Path("/home/deluge/.config/deluge/state"),
+    )
+    cfg.source.rclone_push = RclonePushConfig(
+        enabled=True, transfers=9, remote_name="media-cloud", bwlimit="42M"
+    )
+
+    assert rt.push.enabled is True
+    assert rt.push.transfers == 9
+    assert rt.push.remote_name == "media-cloud"
+    assert rt.push.bwlimit == "42M"
+    assert rt.push.deadline_seconds == 21600
+    assert rt.push.check_interval_seconds == 120
+    assert rt.push.ssh_dial is cfg.source.deluge_sftp
+
+    # Switched off: the keys stay readable (re-enabling is a flip, not a
+    # rewrite), but nothing claims a dial the push cannot use.
+    cfg.source.rclone_push.enabled = False
+    cfg.source.rclone_push.auto_on_prowlarr_timeout = True
+    assert rt.push.enabled is False
+    assert rt.push.auto_on_prowlarr_timeout is False
+    assert rt.push.ssh_dial is None
+    assert rt.push.transfers == 9
 
 
 def test_coordinator_rt_follows_a_swapped_cfg():
