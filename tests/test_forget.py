@@ -814,11 +814,11 @@ async def test_stop_workers_for_times_out_on_wedged_worker(tmp_path, caplog):
 
     from conftest import make_coordinator
 
-    import racing_sync.coordinator as _core
+    import racing_sync.coordinator_schedule as _sched
 
     store = StateStore(tmp_path / "state.db")
-    real_timeout = _core._STOP_WORKERS_TIMEOUT_S
-    _core._STOP_WORKERS_TIMEOUT_S = 0.2
+    real_timeout = _sched._STOP_WORKERS_TIMEOUT_S
+    _sched._STOP_WORKERS_TIMEOUT_S = 0.2
     try:
         coord = make_coordinator(store)
 
@@ -846,7 +846,7 @@ async def test_stop_workers_for_times_out_on_wedged_worker(tmp_path, caplog):
             except (asyncio.CancelledError, Exception):
                 pass
     finally:
-        _core._STOP_WORKERS_TIMEOUT_S = real_timeout
+        _sched._STOP_WORKERS_TIMEOUT_S = real_timeout
         store.close()
 
 
