@@ -18,6 +18,7 @@ from urllib.parse import quote
 from .chain import Chain
 from .config import AppConfig
 from .config_alias import normalize_config
+from .config_disposition import FEATURE_SECTIONS
 from .runtime import Runtime
 
 
@@ -101,6 +102,27 @@ enabled = true
 """,
     ),
 }
+
+
+def _validate_feature_registry() -> None:
+    """`FEATURES` must cover `FEATURE_SECTIONS` exactly, one feature each.
+
+    The section names live in `config_disposition` (one source for the file
+    surface); this module owns only the prose. A toggle added on one side
+    without the other fails here — and in `tests/test_config_ux.py`.
+    """
+    registry = set(FEATURE_SECTIONS)
+    assert len(registry) == len(FEATURE_SECTIONS), "duplicate section in FEATURE_SECTIONS"
+    assert set(FEATURES) == registry, (
+        f"FEATURES and FEATURE_SECTIONS disagree: "
+        f"missing={sorted(registry - set(FEATURES))}, "
+        f"extra={sorted(set(FEATURES) - registry)}"
+    )
+    for name, spec in FEATURES.items():
+        assert spec.section == name, f"feature {name!r} points at section {spec.section!r}"
+
+
+_validate_feature_registry()
 
 STARTER = """\
 # racing-sync — one box: race here, keep seeding from the seed path.

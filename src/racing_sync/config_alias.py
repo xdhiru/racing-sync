@@ -27,9 +27,12 @@ from typing import Any
 
 from .config import AppConfig
 from .config_disposition import (
+    DEFAULT_PROVIDER,
     DEPRECATED,
+    LINK_PROVIDERS,
     NEW_ONLY,
     REMOVED,
+    SUPPORTED_PROVIDERS,
     canonical_leaves,
     rename_prefixes,
 )
@@ -45,23 +48,6 @@ NEW_SECTIONS = (
     "transfer",
     "watch",
 )
-
-#: Provider names per link (the full chain surface; later phases enable the rest).
-_PROVIDERS: dict[str, tuple[str, ...]] = {
-    "acquire": ("auto", "cross_seed", "local", "direct_export", "external", "none"),
-    "transfer": ("rclone", "local_move", "none", "external"),
-    "seed": ("path", "existing", "none"),
-}
-
-#: Providers this release can actually run per link.
-_SUPPORTED: dict[str, tuple[str, ...]] = {
-    "acquire": ("auto", "local", "external"),
-    "transfer": ("rclone", "local_move", "none", "external"),
-    "seed": ("path", "existing", "none"),
-}
-
-#: What an unset provider means (legacy behaviour).
-_DEFAULT_PROVIDER = {"acquire": "auto", "transfer": "rclone", "seed": "path"}
 
 #: Everything a new-spelling table may contain, resolved from the schema.
 _KNOWN_LEAVES, _KNOWN_PREFIXES = canonical_leaves(AppConfig)
@@ -176,14 +162,10 @@ def _require_dest(data: dict[str, Any], aliases: tuple[str, ...]) -> None:
 def _resolve_links(data: dict[str, Any]) -> None:
     """Resolve link switches/providers into the internal pipeline providers.
 
-    Accepted per link in this release:
-
-      acquire  auto (legacy pick) | external (the operator copies the bytes)
-      transfer rclone | none | external (manual copy; same as none to the daemon)
-      seed     path   | none
-
-    Other names are recognised and refused with the phase that will add them,
-    so a typo never reads as "unknown key, ignored".
+    The vocabulary is `config_disposition.LINK_PROVIDERS`; the names this
+    release runs are `SUPPORTED_PROVIDERS`. Everything else is recognised and
+    refused with the phase that will add it, so a typo never reads as
+    "unknown key, ignored".
     """
     pipeline: dict[str, Any] = {}
     for link in ("acquire", "transfer", "seed"):
@@ -196,10 +178,10 @@ def _resolve_links(data: dict[str, Any]) -> None:
         provider = section.pop("provider", None)
         if enabled is not None and not isinstance(enabled, bool):
             raise ValueError(f"[{link}].enabled must be true or false")
-        if provider is not None and provider not in _PROVIDERS[link]:
+        if provider is not None and provider not in LINK_PROVIDERS[link]:
             raise ValueError(
                 f"[{link}].provider = {provider!r} is not a known provider "
-                f"(choose one of: {', '.join(_PROVIDERS[link])})"
+                f"(choose one of: {', '.join(LINK_PROVIDERS[link])})"
             )
         if enabled is False and provider not in (None, "none"):
             raise ValueError(
@@ -216,7 +198,7 @@ def _resolve_links(data: dict[str, Any]) -> None:
             local_path = section.pop("path", None)
             local_unsorted = section.pop("unsorted", None)
             if (local_path is not None or local_unsorted is not None) and (
-                provider or _DEFAULT_PROVIDER["transfer"]
+                provider or DEFAULT_PROVIDER["transfer"]
             ) != "local_move":
                 raise ValueError(
                     '[transfer].path/[transfer].unsorted only apply to provider = "local_move"'
@@ -232,8 +214,8 @@ def _resolve_links(data: dict[str, Any]) -> None:
                     "[acquire].enabled = false is not supported — use "
                     'provider = "external" when the operator copies the bytes.'
                 )
-            chosen = provider or "auto"
-            if chosen not in _SUPPORTED[link]:
+            chosen = provider or DEFAULT_PROVIDER[link]
+            if chosen not in SUPPORTED_PROVIDERS[link]:
                 raise ValueError(_not_yet(link, chosen))
             pipeline[link] = chosen
             continue
@@ -241,10 +223,10 @@ def _resolve_links(data: dict[str, Any]) -> None:
         if provider == "none" or enabled is False:
             chosen = "none"
         elif provider is None:
-            chosen = _DEFAULT_PROVIDER[link]
+            chosen = DEFAULT_PROVIDER[link]
         else:
             chosen = provider
-        if chosen not in _SUPPORTED[link]:
+        if chosen not in SUPPORTED_PROVIDERS[link]:
             raise ValueError(_not_yet(link, chosen))
         pipeline[link] = chosen
         if link == "seed":
@@ -256,7 +238,7 @@ def _resolve_links(data: dict[str, Any]) -> None:
 def _not_yet(link: str, provider: str) -> str:
     return (
         f"[{link}].provider = {provider!r} is not available yet — "
-        f"this release runs: {', '.join(_SUPPORTED[link])}"
+        f"this release runs: {', '.join(SUPPORTED_PROVIDERS[link])}"
     )
 
 
@@ -376,14 +358,14 @@ def _require_core(data: dict[str, Any], aliases: tuple[str, ...]) -> None:
         if not dest.get("save_path"):
             raise ValueError("[storage].save_path is required: where [dest] stages downloads")
     pipeline = data.get("pipeline") or {}
-    if "seed" in aliases and pipeline.get("seed", "path") != "none":
+    if "seed" in aliases and pipeline.get("seed", DEFAULT_PROVIDER["seed"]) != "none":
         fuse = data.get("rclone", {}).get("fuse")
         if not isinstance(fuse, dict) or "mount" not in fuse:
             raise ValueError(
                 "[seed].path is required: where finished content is seeded from "
                 "(a fuse mount or a plain directory), or set enabled = false"
             )
-    if "remote" in aliases and pipeline.get("transfer", "rclone") == "rclone":
+    if "remote" in aliases and pipeline.get("transfer", DEFAULT_PROVIDER["transfer"]) == "rclone":
         remote = data.get("rclone", {}).get("remote")
         if not isinstance(remote, dict) or "default" not in remote or "unsorted" not in remote:
             raise ValueError(

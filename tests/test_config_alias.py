@@ -14,8 +14,15 @@ from pathlib import Path
 
 import pytest
 
+from racing_sync import config_alias, config_disposition
 from racing_sync.config import AppConfig
 from racing_sync.config_alias import normalize_config
+from racing_sync.config_disposition import (
+    DEFAULT_PROVIDER,
+    LINK_PROVIDERS,
+    NEW_ONLY,
+    SUPPORTED_PROVIDERS,
+)
 from racing_sync.config_summary import summarize
 
 FIXTURES = Path(__file__).parent / "fixtures" / "config"
@@ -208,6 +215,74 @@ def test_known_but_unimplemented_provider_is_refused(link: str, provider: str):
 
     with pytest.raises(ValueError, match="not available yet"):
         normalize_config(raw)
+
+
+# --- registry consistency: the alias layer owns no provider table of its own ---
+
+
+def test_alias_imports_the_disposition_registry():
+    assert config_alias.LINK_PROVIDERS is config_disposition.LINK_PROVIDERS
+    assert config_alias.SUPPORTED_PROVIDERS is config_disposition.SUPPORTED_PROVIDERS
+    assert config_alias.DEFAULT_PROVIDER is config_disposition.DEFAULT_PROVIDER
+    for stale in ("_PROVIDERS", "_SUPPORTED", "_DEFAULT_PROVIDER"):
+        assert not hasattr(config_alias, stale), f"config_alias still keeps a private {stale}"
+
+
+@pytest.mark.parametrize(
+    ("link", "provider"),
+    [(link, name) for link, names in SUPPORTED_PROVIDERS.items() for name in names],
+)
+def test_every_supported_provider_is_accepted(link: str, provider: str):
+    raw = _raw()
+    raw.setdefault(link, {})["provider"] = provider
+
+    assert normalize_config(raw).data["pipeline"][link] == provider
+
+
+@pytest.mark.parametrize(
+    ("link", "provider"),
+    [
+        (link, name)
+        for link, names in LINK_PROVIDERS.items()
+        for name in names
+        if name not in SUPPORTED_PROVIDERS[link]
+    ],
+)
+def test_every_unimplemented_link_provider_is_refused(link: str, provider: str):
+    raw = _raw()
+    raw.setdefault(link, {})["provider"] = provider
+
+    with pytest.raises(ValueError, match="not available yet"):
+        normalize_config(raw)
+
+
+@pytest.mark.parametrize("link", sorted(DEFAULT_PROVIDER))
+def test_the_default_provider_is_the_registry_default(link: str):
+    raw = _raw()
+    raw.setdefault(link, {})
+
+    assert normalize_config(raw).data["pipeline"][link] == DEFAULT_PROVIDER[link]
+
+
+def test_provider_errors_quote_the_registry():
+    raw = _raw()
+    raw.setdefault("transfer", {})["provider"] = "bogus"
+    with pytest.raises(ValueError) as unknown:
+        normalize_config(raw)
+    assert "choose one of: " + ", ".join(LINK_PROVIDERS["transfer"]) in str(unknown.value)
+
+    raw = _raw()
+    raw.setdefault("acquire", {})["provider"] = "cross_seed"
+    with pytest.raises(ValueError) as unavailable:
+        normalize_config(raw)
+    assert "this release runs: " + ", ".join(SUPPORTED_PROVIDERS["acquire"]) in str(
+        unavailable.value
+    )
+
+
+def test_new_only_provider_hints_name_only_supported_providers():
+    for link, names in SUPPORTED_PROVIDERS.items():
+        assert NEW_ONLY[f"{link}.provider"] == " | ".join(names)
 
 
 @pytest.mark.parametrize(

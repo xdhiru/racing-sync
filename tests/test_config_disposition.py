@@ -10,10 +10,15 @@ from __future__ import annotations
 
 from racing_sync.config import AppConfig
 from racing_sync.config_disposition import (
+    DEFAULT_PROVIDER,
     DEPRECATED,
+    FEATURE_SECTIONS,
+    LINK_PROVIDERS,
     NEW_ONLY,
+    PROVIDER_HINTS,
     REMOVED,
     RENAMES,
+    SUPPORTED_PROVIDERS,
     disposition,
     extras_prefixes,
     model_leaves,
@@ -84,3 +89,35 @@ def test_rename_order_moves_deep_targets_first():
     """[storage].save_path must land before the [ssd] remainder merges."""
     new_paths = [".".join(new) for new, _old in rename_prefixes()]
     assert new_paths.index("storage.save_path") < new_paths.index("storage")
+
+
+def test_provider_registry_tables_cover_the_same_links():
+    assert set(LINK_PROVIDERS) == set(SUPPORTED_PROVIDERS) == set(DEFAULT_PROVIDER)
+    assert set(DEFAULT_PROVIDER) == {"acquire", "transfer", "seed"}
+
+
+def test_provider_registry_lists_are_unique_and_consistent():
+    for link, names in LINK_PROVIDERS.items():
+        assert names, f"link {link!r} has no provider names"
+        assert len(set(names)) == len(names), f"duplicate provider name in {link!r}"
+        supported = SUPPORTED_PROVIDERS[link]
+        assert supported, f"link {link!r} runs no provider"
+        assert len(set(supported)) == len(supported), f"duplicate supported provider in {link!r}"
+        assert set(supported) <= set(names), f"{link!r}: supported names not in LINK_PROVIDERS"
+        assert DEFAULT_PROVIDER[link] in supported, f"{link!r}: default is not runnable"
+
+
+def test_new_only_provider_hints_are_generated_from_the_registry():
+    assert set(PROVIDER_HINTS) == {f"{link}.provider" for link in SUPPORTED_PROVIDERS}
+    for link, names in SUPPORTED_PROVIDERS.items():
+        hint = NEW_ONLY[f"{link}.provider"]
+        assert hint == " | ".join(names), f"{link}: NEW_ONLY hint disagrees with the registry"
+        assert hint == PROVIDER_HINTS[f"{link}.provider"]
+
+
+def test_feature_sections_are_unique_optional_sections():
+    assert len(set(FEATURE_SECTIONS)) == len(FEATURE_SECTIONS)
+    heads = {path.split(".", 1)[0] for path in FIELDS}
+    heads |= {path.split(".", 1)[0] for path in NEW_ONLY}
+    for name in FEATURE_SECTIONS:
+        assert name in heads, f"feature section {name!r} is not a config section"
