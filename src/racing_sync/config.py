@@ -1352,6 +1352,10 @@ class CleanupConfig(BaseModel):
       watermark. VPS2 never pulls content bytes from VPS1 (SFTP carries only
       the .torrent file), so a secured SSD copy makes VPS1's redundant.
 
+    With `ignore_activity_under_pressure`, a run that reads pressure the same
+    way (bursting or below the low watermark) also drops the activity keep:
+    VPS2 takes over serving the peer. Verification still gates every delete.
+
     Grace adapts to pressure so full autobrr days clear fast and quiet days
     keep seeding: `grace = max(min_grace, min(space_curve, velocity_curve))`
     where space_curve interpolates free space between the low/high
@@ -1383,6 +1387,21 @@ class CleanupConfig(BaseModel):
     idle_confirm_minutes: float = Field(default=45.0, ge=0)
     # Upload rate at/below this (B/s) counts as quiet for idle detection.
     activity_upspeed_bps: int = Field(default=65536, ge=0)
+    # Let disk pressure override the activity gate (off = today's behaviour:
+    # any upspeed/leecher on VPS1 keeps the copy forever). VPS1 is a scratch
+    # disk — its job is landing releases, not carrying swarms — and once VPS2
+    # provably seeds the same bytes, a peer still pulling from VPS1 is not
+    # worth a full disk: the box stops admitting anything and the whole
+    # intake is lost. Zero min_ratio/min_seed_hours is the operator asserting
+    # BOTH clients seed the SAME tracker account, which is what makes VPS2's
+    # fuse seed an acceptable stand-in. When on, the keep is skipped only
+    # while this run reads pressure from the janitor's own signal (bursting,
+    # or free space below `low_watermark_free_bytes`); every other gate still
+    # fails closed — DONE state, fuse byte verification, .torrent
+    # preservation, protected patterns, unknown stats, dry-run. A live
+    # peer's download can be cut short (VPS2 takes over serving it);
+    # that is the accepted trade.
+    ignore_activity_under_pressure: bool = False
     # Optional H&R minimums (0 = disabled). Enable only with per-account
     # needs; VPS2's fuse seeding normally keeps the account compliant.
     min_ratio: float = Field(default=0.0, ge=0)
@@ -1399,7 +1418,13 @@ class CleanupConfig(BaseModel):
     # Back-to-back remove_torrent(+data) calls spike daemon teardown and
     # disk unlinking, which has coincided with autobrr injection timeouts
     # on the same Deluge daemon. 0 = delete back-to-back (old behavior).
-    delete_stagger_seconds: float = Field(default=60.0, ge=0)
+    # 25 s is what the janitor's own fallback already uses when the field is
+    # unreadable, so there is one truth instead of two. The stagger was also
+    # the throughput ceiling: 12 deletes a minute apart run ~11 minutes,
+    # longer than the 300 s burst cadence, so one full run serialised
+    # against the next. 24 groups at 25 s reclaims twice as much in the
+    # same wall time.
+    delete_stagger_seconds: float = Field(default=25.0, ge=0)
     # Seconds between janitor runs.
     janitor_interval_seconds: int = Field(default=3600, ge=300)
     # Settle delay after (re)start before the first janitor run may delete.

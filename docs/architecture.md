@@ -275,10 +275,18 @@ safe against a live daemon because row writes are state/version-guarded and
 adoption re-reads ownership before inserting.
 
 The hourly janitor deletes a VPS1 copy only when the row is `DONE` past its
-grace period, the swarm is idle, the fuse entry is present, and the bytes
-verify; every racing hash in the group must also be proven to seed from the
+grace period (or verifiably idle), the swarm is quiet, the fuse entry is
+present, and the bytes verify; under disk pressure `MOVING` rows go early,
+and bytes on the SSD count as secured because VPS2 never pulls content from
+VPS1. Every racing hash in the group must also be proven to seed from the
 VPS2 mount, otherwise its `.torrent` is cached first (VPS1 is kept when even
-that fails). It re-reads the row and version right before each delete.
+that fails). It re-reads the row and version right before each delete. With
+`[cleanup].ignore_activity_under_pressure`, a run that reads pressure the
+same way the cadence does (bursting, or free space below the low watermark)
+skips only the activity keep — a full scratch disk outranks a leecher, and
+VPS2 takes over serving — while verification, protection, unknown stats and
+`.torrent` preservation stay fail-closed. A pass that finds nothing
+eligible reports why in one line (`nothing eligible (activity 17, grace 3)`).
 
 ## Telegram
 

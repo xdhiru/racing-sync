@@ -594,6 +594,20 @@ class CleanupSettings:
     def config(self) -> CleanupConfig:
         return self._cfg.cleanup
 
+    @property
+    def ignore_activity_under_pressure(self) -> bool:
+        """Let disk pressure override the VPS1 activity keep (opt-in).
+
+        Guarded, and strict `is True`: a config double that never parsed the
+        section reads "off" rather than as consent, because the switch relaxes
+        a safety gate. Only the switch lives here — the janitor's own
+        `_cleanup_pressure` verdict decides whether this run is pressured.
+        """
+        try:
+            return getattr(self._cfg.cleanup, "ignore_activity_under_pressure", None) is True
+        except Exception:
+            return False
+
 
 __all__ = [
     "AcquireSettings",

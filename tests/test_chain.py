@@ -22,8 +22,10 @@ FIXTURES = Path(__file__).parent / "fixtures" / "config"
 # optional [source.rclone_push] section (149 -> 158 modelled keys; every
 # digest moves because the resolved model gained a field), then for the
 # key renames of the config-surface cleanup (same values, new names, so the
-# digest moves again while every resolved number stays put).
-_FULL = "sha256:b652d9dd290a99cc"
+# digest moves again while every resolved number stays put), then for
+# [cleanup].ignore_activity_under_pressure plus the new burst-cap/stagger
+# defaults (one more modelled key, and two resolved numbers moved).
+_FULL = "sha256:605ec7378a014427"
 
 _DOWNLOAD_ONLY = """
 [general]

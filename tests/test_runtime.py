@@ -31,7 +31,13 @@ def _load(name: str) -> AppConfig:
 
 
 def _minimal_with(
-    tmp_path: Path, *, general: str = "", dest: str = "", rclone: str = "", fuse: str = ""
+    tmp_path: Path,
+    *,
+    general: str = "",
+    dest: str = "",
+    rclone: str = "",
+    fuse: str = "",
+    cleanup: str = "",
 ) -> Path:
     """minimal.toml with extra keys spliced into the given sections."""
     text = (FIXTURES / "minimal.toml").read_text(encoding="utf-8")
@@ -39,6 +45,10 @@ def _minimal_with(
     text = text.replace("[dest]\n", f"[dest]\n{dest}\n", 1)
     text = text.replace("[rclone.remote]\n", f"[rclone]\n{rclone}\n\n[rclone.remote]\n", 1)
     text = text.replace("[rclone.fuse]\n", f"[rclone.fuse]\n{fuse}\n", 1)
+    if cleanup:
+        # minimal.toml carries no [cleanup] section at all: the keys land in
+        # a fresh one, which is exactly the "section absent" case too.
+        text = f"{text}\n[cleanup]\n{cleanup}\n"
     path = tmp_path / "config.toml"
     path.write_text(text, encoding="utf-8")
     return path
@@ -46,6 +56,7 @@ def _minimal_with(
 
 _COMMON = {
     "intake.min_age_seconds": 0,
+    "cleanup.ignore_activity_under_pressure": False,
     "storage.safety_margin_bytes": 0,
     "storage.disk_safety_margin_bytes": 0,
     "transfer.provider": "rclone",
@@ -237,6 +248,22 @@ def test_cleanup_view_exposes_the_section():
     cfg = _load("split")
 
     assert Runtime(cfg).cleanup.config is cfg.cleanup
+
+
+def test_cleanup_view_reads_the_pressure_override(tmp_path: Path):
+    """The override is a real bool, off by default, and never consent by mock."""
+    on = Runtime(
+        AppConfig.from_toml(
+            _minimal_with(tmp_path, cleanup="ignore_activity_under_pressure = true")
+        )
+    )
+    assert on.cleanup.ignore_activity_under_pressure is True
+
+    off = Runtime(AppConfig.from_toml(_minimal_with(tmp_path, cleanup="enabled = true")))
+    assert off.cleanup.ignore_activity_under_pressure is False
+
+    # A config double that never parsed the section must not unlock a gate.
+    assert Runtime(make_coordinator().cfg).cleanup.ignore_activity_under_pressure is False
 
 
 def test_general_limits_override_the_section_values(tmp_path: Path):

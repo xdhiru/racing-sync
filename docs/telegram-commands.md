@@ -155,7 +155,11 @@ two questions once for the whole scope.
 - **Cleanup** — the automatic janitor deletes VPS1 copies on its own
   cadence once grace/idle allow. `/cleanup` and `/clean_<hash>` only
   bypass the waiting (cadence, grace, idle): fuse verification, H&R
-  minimums, activity, and `.torrent` preservation always run. `/clean`
+  minimums, activity, and `.torrent` preservation always run — activity
+  unless `[cleanup].ignore_activity_under_pressure` is on and this run
+  reads real disk pressure, when VPS2 takes over serving the peer. `/clean`
   refuses non-DONE rows; MOVING copies are cleaned automatically under
   disk pressure. Both commands do nothing when `[cleanup].enabled` is
-  false (or the chain adds no seed entry to verify against).
+  false (or the chain adds no seed entry to verify against). A pass with
+  nothing to delete answers `🧹 Cleanup: nothing deleted — nothing eligible
+  (activity 17, grace 3)`, naming what held the rows back.

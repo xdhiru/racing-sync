@@ -55,7 +55,7 @@ def test_example_carries_the_shared_daemon_defaults():
     cfg = AppConfig.from_toml(EXAMPLE)
 
     assert cfg.general.source_poll_interval == 120
-    assert cfg.cleanup.delete_stagger_seconds == 60
+    assert cfg.cleanup.delete_stagger_seconds == 25
 
 
 def test_model_defaults_match_the_shared_daemon_values():
@@ -64,7 +64,7 @@ def test_model_defaults_match_the_shared_daemon_values():
     general = GeneralConfig()
     assert general.source_poll_interval == 120
     assert general.dest_poll_interval == 30
-    assert CleanupConfig().delete_stagger_seconds == 60
+    assert CleanupConfig().delete_stagger_seconds == 25
 
 
 def test_example_documents_no_retired_keys(caplog):

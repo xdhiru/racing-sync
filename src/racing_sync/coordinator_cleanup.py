@@ -3,7 +3,9 @@
 Split out of the coordinator god-file. Deletes racing torrents from VPS1
 once VPS2 has secured the content (DONE past adaptive grace and idle, or
 MOVING under disk pressure with bytes verified on SSD). Fail-closed
-throughout: any doubt keeps VPS1.
+throughout: any doubt keeps VPS1 — except, when the operator opts in, the
+activity keep alone lifts under real pressure (VPS1 is a scratch disk and
+VPS2 takes over serving the peer).
 """
 
 from __future__ import annotations
@@ -146,6 +148,67 @@ class CleanupMixin:
             or (lookahead > 0 and projected is not None and projected < lookahead * 3600.0)
         )
         return arrivals, bytes_rate, projected, urgent, bursting
+
+    # Report order for the "nothing eligible" breakdown (`_cleanup_blocked_reason`).
+    _CLEANUP_BLOCK_ORDER = (
+        "grace",
+        "activity",
+        "verification",
+        "unknown stats",
+        "protection",
+        "minimums",
+        "not pressured",
+        "state",
+    )
+
+    def _cleanup_activity_override(self) -> bool:
+        """`[cleanup].ignore_activity_under_pressure`, read through the runtime view.
+
+        Never raises: a half-built config double (or a missing section) reads
+        as "off", which is today's behaviour. The flag only unlocks the
+        activity keep — every other gate stays fail-closed.
+        """
+        try:
+            return self.rt.cleanup.ignore_activity_under_pressure is True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _cleanup_pressured(cfg: object, free_bytes: int | None, bursting: bool) -> bool:
+        """Real pressure for THIS run: bursting, or free below the low watermark.
+
+        Deliberately not a new threshold: `bursting` is what `_cleanup_pressure`
+        already decided for this tick (the janitor passes it down), and the
+        watermark comparison is the same one the MOVING early path and the
+        candidate sort use. Unknown free space is never pressure.
+        """
+        if bursting:
+            return True
+        try:
+            low = int(getattr(cfg, "low_watermark_free_bytes", 0) or 0)
+        except (TypeError, ValueError):
+            low = 0
+        return bool(low and free_bytes is not None and free_bytes < low)
+
+    def _cleanup_note_pressure_override(
+        self, ts: TorrentState, lively: list[Torrent], group_size: int, free_bytes: int | None
+    ) -> None:
+        """One INFO line per row the pressure override rescued from a keep."""
+        leechers = 0
+        for m in lively:
+            try:
+                leechers += max(0, int(m.num_leechers or 0))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        log.info(
+            "pressure: deleting %s despite %d leecher(s)/upspeed (%d/%d racing, "
+            "VPS1 free=%s); VPS2 takes over serving",
+            (ts.source_name or "")[:60],
+            leechers,
+            len(lively),
+            group_size,
+            f"{free_bytes} B" if free_bytes is not None else "unknown",
+        )
 
     def _source_probe_path(self) -> str | None:
         try:
@@ -359,6 +422,12 @@ class CleanupMixin:
         Fail-closed throughout: any doubt about bytes, health, identity or
         activity skips the row for this run.
 
+        With `[cleanup].ignore_activity_under_pressure` the activity keep is
+        skipped while THIS run reads pressure (bursting, or free below the low
+        watermark): a live peer's download is cut short and VPS2 takes over
+        serving it. That gate alone — verification, protection, unknown stats
+        and blob preservation still keep the row whatever the disk says.
+
         The pressure values are optional so direct callers/tests can pass
         only `cfg`; the janitor passes its single probe down so this method
         never re-probes.
@@ -366,7 +435,7 @@ class CleanupMixin:
         Returns a one-line-friendly summary (also on every early-return
         path): `{"deleted", "candidates", "dry_run", "grace_s", "free",
         "bursting", "reason"}` where `reason` is only set when nothing ran
-        ("no rows", "nothing eligible", ...).
+        ("no rows", "nothing eligible (activity 17, grace 3)", ...).
         """
         now_utc = dt.datetime.now(dt.UTC)
         if arrivals is None:
@@ -498,6 +567,16 @@ class CleanupMixin:
         by_hash = {t.infohash.lower(): t for t in src_torrents}
 
         candidates: list[tuple[float, float, TorrentState, list[Torrent]]] = []
+        # What held the scan back: every keep path counts itself here, so an
+        # empty run answers "why" instead of the bare "nothing eligible".
+        blocked: dict[str, int] = {}
+
+        def _blocked(key: str) -> None:
+            try:
+                blocked[key] = int(blocked.get(key, 0)) + 1
+            except Exception:
+                pass
+
         _sem = asyncio.Semaphore(4)
 
         async def _verdict_one(ts: TorrentState):
@@ -507,6 +586,7 @@ class CleanupMixin:
                     if not group:
                         return None
                     if self._cleanup_protected(ts):
+                        _blocked("protection")
                         return None
                 except asyncio.CancelledError:
                     raise
@@ -517,7 +597,15 @@ class CleanupMixin:
                     return None
                 try:
                     return await self._cleanup_verdict(
-                        ts, group, grace_s, now_utc, dry_run, free_bytes, urgent=urgent
+                        ts,
+                        group,
+                        grace_s,
+                        now_utc,
+                        dry_run,
+                        free_bytes,
+                        urgent=urgent,
+                        bursting=bursting,
+                        blocked=blocked,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -535,7 +623,9 @@ class CleanupMixin:
         candidates.extend(v for v in (_verdicts or []) if v is not None)
 
         if not candidates:
-            return _summary(reason="nothing eligible")
+            reason = self._cleanup_blocked_reason(blocked)
+            log.info("cleanup janitor: %s", reason)
+            return _summary(reason=reason)
         pressured = bool(free_bytes is not None and low_free and free_bytes < low_free)
         # Under disk pressure (or any burst) DONE rows go first: their
         # content is fully secured and normally already re-added, so they
@@ -547,6 +637,9 @@ class CleanupMixin:
 
         deleted = 0
         try:
+            # The 25 here is the model default too (they used to disagree):
+            # an unreadable field must not silently double the documented
+            # pause between deletes.
             _stagger = float(getattr(cfg, "delete_stagger_seconds", 25) or 0)
         except (TypeError, ValueError):
             _stagger = 25.0
@@ -643,6 +736,39 @@ class CleanupMixin:
         return (text or type(e).__name__)[:200]
 
     @staticmethod
+    def _cleanup_preview_list(items: object, limit: int = 3, width: int = 60) -> str:
+        """Bounded one-line preview (`a, b, c (+7 more)`) of untrusted names.
+
+        Keep-warnings used to print only a count, so an operator staring at
+        the same row for 80 runs could not tell WHICH file never arrived.
+        Capped on three axes — item count, item width, and the joined text —
+        and control characters are flattened so a path with a newline can
+        never forge a second log line. Never raises.
+        """
+        try:
+            from .logging_setup import strip_control_chars
+        except Exception:  # pragma: no cover - import guard only
+            strip_control_chars = None
+        try:
+            items = list(items or [])
+        except Exception:
+            return "?"
+        shown: list[str] = []
+        for item in items[:limit]:
+            try:
+                text = str(item)
+                if strip_control_chars is not None:
+                    text = strip_control_chars(text)
+                text = text.strip().replace("\n", " ")
+            except Exception:
+                text = "?"
+            shown.append((text or "?")[:width])
+        out = ", ".join(shown)[:200]
+        if len(items) > limit:
+            out += f" (+{len(items) - limit} more)"
+        return out or "?"
+
+    @staticmethod
     def _cleanup_summary_text(summary: dict) -> str:
         """One-line `/cleanup` reply from a `_run_source_cleanup` summary."""
         try:
@@ -666,6 +792,33 @@ class CleanupMixin:
         except (TypeError, ValueError):
             pass
         return line
+
+    @classmethod
+    def _cleanup_blocked_text(cls, blocked: dict[str, int]) -> str:
+        """`activity 17, grace 3` from the keep counters; empty when nothing counted.
+
+        Reported in `_CLEANUP_BLOCK_ORDER` (stable wording, not dict order) and
+        length-capped: this travels into a Telegram reply, so it stays a
+        diagnosis aid rather than a report.
+        """
+        try:
+            counts = {str(k): int(v) for k, v in (blocked or {}).items() if int(v or 0) > 0}
+        except (TypeError, ValueError, AttributeError):
+            return ""
+        if not counts:
+            return ""
+        keys = [k for k in cls._CLEANUP_BLOCK_ORDER if k in counts]
+        keys += sorted(k for k in counts if k not in cls._CLEANUP_BLOCK_ORDER)
+        return ", ".join(f"{k} {counts[k]}" for k in keys)[:160]
+
+    def _cleanup_blocked_reason(self, blocked: dict[str, int]) -> str:
+        """`nothing eligible`, extended with what actually blocked the scan.
+
+        The summary contract is untouched — `reason` stays one plain string
+        the operator line prints verbatim; the breakdown only adds to it.
+        """
+        text = self._cleanup_blocked_text(blocked)
+        return f"nothing eligible ({text})" if text else "nothing eligible"
 
     def _cleanup_remaining_seconds(self, ts: object) -> tuple[bool, float | None] | None:
         """(ready, seconds_left) for a DONE row, or None when not applicable.
@@ -997,8 +1150,11 @@ class CleanupMixin:
         Bypasses grace/idle on purpose (the operator asked for it) but keeps
         every safety check: DONE only, protected patterns, usable swarm
         stats, fuse byte verification, H&R minimums, no live race activity,
-        and .torrent preservation for un-injected copies. Dry-run deletes
-        nothing. Returns the reply text.
+        and .torrent preservation for un-injected copies. The activity keep
+        obeys `[cleanup].ignore_activity_under_pressure` exactly like the
+        janitor's (the same pressure signal, no extra threshold): when the
+        disk is short and VPS2 provably serves the content, VPS1 goes.
+        Dry-run deletes nothing. Returns the reply text.
         """
         try:
             cfg = getattr(self.rt.cleanup, "config", None)
@@ -1071,11 +1227,30 @@ class CleanupMixin:
         if not self._cleanup_minimums_met(group, cfg):
             return f"Keeping VPS1: H&R minimums are not met for {title}."
         try:
-            active = any(self._cleanup_member_active(m, cfg) for m in group)
+            active = [m for m in group if self._cleanup_member_active(m, cfg)]
         except Exception:
-            active = True
+            # Unknowable activity is activity: fail closed.
+            active = list(group)
         if active:
-            return f"Keeping VPS1: {title} still shows race activity."
+            # Same unlock as the janitor, same signal: the override only
+            # applies while THIS run reads pressure (bursting, or free below
+            # the low watermark). No extra probe and no second threshold —
+            # the cached free-space reading is the one the janitor derived
+            # its cadence from, and `_cleanup_pressure` answers for it.
+            try:
+                pressure_free = getattr(self, "_last_source_free_bytes", None)
+            except Exception:
+                pressure_free = None
+            try:
+                pressure_bursting = bool(self._cleanup_pressure(cfg, pressure_free)[4])
+            except Exception:
+                pressure_bursting = False
+            if not (
+                self._cleanup_activity_override()
+                and self._cleanup_pressured(cfg, pressure_free, pressure_bursting)
+            ):
+                return f"Keeping VPS1: {title} still shows race activity."
+            self._cleanup_note_pressure_override(row, active, len(group), pressure_free)
         try:
             preserved = await self._cleanup_preserve_racing_blobs(row, group, dry_run)
         except asyncio.CancelledError:
@@ -1278,6 +1453,8 @@ class CleanupMixin:
         dry_run: bool,
         free_bytes: int | None,
         urgent: bool | None = None,
+        bursting: bool = False,
+        blocked: dict[str, int] | None = None,
     ) -> tuple[float, float, TorrentState, list[Torrent]] | None:
         """Decide deletion for one row; None = keep this run.
 
@@ -1286,10 +1463,29 @@ class CleanupMixin:
         in dry-run mode, which performs zero state mutations). `urgent`
         (None = read the live flag) lets the MOVING early path run when a
         newly discovered release did not fit, even above the low watermark.
+        `bursting` is this tick's `_cleanup_pressure` verdict (never
+        recomputed here); with `[cleanup].ignore_activity_under_pressure` on
+        and pressure real, the activity keep below is skipped — that gate
+        ONLY. Verification, H&R minimums, unknown stats, protected patterns,
+        state and the blob preservation in the delete loop stay fail-closed,
+        so a row that cannot be proven seeded on VPS2 is still kept whatever
+        the disk says. Accepted trade: a live peer's download is cut short
+        and VPS2 takes over serving it. `blocked` (optional) counts which
+        keep fired, for the one-line "nothing eligible" breakdown.
         """
         cfg = self.rt.cleanup.config
+
+        def _keep(key: str) -> None:
+            if blocked is None:
+                return
+            try:
+                blocked[key] = int(blocked.get(key, 0)) + 1
+            except Exception:
+                pass
+
         # 1. Observe swarm activity first: any active member bumps the stamp
         #    and vetoes deletion this run (the race is still going).
+        rescued: list[Torrent] = []
         lively = [m for m in group if self._cleanup_member_active(m, cfg)]
         if lively:
             if not dry_run:
@@ -1308,23 +1504,38 @@ class CleanupMixin:
                         ts.source_infohash[:10],
                         e,
                     )
-            log.debug(
-                "cleanup: %s still active on VPS1 (%d/%d racing); keeping",
-                ts.source_name[:60],
-                len(lively),
-                len(group),
-            )
-            return None
+            # Pressure override: unlocks this keep alone, and only while the
+            # janitor's own pressure signal is on for THIS run. The stamp
+            # above is still recorded — the activity really happened.
+            if not (
+                self._cleanup_activity_override()
+                and self._cleanup_pressured(cfg, free_bytes, bursting)
+            ):
+                log.debug(
+                    "cleanup: %s still active on VPS1 (%d/%d racing); keeping",
+                    ts.source_name[:60],
+                    len(lively),
+                    len(group),
+                )
+                _keep("activity")
+                return None
+            # Remembered, not announced yet: the line belongs at the moment
+            # the row really becomes a candidate, so a later verification keep
+            # never leaves a "deleting" claim sitting in the log.
+            rescued = lively
         # 1b. Unknown self stats (stat-less client): never read as quiet.
         # A stat-less Deluge looks exactly like an idle swarm — deleting on
         # that evidence alone risks an H&R hit on a live race. Keep without
-        # bumping the activity stamp (unknown is not activity).
+        # bumping the activity stamp (unknown is not activity). Pressure
+        # never relaxes this one: an unreported swarm is unproven, not quiet.
         if any(self._cleanup_stats_unknown(m) for m in group):
             log.debug("cleanup: %s has unknown swarm stats; keeping", ts.source_name[:60])
+            _keep("unknown stats")
             return None
         # 2. Opt-in H&R minimums (default off — same-account fuse seeding
         #    keeps the account compliant; see [cleanup] docs).
         if not self._cleanup_minimums_met(group, cfg):
+            _keep("minimums")
             return None
         # 3. State-specific safety + timing.
         completed = ts.completed_at
@@ -1337,14 +1548,17 @@ class CleanupMixin:
         )
         if ts.state == State.DONE:
             if not await self._cleanup_fuse_healthy(ts, dry_run):
+                _keep("verification")
                 return None
             if age_s < grace_s:
                 # Without a completion stamp the idle fast lane proves only
                 # that VPS1 has been quiet, not that the seed has served the
                 # grace period on VPS2 (recovery adopts DONE rows this way).
                 if completed is None:
+                    _keep("grace")
                     return None
                 if not self._cleanup_idle_confirmed(ts, group, now_utc, cfg):
+                    _keep("grace")
                     return None
         elif ts.state == State.MOVING:
             # Early pressure path: bytes are 100% on the VPS2 SSD (MOVING is
@@ -1363,18 +1577,24 @@ class CleanupMixin:
                 except Exception:
                     urgent = False
             if not (pressured or urgent):
+                _keep("not pressured")
                 return None
             if not self._cleanup_idle_confirmed(ts, group, now_utc, cfg):
+                _keep("grace")
                 return None
             if not await self._cleanup_ssd_bytes_present(ts):
+                _keep("verification")
                 return None
         else:
+            _keep("state")
             return None
         _anchor = completed or ts.created_at
         sort_key = _anchor.timestamp() if _anchor else now_utc.timestamp()
         # Grouping guarantees a known row total (unknown sizes never
         # group), so this is always the row's own byte count.
         size = float(ts.total_bytes or 0)
+        if rescued:
+            self._cleanup_note_pressure_override(ts, rescued, len(group), free_bytes)
         return (sort_key, size, ts, group)
 
     def _cleanup_idle_confirmed(
@@ -1477,11 +1697,11 @@ class CleanupMixin:
         missing = sorted(_missing_entries)
         if missing:
             log.warning(
-                "cleanup: %d fuse entr%s missing for %s (%s…); keeping VPS1",
+                "cleanup: %d fuse entr%s missing for %s (%s); keeping VPS1",
                 len(missing),
                 "y" if len(missing) == 1 else "ies",
                 ts.source_name[:60],
-                missing[0][:10],
+                self._cleanup_preview_list([h[:10] for h in missing], limit=3, width=10),
             )
             return False
         blob = ts._blob or ts.cross_seed_blob
@@ -1520,10 +1740,11 @@ class CleanupMixin:
             return False
         if check.missing:
             log.warning(
-                "cleanup: %d fuse file(s) missing for %s at %s; keeping VPS1",
+                "cleanup: %d fuse file(s) missing for %s at %s (e.g. %s); keeping VPS1",
                 len(check.missing),
                 ts.source_name[:60],
                 target,
+                self._cleanup_preview_list(check.missing),
             )
             return False
         if not ts.fuse_verified and getattr(self, "store", None) is not None:
