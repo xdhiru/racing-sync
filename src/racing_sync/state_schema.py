@@ -303,6 +303,93 @@ class TorrentState:
 
 
 # --------------------------------------------------------------------------- #
+# Source push checkpoint (VPS1 -> VPS2 rclone copy of a private group)
+# --------------------------------------------------------------------------- #
+
+
+class PushState(str, enum.Enum):  # noqa: UP042  (StrEnum changes str(Enum); .value is the contract)
+    """Lifecycle of one in-flight "push from VPS1" job (a `SourcePush`).
+
+    running      the detached rclone copy on VPS1 is (assumed) still copying
+    verifying    the copy claims the files are there; remote bytes are being checked
+    done         verification passed, the group is complete on the remote
+    failed       copy or verification broke; needs an operator decision
+    abandoned    superseded (fresh tap, cancel, deadline passed); kept as
+                 history until the next start/claim for the hash replaces it
+
+    Only `running` and `verifying` are live states: they hold the dedupe lock
+    so a second tap never launches a competing copy of the same group.
+    """
+
+    RUNNING = "running"
+    VERIFYING = "verifying"
+    DONE = "done"
+    FAILED = "failed"
+    ABANDONED = "abandoned"
+
+
+#: States meaning "work is happening right now" — the claim/dedupe set.
+LIVE_PUSH_STATES: tuple[PushState, ...] = (PushState.RUNNING, PushState.VERIFYING)
+
+
+@dataclass(slots=True)
+class SourcePush:
+    """Durable checkpoint of one push from VPS1, keyed by the racing hash.
+
+    One record per content group, owned by the VPS1 racing torrent's infohash
+    (all lowercase). Surviving an app restart is the point: the runner reads
+    this back to resume verification instead of launching a second copy.
+    """
+
+    # Identity: the VPS1 racing torrent hash the push was started for.
+    infohash: str
+    # Normalized content key of the group the push serves ("" when unknown).
+    group_key: str = ""
+    # Display name only — never used for matching or layout decisions.
+    content_name: str = ""
+    # The download directory on VPS1. NOT the row's save_path, which always
+    # means the VPS2 SSD.
+    src_dir: str = ""
+    # Full "remote:path/..." prefix the copy writes into.
+    target_remote: str = ""
+    # Path of the --files-from-raw list file written on VPS1 ("" if unused).
+    list_path: str = ""
+    # Path of the detached rclone log file on VPS1.
+    log_path: str = ""
+    state: PushState = PushState.RUNNING
+    started_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.UTC))
+    updated_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.UTC))
+    # Watchdog expiry for the live states. "" means no expiry: the record
+    # stays live until finish_push/clear_push says otherwise.
+    deadline_at: dt.datetime | None = None
+    # Metadata-only progress counters (file counts, never bytes).
+    files_total: int = 0
+    files_present: int = 0
+    last_error: str = ""
+
+    def to_row(self) -> dict:
+        row = {
+            "infohash": self.infohash,
+            "group_key": self.group_key,
+            "content_name": self.content_name,
+            "src_dir": self.src_dir,
+            "target_remote": self.target_remote,
+            "list_path": self.list_path,
+            "log_path": self.log_path,
+            "state": self.state.value if isinstance(self.state, PushState) else str(self.state),
+            "started_at": self.started_at.isoformat() if self.started_at else "",
+            "updated_at": self.updated_at.isoformat() if self.updated_at else "",
+            "deadline_at": self.deadline_at.isoformat() if self.deadline_at else "",
+            "files_total": int(self.files_total or 0),
+            "files_present": int(self.files_present or 0),
+            "last_error": self.last_error,
+        }
+        # Same guarantee as TorrentState.to_row(): a column added to the spec
+        # without a value here raises instead of writing a partial INSERT.
+        return {name: row[name] for name in SOURCE_PUSH_COLUMNS}
+
+
+# --------------------------------------------------------------------------- #
 # Schema: one source of truth
 # --------------------------------------------------------------------------- #
 
@@ -358,6 +445,27 @@ _TORRENT_STATE_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
 
 TORRENT_STATE_COLUMNS: tuple[str, ...] = tuple(name for name, _ddl in _TORRENT_STATE_COLUMN_SPECS)
 
+# Same idea for the source_push table: the CREATE TABLE text and SourcePush's
+# column set come from this tuple, so they cannot drift apart.
+_SOURCE_PUSH_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
+    ("infohash", "TEXT PRIMARY KEY"),
+    ("group_key", "TEXT NOT NULL DEFAULT ''"),
+    ("content_name", "TEXT NOT NULL DEFAULT ''"),
+    ("src_dir", "TEXT NOT NULL DEFAULT ''"),
+    ("target_remote", "TEXT NOT NULL DEFAULT ''"),
+    ("list_path", "TEXT NOT NULL DEFAULT ''"),
+    ("log_path", "TEXT NOT NULL DEFAULT ''"),
+    ("state", "TEXT NOT NULL"),
+    ("started_at", "TEXT NOT NULL"),
+    ("updated_at", "TEXT NOT NULL"),
+    ("deadline_at", "TEXT NOT NULL DEFAULT ''"),
+    ("files_total", "INTEGER NOT NULL DEFAULT 0"),
+    ("files_present", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_error", "TEXT NOT NULL DEFAULT ''"),
+)
+
+SOURCE_PUSH_COLUMNS: tuple[str, ...] = tuple(name for name, _ddl in _SOURCE_PUSH_COLUMN_SPECS)
+
 # Projection without the blob for get/list paths that never need the bytes.
 _TORRENT_STATE_COLUMNS_NO_BLOB = ", ".join(
     "'' AS cross_seed_blob" if name == "cross_seed_blob" else name for name in TORRENT_STATE_COLUMNS
@@ -366,7 +474,7 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = ", ".join(
 #: Bumped whenever a column spec or a data migration changes. Recorded in
 #: `meta` so an upgraded or downgraded DB shows up in the log; the column
 #: diff at open is the actual migration mechanism.
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 
 #: Persisted TorrentState fields: everything except the transient blob copy.
 _PERSISTED_FIELDS = frozenset(f.name for f in dataclass_fields(TorrentState)) - {"_blob"}
@@ -378,10 +486,24 @@ if _PERSISTED_FIELDS != frozenset(TORRENT_STATE_COLUMNS):
         f"without a field {sorted(frozenset(TORRENT_STATE_COLUMNS) - _PERSISTED_FIELDS)}"
     )
 
+_PUSH_PERSISTED_FIELDS = frozenset(f.name for f in dataclass_fields(SourcePush))
+
+if _PUSH_PERSISTED_FIELDS != frozenset(SOURCE_PUSH_COLUMNS):
+    raise RuntimeError(
+        "source_push schema drift: fields without a column "
+        f"{sorted(_PUSH_PERSISTED_FIELDS - frozenset(SOURCE_PUSH_COLUMNS))}; columns "
+        f"without a field {sorted(frozenset(SOURCE_PUSH_COLUMNS) - _PUSH_PERSISTED_FIELDS)}"
+    )
+
 
 def _create_torrent_state_sql() -> str:
     body = ",\n    ".join(f"{name} {ddl}" for name, ddl in _TORRENT_STATE_COLUMN_SPECS)
     return f"CREATE TABLE IF NOT EXISTS torrent_state (\n    {body}\n);"
+
+
+def _create_source_push_sql() -> str:
+    body = ",\n    ".join(f"{name} {ddl}" for name, ddl in _SOURCE_PUSH_COLUMN_SPECS)
+    return f"CREATE TABLE IF NOT EXISTS source_push (\n    {body}\n);"
 
 
 SCHEMA_TABLES = (
@@ -416,6 +538,15 @@ CREATE TABLE IF NOT EXISTS torrent_blob (
     blob        BLOB NOT NULL,
     updated_at  TEXT NOT NULL
 );
+
+"""
+    # Durable "push from VPS1" checkpoint, keyed by the racing hash rather
+    # than by a torrent_state row (like torrent_blob above): the group may be
+    # served by sibling hashes with no row of their own, and a copy started
+    # over SSH keeps running on VPS1 after this process dies, so its state
+    # must survive a restart instead of being re-launched by the next tap.
+    + _create_source_push_sql()
+    + """
 """
 )
 
@@ -429,6 +560,7 @@ CREATE INDEX IF NOT EXISTS ix_public_export_retry
 CREATE INDEX IF NOT EXISTS ix_source_name ON torrent_state(source_name);
 CREATE INDEX IF NOT EXISTS ix_active_updated ON torrent_state(updated_at)
     WHERE deleted_at = '';
+CREATE INDEX IF NOT EXISTS ix_push_state ON source_push(state, deadline_at);
 """
 
 # Convenience concatenation for fresh databases only. Upgrade paths must

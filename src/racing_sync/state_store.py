@@ -15,6 +15,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from .coordinator_errors import AbandonedError
@@ -23,8 +24,12 @@ from .state_schema import (
     _SCHEMA_VERSION,
     _TORRENT_STATE_COLUMN_SPECS,
     _TORRENT_STATE_COLUMNS_NO_BLOB,
+    LIVE_PUSH_STATES,
     SCHEMA_INDEXES,
     SCHEMA_TABLES,
+    SOURCE_PUSH_COLUMNS,
+    PushState,
+    SourcePush,
     State,
     TorrentState,
     check_transition,
@@ -1298,6 +1303,265 @@ class StateStore:
         with self._lock:
             self._conn.execute("DELETE FROM torrent_blob WHERE infohash = ?", (norm,))
 
+    # ---- source_push: durable "push from VPS1" checkpoints ----
+    #
+    # Independent of torrent_state rows (like the racing-blob table above):
+    # the copy runs detached on VPS1, so its progress must survive a restart
+    # of this process and a second operator tap must dedupe onto the existing
+    # record instead of launching a competing copy of the same group.
+    # Best-effort throughout: these are checkpoints, not ledgers, so a failed
+    # write logs and returns False/None rather than taking a worker down.
+
+    def start_push(
+        self,
+        infohash: str,
+        *,
+        group_key: str = "",
+        content_name: str = "",
+        src_dir: str = "",
+        target_remote: str = "",
+        list_path: str = "",
+        log_path: str = "",
+        deadline_at: dt.datetime | None = None,
+        files_total: int = 0,
+    ) -> SourcePush | None:
+        """Force a fresh checkpoint for `infohash`, RESETing any prior record.
+
+        Used on a fresh operator tap: whatever the previous attempt left
+        behind (state, progress, error, timers) is discarded and the push
+        starts again from `running`. Returns the record as stored, None when
+        the write failed or the hash is empty.
+        """
+        self._ensure_open()
+        push = _new_push(
+            infohash,
+            group_key=group_key,
+            content_name=content_name,
+            src_dir=src_dir,
+            target_remote=target_remote,
+            list_path=list_path,
+            log_path=log_path,
+            deadline_at=deadline_at,
+            files_total=files_total,
+        )
+        if push is None:
+            return None
+        try:
+            with self._write_tx():
+                values = tuple(push.to_row().values())
+                qmarks = ", ".join(["?"] * len(SOURCE_PUSH_COLUMNS))
+                self._conn.execute(
+                    f"INSERT OR REPLACE INTO source_push "
+                    f"({', '.join(SOURCE_PUSH_COLUMNS)}) VALUES ({qmarks})",
+                    values,
+                )
+            return push
+        except Exception as e:  # noqa: BLE001
+            log.warning("state DB: could not start push for %s: %s", push.infohash[:10], e)
+            return None
+
+    def claim_push(
+        self,
+        infohash: str,
+        *,
+        group_key: str = "",
+        content_name: str = "",
+        src_dir: str = "",
+        target_remote: str = "",
+        list_path: str = "",
+        log_path: str = "",
+        deadline_at: dt.datetime | None = None,
+        files_total: int = 0,
+    ) -> SourcePush | None:
+        """Atomically claim the hash; None when a live push already owns it.
+
+        The dedupe primitive: one conditional upsert
+        (``INSERT … ON CONFLICT(infohash) DO UPDATE … WHERE <not live>``)
+        inside the write transaction, so two callers can both ask and only
+        one gets a record back — the loser sees the live row and returns
+        None. A finished (done/failed/abandoned) or expired (deadline passed)
+        record is overwritten and claimed.
+        """
+        self._ensure_open()
+        push = _new_push(
+            infohash,
+            group_key=group_key,
+            content_name=content_name,
+            src_dir=src_dir,
+            target_remote=target_remote,
+            list_path=list_path,
+            log_path=log_path,
+            deadline_at=deadline_at,
+            files_total=files_total,
+        )
+        if push is None:
+            return None
+        now = dt.datetime.now(dt.UTC)
+        live_states = [s.value for s in LIVE_PUSH_STATES]
+        live_qmarks = ", ".join(["?"] * len(live_states))
+        updates = ", ".join(
+            f"{name} = excluded.{name}"
+            for name in SOURCE_PUSH_COLUMNS
+            if name != "infohash"  # the conflict key never moves
+        )
+        try:
+            with self._write_tx():
+                cur = self._conn.execute(
+                    f"INSERT INTO source_push ({', '.join(SOURCE_PUSH_COLUMNS)}) "
+                    f"VALUES ({', '.join(['?'] * len(SOURCE_PUSH_COLUMNS))}) "
+                    f"ON CONFLICT(infohash) DO UPDATE SET {updates} "
+                    # Claimable when the existing record is NOT live: a
+                    # terminal state, or a live state past its deadline
+                    # (empty deadline = never expires).
+                    "WHERE NOT ("
+                    f"source_push.state IN ({live_qmarks}) "
+                    "AND (source_push.deadline_at = '' OR source_push.deadline_at > ?)"
+                    ")",
+                    (
+                        *push.to_row().values(),
+                        *live_states,
+                        _push_stamp(now),
+                    ),
+                )
+                if (cur.rowcount or 0) <= 0:
+                    return None
+                return push
+        except Exception as e:  # noqa: BLE001
+            log.warning("state DB: could not claim push for %s: %s", push.infohash[:10], e)
+            return None
+
+    def get_push(self, infohash: str) -> SourcePush | None:
+        """The checkpoint for `infohash`, None when there is none."""
+        self._ensure_open()
+        norm = (infohash or "").strip().lower()
+        if not norm:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM source_push WHERE infohash = ?", (norm,)
+            ).fetchone()
+            return _row_to_push(row) if row else None
+
+    def list_pushes(self, states: Sequence[PushState | str] = ()) -> list[SourcePush]:
+        """Checkpoints in `states` (PushState or its value); all when empty.
+
+        Oldest update first so a caller sweeping stale records sees the
+        longest-running push first.
+        """
+        self._ensure_open()
+        wanted: list[str] = []
+        for s in states or ():
+            value = _as_push_state(s)
+            if value is not None and value not in wanted:
+                wanted.append(value)
+        if states and not wanted:
+            return []
+        clauses = ""
+        params: tuple = ()
+        if wanted:
+            qmarks = ", ".join(["?"] * len(wanted))
+            clauses = f"WHERE state IN ({qmarks})"
+            params = tuple(wanted)
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    f"SELECT * FROM source_push {clauses} ORDER BY updated_at", params
+                ).fetchall()
+                return [_row_to_push(r) for r in rows]
+        except Exception as e:  # noqa: BLE001
+            log.warning("state DB: could not list pushes: %s", e)
+            return []
+
+    def note_push_progress(
+        self, infohash: str, *, files_present: int | None = None, files_total: int | None = None
+    ) -> bool:
+        """Update the metadata-only counters; True when a record was written.
+
+        Narrow UPDATE (counters + updated_at only): a progress note never
+        touches state, paths or the deadline, so it cannot clobber a
+        concurrent finish/claim.
+        """
+        self._ensure_open()
+        norm = (infohash or "").strip().lower()
+        if not norm:
+            return False
+        sets: list[str] = []
+        params: list = []
+        for column, value in (("files_present", files_present), ("files_total", files_total)):
+            if value is None:
+                continue
+            try:
+                params.append(max(0, int(value)))
+            except (TypeError, ValueError):
+                continue
+            sets.append(f"{column} = ?")
+        if not sets:
+            return False
+        params.append(dt.datetime.now(dt.UTC).isoformat())
+        params.append(norm)
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE source_push SET {', '.join(sets)}, updated_at = ? WHERE infohash = ?",
+                tuple(params),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def finish_push(self, infohash: str, state: PushState | str, *, last_error: str = "") -> bool:
+        """Settle a push to a terminal (or verifying) state; True when written.
+
+        Clears nothing else: paths and counters stay readable for the detail
+        card and for a later `start_push` post-mortem.
+        """
+        self._ensure_open()
+        norm = (infohash or "").strip().lower()
+        value = _as_push_state(state)
+        if not norm or value is None:
+            if value is None:
+                log.warning("state DB: ignored push finish with unknown state %r", state)
+            return False
+        try:
+            with self._write_tx():
+                cur = self._conn.execute(
+                    "UPDATE source_push SET state = ?, last_error = ?, updated_at = ? "
+                    "WHERE infohash = ?",
+                    (value, str(last_error or ""), dt.datetime.now(dt.UTC).isoformat(), norm),
+                )
+                return (cur.rowcount or 0) > 0
+        except Exception as e:  # noqa: BLE001
+            log.warning("state DB: could not finish push for %s: %s", norm[:10], e)
+            return False
+
+    def clear_push(self, infohash: str) -> bool:
+        """Drop the checkpoint entirely; True when one existed.
+
+        Frees the hash for the next claim (used once the group is seeded and
+        the record no longer means anything).
+        """
+        self._ensure_open()
+        norm = (infohash or "").strip().lower()
+        if not norm:
+            return False
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM source_push WHERE infohash = ?", (norm,))
+            return (cur.rowcount or 0) > 0
+
+    def push_is_live(self, infohash: str, *, now: dt.datetime | None = None) -> bool:
+        """True while a push for `infohash` is still doing work.
+
+        The single expiry rule callers must not re-implement: live means a
+        `running`/`verifying` state and a deadline in the future (an empty
+        deadline never expires). A crashed copy therefore stops blocking
+        dedupes at its deadline instead of forever.
+        """
+        push = self.get_push(infohash)
+        if push is None:
+            return False
+        if push.state not in LIVE_PUSH_STATES:
+            return False
+        if push.deadline_at is None:
+            return True
+        return (now or dt.datetime.now(dt.UTC)) < push.deadline_at
+
     # Columns a narrow update may touch (everything but identity,
     # creation, and the tombstone stamp itself).
     _UPDATABLE_COLUMNS = frozenset(
@@ -1638,4 +1902,131 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         deleted_at=(
             _safe_dt(row["deleted_at"]) if ("deleted_at" in keys and row["deleted_at"]) else None
         ),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# source_push helpers
+# --------------------------------------------------------------------------- #
+
+_PUSH_STATE_VALUES = frozenset(s.value for s in PushState)
+
+
+def _as_push_state(value: object) -> str | None:
+    """Normalize a PushState member or state string to a schema value.
+
+    None when the value is not a push state, so writers can refuse it loudly
+    instead of storing a state no reader recognizes.
+    """
+    if isinstance(value, PushState):
+        return value.value
+    try:
+        low = str(value or "").strip().lower()
+    except Exception:
+        return None
+    return low if low in _PUSH_STATE_VALUES else None
+
+
+def _safe_push_state(value: object) -> PushState:
+    """Parse a push state without crashing a listing on a corrupt cell.
+
+    Unknown values become FAILED (not a live state) so a garbled record can
+    never hold the dedupe lock forever the way a `running` claim would.
+    """
+    value_ = _as_push_state(value)
+    if value_ is not None:
+        return PushState(value_)
+    log.warning("state DB has unknown push state %r; treating as failed", value)
+    return PushState.FAILED
+
+
+def _push_utc(value: object) -> dt.datetime | None:
+    """Aware-UTC datetime for a push stamp column; None when absent/unparsable.
+
+    Naive values are assumed UTC: the TEXT deadline comparisons only hold
+    when every stamp in the table carries the same offset.
+    """
+    if value is None or value == "":
+        return None
+    if not isinstance(value, dt.datetime):
+        return _safe_dt(value)
+    parsed = value if value.tzinfo is not None else value.replace(tzinfo=dt.UTC)
+    return parsed.astimezone(dt.UTC)
+
+
+def _push_stamp(value: object) -> str:
+    """ISO UTC stamp for a push column ("" for absent = no expiry)."""
+    parsed = _push_utc(value)
+    return parsed.isoformat() if parsed is not None else ""
+
+
+def _new_push(
+    infohash: str,
+    *,
+    group_key: str,
+    content_name: str,
+    src_dir: str,
+    target_remote: str,
+    list_path: str,
+    log_path: str,
+    deadline_at: dt.datetime | None,
+    files_total: int,
+) -> SourcePush | None:
+    """Build the checkpoint every push writer stores; None without a hash.
+
+    Single construction point so `start_push` and `claim_push` (which must
+    produce identical rows) cannot drift, and so the record always starts
+    `running` with zeroed progress and a cleared error.
+    """
+    norm = (infohash or "").strip().lower()
+    if not norm:
+        log.warning("state DB: push request without an infohash ignored")
+        return None
+    now = dt.datetime.now(dt.UTC)
+    return SourcePush(
+        infohash=norm,
+        group_key=str(group_key or ""),
+        content_name=str(content_name or ""),
+        src_dir=str(src_dir or ""),
+        target_remote=str(target_remote or ""),
+        list_path=str(list_path or ""),
+        log_path=str(log_path or ""),
+        state=PushState.RUNNING,
+        started_at=now,
+        updated_at=now,
+        deadline_at=_push_utc(deadline_at),
+        files_total=_safe_int(files_total),
+        files_present=0,
+        last_error="",
+    )
+
+
+def _row_to_push(row: sqlite3.Row) -> SourcePush:
+    keys = row.keys()
+
+    def text(name: str) -> str:
+        return str(row[name] or "") if name in keys else ""
+
+    def stamp(name: str) -> dt.datetime:
+        # started_at/updated_at are NOT NULL, but a corrupt or legacy-empty
+        # cell must not kill the row: fall back to "now".
+        parsed = _push_utc(row[name]) if name in keys else None
+        return parsed if parsed is not None else dt.datetime.now(dt.UTC)
+
+    return SourcePush(
+        infohash=text("infohash"),
+        group_key=text("group_key"),
+        content_name=text("content_name"),
+        src_dir=text("src_dir"),
+        target_remote=text("target_remote"),
+        list_path=text("list_path"),
+        log_path=text("log_path"),
+        state=_safe_push_state(row["state"]) if "state" in keys else PushState.FAILED,
+        started_at=stamp("started_at"),
+        updated_at=stamp("updated_at"),
+        # Empty deadline = no expiry (push_is_live only checks the state).
+        deadline_at=_push_utc(row["deadline_at"]) if "deadline_at" in keys else None,
+        files_total=_safe_int(row["files_total"]) if "files_total" in keys else 0,
+        files_present=_safe_int(row["files_present"]) if "files_present" in keys else 0,
+        last_error=text("last_error"),
     )
