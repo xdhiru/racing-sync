@@ -269,8 +269,17 @@ async def probe_app_path(ssh, cfg, cmd_timeout: float, copy_test: bool = False) 
         f"ok={launched.ok} reason={launched.reason!r} log={launched.log_path!r}",
     )
     if launched.ok:
-        rc, out, err = sh(ssh, f"tail -n 20 {shlex.quote(launched.log_path)} 2>&1", cmd_timeout)
-        report("job log on VPS1 (first 20 lines)", "INFO", (out or "").strip()[:400])
+        rc, out, _ = sh(
+            ssh,
+            f"echo '--- job log ---'; head -c 4000 {shlex.quote(launched.log_path)} 2>&1; "
+            f"echo; echo '--- file list ---'; head -c 1000 {shlex.quote(launched.list_path)} 2>&1",
+            cmd_timeout,
+        )
+        report(
+            "job log + list on VPS1",
+            "INFO",
+            (out or "").strip()[:4000] or show((rc, out, "")),
+        )
         landed = (0, 0)
         for _ in range(20):
             await asyncio.sleep(3)
