@@ -1641,7 +1641,7 @@ class CleanupMixin:
             # The row's cross_seed_blob is the DOWNLOAD torrent for private
             # releases, not the racing torrent. Never use it here: caching it
             # under the racing hash made every later re-inject add the wrong
-            # torrent (the crosssite copy) and the racing seed never appeared.
+            # torrent (the public cross-seed copy) and the racing seed never appeared.
             if h:
                 try:
                     blob = await self._load_racing_torrent_bytes(h)

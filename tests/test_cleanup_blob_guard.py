@@ -395,7 +395,7 @@ async def test_loader_prefers_db_blob(tmp_path: Path):
 async def test_loader_rejects_row_download_blob_for_the_source_hash(tmp_path: Path):
     """The row blob is the download torrent, not the racing torrent.
 
-    Returning it made re-inject add the crosssite download under the racing
+    Returning it made re-inject add the public cross-seed download under the racing
     hash; qB stored the download's own hash, so the racing entry never
     appeared and the racing seed was never created.
     """
