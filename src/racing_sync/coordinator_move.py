@@ -38,14 +38,9 @@ from .coordinator_errors import (
 )
 from .coordinator_paths import _safe_ssd_join, left_on_disk_many
 from .io_bounds import rpc
-from .local_transfer import LocalMoveError, LocalMoveTimeout, move_local_to_local
-from .rclone_ops import (
-    RcloneTimeoutError,
-    _tree_key,
-    move_local_to_remote,
-    rclone_progress_map,
-)
+from .rclone_ops import _tree_key, rclone_progress_map
 from .state import State, TorrentState
+from .transfer import build_transfer
 
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
@@ -2824,31 +2819,14 @@ class MoveMixin:
                         _trees.pop(_k, None)
             except Exception:
                 pass
-            if self.rt.transfer.provider == "local_move":
-                if include:
-                    raise LocalMoveError(
-                        "local_move does not support include patterns yet; "
-                        'use provider = "rclone" for filtered moves'
-                    )
-                try:
-                    res = await move_local_to_local(
-                        local,
-                        Path(remote),
-                        files_from=files_from,
-                        timeout=self.rt.transfer.timeout_seconds,
-                    )
-                except LocalMoveTimeout as e:
-                    raise RcloneTimeoutError(str(e)) from None
-            else:
-                res = await move_local_to_remote(
-                    self.cfg,
-                    local,
-                    remote,
-                    include=include,
-                    files_from=files_from,
-                    extra=extra,
-                    progress=True,
-                )
+            provider = build_transfer(self.rt)
+            res = await provider.move(
+                local,
+                remote,
+                include=include,
+                files_from=files_from,
+                extra=extra,
+            )
             if not res.ok:
                 err = res.stderr.strip()
                 # Headline first: rclone puts the summary up top and the

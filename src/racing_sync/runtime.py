@@ -27,6 +27,11 @@ class Runtime:
         self._cfg = cfg
 
     @property
+    def config(self) -> AppConfig:
+        """The loaded config, for factories that need the whole object."""
+        return self._cfg
+
+    @property
     def intake(self) -> IntakeSettings:
         return IntakeSettings(self._cfg)
 
