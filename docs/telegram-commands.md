@@ -38,6 +38,8 @@ All commands accept an optional `@bot` suffix in group chats
 | `/cancel_all <text>` | Cancel every live group whose title contains `<text>`. |
 | `/cancel_lane` | Cancel a whole lane (DL/MV/RD/QD) — a sheet with live counts. |
 | `/cancel_stalled` | Cancel every download with no seeders and no progress. |
+| `/clean <hash>` | Clean one completed (DONE) task's VPS1 copy now — skips grace/idle but keeps every safety check. |
+| `/cleanup` | Run the VPS1 cleanup pass now — skips only the startup delay and the hourly cadence. |
 | `/files <target>` | Read-only file listing for one torrent/group. |
 | `/find <text>` | Read-only Prowlarr search over the download-target indexers. |
 | `/force <target>` | Start a queued/moving row past the lane caps (in-memory; disarms on lane exit or restart). |
@@ -90,6 +92,19 @@ two questions once for the whole scope.
 
 - `▶ Start <copy> now` — pick which copy of the group to start.
 
+### Act sheet — VPS1 cleanup
+
+- `🧹 Clean VPS1 copies` — shown only for a completed (DONE) group when
+  `[cleanup].enabled` is on. Runs the same per-task cleanup as
+  `/clean_<hash>`: fuse bytes verified, H&R minimums met, no race
+  activity, un-injected `.torrent` bytes preserved; grace/idle are
+  skipped on purpose (operator intent). With `dry_run = true` nothing is
+  deleted and the reply says what would have been.
+- The sheet also prints the janitor's estimate (`Cleanup: clean ready`,
+  `Cleanup: clean ~5h`). The same hint follows a DONE row's stage text in
+  the Active Tasks card: `clean ready` means the timing gates are
+  satisfied, `clean ~5h` is an estimate based on the adaptive grace.
+
 ## Notes
 
 - `abort` / `Close` cancels any open sheet without changing anything.
@@ -99,3 +114,10 @@ two questions once for the whole scope.
   "Already working on it" instead of executing twice.
 - `/find`, `/files` and `/stats` are read-only: they never queue or
   download anything.
+- **Cleanup** — the automatic janitor deletes VPS1 copies on its own
+  cadence once grace/idle allow. `/cleanup` and `/clean_<hash>` only
+  bypass the waiting (cadence, grace, idle): fuse verification, H&R
+  minimums, activity, and `.torrent` preservation always run. `/clean`
+  refuses non-DONE rows; MOVING copies are cleaned automatically under
+  disk pressure. Both commands do nothing when `[cleanup].enabled` is
+  false (or the chain adds no seed entry to verify against).

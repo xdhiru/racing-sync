@@ -459,6 +459,16 @@ class RefreshMixin:
         except Exception:
             notes = {}
         footer = await self._active_footer()
+        # Completed rows are not listed (the card shows in-flight work), but
+        # their VPS1 cleanup countdown stays visible in the footer.
+        try:
+            _pending_fn = getattr(self._coord, "_cleanup_pending_summary", None)
+            if callable(_pending_fn):
+                _pending = await _pending_fn()
+                if isinstance(_pending, str) and _pending:
+                    footer = footer + "\n" + _pending if footer else _pending
+        except Exception:
+            pass
         # Live rclone lines for MOVING rows (strict dict: test doubles
         # answer truthy to everything and must degrade to no lines).
         try:
@@ -468,6 +478,24 @@ class RefreshMixin:
                 move_progress = {}
         except Exception:
             move_progress = {}
+        # Cleanup ETA per DONE row (display-only): the coordinator mirrors
+        # the janitor's adaptive grace + idle fast lane. Strict string
+        # check so a bare/MagicMock coordinator degrades to no hints.
+        cleanup: dict[str, str] = {}
+        try:
+            _hint_fn = getattr(self._coord, "_cleanup_hint", None)
+            if callable(_hint_fn):
+                for _ts, _ in items:
+                    if getattr(_ts, "state", None) != State.DONE:
+                        continue
+                    try:
+                        _hint = _hint_fn(_ts)
+                    except Exception:
+                        continue
+                    if isinstance(_hint, str) and _hint:
+                        cleanup[(_ts.source_infohash or "").lower()] = _hint
+        except Exception:
+            cleanup = {}
         # Status filter (All/DL/MV/RD/QD buttons): the detail nets above
         # run on the FULL list (filtered-out cards still heal); only the
         # render + numbering narrow. Unknown keys show everything.
@@ -500,6 +528,7 @@ class RefreshMixin:
             footer=footer,
             speeds=speed_map,
             move_progress=move_progress,
+            cleanup=cleanup,
         )
         # Stamp the rendered generation: typed /act_N positions resolve
         # against the live list, so a count change between render and tap

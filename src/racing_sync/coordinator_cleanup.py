@@ -13,6 +13,7 @@ import datetime as dt
 import logging
 import time
 from pathlib import Path
+from typing import Any
 
 from .clients.abstract import Torrent
 from .coordinator_content import cleanup_grace_seconds
@@ -239,7 +240,7 @@ class CleanupMixin:
         except Exception:
             pass
 
-    async def _maybe_cleanup_source(self) -> None:
+    async def _maybe_cleanup_source(self, *, force: bool = False) -> dict | None:
         """Gate for the VPS1 cleanup janitor; no-op unless enabled.
 
         The cadence clock persists in store_meta, so a restart resumes the
@@ -254,10 +255,16 @@ class CleanupMixin:
         from it: calm runs keep `janitor_interval_seconds`, pressured ones
         switch to the shorter `burst_janitor_interval_seconds`. The probe
         value is cached for the oversized-arrival check.
+
+        `force` (operator `/cleanup`) skips ONLY the startup-delay and
+        cadence gates: every safety, grace, H&R and blob-preservation rule
+        in `_run_source_cleanup` still applies. Returns the run summary
+        dict, or None when cleanup is disabled, unavailable (no seed
+        entry), still settling, or not due.
         """
         cfg = getattr(self.rt.cleanup, "config", None)
         if cfg is None or not getattr(cfg, "enabled", False):
-            return
+            return None
         if not self.rt.chain.adds_seed_entry:
             # The janitor proves the content is secured by re-verifying our
             # own seed entry. Without that link (disabled or adopt-only)
@@ -268,7 +275,7 @@ class CleanupMixin:
                     "cleanup janitor skipped: no seeding entry is added by this "
                     "chain — completed content cannot be verified yet"
                 )
-            return
+            return None
         try:
             interval = int(getattr(cfg, "janitor_interval_seconds", 3600) or 3600)
         except (TypeError, ValueError):
@@ -295,8 +302,8 @@ class CleanupMixin:
                 self._cleanup_gate_t0 = gate_t0
         except Exception:
             gate_t0 = now_mono
-        if startup_delay > 0 and now_mono - gate_t0 < startup_delay:
-            return
+        if not force and startup_delay > 0 and now_mono - gate_t0 < startup_delay:
+            return None
         # One probe per tick: the pressure decision, the cadence gate and
         # `_run_source_cleanup` all share this reading (and the arrival
         # check compares new releases against it).
@@ -308,8 +315,8 @@ class CleanupMixin:
         arrivals, bytes_rate, projected, urgent, bursting = self._cleanup_pressure(cfg, free_bytes)
         effective = burst_interval if bursting else interval
         now_wall = time.time()
-        if now_wall - self._cleanup_last_run_wall() < effective:
-            return
+        if not force and now_wall - self._cleanup_last_run_wall() < effective:
+            return None
         self._remember_cleanup_run(now_wall)
         # A run is starting: it consumes the urgency flag (a still-cramped
         # disk re-trips the watermark trigger next tick).
@@ -317,7 +324,7 @@ class CleanupMixin:
             self._cleanup_urgent = False
         except Exception:
             pass
-        await self._run_source_cleanup(
+        return await self._run_source_cleanup(
             cfg,
             free_bytes=free_bytes,
             arrivals=arrivals,
@@ -337,7 +344,7 @@ class CleanupMixin:
         projected: float | None = None,
         bursting: bool | None = None,
         urgent: bool | None = None,
-    ) -> None:
+    ) -> dict:
         """Delete VPS1 racing torrents whose content VPS2 fully secured.
 
         Two deletion classes (see [cleanup] docs): normal DONE rows past
@@ -349,6 +356,11 @@ class CleanupMixin:
         The pressure values are optional so direct callers/tests can pass
         only `cfg`; the janitor passes its single probe down so this method
         never re-probes.
+
+        Returns a one-line-friendly summary (also on every early-return
+        path): `{"deleted", "candidates", "dry_run", "grace_s", "free",
+        "bursting", "reason"}` where `reason` is only set when nothing ran
+        ("no rows", "nothing eligible", ...).
         """
         now_utc = dt.datetime.now(dt.UTC)
         if arrivals is None:
@@ -366,6 +378,22 @@ class CleanupMixin:
         bytes_rate = float(bytes_rate or 0.0)
         bursting = bool(bursting)
         urgent = bool(urgent)
+        dry_run = bool(getattr(cfg, "dry_run", True))
+        grace_s = cleanup_grace_seconds(cfg, free_bytes, arrivals)
+
+        def _summary(**over: Any) -> dict:
+            out = {
+                "deleted": 0,
+                "candidates": 0,
+                "dry_run": dry_run,
+                "grace_s": float(grace_s),
+                "free": free_bytes,
+                "bursting": bursting,
+                "reason": "",
+            }
+            out.update(over)
+            return out
+
         # Calm-and-roomy short-circuit: plenty of free space and a quiet
         # intake mean no deletion could help anything — skip the scan and
         # the deletes entirely (next tick re-evaluates). Unknown free space
@@ -395,8 +423,7 @@ class CleanupMixin:
                 free_bytes,
                 arrivals,
             )
-            return
-        grace_s = cleanup_grace_seconds(cfg, free_bytes, arrivals)
+            return _summary(reason="VPS1 roomy and intake calm")
         low_free = int(getattr(cfg, "low_watermark_free_bytes", 0) or 0)
         if free_bytes is not None:
             try:
@@ -450,9 +477,9 @@ class CleanupMixin:
             ]
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup: cannot list state rows: %s", e)
-            return
+            return _summary(reason="cannot list state rows")
         if not rows:
-            return
+            return _summary(reason="no rows")
         try:
             src_torrents = await rpc(
                 self.source_client.list_torrents(category=self.rt.intake.category),
@@ -461,10 +488,8 @@ class CleanupMixin:
             )
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup: cannot list VPS1 torrents: %s", e)
-            return
+            return _summary(reason="cannot list VPS1 torrents")
         by_hash = {t.infohash.lower(): t for t in src_torrents}
-
-        dry_run = bool(getattr(cfg, "dry_run", True))
 
         candidates: list[tuple[float, float, TorrentState, list[Torrent]]] = []
         _sem = asyncio.Semaphore(4)
@@ -498,13 +523,13 @@ class CleanupMixin:
             _verdicts = await asyncio.gather(*(_verdict_one(ts) for ts in rows))
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup: verdict phase failed: %s", e)
-            return
+            return _summary(reason="verdict phase failed")
         # Verdicts are per-row independent (narrow stamps on distinct rows;
         # dry-run mutates nothing): gather preserves row order here.
         candidates.extend(v for v in (_verdicts or []) if v is not None)
 
         if not candidates:
-            return
+            return _summary(reason="nothing eligible")
         pressured = bool(free_bytes is not None and low_free and free_bytes < low_free)
         # Under disk pressure (or any burst) DONE rows go first: their
         # content is fully secured and normally already re-added, so they
@@ -584,6 +609,361 @@ class CleanupMixin:
             deleted,
             f" (cap {cap})" if deleted >= cap else "",
         )
+        return _summary(deleted=deleted, candidates=len(candidates))
+
+    # ---- operator commands + cleanup ETA -------------------------------
+
+    @staticmethod
+    def _cleanup_eta_compact(seconds: float) -> str:
+        """Compact remaining time for the hint (``45m`` / ``5h``)."""
+        try:
+            s = max(0, int(seconds))
+        except (TypeError, ValueError):
+            return ""
+        # Stay in minutes up to ~59m so a rounding edge never prints "60m".
+        if s < 3540:
+            return f"{max(1, round(s / 60))}m"
+        return f"{max(1, round(s / 3600))}h"
+
+    @staticmethod
+    def _cleanup_error_text(e: object) -> str:
+        """Scrubbed one-line error for a command reply (never raises)."""
+        try:
+            from .logging_setup import sanitize_log_text
+
+            text = sanitize_log_text(str(e))
+        except Exception:
+            text = ""
+        return (text or type(e).__name__)[:200]
+
+    @staticmethod
+    def _cleanup_summary_text(summary: dict) -> str:
+        """One-line `/cleanup` reply from a `_run_source_cleanup` summary."""
+        try:
+            deleted = int(summary.get("deleted", 0) or 0)
+            candidates = int(summary.get("candidates", 0) or 0)
+            dry = bool(summary.get("dry_run"))
+            reason = str(summary.get("reason") or "")
+            free = summary.get("free")
+        except Exception:
+            return "Cleanup ran."
+        if reason:
+            return f"🧹 Cleanup: nothing deleted — {reason}."
+        verb = "would delete" if dry else "deleted"
+        line = (
+            f"🧹 Cleanup ({'dry-run' if dry else 'live'}): {verb} "
+            f"{deleted} of {candidates} candidate(s)"
+        )
+        try:
+            if free is not None:
+                line += f" · VPS1 free {int(free) // (1024 * 1024)} MB"
+        except (TypeError, ValueError):
+            pass
+        return line
+
+    def _cleanup_remaining_seconds(self, ts: object) -> tuple[bool, float | None] | None:
+        """(ready, seconds_left) for a DONE row, or None when not applicable.
+
+        Mirrors the janitor's timing: adaptive grace from the last free-space
+        probe plus the idle fast lane (an old `vps1_last_activity_at` stamp).
+        Purely cosmetic — the authoritative gates still run at deletion.
+        """
+        try:
+            if getattr(ts, "state", None) != State.DONE:
+                return None
+            cfg = getattr(self.rt.cleanup, "config", None)
+            if cfg is None or not getattr(cfg, "enabled", False):
+                return None
+            if not self.rt.chain.adds_seed_entry:
+                return None
+        except Exception:
+            return None
+        try:
+            arrivals = float(self._cleanup_arrival_rates(time.monotonic())[0] or 0.0)
+        except Exception:
+            arrivals = 0.0
+        try:
+            free = getattr(self, "_last_source_free_bytes", None)
+        except Exception:
+            free = None
+        try:
+            grace_s = float(cleanup_grace_seconds(cfg, free, arrivals))
+        except Exception:
+            return None
+        completed = getattr(ts, "completed_at", None)
+        anchor = completed or getattr(ts, "created_at", None)
+        if anchor is None:
+            return None
+        now = dt.datetime.now(dt.UTC)
+        try:
+            age_s = (now - anchor).total_seconds()
+        except Exception:
+            return None
+        if age_s >= grace_s:
+            return (True, 0.0)
+        # Idle fast lane: an old activity stamp proves the race finished.
+        # Rows without a completion stamp are never fast-laned (matching
+        # `_cleanup_verdict`: adoption age alone is not seed-time proof).
+        if completed is not None:
+            last = getattr(ts, "vps1_last_activity_at", None)
+            if last is not None:
+                try:
+                    window_s = float(getattr(cfg, "idle_confirm_minutes", 45) or 0) * 60.0
+                except (TypeError, ValueError):
+                    window_s = 45.0 * 60.0
+                try:
+                    if window_s <= 0 or (now - last).total_seconds() >= window_s:
+                        return (True, 0.0)
+                except Exception:
+                    pass
+        return (False, max(0.0, grace_s - age_s))
+
+    def _cleanup_hint(self, ts: object) -> str:
+        """Best-effort "when will VPS1 lose this copy" line for a DONE row."""
+        try:
+            remaining = self._cleanup_remaining_seconds(ts)
+        except Exception:
+            return ""
+        if remaining is None:
+            return ""
+        ready, seconds_left = remaining
+        if ready:
+            return "clean ready"
+        eta = self._cleanup_eta_compact(seconds_left or 0.0)
+        return f"clean ~{eta}" if eta else "clean pending"
+
+    async def _cleanup_pending_summary(self) -> str:
+        """One-line footer for the active card: completed rows awaiting VPS1 removal.
+
+        The pinned list intentionally shows only in-flight rows; this keeps
+        the cleanup countdown visible there without listing every DONE row.
+        """
+        try:
+            cfg = getattr(self.rt.cleanup, "config", None)
+            if cfg is None or not getattr(cfg, "enabled", False):
+                return ""
+            if not self.rt.chain.adds_seed_entry:
+                return ""
+        except Exception:
+            return ""
+        try:
+            rows = await asyncio.to_thread(self.store.list_by_state, State.DONE)
+        except Exception:
+            return ""
+        ready = 0
+        pending = 0
+        soon: float | None = None
+        for ts in rows or []:
+            remaining = self._cleanup_remaining_seconds(ts)
+            if remaining is None:
+                continue
+            is_ready, seconds_left = remaining
+            if is_ready:
+                ready += 1
+                continue
+            pending += 1
+            if seconds_left is not None and (soon is None or seconds_left < soon):
+                soon = seconds_left
+        total = ready + pending
+        if not total:
+            return ""
+        parts = []
+        if ready:
+            parts.append(f"{ready} ready")
+        if soon is not None:
+            eta = self._cleanup_eta_compact(soon)
+            if eta:
+                parts.append(f"next in ~{eta}")
+        return f"🧹 VPS1 cleanup: {total} done · " + " · ".join(parts)
+
+    async def _cleanup_resolve_row(self, norm: str) -> tuple[object | None, str]:
+        """Resolve one tracked row by full hash or 6+ hex prefix.
+
+        DONE rows are invisible to `list_active_inflight`, so the prefix
+        scan reads the full table (`store.all`). Returns (row, "") on a
+        unique match, else (None, reply text).
+        """
+        store = getattr(self, "store", None)
+        if store is None:
+            return None, "Action failed: store not attached."
+        if len(norm) == 40:
+            try:
+                row = await asyncio.to_thread(store.get, norm, include_blob=False)
+            except Exception as e:  # noqa: BLE001
+                return None, f"Lookup failed: {self._cleanup_error_text(e)}"
+            if row is None:
+                return None, f"No tracked torrent is {norm}."
+            return row, ""
+        if len(norm) < 6:
+            return None, "Use /clean_<6+ hex chars> or the full 40-char hash."
+        try:
+            rows = await asyncio.to_thread(store.all)
+        except Exception as e:  # noqa: BLE001
+            return None, f"Lookup failed: {self._cleanup_error_text(e)}"
+        want = [
+            r
+            for r in rows or []
+            if (getattr(r, "source_infohash", "") or "").lower().startswith(norm)
+        ]
+        if len(want) == 1:
+            return want[0], ""
+        if len(want) > 1:
+            return None, (
+                f"/clean_{norm} matches {len(want)} torrents; send /clean_<full 40-char hash>."
+            )
+        return None, f"No tracked torrent starts with {norm!r}."
+
+    async def _cleanup_now_command(self, message: Any = None) -> str:
+        """Run one VPS1 cleanup pass now (operator `/cleanup`).
+
+        Serialized with the janitor loop via `_janitor_lock`. `force`
+        bypasses only the startup-delay/cadence gates: every safety, grace,
+        H&R and blob-preservation rule still applies. Returns the reply
+        text (`message` is accepted for handler-signature symmetry; the
+        Telegram bot sends the reply).
+        """
+        try:
+            cfg = getattr(self.rt.cleanup, "config", None)
+        except Exception:
+            cfg = None
+        if cfg is None or not getattr(cfg, "enabled", False):
+            return "Cleanup is disabled — set [cleanup] enabled = true first."
+        try:
+            if not self.rt.chain.adds_seed_entry:
+                return (
+                    "Cleanup is disabled for this chain: no seeding entry is "
+                    "added, so completed content cannot be verified."
+                )
+        except Exception:
+            return "Cleanup is unavailable: the chain is not loaded."
+        lock = None
+        try:
+            loop_lock = getattr(self, "_loop_lock", None)
+            if callable(loop_lock):
+                lock = loop_lock("_janitor_lock")
+        except Exception:
+            lock = None
+        try:
+            if lock is None:
+                summary = await self._maybe_cleanup_source(force=True)
+            else:
+                async with lock:
+                    summary = await self._maybe_cleanup_source(force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            return f"Cleanup failed: {self._cleanup_error_text(e)}"
+        if summary is None:
+            return "Cleanup did not run."
+        return self._cleanup_summary_text(summary)
+
+    async def _clean_task_command(self, target: str, message: Any = None) -> str:
+        """Clean one completed row's VPS1 copy now (operator `/clean_<hash>`).
+
+        Bypasses grace/idle on purpose (the operator asked for it) but keeps
+        every safety check: DONE only, protected patterns, usable swarm
+        stats, fuse byte verification, H&R minimums, no live race activity,
+        and .torrent preservation for un-injected copies. Dry-run deletes
+        nothing. Returns the reply text.
+        """
+        try:
+            cfg = getattr(self.rt.cleanup, "config", None)
+        except Exception:
+            cfg = None
+        if cfg is None or not getattr(cfg, "enabled", False):
+            return "Cleanup is disabled — set [cleanup] enabled = true first."
+        try:
+            if not self.rt.chain.adds_seed_entry:
+                return (
+                    "Cleanup is disabled for this chain: no seeding entry is "
+                    "added, so completed content cannot be verified."
+                )
+        except Exception:
+            return "Cleanup is unavailable: the chain is not loaded."
+        norm = str(target or "").strip().lower()
+        if not norm or any(c not in "0123456789abcdef" for c in norm):
+            return "Use /clean_<hash> (6+ hex chars, or the full 40-char hash)."
+        row, err = await self._cleanup_resolve_row(norm)
+        if row is None:
+            return err
+        title = str(getattr(row, "source_name", "") or norm[:10])[:60]
+        try:
+            state = getattr(row, "state", None)
+            state_label = getattr(state, "value", "unknown")
+        except Exception:
+            state, state_label = None, "unknown"
+        if state != State.DONE:
+            return (
+                f"{title} is {state_label} — only completed rows can be cleaned; "
+                "MOVING copies clean automatically under pressure."
+            )
+        try:
+            torrents = await rpc(
+                self.source_client.list_torrents(category=self.rt.intake.category),
+                getattr(self, "cfg", None),
+                "source manual cleanup list_torrents",
+            )
+        except Exception as e:  # noqa: BLE001
+            return f"Cleanup failed: {self._cleanup_error_text(e)}"
+        by_hash: dict[str, Torrent] = {}
+        for t in torrents or []:
+            try:
+                by_hash[t.infohash.lower()] = t
+            except Exception:
+                continue
+        group = self._cleanup_group_for(row, by_hash)
+        if not group:
+            return f"No live VPS1 copy for {title} (already cleaned?)."
+        dry_run = bool(getattr(cfg, "dry_run", True))
+        if self._cleanup_protected(row):
+            return f"Keeping VPS1: {title} matches a protected pattern."
+        try:
+            stats_unknown = any(self._cleanup_stats_unknown(m) for m in group)
+        except Exception:
+            stats_unknown = True
+        if stats_unknown:
+            return f"Keeping VPS1: {title} reports no usable VPS1 stats."
+        try:
+            healthy = await self._cleanup_fuse_healthy(row, dry_run)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            return (
+                f"Keeping VPS1: fuse verification failed for {title} "
+                f"({self._cleanup_error_text(e)})."
+            )
+        if not healthy:
+            return f"Keeping VPS1: fuse copy of {title} is not verified."
+        if not self._cleanup_minimums_met(group, cfg):
+            return f"Keeping VPS1: H&R minimums are not met for {title}."
+        try:
+            active = any(self._cleanup_member_active(m, cfg) for m in group)
+        except Exception:
+            active = True
+        if active:
+            return f"Keeping VPS1: {title} still shows race activity."
+        try:
+            preserved = await self._cleanup_preserve_racing_blobs(row, group, dry_run)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            return (
+                f"Keeping VPS1: could not preserve .torrent bytes for {title} "
+                f"({self._cleanup_error_text(e)})."
+            )
+        if not preserved:
+            return f"Keeping VPS1: could not preserve .torrent bytes for {title}."
+        if dry_run:
+            return f"dry-run is on — would delete {len(group)} VPS1 torrent(s) for {title}."
+        try:
+            ok = await self._delete_source_group(row, group, cfg, False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            return f"Cleanup failed for {title}: {self._cleanup_error_text(e)}"
+        if not ok:
+            return f"Delete failed for {title} — will retry next janitor run."
+        return f"Deleted {len(group)} VPS1 torrent(s) for {title}."
 
     @staticmethod
     def _cleanup_sort_candidates(
