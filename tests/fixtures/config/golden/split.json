@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:1d900ed1edecec0b",
+  "digest": "sha256:49900a9ea9b31269",
   "keys": {
     "by_section": {
       "api": 5,
@@ -15,9 +15,9 @@
       "telegram": 3,
       "watch_dir": 2
     },
-    "defaulted": 91,
+    "defaulted": 94,
     "explicit": 55,
-    "model": 144,
+    "model": 147,
     "unknown": []
   },
   "resolved": {
@@ -41,12 +41,15 @@
     "cleanup": {
       "activity_upspeed_bps": 65536,
       "burst_arrivals_per_hour": 8.0,
+      "burst_janitor_interval_seconds": 300,
+      "burst_per_run_cap": 25,
       "calm_arrivals_per_hour": 2.0,
       "critical_watermark_free_bytes": 8589934592,
       "delete_files": true,
       "delete_stagger_seconds": 60.0,
       "dry_run": true,
       "enabled": true,
+      "fill_lookahead_hours": 2.0,
       "high_watermark_free_bytes": 42949672960,
       "idle_confirm_minutes": 45.0,
       "janitor_interval_seconds": 3600,

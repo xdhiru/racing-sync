@@ -89,6 +89,13 @@ enabled = true
 dry_run = true
 # Space out deletions: remove_torrent(+data) stalls a shared Deluge daemon.
 delete_stagger_seconds = 60
+# Burst mode while intake outruns VPS1 free space: shorter cadence + bigger
+# per-run cap (must be <= janitor_interval_seconds / >= per_run_cap).
+burst_janitor_interval_seconds = 300
+burst_per_run_cap = 25
+# Burst when recent arrival bytes/hour project a full disk within N hours
+# (0 disables the projected-fill trigger).
+fill_lookahead_hours = 2.0
 """,
     ),
     "logging_sink": Feature(

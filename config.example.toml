@@ -606,6 +606,15 @@ delete_files = true
 # Max content groups deleted per janitor run + seconds between runs.
 per_run_cap = 10
 janitor_interval_seconds = 1800
+# Burst mode: while intake outruns the disk (free below the low watermark,
+# arrivals at/above burst, a release that does not fit, or projected fill
+# inside fill_lookahead_hours), run on this shorter cadence and cap.
+# Must be <= janitor_interval_seconds and >= per_run_cap respectively.
+burst_janitor_interval_seconds = 300
+burst_per_run_cap = 25
+# Burst when recent arrival bytes/hour project VPS1 filling within this
+# many hours. 0 disables the projected-fill trigger.
+fill_lookahead_hours = 2.0
 # Settle delay after (re)start before the first janitor run may delete.
 # A minutes-long reboot for an upgrade must not trigger an immediate run.
 # 0 disables (run as soon as the hourly cadence allows).

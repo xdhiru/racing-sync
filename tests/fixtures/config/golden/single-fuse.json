@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:7c89ccc880b6cdd9",
+  "digest": "sha256:5f38604b50476540",
   "keys": {
     "by_section": {
       "dest": 4,
@@ -9,9 +9,9 @@
       "source": 5,
       "ssd": 3
     },
-    "defaulted": 125,
+    "defaulted": 128,
     "explicit": 19,
-    "model": 144,
+    "model": 147,
     "unknown": []
   },
   "resolved": {
@@ -35,12 +35,15 @@
     "cleanup": {
       "activity_upspeed_bps": 65536,
       "burst_arrivals_per_hour": 8.0,
+      "burst_janitor_interval_seconds": 300,
+      "burst_per_run_cap": 25,
       "calm_arrivals_per_hour": 2.0,
       "critical_watermark_free_bytes": 8589934592,
       "delete_files": true,
       "delete_stagger_seconds": 60.0,
       "dry_run": true,
       "enabled": false,
+      "fill_lookahead_hours": 2.0,
       "high_watermark_free_bytes": 42949672960,
       "idle_confirm_minutes": 45.0,
       "janitor_interval_seconds": 3600,

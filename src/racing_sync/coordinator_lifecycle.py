@@ -960,18 +960,16 @@ class LifecycleMixin:
             if self._stop:
                 break
             try:
-                await asyncio.sleep(
-                    max(
-                        300,
-                        int(
-                            getattr(
-                                getattr(self.cfg, "cleanup", None), "janitor_interval_seconds", 3600
-                            )
-                            or 3600
-                        ),
-                    )
-                )
+                _cleanup = getattr(self.cfg, "cleanup", None)
+                _normal = int(getattr(_cleanup, "janitor_interval_seconds", 3600) or 3600)
+                _burst = int(getattr(_cleanup, "burst_janitor_interval_seconds", 300) or 300)
+                # Wake on the burst cadence: the step self-gates (calm vs
+                # burst) and returns immediately when cleanup is disabled,
+                # so a tight disk is noticed within burst_janitor_interval.
+                _wake = max(60, min(_burst, _normal))
             except (TypeError, ValueError):
-                await asyncio.sleep(300)
+                _wake = 300
+            try:
+                await asyncio.sleep(_wake)
             except asyncio.CancelledError:
                 break

@@ -511,16 +511,37 @@ class OpsMixin:
         )
         # Intake-velocity signal for the VPS1 cleanup janitor: one
         # timestamp per newly discovered racing release (spam bursts
-        # shorten deletion grace). Hard-capped so a disabled janitor
-        # can't grow it without bound; the janitor prunes hourly.
+        # shorten deletion grace) plus its byte size (bytes/hour intake
+        # rate and projected fill drive burst cadence/cap). Hard-capped so
+        # a disabled janitor can't grow them without bound; the janitor
+        # prunes hourly.
+        size = 0
         try:
+            size = int(primary.size_bytes or 0)
+        except (TypeError, ValueError):
+            size = 0
+        try:
+            mono = time.monotonic()
             arrivals = getattr(self, "_arrival_times", None)
             if arrivals is None:
                 arrivals = []
                 self._arrival_times = arrivals
-            arrivals.append(time.monotonic())
+            arrivals.append(mono)
             if len(arrivals) > 5000:
                 del arrivals[:2500]
+            arrival_bytes = getattr(self, "_arrival_bytes", None)
+            if arrival_bytes is None:
+                arrival_bytes = []
+                self._arrival_bytes = arrival_bytes
+            arrival_bytes.append((mono, size))
+            if len(arrival_bytes) > 5000:
+                del arrival_bytes[:2500]
+        except Exception:
+            pass
+        # An arrival that cannot fit in the last probed free space is
+        # flagged for the janitor (warning + immediate priority).
+        try:
+            self._note_cleanup_arrival(size)
         except Exception:
             pass
         return ts

@@ -18,7 +18,8 @@ from racing_sync.state import State
 
 FIXTURES = Path(__file__).parent / "fixtures" / "config"
 
-_FULL = "sha256:2d0d2bd1b96fc70a"
+# Re-baselined for the [cleanup] burst knobs (three new defaulted keys).
+_FULL = "sha256:8ac00ca38ffb6e1e"
 
 _DOWNLOAD_ONLY = """
 [general]

@@ -1278,6 +1278,20 @@ class CleanupConfig(BaseModel):
     # run: recovery, polls and SFTP settle first. 0 disables (run as soon
     # as the hourly cadence allows).
     janitor_startup_delay_seconds: float = Field(default=300.0, ge=0)
+    # Burst mode: while intake is outrunning the disk (VPS1 free space
+    # below the low watermark, arrivals at/above burst, an arrival that
+    # does not fit, or projected fill inside `fill_lookahead_hours`), the
+    # janitor runs on this shorter cadence and may delete this many
+    # content groups per run. Calm runs keep janitor_interval_seconds /
+    # per_run_cap. Must be <= janitor_interval_seconds.
+    burst_janitor_interval_seconds: int = Field(default=300, ge=60)
+    # Group cap while bursting; must be >= per_run_cap (bursting is extra
+    # headroom, never less work than a calm run).
+    burst_per_run_cap: int = Field(default=25, ge=1)
+    # Projected-fill trigger: burst when the recent arrival byte rate
+    # implies VPS1 fills within this many hours. 0 disables the trigger
+    # (watermark / arrivals / oversized-arrival triggers stay active).
+    fill_lookahead_hours: float = Field(default=2.0, ge=0)
 
     @model_validator(mode="after")
     def _check_bounds(self) -> CleanupConfig:
@@ -1299,6 +1313,20 @@ class CleanupConfig(BaseModel):
             )
         if self.burst_arrivals_per_hour <= self.calm_arrivals_per_hour:
             raise ValueError("cleanup: burst_arrivals_per_hour must be > calm_arrivals_per_hour")
+        if self.burst_janitor_interval_seconds > self.janitor_interval_seconds:
+            raise ValueError(
+                "cleanup: burst_janitor_interval_seconds "
+                f"({self.burst_janitor_interval_seconds}) must be <= "
+                f"janitor_interval_seconds ({self.janitor_interval_seconds}) — "
+                "bursting may only run the janitor sooner, never later"
+            )
+        if self.burst_per_run_cap < self.per_run_cap:
+            raise ValueError(
+                "cleanup: burst_per_run_cap "
+                f"({self.burst_per_run_cap}) must be >= per_run_cap "
+                f"({self.per_run_cap}) — a burst run is extra headroom, "
+                "never less work than a calm run"
+            )
         return self
 
 
