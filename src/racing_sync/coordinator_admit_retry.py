@@ -125,9 +125,9 @@ class RetryAdmitMixin:
         except (TypeError, ValueError):
             _retry_gap = 1800.0
         try:
-            _max_age_s = float(self.rt.acquire.prowlarr_max_age_seconds or 86400)
+            _max_age_s = float(self.rt.acquire.prowlarr_max_age_seconds or 28800)
         except (TypeError, ValueError):
-            _max_age_s = 86400.0
+            _max_age_s = 28800.0
         next_retry = self._schedule_retry(ts, "indexer", _retry_gap)
         max_age = dt.timedelta(seconds=max(60.0, _max_age_s))
         elapsed = now - ts.indexer_first_queried_at
@@ -199,7 +199,7 @@ class RetryAdmitMixin:
         # The row runs the public schedule now: a leftover indexer timer
         # (e.g. from a misclassified retry of a public row) would make
         # list_waiting_ready wake this row every tick, inflating attempts
-        # until the 24h max-age FAILED a public row.
+        # until the 8h max-age FAILED a public row.
         self._schedule_retry(ts, "public", interval)
         # Unbounded schedule by design (no max-age FAILED), so rotate
         # verbosity: first misses log loudly, the long tail at debug —

@@ -549,7 +549,7 @@ pause_public_torrents_on_fuse = true
 #           shifts the deadline by up to its own length), FAILED — or the
 #           racing-torrent fallback below when enabled.
 prowlarr_retry_interval_seconds = 900    # 15 minutes
-prowlarr_max_age_seconds        = 86400  # 24 hours
+prowlarr_max_age_seconds        = 28800  # 8 hours
 # Retry cadence when a VPS1 public .torrent can't be exported (transient
 # SFTP/export glitch). No max-age clock here: the source torrent still
 # exists on VPS1, so giving up would kill a recoverable row (a vanished

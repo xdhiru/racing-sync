@@ -42,9 +42,9 @@ def test_first_attempt_sets_first_queried_at():
     assert abs(diff - interval) < 1
 
 
-def test_retry_window_is_24_hours():
+def test_retry_window_is_8_hours():
     cfg = _cfg()
-    assert cfg.cross_seed.prowlarr_max_age_seconds == 86400
+    assert cfg.cross_seed.prowlarr_max_age_seconds == 28800
     assert cfg.cross_seed.prowlarr_retry_interval_seconds == 900
 
 
@@ -58,9 +58,12 @@ async def test_vanished_source_grants_fresh_window(tmp_path):
     store = StateStore(tmp_path / "state.db")
     try:
         coord = make_coordinator()
-        coord.cfg = _cfg()
+        cfg = _cfg()
+        coord.cfg = cfg
         coord.store = store
-        _old = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=86400 + 60)
+        _old = dt.datetime.now(dt.UTC) - dt.timedelta(
+            seconds=cfg.cross_seed.prowlarr_max_age_seconds + 60
+        )
         for h, reason, final in (
             ("a" * 40, "source vanished from VPS1", State.WAITING_INDEXER),
             ("b" * 40, "indexer miss", State.FAILED),
@@ -108,7 +111,7 @@ async def test_public_retry_rotates_verbosity(tmp_path, caplog):
 
 
 def test_expired_max_age_marks_failed():
-    """If the first attempt was > 24 h ago, the next park should escalate
+    """If the first attempt was > 8 h ago, the next park should escalate
     to FAILED. We simulate by backdating indexer_first_queried_at."""
     cfg = _cfg()
     ts = TorrentState(
@@ -844,7 +847,7 @@ async def test_waiting_indexer_retry_republishes_public_schedule(tmp_path: Path,
     """A public row re-parked from WAITING_INDEXER must not be counted as
     an 'indexer miss': the reason is re-derived, the public timer is pushed
     and a stale indexer timer is cleared. Otherwise list_waiting_ready
-    wakes it every tick, inflating attempts until the 24h FAILED a row
+    wakes it every tick, inflating attempts until the 8h FAILED a row
     that has no max-age clock by design."""
     import datetime as dt
     import logging

@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:e6d3cf73fc9fee9c",
+  "digest": "sha256:d5a5bdb22f4c5427",
   "keys": {
     "by_section": {
       "api": 2,
@@ -65,7 +65,7 @@
       "fallback_to_racing_torrent_on_prowlarr_timeout": false,
       "inject_racing_torrents_to_fuse": true,
       "pause_public_torrents_on_fuse": true,
-      "prowlarr_max_age_seconds": 86400,
+      "prowlarr_max_age_seconds": 28800,
       "prowlarr_retry_interval_seconds": 1800,
       "public_export_retry_interval_seconds": 1800,
       "refetch_public_via_prowlarr": false

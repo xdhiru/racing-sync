@@ -996,7 +996,7 @@ class OpsMixin:
                 pass
             if self._prowlarr_query_possible(ts):
                 # The VPS1 copy is gone but a Prowlarr cross-seed may
-                # still supply the SSD bytes: park (24h max-age backstop
+                # still supply the SSD bytes: park (8h max-age backstop
                 # still applies) and let the caller pick from persisted
                 # metadata instead of failing a recoverable row.
                 log.warning(

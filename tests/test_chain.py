@@ -18,8 +18,8 @@ from racing_sync.state import State
 
 FIXTURES = Path(__file__).parent / "fixtures" / "config"
 
-# Re-baselined for the [cleanup] burst knobs (three new defaulted keys).
-_FULL = "sha256:8ac00ca38ffb6e1e"
+# Re-baselined for the prowlarr_max_age_seconds default (86400 -> 28800).
+_FULL = "sha256:77087e033db5dfe8"
 
 _DOWNLOAD_ONLY = """
 [general]
