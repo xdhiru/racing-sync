@@ -82,6 +82,16 @@ _SUMMARY_TAIL = (
     "2026-11-21 09:58:02 INFO : Elapsed time: 46m1s"
 )
 
+#: What a healthy VPS1 answers the two probes the launch depends on: both
+#: wrappers exist, its rclone knows the optional flag, and the copy is running.
+_CAP_ANSWER = (
+    "SYNC-PUSH-CAP:setsid=yes\nSYNC-PUSH-CAP:nohup=yes\n"
+    "SYNC-PUSH-CAP:rclone-version=\nrclone v1.66.0\n"
+)
+_PROOF_ANSWER = (
+    "SYNC-PUSH-PROOF:pgrep=found\nSYNC-PUSH-PROOF:log=absent\nSYNC-PUSH-PROOF:log-begin\n"
+)
+
 
 # --------------------------------------------------------------------------- #
 # A: the probe itself — one bounded shell, four honest answers
@@ -117,7 +127,9 @@ class _LaneDial(_LogDial):
 
     Replies are chosen by substring, exactly like a real VPS1 would answer,
     and the pooled entry points are recorded so a test can prove the lane
-    never used them.
+    never used them. The wrapper/version probe and the launch proof are keyed
+    by their own tags and matched FIRST, because both of them also contain
+    `command -v` like the rclone-existence probe does.
     """
 
     def __init__(self, reply: tuple[int | None, str, str] | None = None):
@@ -127,6 +139,10 @@ class _LaneDial(_LogDial):
 
     def run_shell_dedicated(self, command: str, timeout: float = 30.0):
         self.commands.append(command)
+        if "SYNC-PUSH-CAP" in command:
+            return (0, _CAP_ANSWER, "")
+        if "SYNC-PUSH-PROOF" in command:
+            return (0, _PROOF_ANSWER, "")
         if "command -v" in command:
             return (0, "/usr/bin/rclone\n", "")
         if "listremotes" in command:
@@ -657,13 +673,27 @@ def _live_member(cfg: DelugeSFTPConfig) -> _SFTPConnection:
 
 
 class _VPS1:
-    """A fake paramiko transport that answers the push lane's own commands."""
+    """A fake paramiko transport that answers the push lane's own commands.
 
-    def __init__(self, *, log_tail: str = "INFO : starting", size: int = 2048):
+    `cap` / `proof` override what this VPS1 says to the two probes the launch
+    depends on; both are matched before `command -v`, which the rclone probe,
+    the wrapper probe and the proof probe all contain.
+    """
+
+    def __init__(
+        self,
+        *,
+        log_tail: str = "INFO : starting",
+        size: int = 2048,
+        cap: str | None = None,
+        proof: str | None = None,
+    ):
         self.commands: list[str] = []
         self.writes: list[tuple[str, bytes]] = []
         self._log_tail = log_tail
         self._size = size
+        self._cap = cap if cap is not None else _CAP_ANSWER
+        self._proof = proof if proof is not None else _PROOF_ANSWER
 
     def client(self) -> MagicMock:
         client = MagicMock()
@@ -699,7 +729,11 @@ class _VPS1:
         stdin, out, err = MagicMock(), MagicMock(), MagicMock()
         out.channel.recv_exit_status.return_value = 0
         err.read.return_value = b""
-        if "command -v" in command:
+        if "SYNC-PUSH-CAP" in command:
+            out.read.return_value = self._cap.encode()
+        elif "SYNC-PUSH-PROOF" in command:
+            out.read.return_value = self._proof.encode()
+        elif "command -v" in command:
             out.read.return_value = b"/usr/bin/rclone\n"
         elif "listremotes" in command:
             out.read.return_value = b"seedremote:\n"
@@ -736,7 +770,8 @@ def _push_transport_cfg() -> AppConfig:
 
 @pytest.mark.anyio
 async def test_a_full_start_and_poll_cycle_never_leases_a_pool_member(tmp_path, monkeypatch):
-    """Preflight, the list write, the launch AND the log read: one dial each.
+    """Preflight, the list write, the launch, its proof AND the log read: one dial
+    each.
 
     The pooled members are instrumented to raise on a lease, so this passing at
     all is the proof; their own locks stay free and their transports stay
@@ -764,7 +799,13 @@ async def test_a_full_start_and_poll_cycle_never_leases_a_pool_member(tmp_path, 
     )
     assert check.ok, check.reason
     started = await start_copy(
-        request, ssh=exporter, rclone_bin="/usr/bin/rclone", now=1762000000.0
+        request,
+        ssh=exporter,
+        rclone_bin="/usr/bin/rclone",
+        now=1762000000.0,
+        detacher=check.detacher,
+        error_on_no_transfer=check.error_on_no_transfer,
+        proof_delay_s=0.0,
     )
     assert started.ok, started.reason
     verdict, reason = await push_liveness(
@@ -773,14 +814,18 @@ async def test_a_full_start_and_poll_cycle_never_leases_a_pool_member(tmp_path, 
     assert verdict == "alive", reason
 
     assert leases == []
-    # Three execs before the poll: the two preflight probes and the launch —
+    # Four execs before the poll: the three preflight probes and the launch —
     # and the list went over SFTP on its own dial, never through a member.
     assert vps1.commands[0] == "command -v /usr/bin/rclone"
-    assert vps1.commands[1] == "/usr/bin/rclone listremotes"
-    assert vps1.commands[2].startswith("setsid /usr/bin/rclone copy ")
-    assert vps1.commands[2].endswith("</dev/null >/dev/null 2>&1 &")
-    assert "move" not in vps1.commands[2].split()
+    assert "SYNC-PUSH-CAP" in vps1.commands[1]
+    assert vps1.commands[2] == "/usr/bin/rclone listremotes"
+    assert vps1.commands[3].startswith("setsid /usr/bin/rclone copy ")
+    assert vps1.commands[3].endswith(f"</dev/null >> {LOG_PATH} 2>&1 &")
+    assert "move" not in vps1.commands[3].split()
     assert vps1.writes == [(LIST_PATH, f"{EPISODE_TOP}/{EPISODE_NAME}\n".encode())]
+    # The proof of life ran, on the same dedicated dial, and found the job.
+    assert any("SYNC-PUSH-PROOF" in c for c in vps1.commands)
+    assert vps1.commands.index(next(c for c in vps1.commands if "SYNC-PUSH-PROOF" in c)) == 4
     assert any(_SIZE_TAG in c for c in vps1.commands)  # the liveness read
     # Not one byte read through a pooled member, and every member is idle.
     member._client.exec_command.assert_not_called()
@@ -1029,7 +1074,10 @@ async def test_the_copy_is_still_a_copy_and_still_gated_after_the_defaults_chang
     assert dial.commands == []  # refused before a single remote call
 
     started = await start_copy(
-        _request((PushFile(EPISODE_NAME, 2000),)), ssh=dial, rclone_bin="/usr/bin/rclone"
+        _request((PushFile(EPISODE_NAME, 2000),)),
+        ssh=dial,
+        rclone_bin="/usr/bin/rclone",
+        proof_delay_s=0.0,
     )
     assert started.ok, started.reason
     assert dial.written == [(started.list_path, f"{EPISODE_NAME}\n".encode())]
@@ -1042,7 +1090,12 @@ async def test_the_copy_is_still_a_copy_and_still_gated_after_the_defaults_chang
     assert "--files-from-raw" in command
     assert "--error-on-no-transfer" in command
     assert "--ignore-existing" in command
-    assert command.startswith("setsid ") and command.endswith("</dev/null >/dev/null 2>&1 &")
+    assert command.startswith("setsid ") and command.endswith(
+        f"</dev/null >> {started.log_path} 2>&1 &"
+    )
+    # The launcher's own output is never discarded: nothing points at /dev/null
+    # for writing, only stdin comes from it.
+    assert ">/dev/null" not in command
 
 
 @pytest.mark.anyio

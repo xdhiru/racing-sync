@@ -33,6 +33,23 @@ HASH = "ab12cd34ef56ab78cd90ef12ab34cd56ef78ab90"
 SRC_DIR = "/data/downloads/Example.Show.S01E01.Example-Group"
 TARGET = "seedremote:TV/Example Show (2020)"
 LIST_PATH = "/tmp/racing-sync-push-ab12cd34ef-1762000000.lst"
+LOG_PATH = "/tmp/racing-sync-push-ab12cd34ef-1762000000.log"
+
+#: The canned answers a healthy VPS1 gives the two NEW pre-launch probes: both
+#: wrappers exist, and its rclone is new enough for the optional flag. Keyed by
+#: their own tag so a test that only spells `command -v` cannot accidentally
+#: answer them (the capability probe asks `command -v setsid`, too).
+CAP_REPLY = (
+    0,
+    "SYNC-PUSH-CAP:setsid=yes\nSYNC-PUSH-CAP:nohup=yes\n"
+    "SYNC-PUSH-CAP:rclone-version=\nrclone v1.66.0\n",
+    "",
+)
+PROOF_REPLY = (
+    0,
+    "SYNC-PUSH-PROOF:pgrep=found\nSYNC-PUSH-PROOF:log=absent\nSYNC-PUSH-PROOF:log-begin\n",
+    "",
+)
 
 
 def _files() -> tuple[PushFile, ...]:
@@ -61,13 +78,19 @@ class FakeDial:
     The push lane only ever calls the DEDICATED runners; they are here as thin
     delegates so a test can drive them with the same canned replies (the real
     non-pooled behaviour is pinned in tests/test_push_liveness.py).
+
+    The two probes the launch depends on (wrapper/version, proof of life) are
+    answered by default — a healthy VPS1 — and a test overrides them by passing
+    their own `SYNC-PUSH-CAP` / `SYNC-PUSH-PROOF` needle, which keeps matching
+    FIRST because the defaults are seeded before the caller's dict.
     """
 
     def __init__(self, replies: dict[str, tuple[int | None, str, str]] | None = None, **flags):
         self.commands: list[str] = []
         self.written: list[tuple[str, bytes]] = []
         self.launched: list[str] = []
-        self._replies = replies or {}
+        self._replies = {"SYNC-PUSH-CAP": CAP_REPLY, "SYNC-PUSH-PROOF": PROOF_REPLY}
+        self._replies.update(replies or {})
         self.write_ok = flags.get("write_ok", True)
         self.launch_ok = flags.get("launch_ok", True)
         self.raise_on_shell = flags.get("raise_on_shell", False)
@@ -198,7 +221,10 @@ def test_build_copy_command_is_a_copy_and_never_a_move():
     assert "--error-on-no-transfer" in tokens
     # positionals come last, after the end-of-flags marker.
     assert tokens.index("--") < tokens.index(SRC_DIR)
-    assert tokens[-7:] == ["--", SRC_DIR, TARGET, "</dev/null", ">/dev/null", "2>&1", "&"]
+    assert tokens[-8:] == ["--", SRC_DIR, TARGET, "</dev/null", ">>", "/tmp/push.log", "2>&1", "&"]
+    # THE FIX: nothing the LOGIN SHELL writes is discarded any more.
+    assert ">/dev/null" not in cmd
+    assert ">> /tmp/push.log 2>&1" in cmd
 
 
 def test_build_copy_command_omits_bwlimit_when_unset():
@@ -223,7 +249,31 @@ def test_build_copy_command_detaches_the_job():
         log_path="/tmp/push.log",
     )
     assert cmd.startswith("setsid ")
-    assert cmd.endswith("</dev/null >/dev/null 2>&1 &")
+    assert cmd.endswith("</dev/null >> /tmp/push.log 2>&1 &")
+
+
+def test_build_copy_command_refuses_a_wrapper_it_was_not_told_about():
+    """The wrapper is spliced UNQUOTED, so it takes the strict gate + whitelist."""
+    with pytest.raises(ValueError, match="session-surviving wrapper"):
+        build_copy_command(
+            _request(),
+            rclone_bin="rclone",
+            transfers=4,
+            bwlimit="",
+            list_path=LIST_PATH,
+            log_path="/tmp/push.log",
+            detacher="setsid; rm -rf /var/tmp",
+        )
+    with pytest.raises(ValueError, match="session-surviving wrapper"):
+        build_copy_command(
+            _request(),
+            rclone_bin="rclone",
+            transfers=4,
+            bwlimit="",
+            list_path=LIST_PATH,
+            log_path="/tmp/push.log",
+            detacher="screen",
+        )
 
 
 def test_build_copy_command_quotes_spaces_single_quotes_and_a_semicolon():
@@ -241,8 +291,8 @@ def test_build_copy_command_quotes_spaces_single_quotes_and_a_semicolon():
     assert nasty not in cmd
     tokens = shlex.split(cmd)
     assert ";" not in tokens
-    assert tokens[-6] == nasty
-    assert tokens[-5] == "seedremote:TV/Example Show (2020)"
+    assert tokens[-7] == nasty
+    assert tokens[-6] == "seedremote:TV/Example Show (2020)"
     # `;` outside quotes would end the command; here it is data inside the
     # quoted positional, and the backgrounding `&` appears exactly once.
     assert tokens.count("&") == 1
@@ -485,10 +535,11 @@ async def test_start_copy_writes_the_list_and_launches_the_copy():
         transfers=4,
         bwlimit="42M",
         now=1762000000.4,
+        proof_delay_s=0.0,
     )
     assert check.ok, check.reason
     assert check.list_path == LIST_PATH
-    assert check.log_path == "/tmp/racing-sync-push-ab12cd34ef-1762000000.log"
+    assert check.log_path == LOG_PATH
     assert check.files_total == 2
     assert [p for p, _ in dial.written] == [LIST_PATH]
     assert (
@@ -504,7 +555,10 @@ async def test_start_copy_writes_the_list_and_launches_the_copy():
     # One launch, the copy line, and no content ever crossed the dial.
     assert len(dial.launched) == 1
     assert dial.launched[0].startswith("setsid /usr/bin/rclone copy ")
+    assert dial.launched[0].endswith(f"</dev/null >> {LOG_PATH} 2>&1 &")
     assert "move" not in shlex.split(dial.launched[0])
+    # A VPS1 that showed the process is proven alive, so nothing is excused.
+    assert check.reason == ""
 
 
 @pytest.mark.anyio
@@ -519,7 +573,7 @@ async def test_start_copy_refuses_before_touching_ssh_when_nothing_survives():
 @pytest.mark.anyio
 async def test_start_copy_cleans_the_list_when_the_launch_fails():
     dial = _ok_dial(launch_ok=False)
-    check = await start_copy(_request(), ssh=dial, now=1762000000.0)
+    check = await start_copy(_request(), ssh=dial, now=1762000000.0, proof_delay_s=0.0)
     assert not check.ok
     assert "did not accept the detached rclone copy" in check.reason
     assert any(c == f"rm -f {LIST_PATH}" for c in dial.commands)
@@ -603,7 +657,9 @@ async def test_push_launch_uses_a_dedicated_transport_and_never_leases(monkeypat
         patch("racing_sync.sftp_source._ipv4_socket"),
         patch("racing_sync.sftp_source.paramiko.SSHClient", return_value=dedicated) as cls,
     ):
-        check = await start_copy(_request(), ssh=proxy, transfers=4, now=1762000000.0)
+        check = await start_copy(
+            _request(), ssh=proxy, transfers=4, now=1762000000.0, proof_delay_s=0.0
+        )
 
     assert check.ok, check.reason
     assert leases == []
@@ -701,8 +757,8 @@ def test_member_launch_detached_also_dials_its_own_transport():
 async def test_preflight_probes_go_through_the_dedicated_dial_not_the_pool(monkeypatch):
     """The fix: preflight may no longer compete with the racing .torrent fetches.
 
-    Both probes are answered by a transport dialled for this call only, and the
-    pooled member is provably untouched (its exec_command never fires and its
+    All three probes are answered by a transport dialled for this call only, and
+    the pooled member is provably untouched (its exec_command never fires and its
     lock stays free, while `_lease` is wired to raise).
     """
     cfg = _sftp_cfg()
@@ -718,6 +774,7 @@ async def test_preflight_probes_go_through_the_dedicated_dial_not_the_pool(monke
     dedicated = MagicMock()
     dedicated.exec_command.side_effect = [
         _fake_exec(b"/usr/bin/rclone\n", status=0),
+        _fake_exec(CAP_REPLY[1].encode(), status=0),
         _fake_exec(b"seedremote:\n", status=0),
     ]
     with (
@@ -729,11 +786,14 @@ async def test_preflight_probes_go_through_the_dedicated_dial_not_the_pool(monke
         )
 
     assert check.ok, check.reason
-    # Two probes, one throwaway transport each, dialled from the config.
-    assert dial.call_count == 2 and dial.call_args_list[0].args == (cfg,)
+    assert (check.detacher, check.error_on_no_transfer) == ("setsid", True)
+    # Three probes, one throwaway transport each, dialled from the config.
+    assert dial.call_count == 3 and dial.call_args_list[0].args == (cfg,)
     asked = [c.args[0] for c in dedicated.exec_command.call_args_list]
-    assert asked == ["command -v /usr/bin/rclone", "/usr/bin/rclone listremotes"]
-    assert dedicated.close.call_count == 2
+    assert asked[0] == "command -v /usr/bin/rclone"
+    assert "SYNC-PUSH-CAP" in asked[1] and "command -v setsid" in asked[1]
+    assert asked[2] == "/usr/bin/rclone listremotes"
+    assert dedicated.close.call_count == 3
     # The pooled member saw nothing at all.
     member._client.exec_command.assert_not_called()
     assert member._lock.acquire(blocking=False) is True

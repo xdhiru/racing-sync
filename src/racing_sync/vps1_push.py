@@ -13,6 +13,14 @@ Contract rules this module enforces by construction:
   would stop its seed mid-race and destroy the ratio the release was raced
   for. Deletion stays the janitor's job. The only remote delete is our own
   throwaway file list, after a launch that never started.
+* **the launcher never talks into a void.** A detached job has no stdout, so
+  the WRAPPER's own stdout/stderr go into the job's log file, never to
+  ``/dev/null``: when the login shell itself fails (`setsid: command not
+  found`, an unknown rclone long flag, a quoting disaster) that text is the
+  only evidence there is, and it must land in the one file this module and
+  its caller already read. See ``build_copy_command`` — this rule exists
+  because 28 launches reported success while 282 polls saw `0/1` and nothing
+  at all had run on VPS1.
 * **metadata only.** Nothing here reads or hashes content — not over SSH,
   not against the rclone mount or VPS2's SSD. Progress is a name comparison
   against ``rclone lsf -R --files-only``.
@@ -133,6 +141,44 @@ _SIZE_ABSENT = -1
 #: Control characters in a log line (scrubbed before anything is stored).
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 
+#: What may wrap the copy so it survives the SSH session ending, in preference
+#: order. `setsid` gives the job its own session (no controlling terminal to
+#: hang up); `nohup` at least ignores SIGHUP, which is good enough to keep a
+#: transfer running. Neither on VPS1 is a REFUSAL, never a blind launch.
+_DETACHER_CANDIDATES = ("setsid", "nohup")
+
+#: Tag prefix of the capability probe's own output lines, so a stray line of
+#: shell noise can never be read as an answer (and so a test double can match
+#: this probe by substring without colliding with `command -v rclone`).
+_CAP_TAG = "SYNC-PUSH-CAP:"
+
+#: The lowest rclone that knows `--error-on-no-transfer` (1.58, 2021-05).
+#: VPS2's version proves nothing about VPS1's, so this is probed, never assumed.
+_MIN_RCLONE_NO_TRANSFER_ERROR = (1, 58)
+
+_VERSION_RE = re.compile(r"v(\d+)\.(\d+)")
+
+#: Tag prefix of the launch proof's output lines (see `_launch_proof_command`).
+_PROOF_TAG = "SYNC-PUSH-PROOF:"
+
+#: How long to wait after the launch before asking whether the job is really
+#: there. Short enough that a dead lane answers the operator in seconds — the
+#: incident this closes reported "push started" and then said nothing more for
+#: the whole `timeout_seconds`; long enough that rclone has had time to open
+#: its own `--log` on a busy box.
+_LAUNCH_PROOF_DELAY_S = 4.0
+
+#: Hard ceiling on that wait: this runs inline in the push's own task, and a
+#: mis-set caller must never make a push stall for minutes.
+_LAUNCH_PROOF_DELAY_MAX_S = 20.0
+
+#: Budget of the proof's single shell (one pgrep, two tests and a bounded
+#: head). Transport trouble is read as "unknown", never as "dead".
+_PROOF_TIMEOUT_S = 20.0
+
+#: How many leading log lines the proof may quote into its failure reason.
+_PROOF_LOG_LINES = 12
+
 
 @dataclass(frozen=True)
 class PushFile:
@@ -169,6 +215,14 @@ class PushCheck:
     tail is what `start_copy` hands back so the caller can store
     `list_path` / `log_path` / `files_total` without re-deriving them;
     `src_dir` and `target_remote` are already on the request.
+
+    `detacher` / `error_on_no_transfer` are what `preflight` LEARNED about
+    VPS1 and what `start_copy` must therefore build: the wrapper the operator
+    actually has, and the optional flag only when their rclone accepts it.
+    They default to the historical behaviour, so a caller that never probed
+    (or an older test double) still gets the old command line. When a
+    successful `start_copy` could not PROVE the copy is alive it says so in
+    `reason` — the push still went ahead, and the poll decides later.
     """
 
     ok: bool
@@ -176,6 +230,8 @@ class PushCheck:
     list_path: str = ""
     log_path: str = ""
     files_total: int = 0
+    detacher: str = "setsid"
+    error_on_no_transfer: bool = True
 
 
 def _fail(reason: str) -> PushCheck:
@@ -349,6 +405,8 @@ def build_copy_command(
     bwlimit: str,
     list_path: str,
     log_path: str,
+    detacher: str = "setsid",
+    error_on_no_transfer: bool = True,
 ) -> str:
     """The one detached command line that runs the copy on VPS1.
 
@@ -360,20 +418,51 @@ def build_copy_command(
     ``--ignore-existing`` keeps a re-push cheap and, above all, never
     overwrites; ``--log``/``--loglevel INFO`` leaves the post-mortem on VPS1
     because a detached process has no stdout anyone can read.
+
+    WHY THE SHELL'S OWN OUTPUT GOES INTO THAT LOG, NOT /dev/null: this exact
+    incident. The wrapper used to end ``</dev/null >/dev/null 2>&1 &``, so every
+    byte the LOGIN SHELL wrote — `setsid: command not found`, `rclone: unknown
+    long flag '--error-on-no-transfer'`, a quoting failure, even a /tmp that
+    would not open — vanished, while rclone's `--log` file only ever appears
+    once rclone itself starts. 28 launches were reported as successes, 282
+    polls read `has 0/1 file(s)`, and nothing could say which of the three
+    candidate causes was real (no setsid, an rclone too old for the flag, a job
+    killed when the exec channel closed). Redirecting the wrapper into the job's
+    log makes a shell-level failure land in the one file this module already
+    reads, so the launch either has evidence or has a reason.
+
+    `detacher` is the wrapper `preflight` PROVED to exist on VPS1 (`setsid`, or
+    the session-surviving fallback `nohup`); `error_on_no_transfer` adds the
+    zero-transfer-is-an-error flag only for an rclone new enough to accept it —
+    an unsupported flag is fatal, while omitting a nicety is harmless. Both keep
+    the historical behaviour as their default, and this function stays pure and
+    deterministic: it never probes and never waits on anything.
     """
     src = str(getattr(request, "src_dir", "") or "")
     dst = str(getattr(request, "target_remote", "") or "")
     limit = str(bwlimit or "")
+    wrapper = str(detacher or "setsid").strip()
     for value, label in (
         (src, "src_dir"),
         (dst, "target_remote"),
         (str(rclone_bin or ""), "rclone_bin"),
         (str(list_path or ""), "list_path"),
         (str(log_path or ""), "log_path"),
+        (wrapper, "detacher"),
     ):
         reason = _arg_refusal(value, label)
         if reason:
             raise ValueError(reason)
+    # The wrapper is spliced into the command UNQUOTED (it has to stay a
+    # command word, not an argument), so it gets the strict gate that rejects
+    # anything a shell could reinterpret, plus the whitelist of what preflight
+    # can actually have found.
+    strict = _unsafe_path_reason(wrapper, "detacher")
+    if strict or wrapper not in _DETACHER_CANDIDATES:
+        raise ValueError(
+            f"push refused: {wrapper!r} is not a usable session-surviving wrapper "
+            f"(want {' or '.join(_DETACHER_CANDIDATES)})"
+        )
     # bwlimit is rclone syntax ("42M", "8M,24:00-08:00"), not a path: only a
     # line break would corrupt the command, and quoting cannot undo that.
     if any(c in limit for c in ("\n", "\r", "\x00")):
@@ -401,24 +490,32 @@ def build_copy_command(
     ]
     if limit.strip():
         argv += ["--bwlimit", limit.strip()]
-    argv += [
-        "--log",
-        str(log_path),
-        "--loglevel",
-        "INFO",
-        # Fail loudly when the copy transfers nothing: an rc=0 that moved zero
-        # files would look like a finished push. Already-complete pushes are
-        # refused earlier by preflight, so a no-transfer here is real trouble.
-        # (Needs rclone >= 1.58 on VPS1 — the same flag rclone_ops' move uses.)
-        "--error-on-no-transfer",
-    ]
+    argv += ["--log", str(log_path), "--loglevel", "INFO"]
+    if error_on_no_transfer is not False:
+        argv += [
+            # Fail loudly when the copy transfers nothing: an rc=0 that moved zero
+            # files would look like a finished push. Already-complete pushes are
+            # refused earlier by preflight, so a no-transfer here is real trouble.
+            # Needs rclone >= 1.58 ON VPS1, which `preflight` now probes instead of
+            # assuming (VPS2's version says nothing about VPS1's); an old rclone
+            # treats the unknown flag as a fatal error, so it is only ever added
+            # when the probe proves support.
+            "--error-on-no-transfer",
+        ]
 
     _guard_copy_only(argv)
     quoted = " ".join(shlex.quote(token) for token in argv)
-    # `--` before the positionals, then the detach wrapper: setsid gives the
-    # copy its own session, </dev/null drops stdin, and the trailing & lets
-    # the login shell exit so closing our channel cannot SIGHUP the transfer.
-    return f"setsid {quoted} -- {shlex.quote(src)} {shlex.quote(dst)} </dev/null >/dev/null 2>&1 &"
+    # `--` before the positionals, then the detach wrapper: it gives the copy
+    # its own session (setsid) or at least immunity to SIGHUP (nohup),
+    # </dev/null drops stdin and the trailing & lets the login shell exit, so
+    # closing our channel cannot kill the transfer. The shell's stdout/stderr
+    # are APPENDED to the job's own log (see above): rclone writes its log with
+    # `--log`, so this only ever adds the wrapper's words to the same file, and
+    # a zero-byte log stays the "rclone never spoke" evidence the poll reads.
+    return (
+        f"{wrapper} {quoted} -- {shlex.quote(src)} {shlex.quote(dst)} "
+        f"</dev/null >> {shlex.quote(log_path)} 2>&1 &"
+    )
 
 
 def _guard_copy_only(argv: Sequence[str]) -> None:
@@ -480,6 +577,104 @@ async def _remote_shell(
         return (None, "", f"{type(e).__name__}: {e}")
 
 
+def _capability_probe_command(rclone_bin: str) -> str:
+    """ONE shell that says what VPS1 can actually run a detached copy with.
+
+    Answers three questions with tagged lines, so a stray word of shell noise
+    cannot be read as an answer:
+
+    * does `setsid` exist? does `nohup`? (the wrapper the launch may use);
+    * what rclone does VPS1 have? `rclone version` first, `rclone --version`
+      as the fallback for a build that predates the subcommand, each cut to
+      one line so a long `--version` banner never floods the channel.
+
+    Everything here is best-effort by construction: a probe that cannot answer
+    is missing tags, which the caller reads as "unknown" (and unknown means
+    refuse the LAUNCH path or omit the optional flag, never launch blind).
+    """
+    binary = shlex.quote(str(rclone_bin or "rclone"))
+    parts: list[str] = []
+    for name in _DETACHER_CANDIDATES:
+        parts.append(
+            f"if command -v {name} >/dev/null 2>&1; then "
+            f"echo '{_CAP_TAG}{name}=yes'; else echo '{_CAP_TAG}{name}=no'; fi"
+        )
+    parts.append(f"echo '{_CAP_TAG}rclone-version='")
+    parts.append(f"{binary} version 2>/dev/null | head -n 1")
+    parts.append(f"{binary} --version 2>/dev/null | head -n 1")
+    return "; ".join(parts)
+
+
+def _parse_capability_output(text: object) -> dict[str, str]:
+    """{setsid/nohup: "yes"|"no", version: the first line that looks like one}.
+
+    Only this module's own tagged lines are trusted; anything else in the
+    output is noise. A missing key means VPS1 did not answer that question.
+    """
+    found: dict[str, str] = {}
+    after_version_tag = False
+    for line in str(text or "").splitlines():
+        flat = line.strip()
+        if flat.startswith(_CAP_TAG):
+            key, sep, value = flat[len(_CAP_TAG) :].partition("=")
+            key = key.strip().lower()
+            if sep and key == "rclone-version":
+                after_version_tag = True
+                if _VERSION_RE.search(value):
+                    found["version"] = value.strip()
+                continue
+            if sep and key in _DETACHER_CANDIDATES and value.strip().lower() in ("yes", "no"):
+                found[key] = value.strip().lower()
+            continue
+        if after_version_tag and "version" not in found and _VERSION_RE.search(flat):
+            found["version"] = flat
+    return found
+
+
+def _rclone_version_tuple(text: object) -> tuple[int, int] | None:
+    """(major, minor) from rclone's own version words, None when unparsable.
+
+    `v1.66.0`, `v1.62.1-32-gabcdef`, `rclone v1.58.0-beta.1` and a bare
+    `v1.58` all read fine; garbage reads as unknown, which costs the push
+    nothing but one optional flag.
+    """
+    match = _VERSION_RE.search(str(text or ""))
+    if not match:
+        return None
+    try:
+        return (int(match.group(1)), int(match.group(2)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _supports_error_on_no_transfer(version: tuple[int, int] | None) -> bool:
+    """The version gate for the one OPTIONAL flag: known-new-enough only.
+
+    Unknown is deliberately False: `--error-on-no-transfer` turns a zero-byte
+    rc=0 into an error, which is a nicety, while a flag an old rclone does not
+    know aborts the copy where it stands. Omitting a nicety is harmless;
+    including a fatal flag is not.
+    """
+    return version is not None and version >= _MIN_RCLONE_NO_TRANSFER_ERROR
+
+
+def _detacher_refusal(caps: dict[str, str], status: int | None, out: str, err: str) -> str:
+    """Why the launch may not go out blind, naming both wrappers we asked for."""
+    if status is None:
+        said = f"the probe did not run ({_one_line(err) or 'no answer from VPS1'})"
+    elif status != 0:
+        said = f"the probe exited {status} ({_one_line(err or out)})"
+    elif not caps:
+        said = f"the probe answered {_one_line(out) or 'nothing at all'}"
+    else:
+        said = ", ".join(f"{name}={caps.get(name, 'unknown')}" for name in _DETACHER_CANDIDATES)
+    return (
+        f"push refused: VPS1 has no usable session-surviving wrapper "
+        f"(asked for {' or '.join(_DETACHER_CANDIDATES)}; {said}) — the copy "
+        "would die with the SSH session, so the push is refused instead of launched blind"
+    )
+
+
 async def preflight(
     request: PushRequest,
     *,
@@ -496,10 +691,14 @@ async def preflight(
     VPS1 or an unlistable remote is a failed check with a reason, never an
     exception, because the caller falls back to the normal chain.
 
-    The two probes run on the DEDICATED dial (see `_remote_shell`): preflight
+    The probes run on the DEDICATED dial (see `_remote_shell`): preflight
     used to lease pooled members, so a saturated racing path turned it into
     `could not list VPS1 rclone remotes: Timeout opening channel` — a refusal
-    that cost the push nothing but read as "push unavailable" forever.
+    that cost the push nothing but read as "push unavailable" forever. The
+    third one exists because the launch used to be a guess: it asks VPS1 which
+    session-surviving wrapper it has and what its own rclone version is, and
+    puts the answers on the returned check for `start_copy` (and
+    `build_copy_command`) to obey.
     """
     files = list(getattr(request, "files", ()) or ())
     if not files:
@@ -542,6 +741,30 @@ async def preflight(
             f"(exit {status}): {_one_line(err or out)}"
         )
 
+    # ... and VPS1 must be able to run it DETACHED, with flags it understands.
+    # One more dedicated probe, because the launch is exactly where guessing
+    # costs an incident: `setsid` missing and an rclone too old for
+    # `--error-on-no-transfer` both look like a successful launch whose copy
+    # never existed. The detacher is mandatory (refuse without it); the version
+    # only gates an optional flag (unknown is an omission, never a refusal).
+    status, out, err = await _remote_shell(ssh, _capability_probe_command(rclone_bin), timeout_s)
+    caps = _parse_capability_output(out) if status is not None else {}
+    detacher = next((name for name in _DETACHER_CANDIDATES if caps.get(name) == "yes"), "")
+    if not detacher:
+        return _fail(_detacher_refusal(caps, status, out, err))
+    version_text = caps.get("version", "")
+    version = _rclone_version_tuple(version_text)
+    error_on_no_transfer = _supports_error_on_no_transfer(version)
+    # Once per push, and only at debug: the operator reads this when a launch
+    # is refused or a copy never starts, and must not have to guess what the
+    # wrapper was built from.
+    log.debug(
+        "push preflight: VPS1 wrapper=%s, rclone version=%s, --error-on-no-transfer=%s",
+        detacher,
+        _one_line(version_text) or "unknown",
+        "included" if error_on_no_transfer else "omitted",
+    )
+
     # ... and it must know the remote under that name.
     status, out, err = await _remote_shell(
         ssh, f"{shlex.quote(str(rclone_bin))} listremotes", timeout_s
@@ -575,7 +798,13 @@ async def preflight(
                 f"({dst}) — nothing to copy"
             )
 
-    return PushCheck(True, "", files_total=len(accepted))
+    return PushCheck(
+        True,
+        "",
+        files_total=len(accepted),
+        detacher=detacher,
+        error_on_no_transfer=error_on_no_transfer,
+    )
 
 
 async def start_copy(
@@ -587,17 +816,33 @@ async def start_copy(
     bwlimit: str = "",
     now: float | None = None,
     write_timeout_s: float = _WRITE_TIMEOUT_S,
+    detacher: str = "setsid",
+    error_on_no_transfer: bool = True,
+    proof_delay_s: float | None = None,
 ) -> PushCheck:
-    """Write the file list on VPS1 and launch the detached copy; never wait.
+    """Write the file list on VPS1, launch the detached copy and PROVE it ran.
 
     On success the PushCheck carries `list_path` / `log_path` / `files_total`
-    for the caller's checkpoint. Nothing here verifies the transfer: that is
-    `remote_progress`, `push_liveness` and the caller's deadline.
+    for the caller's checkpoint. Nothing here verifies the TRANSFER: that is
+    `remote_progress`, `push_liveness` and the caller's deadline — what it does
+    verify, a few seconds after the launch, is that a copy EXISTS
+    (`_confirm_launch`), because an accepted exec request was not proof: the
+    production run this closes logged 28 `push launched` lines with 282 polls
+    reading `has 0/1 file(s)` and zero completed copies, and a manual tap
+    answered "push started" while VPS1 showed no process and no traffic.
+
+    A proven dead launch is a refusal that leaves NOTHING behind to clean up
+    beyond our own scratch list (the only delete this module issues), so the
+    caller settles no live checkpoint and the slot frees immediately. A launch
+    this check cannot judge reports `alive (unproven)` in `reason` and stays
+    successful — the poll, with its grace, decides later.
 
     The list goes out over SFTP on the DEDICATED dial and the copy starts on
     its own throwaway transport, so neither can be starved by (or starve) a
     racing .torrent fetch — the `sftp: write of /tmp/racing-sync-push-….lst
     failed: TimeoutError()` refusals in the production log were pooled writes.
+    `detacher` and `error_on_no_transfer` carry what `preflight` learned, so
+    the wrapper is one VPS1 has rather than one this daemon hoped for.
     """
     files = list(getattr(request, "files", ()) or ())
     accepted, why = sanitize_push_files(files)
@@ -615,6 +860,8 @@ async def start_copy(
             bwlimit=bwlimit,
             list_path=list_path,
             log_path=log_path,
+            detacher=detacher,
+            error_on_no_transfer=error_on_no_transfer,
         )
     except ValueError as e:
         return _fail(str(e))
@@ -655,13 +902,34 @@ async def start_copy(
         return _fail(
             f"push refused: VPS1 did not accept the detached rclone copy (see {log_path}){tail}"
         )
-    log.info("push launched: %d files, list %s, log %s", len(accepted), list_path, log_path)
+
+    # The exec request was accepted; that is NOT the copy existing. Ask once,
+    # a few seconds later, on the same dedicated dial.
+    verdict, note = await _confirm_launch(
+        ssh=ssh, list_path=list_path, log_path=log_path, delay_s=proof_delay_s
+    )
+    if verdict == "dead":
+        cleaned, clean_reason = await _drop_list_file(ssh, list_path)
+        tail = "" if cleaned else f"; stale list cleanup failed ({clean_reason})"
+        log.warning("push launch died: %s: %s", log_path, note)
+        return _fail(f"{note}{tail}")
+    log.info(
+        "push launched: %d files, list %s, log %s (%s)",
+        len(accepted),
+        list_path,
+        log_path,
+        note or "proof: alive",
+    )
     return PushCheck(
         True,
-        "",
+        # Only an unproven launch has something to say on a success; the
+        # caller puts it in the operator's reply, and the poll decides.
+        note if verdict == "unproven" else "",
         list_path=list_path,
         log_path=log_path,
         files_total=len(accepted),
+        detacher=detacher,
+        error_on_no_transfer=error_on_no_transfer,
     )
 
 
@@ -686,6 +954,183 @@ def _scrub_log_line(line: object) -> str:
     """One safe, bounded, operator-readable line taken from the rclone log."""
     flat = _CONTROL_RE.sub(" ", str(line or ""))
     return " ".join(flat.split())[:200]
+
+
+def _pgrep_pattern(list_path: str) -> str:
+    """The list path as a pattern our OWN probe cannot match.
+
+    `pgrep -f` searches every process's full command line — and the command
+    line of the shell running this very probe contains the path it is looking
+    for, so a plain pattern would always "find" the copy and prove nothing.
+    Spelling the last dot as a bracket expression keeps the regex matching
+    rclone's real command line (`…/x.lst`) while the probe's own text
+    (`…/x[.]lst`) no longer matches it. The list path is unique per push —
+    `_push_scratch_paths` keys it by infohash and the start epoch precisely so
+    it can serve as this job's fingerprint.
+    """
+    text = str(list_path or "")
+    head, sep, tail = text.rpartition(".")
+    return f"{head}[.]{tail}" if sep else text
+
+
+def _launch_proof_command(list_path: str, log_path: str) -> str:
+    """One bounded shell that answers "did the copy we just launched survive?".
+
+    Two independent pieces of evidence, each on its own tagged line, plus the
+    first lines of the job log for the reason:
+
+    * `pgrep -f` on this job's unique list path — but only read as an answer
+      when pgrep RAN: `command -v pgrep` first, and pgrep's own exit status
+      separates "found" (0) from "looked and did not find" (1) from "could not
+      do it" (2+: a syntax error, a `-f` this pgrep does not implement). The
+      last case must never be read as a dead copy.
+    * the job log: `test -s` (non-empty), `test -f` (there but empty) or
+      neither. Since the wrapper appends the login shell's output to this very
+      file, a shell-level failure makes it non-empty, which is exactly the
+      evidence that says something ran.
+
+    Never a glob, never a directory walk, never the mount, never content.
+    """
+    pattern = shlex.quote(_pgrep_pattern(list_path))
+    log_file = shlex.quote(str(log_path))
+    return "; ".join(
+        [
+            "if command -v pgrep >/dev/null 2>&1; then "
+            f"pgrep -f -- {pattern} >/dev/null 2>&1; rc=$?; "
+            f"if [ $rc -eq 0 ]; then echo '{_PROOF_TAG}pgrep=found'; "
+            f"elif [ $rc -eq 1 ]; then echo '{_PROOF_TAG}pgrep=notfound'; "
+            f"else echo '{_PROOF_TAG}pgrep=error'; fi; "
+            f"else echo '{_PROOF_TAG}pgrep=missing'; fi",
+            f"if test -s {log_file}; then echo '{_PROOF_TAG}log=bytes'; "
+            f"elif test -f {log_file}; then echo '{_PROOF_TAG}log=empty'; "
+            f"else echo '{_PROOF_TAG}log=absent'; fi",
+            f"echo '{_PROOF_TAG}log-begin'",
+            f"if test -f {log_file}; then head -n {_PROOF_LOG_LINES} {log_file} 2>/dev/null; fi",
+        ]
+    )
+
+
+def _parse_proof_output(text: object) -> tuple[str, str, list[str]]:
+    """(pgrep answer, log state, first captured log lines) — "" means unknown.
+
+    Only the probe's OWN tagged lines are trusted, and only the ones ahead of
+    the `log-begin` marker: past that marker everything — including a line that
+    happens to look like a tag — is captured log content, so a job log can
+    never talk its way into a verdict. Anything else in the output is noise.
+    """
+    pgrep = ""
+    log_state = ""
+    captured: list[str] = []
+    collecting = False
+    for line in str(text or "").splitlines():
+        flat = line.strip()
+        if not collecting and flat.startswith(_PROOF_TAG):
+            key, sep, value = flat[len(_PROOF_TAG) :].partition("=")
+            key = key.strip()
+            if not sep:
+                collecting = key == "log-begin"
+                continue
+            answer = value.strip().lower()
+            if key == "pgrep" and answer in ("found", "notfound", "error", "missing"):
+                pgrep = answer
+            elif key == "log" and answer in ("bytes", "empty", "absent"):
+                log_state = answer
+            elif key == "log-begin":
+                collecting = True
+            continue
+        if collecting:
+            scrubbed = _scrub_log_line(line)
+            if scrubbed:
+                captured.append(scrubbed)
+    return pgrep, log_state, captured[:_PROOF_LOG_LINES]
+
+
+def _proof_dead_reason(
+    list_path: str, log_path: str, pgrep: str, log_state: str, captured: list[str]
+) -> str:
+    """A failed launch, said in one line: what was checked and what it showed."""
+    checks = (
+        f"no process matching {_pgrep_pattern(list_path)!r} (pgrep answered {pgrep or 'nothing'}) "
+        f"and the job log {log_path} is {log_state or 'unreadable'}"
+    )
+    if captured:
+        return (
+            f"push refused: VPS1 accepted the launch but no copy is running "
+            f"({checks}); the log says: {' | '.join(captured[:_PROOF_LOG_LINES])}"
+        )
+    return (
+        f"push refused: VPS1 accepted the launch but no copy is running "
+        f"({checks}) and nothing was ever written to it"
+    )
+
+
+async def _confirm_launch(
+    *, ssh: object, list_path: str, log_path: str, delay_s: float | None
+) -> tuple[str, str]:
+    """Did the detached copy we just launched actually start? ("alive"|"unproven"|"dead")
+
+    One short confirmation, a few seconds after the launch, on the push's own
+    dedicated dial:
+
+    * `("alive", note)` — pgrep found this job's process, OR the job log has
+      bytes of its own (rclone opened it, or the login shell wrote its failure
+      there — either way something ran and the poll can read it).
+    * `("dead", reason)` — pgrep ran cleanly and did not find it, and the log is
+      absent or empty. Nothing is running and nothing would ever be written:
+      the reason names both checks and quotes the first log lines if any.
+    * `("unproven", note)` — anything else, and deliberately NOT death: no
+      dial, a wedged or unparsable answer, a pgrep that is not installed or
+      errored with no log to fall back on. The existing `push_liveness` poll,
+      with its grace window, decides later; missing evidence never kills a
+      possibly-live copy.
+
+    The wait is an `asyncio.sleep` on the push's own task — bounded,
+    cancellable, and holding no pool lease (nothing here leases a member). No
+    `delay_s` means the shipped one, read here at call time rather than bound
+    into a default argument, so the constant stays the single knob.
+    """
+    resolved = _LAUNCH_PROOF_DELAY_S if delay_s is None else delay_s
+    try:
+        delay = max(0.0, min(_LAUNCH_PROOF_DELAY_MAX_S, float(resolved)))
+    except (TypeError, ValueError):
+        delay = _LAUNCH_PROOF_DELAY_S
+    if delay:
+        await asyncio.sleep(delay)
+
+    unsafe = _unsafe_path_reason(list_path, "list_path") or _unsafe_path_reason(
+        log_path, "log_path"
+    )
+    if unsafe:
+        return "unproven", f"{unsafe} (the launch cannot be checked, so it stays alive)"
+
+    status, out, err = await _remote_shell(
+        ssh, _launch_proof_command(list_path, log_path), _PROOF_TIMEOUT_S
+    )
+    if status is None:
+        return (
+            "unproven",
+            f"cannot tell yet: {_one_line(err) or 'no answer from VPS1'} "
+            "(the poll will judge the copy)",
+        )
+
+    pgrep, log_state, captured = _parse_proof_output(out)
+    if pgrep == "found":
+        return "alive", f"VPS1 has the copy running ({_pgrep_pattern(list_path)})"
+    if log_state == "bytes":
+        return "alive", f"the job log at {log_path} already has content"
+    if pgrep == "notfound" and log_state in ("absent", "empty"):
+        return "dead", _proof_dead_reason(list_path, log_path, pgrep, log_state, captured)
+    if not pgrep and not log_state:
+        return (
+            "unproven",
+            f"cannot tell yet: the proof answered {_one_line(out) or 'nothing at all'} "
+            "(the poll will judge the copy)",
+        )
+    return (
+        "unproven",
+        f"alive (unproven): pgrep said {pgrep or 'nothing'} and the log at {log_path} is "
+        f"{log_state or 'unreadable'}; the poll will judge it",
+    )
 
 
 def _liveness_probe_command(log_path: str) -> str:

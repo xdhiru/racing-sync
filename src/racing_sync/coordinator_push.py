@@ -34,6 +34,21 @@ Contract this module keeps:
   and a provably dead copy is FAILED on that same sweep so the next release
   gets the slot; `timeout_seconds` stays the backstop for anything the log
   cannot prove, and a slow-but-silent big upload is never killed.
+* **a launch that never started is said out loud, seconds later.**
+  `start_copy` confirms its own launch (`vps1_push._confirm_launch`: this
+  job's unique list path in `pgrep`, else a non-empty job log) and a dead one
+  comes back as a refusal — so the "a failed attempt leaves no live
+  checkpoint" rule below frees the slot at once instead of squatting it for
+  `timeout_seconds`, and the operator's `/push_source` reply carries the
+  reason (with the launcher's own captured words) verbatim. What the check
+  cannot judge is reported as `alive (unproven)` and left to the poll, because
+  missing evidence never kills a possibly-live copy.
+* **a broken VPS1 lane is not hammered.** After
+  `_PUSH_LAUNCH_FAIL_LIMIT` launch/proof failures in a row for the same
+  infohash, the automatic paths (indexer-timeout auto push, janitor-pressure
+  sweep) leave that hash alone until the window expires, so a permanently
+  broken box does not spend a preflight, a list write, a launch and a proof on
+  every poll. A human tap is never deferred: `/push_source` always tries.
 * **never on the pooled members.** Preflight, the file-list write and the log
   read all go through the dial's DEDICATED runners, so the push lane can
   neither queue behind a racing .torrent fetch nor starve one.
@@ -126,6 +141,31 @@ _LIVENESS_GRACE_FLOOR_S = 300.0
 
 #: Bound for the verdict memo, mirroring `_PUSH_WANTED_CAP`.
 _LIVENESS_SEEN_CAP = 200
+
+#: Consecutive launch/proof failures for ONE infohash before the automatic
+#: paths stop trying it. A copy that VPS1 accepted and did not start is a
+#: broken lane, not a transient: every attempt costs a preflight, a version
+#: probe, a list write, a launch and a proof, all of it SSH the racing path
+#: needs. One retry after a dead launch is fair (a wedged channel, a box
+#: mid-reboot); a second one in a row says the lane is broken, and a THIRD
+#: attempt would only spend SSH on a VPS1 that has already failed to run the
+#: copy twice.
+_PUSH_LAUNCH_FAIL_LIMIT = 2
+
+#: Cap for the launch-failure counter, mirroring `_PRESSURE_BACKOFF_CAP` — and
+#: pruned the same way `_failed_late_cross_seeds` is: expired entries dropped
+#: on every insert, oldest shed first past the cap, so a long-lived daemon
+#: never grows with the number of pushes ever run.
+_PUSH_LAUNCH_FAIL_CAP = 200
+
+#: How long a hash stays skipped once the counter arms, as a MULTIPLE of the
+#: push cadence with a floor (no new config key — the push's own clock is the
+#: unit). Longer than the refusal defer, and about a different question: a
+#: refusal like "cap full" or "nothing complete yet" is worth another look next
+#: poll, while a launch that died is only worth another look after the operator
+#: had a chance to notice.
+_PUSH_LAUNCH_FAIL_MULTIPLIER = 10.0
+_PUSH_LAUNCH_FAIL_FLOOR_S = 600.0
 
 
 def _one_line(text: object) -> str:
@@ -334,6 +374,15 @@ class PushMixin:
             return False, "push refused: rclone_push.enabled = false"
         if len(h) != 40:
             return False, "push refused: the row has no VPS1 infohash to key the push on"
+        if reason != "manual":
+            # A lane that died on this hash twice in a row is not worth another
+            # preflight, list write, launch and proof this poll. Checked BEFORE
+            # any remote work (and before the claim), so the throttle costs
+            # nothing; it only ever defers the automatic paths — an operator's
+            # tap always tries.
+            deferred = self._push_launch_throttled(h)
+            if deferred:
+                return False, deferred
         store = getattr(self, "store", None)
         if store is None or not callable(getattr(store, "claim_push", None)):
             return False, "push refused: no state store to keep the checkpoint in"
@@ -431,19 +480,33 @@ class PushMixin:
             await self._push_settle(store, h, PushState.ABANDONED, check.reason)
             return False, check.reason
 
+        # What preflight PROVED VPS1 has, obeyed when the line is built: the
+        # wrapper that exists there, and the optional flag only for an rclone
+        # that accepts it. Whitelisted, because a launch is exactly where an
+        # unproven token costs an incident; a caller that never probed keeps
+        # the historical defaults.
+        detacher = str(getattr(check, "detacher", "") or "").strip()
+        if detacher not in ("setsid", "nohup"):
+            detacher = "setsid"
         started = await start_copy(
             request,
             ssh=ssh,
             rclone_bin=self._push_rclone_bin(),
             transfers=self._push_transfers(),
             bwlimit=self._push_bwlimit(),
+            detacher=detacher,
+            error_on_no_transfer=getattr(check, "error_on_no_transfer", True) is not False,
         )
         if not started.ok:
             await self._push_settle(store, h, PushState.FAILED, started.reason)
+            self._note_push_launch_failure(h, started.reason)
             return False, started.reason
 
         # The copy is detached and running: stamp the scratch paths + counters
-        # the transport generated, then hand the row over.
+        # the transport generated, then hand the row over. A launch that
+        # started ends the failure streak, so a lane that was broken and got
+        # fixed is eligible again at once.
+        self._forget_push_launch_failure(h)
         try:
             await offload(
                 store.start_push,
@@ -468,6 +531,17 @@ class PushMixin:
         if not parked:
             await self._push_settle(store, h, PushState.ABANDONED, park_why)
             return False, park_why
+        # An unproven launch says so in the transport's own one-liner, and that
+        # line goes ON the reply: "it started" and "we could not prove it
+        # started" must not read the same to the operator. Nothing is killed on
+        # missing evidence — `push_liveness` judges it later.
+        note = f" ({_one_line(started.reason)})" if started.reason else ""
+        if note:
+            log.warning(
+                "push: %s started unproven: %s",
+                h[:10],
+                _one_line(started.reason),
+            )
         log.info(
             "push from VPS1 started for %s (%d file(s) -> %s; %s)",
             display,
@@ -475,7 +549,7 @@ class PushMixin:
             target_remote,
             reason or "manual",
         )
-        return True, f"pushing {len(files)} file(s) from VPS1 to {target_remote}"
+        return True, f"pushing {len(files)} file(s) from VPS1 to {target_remote}{note}"
 
     # ---- step helpers --------------------------------------------------- #
 
@@ -898,10 +972,115 @@ class PushMixin:
             pass
 
     def _forget_wanted(self, infohash: str) -> None:
+        """Drop the wanted-name set for a push that is over."""
         try:
             cache = getattr(self, "_push_wanted", None)
             if isinstance(cache, dict):
                 cache.pop((infohash or "").lower(), None)
+        except Exception:
+            pass
+
+    # ---- launch-failure throttle (do not hammer a broken lane) ----------- #
+
+    def _push_launch_fail_window(self) -> float:
+        """The skip window (seconds) once a hash has failed to START repeatedly."""
+        try:
+            return max(
+                _PUSH_LAUNCH_FAIL_FLOOR_S,
+                float(self._push_poll_seconds()) * _PUSH_LAUNCH_FAIL_MULTIPLIER,
+            )
+        except Exception:
+            return _PUSH_LAUNCH_FAIL_FLOOR_S
+
+    def _push_launch_throttled(self, infohash: str) -> str:
+        """A refusal line while this hash is being left alone; "" when it may try.
+
+        Deliberately NOT the pressure refusal defer (`_push_pressure_backed_off`)
+        that already exists: that one parks ANY refusal — cap full, nothing
+        complete, a preflight blip — for a few polls, and only the pressure
+        sweep consults it. This one counts consecutive failures to get a copy
+        RUNNING (launch refused, or the proof found no process and no log),
+        which means the VPS1 lane itself is broken, and it gates both automatic
+        paths from inside `start_source_push` so the indexer-timeout auto push
+        is covered next to the sweep. Two different questions, two maps; a
+        manual tap answers to neither.
+        """
+        h = (infohash or "").strip().lower()
+        if not h:
+            return ""
+        try:
+            memo = getattr(self, "_push_launch_failures", None)
+            if not isinstance(memo, dict):
+                return ""
+            entry = memo.get(h)
+            if not isinstance(entry, tuple) or len(entry) != 4:
+                return ""
+            count, armed, seen, why = entry
+            now = time.monotonic()
+            armed_at = float(armed)
+            if armed_at > 0.0 and now < armed_at:
+                left = int(armed_at - now) + 1
+                return (
+                    f"push refused: VPS1 failed to start the last {int(count)} push(es) for "
+                    f"this group ({_one_line(why)}); not trying again for another {left}s"
+                )
+            # Window passed (or never armed and now stale): the streak is
+            # forgotten, so the next attempt starts from zero.
+            if armed_at <= 0.0 and now - float(seen) < self._push_launch_fail_window():
+                return ""
+            memo.pop(h, None)
+            return ""
+        except Exception:
+            return ""
+
+    def _note_push_launch_failure(self, infohash: str, why: str) -> int:
+        """Count one launch/proof failure; arm the skip window at the limit.
+
+        Bounded and pruned exactly like `_note_pressure_refusal` /
+        `_failed_late_cross_seeds`: expired streaks dropped on every insert,
+        oldest shed past the cap. Never raises — this is bookkeeping on the way
+        to a refusal, not the refusal itself.
+        """
+        h = (infohash or "").strip().lower()
+        if not h:
+            return 0
+        try:
+            memo = getattr(self, "_push_launch_failures", None)
+            if not isinstance(memo, dict):
+                memo = {}
+                self._push_launch_failures = memo  # type: ignore[attr-defined]
+            now = time.monotonic()
+            window = self._push_launch_fail_window()
+            for stale in [k for k, v in memo.items() if now - float(v[2]) >= window]:
+                memo.pop(stale, None)
+            prior = memo.get(h)
+            count = int(prior[0]) + 1 if isinstance(prior, tuple) and len(prior) == 4 else 1
+            armed = now + window if count >= _PUSH_LAUNCH_FAIL_LIMIT else 0.0
+            memo[h] = (count, armed, now, _one_line(why))
+            if len(memo) > _PUSH_LAUNCH_FAIL_CAP:
+                for oldest in list(memo.keys())[: len(memo) - _PUSH_LAUNCH_FAIL_CAP]:
+                    memo.pop(oldest, None)
+            if armed > 0.0:
+                log.warning(
+                    "push: %s failed to start %d times in a row (%s); the automatic paths "
+                    "leave it alone for %ds",
+                    h[:10],
+                    count,
+                    _one_line(why),
+                    int(window),
+                )
+            else:
+                log.debug("push: %s failed to start (%s)", h[:10], _one_line(why))
+            return count
+        except Exception:
+            return 1
+
+    def _forget_push_launch_failure(self, infohash: str) -> None:
+        """A copy that really started ends the streak: eligible again at once."""
+        try:
+            memo = getattr(self, "_push_launch_failures", None)
+            if isinstance(memo, dict):
+                memo.pop((infohash or "").strip().lower(), None)
         except Exception:
             pass
 
@@ -1405,7 +1584,12 @@ class PushMixin:
         `coordinator_reinject.py`) can still attach same-release torrents
         afterwards. Concurrency is the push's own cap: the sweep budget is
         `max_concurrent_pushes` minus what is already live, and a refusal
-        backs off per hash instead of retrying every poll.
+        backs off per hash instead of retrying every poll. Two separate
+        deferrals apply, because they answer different questions: the existing
+        refusal map (ANY refusal — cap full, nothing complete, a preflight
+        blip — for a few polls, this sweep only) and the launch-failure streak
+        checked inside `start_source_push` (a copy that never started, for the
+        whole automatic lane including the indexer-timeout auto path).
         """
         if not self._push_pressure_on():
             return 0

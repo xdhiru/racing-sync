@@ -313,9 +313,12 @@ def _launch_detached(cfg: DelugeSFTPConfig, command: str) -> bool:
     `_reconnect_for_retry()` rebuilding the transport) tears down its
     channels and orphans the transfer. A throwaway transport dies right
     after the launch — which is safe, because `command` is built as
-    `setsid … </dev/null … &`: setsid puts the job in its own session with
-    no controlling terminal, </dev/null detaches stdin and the trailing &
-    lets the login shell exit, so the session teardown cannot SIGHUP it.
+    `setsid … </dev/null >> <job log> 2>&1 &` (or `nohup …`, whichever
+    `vps1_push.preflight` proved exists): the wrapper puts the job out of the
+    session's reach, </dev/null detaches stdin, the trailing & lets the login
+    shell exit, and the shell's own output goes to the job's log file — never
+    /dev/null — so a wrapper that could not run is visible in the file the app
+    already reads (see `vps1_push.build_copy_command`).
 
     `Channel.exec_command()` blocks only until the server ANSWERS the exec
     request (sshd has forked the shell), never until the job finishes, so a
@@ -426,12 +429,12 @@ def _run_shell_dedicated(
     """Run one short command on a DEDICATED transport; never a pool lease.
 
     Why this exists next to `_launch_detached`: the push lane's *short* calls
-    (preflight's `command -v` / `listremotes`, the log liveness read) are not
-    the launch, and until now they leased a pooled member — so they queued
-    behind, and competed with, the racing client's .torrent fetches. On a
-    saturated VPS1 uplink those leases died with `Timeout opening channel`,
-    which read as "push unavailable". A dial of its own cannot be starved by
-    the pool and can never starve it.
+    (preflight's `command -v` / `rclone version` / `listremotes` probes, the
+    launch proof, the log liveness read) are not the launch, and until now they
+    leased a pooled member — so they queued behind, and competed with, the
+    racing client's .torrent fetches. On a saturated VPS1 uplink those leases
+    died with `Timeout opening channel`, which read as "push unavailable". A
+    dial of its own cannot be starved by the pool and can never starve it.
 
     Same contract as the pooled `run_shell`: (exit status, stdout, stderr),
     never raises, streams always closed (a leaked channel pins a server-side
@@ -1247,8 +1250,9 @@ class _SFTPConnection:
         """Start `command` on a DEDICATED transport (never a pool member).
 
         See `_launch_detached`: the caller's command must already carry
-        `setsid … </dev/null … &` so the job outlives this session. Safe to
-        call after `close()` — it does not revive (or need) pool members.
+        `setsid … </dev/null >> <job log> 2>&1 &` (or the proven `nohup`
+        variant) so the job outlives this session. Safe to call after
+        `close()` — it does not revive (or need) pool members.
         """
         return _launch_detached(self._cfg, command)
 
@@ -1613,13 +1617,13 @@ class SFTPExporter:
     ) -> tuple[int | None, str, str]:
         """One short remote command on a DEDICATED transport; never a lease.
 
-        The push lane's preflight (`command -v`, `rclone listremotes`) and
-        its log liveness read run here, so they can neither queue behind a
-        racing .torrent fetch nor steal a member from one. Same
-        (status, stdout, stderr) shape and same never-raises contract as
-        `run_shell`, and — like `launch_detached` — it works with the pool
-        closed, because it only ever dials from the config through
-        `_dial_client` (the one host-key/credential path).
+        The push lane's preflight (`command -v`, its wrapper/version probe,
+        `rclone listremotes`), its launch proof and its log liveness read run
+        here, so they can neither queue behind a racing .torrent fetch nor
+        steal a member from one. Same (status, stdout, stderr) shape and same
+        never-raises contract as `run_shell`, and — like `launch_detached` — it
+        works with the pool closed, because it only ever dials from the config
+        through `_dial_client` (the one host-key/credential path).
         """
         return _run_shell_dedicated(self._cfg, command, timeout)
 
