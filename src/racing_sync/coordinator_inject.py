@@ -231,7 +231,7 @@ class InjectMixin:
         if not h:
             return "", None, []
         try:
-            blob = await self._fetch_racing_torrent_bytes(h)
+            blob = await self._load_racing_torrent_bytes(h)
         except Exception as e:  # noqa: BLE001
             blob = None
             log.debug("injectfuse: fetch %s failed: %s", h[:10], e)
