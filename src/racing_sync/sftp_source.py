@@ -63,6 +63,21 @@ _BULK_IO_TIMEOUT_S: float = 120.0
 _BULK_MAX_FILES: int = 5000
 _BULK_MAX_TOTAL_BYTES: int = 128 * 1024 * 1024  # 128 MiB
 
+# Short remote probes (the VPS1 push preflight: `command -v`, `listremotes`).
+# Bounded like stat/df: a wedged channel must return "unknown", never hold a
+# pool member. Kept above the transport's own 15s dial timeouts.
+_SHELL_CMD_TIMEOUT_S: float = 30.0
+
+# Budget for the detached push launch's dedicated dial: only the socket,
+# session-channel open and the exec REQUEST are waited on (never the remote
+# job itself), so this stays short.
+_DETACH_CHANNEL_TIMEOUT_S: float = 30.0
+
+# Cap for `write_remote_file`: the push file list is a few KB of names; a
+# payload this size means a caller passed content by mistake (and content
+# never travels over the push transport).
+_MAX_REMOTE_WRITE_BYTES: int = 4 * 1024 * 1024  # 4 MiB
+
 # Infohash filenames in the deluge/qBittorrent state dirs.
 _HEX40_RE = _re.compile(r"[0-9a-fA-F]{40}")
 
@@ -148,6 +163,225 @@ def _ipv4_socket(host: str, port: int, *, timeout: float = 15) -> socket.socket:
     raise SFTPError(f"could not connect to {host}:{port} (IPv4): {last_err}")
 
 
+def _secret_value(raw: object) -> str:
+    """Plain text of a SecretStr-or-string config value (never raises)."""
+    try:
+        return str(raw.get_secret_value() if hasattr(raw, "get_secret_value") else raw)
+    except Exception:
+        return ""
+
+
+def _creds_present(cfg: DelugeSFTPConfig) -> bool:
+    """True when one explicit SSH credential (key path or password) exists."""
+    if getattr(cfg, "ssh_key_path", None):
+        return True
+    return bool(_secret_value(getattr(cfg, "ssh_password", "")).strip())
+
+
+def _load_private_key(path: object, *, passphrase: str | None) -> paramiko.PKey:
+    """Try RSA, then ECDSA, then Ed25519 key loaders.
+
+    Note: DSA was removed from paramiko 4.x and is no longer
+    supported. SSH DSA keys have been deprecated by NIST since 2011
+    and rejected by OpenSSH since 7.4; we don't try to load them.
+    """
+    errors: list[str] = []
+    for loader in (
+        paramiko.RSAKey.from_private_key_file,
+        paramiko.ECDSAKey.from_private_key_file,
+        paramiko.Ed25519Key.from_private_key_file,
+    ):
+        try:
+            return loader(str(path), password=passphrase)
+        except paramiko.PasswordRequiredException:
+            raise  # bubble up — caller decides how to handle it
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{loader.__name__}: {e}")
+    raise paramiko.SSHException(
+        "could not parse private key as RSA/ECDSA/Ed25519: " + " | ".join(errors)
+    )
+
+
+def _apply_host_key_policy(client: paramiko.SSHClient, cfg: DelugeSFTPConfig) -> None:
+    """Load trusted host keys and set the missing-host-key policy.
+
+    Single source of truth for host-key handling: pooled members and the
+    dedicated detached-launch dial go through here, so the second one can
+    never drift into a weaker policy than the first.
+    """
+    if getattr(cfg, "known_hosts_path", None):
+        client.load_host_keys(str(cfg.known_hosts_path))
+    else:
+        try:
+            client.load_system_host_keys()
+        except Exception:
+            pass
+    if getattr(cfg, "auto_add_host_key", False):
+        log.warning(
+            "sftp: auto-adding host key for %s (MITM risk; pin via known_hosts_path)",
+            cfg.ssh_host,
+        )
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    else:
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+
+def _ssh_connect_kwargs(cfg: DelugeSFTPConfig) -> dict:
+    """Auth kwargs for `SSHClient.connect()` — the configured credential only.
+
+    Raises SFTPError (never paramiko internals) for key problems so every
+    dial path reports the same operator-readable failure.
+    """
+    kwargs: dict = {
+        "hostname": cfg.ssh_host,
+        "port": cfg.ssh_port,
+        "username": cfg.ssh_user,
+        "timeout": 15,
+        "banner_timeout": 15,
+        "auth_timeout": 15,
+        # Never offer agent keys / ~/.ssh keys by surprise — only the
+        # explicitly configured credential.
+        "allow_agent": False,
+        "look_for_keys": False,
+    }
+    if getattr(cfg, "ssh_key_path", None):
+        # Load the key manually when a passphrase is configured, so paramiko
+        # can decrypt the (possibly encrypted) private key. Without one we
+        # could let paramiko load it via `key_filename=`, but loading it
+        # explicitly here keeps both code paths uniform.
+        try:
+            pkey = _load_private_key(
+                cfg.ssh_key_path,
+                passphrase=_secret_value(getattr(cfg, "ssh_key_passphrase", "")) or None,
+            )
+        except paramiko.PasswordRequiredException as e:
+            raise SFTPError(
+                f"SSH key {cfg.ssh_key_path} is encrypted but ssh_key_passphrase is empty/missing"
+            ) from e
+        except paramiko.SSHException as e:
+            raise SFTPError(f"could not load SSH key {cfg.ssh_key_path}: {e}") from e
+        kwargs["pkey"] = pkey
+    else:
+        kwargs["password"] = _secret_value(getattr(cfg, "ssh_password", ""))
+    return kwargs
+
+
+def _dial_client(cfg: DelugeSFTPConfig) -> paramiko.SSHClient:
+    """Build, authenticate and return a LIVE SSHClient on its own transport.
+
+    Shared by pooled members and by the detached push launch, so an
+    authenticated dial exists exactly once. Raises on failure (SFTPError,
+    paramiko or OSError) and never leaks the half-open socket/transport.
+    """
+    if not _creds_present(cfg):
+        raise SFTPError("no SSH credentials: set ssh_key_path or ssh_password")
+    client: paramiko.SSHClient | None = None
+    sock: socket.socket | None = None
+    try:
+        client = paramiko.SSHClient()
+        _apply_host_key_policy(client, cfg)
+        # Force IPv4 resolution: the racing VPS may not have a routable IPv6
+        # address and paramiko defaults to getaddrinfo's first result, which
+        # can be a hung AAAA connection. We pre-resolve with AF_INET, open a
+        # socket ourselves, and pass it to connect().
+        sock = _ipv4_socket(cfg.ssh_host, cfg.ssh_port, timeout=15)
+        client.connect(sock=sock, **_ssh_connect_kwargs(cfg))
+        return client
+    except BaseException:
+        # BaseException on purpose: CancelledError/KeyboardInterrupt must
+        # also close the half-open socket/transport instead of leaking it
+        # while the caller's task unwinds.
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        raise
+
+
+def _launch_detached(cfg: DelugeSFTPConfig, command: str) -> bool:
+    """Start `command` on a DEDICATED transport and leave immediately.
+
+    Why a dedicated dial instead of a pool lease: a push is a multi-hour
+    `rclone copy`. Leasing it would occupy one of the few pool members for
+    its whole life, and closing that member (pool `close()`, or
+    `_reconnect_for_retry()` rebuilding the transport) tears down its
+    channels and orphans the transfer. A throwaway transport dies right
+    after the launch — which is safe, because `command` is built as
+    `setsid … </dev/null … &`: setsid puts the job in its own session with
+    no controlling terminal, </dev/null detaches stdin and the trailing &
+    lets the login shell exit, so the session teardown cannot SIGHUP it.
+
+    `Channel.exec_command()` blocks only until the server ANSWERS the exec
+    request (sshd has forked the shell), never until the job finishes, so a
+    return without error is the confirmation we need. Nothing here reads the
+    exit status. Best-effort: any failure is False, never an exception.
+    """
+    if not command or not command.strip():
+        log.warning("sftp: refusing to launch an empty detached command")
+        return False
+    client: paramiko.SSHClient | None = None
+    channel = None
+    try:
+        client = _dial_client(cfg)
+        try:
+            transport = client.get_transport()
+        except Exception:
+            transport = None
+        if transport is None or not transport.is_active():
+            log.warning("sftp: detached launch found no live transport")
+            return False
+        try:
+            channel = transport.open_session(timeout=_DETACH_CHANNEL_TIMEOUT_S)
+        except Exception as e:  # noqa: BLE001
+            log.warning("sftp: detached launch could not open a session: %r", e)
+            return False
+        if channel is None:
+            log.warning("sftp: detached launch got no session channel")
+            return False
+        # Confirm the channel really opened BEFORE handing it the command:
+        # an unopened/refused channel has no id and is already closed.
+        try:
+            if int(channel.get_id()) < 0 or bool(channel.is_closed()):
+                log.warning("sftp: detached launch session channel is not usable")
+                return False
+        except Exception:
+            pass
+        try:
+            channel.settimeout(_DETACH_CHANNEL_TIMEOUT_S)
+        except Exception:
+            pass
+        try:
+            channel.exec_command(command)
+        except Exception as e:  # noqa: BLE001
+            log.warning("sftp: detached launch exec request failed: %r", e)
+            return False
+        log.info("sftp: detached remote command started (%d chars)", len(command))
+        return True
+    except Exception as e:  # noqa: BLE001
+        # socket.timeout stringifies to "" — log the repr for diagnosis.
+        log.warning("sftp: detached launch failed: %r", e)
+        return False
+    finally:
+        # Deliberate: drop the channel and the transport without waiting for
+        # the remote job (see the docstring — setsid already detached it).
+        if channel is not None:
+            try:
+                channel.close()
+            except Exception:
+                pass
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
 class _SFTPConnection:
     """One SSH/SFTP connection (single transport, lock-guarded).
 
@@ -173,14 +407,7 @@ class _SFTPConnection:
         self.close()
 
     def _creds_present(self) -> bool:
-        if self._cfg.ssh_key_path:
-            return True
-        pwd = (
-            self._cfg.ssh_password.get_secret_value()
-            if hasattr(self._cfg.ssh_password, "get_secret_value")
-            else str(self._cfg.ssh_password)
-        )
-        return bool((pwd or "").strip())
+        return _creds_present(self._cfg)
 
     def connect(self) -> None:
         with self._lock:
@@ -189,118 +416,44 @@ class _SFTPConnection:
                 raise SFTPError("no SSH credentials: set ssh_key_path or ssh_password")
             # close() marks _closed; a fresh dial revives the member.
             self._closed = False
-            sock: socket.socket | None = None
             try:
-                self._client = paramiko.SSHClient()
-                if self._cfg.known_hosts_path:
-                    self._client.load_host_keys(str(self._cfg.known_hosts_path))
-                else:
-                    try:
-                        self._client.load_system_host_keys()
-                    except Exception:
-                        pass
-                if self._cfg.auto_add_host_key:
-                    log.warning(
-                        "sftp: auto-adding host key for %s (MITM risk; pin via known_hosts_path)",
-                        self._cfg.ssh_host,
-                    )
-                    self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                else:
-                    self._client.set_missing_host_key_policy(paramiko.RejectPolicy())
-                kwargs: dict = {
-                    "hostname": self._cfg.ssh_host,
-                    "port": self._cfg.ssh_port,
-                    "username": self._cfg.ssh_user,
-                    "timeout": 15,
-                    "banner_timeout": 15,
-                    "auth_timeout": 15,
-                    # Never offer agent keys / ~/.ssh keys by surprise — only
-                    # the explicitly configured credential.
-                    "allow_agent": False,
-                    "look_for_keys": False,
-                }
-                if self._cfg.ssh_key_path:
-                    # Load the key manually when a passphrase is configured, so
-                    # paramiko can decrypt the (possibly encrypted) private key.
-                    # Without a passphrase we can let paramiko load it via
-                    # `key_filename=` itself, but loading it explicitly here
-                    # keeps both code paths uniform.
-                    try:
-                        passphrase = (
-                            self._cfg.ssh_key_passphrase.get_secret_value()
-                            if hasattr(self._cfg.ssh_key_passphrase, "get_secret_value")
-                            else str(self._cfg.ssh_key_passphrase)
-                        ) or None
-                        pkey = self._load_private_key(
-                            self._cfg.ssh_key_path,
-                            passphrase=passphrase,
-                        )
-                    except paramiko.PasswordRequiredException as e:
-                        raise SFTPError(
-                            f"SSH key {self._cfg.ssh_key_path} is encrypted but "
-                            f"ssh_key_passphrase is empty/missing"
-                        ) from e
-                    except paramiko.SSHException as e:
-                        raise SFTPError(
-                            f"could not load SSH key {self._cfg.ssh_key_path}: {e}"
-                        ) from e
-                    kwargs["pkey"] = pkey
-                else:
-                    kwargs["password"] = (
-                        self._cfg.ssh_password.get_secret_value()
-                        if hasattr(self._cfg.ssh_password, "get_secret_value")
-                        else str(self._cfg.ssh_password)
-                    )
-                # Force IPv4 resolution: the racing VPS may not have a routable
-                # IPv6 address and paramiko defaults to getaddrinfo's first
-                # result, which can be a hung AAAA connection. We pre-resolve
-                # with AF_INET, open a socket ourselves, and pass it to connect().
-                sock = _ipv4_socket(self._cfg.ssh_host, self._cfg.ssh_port, timeout=15)
-                kwargs["sock"] = sock
-                self._client.connect(**kwargs)
-                self._sftp = self._client.open_sftp()
-                try:
-                    _chan = self._sftp.get_channel()
-                    if _chan is not None:
-                        _chan.settimeout(_SFTP_IO_TIMEOUT_S)
-                except Exception:
-                    pass
-                log.info("sftp connected to %s:%d", self._cfg.ssh_host, self._cfg.ssh_port)
+                # Same dial the detached push launch uses, so host-key policy
+                # and credential handling exist in exactly one place.
+                client = _dial_client(self._cfg)
             except BaseException:
                 # BaseException on purpose: CancelledError/KeyboardInterrupt
-                # must also close the half-open socket/transport instead of
-                # leaking it while the task unwinds.
-                if sock is not None:
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
+                # must also close the half-open transport instead of leaking
+                # it while the task unwinds.
                 self.close()
                 raise
+            if self._closed:
+                # close() landed while this dial was in flight (pool shutdown
+                # takes the lock non-blockingly and never waits for it): the
+                # caller above already tore down what it could see, so drop
+                # this transport instead of installing one nobody leases.
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                raise SFTPError("sftp member closed during dial")
+            self._client = client
+            try:
+                self._sftp = self._client.open_sftp()
+            except BaseException:
+                self.close()
+                raise
+            try:
+                _chan = self._sftp.get_channel()
+                if _chan is not None:
+                    _chan.settimeout(_SFTP_IO_TIMEOUT_S)
+            except Exception:
+                pass
+            log.info("sftp connected to %s:%d", self._cfg.ssh_host, self._cfg.ssh_port)
 
     @staticmethod
     def _load_private_key(path: Path, *, passphrase: str | None) -> paramiko.PKey:
-        """Try RSA, then ECDSA, then Ed25519 key loaders.
-
-        Note: DSA was removed from paramiko 4.x and is no longer
-        supported. SSH DSA keys have been deprecated by NIST since 2011
-        and rejected by OpenSSH since 7.4; we don't try to load them.
-        """
-        errors: list[str] = []
-        for loader in (
-            paramiko.RSAKey.from_private_key_file,
-            paramiko.ECDSAKey.from_private_key_file,
-            paramiko.Ed25519Key.from_private_key_file,
-        ):
-            try:
-                return loader(str(path), password=passphrase)
-            except paramiko.PasswordRequiredException:
-                raise  # bubble up — caller decides how to handle it
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"{loader.__name__}: {e}")
-        raise paramiko.SSHException(
-            "could not parse private key as RSA/ECDSA/Ed25519: " + " | ".join(errors)
-        )
+        """Key loaders shared with the module-level dial (see `_load_private_key`)."""
+        return _load_private_key(path, passphrase=passphrase)
 
     def close(self) -> None:
         # Best-effort, never blocks: mark dead first so new leases skip
@@ -807,6 +960,170 @@ class _SFTPConnection:
                     pass
             return out
 
+    # ---- short remote commands, small file writes, detached launches ----
+    #
+    # These back the VPS1 push transport (see vps1_push.py). All three are
+    # best-effort by contract: they return a failure value instead of
+    # raising, because a push must never take the daemon down with it.
+
+    def run_shell(
+        self, command: str, timeout: float = _SHELL_CMD_TIMEOUT_S
+    ) -> tuple[int | None, str, str]:
+        """Run one short remote command; return (exit_status, stdout, stderr).
+
+        Bounded and stream-cleaning like the stat/df probes (a leaked exec
+        channel pins a server-side session). Never raises: an unreachable
+        host, a wedged channel or a busy lock comes back as a non-zero/None
+        status with the reason in stderr, which is exactly what a preflight
+        check needs to degrade to "unknown". Caller-provided command string;
+        every interpolated token must already be `shlex.quote`d by the caller.
+        """
+        if not command or not command.strip():
+            return (None, "", "empty command")
+        try:
+            bound = max(1.0, float(timeout))
+        except (TypeError, ValueError):
+            bound = _SHELL_CMD_TIMEOUT_S
+        out = ""
+        err = ""
+        status: int | None = None
+        try:
+            self._acquire_or_busy(self._lock, f"shell {command[:60]!r}")
+        except Exception as e:  # noqa: BLE001
+            return (None, "", str(e))
+        try:
+            with self._lock:
+                if (
+                    self._client is None
+                    or self._client.get_transport() is None
+                    or not self._client.get_transport().is_active()
+                ):
+                    try:
+                        self.connect()
+                    except Exception as e:  # noqa: BLE001
+                        return (None, "", f"sftp connect failed: {e}")
+                if self._client is None:
+                    return (None, "", "sftp not connected")
+                stdin = stdout = stderr = None
+                try:
+                    stdin, stdout, stderr = self._client.exec_command(command, timeout=bound)
+                    try:
+                        stdout.channel.settimeout(bound)
+                    except Exception:
+                        pass
+                    # Read both streams before the exit status: a full stdout
+                    # buffer deadlocks against a status wait.
+                    try:
+                        out = (stdout.read() or b"").decode("utf-8", errors="replace")
+                    except Exception as e:  # noqa: BLE001
+                        return (None, out, f"stdout read failed: {type(e).__name__}: {e}")
+                    try:
+                        err = (stderr.read() or b"").decode("utf-8", errors="replace")
+                    except Exception:
+                        err = ""
+                    try:
+                        status = stdout.channel.recv_exit_status()
+                    except Exception:
+                        status = None
+                except Exception as e:  # noqa: BLE001
+                    return (None, out, f"command failed to run: {type(e).__name__}: {e}")
+                finally:
+                    _close_exec_streams(stdin, stdout, stderr)
+        except Exception as e:  # noqa: BLE001
+            return (None, out, f"shell probe failed: {type(e).__name__}: {e}")
+        finally:
+            try:
+                self._lock.release()
+            except Exception:
+                pass
+        return (status, out, err)
+
+    def write_remote_file(self, path: str, data: bytes) -> bool:
+        """Write a SMALL remote file (0600) over SFTP; True when it landed.
+
+        Used for the push file list only — never content (see the project's
+        no-content-over-the-push rule), which the byte cap also enforces.
+        """
+        if not isinstance(path, str) or not path.strip():
+            log.warning("sftp: refusing to write a remote file with an empty path")
+            return False
+        clean = path.strip()
+        if clean != path or "\n" in clean or "\r" in clean or "\0" in clean:
+            log.warning("sftp: refusing to write a remote file to an unsafe path")
+            return False
+        if not clean.startswith("/"):
+            # Absolute POSIX only: a relative path resolves against the
+            # SSH user's home, and a `-`-leading one reads as a flag.
+            log.warning("sftp: refusing to write remote file %s (want an absolute path)", clean)
+            return False
+        if any(c in clean for c in (";", "`", "$")):
+            log.warning("sftp: refusing to write remote file %s (shell metacharacters)", clean)
+            return False
+        payload = bytes(data or b"")
+        if not payload:
+            log.warning("sftp: refusing to write an empty remote file %s", clean)
+            return False
+        if len(payload) > _MAX_REMOTE_WRITE_BYTES:
+            log.warning(
+                "sftp: refusing to write %d bytes to %s (cap %d: content never goes over SSH)",
+                len(payload),
+                clean,
+                _MAX_REMOTE_WRITE_BYTES,
+            )
+            return False
+        try:
+            self._acquire_or_busy(self._lock, f"write {clean}")
+        except Exception as e:  # noqa: BLE001
+            log.warning("sftp: could not write %s: %s", clean, e)
+            return False
+        try:
+            with self._lock:
+                if (
+                    self._sftp is None
+                    or self._client is None
+                    or self._client.get_transport() is None
+                    or not self._client.get_transport().is_active()
+                ):
+                    try:
+                        self.connect()
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("sftp: could not write %s: connect failed: %s", clean, e)
+                        return False
+                if self._sftp is None:
+                    return False
+                try:
+                    with self._sftp.open(clean, "wb") as fh:
+                        fh.write(payload)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("sftp: write of %s failed: %r", clean, e)
+                    return False
+                # 0600: the list is a path inventory of the racing box, so it
+                # stays unreadable to other accounts on a shared host. A
+                # server without the POSIX rename/chmod extension only loses
+                # the tightening, not the write.
+                try:
+                    self._sftp.chmod(clean, 0o600)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("sftp: could not chmod %s to 0600: %r", clean, e)
+                return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("sftp: write of %s failed: %r", clean, e)
+            return False
+        finally:
+            try:
+                self._lock.release()
+            except Exception:
+                pass
+
+    def launch_detached(self, command: str) -> bool:
+        """Start `command` on a DEDICATED transport (never a pool member).
+
+        See `_launch_detached`: the caller's command must already carry
+        `setsid … </dev/null … &` so the job outlives this session. Safe to
+        call after `close()` — it does not revive (or need) pool members.
+        """
+        return _launch_detached(self._cfg, command)
+
 
 class SFTPExporter:
     """Pooled SFTP exporter: N independent SSH/SFTP connections.
@@ -1107,3 +1424,38 @@ class SFTPExporter:
             return m.list_state_dir()
         finally:
             self._release(m)
+
+    def run_shell(
+        self, command: str, timeout: float = _SHELL_CMD_TIMEOUT_S
+    ) -> tuple[int | None, str, str]:
+        """Run one short remote command on a leased member (see the member).
+
+        The lease is held only for the duration of the command — probes are
+        sub-second, so they never sit behind a bulk fetch. SYNC and blocking:
+        run it via asyncio.to_thread.
+        """
+        m = self._lease(f"shell {command[:40]!r}")
+        try:
+            return m.run_shell(command, timeout)
+        finally:
+            self._release(m)
+
+    def write_remote_file(self, path: str, data: bytes) -> bool:
+        """Write a small (0600) remote file over SFTP (see the member)."""
+        m = self._lease(f"write {path}")
+        try:
+            return m.write_remote_file(path, data)
+        finally:
+            self._release(m)
+
+    def launch_detached(self, command: str) -> bool:
+        """Launch `command` on its OWN transport — no lease, no revive.
+
+        Deliberately does not touch the pool: a multi-hour push would occupy
+        a member for its whole life, and `close()` / `_reconnect_for_retry()`
+        would drop the transport under it and orphan the transfer. Because it
+        dials from the config directly, this still works while the pool is
+        shut down (a push started before shutdown keeps running on the
+        racing box regardless of what this process does).
+        """
+        return _launch_detached(self._cfg, command)
