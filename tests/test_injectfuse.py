@@ -20,13 +20,42 @@ from racing_sync.telegram_bot import (
     INJECT_CMD_RE,
     TelegramBot,
 )
-from racing_sync.watchdir import _bencode
+from racing_sync.watchdir import _bencode, _bencoded_info_hash
 
-H1 = "a" * 40
-H2 = "b" * 40
 NAME = "Show.S01E01.1080p"
 TRACKER1 = "https://tracker.example/announce?passkey=AAA"
 TRACKER2 = "https://beta.example/announce?passkey=BBB"
+
+
+def _blob(fname="Solo.mkv", size=500):
+    return _bencode(
+        {
+            b"info": {b"name": fname.encode(), b"length": size},
+        }
+    )
+
+
+def _hash_of(blob: bytes) -> str:
+    """The infohash a torrent's bytes really carry."""
+    return _bencoded_info_hash(blob)[0].lower()
+
+
+# The fixtures carry the hash their bytes imply: the racing-bytes loader
+# rejects bytes that belong to a different torrent.
+_BLOB_SOLO = _blob()
+_BLOB_OTHER = _blob("Other.mkv", 500)
+H1 = _hash_of(_BLOB_SOLO)
+H2 = _hash_of(_BLOB_OTHER)
+
+
+def _export_by_hash(h):
+    """Export mock that answers with the bytes belonging to that hash."""
+    h = str(h or "").lower()
+    if h == H1:
+        return _BLOB_SOLO
+    if h == H2:
+        return _BLOB_OTHER
+    return None
 
 
 def _torrent(h, tracker, size=500):
@@ -40,14 +69,6 @@ def _torrent(h, tracker, size=500):
         progress=1.0,
         trackers=[tracker],
         files=[],
-    )
-
-
-def _blob(fname="Solo.mkv", size=500):
-    return _bencode(
-        {
-            b"info": {b"name": fname.encode(), b"length": size},
-        }
     )
 
 
@@ -166,9 +187,9 @@ async def test_resolve_finds_row_by_sibling_hash(tmp_path):
 @pytest.mark.anyio
 async def test_verify_ready_no_state_change(tmp_path):
     coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
-    blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    (fuse / "Other.mkv").write_bytes(b"x" * 500)
     try:
         coord.store.upsert(
             TorrentState(
@@ -190,8 +211,8 @@ async def test_verify_broken_fuse_cfg_fails_closed(tmp_path):
     ready, never stat the SSD dir as fuse (a false 'present' would pass
     verification for data never seeded)."""
     coord, ssd, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
-    blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    _blob()
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     (ssd / "Solo.mkv").write_bytes(b"x" * 500)
 
     class _BrokenFuse:
@@ -217,8 +238,8 @@ async def test_verify_broken_fuse_cfg_fails_closed(tmp_path):
 @pytest.mark.anyio
 async def test_verify_missing_no_state_change(tmp_path, mounted_fuse):
     coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
-    blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    _blob()
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     try:
         coord.store.upsert(
             TorrentState(
@@ -238,7 +259,7 @@ async def test_verify_missing_no_state_change(tmp_path, mounted_fuse):
 async def test_confirmed_drives_waiting_row(tmp_path):
     coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
     try:
         coord.store.upsert(
@@ -259,9 +280,9 @@ async def test_confirmed_drives_waiting_row(tmp_path):
 @pytest.mark.anyio
 async def test_confirmed_keeps_existing_blob(tmp_path):
     coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
-    blob = _blob()
+    _blob()
     other = _blob("Other.mkv", 500)
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
     try:
         coord.store.upsert(
@@ -283,8 +304,8 @@ async def test_confirmed_keeps_existing_blob(tmp_path):
 @pytest.mark.anyio
 async def test_confirmed_missing_keeps_prior_state(tmp_path, mounted_fuse):
     coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
-    blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    _blob()
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     try:
         coord.store.upsert(
             TorrentState(
@@ -303,9 +324,9 @@ async def test_confirmed_missing_keeps_prior_state(tmp_path, mounted_fuse):
 @pytest.mark.anyio
 async def test_confirmed_preempts_active_download(tmp_path):
     coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
-    blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    (fuse / "Other.mkv").write_bytes(b"x" * 500)
     try:
         coord.store.upsert(
             TorrentState(
@@ -323,9 +344,9 @@ async def test_confirmed_preempts_active_download(tmp_path):
 @pytest.mark.anyio
 async def test_confirmed_lifts_cancel(tmp_path):
     coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
-    blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    (fuse / "Other.mkv").write_bytes(b"x" * 500)
     try:
         coord.store.upsert(
             TorrentState(
@@ -345,7 +366,7 @@ async def test_confirmed_lifts_cancel(tmp_path):
 async def test_confirmed_creates_row_when_untracked(tmp_path):
     coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
     try:
         assert coord.store.get(H1) is None
@@ -363,8 +384,8 @@ async def test_confirmed_creates_row_when_untracked(tmp_path):
 @pytest.mark.anyio
 async def test_confirmed_untracked_missing_creates_nothing(tmp_path):
     coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
-    blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    _blob()
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     try:
         out = await coord.injectfuse_confirmed([H1])
         assert out.startswith("Not injected")
@@ -376,9 +397,9 @@ async def test_confirmed_untracked_missing_creates_nothing(tmp_path):
 @pytest.mark.anyio
 async def test_confirmed_done_noop(tmp_path):
     coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
-    blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    (fuse / "Other.mkv").write_bytes(b"x" * 500)
     try:
         coord.store.upsert(
             TorrentState(source_infohash=H1, source_name=NAME, total_bytes=500, state=State.DONE)
@@ -688,9 +709,9 @@ async def test_group_question_falls_back_when_vps1_gone(tmp_path):
 async def test_verify_members_run_concurrently(tmp_path):
     """Group members verify in parallel, not one fetch+stat at a time."""
     coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1), _torrent(H2, TRACKER2)])
-    blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    (fuse / "Other.mkv").write_bytes(b"x" * 500)
     in_flight = 0
     peak = 0
     real_fetch = coord._fetch_racing_torrent_bytes
@@ -722,9 +743,9 @@ async def test_preempt_deletes_ssd_entry_under_rpc_budget(tmp_path):
     """Preempt lists + deletes under the RPC budget; SSD entry is dropped."""
     dest_h = "d" * 40
     coord, ssd, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
-    blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    (fuse / "Other.mkv").write_bytes(b"x" * 500)
     _ssd_entry = _torrent(dest_h, TRACKER1)
     _ssd_entry.save_path = str(ssd)
     coord.dest_client.list_torrents = AsyncMock(return_value=[_ssd_entry])
@@ -776,9 +797,9 @@ async def test_apply_active_row_without_blob_preempts_nothing(tmp_path):
 async def test_confirmed_untracked_routes_via_new_and_transition(tmp_path):
     """Untracked adoption inserts NEW then drives via transition hooks."""
     coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
-    blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    (fuse / "Other.mkv").write_bytes(b"x" * 500)
     calls = []
     real_transition = coord.transition
 
@@ -823,9 +844,9 @@ async def test_confirmed_drives_every_hash(tmp_path):
         files=[],
     )
     coord, _, fuse = _coord(tmp_path, [t1, t2])
-    blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    (fuse / "Other.mkv").write_bytes(b"x" * 500)
     try:
         out = await coord.injectfuse_confirmed([H1, H2])
         lines = [ln for ln in out.splitlines() if ln.startswith("injecting")]
@@ -840,9 +861,9 @@ async def test_confirmed_drives_every_hash(tmp_path):
 async def test_confirmed_same_group_drives_once(tmp_path):
     """Two hashes in one content group drive once, not twice."""
     coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1), _torrent(H2, TRACKER2)])
-    blob = _blob()
-    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    coord.source_client.export_torrent = AsyncMock(side_effect=_export_by_hash)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    (fuse / "Other.mkv").write_bytes(b"x" * 500)
     try:
         out = await coord.injectfuse_confirmed([H1, H2])
         assert out.startswith("injecting")

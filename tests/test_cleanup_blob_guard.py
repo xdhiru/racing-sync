@@ -390,7 +390,8 @@ async def test_loader_drops_a_poisoned_racing_cache(tmp_path: Path):
         coord._fetch_racing_torrent_bytes = AsyncMock(return_value=racing)
 
         assert await coord._load_racing_torrent_bytes(h) == racing
-        assert store.get_racing_blob(h) == b""
+        # The poisoned entry is dropped and the fetched bytes take its place.
+        assert store.get_racing_blob(h) == racing
     finally:
         store.close()
 

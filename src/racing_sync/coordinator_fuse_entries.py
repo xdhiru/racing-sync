@@ -257,9 +257,28 @@ class FuseEntryMixin:
         if not blob:
             return None
         try:
-            return bytes(blob)
+            candidate = bytes(blob)
         except Exception:
             return None
+        matched = self._blob_matches_infohash(candidate, h)
+        if matched is False:
+            log.warning(
+                "_load_racing_torrent_bytes: fetched bytes for %s belong to a "
+                "different torrent; rejecting them",
+                h[:10],
+            )
+            return None
+        if matched is True and store is not None:
+            # One good fetch is enough: keep the bytes so a later VPS1
+            # outage (or a cleanup that removed the racing copy) cannot
+            # lose the racing seed.
+            try:
+                await asyncio.to_thread(store.set_racing_blob, h, candidate)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "_load_racing_torrent_bytes: could not cache bytes for %s: %s", h[:10], e
+                )
+        return candidate
 
     @staticmethod
     def _expected_fuse_files(blob: bytes | None) -> list[tuple[str, int]] | None:

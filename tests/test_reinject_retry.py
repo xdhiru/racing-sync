@@ -479,6 +479,7 @@ async def test_check_and_inject_late_cross_seeds_normalizes_hash(tmp_path: Path)
     fsize = 1000
     (fuse_dir / fname).write_bytes(b"m" * fsize)
     blob = _single_file_torrent_bytes(fname, fsize)
+    hash_val = _hash_of(blob).upper()
     coord = make_coordinator()
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord.dest_client = MagicMock()
@@ -496,7 +497,7 @@ async def test_check_and_inject_late_cross_seeds_normalizes_hash(tmp_path: Path)
 
     t_upper = Torrent(
         # 40-hex is required by the racing-bytes loader's infohash guard.
-        hash="ABCD" + "0" * 36,
+        hash=hash_val,
         name="Test.Movie.2026",
         category="",
         save_path="",
@@ -508,7 +509,7 @@ async def test_check_and_inject_late_cross_seeds_normalizes_hash(tmp_path: Path)
     await coord._check_and_inject_late_cross_seeds(ts, [t_upper])
 
     # Injected hash should be stored in lowercase
-    assert ts.injected_private_hashes == ("ABCD" + "0" * 36).lower()
+    assert ts.injected_private_hashes == hash_val.lower()
     coord.store.upsert.assert_called_once_with(ts)
 
 
@@ -600,6 +601,13 @@ def _single_file_torrent_bytes(name: str, length: int) -> bytes:
             },
         }
     )
+
+
+def _hash_of(blob: bytes) -> str:
+    """The infohash a torrent's bytes really carry."""
+    from racing_sync.watchdir import _bencoded_info_hash
+
+    return _bencoded_info_hash(blob)[0].lower()
 
 
 @pytest.mark.anyio
@@ -1522,7 +1530,7 @@ async def test_late_cross_seed_repairs_skipped_racing_injection(tmp_path: Path):
     coord._save_path_points_at_target = MagicMock(return_value=True)
     coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path="x"))
 
-    racing_hash = "b" * 40  # VPS1 private torrent (SFTP timed out in RE_ADDING)
+    racing_hash = _hash_of(blob)  # VPS1 private torrent (SFTP timed out in RE_ADDING)
     xseed_hash = "c" * 40  # cross-seed actually injected
     ts = TorrentState(
         source_infohash=racing_hash,
@@ -1869,7 +1877,12 @@ async def test_re_inject_racing_matches_fetch_concurrently(tmp_path: Path):
     fuse_dir = tmp_path / "fuse"
     fuse_dir.mkdir()
     (fuse_dir / "Movie.File.mkv").write_bytes(b"x" * 50)
+    (fuse_dir / "Movie.Other.mkv").write_bytes(b"x" * 50)
     blob = _bencode({b"info": {b"name": b"Movie.File.mkv", b"length": 50}})
+    other = _bencode({b"info": {b"name": b"Movie.Other.mkv", b"length": 50}})
+    hash_a = _hash_of(blob)
+    hash_b = _hash_of(other)
+    by_hash = {hash_a: blob, hash_b: other}
 
     coord = make_coordinator()
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
@@ -1884,7 +1897,7 @@ async def test_re_inject_racing_matches_fetch_concurrently(tmp_path: Path):
         peak = max(peak, in_flight)
         try:
             await asyncio.sleep(0.05)
-            return blob
+            return by_hash[str(h).lower()]
         finally:
             in_flight -= 1
 
@@ -1892,7 +1905,7 @@ async def test_re_inject_racing_matches_fetch_concurrently(tmp_path: Path):
     coord._list_source_torrents = AsyncMock(
         return_value=[
             Torrent(
-                hash="1" * 40,
+                hash=hash_a,
                 name="Movie",
                 category="",
                 save_path="",
@@ -1901,7 +1914,7 @@ async def test_re_inject_racing_matches_fetch_concurrently(tmp_path: Path):
                 progress=1.0,
             ),
             Torrent(
-                hash="2" * 40,
+                hash=hash_b,
                 name="Movie",
                 category="",
                 save_path="",
@@ -1923,7 +1936,7 @@ async def test_re_inject_racing_matches_fetch_concurrently(tmp_path: Path):
 
     assert peak == 2
     assert coord._ensure_fuse_entry.await_count == 2
-    assert set(ts.injected_private_hashes.split(",")) == {"1" * 40, "2" * 40}
+    assert set(ts.injected_private_hashes.split(",")) == {hash_a, hash_b}
 
 
 def test_late_seed_sweep_prunes_outage_map_independently():

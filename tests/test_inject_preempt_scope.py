@@ -15,9 +15,20 @@ from conftest import make_coordinator
 
 from racing_sync.clients.abstract import Torrent
 from racing_sync.state import State, StateStore, TorrentState
-from racing_sync.watchdir import _bencode
+from racing_sync.watchdir import _bencode, _bencoded_info_hash
 
-H_SOURCE = "a" * 40
+
+def _blob(fname="Solo.mkv", size=500):
+    return _bencode(
+        {
+            b"info": {b"name": fname.encode(), b"length": size},
+        }
+    )
+
+
+# The racing hash carries the infohash its bytes imply: the racing-bytes
+# loader rejects bytes that belong to a different torrent.
+H_SOURCE = _bencoded_info_hash(_blob())[0].lower()
 H_SSD = "d" * 40
 H_FUSE = "e" * 40
 H_FOREIGN = "f" * 40
@@ -36,14 +47,6 @@ def _entry(h, save_path):
         progress=0.5,
         trackers=[TRACKER],
         files=[],
-    )
-
-
-def _blob(fname="Solo.mkv", size=500):
-    return _bencode(
-        {
-            b"info": {b"name": fname.encode(), b"length": size},
-        }
     )
 
 
