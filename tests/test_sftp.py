@@ -881,3 +881,86 @@ def test_invalid_state_file_logs_its_size(caplog):
     messages = [r.getMessage() for r in caplog.records if "bencoded" in r.getMessage()]
     assert messages
     assert "13 bytes" in messages[0]
+
+
+class _FakeStdout:
+    """A paramiko-like stdout: a byte stream with a channel stub."""
+
+    def __init__(self, data: bytes):
+        import io
+
+        self._buf = io.BytesIO(data)
+        self.channel = MagicMock()
+        self.channel.recv_exit_status.return_value = 0
+
+    def read(self, size: int = -1) -> bytes:
+        return self._buf.read(size)
+
+    def readinto(self, b) -> int:  # pragma: no cover - passthrough
+        return self._buf.readinto(b)
+
+    def readable(self) -> bool:
+        return True
+
+
+def _tar_with(members: dict[str, bytes]) -> bytes:
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, payload in members.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+    return buf.getvalue()
+
+
+def test_fetch_all_torrents_parses_one_tar_stream():
+    """One session, many .torrent files, keyed by their real infohash."""
+    from racing_sync.sftp_source import _torrent_identity
+
+    other = _create_sample_torrent_data("Other", 200, "http://x/announce")
+    archive = _tar_with(
+        {
+            "a" * 40 + ".torrent": SAMPLE_TORRENT,
+            "b" * 40 + ".torrent": other,
+            "notes.txt": b"not a torrent",
+        }
+    )
+
+    exporter = object.__new__(_SFTPConnection)
+    exporter._lock = threading.RLock()
+    exporter._closed = False
+    exporter._cfg = _sftp_cfg(state_dir=Path("/var/data/deluge/state"))
+    mock_client = MagicMock()
+    mock_client.get_transport().is_active.return_value = True
+    mock_client.exec_command.return_value = (MagicMock(), _FakeStdout(archive), MagicMock())
+    exporter._client = mock_client
+    exporter._sftp = MagicMock()
+
+    out = exporter.fetch_all_torrents()
+
+    assert set(out) == {_torrent_identity(SAMPLE_TORRENT), _torrent_identity(other)}
+    assert out[_torrent_identity(SAMPLE_TORRENT)] == SAMPLE_TORRENT
+    # One command, both dirs, and only .torrent patterns.
+    cmd = mock_client.exec_command.call_args[0][0]
+    assert cmd.startswith("tar ")
+    assert "/var/data/deluge/state" in cmd
+    assert "BT_backup" in cmd
+    assert "notes.txt" not in out
+
+
+def test_fetch_all_torrents_survives_a_broken_command():
+    """A failed bulk fetch returns nothing and never raises."""
+    exporter = object.__new__(_SFTPConnection)
+    exporter._lock = threading.RLock()
+    exporter._closed = False
+    exporter._cfg = _sftp_cfg(state_dir=Path("/var/data/deluge/state"))
+    mock_client = MagicMock()
+    mock_client.get_transport().is_active.return_value = True
+    mock_client.exec_command.side_effect = OSError("no tar here")
+    exporter._client = mock_client
+    exporter._sftp = MagicMock()
+
+    assert exporter.fetch_all_torrents() == {}

@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import re as _re
 import socket
+import tarfile
 import threading
 import time
 from collections.abc import Iterable
@@ -20,6 +21,20 @@ import paramiko  # type: ignore[import-untyped]
 from .config import DelugeSFTPConfig
 
 log = logging.getLogger(__name__)
+
+
+def _torrent_identity(data: bytes) -> str | None:
+    """Infohash of a bencoded torrent, or None when it is not one."""
+    try:
+        from .watchdir import _bencoded_info_hash, is_bencoded_torrent
+
+        if not is_bencoded_torrent(data):
+            return None
+        v1, _name, _size, _announce = _bencoded_info_hash(data)
+    except Exception:
+        return None
+    return (v1 or "").lower() or None
+
 
 MAX_TORRENT_BYTES: int = 20 * 1024 * 1024  # 20 MiB safety cap, matching Prowlarr
 
@@ -40,6 +55,13 @@ _POOL_SIZE_MAX: int = 8
 # it a wedged transport stalls fetch_torrent forever, and the caller's
 # wait_for abandon leaves the thread holding the member lock.
 _SFTP_IO_TIMEOUT_S: float = 15.0
+
+# Bulk fetch bounds: one `tar` stream replaces N per-file reads, so the
+# transfer is bigger and slower than a single file — give it room, but
+# never unbounded (a runaway archive must not eat the disk or the loop).
+_BULK_IO_TIMEOUT_S: float = 120.0
+_BULK_MAX_FILES: int = 5000
+_BULK_MAX_TOTAL_BYTES: int = 128 * 1024 * 1024  # 128 MiB
 
 # Infohash filenames in the deluge/qBittorrent state dirs.
 _HEX40_RE = _re.compile(r"[0-9a-fA-F]{40}")
@@ -350,6 +372,129 @@ class _SFTPConnection:
             return False
 
     # ---- torrent file ----
+
+    def _torrent_dirs(self) -> list[str]:
+        """Remote dirs that hold .torrent files (state dir + BT_backup).
+
+        POSIX paths: these are remote paths, and the config value may be
+        written with Windows separators on a dev box.
+        """
+        out: list[str] = []
+        try:
+            state = self._cfg.state_dir
+        except Exception:
+            state = None
+        if state is not None:
+            state_posix = PurePosixPath(
+                state.as_posix() if hasattr(state, "as_posix") else str(state).replace("\\", "/")
+            )
+            out.append(state_posix.as_posix())
+            out.append((state_posix.parent / "BT_backup").as_posix())
+        seen: set[str] = set()
+        dirs: list[str] = []
+        for d in out:
+            if d in seen:
+                continue
+            seen.add(d)
+            dirs.append(d)
+        return dirs
+
+    @staticmethod
+    def _bulk_tar_command(dirs: list[str]) -> str:
+        """One `tar` command that streams every .torrent from `dirs`."""
+        import shlex
+
+        parts = ["tar", "-cf", "-", "--wildcards"]
+        for d in dirs:
+            parts += ["-C", shlex.quote(d), "*.torrent"]
+        return " ".join(parts)
+
+    def fetch_all_torrents(self) -> dict[str, bytes]:
+        """Every .torrent under the configured dirs, keyed by infohash.
+
+        One `tar` stream over the existing SSH session replaces N
+        per-file SFTP reads: the fragile part is the transport, not the
+        file count. Best-effort — a failure returns whatever was parsed
+        (possibly empty) and never raises; the per-file path stays as
+        the fallback.
+        """
+        out: dict[str, bytes] = {}
+        dirs = self._torrent_dirs()
+        if not dirs:
+            return out
+        try:
+            with self._lock:
+                try:
+                    transport = self._client.get_transport() if self._client else None
+                except Exception:
+                    transport = None
+                if transport is None or not transport.is_active():
+                    log.info("sftp connection dropped or not active; reconnecting...")
+                    try:
+                        self.connect()
+                    except Exception as e:
+                        log.warning("sftp reconnect failed: %s", e)
+                        return out
+                try:
+                    _stdin, stdout, _stderr = self._client.exec_command(
+                        self._bulk_tar_command(dirs),
+                        timeout=_BULK_IO_TIMEOUT_S,
+                    )
+                except Exception as e:
+                    log.warning("sftp bulk torrent fetch could not start: %s", e)
+                    return out
+                try:
+                    _channel = stdout.channel
+                    _channel.settimeout(_BULK_IO_TIMEOUT_S)
+                except Exception:
+                    pass
+                total = 0
+                try:
+                    with tarfile.open(fileobj=stdout, mode="r|") as tf:
+                        for member in tf:
+                            if not member.isfile() or not member.name.endswith(".torrent"):
+                                continue
+                            if len(out) >= _BULK_MAX_FILES or total >= _BULK_MAX_TOTAL_BYTES:
+                                break
+                            if int(member.size or 0) > MAX_TORRENT_BYTES:
+                                continue
+                            try:
+                                fh = tf.extractfile(member)
+                            except Exception:
+                                continue
+                            if fh is None:
+                                continue
+                            try:
+                                data = fh.read(MAX_TORRENT_BYTES + 1)
+                            except Exception:
+                                continue
+                            finally:
+                                try:
+                                    fh.close()
+                                except Exception:
+                                    pass
+                            if len(data) > MAX_TORRENT_BYTES:
+                                continue
+                            parsed = _torrent_identity(data)
+                            if not parsed:
+                                continue
+                            out[parsed] = data
+                            total += len(data)
+                except Exception as e:
+                    log.warning("sftp bulk torrent fetch failed: %s", e)
+                try:
+                    _rc = stdout.channel.recv_exit_status()
+                except Exception:
+                    _rc = None
+                if _rc not in (0, None) and not out:
+                    log.warning(
+                        "sftp bulk torrent fetch exited %s (no .torrent stream); "
+                        "falling back to per-file reads",
+                        _rc,
+                    )
+        except Exception as e:  # noqa: BLE001
+            log.warning("sftp bulk torrent fetch failed: %s", e)
+        return out
 
     def fetch_torrent(self, infohash: str) -> bytes | None:
         """Return the .torrent bytes for `infohash` or None if missing."""
@@ -899,6 +1044,20 @@ class SFTPExporter:
         m = self._lease(f"fetch {infohash[:10]}")
         try:
             return m.fetch_torrent(infohash)
+        finally:
+            self._release(m)
+
+    def fetch_all_torrents(self) -> dict[str, bytes]:
+        """Every .torrent the remote knows, keyed by infohash.
+
+        One leased member runs a single `tar` stream: the per-file path
+        costs one SFTP session per torrent, which is exactly what breaks
+        when the link to the racing box is flaky. SYNC and blocking — run
+        via asyncio.to_thread.
+        """
+        m = self._lease("fetch-all-torrents")
+        try:
+            return m.fetch_all_torrents()
         finally:
             self._release(m)
 
