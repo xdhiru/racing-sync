@@ -491,7 +491,9 @@ async def test_best_match_rejects_different_release_group():
     foreign bytes corrupts the seed."""
     client = _download_client()
     query = "Example.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-DUMMYGRP.mkv"
-    wrong_group = "Example.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-WebRip.mkv"
+    wrong_group = (
+        "Example.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-WebRip.mkv"
+    )
     size = 1_450_000_000
     client.search_indexer = AsyncMock(return_value=[_hit(wrong_group, size + 5_000_000)])
 
@@ -511,10 +513,7 @@ async def test_best_match_accepts_punctuation_variants_and_strips_tags():
             ),
         ]
     )
-    query = (
-        "Example Outpost S04E08 Signal in the Dark 1080p "
-        "AMZN WEB-DL DDP5.1 H.264-DUMMYGRP"
-    )
+    query = "Example Outpost S04E08 Signal in the Dark 1080p AMZN WEB-DL DDP5.1 H.264-DUMMYGRP"
     best = await client.best_match(query, target_size=size)
     assert best is not None
 
@@ -862,7 +861,9 @@ async def test_pick_rejects_hit_whose_payload_is_another_release():
     decoded payload check must refuse it (park, never download onward)."""
     from racing_sync.clients.abstract import Torrent
 
-    src_show = "Example.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-DUMMYGRP.mkv"
+    src_show = (
+        "Example.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-DUMMYGRP.mkv"
+    )
     hit_show = "Example.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-WebRip.mkv"
     size = 1_450_000_000
     hit_blob = _bencode(

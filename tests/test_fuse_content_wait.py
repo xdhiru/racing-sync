@@ -332,7 +332,7 @@ async def test_watch_origin_label_is_preserved(tmp_path):
         store.close()
 
 
-EPISODE = "Example.Show.S01E01.576p.DUMMY.WEB-DL.EAC3.H264.mkv"
+EPISODE = "Example.Show.S01E01.576p.WEB-DL.EAC3.H264-DUMMY.mkv"
 
 
 def _episode_blob() -> bytes:

@@ -442,9 +442,9 @@ def test_classifier_false_positive_prevention():
     assert parse_episode("Movie.2020.3840x2160.mkv") is None
     assert parse_episode("Movie.2020.1280x720.mkv") is None
 
-    # Title words with 'e' followed by digits (e.g. Fable2, Fable2, Glide1997, Scene2)
-    assert parse_episode("Fable2.1995.1080p.mkv") is None
-    assert parse_episode("Fable2.2002.1080p.mkv") is None
+    # Title words with 'e' followed by digits (e.g. Fable2, Glide1997, Scene2)
+    assert parse_episode("Fable2.2004.1080p.mkv") is None
+    assert parse_episode("Glide2.2002.1080p.mkv") is None
     assert parse_episode("Glide1997.mkv") is None
     assert parse_episode("Scene2.mkv") is None
 
@@ -459,8 +459,8 @@ def test_classifier_false_positive_prevention():
     movie_res = [TorrentFile("Movie.2020.1920x1080.mkv", 4_000_000_000)]
     assert classify(movie_res, cfg).kind == "movie"
 
-    movie_se7en = [TorrentFile("Fable2.1995.1080p.BluRay.x264.DTS.5.1.mkv", 10_000_000_000)]
-    assert classify(movie_se7en, cfg).kind == "movie"
+    movie_fable2 = [TorrentFile("Fable2.2004.1080p.BluRay.x264.DTS.5.1.mkv", 10_000_000_000)]
+    assert classify(movie_fable2, cfg).kind == "movie"
 
 
 def test_classifier_episode_delimiter_support():

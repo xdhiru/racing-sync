@@ -106,8 +106,8 @@ def blob_is_wrapped(blob: bytes | None) -> bool:
 def looks_like_single_file(name: str) -> bool:
     """True when the basename ends in a media/archive suffix, not release junk.
 
-    Folder names can be dot-heavy (``Show.S24E32.1080p.WEB.H264-DUMMYGRP``),
-    so only the final suffix decides; ``.mkv`` wins, ``.H264-DUMMYGRP`` does not.
+    Folder names can be dot-heavy (``Example.Show.S24E32.1080p.WEB.H264-GROUP``),
+    so only the final suffix decides; ``.mkv`` wins, ``.H264-GROUP`` does not.
     """
     if not isinstance(name, str) or not name.strip():
         return False
