@@ -105,7 +105,8 @@ async def test_late_seed_healthy_check_memoized(tmp_path):
     coord.cfg.rclone.fuse.mount_unsorted = str(fuse)
     coord._target_mount_for = MagicMock(return_value=fuse)
     coord.dest_client = MagicMock()
-    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
+    # Late-seed/repair paths load racing bytes through the DB-first loader.
+    coord._load_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord._failed_late_cross_seeds = {}
     # First attempt rejected -> deferred; retry succeeds -> injected.
     coord.dest_client.add_torrent = AsyncMock(

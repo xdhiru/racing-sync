@@ -370,6 +370,11 @@ class CleanupMixin:
                     getattr(getattr(_fresh, "state", None), "value", "row gone"),
                 )
                 continue
+            # Deleting VPS1 loses any racing torrent that was never injected:
+            # its .torrent bytes only ever come from VPS1. Persist them first;
+            # a member whose bytes cannot be preserved vetoes this candidate.
+            if not await self._cleanup_preserve_racing_blobs(ts, group, dry_run):
+                continue
             try:
                 ok = await self._delete_source_group(ts, group, cfg, dry_run)
             except Exception as e:  # noqa: BLE001
@@ -960,6 +965,87 @@ class CleanupMixin:
                 base,
             )
         return ok
+
+    async def _cleanup_preserve_racing_blobs(
+        self, ts: TorrentState, group: list[Torrent], dry_run: bool
+    ) -> bool:
+        """Persist .torrent bytes for every racing member not yet injected.
+
+        The group-coverage complement of `_cleanup_fuse_healthy` (which only
+        proves the row's own hashes): a member that was never re-injected
+        loses its only source of .torrent bytes when VPS1 is deleted —
+        `_re_inject_racing_torrents` and the late-seed repair would have
+        nothing left to fetch. So, per un-injected member, prefer the row's
+        own blob (source hash), then the DB, then a live VPS1 fetch.
+
+        Returns True when every un-injected member is covered. Any member
+        whose bytes cannot be preserved (or cannot be written) returns
+        False: fail-closed, keep VPS1 this run. Dry-run fetches to prove
+        readability but performs zero writes.
+        """
+        try:
+            injected = {h.lower() for h in ts.injected_private_hashes.split(",") if h}
+        except Exception:  # noqa: BLE001
+            injected = set()
+        src_low = (ts.source_infohash or "").lower()
+        store = getattr(self, "store", None)
+        for m in group or []:
+            h = str(getattr(m, "infohash", "") or "").lower()
+            if h and h in injected:
+                continue
+            blob: bytes | None = None
+            # The row's own bytes are the authoritative copy for its source
+            # hash (and lighter than a fan-out fetch per group member).
+            if h and h == src_low:
+                cand = getattr(ts, "cross_seed_blob", None)
+                if isinstance(cand, (bytes, bytearray)) and cand:
+                    blob = bytes(cand)
+            if blob is None and h and store is not None:
+                try:
+                    cand = await asyncio.to_thread(store.get_blob, h)
+                    if isinstance(cand, (bytes, bytearray)) and cand:
+                        blob = bytes(cand)
+                except Exception:  # noqa: BLE001
+                    blob = None
+            if blob is None and h:
+                try:
+                    blob = await self._load_racing_torrent_bytes(h)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "cleanup: could not fetch .torrent bytes for racing torrent %s: %s",
+                        h[:10],
+                        e,
+                    )
+                    blob = None
+            if not blob:
+                log.warning(
+                    "cleanup: keeping %s — racing torrent %s is not injected "
+                    "and its .torrent bytes cannot be preserved",
+                    (ts.source_name or "")[:60],
+                    h[:10] or "?",
+                )
+                return False
+            if not dry_run:
+                try:
+                    saved = await asyncio.to_thread(store.set_racing_blob, h, bytes(blob))
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "cleanup: could not preserve .torrent bytes for racing torrent %s: %s; "
+                        "keeping VPS1",
+                        h[:10],
+                        e,
+                    )
+                    return False
+                if saved is False:
+                    # The store refused the write (row gone/tombstoned): the
+                    # bytes are not on disk, so the VPS1 copy must stay.
+                    log.warning(
+                        "cleanup: .torrent bytes for racing torrent %s were not persisted; "
+                        "keeping VPS1",
+                        h[:10],
+                    )
+                    return False
+        return True
 
     async def _delete_source_group(
         self, ts: TorrentState, group: list[Torrent], cfg: object, dry_run: bool

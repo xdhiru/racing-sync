@@ -452,6 +452,9 @@ async def test_moving_early_deletes_only_under_pressure(tmp_path: Path):
             injected="",
             save_path=str(ssd),
         )
+        # The racing copy was never injected; the blob guard needs the
+        # .torrent bytes in the DB before the VPS1 delete is allowed.
+        assert store.set_blob(pub, _single_file_blob()) is True
         src = _FakeSource([_member(pub)])
         dest = _FakeDest([pub], files=list(files))
         coord = _make_coord(ssd, store, src, dest, _base_cfg(ssd))

@@ -361,7 +361,7 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = ", ".join(
 #: Bumped whenever a column spec or a data migration changes. Recorded in
 #: `meta` so an upgraded or downgraded DB shows up in the log; the column
 #: diff at open is the actual migration mechanism.
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 #: Persisted TorrentState fields: everything except the transient blob copy.
 _PERSISTED_FIELDS = frozenset(f.name for f in dataclass_fields(TorrentState)) - {"_blob"}
@@ -400,6 +400,16 @@ CREATE TABLE IF NOT EXISTS ignored_torrents (
     source_infohash TEXT PRIMARY KEY,
     source_name     TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT ''
+);
+
+-- Racing-client .torrent cache, independent of torrent_state rows: a
+-- content group's sibling racing torrents have no row of their own, yet
+-- their bytes must survive a VPS1 cleanup so the fuse re-add (and the
+-- late-seed repair) can still inject them.
+CREATE TABLE IF NOT EXISTS torrent_blob (
+    infohash    TEXT PRIMARY KEY,
+    blob        BLOB NOT NULL,
+    updated_at  TEXT NOT NULL
 );
 """
 )

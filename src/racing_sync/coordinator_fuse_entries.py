@@ -171,6 +171,41 @@ class FuseEntryMixin:
                 )
             return None
 
+    async def _load_racing_torrent_bytes(self, infohash: str) -> bytes | None:
+        """Load a racing torrent's raw .torrent bytes, DB first.
+
+        The janitor can delete a VPS1 group before every racing torrent was
+        re-injected; after that the SFTP state dir and the client export are
+        gone. The DB copy (preserved by the janitor, or cached by an earlier
+        fetch) is therefore authoritative when present; only a miss falls
+        back to VPS1 via `_fetch_racing_torrent_bytes`.
+
+        Test doubles return a MagicMock from `get_blob`: only a non-empty
+        bytes value counts as a hit, never a mock.
+        """
+        # Same infohash guard style as _fetch_racing_torrent_bytes.
+        if (
+            not infohash
+            or len(infohash) != 40
+            or not all(c in "0123456789abcdefABCDEF" for c in infohash)
+        ):
+            log.warning("_load_racing_torrent_bytes: skipping invalid infohash %r", infohash)
+            return None
+        h = infohash.lower()
+        try:
+            store = getattr(self, "store", None)
+            if store is not None:
+                # Row-independent cache first (sibling racing torrents have
+                # no row of their own), then the row blob, then VPS1.
+                for reader in (store.get_racing_blob, store.get_blob):
+                    blob = await asyncio.to_thread(reader, h)
+                    if isinstance(blob, (bytes, bytearray)) and blob:
+                        return bytes(blob)
+        except Exception as e:  # noqa: BLE001
+            # A DB miss/read error is not fatal: VPS1 may still have the bytes.
+            log.warning("_load_racing_torrent_bytes: blob read failed for %s: %s", h[:10], e)
+        return await self._fetch_racing_torrent_bytes(infohash)
+
     @staticmethod
     def _expected_fuse_files(blob: bytes | None) -> list[tuple[str, int]] | None:
         """Decode (torrent-relative name, size) pairs from .torrent bytes.

@@ -495,7 +495,8 @@ async def test_check_and_inject_late_cross_seeds_normalizes_hash(tmp_path: Path)
     )
 
     t_upper = Torrent(
-        hash="LATE1234EF",
+        # 40-hex is required by the racing-bytes loader's infohash guard.
+        hash="ABCD" + "0" * 36,
         name="Test.Movie.2026",
         category="",
         save_path="",
@@ -507,7 +508,7 @@ async def test_check_and_inject_late_cross_seeds_normalizes_hash(tmp_path: Path)
     await coord._check_and_inject_late_cross_seeds(ts, [t_upper])
 
     # Injected hash should be stored in lowercase
-    assert ts.injected_private_hashes == "late1234ef"
+    assert ts.injected_private_hashes == ("ABCD" + "0" * 36).lower()
     coord.store.upsert.assert_called_once_with(ts)
 
 
