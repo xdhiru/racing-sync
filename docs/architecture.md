@@ -229,7 +229,9 @@ adoption re-reads ownership before inserting.
 
 The hourly janitor deletes a VPS1 copy only when the row is `DONE` past its
 grace period, the swarm is idle, the fuse entry is present, and the bytes
-verify; it re-reads the row and version right before each delete.
+verify; every racing hash in the group must also be proven to seed from the
+VPS2 mount, otherwise its `.torrent` is cached first (VPS1 is kept when even
+that fails). It re-reads the row and version right before each delete.
 
 ## Telegram
 

@@ -95,6 +95,9 @@ def _harness(tmp_path: Path, count: int = 4, **cleanup_over):
     coord.store = store
     coord.source_client = _FakeSource(members)
     coord.dest_client = MagicMock()
+    # The blob guard has its own tests: treat every member as a verified
+    # fuse seed so these tests measure pressure/cap behaviour only.
+    coord._cleanup_fuse_seeded_hashes = AsyncMock(return_value={m.hash.lower() for m in members})
     coord.sftp = None
     coord._stop = False
     return coord, store, members
