@@ -26,7 +26,6 @@ from pathlib import Path
 from .classifier import Classification
 from .clients.abstract import TorrentFile
 from .content_keys import same_content
-from .coordinator_content import route_kind_is_sorted
 from .coordinator_errors import (
     AbandonedError,
     RcloneTransientError,
@@ -46,8 +45,9 @@ from .coordinator_move_shapes import MoveShapesMixin
 from .coordinator_paths import _safe_ssd_join
 from .io_bounds import rpc
 from .rclone_ops import _tree_key, rclone_progress_map
+from .seed_layout import SeedLayout, decide_seed_layout
 from .state import State, TorrentState
-from .torrent_layout import common_top, is_flat, join_remote, looks_like_single_file
+from .torrent_layout import common_top, is_flat, looks_like_single_file
 from .transfer import build_transfer
 
 # Keep the historic logger name so log output is unchanged by the split.
@@ -454,39 +454,19 @@ class MoveMixin(CheckpointMixin, MoveShapesMixin):
         await self._purge_incomplete_files(h, src_dir, incomplete_files)
         await self._purge_temp_files(cls_files, folder, src_dir)
 
-        # 4. Decide target remote from the PINNED kind (see above): batches
-        # were moved under it, so the sweep must land beside them even if the
-        # fresh file list classifies differently.
-        if route_kind_is_sorted(pinned_kind):
-            remote = self.rt.transfer.remote_default
-        else:
-            remote = self.rt.transfer.remote_unsorted
-
-        # 4b. Fix the physical seed layout before anything moves. A wrapped
-        # target already keeps its own top folder; a flat target whose racing
-        # siblings are folder-shaped is moved into that folder, so wrapped
-        # blobs seed at the mount root and flat blobs one level inside it.
+        # 4. Decide target remote + physical seed layout from the PINNED
+        # kind (see above): batches were moved under it, so the sweep must
+        # land beside them even if the fresh file list classifies
+        # differently. The rule itself lives in seed_layout.decide_seed_layout
+        # (shared verbatim with the VPS1 push feature); this call also pins
+        # seed_subdir on the row. A wrapped target keeps its own top folder;
+        # a flat target whose racing siblings are folder-shaped is moved into
+        # that folder, so wrapped blobs seed at the mount root and flat blobs
+        # one level inside it (see coordinator_fuse_entries._seed_root_for).
         target_names = [getattr(f, "name", "") or "" for f in cls_files]
-        target_top = common_top(target_names)
-        wrapper = ""
-        if ts.batches_total > 1:
-            # Batches were already moved under the target's own layout;
-            # adding a wrapper now would split the files across two roots.
-            seed_subdir = target_top or ""
-        elif target_top:
-            seed_subdir = target_top
-        elif is_flat(target_names):
-            # A replayed attempt must keep the layout chosen before the
-            # crash; a fresh row derives it from its racing siblings.
-            wrapper = str(getattr(ts, "seed_subdir", "") or "").strip()
-            if not wrapper:
-                wrapper = await self._racing_wrapper_folder(ts)
-            seed_subdir = wrapper
-        else:
-            seed_subdir = ""
-        await self._pin_seed_subdir(ts, seed_subdir)
-        move_remote = join_remote(remote, wrapper)
-        if wrapper:
+        layout = await self._seed_layout_for(ts, target_names=target_names, kind=pinned_kind)
+        move_remote = layout.target_remote
+        if layout.wrapper:
             try:
                 if self.rt.transfer.provider == "local_move":
                     # local_move refuses a missing destination root; rclone
@@ -656,6 +636,51 @@ class MoveMixin(CheckpointMixin, MoveShapesMixin):
         # (episodes/single_file/sizes) below.
         branch_kind = pinned_kind if pinned_kind not in ("", "unknown") else cls.kind
         return cls, pinned_kind, branch_kind
+
+    async def _seed_layout_for(
+        self,
+        ts: TorrentState,
+        *,
+        target_names: list[str],
+        kind: str | None = None,
+    ) -> SeedLayout:
+        """Resolve, decide and pin the shared seed layout for one row.
+
+        Wraps the pure ``decide_seed_layout`` rule (module ``seed_layout``)
+        with the two side effects the move stage needs: the async racing
+        sibling lookup and persisting ``seed_subdir`` on the row. The push
+        feature calls the pure helper directly (blob names, no SSD state);
+        this method is the one implementation of the rule on the move side.
+        """
+        if kind is None:
+            kind = str(getattr(ts, "classification_kind", "") or "")
+        try:
+            batches_total = int(getattr(ts, "batches_total", 0) or 0)
+        except (TypeError, ValueError):
+            batches_total = 0
+        pinned = str(getattr(ts, "seed_subdir", "") or "").strip()
+        racing_wrapper = ""
+        # Pre-check mirroring only the flat branch's guard, so the async
+        # sibling listing never runs unless the rule could use its result.
+        # The authoritative decision is made once, inside the pure helper.
+        if (
+            batches_total <= 1
+            and not pinned
+            and not common_top(target_names)
+            and is_flat(target_names)
+        ):
+            racing_wrapper = await self._racing_wrapper_folder(ts)
+        layout = decide_seed_layout(
+            kind=kind,
+            target_names=target_names,
+            batches_total=batches_total,
+            pinned_seed_subdir=pinned,
+            racing_wrapper=racing_wrapper,
+            remote_default=self.rt.transfer.remote_default,
+            remote_unsorted=self.rt.transfer.remote_unsorted,
+        )
+        await self._pin_seed_subdir(ts, layout.seed_subdir)
+        return layout
 
     async def _racing_wrapper_folder(self, ts: TorrentState) -> str:
         """Folder a flat download must be wrapped in for its racing seeds.
