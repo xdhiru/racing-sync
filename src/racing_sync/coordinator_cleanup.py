@@ -680,6 +680,8 @@ class CleanupMixin:
         bursting: bool | None = None,
         urgent: bool | None = None,
         force: bool = False,
+        target_override: int | None = None,
+        reclaim_override: bool = False,
     ) -> dict:
         """Delete VPS1 racing torrents whose content VPS2 fully secured.
 
@@ -711,6 +713,13 @@ class CleanupMixin:
         The pressure values are optional so direct callers/tests can pass
         only `cfg`; the janitor passes its single probe down so this method
         never re-probes, and the target arithmetic works off that one reading.
+
+        `target_override` / `reclaim_override` exist for the RESCUE lane (see
+        `rescue_vps1_room`): the room one specific arrival needs replaces the
+        band's target, and "space is needed" is a fact the caller already
+        measured instead of something the band has to infer. Neither relaxes a
+        gate — verification, protection, unknown stats, blob preservation, the
+        re-read and `per_run_cap` all still run.
 
         Returns a one-line-friendly summary (also on every early-return
         path): `{"deleted", "candidates", "dry_run", "free", "free_after",
@@ -745,7 +754,16 @@ class CleanupMixin:
         # passed down: the trigger decides whether this pass may delete at all,
         # the target is where it stops. No per-row probe, no second clock.
         trigger, target = self._cleanup_band(cfg)
+        # The rescue lane asks for one arrival's room instead of the band's
+        # target, and states the need as a measurement it already took.
+        if target_override is not None:
+            try:
+                target = max(0, int(target_override))
+            except (TypeError, ValueError):
+                pass
         reclaim = self._cleanup_reclaim_needed(cfg, free_bytes, urgent, emergency)
+        if reclaim_override:
+            reclaim = True
         # An UNMEASURABLE disk is not a roomy one. Without a reading the band
         # cannot be evaluated at all, and answering "no space needed" from a
         # probe that never ran would silence the janitor forever (a source
@@ -1085,6 +1103,491 @@ class CleanupMixin:
             shortfall_bytes=shortfall,
             eligible_remaining=eligible_remaining,
         )
+
+    # ------------------------------------------------------------------- rescue
+
+    # An arrival that cannot fit VPS1 is the one case where "wait for the next
+    # janitor tick" is not an answer: autobrr feeds the racing client directly,
+    # so the torrent is already there and the client simply cannot write. The
+    # rescue lane makes the room immediately, then resumes that one torrent
+    # instead of leaving a red row for a human to notice.
+    #
+    # It bypasses the WAITING, never a gate. Every byte a rescue frees goes
+    # through `_run_source_cleanup`, so the same proofs decide each row: fuse
+    # entries seeding off the MOUNT plus verified bytes (DONE), idle swarm plus
+    # SSD bytes (MOVING), protected patterns, unknown stats, `.torrent`
+    # preservation before the delete, the state+version re-read, dry-run
+    # purity and `per_run_cap`. And an unmeasurable disk is not a claim: with
+    # no free-space reading a rescue refuses, exactly like an automatic pass.
+
+    #: Rescue bookkeeping is bounded per release, the way the push lane bounds
+    #: its own memos (`_note_push_launch_failure`, itself pruned like
+    #: `_failed_late_cross_seeds`): expired entries dropped on every insert,
+    #: oldest shed past the cap. Never an unbounded dict.
+    _RESCUE_MEMO_CAP = 200
+
+    #: How many consecutive discovery polls must show the same progress (with
+    #: no download rate) before a tracked release counts as starved.
+    _RESCUE_STALL_POLLS = 2
+
+    #: A progress delta below this is "did not move": anything larger, or any
+    #: non-zero `dlspeed_bps`, means the race is alive and nothing is starved.
+    _RESCUE_PROGRESS_EPS = 0.005
+
+    def _rescue_margin_bytes(self) -> int:
+        """`[storage].disk_safety_margin_bytes` as an int (0 when unreadable).
+
+        The same margin the capacity model already subtracts in
+        `_note_cleanup_arrival`; an unreadable value reads 0, which only makes
+        the rescue ask for less, never for more.
+        """
+        try:
+            return max(0, int(getattr(self.rt.storage, "disk_safety_margin_bytes", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+        except Exception:
+            return 0
+
+    def _rescue_window_seconds(self, cfg: object) -> float:
+        """One rescue attempt per release per burst cadence (no new key).
+
+        Reuses `burst_janitor_interval_seconds` — the clock the janitor already
+        switches to when space is needed — with the same 60 s floor the cadence
+        applies, so a rescue cannot be retried every poll while a genuinely
+        doomed release is still bounded to one expensive sweep per window.
+        """
+        try:
+            burst = float(getattr(cfg, "burst_janitor_interval_seconds", 300) or 300)
+        except (TypeError, ValueError):
+            burst = 300.0
+        return max(60.0, burst)
+
+    def _rescue_attempt_blocked_seconds(self, infohash: str) -> float:
+        """Seconds left in this hash's rescue window (0 = free to attempt).
+
+        Reads (and prunes) the memo only; expired attempts are forgotten, so a
+        release that has been rescued once is eligible again next window.
+        """
+        h = (infohash or "").strip().lower()
+        if not h:
+            return 0.0
+        memo = getattr(self, "_rescue_attempts", None)
+        if not isinstance(memo, dict) or not memo:
+            return 0.0
+        try:
+            cfg = getattr(self.rt.cleanup, "config", None)
+            window = self._rescue_window_seconds(cfg)
+            now = time.monotonic()
+            for stale in [k for k, v in memo.items() if now - float(v) >= window]:
+                memo.pop(stale, None)
+            at = memo.get(h)
+            if at is None:
+                return 0.0
+            left = window - (now - float(at))
+            return max(0.0, left)
+        except Exception:
+            return 0.0
+
+    def _note_rescue_attempt(self, infohash: str) -> None:
+        """Stamp one rescue attempt for this hash. Never raises (bookkeeping)."""
+        h = (infohash or "").strip().lower()
+        if not h:
+            return
+        try:
+            memo = getattr(self, "_rescue_attempts", None)
+            if not isinstance(memo, dict):
+                memo = {}
+                self._rescue_attempts = memo
+            cfg = getattr(self.rt.cleanup, "config", None)
+            window = self._rescue_window_seconds(cfg)
+            now = time.monotonic()
+            for stale in [k for k, v in memo.items() if now - float(v) >= window]:
+                memo.pop(stale, None)
+            memo[h] = now
+            if len(memo) > self._RESCUE_MEMO_CAP:
+                for oldest in list(memo.keys())[: len(memo) - self._RESCUE_MEMO_CAP]:
+                    memo.pop(oldest, None)
+        except Exception:
+            return
+
+    def _rescue_stall_window_seconds(self) -> float:
+        """How long a stalled streak survives between discovery polls.
+
+        Must outlast the polls the rule counts: a streak observed every
+        `[general].source_poll_interval` would be pruned before it could reach
+        `_RESCUE_STALL_POLLS` on a slow-polling setup. So it is the rescue
+        window, widened to cover four polls (existing clocks only, no new key).
+        """
+        try:
+            cfg = getattr(self.rt.cleanup, "config", None)
+            window = self._rescue_window_seconds(cfg)
+        except Exception:
+            return 600.0
+        try:
+            poll = float(getattr(self.rt.config.general, "source_poll_interval", 120) or 120)
+        except (TypeError, ValueError):
+            poll = 120.0
+        except Exception:
+            poll = 120.0
+        return max(window, 4.0 * max(5.0, poll))
+
+    def _note_racing_stall(self, infohash: str, progress: object, dlspeed_bps: object) -> int:
+        """Consecutive discovery polls in which this release did not advance.
+
+        A download rate above zero or any real progress delta resets the
+        streak to 0 (the race is alive); otherwise the streak grows and, at
+        `_RESCUE_STALL_POLLS`, says the client has stopped writing. Bounded and
+        pruned exactly like `_note_rescue_attempt` / `_failed_late_cross_seeds`
+        (expired hashes dropped on every insert, oldest shed past the cap), so
+        a long-lived daemon never grows with the number of releases ever seen.
+        Never raises.
+        """
+        h = (infohash or "").strip().lower()
+        if not h:
+            return 0
+        try:
+            p = float(progress or 0.0)
+            rate = float(dlspeed_bps or 0.0)
+        except (TypeError, ValueError):
+            return 0
+        try:
+            memo = getattr(self, "_rescue_stalls", None)
+            if not isinstance(memo, dict):
+                memo = {}
+                self._rescue_stalls = memo
+            window = self._rescue_stall_window_seconds()
+            now = time.monotonic()
+            for stale in [k for k, v in memo.items() if now - float(v[1]) >= window]:
+                memo.pop(stale, None)
+            prior = memo.get(h)
+            seen = float(prior[0]) if isinstance(prior, tuple) and len(prior) == 3 else p
+            streak = int(prior[2]) if isinstance(prior, tuple) and len(prior) == 3 else 0
+            if rate > 0.0 or p > seen + self._RESCUE_PROGRESS_EPS:
+                streak = 0
+            else:
+                streak += 1
+            memo[h] = (p, now, streak)
+            if len(memo) > self._RESCUE_MEMO_CAP:
+                for oldest in list(memo.keys())[: len(memo) - self._RESCUE_MEMO_CAP]:
+                    memo.pop(oldest, None)
+            return max(0, streak)
+        except Exception:
+            return 0
+
+    def _rescue_arrival_did_not_fit(self, size_bytes: int) -> bool:
+        """Arithmetic trigger: the LAST MEASURED free space cannot hold this release.
+
+        Reads only the janitor's cached reading (`_last_source_free_bytes`) —
+        no probe, no guess. With no reading the answer is "we do not know", so
+        the rescue does NOT fire: an unmeasured disk is not a claim, which is
+        the whole point of the capacity model.
+        """
+        try:
+            free = getattr(self, "_last_source_free_bytes", None)
+            if free is None:
+                log.debug(
+                    "rescue: VPS1 free space unmeasured — no room claim for a %s byte arrival",
+                    size_bytes,
+                )
+                return False
+            size = int(size_bytes or 0)
+            if size <= 0:
+                return False
+            return int(free) < size + self._rescue_margin_bytes()
+        except Exception:
+            return False
+
+    async def rescue_vps1_room(self, size_bytes: int, *, why: str) -> tuple[bool, int, str]:
+        """Reclaim secured VPS1 content until one arrival fits: (made, freed, reason).
+
+        The rescue arm of the capacity model. It runs the janitor's own
+        proof-gated sweep (`_run_source_cleanup`) with the arrival's need
+        (`size + [storage].disk_safety_margin_bytes`) as the free-space TARGET
+        instead of the band's, so it stops the moment the release fits — even
+        while more eligible rows are still seeding. Same single per-run cap,
+        same ordering (secured DONE rows first, biggest first), same
+        verification, protection, blob-preservation and re-read rules: the only
+        thing removed is waiting for the next tick.
+
+        Refusals are honest and always come with a reason:
+          - `[cleanup].enabled` false → the app may not touch the space at all;
+          - no chain seed entry → nothing can be proven secured;
+          - no free-space reading → no claim about room;
+          - dry run → bytes were rehearsed, not freed (so nothing is resumed);
+          - free already covers the need → nothing to do.
+
+        It never stamps the janitor's cadence and never consumes
+        `_cleanup_urgent`: this calls the sweep directly, so a rescue that
+        frees nothing leaves the normal schedule untouched.
+        """
+        try:
+            cfg = getattr(self.rt.cleanup, "config", None)
+        except Exception:
+            cfg = None
+        if cfg is None:
+            return False, 0, "no [cleanup] section is readable, so nothing may be reclaimed"
+        if not getattr(cfg, "enabled", False):
+            return (
+                False,
+                0,
+                "the cleanup janitor is disabled ([cleanup].enabled = false): "
+                "this app cannot free space it is not allowed to touch",
+            )
+        try:
+            size = int(size_bytes or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size <= 0:
+            return False, 0, "no usable release size to make room for"
+        try:
+            if not self.rt.chain.adds_seed_entry:
+                return (
+                    False,
+                    0,
+                    "no seeding entry is added by this chain, so no content is proven secured",
+                )
+        except Exception:
+            return False, 0, "the chain is not loaded, so nothing is proven secured"
+        margin = self._rescue_margin_bytes()
+        need = size + margin
+        free = await self._source_free_bytes()
+        try:
+            self._last_source_free_bytes = free
+        except Exception:
+            pass
+        if free is None:
+            return (
+                False,
+                0,
+                "VPS1 free space is unmeasured: refusing to reclaim against a number "
+                "we cannot check",
+            )
+        free = int(free)
+        if free >= need:
+            return (
+                False,
+                0,
+                f"VPS1 already has {self._cleanup_bytes_compact(free)} free, "
+                f"{self._cleanup_bytes_compact(need)} is needed: nothing reclaimed",
+            )
+        dry_run = bool(getattr(cfg, "dry_run", True))
+        # The pressure snapshot a normal tick would have derived for this
+        # reading, with the arrival-did-not-fit state asserted (that IS what
+        # happened): the same urgent/bursting pair the janitor itself reaches
+        # for via `_cleanup_urgent`, so the cap and the ordering are unchanged.
+        arrivals, bytes_rate, projected, _urgent, _bursting = self._cleanup_pressure(cfg, free)
+        lock = None
+        try:
+            loop_lock = getattr(self, "_loop_lock", None)
+            if callable(loop_lock):
+                lock = loop_lock("_janitor_lock")
+        except Exception:
+            lock = None
+        try:
+            if lock is None:
+                summary = await self._run_source_cleanup(
+                    cfg,
+                    free_bytes=free,
+                    arrivals=float(arrivals or 0.0),
+                    bytes_rate=float(bytes_rate or 0.0),
+                    projected=projected,
+                    bursting=True,
+                    urgent=True,
+                    target_override=need,
+                    reclaim_override=True,
+                )
+            else:
+                # Serialised with the janitor lane: two sweeps deleting the same
+                # rows at once would double-spend the RPCs and the stagger.
+                async with lock:
+                    summary = await self._run_source_cleanup(
+                        cfg,
+                        free_bytes=free,
+                        arrivals=float(arrivals or 0.0),
+                        bytes_rate=float(bytes_rate or 0.0),
+                        projected=projected,
+                        bursting=True,
+                        urgent=True,
+                        target_override=need,
+                        reclaim_override=True,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            return False, 0, f"the reclaim sweep could not run: {self._cleanup_error_text(e)}"
+        deleted = int(summary.get("deleted") or 0)
+        raw_after = summary.get("free_after")
+        freed = int(raw_after) - free if isinstance(raw_after, int) and raw_after > free else 0
+        if dry_run:
+            return (
+                False,
+                0,
+                f"[cleanup].dry_run is on: {deleted} secured group(s) would go "
+                f"({self._cleanup_bytes_compact(freed)} projected), nothing was freed",
+            )
+        if freed <= 0:
+            reason = str(summary.get("reason") or "") or "no eligible secured row was found"
+            return False, 0, f"nothing could be reclaimed ({reason})"
+        if isinstance(raw_after, int) and raw_after >= need:
+            return (
+                True,
+                freed,
+                f"freed {self._cleanup_bytes_compact(freed)} of secured VPS1 content: "
+                f"free {self._cleanup_bytes_compact(free)} -> "
+                f"{self._cleanup_bytes_compact(raw_after)}, "
+                f"{self._cleanup_bytes_compact(need)} needed",
+            )
+        short = need - int(raw_after) if isinstance(raw_after, int) else need
+        tail = (
+            f"per-run cap {summary.get('cap')} stopped it"
+            if summary.get("eligible_remaining")
+            else "the eligible secured inventory ran out"
+        )
+        return (
+            False,
+            freed,
+            f"freed {self._cleanup_bytes_compact(freed)} but is still "
+            f"{self._cleanup_bytes_compact(short)} short of the "
+            f"{self._cleanup_bytes_compact(need)} needed ({tail})",
+        )
+
+    @staticmethod
+    def _rescue_entry_held(entries: object) -> tuple[bool, str]:
+        """True when the racing client itself reports the arrival paused/stopped.
+
+        The same reading `_client_reports_paused` uses (`paus`/`stop` in the
+        state string) and the same honest limit: an unknown/empty state is not
+        evidence of an operator hold. Only a client entry that says
+        paused/stopped stops a rescue resume — that is the operator's own
+        action outside this app, and the rescue leaves it exactly as found.
+        """
+        try:
+            for t in entries or ():
+                s = str(getattr(t, "state", "") or "").strip().lower()
+                if not s:
+                    continue
+                if "paus" in s or "stop" in s:
+                    return True, f"the racing client lists it as {s!r}"
+        except Exception:
+            return False, ""
+        return False, ""
+
+    async def _rescue_resume_starved(
+        self, ts: object, *, entries: object = (), why: str = ""
+    ) -> bool:
+        """Resume the one release the rescue just made room for. Best-effort.
+
+        Uses `resume()` — the API both source adapters actually expose
+        (Deluge `core.resume_torrent`, qBittorrent `torrents/start` with the
+        legacy `torrents/resume` fallback). Refuses an operator-held row
+        (`skipped`, the `/hold_` flag) and a client entry the operator paused,
+        and a failed call is a WARNING with the reason — never an exception
+        into the discovery poll that asked for the rescue.
+        """
+        h = (getattr(ts, "source_infohash", "") or "").strip().lower()
+        if not h:
+            return False
+        try:
+            if int(getattr(ts, "skipped", 0) or 0):
+                log.warning(
+                    "rescue: made room for %s but it is held (/resume_ it to start it); "
+                    "not touching the client",
+                    h[:10],
+                )
+                return False
+        except (TypeError, ValueError):
+            pass
+        held, how = self._rescue_entry_held(entries)
+        if held:
+            log.warning(
+                "rescue: made room for %s but %s; leaving it as the operator set it",
+                h[:10],
+                how,
+            )
+            return False
+        resume = getattr(getattr(self, "source_client", None), "resume", None)
+        if not callable(resume):
+            log.warning(
+                "rescue: the VPS1 racing client exposes no resume API, so %s was not resumed",
+                h[:10],
+            )
+            return False
+        try:
+            await rpc(resume(h), getattr(self, "cfg", None), "rescue resume")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "rescue: room was made for %s (%s) but the resume failed: %s",
+                h[:10],
+                why or "starved arrival",
+                self._cleanup_error_text(e),
+            )
+            return False
+        log.debug("rescue: resumed %s", h[:10])
+        return True
+
+    async def rescue_starved_release(
+        self,
+        ts: TorrentState,
+        size_bytes: int,
+        *,
+        why: str,
+        entries: object = (),
+    ) -> bool:
+        """Detection already fired: make room, then resume. One INFO on success.
+
+        The bound lives here — at most one attempt per release per
+        `_rescue_window_seconds` window — so a release that cannot be saved
+        costs one expensive sweep per window, not one per poll. Returns True
+        only when the rescue freed room AND the release was resumed.
+        """
+        h = (getattr(ts, "source_infohash", "") or "").strip().lower()
+        if not h:
+            return False
+        try:
+            blocked = self._rescue_attempt_blocked_seconds(h)
+        except Exception:
+            blocked = 0.0
+        if blocked > 0.0:
+            log.debug(
+                "rescue: %s was attempted %ds ago (window %ds); not retrying",
+                h[:10],
+                int(blocked),
+                int(self._rescue_window_seconds(getattr(self.rt.cleanup, "config", None))),
+            )
+            return False
+        self._note_rescue_attempt(h)
+        try:
+            made, freed, reason = await self.rescue_vps1_room(int(size_bytes or 0), why=why)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("rescue: attempt for %s failed: %s", h[:10], self._cleanup_error_text(e))
+            return False
+        if not made:
+            margin = self._rescue_margin_bytes()
+            need = int(size_bytes or 0) + margin
+            cached = getattr(self, "_last_source_free_bytes", None)
+            if freed <= 0 and isinstance(cached, int) and cached >= need:
+                # Nothing to do after all: the cached reading the trigger used
+                # was older than the probe this pass made. Not a failure.
+                log.info("rescue: %s — %s", h[:10], reason)
+                return False
+            log.warning("rescue: no room made for %s (%s): %s", h[:10], why, reason)
+            return False
+        if not await self._rescue_resume_starved(ts, entries=entries, why=why):
+            return False
+        # One INFO line, no release title: the neighbouring capacity warning
+        # (`_note_cleanup_arrival`) deliberately keeps names out of the log, so
+        # this lane identifies the arrival by hash prefix and size only.
+        log.info(
+            "rescue: freed %s on VPS1 for %s and resumed it (%s)",
+            self._cleanup_bytes_compact(freed),
+            h[:10],
+            why,
+        )
+        return True
 
     # ---- operator commands + VPS1 headroom status ----------------------
 

@@ -486,6 +486,16 @@ class OpsMixin:
             if existing_ts.state == State.DONE and self.rt.acquire.inject_racing_torrents_to_fuse:
                 if not getattr(existing_ts, "skipped", 0):
                     await self._check_and_inject_late_cross_seeds(existing_ts, group)
+            # Stalled-arrival trigger for the VPS1 rescue lane: a release this
+            # app already knows that stopped advancing on a disk with no room
+            # left. Detection only — the memo, the bound, the reclaim and the
+            # resume live in `coordinator_cleanup`.
+            try:
+                await self._detect_starved_arrival(existing_ts, group)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.debug("rescue: stalled check skipped: %r", e)
             return None
 
         # Elect ONE primary torrent for SSD download:
@@ -545,7 +555,95 @@ class OpsMixin:
             self._note_cleanup_arrival(size)
         except Exception:
             pass
+        # ... and the rescue lane acts on that same arithmetic NOW instead of
+        # one cadence later: the racing client has already been handed the
+        # torrent (autobrr feeds it directly), so "no room" is a download that
+        # is about to error, not a warning to read in the morning. Only the
+        # LAST MEASURED free space counts — with no reading nothing is claimed
+        # and nothing is reclaimed.
+        try:
+            if self._rescue_arrival_did_not_fit(size):
+                await self.rescue_starved_release(
+                    ts,
+                    size,
+                    why="new arrival does not fit VPS1",
+                    entries=group,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("rescue: arrival rescue failed: %r", e)
         return ts
+
+    async def _detect_starved_arrival(self, ts: TorrentState, group: list[Torrent]) -> None:
+        """Second rescue trigger: a tracked race that stopped advancing, starving.
+
+        The arithmetic trigger only catches a release that never fit to begin
+        with. This one catches the late kind: the disk filled underneath a
+        running race, the racing client wrote nothing for
+        `CleanupMixin._RESCUE_STALL_POLLS` discovery polls in a row at zero
+        download rate, and the last measured free space is below
+        `[storage].disk_safety_margin_bytes` (a disk inside its own safety
+        margin cannot take another block). With no reading, nothing is claimed.
+
+        The ask is bounded to the bytes still missing (`size * (1 - progress)`),
+        never the whole release: a rescue must not delete more secured content
+        than this download actually needs to finish.
+        """
+        if getattr(ts, "state", None) in (State.DONE, State.FAILED):
+            return
+        if not group:
+            return
+        want = (getattr(ts, "source_infohash", "") or "").strip().lower()
+        member = next(
+            (t for t in group if (t.infohash or "").lower() == want),
+            group[0],
+        )
+        try:
+            progress = float(getattr(member, "progress", 0) or 0.0)
+            size = int(getattr(member, "size_bytes", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if size <= 0 or progress >= 1.0:
+            return
+        streak = self._note_racing_stall(
+            want or (member.infohash or ""),
+            progress,
+            getattr(member, "dlspeed_bps", 0),
+        )
+        if streak < self._RESCUE_STALL_POLLS:
+            return
+        free = getattr(self, "_last_source_free_bytes", None)
+        margin = self._rescue_margin_bytes()
+        if free is None or margin <= 0:
+            # No reading or no margin: "starved" would be a guess, so it is
+            # not an emergency and the disk keeps every second of seed time.
+            log.debug(
+                "rescue: %s stalled %d poll(s) but VPS1 room is unmeasured; not claiming it",
+                (want or "?")[:10],
+                streak,
+            )
+            return
+        if int(free) >= margin:
+            # Room above the safety margin means the stall is a dead swarm or
+            # a tracker problem, not a full disk: nothing may be deleted for it.
+            log.debug(
+                "rescue: %s stalled %d poll(s) with %s free (margin %s): not a room problem",
+                (want or "?")[:10],
+                streak,
+                self._cleanup_bytes_compact(int(free)),
+                self._cleanup_bytes_compact(margin),
+            )
+            return
+        remaining = int(size * (1.0 - progress))
+        if remaining <= 0:
+            return
+        await self.rescue_starved_release(
+            ts,
+            remaining,
+            why=f"stalled {streak} poll(s) with no room left",
+            entries=group,
+        )
 
     async def _poll_source_step(self) -> None:
         """Source-poller pass: watch scan, source ingest, fuse sweep.
