@@ -547,7 +547,7 @@ async def test_do_new_watch_dir_no_blob_dir_warns_plainly(tmp_path: Path, caplog
             state=State.NEW,
         )
 
-        with patch("racing_sync.coordinator_admit._watch_cross_seed_dir", return_value=None):
+        with patch("racing_sync.coordinator_admit_watch._watch_cross_seed_dir", return_value=None):
             with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
                 await coord._do_new_watch_dir(ts)
         assert "no blob dir" in caplog.text
