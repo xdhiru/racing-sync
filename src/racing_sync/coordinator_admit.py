@@ -3,8 +3,8 @@
 `AdmitMixin` is the composite admission mixin: it keeps the NEW/WAITING_DISK
 dispatch (`_do_new`, `_do_waiting_indexer`, `_pick_and_admit`,
 `_admit_resolved`, `_admit_local`, `_adopt_ssd_entry`) and composes the
-`FuseAdmitMixin`, `WatchAdmitMixin`, `QueueAdmitMixin` and `RetryAdmitMixin`
-seams that were split out of this module. Test patch-targets
+`FuseAdmitMixin`, `WatchAdmitMixin`, `QueueAdmitMixin`, `LaneAdmitMixin`
+and `RetryAdmitMixin` seams that were split out of this module. Test patch-targets
 (`racing_sync.coordinator.*`) resolve through the coordinator namespace via
 deferred imports at the call sites (a module-level `__getattr__` cannot
 serve implicit global lookups); everything else is imported directly.
@@ -16,6 +16,7 @@ import logging
 import time
 
 from .coordinator_admit_fuse import FuseAdmitMixin
+from .coordinator_admit_lanes import LaneAdmitMixin
 from .coordinator_admit_queue import (
     _BLOB_PARSE_TTL_S,  # noqa: F401  (re-exported module constant)
     _SETUP_EMPTY_FILES_FAIL_TRIES,  # noqa: F401  (tests import from here)
@@ -36,7 +37,7 @@ from .state import State, TorrentState
 log = logging.getLogger("racing_sync.coordinator")
 
 
-class AdmitMixin(FuseAdmitMixin, WatchAdmitMixin, QueueAdmitMixin, RetryAdmitMixin):
+class AdmitMixin(FuseAdmitMixin, WatchAdmitMixin, QueueAdmitMixin, LaneAdmitMixin, RetryAdmitMixin):
     async def _pick_and_admit(
         self,
         ts: TorrentState,
