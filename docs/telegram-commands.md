@@ -68,6 +68,16 @@ nothing (a bare known verb answers with its usage line instead).
   `RD` (re-adding), `QD` (queued + waiting), plus the aggregate overview.
   The filter narrows the render *and* the numbering; the destructive
   scope always matches what the list showed.
+- **`🗄` (still on VPS1)** — completed releases whose files the racing
+  client still lists: `DONE` rows with at least one hash (source, dest,
+  cross-seed or `injected_private_hashes`) present in the cached VPS1
+  listing, oldest completion first, each line carrying the `🗄 still on
+  VPS1` badge and the janitor's own ETA (`clean ~5h` / `clean ready`).
+  `DONE` shows in this tab only — `All` and every lane exclude it, and
+  `cancel_lane` refuses it. The button disappears with
+  `[cleanup].enabled = false` (a stored `🗄` filter then falls back to
+  `All`), and while the VPS1 listing cannot be read the tab says
+  `VPS1 listing unavailable` instead of inventing rows.
 - **Per-group command** — each group shows `/act <n>`, the single entry
   point with the eligible actions.
 - **Per-row buttons** — act on one copy: cancel, start now, hold/unhold.

@@ -18,10 +18,12 @@ from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 
 from .state import State, TorrentState
 from .telegram_protocol import (
+    _CLEANUP_FILTER_KEY,
     _SSD_FREE_TTL_S,
     _VPS1_FREE_TTL_S,
     _is_parse_error,
     _is_transient_tg_error,
+    cleanup_tab_available,
 )
 from .telegram_views import (
     _esc,
@@ -47,6 +49,11 @@ _ACTIVE_PROBE_EVERY = 20
 _TG_MESSAGE_LIMIT_UNITS = 4096
 
 
+#: Shown in the 🗄 tab instead of rows when the VPS1 listing cannot be
+#: read: an unknown listing is never rendered as "nothing is still there".
+_VPS1_LISTING_NOTE = "VPS1 listing unavailable — seeded rows hidden"
+
+
 def _fit_active_card(text: str) -> str:
     """Truncate the active card only when Telegram would reject it.
 
@@ -63,6 +70,57 @@ def _fit_active_card(text: str) -> str:
 
 
 class RefreshMixin:
+    def _cleanup_tab_on(self) -> bool:
+        """🗄 tab availability (janitor enabled), strict bool, never raises."""
+        try:
+            return cleanup_tab_available(getattr(self, "_coord", None))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _cleanup_helper_result(res: object) -> tuple[list, bool]:
+        """Shape-check `cleanup_pending_rows()` -> (rows, listing_unavailable).
+
+        Strict so a bare/MagicMock coordinator (whose return value unpacks
+        to mocks) degrades to "no listing" instead of rendering mock noise
+        as rows.
+        """
+        try:
+            if not isinstance(res, tuple) or len(res) != 2:
+                return [], True
+            rows, unavailable = res
+            if not isinstance(rows, list) or not isinstance(unavailable, bool):
+                return [], True
+            return list(rows), unavailable
+        except Exception:
+            return [], True
+
+    async def _cleanup_pending_display(self) -> tuple[list, bool]:
+        """🗄 rows for the card — coordinator helper, off the event loop."""
+        try:
+            fn = getattr(self._coord, "cleanup_pending_rows", None)
+            if not callable(fn):
+                return [], True
+            return self._cleanup_helper_result(await asyncio.to_thread(fn))
+        except Exception:
+            return [], True
+
+    def _cleanup_pending_rows_sync(self) -> tuple[list, bool]:
+        """🗄 rows for the sync numbering path (cached reads only).
+
+        `/act_N` and the typed verbs resolve positions inside a sync helper,
+        so this uses the same sources the refresh used without an RPC: the
+        poller's cached VPS1 view (pure memory) plus the store's DONE
+        display cache (one bounded query per _DISPLAY_CACHE_S window).
+        """
+        try:
+            fn = getattr(self._coord, "cleanup_pending_rows", None)
+            if not callable(fn):
+                return [], True
+            return self._cleanup_helper_result(fn())
+        except Exception:
+            return [], True
+
     async def _mark_detail_cancelled(
         self,
         message_id: int,
@@ -338,6 +396,33 @@ class RefreshMixin:
         except Exception:
             pass
         rows = await asyncio.to_thread(self._store.list_active_inflight)
+        # The 🗄 tab is the one category list_active_inflight can never
+        # return (its SQL excludes done/failed), so the row source is
+        # resolved up here: with the stored filter `vc` the displayed rows
+        # come from the coordinator's cleanup-pending helper instead. Every
+        # other filter — and therefore every existing tab — keeps the
+        # inflight list exactly as before, and the detail nets below still
+        # run on it (they heal cards of in-flight work the tab replaced).
+        try:
+            _flt = getattr(self, "_status_filter", None) or "all"
+        except Exception:
+            _flt = "all"
+        _vc_items: list[tuple[TorrentState, float | None]] = []
+        _vc_unavailable = False
+        if _flt == _CLEANUP_FILTER_KEY:
+            if not self._cleanup_tab_on():
+                # Janitor off: the tab promises a reclaim that can never
+                # happen, so it is dropped — stored filter included.
+                _flt = "all"
+                try:
+                    self._status_filter = "all"
+                except Exception:
+                    pass
+            else:
+                _vc_rows, _vc_unavailable = await self._cleanup_pending_display()
+                # Live progress is meaningless for a seeded row; the render
+                # only needs the row + its (absent) progress slot.
+                _vc_items = [(ts, None) for ts in _vc_rows]
         # Pull live progress + download rates from coordinator's tracker
         progress_map = self._coord.live_progress_map()
         try:
@@ -478,36 +563,27 @@ class RefreshMixin:
                 move_progress = {}
         except Exception:
             move_progress = {}
-        # Cleanup ETA per DONE row (display-only): the coordinator mirrors
-        # the janitor's adaptive grace + idle fast lane. Strict string
-        # check so a bare/MagicMock coordinator degrades to no hints.
-        cleanup: dict[str, str] = {}
-        try:
-            _hint_fn = getattr(self._coord, "_cleanup_hint", None)
-            if callable(_hint_fn):
-                for _ts, _ in items:
-                    if getattr(_ts, "state", None) != State.DONE:
-                        continue
-                    try:
-                        _hint = _hint_fn(_ts)
-                    except Exception:
-                        continue
-                    if isinstance(_hint, str) and _hint:
-                        cleanup[(_ts.source_infohash or "").lower()] = _hint
-        except Exception:
-            cleanup = {}
-        # Status filter (All/DL/MV/RD/QD buttons): the detail nets above
-        # run on the FULL list (filtered-out cards still heal); only the
-        # render + numbering narrow. Unknown keys show everything.
-        try:
-            _flt = getattr(self, "_status_filter", None) or "all"
-        except Exception:
-            _flt = "all"
+        # Status filter (All/DL/MV/RD/QD/🗄 buttons): the detail nets above
+        # run on the FULL inflight list (filtered-out cards still heal);
+        # only the render + numbering narrow. Unknown keys show everything.
+        # `vc` is the exception by construction: its rows come from the
+        # cleanup-pending source resolved with the filter above, since no
+        # DONE row can ever appear in the inflight list.
         try:
             from .telegram_protocol import match_status_filter as _matchflt
 
             if _flt == "all":
-                shown = items
+                # Defence in depth: `all` shows exactly what it always
+                # showed (the inflight list, which the store keeps free of
+                # DONE), but a seeded row can never ride along even if a
+                # caller ever hands one in — only 🗄 owns that state.
+                shown = [
+                    (_ts, _pg)
+                    for (_ts, _pg) in items
+                    if _matchflt(getattr(getattr(_ts, "state", None), "value", ""), "all")
+                ]
+            elif _flt == _CLEANUP_FILTER_KEY:
+                shown = _vc_items
             else:
                 shown = [
                     (_ts, _pg)
@@ -520,6 +596,27 @@ class RefreshMixin:
                 _flt = "all"
             except Exception:
                 pass
+        # Cleanup ETA per displayed DONE row (display-only): the coordinator
+        # mirrors the janitor's adaptive grace + idle fast lane. Strict
+        # string check so a bare/MagicMock coordinator degrades to no hints.
+        # Iterating `shown` is what makes this path live at all: the
+        # inflight list never contains a DONE row, so only the 🗄 tab can
+        # carry the hint the janitor already computes.
+        cleanup: dict[str, str] = {}
+        try:
+            _hint_fn = getattr(self._coord, "_cleanup_hint", None)
+            if callable(_hint_fn):
+                for _ts, _ in shown:
+                    if getattr(_ts, "state", None) != State.DONE:
+                        continue
+                    try:
+                        _hint = _hint_fn(_ts)
+                    except Exception:
+                        continue
+                    if isinstance(_hint, str) and _hint:
+                        cleanup[(_ts.source_infohash or "").lower()] = _hint
+        except Exception:
+            cleanup = {}
         text, cur_page, total_pages = render_active(
             shown,
             page=self._current_page,
@@ -529,6 +626,9 @@ class RefreshMixin:
             speeds=speed_map,
             move_progress=move_progress,
             cleanup=cleanup,
+            unavailable_note=(
+                _VPS1_LISTING_NOTE if (_flt == _CLEANUP_FILTER_KEY and _vc_unavailable) else ""
+            ),
         )
         # Stamp the rendered generation: typed /act_N positions resolve
         # against the live list, so a count change between render and tap

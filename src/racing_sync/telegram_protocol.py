@@ -641,12 +641,18 @@ _MATCH_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,47}$")
 
 #: Active-list status filters: key -> row states shown (`None` = all).
 #: QD covers the queued/waiting lanes (QUEUED + NEW + WAITING_*).
+#: VC is the "seeded, files still on VPS1" category: DONE rows narrowed
+#: further by the cached VPS1 listing (see `Coordinator.cleanup_pending_rows`),
+#: so its state set alone is not the whole rule — only the refresh path
+#: that swaps the row source can show them.
+_CLEANUP_FILTER_KEY = "vc"
 _STATUS_FILTERS: dict[str, frozenset | None] = {
     "all": None,
     "dl": frozenset({"downloading"}),
     "mv": frozenset({"moving"}),
     "rd": frozenset({"re_adding"}),
     "qd": frozenset({"queued", "new", "waiting_disk", "waiting_indexer"}),
+    _CLEANUP_FILTER_KEY: frozenset({"done"}),
 }
 #: Filter keyboard buttons in order: (key, label). `ov` is the aggregate
 #: overview (not a filter) and shares the `status:` callback namespace.
@@ -656,21 +662,50 @@ _STATUS_FILTER_BUTTONS: tuple = (
     ("mv", "MV"),
     ("rd", "RD"),
     ("qd", "QD"),
+    (_CLEANUP_FILTER_KEY, "🗄"),
     ("ov", "📊"),
 )
+
+#: The one state the 🗄 tab owns. Every other filter must exclude it:
+#: until the tab existed no DONE row could reach these code paths (the
+#: store SQL dropped them), so a plain "state in set" check would let the
+#: new row source leak DONE into All.
+_DONE_STATE = "done"
 
 
 def match_status_filter(state_value: object, key: str) -> bool:
     """True when a row state passes the active-list filter. Never raises."""
     try:
-        if (key or "all") == "all":
+        _sv = str(state_value or "").lower()
+        _key = key or "all"
+        if _key == _CLEANUP_FILTER_KEY:
+            return _sv == _DONE_STATE
+        if _sv == _DONE_STATE:
+            return False
+        if _key == "all":
             return True
-        _want = _STATUS_FILTERS.get(key or "all")
+        _want = _STATUS_FILTERS.get(_key)
         if _want is None:
             return True
-        return str(state_value or "").lower() in _want
+        return _sv in _want
     except Exception:
         return True
+
+
+def cleanup_tab_available(coord: object) -> bool:
+    """True only when the coordinator proves the VPS1 janitor is enabled.
+
+    The 🗄 tab promises that the listed copies will be reclaimed; with
+    `[cleanup].enabled` off nothing is ever reclaimed, so the button, the
+    rows and a stored `vc` filter all vanish. Answering `is True` (and
+    nothing else) keeps bare/MagicMock doubles — which answer truthy to
+    every attribute — failing closed instead of showing an empty lie.
+    """
+    try:
+        fn = getattr(coord, "cleanup_tab_enabled", None)
+        return callable(fn) and fn() is True
+    except Exception:
+        return False
 
 
 def _is_bulk_scope(h: str) -> bool:
@@ -805,7 +840,9 @@ class CancelScope(NamedTuple):
         if self.kind == "status":
             # Fail closed: only the lane keys cancel. An unknown key
             # (all/ov/garbage) must never resolve to the whole list —
-            # match_status_filter fail-opens to True for display.
+            # match_status_filter fail-opens to True for display. `vc` is
+            # deliberately NOT listed: DONE rows are seeded, not in
+            # flight, and must never be cancellable through a lane tap.
             if self.key not in ("dl", "mv", "rd", "qd"):
                 raise ScopeGone()
             _label = dict(_STATUS_FILTER_BUTTONS).get(self.key, self.key)

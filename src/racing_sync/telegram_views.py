@@ -792,6 +792,7 @@ def render_active(
     speeds: dict[str, int] | None = None,
     move_progress: dict[str, object] | None = None,
     cleanup: dict[str, str] | None = None,
+    unavailable_note: str = "",
 ) -> tuple[str, int, int]:
     """Render paginated active tasks, grouped by file for mobile width.
 
@@ -817,6 +818,9 @@ def render_active(
 
     `footer` is an optional trailing line (e.g. storage stats) appended
     directly after (single newline, no blank gap); "" disables it.
+    `unavailable_note` replaces the "no tasks" line when the list is empty
+    because its truth source could not be read (the 🗄 tab without a VPS1
+    listing): an unknown listing is never rendered as an empty one.
     """
     try:
         page_size = int(page_size)
@@ -826,7 +830,8 @@ def render_active(
     total_items = len(active)
 
     if not active:
-        text = "📌 *Active Tasks*\n\n_No active tasks in flight._"
+        _idle = f"_{unavailable_note}_" if unavailable_note else "_No active tasks in flight._"
+        text = f"📌 *Active Tasks*\n\n{_idle}"
         if footer:
             text += f"\n{footer}"
         return (
@@ -890,6 +895,12 @@ def render_active(
                 _clean_hint = ""
             if _clean_hint:
                 state_text += f" · {_esc(str(_clean_hint))}"
+            if getattr(ts, "state", None) == State.DONE:
+                # The 🗄 tab's evidence badge: a DONE row only reaches the
+                # renderer through it, and it is there because the cached
+                # VPS1 listing still lists the copy's files. The ETA comes
+                # from `cleanup` (the janitor's own hint), untouched.
+                state_text += " · 🗄 still on VPS1"
             if domain_full:
                 lines.append(f"▸ {_esc(domain_full)} {state_text}")
             else:

@@ -211,9 +211,12 @@ class StateStore:
         list_active_inflight() is display-only (Telegram renders); every
         structural write invalidates so taps never render pre-mutation
         rows, while tap bursts without intervening writes share one scan.
+        The DONE tab list (list_done_display) shares the invalidation so
+        a row leaving DONE can never keep showing in that tab.
         """
         try:
             self._display_cache = None
+            self._display_done_cache = None
         except Exception:
             pass
 
@@ -566,6 +569,39 @@ class StateStore:
             out = [_row_to_state(r) for r in rows]
         try:
             self._display_cache = (time.monotonic(), out)
+        except Exception:
+            pass
+        return out
+
+    def list_done_display(self) -> list[TorrentState]:
+        """DONE rows for the active-tasks "still on VPS1" tab (display only).
+
+        `list_active_inflight` deliberately excludes done/failed and many
+        callers rely on that, so the tab reads its own DONE list instead of
+        widening the inflight SQL. Same sharing window and invalidation
+        style as the inflight list: every structural write drops both
+        caches, so a tap never renders a pre-mutation row while a tap
+        storm shares one scan.
+        """
+        self._ensure_open()
+        try:
+            _mc = getattr(self, "_display_done_cache", None)
+            if (
+                isinstance(_mc, tuple)
+                and len(_mc) == 2
+                and time.monotonic() - float(_mc[0]) < _DISPLAY_CACHE_S
+            ):
+                return list(_mc[1])
+        except Exception:
+            pass
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state "
+                "WHERE state = 'done' AND deleted_at = '' ORDER BY completed_at"
+            ).fetchall()
+            out = [_row_to_state(r) for r in rows]
+        try:
+            self._display_done_cache = (time.monotonic(), out)
         except Exception:
             pass
         return out

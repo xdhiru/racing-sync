@@ -13,11 +13,13 @@ from typing import Any
 from .state import State
 from .telegram_buttons import ButtonMaker
 from .telegram_protocol import (
+    _CLEANUP_FILTER_KEY,
     _MATCH_MAX_BYTES,
     _MATCH_MIN_CHARS,
     CancelScope,
     _action_error_text,
     _match_token,
+    match_status_filter,
 )
 from .telegram_views import (
     _batch_display,
@@ -41,6 +43,8 @@ class CancelActionsMixin:
         number against the raw store list would misroute #1 to a
         filtered-out row. Identity tokens (group id, full hash, legacy
         prefix) are stable across filters and must keep the full list.
+        The 🗄 filter (`vc`) swaps the source outright — its rows are the
+        cleanup-pending DONE list, not the inflight list it was handed.
         Fails open to the unfiltered rows — never raises.
         """
         try:
@@ -51,15 +55,29 @@ class CancelActionsMixin:
             flt = getattr(self, "_status_filter", None) or "all"
         except Exception:
             flt = "all"
-        if not flt or str(flt).lower() == "all":
+        if not flt:
             return full
+        _fltl = str(flt).lower()
+        if _fltl == _CLEANUP_FILTER_KEY:
+            # The 🗄 tab numbers what it shows: DONE rows are invisible
+            # to the inflight list the caller read, so positions resolve
+            # against the same cleanup-pending source the renderer used.
+            # Janitor off (or listing unknown, or the helper missing) =>
+            # no rows, so a number can never address something the screen
+            # did not show — falling back to `full` here would misroute a
+            # tab position onto an in-flight row.
+            try:
+                if not self._cleanup_tab_on():
+                    return []
+                _rows, _unavailable = self._cleanup_pending_rows_sync()
+                return [] if _unavailable else _rows
+            except Exception:
+                return []
         try:
-            from .telegram_protocol import match_status_filter
-
             return [
                 _r
                 for _r in full
-                if match_status_filter(getattr(getattr(_r, "state", None), "value", ""), flt)
+                if match_status_filter(getattr(getattr(_r, "state", None), "value", ""), _fltl)
             ]
         except Exception:
             return full
@@ -647,9 +665,15 @@ class CancelActionsMixin:
         tapping one opens the same remember -> keep/delete sheets as
         every other scope (`cancel:status:<key>`, re-resolved live at
         each tap). Empty lanes are omitted; an empty list replies so.
+        The 🗄 category is never a lane: seeded DONE rows are not
+        in-flight work and must not be cancellable from here.
         """
         try:
-            from .telegram_protocol import _STATUS_FILTER_BUTTONS, match_status_filter
+            from .telegram_protocol import (
+                _CLEANUP_FILTER_KEY,
+                _STATUS_FILTER_BUTTONS,
+                match_status_filter,
+            )
 
             _get_all = getattr(self._store, "list_active_inflight", None)
             rows = await asyncio.to_thread(_get_all) if callable(_get_all) else []
@@ -667,7 +691,10 @@ class CancelActionsMixin:
                 except Exception:
                     continue
                 for _key, _ in _STATUS_FILTER_BUTTONS:
-                    if _key in ("all", "ov"):
+                    # `all`/`ov` are not lanes; `vc` is the seeded-but-not-yet
+                    # -reclaimed category — its rows are DONE, and a DONE row
+                    # must never be cancellable through a lane tap.
+                    if _key in ("all", "ov", _CLEANUP_FILTER_KEY):
                         continue
                     try:
                         if match_status_filter(_sv, _key):
@@ -708,7 +735,7 @@ class CancelActionsMixin:
                 return
         _maker = ButtonMaker()
         for _key, _label in _STATUS_FILTER_BUTTONS:
-            if _key in ("all", "ov"):
+            if _key in ("all", "ov", _CLEANUP_FILTER_KEY):
                 continue
             try:
                 _n = int(_counts.get(_key, 0) or 0)

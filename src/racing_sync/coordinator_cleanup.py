@@ -24,6 +24,12 @@ from .state import State, TorrentState
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
 
+#: How old the cached VPS1 listing may be before "still on VPS1" stops
+#: being provable. The poller refreshes every tick (45 s TTL), so a view
+#: older than this means the source poll is dead: the 🗄 tab must say
+#: "listing unavailable" instead of guessing presence from a ghost.
+_VPS1_LISTING_MAX_AGE_S = 120.0
+
 
 class CleanupMixin:
     """VPS1 janitor (duck-typed ``self``: cfg/store/source_client/dest_client)."""
@@ -731,6 +737,134 @@ class CleanupMixin:
             return "clean ready"
         eta = self._cleanup_eta_compact(seconds_left or 0.0)
         return f"clean ~{eta}" if eta else "clean pending"
+
+    def cleanup_tab_enabled(self) -> bool:
+        """True when the "still on VPS1" (🗄) category is meaningful.
+
+        With `[cleanup].enabled` off the janitor never reclaims anything, so
+        the tab would promise a countdown that cannot arrive: the button,
+        the rows and a stored `vc` filter all go away instead. Returns a
+        real bool so the Telegram side can fail closed on bare doubles.
+        """
+        try:
+            cfg = getattr(getattr(getattr(self, "rt", None), "cleanup", None), "config", None)
+            if cfg is None:
+                cfg = getattr(getattr(self, "cfg", None), "cleanup", None)
+            return bool(getattr(cfg, "enabled", False))
+        except Exception:
+            return False
+
+    def vps1_present_hashes(self) -> set[str] | None:
+        """Lowercase hashes the cached VPS1 listing currently reports.
+
+        Pure cache read of the poller's TTL-cached racing-client view
+        (`_source_torrents_cache`): no RPC, so the Telegram path can never
+        add a VPS1 round trip of its own, and no exception escapes.
+
+        Returns None when there is no listing to reason from (never polled,
+        or older than `_VPS1_LISTING_MAX_AGE_S`, i.e. the source poll is
+        dead). Callers must treat None as "unknown" — never as "nothing is
+        present", which would silently hide rows that still hold files.
+        """
+        try:
+            cache = getattr(self, "_source_torrents_cache", None)
+            if cache is None:
+                return None
+            stamp = float(getattr(self, "_source_torrents_cached_at", 0.0) or 0.0)
+            if stamp <= 0.0 or (time.monotonic() - stamp) > _VPS1_LISTING_MAX_AGE_S:
+                return None
+            out: set[str] = set()
+            for torrent in cache or []:
+                try:
+                    h = str(getattr(torrent, "infohash", "") or getattr(torrent, "hash", ""))
+                except Exception:
+                    continue
+                h = h.strip().lower()
+                # Hex-only: a test double or a client object with a repr
+                # where a hash should be must not pose as a presence proof.
+                if 32 <= len(h) <= 64 and all(c in "0123456789abcdef" for c in h):
+                    out.add(h)
+            return out
+        except Exception:
+            return None
+
+    @staticmethod
+    def _cleanup_row_hashes(ts: object) -> set[str]:
+        """Every hash a row claims on VPS1 (racing + cross-seed + injected)."""
+        try:
+            raw = [
+                getattr(ts, "source_infohash", ""),
+                getattr(ts, "dest_infohash", ""),
+                getattr(ts, "cross_seed_infohash", ""),
+                *(str(getattr(ts, "injected_private_hashes", "") or "").split(",")),
+            ]
+        except Exception:
+            return set()
+        out: set[str] = set()
+        for h in raw:
+            try:
+                n = str(h or "").strip().lower()
+            except Exception:
+                continue
+            if n:
+                out.add(n)
+        return out
+
+    def cleanup_pending_rows(self) -> tuple[list[TorrentState], bool]:
+        """DONE rows whose files are provably still on VPS1.
+
+        Truth source is evidence, not a flag: a row belongs when it is
+        DONE *and* at least one of its hashes is in the live VPS1 listing
+        (`injected_private_hashes` counts — the racing copy is one member
+        of the group, not the only one that can still hold bytes). There is
+        no persisted "cleaned" marker and adding one would be a claim, so
+        a row disappears the moment the source listing stops showing it.
+
+        Sorted oldest grace anchor (`completed_at`, falling back to
+        `created_at`) first, i.e. what the janitor reclaims next.
+
+        Returns `(rows, listing_unavailable)`; with no fresh listing the
+        rows are empty and the flag is True, so the caller shows a note
+        instead of a fabricated or falsely-empty list. Cheap (cache read +
+        one cached display query) and never raises.
+        """
+        try:
+            if not self.cleanup_tab_enabled():
+                return [], False
+            present = self.vps1_present_hashes()
+            if present is None:
+                return [], True
+            rows_fn = getattr(getattr(self, "store", None), "list_done_display", None)
+            if not callable(rows_fn):
+                return [], True
+            rows = list(rows_fn() or [])
+        except Exception:
+            return [], True
+        out: list[TorrentState] = []
+        for ts in rows:
+            try:
+                if getattr(ts, "state", None) != State.DONE:
+                    continue
+                if not (self._cleanup_row_hashes(ts) & present):
+                    continue
+            except Exception:
+                continue
+            out.append(ts)
+        out.sort(key=self._cleanup_grace_anchor_key)
+        return out, False
+
+    @staticmethod
+    def _cleanup_grace_anchor_key(ts: object) -> float:
+        """Epoch of the row's grace anchor; unknown stamps sort last."""
+        try:
+            anchor = getattr(ts, "completed_at", None) or getattr(ts, "created_at", None)
+            if anchor is None:
+                return float("inf")
+            if getattr(anchor, "tzinfo", None) is None:
+                anchor = anchor.replace(tzinfo=dt.UTC)
+            return float(anchor.timestamp())
+        except Exception:
+            return float("inf")
 
     async def _cleanup_pending_summary(self) -> str:
         """One-line footer for the active card: completed rows awaiting VPS1 removal.

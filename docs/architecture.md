@@ -283,7 +283,9 @@ that fails). It re-reads the row and version right before each delete.
 ## Telegram
 
 One `racing-sync online` message on startup, one long-lived Active Tasks card
-(paginated, status filters), and one detail card per torrent. Every command
+(paginated, status filters — including the `🗄` tab of `DONE` rows whose files
+the cached VPS1 listing still reports, awaiting the janitor's grace), and one
+detail card per torrent. Every command
 is registered in the `/` popup with a description; targets use a space
 (`/cancel 3`) or an underscore (`/cancel_3`). Full list:
 `docs/telegram-commands.md`. Destructive sheets re-resolve live at each tap,

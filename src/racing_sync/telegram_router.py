@@ -584,9 +584,19 @@ class RouterMixin:
                         pass
                     return
                 try:
-                    from .telegram_protocol import _STATUS_FILTERS
+                    from .telegram_protocol import (
+                        _CLEANUP_FILTER_KEY,
+                        _STATUS_FILTERS,
+                        cleanup_tab_available,
+                    )
 
                     _valid = _skey in _STATUS_FILTERS
+                    if _valid and _skey == _CLEANUP_FILTER_KEY:
+                        # No janitor, no 🗄 tab: the tap is ignored (the
+                        # button is not built either), so a stored `vc`
+                        # filter can never outlive the cleanup switch.
+                        if not cleanup_tab_available(getattr(self, "_coord", None)):
+                            _valid = False
                 except Exception:
                     _valid = _skey in ("all", "dl", "mv", "rd", "qd")
                 if _valid:

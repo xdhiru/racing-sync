@@ -943,8 +943,9 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         action buttons) or a ButtonMaker, already chunked by the caller —
         invalid entries are logged and skipped so one bad button can
         never break the periodic list render. The trailing filter row
-        (All/DL/MV/RD/QD + overview) carries `status:` callbacks; the
-        active filter renders bracketed.
+        (All/DL/MV/RD/QD/🗄 + overview) carries `status:` callbacks; the
+        active filter renders bracketed and 🗄 only exists while the VPS1
+        janitor is enabled.
         """
         if total_pages <= 1:
             buttons = [[InlineKeyboardButton("🔄 Refresh", callback_data="page:refresh")]]
@@ -971,12 +972,22 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         except Exception:
             pass
         try:
-            from .telegram_protocol import _STATUS_FILTER_BUTTONS
+            from .telegram_protocol import (
+                _CLEANUP_FILTER_KEY,
+                _STATUS_FILTER_BUTTONS,
+                cleanup_tab_available,
+            )
 
             _cur = status_filter or "all"
+            # The 🗄 (files still on VPS1) tab is a janitor promise: with
+            # [cleanup].enabled off it can never be kept, so the button is
+            # not built at all.
+            _vc_ok = cleanup_tab_available(getattr(self, "_coord", None))
             _frow = []
             for _key, _label in _STATUS_FILTER_BUTTONS:
                 try:
+                    if _key == _CLEANUP_FILTER_KEY and not _vc_ok:
+                        continue
                     _txt = f"·{_label}·" if _key == _cur else _label
                     _frow.append(InlineKeyboardButton(_txt, callback_data=f"status:{_key}"))
                 except Exception:
