@@ -143,6 +143,22 @@ class RetryAdmitMixin:
         )
 
         if elapsed >= max_age:
+            if self._push_is_live(ts.source_infohash):
+                # A live VPS1 push owns this content. The indexer window is
+                # spent, but failing the row while bytes are still landing on
+                # the seed remote throws the race away, so re-arm on the push
+                # check cadence instead of escalating. `indexer_first_queried_at`
+                # stays exactly as it is: the moment the push dies (deadline
+                # passed -> not live) the next park hits the normal ceiling.
+                log.info(
+                    "%s: indexer window expired but the VPS1 push is running; "
+                    "re-arming on the push cadence instead of failing (%ds)",
+                    ts.source_name[:60],
+                    int(self._push_check_interval()),
+                )
+                self._schedule_retry(ts, "indexer", self._push_check_interval())
+                self._park_waiting_indexer(ts, reason="indexer")
+                return
             if reason == "source vanished from VPS1":
                 # Disappearance starts a new cross-seed situation: the
                 # earlier window may have leaned on the VPS1 copy, so an
@@ -255,11 +271,24 @@ class RetryAdmitMixin:
         owners: list = []
         waiters: list = []
         try:
+            # Memoized (one SELECT per snapshot window, and not even that
+            # while [source.rclone_push] is off).
+            live_pushes = self._live_push_hashes()
+        except Exception:
+            live_pushes = set()
+        try:
             for r in rows or []:
                 try:
                     if (r.source_infohash or "").lower() == me:
                         continue
                     if r.state in _INFLIGHT_OWNER_STATES:
+                        bucket = owners
+                    elif live_pushes and (r.source_infohash or "").lower() in live_pushes:
+                        # A row whose hash owns a LIVE VPS1 push is an owner
+                        # too: `_INFLIGHT_OWNER_STATES` only names SSD work,
+                        # and a push row parks as WAITING_INDEXER, so without
+                        # this a same-content sibling would start its own SSD
+                        # download right behind the copy already running.
                         bucket = owners
                     elif r.state in _INFLIGHT_PREADMIT_STATES:
                         bucket = waiters
@@ -380,6 +409,11 @@ class RetryAdmitMixin:
             _o = (owner_hash or "").strip().lower()
             if not _o:
                 return False
+            # A parked WAITING_INDEXER row that owns a live VPS1 push is still
+            # an owner (see _inflight_same_content): the waiter must not
+            # re-scan and start a duplicate download behind the copy.
+            if self._push_has_live_owner(_o):
+                return True
             for r in self._inflight_snapshot_rows() or []:
                 try:
                     if (r.source_infohash or "").lower() == _o and r.state in (

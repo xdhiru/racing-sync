@@ -82,6 +82,7 @@ from .coordinator_ops import (
     _elect_primary_torrent as _elect_primary_torrent,  # noqa: F401  (re-exported API)
 )
 from .coordinator_picker import pick_ssd_source_for_racing
+from .coordinator_push import PushMixin
 from .coordinator_racing_blobs import RacingBlobMixin
 from .coordinator_readd import ReaddMixin
 from .coordinator_schedule import (
@@ -190,6 +191,7 @@ class Coordinator(
     ReaddMixin,
     FuseMixin,
     RacingBlobMixin,
+    PushMixin,
     DownloadMixin,
     MoveMixin,
     AdmitMixin,

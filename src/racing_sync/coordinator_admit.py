@@ -166,6 +166,38 @@ class AdmitMixin(FuseAdmitMixin, WatchAdmitMixin, QueueAdmitMixin, LaneAdmitMixi
                 park_reason == "indexer miss"
                 and not getattr(ts, "force_direct", 0)
                 and self._prowlarr_timed_out(ts)
+                and self._push_auto_enabled()
+                and not self._push_is_live(ts.source_infohash)
+            ):
+                # Opt-in precedence (auto_on_prowlarr_timeout): before leeching
+                # the private swarm on VPS2, ask VPS1 to copy the bytes it
+                # already holds onto the seed remote. A refusal — switch off,
+                # nothing complete, cap reached, no dial — falls straight
+                # through to the existing leech below, unchanged.
+                started, push_note = await self.start_source_push(ts, reason="auto")
+                if started:
+                    log.info(
+                        "prowlarr timeout for %s: pushing from VPS1 instead of leeching (%s)",
+                        ts.source_name[:60],
+                        push_note,
+                    )
+                    # start_source_push parked the row on the push cadence;
+                    # the sweep admits it the moment the remote has it all.
+                    return
+                log.info(
+                    "prowlarr timeout for %s: push unavailable (%s); using the VPS2 leech",
+                    ts.source_name[:60],
+                    push_note,
+                )
+            if (
+                park_reason == "indexer miss"
+                and not getattr(ts, "force_direct", 0)
+                and self._prowlarr_timed_out(ts)
+                # A live push is carrying exactly these bytes onto the seed
+                # remote; a second copy on VPS2 would be the double transfer
+                # the push exists to remove (and the guard is inert unless a
+                # push is live — no push, today's leech).
+                and not self._push_is_live(ts.source_infohash)
             ):
                 # Automatic fallback (opt-in): the download-target indexers
                 # never produced this release within prowlarr_max_age_seconds.
@@ -337,6 +369,20 @@ class AdmitMixin(FuseAdmitMixin, WatchAdmitMixin, QueueAdmitMixin, LaneAdmitMixi
             except Exception:
                 await self._ssd_release(ts.source_infohash)
                 raise
+            return
+        # A live VPS1 push is carrying exactly these bytes onto the seed
+        # remote already, so this row must not book SSD for a second copy:
+        # nothing is reserved on this branch, and the release is the belt for
+        # a row that arrived holding a reservation (the same helper the
+        # failure paths above use, so a budget can never leak). Without the
+        # push it is dead code — the guard asks the store, not the config.
+        if self._push_is_live(ts.source_infohash):
+            await self._ssd_release(ts.source_infohash)
+            log.info(
+                "keeping %s off the SSD while the VPS1 push runs",
+                display_name,
+            )
+            self._park_behind_push(ts)
             return
         # Global SSD ledger: reserve before QUEUED so concurrent high-size
         # arrivals can't all pass a point-in-time free check and exceed the

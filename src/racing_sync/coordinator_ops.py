@@ -602,6 +602,17 @@ class OpsMixin:
         except Exception as e:  # noqa: BLE001
             log.warning("manual move sweep failed: %s", e)
 
+        # 2b-3. VPS1 push sweep: advance the live "push from VPS1" checkpoints
+        # (one metadata-only remote listing per push per check interval) and
+        # hand finished ones to the admission path just above. Returns without
+        # touching the store unless [source.rclone_push].enabled is on.
+        try:
+            await self.push_sweep()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("push sweep failed: %s", e)
+
         # 2c. Intake handoff: freshly discovered NEW rows start work now
         # instead of waiting out the next scheduler tick (racing is
         # time-sensitive). Production only (the scheduler remains the
