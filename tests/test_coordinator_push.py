@@ -12,7 +12,10 @@ Pinned here:
   because both clients preallocate and a size check would lie;
 * the layout identity: push and move must reach the same `target_remote` for
   the same names (asserted against `decide_seed_layout` directly, so the two
-  callers cannot drift);
+  callers cannot drift) — and the kind they route on is the one the pushed
+  names classify to, not the schema default "unknown" a pre-admission row
+  carries, pinned on the row so the stages after the push agree with where
+  the bytes went;
 * the four suppression guards while a push is live (no timeout leech, no SSD
   reservation, no max-age FAILED, a same-content sibling defers);
 * the handover: the existing all-remote evidence path admits the row with no
@@ -43,7 +46,14 @@ ROOT = Path(__file__).parent.parent
 EPISODE_NAME = "Example.Show.S01E01.1080p.WEB-DL.AAC2.0.H.264-ExampleGroup.mkv"
 EPISODE_TOP = "Example.Show.S01E01.1080p.WEB-DL.AAC2.0.H.264-ExampleGroup"
 NEXT_EPISODE = "Example.Show.S01E02.1080p.WEB-DL.AAC2.0.H.264-ExampleGroup.mkv"
+THIRD_EPISODE = "Example.Show.S01E03.1080p.WEB-DL.AAC2.0.H.264-ExampleGroup.mkv"
 MOVIE_NAME = "Example.Film.2026.1080p.WEB-DL.x264-ExampleGroup.mkv"
+MOVIE_TOP = "Example.Film.2026.1080p.WEB-DL.x264-ExampleGroup"
+SEASON_TOP = "Example.Show.S01.1080p.WEB-DL.AAC2.0.H.264-ExampleGroup"
+# Extra videos with no episode tag: two episodes plus these classify `mixed`.
+BONUS_ONE = "Example.Bonus.One.mkv"
+BONUS_TWO = "Example.Bonus.Two.mkv"
+BONUS_THREE = "Example.Bonus.Three.mkv"
 ANNOUNCE = "https://tracker.example.invalid/announce/abcdef"
 VPS1_DIR = "/data/racing"
 
@@ -584,16 +594,23 @@ async def test_push_refused_without_the_file_names_of_this_torrent(tmp_path, tra
 
 
 @pytest.mark.parametrize(
-    "name, top, kind, expect_remote",
+    "name, top, row_kind, route_kind, expect_remote",
     [
-        (EPISODE_NAME, EPISODE_TOP, "episode", UNSORTED_REMOTE),
-        (NEXT_EPISODE, "Example.Show.S01E02.ExampleGroup", "season", SORTED_REMOTE),
-        (MOVIE_NAME, "Example.Film.2026.ExampleGroup", "movie", SORTED_REMOTE),
+        (EPISODE_NAME, EPISODE_TOP, "episode", "episode", UNSORTED_REMOTE),
+        (NEXT_EPISODE, "Example.Show.S01E02.ExampleGroup", "season", "season", SORTED_REMOTE),
+        (MOVIE_NAME, "Example.Film.2026.ExampleGroup", "movie", "movie", SORTED_REMOTE),
+        # The proven bug: a pushed row is parked BEFORE admission, so its
+        # stored kind is the schema default "unknown". The kind the bytes
+        # imply decides — written here literally (never read back from the
+        # code under test), so the rule stays one shared `decide_seed_layout`
+        # call and the two callers still cannot drift.
+        (EPISODE_NAME, EPISODE_TOP, "unknown", "episode", UNSORTED_REMOTE),
+        (MOVIE_NAME, "Example.Film.2026.ExampleGroup", "unknown", "movie", SORTED_REMOTE),
     ],
 )
 @pytest.mark.anyio
 async def test_push_layout_equals_the_move_layout_for_the_same_names(
-    tmp_path, transport, name, top, kind, expect_remote
+    tmp_path, transport, name, top, row_kind, route_kind, expect_remote
 ):
     """Push and move call one rule: same names -> same remote + pinned top."""
     store = StateStore(tmp_path / "state.db")
@@ -605,14 +622,14 @@ async def test_push_layout_equals_the_move_layout_for_the_same_names(
             live=[_vps1_torrent(blob, name=top, size=2000, progress=0.2)],
             files=[TorrentFile(f"{top}/{name}", 2000, progress=1.0)],
         )
-        ts = _row(store, blob, name=top, size=2000, kind=kind, state=State.WAITING_INDEXER)
+        ts = _row(store, blob, name=top, size=2000, kind=row_kind, state=State.WAITING_INDEXER)
 
         started, why = await coord.start_source_push(ts)
         assert started is True, why
 
         request = _request_of(transport["start_copy"])
         moved = decide_seed_layout(
-            kind=kind,
+            kind=route_kind,
             target_names=[f.name for f in request.files],
             # The push has no SSD batches; that is the whole point of the
             # shared helper — the decision depends on the names only, never
@@ -673,6 +690,227 @@ async def test_flat_push_wraps_like_the_move_stage(tmp_path, transport):
         )
         assert expected.target_remote == request.target_remote
         assert store.get(_hash_of(blob)).seed_subdir == EPISODE_TOP
+    finally:
+        store.close()
+
+
+# --------------------------------------------------------------------------- #
+# the kind a push routes on (a pushed row is pre-admission, so it is "unknown")
+# --------------------------------------------------------------------------- #
+
+
+def _blob_of(files: list[tuple[str, int]]) -> bytes:
+    """A .torrent whose own bytes carry exactly these names."""
+    tops = {name.rsplit("/", 1)[0] for name, _s in files if "/" in name}
+    if not tops:
+        name, size = files[0]
+        return _single_blob(name, size)
+    return _wrapped_blob(next(iter(tops)), [(n.rsplit("/", 1)[-1], s) for n, s in files])
+
+
+def _narrow_writes(store: StateStore, monkeypatch) -> MagicMock:
+    """Spy the store's narrow writes so a test can see what was persisted."""
+    spy = MagicMock(wraps=store.update_columns)
+    monkeypatch.setattr(store, "update_columns", spy)
+    return spy
+
+
+def _kind_writes(spy: MagicMock) -> list[dict]:
+    """Among those writes, the mappings that touched the classification column."""
+    return [
+        call.args[1]
+        for call in spy.call_args_list
+        if len(call.args) > 1
+        and isinstance(call.args[1], dict)
+        and "classification_kind" in call.args[1]
+    ]
+
+
+def _classify_spy(monkeypatch) -> list[int]:
+    """Count the classifier calls the push makes, still returning the real answer."""
+    from racing_sync.classifier import classify as real_classify
+
+    seen: list[int] = []
+
+    def _spy(files, cfg):
+        seen.append(len(list(files)))
+        return real_classify(files, cfg)
+
+    monkeypatch.setattr(coordinator_module, "classify", _spy)
+    return seen
+
+
+@pytest.mark.parametrize(
+    "files, expect_kind, expect_remote",
+    [
+        # The regression the production log proved: a single-file movie — here
+        # a BluRay one — went to the unsorted remote, because the row's stored
+        # kind is the schema default "unknown" until admission pins it.
+        ([(MOVIE_NAME, 2000)], "movie", SORTED_REMOTE),
+        ([(f"{MOVIE_TOP}/{MOVIE_NAME}", 2000)], "movie", SORTED_REMOTE),
+        ([(f"{EPISODE_TOP}/{EPISODE_NAME}", 2000)], "episode", UNSORTED_REMOTE),
+        (
+            [
+                (f"{SEASON_TOP}/{EPISODE_NAME}", 2000),
+                (f"{SEASON_TOP}/{NEXT_EPISODE}", 2000),
+                (f"{SEASON_TOP}/{THIRD_EPISODE}", 2000),
+            ],
+            "season",
+            SORTED_REMOTE,
+        ),
+        (
+            [
+                (f"{SEASON_TOP}/{EPISODE_NAME}", 2000),
+                (f"{SEASON_TOP}/{NEXT_EPISODE}", 2000),
+                (f"{SEASON_TOP}/{BONUS_ONE}", 2000),
+                (f"{SEASON_TOP}/{BONUS_TWO}", 2000),
+                (f"{SEASON_TOP}/{BONUS_THREE}", 2000),
+            ],
+            "mixed",
+            SORTED_REMOTE,
+        ),
+    ],
+)
+@pytest.mark.anyio
+async def test_unknown_stored_kind_is_resolved_from_the_pushed_files(
+    tmp_path, transport, files, expect_kind, expect_remote
+):
+    """The push routes on the kind its bytes imply, exactly like the move stage."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        blob = _blob_of(files)
+        total = sum(size for _n, size in files)
+        display = files[0][0].rsplit("/", 1)[0] if "/" in files[0][0] else files[0][0]
+        coord = _push_coordinator(
+            store,
+            _push_cfg(),
+            live=[_vps1_torrent(blob, name=display, size=total)],
+            files=[],
+        )
+        ts = _row(
+            store, blob, name=display, size=total, kind="unknown", state=State.WAITING_INDEXER
+        )
+
+        started, why = await coord.start_source_push(ts)
+        assert started is True, why
+
+        request = _request_of(transport["start_copy"])
+        assert [f.name for f in request.files] == [n for n, _s in files]
+        # The remote the resolved kind routes to — movie/season/mixed sorted,
+        # a lone episode unsorted — never the default "unknown" one.
+        assert request.target_remote == expect_remote
+        expected = decide_seed_layout(
+            kind=expect_kind,
+            target_names=[n for n, _s in files],
+            batches_total=0,
+            pinned_seed_subdir="",
+            racing_wrapper="",
+            remote_default=SORTED_REMOTE,
+            remote_unsorted=UNSORTED_REMOTE,
+        )
+        assert request.target_remote == expected.target_remote
+        assert store.get(_hash_of(blob)).classification_kind == expect_kind
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_push_pins_the_derived_kind_with_a_narrow_write(tmp_path, transport, monkeypatch):
+    """The derived kind reaches the STORE, so later stages need not re-derive.
+
+    Asserted on the row as re-read, not on the in-memory snapshot: the handover,
+    the indexer retry and a restart all read it back. The write must stay
+    narrow and version-guarded — a whole-row upsert of the snapshot the push
+    read before its awaits would replay stale columns over any transition that
+    raced it, and would invalidate the `seed_subdir` pin made right after.
+    """
+    store = StateStore(tmp_path / "state.db")
+    writes = _narrow_writes(store, monkeypatch)
+    try:
+        blob = _wrapped_blob(MOVIE_TOP, [(MOVIE_NAME, 2000)])
+        coord = _push_coordinator(
+            store, _push_cfg(), live=[_vps1_torrent(blob, name=MOVIE_TOP, size=2000)], files=[]
+        )
+        ts = _row(
+            store, blob, name=MOVIE_TOP, size=2000, kind="unknown", state=State.WAITING_INDEXER
+        )
+        revision = ts.version
+
+        started, why = await coord.start_source_push(ts)
+        assert started is True, why
+
+        assert _request_of(transport["start_copy"]).target_remote == SORTED_REMOTE
+        kinds = _kind_writes(writes)
+        assert kinds == [{"classification_kind": "movie"}]
+        assert writes.call_args_list[0].kwargs["expected_version"] == revision
+        fresh = store.get(_hash_of(blob))
+        assert fresh.classification_kind == "movie"
+        # The kind write kept the snapshot's revision in sync, so the layout
+        # pin of the same push still landed.
+        assert fresh.seed_subdir == MOVIE_TOP
+        assert fresh.version > revision
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_push_keeps_a_kind_admission_already_pinned(tmp_path, transport, monkeypatch):
+    """A real stored kind is final: no re-derivation, no churn, no rewrite."""
+    store = StateStore(tmp_path / "state.db")
+    writes = _narrow_writes(store, monkeypatch)
+    seen = _classify_spy(monkeypatch)
+    try:
+        # An episode-shaped blob on a row admission classified as a season
+        # pack: the pinned kind routes, exactly as the move stage's pin does.
+        blob = _wrapped_blob(EPISODE_TOP, [(EPISODE_NAME, 2000)])
+        coord = _push_coordinator(
+            store,
+            _push_cfg(),
+            live=[_vps1_torrent(blob, name=EPISODE_TOP, size=2000, progress=0.2)],
+            files=[TorrentFile(f"{EPISODE_TOP}/{EPISODE_NAME}", 2000, progress=1.0)],
+        )
+        ts = _row(
+            store, blob, name=EPISODE_TOP, size=2000, kind="season", state=State.WAITING_INDEXER
+        )
+
+        started, why = await coord.start_source_push(ts)
+        assert started is True, why
+
+        assert _request_of(transport["start_copy"]).target_remote == SORTED_REMOTE
+        assert seen == []
+        assert _kind_writes(writes) == []
+        assert store.get(_hash_of(blob)).classification_kind == "season"
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_push_routes_unsorted_when_classification_fails(tmp_path, transport, monkeypatch):
+    """Fail-closed: an unusable classification keeps today's routing and the push."""
+    store = StateStore(tmp_path / "state.db")
+    writes = _narrow_writes(store, monkeypatch)
+
+    def _unavailable(_files, _cfg):
+        raise RuntimeError("classifier unavailable")
+
+    monkeypatch.setattr(coordinator_module, "classify", _unavailable)
+    try:
+        blob = _wrapped_blob(MOVIE_TOP, [(MOVIE_NAME, 2000)])
+        coord = _push_coordinator(
+            store, _push_cfg(), live=[_vps1_torrent(blob, name=MOVIE_TOP, size=2000)], files=[]
+        )
+        ts = _row(
+            store, blob, name=MOVIE_TOP, size=2000, kind="unknown", state=State.WAITING_INDEXER
+        )
+
+        # No exception escapes into the caller, and no third routing branch:
+        # the push still goes ahead with the answer it had before the fix.
+        started, why = await coord.start_source_push(ts)
+        assert started is True, why
+
+        assert _request_of(transport["start_copy"]).target_remote == UNSORTED_REMOTE
+        assert _kind_writes(writes) == []
+        assert store.get(_hash_of(blob)).classification_kind == "unknown"
     finally:
         store.close()
 

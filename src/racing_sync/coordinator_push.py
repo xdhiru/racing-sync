@@ -20,7 +20,11 @@ Contract this module keeps:
 * **one shared layout rule.** The target comes from
   ``seed_layout.decide_seed_layout`` with ``batches_total=0``, i.e. an
   episode pushed from VPS1 lands exactly where the same episode moved from
-  VPS2 would; that is the whole point of the extraction.
+  VPS2 would; that is the whole point of the extraction. The kind it routes
+  on is the one the pushed names classify to — a pushed row is parked before
+  admission, so its stored ``classification_kind`` is still the schema
+  default ``"unknown"`` — and that derived kind is pinned on the row so the
+  stages after the push agree with where the bytes actually went.
 * **clean refusals.** `start_source_push` returns (started, one-line reason)
   instead of raising, because its callers (a Telegram command, an /act
   button, the indexer-timeout fallback, the janitor-pressure sweep) must all
@@ -688,9 +692,15 @@ class PushMixin:
         SSD batches, so `batches_total=0` and the names come from the blob.
         An episode therefore lands in `remote_unsorted` with the same pinned
         top folder as an episode moved from VPS2 would.
+
+        The kind is the one the pushed bytes imply, never the one the row
+        happens to carry (see `_push_resolve_kind`): a pushed row is parked in
+        WAITING_INDEXER BEFORE admission, so its stored `classification_kind`
+        is the schema default "unknown", and routing on that would send every
+        push — a movie included — to the unsorted remote.
         """
         names = [f.name for f in files]
-        kind = str(getattr(ts, "classification_kind", "") or "")
+        kind = self._push_resolve_kind(ts, files)
         pinned = str(getattr(ts, "seed_subdir", "") or "").strip()
         racing_wrapper = ""
         if not common_top(names) and is_flat(names) and not pinned:
@@ -706,6 +716,71 @@ class PushMixin:
         )
         await self._pin_seed_subdir(ts, layout.seed_subdir)
         return layout
+
+    def _push_resolve_kind(self, ts: TorrentState, files: Sequence[PushFile]) -> str:
+        """The routing kind for this push, deriving and pinning it when needed.
+
+        `classification_kind` is only pinned by admission/move
+        (`coordinator_admit_fuse` / `coordinator_move`), so a row that is
+        waiting for an indexer — which is exactly what a push takes over —
+        still carries the schema default "unknown". `route_kind_is_sorted`
+        reads that as unsorted, so the push would misroute the content the
+        row's own bytes describe. Derive the kind from the very file list
+        being pushed, with the classifier the fuse path uses, and write it
+        back so the later stages agree with where the bytes went instead of
+        re-deriving from a different listing.
+
+        Fail-closed: nothing usable (a raise, an empty list, "unknown") keeps
+        today's answer — "unknown", i.e. the unsorted remote — and a row that
+        already carries a real kind is never reclassified.
+        """
+        stored = str(getattr(ts, "classification_kind", "") or "").strip().lower()
+        if stored not in ("", "unknown"):
+            return stored
+        derived = self._push_classify_kind(ts, files)
+        if not derived:
+            return "unknown"
+        self._push_pin_kind(ts, derived)
+        return derived
+
+    def _push_classify_kind(self, ts: TorrentState, files: Sequence[PushFile]) -> str:
+        """The classifier's kind for these names, "" when it has no usable answer."""
+        try:
+            # Patched in tests as racing_sync.coordinator.classify; resolve
+            # through the coordinator namespace (the fuse/move precedent).
+            from . import coordinator as _coordinator
+
+            derived = str(_coordinator.classify(files, getattr(self, "cfg", None)).kind or "")
+        except Exception as e:  # noqa: BLE001
+            log.debug(
+                "push layout: no classification for %s, routing as unknown: %s",
+                str(getattr(ts, "source_infohash", ""))[:10],
+                e,
+            )
+            return ""
+        derived = derived.strip().lower()
+        return "" if derived == "unknown" else derived
+
+    def _push_pin_kind(self, ts: TorrentState, kind: str) -> None:
+        """Pin a derived kind on the row; best-effort, never raises into the push.
+
+        Narrow and version-guarded, exactly like `_pin_seed_subdir` right
+        below: this runs after awaits, and a whole-row upsert would replay a
+        stale snapshot over a concurrent transition (and invalidate its own
+        revision). Losing the race only means the next stage re-derives.
+        """
+        try:
+            ts.classification_kind = kind
+            store = getattr(self, "store", None)
+            if not callable(getattr(store, "update_columns", None)):
+                return
+            rev = store.update_columns(
+                ts.source_infohash, {"classification_kind": kind}, expected_version=ts.version
+            )
+            if rev:
+                ts.version = rev
+        except Exception:  # noqa: BLE001
+            pass
 
     def _push_remote_default(self) -> str:
         try:
