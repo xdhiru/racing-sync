@@ -128,7 +128,9 @@ explicit modes: `require_size=True` for deferral/election (two unsized
 releases must not defer forever), `allow_unknown=False` for destructive
 grouping (name-only evidence never deletes). `watchdir.parse_torrent` is the
 one `.torrent` parser (v1 SHA-1, v2 SHA-256, hybrid; v2-only is refused
-because the pipeline is v1-keyed).
+because the pipeline is v1-keyed). Racing bytes are hash-validated against
+the requested infohash before use: the row blob is the download torrent, so
+returning it unvalidated would re-add the wrong hash.
 
 **Fuse verification.** `fuse_gate.verify_blob_on_mount` returns
 `mount_ok` / `expected` / `missing`, with `confirm=True` re-probing once

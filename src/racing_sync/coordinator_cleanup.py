@@ -1615,7 +1615,6 @@ class CleanupMixin:
             injected = {h.lower() for h in ts.injected_private_hashes.split(",") if h}
         except Exception:  # noqa: BLE001
             injected = set()
-        src_low = (ts.source_infohash or "").lower()
         store = getattr(self, "store", None)
         member_hashes = {str(getattr(m, "infohash", "") or "").lower() for m in (group or [])}
         member_hashes.discard("")
@@ -1639,20 +1638,11 @@ class CleanupMixin:
                     h[:10],
                 )
             blob: bytes | None = None
-            # The row's own bytes are the authoritative copy for its source
-            # hash (and lighter than a fan-out fetch per group member).
-            if h and h == src_low:
-                cand = getattr(ts, "cross_seed_blob", None)
-                if isinstance(cand, (bytes, bytearray)) and cand:
-                    blob = bytes(cand)
-            if blob is None and h and store is not None:
-                try:
-                    cand = await asyncio.to_thread(store.get_blob, h)
-                    if isinstance(cand, (bytes, bytearray)) and cand:
-                        blob = bytes(cand)
-                except Exception:  # noqa: BLE001
-                    blob = None
-            if blob is None and h:
+            # The row's cross_seed_blob is the DOWNLOAD torrent for private
+            # releases, not the racing torrent. Never use it here: caching it
+            # under the racing hash made every later re-inject add the wrong
+            # torrent (the seedpool copy) and the racing seed never appeared.
+            if h:
                 try:
                     blob = await self._load_racing_torrent_bytes(h)
                 except Exception as e:  # noqa: BLE001

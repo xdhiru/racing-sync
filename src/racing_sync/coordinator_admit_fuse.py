@@ -293,7 +293,7 @@ class FuseAdmitMixin:
                     # them once (the same call the pick would make later)
                     # and cache them for the admit tail.
                     try:
-                        blob = await self._fetch_racing_torrent_bytes(h)
+                        blob = await self._load_racing_torrent_bytes(h)
                     except Exception:
                         blob = None
                     if blob:

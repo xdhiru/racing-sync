@@ -171,6 +171,23 @@ class FuseEntryMixin:
                 )
             return None
 
+    @staticmethod
+    def _blob_matches_infohash(blob: bytes, infohash: str) -> bool | None:
+        """True/False when decodable; None when the bytes are not a torrent.
+
+        Racing-torrent blobs are looked up by their own hash. The row-level
+        blob is the *download* torrent (a different hash for private
+        releases), so an unvalidated row-blob hit would re-add the download
+        torrent under the racing hash and make the racing seed invisible.
+        """
+        try:
+            from .watchdir import _bencoded_info_hash
+
+            v1, _name, _size, _announce = _bencoded_info_hash(bytes(blob))
+        except Exception:
+            return None
+        return (v1 or "").lower() == (infohash or "").lower()
+
     async def _load_racing_torrent_bytes(self, infohash: str) -> bytes | None:
         """Load a racing torrent's raw .torrent bytes, DB first.
 
@@ -179,6 +196,11 @@ class FuseEntryMixin:
         gone. The DB copy (preserved by the janitor, or cached by an earlier
         fetch) is therefore authoritative when present; only a miss falls
         back to VPS1 via `_fetch_racing_torrent_bytes`.
+
+        Every DB candidate is matched against the requested infohash. The
+        row-scoped blob is the download/cross-seed torrent, not the racing
+        torrent, so returning it unvalidated re-adds the wrong hash and the
+        racing seed never appears. A poisoned cache entry is dropped.
 
         Test doubles return a MagicMock from `get_blob`: only a non-empty
         bytes value counts as a hit, never a mock.
@@ -192,19 +214,52 @@ class FuseEntryMixin:
             log.warning("_load_racing_torrent_bytes: skipping invalid infohash %r", infohash)
             return None
         h = infohash.lower()
+        store = None
         try:
             store = getattr(self, "store", None)
-            if store is not None:
-                # Row-independent cache first (sibling racing torrents have
-                # no row of their own), then the row blob, then VPS1.
-                for reader in (store.get_racing_blob, store.get_blob):
+        except Exception:
+            store = None
+        if store is not None:
+            for reader, is_racing_cache in (
+                (store.get_racing_blob, True),
+                (store.get_blob, False),
+            ):
+                try:
                     blob = await asyncio.to_thread(reader, h)
-                    if isinstance(blob, (bytes, bytearray)) and blob:
-                        return bytes(blob)
+                except Exception as e:  # noqa: BLE001
+                    # A DB miss/read error is not fatal: VPS1 may still have
+                    # the bytes.
+                    log.warning(
+                        "_load_racing_torrent_bytes: blob read failed for %s: %s", h[:10], e
+                    )
+                    continue
+                if not isinstance(blob, (bytes, bytearray)) or not blob:
+                    continue
+                candidate = bytes(blob)
+                matched = self._blob_matches_infohash(candidate, h)
+                if matched is True:
+                    return candidate
+                if is_racing_cache:
+                    try:
+                        await asyncio.to_thread(store.delete_racing_blob, h)
+                    except Exception:  # noqa: BLE001
+                        pass
+                log.warning(
+                    "_load_racing_torrent_bytes: cached bytes for %s are a different "
+                    "torrent; ignoring them",
+                    h[:10],
+                )
+        try:
+            blob = await self._fetch_racing_torrent_bytes(infohash)
         except Exception as e:  # noqa: BLE001
-            # A DB miss/read error is not fatal: VPS1 may still have the bytes.
-            log.warning("_load_racing_torrent_bytes: blob read failed for %s: %s", h[:10], e)
-        return await self._fetch_racing_torrent_bytes(infohash)
+            log.warning("_load_racing_torrent_bytes: fetch failed for %s: %s", h[:10], e)
+            return None
+        if not blob:
+            return None
+        try:
+            return bytes(blob)
+        except Exception:
+            return None
 
     @staticmethod
     def _expected_fuse_files(blob: bytes | None) -> list[tuple[str, int]] | None:

@@ -68,6 +68,28 @@ def _fuse_seed(h: str, save_path: str = "/mnt/fuse") -> Torrent:
     )
 
 
+def _torrent_bytes(name: str = NAME, size: int = SIZE) -> bytes:
+    from racing_sync.watchdir import _bencode
+
+    return _bencode(
+        {
+            b"announce": b"http://tracker.example/announce",
+            b"info": {
+                b"name": name.encode(),
+                b"length": size,
+                b"piece length": 16384,
+                b"pieces": b"0" * 20,
+            },
+        }
+    )
+
+
+def _hash_of(blob: bytes) -> str:
+    from racing_sync.watchdir import _bencoded_info_hash
+
+    return _bencoded_info_hash(blob)[0].lower()
+
+
 def _member(h: str = H) -> Torrent:
     return Torrent(
         hash=h,
@@ -290,20 +312,19 @@ async def test_dry_run_checks_readability_without_writing(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_source_member_prefers_the_row_blob(tmp_path: Path):
-    """The row's own bytes win for its source hash (no fetch, no update)."""
+async def test_source_member_uses_the_racing_loader(tmp_path: Path):
+    """Racing bytes always come through the hash-validated loader."""
     store = StateStore(tmp_path / "state.db")
     try:
         ts = _row(store)
-        ts.cross_seed_blob = BLOB
         coord = _coord(store, _FakeSource([_member()]), _cleanup_cfg())
-        coord._load_racing_torrent_bytes = AsyncMock(return_value=None)
+        coord._load_racing_torrent_bytes = AsyncMock(return_value=BLOB)
         store.set_racing_blob = MagicMock(wraps=store.set_racing_blob)
 
         ok = await coord._cleanup_preserve_racing_blobs(ts, [_member()], dry_run=False)
 
         assert ok is True
-        coord._load_racing_torrent_bytes.assert_not_awaited()
+        coord._load_racing_torrent_bytes.assert_awaited_once_with(H)
         store.set_racing_blob.assert_called_once_with(H, BLOB)
     finally:
         store.close()
@@ -311,18 +332,65 @@ async def test_source_member_prefers_the_row_blob(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_loader_prefers_db_blob(tmp_path: Path):
-    """A persisted blob is returned without touching VPS1."""
+    """A persisted racing blob is returned without touching VPS1."""
+    racing = _torrent_bytes()
+    h = _hash_of(racing)
     store = StateStore(tmp_path / "state.db")
     try:
-        _row(store)
-        assert store.set_racing_blob(H, BLOB) is True
+        _row(store, infohash=h)
+        assert store.set_racing_blob(h, racing) is True
         coord = make_coordinator(store=store, cfg=AppConfig.from_toml(FIXTURES / "minimal.toml"))
         coord._fetch_racing_torrent_bytes = AsyncMock(return_value=b"other")
 
-        got = await coord._load_racing_torrent_bytes(H)
+        got = await coord._load_racing_torrent_bytes(h)
 
-        assert got == BLOB
+        assert got == racing
         coord._fetch_racing_torrent_bytes.assert_not_awaited()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_loader_rejects_row_download_blob_for_the_source_hash(tmp_path: Path):
+    """The row blob is the download torrent, not the racing torrent.
+
+    Returning it made re-inject add the seedpool download under the racing
+    hash; qB stored the download's own hash, so the racing entry never
+    appeared and the racing seed was never created.
+    """
+    racing = _torrent_bytes()
+    h = _hash_of(racing)
+    download = _torrent_bytes(name="Example.Download.S01E01.mkv", size=SIZE + 1)
+    assert _hash_of(download) != h
+    store = StateStore(tmp_path / "state.db")
+    try:
+        _row(store, infohash=h)
+        assert store.set_blob(h, download) is True
+        coord = make_coordinator(store=store, cfg=AppConfig.from_toml(FIXTURES / "minimal.toml"))
+        coord._fetch_racing_torrent_bytes = AsyncMock(return_value=racing)
+
+        got = await coord._load_racing_torrent_bytes(h)
+
+        assert got == racing
+        coord._fetch_racing_torrent_bytes.assert_awaited_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_loader_drops_a_poisoned_racing_cache(tmp_path: Path):
+    racing = _torrent_bytes()
+    h = _hash_of(racing)
+    download = _torrent_bytes(name="Example.Download.S01E01.mkv", size=SIZE + 1)
+    store = StateStore(tmp_path / "state.db")
+    try:
+        _row(store, infohash=h)
+        assert store.set_racing_blob(h, download) is True
+        coord = make_coordinator(store=store, cfg=AppConfig.from_toml(FIXTURES / "minimal.toml"))
+        coord._fetch_racing_torrent_bytes = AsyncMock(return_value=racing)
+
+        assert await coord._load_racing_torrent_bytes(h) == racing
+        assert store.get_racing_blob(h) == b""
     finally:
         store.close()
 
@@ -345,13 +413,15 @@ async def test_loader_falls_back_to_vps1_on_db_miss(tmp_path: Path):
 @pytest.mark.anyio
 async def test_loader_ignores_mock_blob(tmp_path: Path):
     """Test doubles return a Mock from get_blob; never treat it as bytes."""
+    racing = _torrent_bytes()
+    h = _hash_of(racing)
     store = MagicMock()
     coord = make_coordinator(store=store, cfg=AppConfig.from_toml(FIXTURES / "minimal.toml"))
-    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=BLOB)
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=racing)
 
-    got = await coord._load_racing_torrent_bytes(H)
+    got = await coord._load_racing_torrent_bytes(h)
 
-    assert got == BLOB
+    assert got == racing
     assert isinstance(store.get_blob.return_value, MagicMock)
     coord._fetch_racing_torrent_bytes.assert_awaited_once()
 
@@ -382,15 +452,18 @@ async def test_racing_blob_cache_needs_no_state_row(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_loader_prefers_racing_cache_over_row_blob(tmp_path: Path):
+    racing = _torrent_bytes()
+    h = _hash_of(racing)
+    download = _torrent_bytes(name="Example.Download.S01E01.mkv", size=SIZE + 1)
     store = StateStore(tmp_path / "state.db")
     try:
-        _row(store)
-        assert store.set_blob(H, b"row-copy") is True
-        assert store.set_racing_blob(H, BLOB) is True
+        _row(store, infohash=h)
+        assert store.set_blob(h, download) is True
+        assert store.set_racing_blob(h, racing) is True
         coord = make_coordinator(store=store, cfg=AppConfig.from_toml(FIXTURES / "minimal.toml"))
         coord._fetch_racing_torrent_bytes = AsyncMock(return_value=b"vps1")
 
-        assert await coord._load_racing_torrent_bytes(H) == BLOB
+        assert await coord._load_racing_torrent_bytes(h) == racing
         coord._fetch_racing_torrent_bytes.assert_not_awaited()
     finally:
         store.close()
