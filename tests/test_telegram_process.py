@@ -530,6 +530,8 @@ async def test_bot_command_menu_lists_add(tmp_path):
         "cancel_all",
         "cancel_lane",
         "cancel_stalled",
+        "clean",
+        "cleanup",
         "files",
         "find",
         "force",

@@ -771,7 +771,16 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                     note = _wn(ts) or ""
         except Exception:
             note = ""
-        text = render_detail(ts, progress, note)
+        cleanup_hint = ""
+        try:
+            _hint_fn = getattr(getattr(self, "_coord", None), "_cleanup_hint", None)
+            if callable(_hint_fn):
+                _hint = _hint_fn(ts)
+                if isinstance(_hint, str):
+                    cleanup_hint = _hint
+        except Exception:
+            cleanup_hint = ""
+        text = render_detail(ts, progress, note, cleanup_hint)
         # Grace-held rows are actionable: offer the override inline so
         # the operator doesn't have to remember the command shape
         # (now starts this copy at once with its starting bytes).

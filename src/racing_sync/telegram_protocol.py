@@ -106,6 +106,14 @@ ADD_CMD_RE = re.compile(r"^/add(?:@[\w_]+)?\b")
 #: Optional `@bot` suffix; no argument.
 TICK_RE = re.compile(r"^/tick(?:@[\w_]+)?\s*$")
 
+#: `/cleanup` — run one VPS1 cleanup pass now (no argument). Skips only
+#: the startup-delay/cadence gates; every safety/grace rule still applies.
+CLEANUP_RE = re.compile(r"^/cleanup(?:@[\w_]+)?\s*$")
+
+#: `/clean <target>` — clean one completed (DONE) row's VPS1 copy now.
+#: Manual intent bypasses grace/idle but keeps every safety check.
+CLEAN_RE = re.compile(r"^/clean(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
 #: `/active` — send a fresh Active Tasks card now (recovery when the
 #: long-lived card went missing or was deleted from the chat).
 #: Optional `@bot` suffix; no argument.
@@ -448,6 +456,16 @@ async def _cmd_add(bot, match, message):
     await bot._process_document_command(message)
 
 
+async def _cmd_cleanup(bot, match, message):
+    """`/cleanup`: run one VPS1 cleanup pass now."""
+    await bot._cleanup_now_command(message)
+
+
+async def _cmd_clean(bot, match, message):
+    """`/clean_<hash>`: clean one completed row's VPS1 copy now."""
+    await bot._clean_task_command((match.group(1) or "").lower(), message)
+
+
 async def _cmd_find(bot, match, message):
     """`/find <text>`: read-only Prowlarr search readout."""
     from .telegram_views import _size_compact
@@ -527,6 +545,8 @@ _COMMAND_USAGE: dict[str, str] = {
     "files": "/files <group number or hash> — list its files (read-only)",
     "cancel_all": "/cancel_all <text> — cancel every group whose title contains the text",
     "find": "/find <text> — search the download-target indexers (read-only)",
+    "cleanup": "/cleanup — run the VPS1 cleanup pass now",
+    "clean": "/clean <hash> — clean a completed task's VPS1 copy now",
 }
 
 
@@ -556,6 +576,8 @@ _CHAT_COMMANDS: tuple = (
     _ChatCommand("cancel_all", CANCEL_ALL_RE, _cmd_cancel_match),
     _ChatCommand("cancel_lane", CANCEL_LANE_RE, _cmd_cancel_status),
     _ChatCommand("cancel_stalled", CANCEL_STALLED_RE, _cmd_cancel_stalled),
+    _ChatCommand("cleanup", CLEANUP_RE, _cmd_cleanup),
+    _ChatCommand("clean", CLEAN_RE, _cmd_clean),
     _ChatCommand("start", START_CMD_RE, _cmd_group("now")),
     _ChatCommand("force", FORCE_CMD_RE, _cmd_group("forcestart")),
     _ChatCommand("hold", HOLD_CMD_RE, _cmd_group("skip")),
@@ -995,7 +1017,7 @@ def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
     Shapes: `<cmd>:<40hex>`, `<cmd>:all:<40hex>`,
     `<cmd>:<40hex>:yes|no`, `<cmd>:all:<40hex>:yes|no` (keep/inject),
     `forget:<scope>`, `forget:<scope>:<0|1>`,
-    `keep:<scope>:<0|1>:<yes|no>`, `abort`, bulk-match scopes
+    `keep:<scope>:<0|1>:<yes|no>`, `clean:<40hex>`, `abort`, bulk-match scopes
     `forget:match:<tok>:<0|1>` / `keep:match:<tok>:<0|1>:<yes|no>`
     (`<tok>` = base64url query, `match:<tok>` in the hash slot) and the
     predicate scope `forget:stalled:<0|1>` /
@@ -1010,7 +1032,15 @@ def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
         parts = str(data or "").split(":")
         if parts == ["abort"]:
             return ("abort", False, "", "", None)
-        if len(parts) == 2 and parts[0] in ("go", "cancel", "inject", "skip", "resume", "forget"):
+        if len(parts) == 2 and parts[0] in (
+            "go",
+            "cancel",
+            "inject",
+            "skip",
+            "resume",
+            "forget",
+            "clean",
+        ):
             if _is_hex40(parts[1]):
                 return (parts[0], False, parts[1].lower(), "", None)
         if (
@@ -1127,6 +1157,14 @@ def _bot_command_menu() -> list:
             BotCommand(
                 "cancel_stalled",
                 "Cancel every download with no seeders and no progress",
+            ),
+            BotCommand(
+                "clean",
+                "Clean a completed task's VPS1 copy now — /clean <hash>",
+            ),
+            BotCommand(
+                "cleanup",
+                "Run the VPS1 cleanup pass now",
             ),
             BotCommand(
                 "files",

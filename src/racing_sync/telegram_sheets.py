@@ -64,6 +64,23 @@ class SheetsMixin:
                     _free_any = True
         except Exception:
             pass
+        # Manual VPS1 cleanup is only meaningful for a completed group and
+        # only when the janitor is enabled at all (the coordinator's own
+        # gates still re-check everything at tap time).
+        _done_any = False
+        try:
+            _done_any = any(getattr(_ts, "state", None) == State.DONE for _ts in members or [])
+        except Exception:
+            _done_any = False
+        _cleanup_on = False
+        if _done_any:
+            try:
+                _cfg = getattr(self, "cfg", None)
+                if _cfg is None:
+                    _cfg = getattr(getattr(self, "_coord", None), "cfg", None)
+                _cleanup_on = bool(getattr(getattr(_cfg, "cleanup", None), "enabled", False))
+            except Exception:
+                _cleanup_on = False
         _inject_ok = False
         try:
             for _ts in members or []:
@@ -89,6 +106,8 @@ class SheetsMixin:
             _maker.add("⏭ Skip release (pause downloads)", f"skip:all:{_leader}").newline()
         if _held_any and _leader:
             _maker.add("⏪ Resume release (restart it)", f"resume:all:{_leader}").newline()
+        if _done_any and _cleanup_on and _leader:
+            _maker.add("🧹 Clean VPS1 copies", f"clean:{_leader}").newline()
         _maker.add("Close", "abort")
         _text = (
             f"{_tspec}"

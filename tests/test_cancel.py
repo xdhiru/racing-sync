@@ -1195,7 +1195,7 @@ def test_chat_command_registry_covers_all_verbs():
     from racing_sync.telegram_bot import _CHAT_COMMANDS
 
     names = [c.name for c in _CHAT_COMMANDS]
-    assert len(names) == len(set(names)) == 19
+    assert len(names) == len(set(names)) == 21
     for c in _CHAT_COMMANDS:
         assert callable(c.pattern.match)
         assert callable(c.handle)
@@ -1209,6 +1209,10 @@ def test_chat_command_registry_covers_all_verbs():
         "/cancel_all evil show": ["cancel_all"],
         "/cancel_all": ["cancel_all"],
         "/cancel_stalled": ["cancel_stalled"],
+        "/cleanup": ["cleanup"],
+        "/cleanup@my_bot": ["cleanup"],
+        "/clean 0123abcd": ["clean"],
+        "/clean_0123abcd": ["clean"],
         "/start abcdef12": ["start"],
         "/start_abcdef12": ["start"],
         "/force abcdef12": ["force"],
@@ -1251,6 +1255,9 @@ def test_chat_command_registry_covers_all_verbs():
         "/cancel_lanex",
         "/cancel_allx",
         "/cancel_stalledx",
+        "/cleanupx",
+        "/clean_",
+        "/clean_x",
         "/pausex",
         "/statsx",
         "/findx",

@@ -122,6 +122,15 @@ class RouterMixin:
                 await _say(result)
                 await _refresh()
                 return
+            if cmd == "clean" and _h and not _choice:
+                # Manual per-task VPS1 cleanup from the act sheet. The
+                # command replies itself (no sheet to thread a reply to).
+                try:
+                    await self._clean_task_command(_h, None)
+                except Exception as e:  # noqa: BLE001
+                    await _say(_action_error_text(e))
+                await _refresh()
+                return
             if cmd == "cancel" and _h and not _choice:
                 # First question is remember-or-not (keep/delete follows);
                 # the scope travels in the buttons, nothing is stored.
@@ -523,6 +532,7 @@ class RouterMixin:
             or data.startswith("cancel:")
             or data.startswith("skip:")
             or data.startswith("resume:")
+            or data.startswith("clean:")
         ):
             if _slow_tap(data):
                 # Feedback first: the execution below can outlive the tap

@@ -346,11 +346,17 @@ def _retry_minutes(ts: TorrentState) -> int | None:
     return max(1, round(_retry_s / 60))
 
 
-def render_detail(ts: TorrentState, progress: float | None = None, note: str = "") -> str:
+def render_detail(
+    ts: TorrentState,
+    progress: float | None = None,
+    note: str = "",
+    cleanup: str = "",
+) -> str:
     """Per-torrent detail message (edited in place as state advances).
 
     `note` is an optional one-line extra (e.g. why a NEW row is waiting)
-    rendered after the state-specific lines.
+    rendered after the state-specific lines. `cleanup` is the janitor's
+    "clean ready"/"clean ~2h" hint for DONE rows.
     """
     icon = _STATE_ICON.get(ts.state, ts.state.value.upper())
     name, size, full_hash = _row_text_bits(ts)
@@ -407,6 +413,8 @@ def render_detail(ts: TorrentState, progress: float | None = None, note: str = "
             lines.append("Re-adding on fuse mount")
     elif ts.state == State.DONE:
         lines.append("✓ Seeded from fuse mount")
+        if cleanup:
+            lines.append(f"VPS1 cleanup: {_esc(cleanup)}")
     elif ts.state == State.FAILED:
         from .logging_setup import sanitize_log_text as _san
 
@@ -776,6 +784,7 @@ def render_active(
     footer: str = "",
     speeds: dict[str, int] | None = None,
     move_progress: dict[str, object] | None = None,
+    cleanup: dict[str, str] | None = None,
 ) -> tuple[str, int, int]:
     """Render paginated active tasks, grouped by file for mobile width.
 
@@ -795,6 +804,9 @@ def render_active(
     maps source_infohash -> one-line extra shown on that tracker's line.
     `move_progress` maps lowercase infohash -> RcloneProgress for MOVING
     rows (live rclone line); absent/stale entries render plainly.
+    `cleanup` maps lowercase infohash -> cleanup hint (``clean ~5h`` /
+    ``clean ready``) appended to that row's stage text; empty/absent
+    leaves the output unchanged.
 
     `footer` is an optional trailing line (e.g. storage stats) appended
     directly after (single newline, no blank gap); "" disables it.
@@ -865,6 +877,12 @@ def render_active(
             except Exception:
                 _mp = None
             state_text = _active_state_text(ts, progress, _note, _spd, move_progress=_mp)
+            try:
+                _clean_hint = (cleanup or {}).get((ts.source_infohash or "").lower(), "")
+            except Exception:
+                _clean_hint = ""
+            if _clean_hint:
+                state_text += f" · {_esc(str(_clean_hint))}"
             if domain_full:
                 lines.append(f"▸ {_esc(domain_full)} {state_text}")
             else:

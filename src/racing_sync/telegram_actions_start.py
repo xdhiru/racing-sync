@@ -234,6 +234,85 @@ class StartActionsMixin:
             members = list(_by_gid[1]) if _by_gid is not None else []
         return members, len(groups), by_number
 
+    async def _cleanup_now_command(self, message: Any) -> None:
+        """Run one VPS1 cleanup pass now (`/cleanup`).
+
+        A burst pass can take minutes (staggered deletions), so it runs as
+        a background task: awaiting it inline would stall update polling and
+        invite Telegram retries. The coordinator owns the gates and the
+        summary; this relays the reply and refreshes the active card.
+        """
+        coord = getattr(self, "_coord", None)
+        runner = getattr(coord, "_cleanup_now_command", None)
+        if coord is None or not callable(runner):
+            try:
+                await self._reply("Action failed: bot not attached.", reply_to=message)
+            except Exception:
+                pass
+            return
+
+        async def _run() -> None:
+            try:
+                text = await runner(message)
+            except Exception as e:  # noqa: BLE001
+                text = _action_error_text(e)
+            try:
+                await self._reply(str(text)[:300], reply_to=message)
+            except Exception:
+                pass
+            try:
+                self._last_active_cache = None
+                await self._refresh_active_message()
+            except Exception:
+                pass
+
+        prev = getattr(self, "_cleanup_task", None)
+        if prev is not None and not prev.done():
+            try:
+                await self._reply(
+                    "Cleanup already running; its result will follow.",
+                    reply_to=message,
+                )
+            except Exception:
+                pass
+            return
+        try:
+            self._cleanup_task = asyncio.create_task(_run())
+        except Exception as e:  # noqa: BLE001
+            try:
+                await self._reply(_action_error_text(e), reply_to=message)
+            except Exception:
+                pass
+
+    async def _clean_task_command(self, target: str, message: Any = None) -> None:
+        """Clean one completed task's VPS1 copy now (`/clean_<hash>`).
+
+        Works without a message object (act-sheet button): the reply goes
+        to the chat without a `reply_to`. The coordinator resolves the
+        row and runs every safety check; dry-run deletes nothing.
+        """
+        coord = getattr(self, "_coord", None)
+        runner = getattr(coord, "_clean_task_command", None)
+        if coord is None or not callable(runner):
+            try:
+                await self._reply("Action failed: bot not attached.", reply_to=message)
+            except Exception:
+                pass
+            return
+        try:
+            text = await runner((target or "").strip().lower())
+        except Exception as e:  # noqa: BLE001
+            text = _action_error_text(e)
+        try:
+            await self._reply(str(text)[:300], reply_to=message)
+        except Exception:
+            pass
+        try:
+            self._last_active_cache = None
+            await self._refresh_active_message()
+        except Exception:
+            pass
+
     async def _act_command_entry(self, token: str, message: Any) -> None:
         """Reply with the action sheet for a content group.
 
@@ -321,6 +400,16 @@ class StartActionsMixin:
                 _text, _rows = self._sheet_text_and_rows(
                     members, title, getattr(members[0], "total_bytes", 0) if members else 0, notes
                 )
+                # Cleanup ETA for the group leader: only meaningful for a
+                # DONE row in an enabled deployment (`_cleanup_hint` returns
+                # "" otherwise), so the sheet stays unchanged everywhere else.
+                try:
+                    _hint_fn = getattr(getattr(self, "_coord", None), "_cleanup_hint", None)
+                    _hint = _hint_fn(members[0]) if callable(_hint_fn) else ""
+                except Exception:
+                    _hint = ""
+                if isinstance(_hint, str) and _hint:
+                    _text = f"{_text}\nCleanup: {_hint}"
                 if _gen_warn:
                     _text = _gen_warn + _text
             except Exception as e:  # noqa: BLE001
