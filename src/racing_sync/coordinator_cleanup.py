@@ -26,6 +26,7 @@ import asyncio
 import datetime as dt
 import logging
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,12 @@ _EMERGENCY_WAKE_MIN_FLOOR_S = 15.0
 #: Fixed since `idle_confirm_minutes` left the config: the knob it used to read
 #: is now a REMOVED key, and the rule it served still applies.
 _MOVING_IDLE_CONFIRM_S = 45 * 60.0
+
+#: The reason prefix `rescue_vps1_room` returns when deletion could not close
+#: the gap but the push lane took the unsecured releases over. One spelling, so
+#: the caller can tell "relocating" (do NOT resume, report progress) apart from
+#: "nothing is possible" (today's warning) without re-deriving anything.
+_RESCUE_RELOCATING_PREFIX = "relocating, will retry"
 
 
 class CleanupMixin:
@@ -724,11 +731,16 @@ class CleanupMixin:
         Returns a one-line-friendly summary (also on every early-return
         path): `{"deleted", "candidates", "dry_run", "free", "free_after",
         "trigger", "target", "target_reached", "shortfall_bytes",
-        "eligible_remaining", "cap", "bursting", "reason"}` where `reason` is
+        "eligible_remaining", "cap", "bursting", "reason",
+        "relocate_requested", "relocate_note"}` where `reason` is
         only set when nothing ran ("no rows", "nothing eligible (activity 17,
         verification 3)", "no space needed yet: ... (waiting for space 12)"),
-        and `free`/`free_after`/`target` are None wherever the disk gave no
-        reading (never a guessed byte count).
+        `free`/`free_after`/`target` are None wherever the disk gave no
+        reading (never a guessed byte count), and `relocate_requested`/
+        `relocate_note` carry what the RELOCATION escape hatch (`_reclaim_request_pushes`)
+        did about the releases the sweep may not delete while the disk is still
+        short — a count of pushes started and the lane's own one-line answer,
+        verbatim.
         """
         now_utc = dt.datetime.now(dt.UTC)
         if arrivals is None:
@@ -784,6 +796,14 @@ class CleanupMixin:
             cap = max(1, int(getattr(cfg, cap_field, cap_default) or cap_default))
         except (TypeError, ValueError):
             cap = 10
+        # The acute/ordinary split for the relocation escape hatch: an emergency
+        # (the disk cannot land the next race) or the rescue lane's
+        # `target_override` is ACUTE, a plain top-up toward the band's target is
+        # ORDINARY. Derived here once, from state this pass already computed.
+        acute = bool(emergency) or target_override is not None
+        # What the relocation hatch did, merged into every summary that leaves
+        # this method short of room (`_relocate` is the only writer).
+        relocate: dict[str, Any] = {"relocate_requested": 0, "relocate_note": ""}
 
         def _summary(**over: Any) -> dict:
             out = {
@@ -800,9 +820,45 @@ class CleanupMixin:
                 "cap": cap,
                 "bursting": bursting,
                 "reason": "",
+                "relocate_requested": 0,
+                "relocate_note": "",
             }
             out.update(over)
             return out
+
+        async def _relocate(all_rows: object, present: set[str], short_by: int, note: str) -> None:
+            """Ask the push lane to relocate what the sweep may not delete.
+
+            Called ONLY when this pass is short of room AND cannot close the gap
+            with deletions, and only when every gate is open — a measured disk
+            (an unmeasurable one is never a claim, so nothing here is asked), a
+            live (not rehearsal) pass, `[cleanup].enabled` and the push lane's
+            own consent, all checked by `_reclaim_relocate_gate`. The hatch
+            deletes nothing: it converts unsecured VPS1 releases into deletable
+            ones on a later pass, or says why it could not.
+            """
+            if blind or dry_run:
+                return
+            if self._reclaim_relocate_gate():
+                return
+            started, line = await self._reclaim_request_pushes(
+                self._reclaim_rows_on_vps1(all_rows, present),
+                short_by,
+                why=note,
+                acute=acute,
+                pass_cap=cap,
+            )
+            relocate["relocate_requested"] = started
+            relocate["relocate_note"] = line
+            if not line:
+                return
+            if started:
+                log.info("cleanup janitor: %s", line)
+            else:
+                # One WARNING per pass, the lane's reason quoted as it came back:
+                # an unsecured release is never abandoned, forgotten or deleted
+                # for being in the way, so this line IS the operator's decision.
+                log.warning("cleanup janitor: %s", line)
 
         # No need for room, nothing to do: seeding VPS1 copies costs the disk
         # and buys the swarm time, so an idle day deletes nothing however old
@@ -894,13 +950,17 @@ class CleanupMixin:
             )
 
         try:
-            rows = [
-                ts for ts in await offload(self.store.all) if ts.state in (State.DONE, State.MOVING)
-            ]
+            _all_rows = list(await offload(self.store.all))
+            rows = [ts for ts in _all_rows if ts.state in (State.DONE, State.MOVING)]
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup: cannot list state rows: %s", e)
             return _summary(reason="cannot list state rows")
-        if not rows:
+        if not _all_rows:
+            # An EMPTY table is not "nothing eligible": there is no content on
+            # VPS1 this pass could relocate either, so it really is a no-op.
+            # Rows that are merely unsecured (no DONE/MOVING yet) fall through
+            # to the scan, because that is the case the relocation hatch exists
+            # for — the sweep has nothing to delete and the disk is full.
             return _summary(reason="no rows")
         try:
             src_torrents = await rpc(
@@ -971,7 +1031,18 @@ class CleanupMixin:
         if not candidates:
             reason = self._cleanup_blocked_reason(blocked, emergency=emergency is not None)
             log.info("cleanup janitor: %s", reason)
-            return _summary(reason=reason)
+            # Nothing deletable AND still short of room: the bytes in the way
+            # are unsecured ones, so this is exactly where relocation is asked
+            # for (and where its one WARNING line is earned).
+            short_by = max(0, target - int(free_bytes or 0)) if target else 0
+            if short_by > 0:
+                await _relocate(
+                    _all_rows,
+                    set(by_hash),
+                    short_by,
+                    "eligible secured inventory ran out, disk still short",
+                )
+            return _summary(reason=reason, shortfall_bytes=short_by, **relocate)
         # Every pass that reaches here is reclaiming, so the pressure order is
         # always the right one: DONE rows before MOVING rows (their content is
         # fully secured and normally already re-added), then biggest-first (a
@@ -1095,6 +1166,18 @@ class CleanupMixin:
                 self._cleanup_bytes_compact(target),
                 eligible_remaining,
             )
+        elif shortfall > 0:
+            # The pass deleted EVERY secured row it was allowed to and is still
+            # short (the cap did not stop it): ask the push lane to relocate the
+            # unsecured releases that are holding the disk full. A cap-stopped
+            # pass does not ask — its own deletions are not finished yet, and a
+            # relocation would compete with them.
+            await _relocate(
+                _all_rows,
+                set(by_hash),
+                shortfall,
+                "eligible secured inventory ran out, still short of the free-space target",
+            )
         return _summary(
             deleted=deleted,
             candidates=len(candidates),
@@ -1102,6 +1185,248 @@ class CleanupMixin:
             target_reached=shortfall <= 0,
             shortfall_bytes=shortfall,
             eligible_remaining=eligible_remaining,
+            **relocate,
+        )
+
+    # ------------------------------------------------------------- relocate
+    #
+    # The escape hatch for "the eligible inventory ran out". A space-driven pass
+    # can delete every secured row it is allowed to and STILL be short of the
+    # target, because the bytes VPS1 is most likely to be full of are exactly
+    # the ones the janitor may NOT delete: releases parked unsecured (no
+    # cross-seed found yet, or mid-pipeline). The answer is not deletion, it is
+    # RELOCATION — ask the push lane to copy those bytes onto the very remote
+    # VPS2 seeds from, which converts them into deletable content for a later
+    # pass. This capability only CHOOSES candidates and calls
+    # `coordinator_push.start_source_push`; every push rule (content
+    # completeness, the master switch, the concurrency budget, per-hash dedupe)
+    # stays in the lane, and so do its refusal reasons, which the pass reports
+    # verbatim so the operator sees the lane's own words rather than a
+    # paraphrase.
+    #
+    # What it NEVER does: delete, forget, abandon or resume anything. An
+    # unsecured release stays on VPS1 until either VPS2 has secured it or the
+    # push lane itself has PROVEN VPS1 holds it complete; the decision about
+    # content nobody has secured yet stays with the operator, and the only
+    # consequence of a failed relocation here is the one WARNING line.
+
+    #: Row states whose bytes still live on VPS1 and have NOT been secured on
+    #: VPS2 — the unsecured inventory relocation may convert. DONE/MOVING are
+    #: the sweep's own business (secured, or being secured right now) and the
+    #: push lane refuses them outright (`_PUSH_UNTOUCHABLE`, same for
+    #: DOWNLOADING/RE_ADDING); FAILED is terminal and awaits inspection, and a
+    #: pushed FAILED row would never be admitted (`_PUSH_ADMITTABLE` excludes
+    #: it), so offering it would copy bytes nobody is going to adopt.
+    _RELOCATABLE_STATES = frozenset(
+        {State.NEW, State.WAITING_INDEXER, State.WAITING_DISK, State.QUEUED}
+    )
+
+    #: The `reason` this path hands the push lane. Not "manual" (that word means
+    #: "an operator asked", and it is what exempts a hash from the launch-failure
+    #: throttle), not "pressure" (that is the time-based sweep's own verdict).
+    RELOCATE_PUSH_REASON = "reclaim"
+
+    @staticmethod
+    def _reclaim_relocate_ceiling(pass_cap: int) -> int:
+        """Requests a single pass may make: a quarter of ITS OWN per-run cap.
+
+        Derived from `per_run_cap`/`burst_per_run_cap` (the number the pass
+        already computed for its deletes — no new key, and a burst pass is
+        allowed to relocate as much as it is allowed to delete), with a floor of
+        1 so a cap of 1 or 2 still gets one shot. Relocation is the slower,
+        bandwidth-eating half of the same job, so it must never out-run the
+        deletes that are already bounded.
+        """
+        try:
+            cap = int(pass_cap or 0)
+        except (TypeError, ValueError):
+            cap = 0
+        return max(1, cap // 4)
+
+    def _reclaim_relocate_gate(self) -> str:
+        """Why this pass may not ask for relocation at all; "" when it may.
+
+        Every clause is a gate the janitor or the push lane already honours, so
+        the capability adds no new opt-out: `[cleanup].enabled` (the app may not
+        touch space it is not allowed to), `[cleanup].dry_run` (a rehearsal may
+        not start real copies), the push master switch, and
+        `[source.rclone_push].push_on_janitor_pressure` — the existing key whose
+        documented meaning is exactly "let the cleanup janitor's pressure verdict
+        start a push". With any of them off the whole feature is inert: no row
+        listing, no request, no warning line.
+        """
+        try:
+            cfg = getattr(self.rt.cleanup, "config", None)
+        except Exception:
+            cfg = None
+        if cfg is None:
+            return "no [cleanup] section is readable"
+        if not getattr(cfg, "enabled", False):
+            return "the cleanup janitor is disabled ([cleanup].enabled = false)"
+        if bool(getattr(cfg, "dry_run", True)):
+            return "[cleanup].dry_run is on: a rehearsal may not start real copies"
+        if not self._push_switch_on():
+            return "the VPS1 push lane is disabled ([source.rclone_push].enabled = false)"
+        if not self._push_pressure_on():
+            return (
+                "[source.rclone_push].push_on_janitor_pressure = false: the janitor's "
+                "verdict may not start pushes"
+            )
+        return ""
+
+    def _reclaim_rows_on_vps1(self, rows: object, present: set[str]) -> list[TorrentState]:
+        """Rows whose bytes the VPS1 listing still holds, from THIS pass's read.
+
+        Presence is evidence, never a flag: the same rule the 🗄 "still on VPS1"
+        view uses (`_cleanup_row_hashes` ∩ the live listing), fed by the listing
+        the sweep already fetched for its own deletes — so relocation costs no
+        extra RPC. Whether a row is unsecured and pushable is the chooser's
+        question, not this filter's.
+        """
+        out: list[TorrentState] = []
+        for ts in rows or []:
+            try:
+                if not (self._cleanup_row_hashes(ts) & present):
+                    continue
+            except Exception:
+                continue
+            out.append(ts)
+        return out
+
+    async def _reclaim_request_pushes(
+        self,
+        rows: Sequence[TorrentState],
+        need_bytes: int,
+        *,
+        why: str,
+        acute: bool,
+        pass_cap: int,
+    ) -> tuple[int, str]:
+        """Ask the push lane to relocate unsecured VPS1 releases: (started, line).
+
+        Returns how many pushes were started plus a one-line summary for the
+        pass (counts and bytes only, never a release title — the rescue and push
+        lanes' logging discipline, matched). An empty line means "there was
+        nothing to say": the lane is closed, the pass already has its room, or
+        no unsecured row is on VPS1 at all. It never raises into the sweep.
+
+        ORDERING — the rule, both branches: ACUTE pressure relocates the
+        SMALLEST releases first, ORDINARY pressure the LARGEST. Acute is not a
+        new threshold, it is the caller's own state passed in as `acute`: either
+        the RESCUE lane (a pass run with a `target_override`, i.e. one arrival's
+        `size + margin`) or an EMERGENCY pass (`_cleanup_emergency_trigger`
+        answering "critical" or "arrival-did-not-fit" — the same one-line fact
+        that makes the janitor act early). When the box cannot land the next
+        race, the fastest win is the fewest bytes per row converted into a
+        deletable one, and the smallest pile of half-finished copies if it keeps
+        filling; when there is room but the target wants topping up, the scarce
+        push slots should relocate as many bytes per job as possible, which is
+        the biggest-first instinct the sweep's deletes already use.
+
+        BOUNDS: at most ONE request per row (the rows are distinct by hash), the
+        lane's own budget `max_concurrent_pushes` minus what is already live, AND
+        `_reclaim_relocate_ceiling(pass_cap)` per pass — so a 200-row backlog can
+        never fire 200 copies. Concurrency is never exceeded silently: the
+        smaller of the two bounds wins.
+
+        SKIPS (all of them existing state, no parallel memos): a row the push
+        lane cannot accept (not in `_RELOCATABLE_STATES`, no 40-char VPS1 hash,
+        an operator hold `skipped`, a watch-origin drop), a row that already owns
+        a live push (`push_is_live` / `_live_push_hashes`), and a row deferred in
+        an existing per-hash memo — the pressure refusal backoff
+        (`_push_pressure_backed_off`, written by `_note_pressure_refusal`, which
+        this path also feeds on every refusal so a pass does not re-ask the same
+        doomed release) and the launch-failure streak
+        (`_push_launch_throttled`, a lane that has died twice in a row).
+
+        SAFETY: the only action is `start_source_push`, which keeps every one of
+        its own checks and refuses cleanly; nothing here deletes, forgets or
+        abandons an unsecured release, and a refusal only ever produces the
+        operator's WARNING line.
+        """
+        gate = self._reclaim_relocate_gate()
+        if gate:
+            return 0, ""
+        try:
+            need = int(need_bytes or 0)
+        except (TypeError, ValueError):
+            need = 0
+        if need <= 0:
+            # The pass already has its room: relocation is for a pass that is
+            # SHORT, never for one that reached its target.
+            return 0, ""
+        ordered: list[TorrentState] = []
+        seen: set[str] = set()
+        live = self._live_push_hashes()
+        for ts in rows or []:
+            try:
+                if getattr(ts, "state", None) not in self._RELOCATABLE_STATES:
+                    continue
+                if int(getattr(ts, "skipped", 0) or 0):
+                    continue
+                h = (getattr(ts, "source_infohash", "") or "").strip().lower()
+                if len(h) != 40 or h in seen:
+                    continue
+                seen.add(h)
+                if h in live or self._push_is_live(h):
+                    continue
+                if self._push_pressure_backed_off(h) or self._push_launch_throttled(h):
+                    continue
+                probe = getattr(self, "_is_watch_row", None)
+                if callable(probe) and probe(ts) is True:
+                    continue
+            except Exception:
+                continue
+            ordered.append(ts)
+        if not ordered:
+            return 0, ""
+
+        def _size(ts: TorrentState) -> int:
+            try:
+                return max(0, int(getattr(ts, "total_bytes", 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        try:
+            ordered.sort(key=_size, reverse=not acute)
+        except Exception:
+            pass
+        at_stake = sum(_size(ts) for ts in ordered)
+        ceiling = self._reclaim_relocate_ceiling(pass_cap)
+        try:
+            budget = min(ceiling, max(0, self._push_max_concurrent() - len(live)))
+        except Exception:
+            budget = 0
+        started = 0
+        last_refusal = ""
+        for ts in ordered:
+            if budget <= 0:
+                break
+            h = (getattr(ts, "source_infohash", "") or "").strip().lower()
+            try:
+                ok, reason = await self.start_source_push(ts, reason=self.RELOCATE_PUSH_REASON)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                flat = " ".join(str(e).split())[:300]
+                ok, reason = False, f"push refused: the reclaim path could not ask ({flat})"
+            if ok:
+                started += 1
+                budget -= 1
+                continue
+            last_refusal = " ".join(str(reason or "").split())[:300]
+            # The lane's own per-hash defer: the next pass skips this release
+            # until the window expires instead of re-asking every tick.
+            self._note_pressure_refusal(h, last_refusal)
+        if started:
+            return started, (
+                f"relocation requested for {started}/{len(ordered)} unsecured VPS1 release(s) "
+                f"({self._cleanup_bytes_compact(at_stake)} at stake, {why})"
+            )
+        return 0, (
+            f"{self._cleanup_bytes_compact(at_stake)} still unsecured on VPS1, "
+            f"relocation unavailable: "
+            f"{last_refusal or 'no unsecured VPS1 release is pushable'}"
         )
 
     # ------------------------------------------------------------------- rescue
@@ -1316,6 +1641,17 @@ class CleanupMixin:
           - dry run → bytes were rehearsed, not freed (so nothing is resumed);
           - free already covers the need → nothing to do.
 
+        Three outcomes when the sweep comes back, in this order:
+          1. ROOM MADE — `True`, and the caller resumes the starved release;
+          2. RELOCATING — `False` with a reason starting "relocating, will
+             retry": deletion could not close the gap, so the unsecured
+             releases holding the disk were handed to the push lane
+             (`_reclaim_request_pushes`) and will be deletable on a later pass.
+             The arrival is deliberately NOT resumed — the room does not exist
+             yet, and resuming it now only stalls again;
+          3. NOTHING POSSIBLE — `False` with today's reasons (nothing
+             reclaimable, or the cap stopped it short), no relocation asked.
+
         It never stamps the janitor's cadence and never consumes
         `_cleanup_urgent`: this calls the sweep directly, so a rescue that
         frees nothing leaves the normal schedule untouched.
@@ -1416,6 +1752,7 @@ class CleanupMixin:
         except Exception as e:  # noqa: BLE001
             return False, 0, f"the reclaim sweep could not run: {self._cleanup_error_text(e)}"
         deleted = int(summary.get("deleted") or 0)
+        relocating = int(summary.get("relocate_requested") or 0)
         raw_after = summary.get("free_after")
         freed = int(raw_after) - free if isinstance(raw_after, int) and raw_after > free else 0
         if dry_run:
@@ -1426,6 +1763,19 @@ class CleanupMixin:
                 f"({self._cleanup_bytes_compact(freed)} projected), nothing was freed",
             )
         if freed <= 0:
+            if relocating > 0:
+                # Outcome 2 of 3: deletion could not help, but the unsecured
+                # releases are being relocated right now. Room does NOT exist
+                # yet, so the arrival is NOT resumed (resuming it now would only
+                # stall again); the detection poll retries within its own window.
+                return (
+                    False,
+                    0,
+                    f"{_RESCUE_RELOCATING_PREFIX}: no secured row could be reclaimed, "
+                    f"{relocating} unsecured VPS1 release(s) are being pushed off the disk; "
+                    f"free {self._cleanup_bytes_compact(free)} of "
+                    f"{self._cleanup_bytes_compact(need)} needed",
+                )
             reason = str(summary.get("reason") or "") or "no eligible secured row was found"
             return False, 0, f"nothing could be reclaimed ({reason})"
         if isinstance(raw_after, int) and raw_after >= need:
@@ -1443,6 +1793,17 @@ class CleanupMixin:
             if summary.get("eligible_remaining")
             else "the eligible secured inventory ran out"
         )
+        if relocating > 0:
+            # Outcome 2 again: room was made but is not enough, and the rest is
+            # coming off by relocation instead of deletion. Still no resume.
+            return (
+                False,
+                freed,
+                f"{_RESCUE_RELOCATING_PREFIX}: freed {self._cleanup_bytes_compact(freed)} but is "
+                f"still {self._cleanup_bytes_compact(short)} short of the "
+                f"{self._cleanup_bytes_compact(need)} needed ({tail}); "
+                f"{relocating} unsecured release(s) are being pushed off VPS1",
+            )
         return (
             False,
             freed,
@@ -1573,6 +1934,19 @@ class CleanupMixin:
                 # Nothing to do after all: the cached reading the trigger used
                 # was older than the probe this pass made. Not a failure.
                 log.info("rescue: %s — %s", h[:10], reason)
+                return False
+            if reason.startswith(_RESCUE_RELOCATING_PREFIX):
+                # Outcome 2: the sweep found nothing secured to delete (or not
+                # enough) and handed the unsecured releases to the push lane
+                # instead. NO resume — the room is on its way, not here yet —
+                # and this is reported as progress, not as a failure: the next
+                # detection poll within the rescue window retries, and an
+                # unsecured release is never dropped on the floor meanwhile.
+                log.info(
+                    "rescue: %s is waiting on relocation, not resumed (%s)",
+                    h[:10],
+                    reason,
+                )
                 return False
             log.warning("rescue: no room made for %s (%s): %s", h[:10], why, reason)
             return False

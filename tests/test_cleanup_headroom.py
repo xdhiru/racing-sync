@@ -641,3 +641,80 @@ def test_hint_drops_the_countdown_helpers_and_ignores_age():
     row_b.completed_at = now - dt.timedelta(days=400)
     # Same status at 1 minute and at 400 days: the hint cannot count down.
     assert coord_a._cleanup_hint(row) == coord_b._cleanup_hint(row_b)
+
+
+# ------------------------------------------------------- relocation from a pass
+#
+# The headroom pass has a second move when its deletions run out: the unsecured
+# releases squatting VPS1 are handed to the push lane (`relocate`), which copies
+# them onto the seed remote so a later pass can delete them. These two tests pin
+# the boundary of that hatch — asked when the pass ran short, never asked when
+# the pass reached its target. The lane's existing consent keys are the only
+# switch; the feature adds no config of its own.
+
+
+def _open_push_lane(cfg: MagicMock) -> None:
+    """The existing `[source.rclone_push]` consent, read exactly by the runtime."""
+    cfg.source.rclone_push.enabled = True
+    cfg.source.rclone_push.push_on_janitor_pressure = True
+    cfg.source.rclone_push.max_concurrent_pushes = 4
+
+
+def _squatting(tmp_path: Path, store: StateStore, src, cfg, h: str, size: int):
+    """An unsecured release whose bytes are still on VPS1 (+ its mount entry)."""
+    name = f"Harbor.Lights.S03E{int(h[-2:], 16)}.mkv"
+    now = dt.datetime.now(dt.UTC)
+    ts = TorrentState(
+        source_infohash=h,
+        source_name=name,
+        total_bytes=size,
+        state=State.WAITING_INDEXER,
+        created_at=now - dt.timedelta(seconds=60),
+    )
+    store.upsert(ts)
+    src.members.append(_member(h, name, size))
+    return name
+
+
+@pytest.mark.anyio
+async def test_short_pass_relocates_the_unsecured_rows(tmp_path: Path):
+    """Deletions ran out and the target is still out of reach: the lane is asked."""
+    coord, store, src, cfg, _hashes = _harness(tmp_path, count=1)
+    _open_push_lane(cfg)
+    asked: list[tuple[str, str]] = []
+
+    async def _ask(ts, *, reason="manual"):
+        asked.append(((getattr(ts, "source_infohash", "") or "").lower(), reason))
+        return True, "pushing 1 file(s) from VPS1 to seedremote:unsorted"
+
+    coord.start_source_push = AsyncMock(side_effect=_ask)
+    _squatting(tmp_path, store, src, cfg, _hash(50), 4000)
+    try:
+        summary = await _run(coord, cfg)
+        assert len(src.deleted) == 1
+        # free 0 -> 1000, target 2500: 1500 still missing after the deletes.
+        assert summary["shortfall_bytes"] == TARGET - ROW_BYTES
+        assert summary["relocate_requested"] == 1
+        assert [hh for hh, _r in asked] == [_hash(50)]
+        assert asked[0][1] == "reclaim"
+        assert "still unsecured" not in summary["relocate_note"]
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_a_pass_that_reached_its_target_asks_for_nothing(tmp_path: Path):
+    """Room restored by deletion alone: the hatch is never consulted."""
+    coord, store, src, cfg, _hashes = _harness(tmp_path, count=3)
+    _open_push_lane(cfg)
+    coord.start_source_push = AsyncMock(return_value=(True, "pushing"))
+    _squatting(tmp_path, store, src, cfg, _hash(51), 4000)
+    try:
+        summary = await _run(coord, cfg)
+        assert len(src.deleted) == 3
+        assert summary["target_reached"] is True
+        assert summary["shortfall_bytes"] == 0
+        assert summary["relocate_requested"] == 0
+        assert coord.start_source_push.await_count == 0
+    finally:
+        store.close()

@@ -298,6 +298,10 @@ async def test_run_source_cleanup_summary_on_empty_table(tmp_path):
             "cap",
             "bursting",
             "reason",
+            # The relocation hatch (what the sweep did about the releases it may
+            # NOT delete): a count of pushes asked for and the lane's own line.
+            "relocate_requested",
+            "relocate_note",
         }
     finally:
         store.close()

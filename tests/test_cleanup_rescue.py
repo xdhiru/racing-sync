@@ -765,3 +765,120 @@ class caplog_at_info:
         self._log.removeHandler(self._handler)
         self._log.setLevel(self._level)
         return False
+
+
+# ------------------------------------------------- relocation (rescue outcome 2)
+#
+# A rescue whose deletions cannot help has a second move: hand the unsecured
+# releases to the push lane, which copies them onto the seed remote and makes
+# them deletable later. That is outcome 2 of the three `rescue_vps1_room` can
+# report — room made (resume), relocating (do NOT resume, the room is not there
+# yet), nothing possible (today's refusal). The push lane's own consent keys are
+# the only thing that has to be switched on; no new config exists for this.
+
+
+def _open_push_lane(cfg: MagicMock) -> None:
+    """The existing `[source.rclone_push]` consent, read exactly by the runtime."""
+    cfg.source.rclone_push.enabled = True
+    cfg.source.rclone_push.push_on_janitor_pressure = True
+    cfg.source.rclone_push.max_concurrent_pushes = 4
+
+
+def _squatting(store: StateStore, src, h: str, *, name: str, size: int) -> TorrentState:
+    """An unsecured release whose bytes are still on VPS1 (row + client member)."""
+    ts = _new_row(store, h, name=name, size=size)
+    src.members.append(_member(h, name, size, state="downloading", progress=0.0))
+    return ts
+
+
+@pytest.mark.anyio
+async def test_rescue_that_only_relocated_does_not_resume(tmp_path: Path):
+    """Outcome 2: nothing secured, so the bytes are moved instead — no resume."""
+    coord, store, src, cfg, _hashes = _harness(tmp_path, count=1, unverified=1)
+    _open_push_lane(cfg)
+    asked: list[tuple[str, str]] = []
+
+    async def _ask(ts, *, reason="manual"):
+        asked.append(((getattr(ts, "source_infohash", "") or "").lower(), reason))
+        return True, "pushing 1 file(s) from VPS1 to seedremote:unsorted"
+
+    squat_name = "Example.Show.S01E30.1080p.WEB-DL-GROUP.mkv"
+    coord.start_source_push = AsyncMock(side_effect=_ask)
+    _squatting(store, src, "e" * 40, name=squat_name, size=4000)
+    starved = _new_row(store, "a" * 40, name=STARVED_NAME, size=1500)
+    try:
+        made, freed, reason = await coord.rescue_vps1_room(1500, why="test")
+        assert (made, freed) == (False, 0)
+        assert reason.startswith("relocating, will retry")
+        assert "1 unsecured VPS1 release(s)" in reason
+        # The lane is asked with its own reason word, so its checks still apply.
+        assert asked == [("e" * 40, "reclaim")]
+        done = await coord.rescue_starved_release(
+            starved, 1500, why="new arrival does not fit VPS1", entries=[]
+        )
+        assert done is False
+        assert src.resumed == [], "the room is on its way, not here: nothing resumes"
+        assert src.deleted == [], "an unsecured release was not deleted for being in the way"
+        assert store.get("e" * 40, include_blob=False).state == State.NEW
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_rescue_with_the_lane_open_still_resumes_when_it_made_room(tmp_path: Path):
+    """Outcome 1 is unchanged: room made by deletion resumes, hatch not consulted."""
+    coord, store, src, cfg, _hashes = _harness(tmp_path, count=4)
+    _open_push_lane(cfg)
+    coord.start_source_push = AsyncMock(return_value=(True, "pushing"))
+    starved = _new_row(store, "a" * 40, name=STARVED_NAME, size=1500)
+    try:
+        done = await coord.rescue_starved_release(
+            starved, 1500, why="new arrival does not fit VPS1", entries=[]
+        )
+        assert done is True
+        assert src.resumed == ["a" * 40]
+        assert len(src.deleted) == 2
+        assert coord.start_source_push.await_count == 0
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_cap_stopped_rescue_reports_its_shortfall_not_a_relocation(tmp_path: Path):
+    """Outcome 3 stands while the sweep's own deletes are still owed."""
+    coord, store, src, cfg, _hashes = _harness(
+        tmp_path, count=8, per_run_cap=1, burst_per_run_cap=1
+    )
+    _open_push_lane(cfg)
+    coord.start_source_push = AsyncMock(return_value=(True, "pushing"))
+    _squatting(store, src, "e" * 40, name="Example.Show.S01E31.1080p.WEB-DL-GROUP.mkv", size=4000)
+    try:
+        made, freed, reason = await coord.rescue_vps1_room(8000, why="test")
+        assert made is False
+        assert freed == ROW_BYTES
+        assert not reason.startswith("relocating")
+        assert "short" in reason and "cap" in reason
+        assert coord.start_source_push.await_count == 0
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_relocating_rescue_is_reported_as_progress_not_as_a_failure(tmp_path, caplog):
+    """No WARNING for a relocation in flight: the release is being handled."""
+    coord, store, src, cfg, _hashes = _harness(tmp_path, count=1, unverified=1)
+    _open_push_lane(cfg)
+    coord.start_source_push = AsyncMock(return_value=(True, "pushing"))
+    _squatting(store, src, "e" * 40, name="Example.Show.S01E32.1080p.WEB-DL-GROUP.mkv", size=4000)
+    starved = _new_row(store, "a" * 40, name=STARVED_NAME, size=1500)
+    try:
+        with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
+            done = await coord.rescue_starved_release(
+                starved, 1500, why="new arrival does not fit VPS1", entries=[]
+            )
+        assert done is False
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not any("no room made" in m for m in warnings)
+        assert all(STARVED_NAME not in m for m in warnings)
+    finally:
+        store.close()
