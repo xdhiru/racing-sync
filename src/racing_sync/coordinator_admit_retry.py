@@ -20,6 +20,13 @@ log = logging.getLogger("racing_sync.coordinator")
 # (workers + Telegram notes) share one all_active() scan per window.
 _INFLIGHT_SNAPSHOT_S = 30.0
 
+#: Absolute floor (seconds) for a disk-pressure-collapsed indexer wait.
+#: The collapse may never fire before a couple of retries have happened, so
+#: the effective window is clamped to `max(this, 2 *
+#: prowlarr_retry_interval_seconds)` — the retry interval is already a tuned
+#: key, this literal only guards a degenerate/zero interval.
+_INDEXER_WAIT_COLLAPSE_FLOOR_S = 600.0
+
 #: States that already own (or are acquiring) the SSD bytes for their content.
 _INFLIGHT_OWNER_STATES = frozenset({State.QUEUED, State.DOWNLOADING, State.MOVING, State.RE_ADDING})
 
@@ -28,12 +35,89 @@ _INFLIGHT_PREADMIT_STATES = frozenset({State.NEW, State.WAITING_INDEXER, State.W
 
 
 class RetryAdmitMixin:
+    def _indexer_configured_wait_seconds(self) -> float:
+        """`[acquire].indexer_wait_seconds` as a float (config default fallback).
+
+        One definition shared by the collapse helper and the park's ceiling,
+        so the trigger and the escalation cannot read the window differently.
+        """
+        try:
+            return float(self.rt.acquire.indexer_wait_seconds or 28800)
+        except (TypeError, ValueError):
+            return 28800.0
+
+    def _indexer_retry_gap_seconds(self) -> float:
+        """`[acquire].prowlarr_retry_interval_seconds` as a float (same fallback)."""
+        try:
+            return float(self.rt.acquire.prowlarr_retry_interval_seconds or 1800)
+        except (TypeError, ValueError):
+            return 1800.0
+
+    def _indexer_effective_wait_seconds(self, ts: TorrentState) -> tuple[float, str]:
+        """The indexer wait this row should honour NOW: `(seconds, reason)`.
+
+        Calm disk ⇒ `(indexer_wait_seconds, "")` — today's behaviour, byte for
+        byte. Under VPS1 disk pressure the window COLLAPSES to the janitor's
+        own projection of how long until the box fills, because a parked row
+        holds the only copy of those bytes on VPS1 and the janitor cannot
+        touch a non-DONE row:
+
+            effective = max(floor, min(indexer_wait_seconds, seconds_to_fill))
+            floor     = max(_INDEXER_WAIT_COLLAPSE_FLOOR_S,
+                            2 * prowlarr_retry_interval_seconds)
+
+        No new key and no new tunable: both numbers are already derived, and
+        the floor keeps the collapse from firing before at least a couple of
+        retries have run.
+
+        Pressure comes from the SAME sources as `pressure_push_sweep`: the
+        janitor's cached free-space probe (`_last_source_free_bytes`, never a
+        new VPS1 RPC) fed into `_cleanup_pressure` with the `[cleanup]`
+        section, and "pressured" means that verdict's `bursting or urgent`.
+        Unknown free space, a calm box or no projection (bytes_rate 0) all
+        mean NO collapse — never guess.
+
+        `reason` is a one-line, self-contained explanation, empty when
+        nothing collapsed. Both call sites — `_prowlarr_timed_out` (the
+        racing-torrent/push trigger) and `_park_for_indexer_retry` (the
+        FAILED escalation) — read only this helper, so they cannot drift.
+        """
+        configured = self._indexer_configured_wait_seconds()
+        try:
+            free = getattr(self, "_last_source_free_bytes", None)
+            if free is None:
+                return configured, ""
+            _arrivals, _bytes_rate, projected, urgent, bursting = self._cleanup_pressure(
+                getattr(self.rt.cleanup, "config", None), free
+            )
+            if not (bursting or urgent) or projected is None:
+                return configured, ""
+            floor = max(_INDEXER_WAIT_COLLAPSE_FLOOR_S, 2.0 * self._indexer_retry_gap_seconds())
+            effective = max(floor, min(configured, float(projected)))
+            if effective >= configured:
+                return configured, ""
+            verdict = "+".join(
+                name for name, on in (("bursting", bursting), ("urgent", urgent)) if on
+            )
+            return effective, (
+                f"indexer wait collapsed under VPS1 disk pressure: effective {effective:.0f}s "
+                f"vs configured {configured:.0f}s (VPS1 free {int(free)} B, {verdict}, "
+                f"projected to fill in {float(projected):.0f}s)"
+            )
+        except Exception:
+            # Fail closed to the configured window: a half-built double or a
+            # missing janitor reading must never shorten (or lengthen) a wait.
+            return configured, ""
+
     def _prowlarr_timed_out(self, ts: TorrentState) -> bool:
         """True when the opt-in racing-torrent fallback may fire.
 
         Requires the config flag plus an exhausted prowlarr retry window
-        (first attempt older than indexer_wait_seconds). Fail-closed:
-        any doubt returns False and the row keeps retrying / fails as before.
+        (first attempt older than the EFFECTIVE indexer wait — see
+        `_indexer_effective_wait_seconds`; the same value the park escalates
+        on, so the leech/push fallback and the FAILED path always agree).
+        Fail-closed: any doubt returns False and the row keeps retrying /
+        fails as before.
         """
         try:
             if not self.rt.acquire.fallback_to_racing_torrent:
@@ -41,7 +125,8 @@ class RetryAdmitMixin:
             first = ts.indexer_first_queried_at
             if first is None:
                 return False
-            window = dt.timedelta(seconds=self.rt.acquire.indexer_wait_seconds)
+            _wait_s, _reason = self._indexer_effective_wait_seconds(ts)
+            window = dt.timedelta(seconds=_wait_s)
             return (dt.datetime.now(dt.UTC) - first) >= window
         except Exception:
             return False
@@ -105,8 +190,10 @@ class RetryAdmitMixin:
         Subsequent attempts: same interval (fixed, not exponential — we
         expect the download-target indexers to catch up shortly for racing
         releases).
-        Hard cap: indexer_wait_seconds since the FIRST attempt. If
-        that ceiling is reached, mark FAILED for manual handling.
+        Hard cap: the EFFECTIVE indexer wait (see
+        `_indexer_effective_wait_seconds`: `indexer_wait_seconds`, collapsed
+        under VPS1 disk pressure) since the FIRST attempt. If that ceiling is
+        reached, mark FAILED for manual handling.
 
         A "source export miss" (public racing torrent whose .torrent
         can't be exported right now) never queries the download-target
@@ -120,14 +207,9 @@ class RetryAdmitMixin:
         if ts.indexer_first_queried_at is None:
             ts.indexer_first_queried_at = now
         ts.indexer_attempts += 1
-        try:
-            _retry_gap = float(self.rt.acquire.prowlarr_retry_interval_seconds or 1800)
-        except (TypeError, ValueError):
-            _retry_gap = 1800.0
-        try:
-            _wait_s = float(self.rt.acquire.indexer_wait_seconds or 28800)
-        except (TypeError, ValueError):
-            _wait_s = 28800.0
+        _retry_gap = self._indexer_retry_gap_seconds()
+        _wait_s, _collapse = self._indexer_effective_wait_seconds(ts)
+        _configured_s = self._indexer_configured_wait_seconds()
         next_retry = self._schedule_retry(ts, "indexer", _retry_gap)
         window = dt.timedelta(seconds=max(60.0, _wait_s))
         elapsed = now - ts.indexer_first_queried_at
@@ -150,6 +232,8 @@ class RetryAdmitMixin:
                 # poll cadence instead of escalating. `indexer_first_queried_at`
                 # stays exactly as it is: the moment the push dies (deadline
                 # passed -> not live) the next park hits the normal ceiling.
+                # This wins over a collapsed window too — a row whose bytes
+                # are mid-copy is never failed for the disk it is freeing.
                 log.info(
                     "%s: indexer window expired but the VPS1 push is running; "
                     "re-arming on the push cadence instead of failing (%ds)",
@@ -173,6 +257,18 @@ class RetryAdmitMixin:
                 ts.indexer_first_queried_at = now
                 elapsed = dt.timedelta(0)
             else:
+                if _collapse and elapsed < dt.timedelta(seconds=max(60.0, _configured_s)):
+                    # The collapse — not the clock — ended the wait. Say so
+                    # once, with both numbers and the disk signal, so the
+                    # operator can see why this fell back after minutes
+                    # instead of the full configured window.
+                    log.info(
+                        "%s: %s; escalating after %ds (the configured window alone "
+                        "would not have been exhausted yet)",
+                        ts.source_name[:60],
+                        _collapse,
+                        int(elapsed.total_seconds()),
+                    )
                 log.error(
                     "download-target indexers giving up on %s after %d attempts (%ds > %ds max)",
                     ts.source_name,
@@ -181,11 +277,18 @@ class RetryAdmitMixin:
                     int(window.total_seconds()),
                 )
                 # From WAITING_INDEXER → FAILED is legal (see ALLOWED).
-                self.transition(
-                    ts,
-                    State.FAILED,
-                    error=(f"Prowlarr cross-seed not found within {int(window.total_seconds())}s"),
-                )
+                # Keep the plain-timeout wording when the window was NOT
+                # collapsed; when it was, name the pressure that ended it.
+                if _collapse:
+                    _elapsed_int = int(elapsed.total_seconds())
+                    _reason_text = (
+                        f"Prowlarr cross-seed wait exhausted after {_elapsed_int}s "
+                        f"under disk pressure: {_collapse}"
+                    )
+                else:
+                    _wait_int = int(window.total_seconds())
+                    _reason_text = f"Prowlarr cross-seed not found within {_wait_int}s"
+                self.transition(ts, State.FAILED, error=_reason_text)
                 return
 
         # If we're being called from _do_new (state is NEW), the park
