@@ -413,6 +413,13 @@ def render_detail(
             lines.append("Re-adding on fuse mount")
     elif ts.state == State.DONE:
         lines.append("✓ Seeded from fuse mount")
+        try:
+            from .coordinator_content import racing_seed_pending as _racing_pending
+
+            if _racing_pending(ts):
+                lines.append("⚠ Racing torrent not injected yet (cross-seed only) — retrying")
+        except Exception:
+            pass
         if cleanup:
             lines.append(f"VPS1 cleanup: {_esc(cleanup)}")
     elif ts.state == State.FAILED:

@@ -293,6 +293,35 @@ def _should_notify_telegram(prev: State, dst: State) -> bool:
 _SORTED_ROUTE_KINDS = frozenset({"movie", "season", "mixed"})
 
 
+def racing_seed_pending(ts: object) -> bool:
+    """True when a DONE row's own racing torrent is not seeded (yet).
+
+    The content torrent (a cross-seed copy) can be seeded while the racing
+    torrent itself failed to inject — its .torrent bytes were unreachable
+    on VPS1. The row is DONE (the content seeds), but the racing copy is
+    missing, and the card should say so instead of a plain "done".
+    """
+    try:
+        if getattr(ts, "state", None) != State.DONE:
+            return False
+        source = str(getattr(ts, "source_infohash", "") or "").lower()
+        if not source:
+            return False
+        injected = {
+            h.strip().lower()
+            for h in str(getattr(ts, "injected_private_hashes", "") or "").split(",")
+            if h.strip()
+        }
+        if source in injected:
+            return False
+        # Only a row whose content came from a different torrent has a
+        # racing copy of its own that could still be missing.
+        content = str(getattr(ts, "cross_seed_infohash", "") or "").lower()
+        return bool(content) and content in injected
+    except Exception:
+        return False
+
+
 def route_kind_is_sorted(kind: object) -> bool:
     """True when this classification routes to the default remote/mount."""
     try:
