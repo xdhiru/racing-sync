@@ -36,13 +36,14 @@ Contract this module keeps:
   cannot prove, and a slow-but-silent big upload is never killed.
 * **a launch that never started is said out loud, seconds later.**
   `start_copy` confirms its own launch (`vps1_push._confirm_launch`: this
-  job's unique list path in `pgrep`, else a non-empty job log) and a dead one
-  comes back as a refusal — so the "a failed attempt leaves no live
-  checkpoint" rule below frees the slot at once instead of squatting it for
-  `timeout_seconds`, and the operator's `/push_source` reply carries the
-  reason (with the launcher's own captured words) verbatim. What the check
-  cannot judge is reported as `alive (unproven)` and left to the poll, because
-  missing evidence never kills a possibly-live copy.
+  job's unique list path in `pgrep`, else the job log's own words judged by
+  `push_liveness`'s fatal-line table — a non-empty log is EVIDENCE, not proof
+  of life) and a dead one comes back as a refusal — so the "a failed attempt
+  leaves no live checkpoint" rule below frees the slot at once instead of
+  squatting it for `timeout_seconds`, and the operator's `/push_source` reply
+  carries the reason (with the launcher's own captured words) verbatim. What
+  the check cannot judge is reported as `alive (unproven)` and left to the
+  poll, because missing evidence never kills a possibly-live copy.
 * **a broken VPS1 lane is not hammered.** After
   `_PUSH_LAUNCH_FAIL_LIMIT` launch/proof failures in a row for the same
   infohash, the automatic paths (indexer-timeout auto push, janitor-pressure
@@ -481,10 +482,13 @@ class PushMixin:
             return False, check.reason
 
         # What preflight PROVED VPS1 has, obeyed when the line is built: the
-        # wrapper that exists there, and the optional flag only for an rclone
-        # that accepts it. Whitelisted, because a launch is exactly where an
-        # unproven token costs an incident; a caller that never probed keeps
-        # the historical defaults.
+        # wrapper that exists there, the optional flag only for an rclone that
+        # accepts it, and the SPELLINGS of the two logging flags that rclone's
+        # own help text reported. Whitelisted, because a launch is exactly where
+        # an unproven token costs an incident — the 28 dead copies of the last
+        # one were one wrong character (`--log`, where rclone says `--log-file`)
+        # — and a caller that never probed keeps the verified defaults, which
+        # `build_copy_command` still filters through its own whitelist.
         detacher = str(getattr(check, "detacher", "") or "").strip()
         if detacher not in ("setsid", "nohup"):
             detacher = "setsid"
@@ -496,6 +500,8 @@ class PushMixin:
             bwlimit=self._push_bwlimit(),
             detacher=detacher,
             error_on_no_transfer=getattr(check, "error_on_no_transfer", True) is not False,
+            log_file_flag=getattr(check, "log_file_flag", "--log-file"),
+            log_level_flag=getattr(check, "log_level_flag", "--log-level"),
         )
         if not started.ok:
             await self._push_settle(store, h, PushState.FAILED, started.reason)

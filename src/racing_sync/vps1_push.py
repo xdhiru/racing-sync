@@ -21,6 +21,17 @@ Contract rules this module enforces by construction:
   its caller already read. See ``build_copy_command`` — this rule exists
   because 28 launches reported success while 282 polls saw `0/1` and nothing
   at all had run on VPS1.
+* **a flag is only ever emitted because VPS1 said it has it.** The same
+  incident came from ONE wrong character: rclone spells its log flag
+  ``--log-file`` and this module sent ``--log``, so every launch died printing
+  a usage error in 0.4 s. The logging-flag spellings are therefore PROBED from
+  rclone's own self-description (`_capability_probe_command`) and
+  `build_copy_command` will physically not emit a spelling outside its
+  whitelist. Dropping an unsupported flag costs nothing — the wrapper's
+  redirect already puts the post-mortem in the log `push_liveness` reads —
+  while inventing one is fatal, which is also why a launch whose own first log
+  lines already say "give up" is reported DEAD on the spot
+  (`_confirm_launch`) instead of "push started".
 * **metadata only.** Nothing here reads or hashes content — not over SSH,
   not against the rclone mount or VPS2's SSD. Progress is a name comparison
   against ``rclone lsf -R --files-only``.
@@ -118,12 +129,20 @@ _LIVENESS_GRACE_S = 300.0
 
 #: rclone's own failure vocabulary, kept SMALL on purpose: every one of these
 #: is a line rclone writes for a run that has given up (an `ERROR`/`Fatal`
-#: prefix, a Go panic, a child exit status, a `Failed to <verb>` summary).
+#: prefix, a Go panic, a child exit status, a `Failed to <verb>` summary, or
+#: cobra's `Error:` line for a run that never even STARTED — an unknown flag,
+#: an unparsable command line, a bad config. That last one is the production
+#: case: `Error: unknown flag: --log`, printed 0.4 s after a "successful"
+#: launch, 28 times over).
+#: Note the case matters, and `Errors:` (rclone's stats key, see
+#: `_FINISHED_MARKERS`) deliberately does NOT match `Error:`: the colon has to
+#: follow "Error" directly, so a normal closing summary stays evidence of a
+#: finished run rather than a dead one.
 #: Anything else in the tail is silence, and silence is NORMAL here.
-_FATAL_MARKERS = ("ERROR", "Fatal", "panic:", "exit status", "Failed to")
+_FATAL_MARKERS = ("ERROR", "Error:", "Fatal", "panic:", "exit status", "Failed to")
 
-#: rclone's stats-summary block keys. At `--loglevel INFO` with rclone's own
-#: default `--stats-loglevel` (error) this block is written ONCE, as the run
+#: rclone's stats-summary block keys. At `--log-level INFO` with rclone's own
+#: default `--stats-log-level` (error) this block is written ONCE, as the run
 #: exits, which is exactly the evidence `finished` needs; if a build did log
 #: the periodic blocks, their text differs poll to poll and the caller's
 #: two-same-verdicts rule never fires, so a slow copy still survives. An error
@@ -152,6 +171,58 @@ _DETACHER_CANDIDATES = ("setsid", "nohup")
 #: this probe by substring without colliding with `command -v rclone`).
 _CAP_TAG = "SYNC-PUSH-CAP:"
 
+#: Markers bracketing the help text the capability probe quotes back, so the
+#: logging-flag names are read from rclone's OWN self-description and nothing
+#: else in the channel can be mistaken for them.
+_CAP_HELP_BEGIN = f"{_CAP_TAG}log-help-begin"
+_CAP_HELP_END = f"{_CAP_TAG}log-help-end"
+
+#: Key `log-help` is filed under in the parsed capability answers.
+_CAP_HELP_KEY = "log-help"
+
+#: How much help text may cross the channel: `rclone help logging` is a couple
+#: of KiB and `rclone help flags` (the fallback) tens, and both are cut short
+#: here, because a probe must never be able to flood a push.
+_CAP_HELP_MAX_BYTES = 65536
+
+#: The ONLY logging-flag spellings `build_copy_command` may ever emit, split by
+#: the ROLE each plays (a level flag handed a path would be read as a level,
+#: which is the same class of bug as the one below). `--log-file` is rclone's
+#: "write my log here", `--log-level` its modern level flag and `--loglevel`
+#: the pre-1.55 alias, accepted only when a build reports no other spelling.
+#: A bare `--log` — the flag that killed 28 launches — is on no list here, so
+#: it cannot be emitted even by a caller that asks for it by name.
+_LOG_FILE_FLAG = "--log-file"
+_LOG_LEVEL_FLAG = "--log-level"
+_LOG_LEVEL_ALIAS = "--loglevel"
+_LOG_FILE_FLAG_CHOICES = (_LOG_FILE_FLAG,)
+_LOG_LEVEL_FLAG_CHOICES = (_LOG_LEVEL_FLAG, _LOG_LEVEL_ALIAS)
+
+
+def _help_flag_pattern(name: str) -> re.Pattern[str]:
+    """A regex matching one rclone flag DEFINITION, at the start of a line.
+
+    rclone's help prints each flag on its own line, optionally after a short
+    form (`  -v, --verbose  …`), so anchoring on the line start is what makes
+    this a match on the flag's DEFINITION and not on a description that happens
+    to mention it — the deprecated `--loglevel` line is literally described as
+    "alias for --log-level", and a build that only has the alias must not be
+    read as having the modern spelling. The trailing guard ends the NAME, so
+    `--log-file-max-size` is never a match for `--log-file`.
+
+    Strict on purpose: a build whose help this cannot read comes back as
+    "unsupported", which omits a flag (harmless) rather than inventing one
+    (fatal).
+    """
+    return re.compile(rf"^[ \t]*(?:-\w[ \t]*,[ \t]*)?{re.escape(name)}(?![-_0-9A-Za-z])", re.M)
+
+
+#: Flag names as rclone defines them in its help, matched by NAME and by
+#: position — never as a substring of a longer flag or of a description.
+_LOG_FILE_HELP_RE = _help_flag_pattern("--log-file")
+_LOG_LEVEL_HELP_RE = _help_flag_pattern("--log-level")
+_LOG_LEVEL_ALIAS_HELP_RE = _help_flag_pattern("--loglevel")
+
 #: The lowest rclone that knows `--error-on-no-transfer` (1.58, 2021-05).
 #: VPS2's version proves nothing about VPS1's, so this is probed, never assumed.
 _MIN_RCLONE_NO_TRANSFER_ERROR = (1, 58)
@@ -165,7 +236,8 @@ _PROOF_TAG = "SYNC-PUSH-PROOF:"
 #: there. Short enough that a dead lane answers the operator in seconds — the
 #: incident this closes reported "push started" and then said nothing more for
 #: the whole `timeout_seconds`; long enough that rclone has had time to open
-#: its own `--log` on a busy box.
+#: its own `--log-file` on a busy box, and long enough for a run that died on
+#: its own command line to have written its complaint.
 _LAUNCH_PROOF_DELAY_S = 4.0
 
 #: Hard ceiling on that wait: this runs inline in the push's own task, and a
@@ -223,6 +295,13 @@ class PushCheck:
     (or an older test double) still gets the old command line. When a
     successful `start_copy` could not PROVE the copy is alive it says so in
     `reason` — the push still went ahead, and the poll decides later.
+
+    `log_file_flag` / `log_level_flag` are the same lesson applied to the two
+    flags that decide WHERE rclone writes its own post-mortem: what VPS1's
+    rclone says it accepts, with `None` meaning "this build does not have it —
+    emit nothing". They default to the verified-correct spellings, so a caller
+    that never probed still gets a VALID line, and `build_copy_command` refuses
+    any spelling outside its whitelist, so a wrong flag is not possible.
     """
 
     ok: bool
@@ -232,6 +311,8 @@ class PushCheck:
     files_total: int = 0
     detacher: str = "setsid"
     error_on_no_transfer: bool = True
+    log_file_flag: str | None = _LOG_FILE_FLAG
+    log_level_flag: str | None = _LOG_LEVEL_FLAG
 
 
 def _fail(reason: str) -> PushCheck:
@@ -397,6 +478,33 @@ def _push_scratch_paths(request: PushRequest, now: float | None = None) -> tuple
     return f"{stem}.lst", f"{stem}.log"
 
 
+def _usable_log_flag(value: object, choices: tuple[str, ...], label: str) -> str | None:
+    """The probed logging flag, or None when it is not a spelling we know.
+
+    THE POINT OF THIS FUNCTION: `build_copy_command` cannot emit a flag that is
+    not on `choices`, so the one wrong character that cost 28 launches
+    (`--log`, which rclone has never had) is impossible HERE, whatever a
+    caller — probed, unprobed, or a mock from a test — hands in. An unknown
+    spelling is dropped, not raised: rclone then logs to the wrapper's redirect
+    instead of the file it names, which is harmless, while refusing a push over
+    a cosmetic flag would be the harm.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text in choices:
+        return text
+    log.warning(
+        "push: not emitting the unsupported rclone %s flag %r (want %s)",
+        label,
+        text,
+        " or ".join(choices),
+    )
+    return None
+
+
 def build_copy_command(
     request: PushRequest,
     *,
@@ -407,6 +515,8 @@ def build_copy_command(
     log_path: str,
     detacher: str = "setsid",
     error_on_no_transfer: bool = True,
+    log_file_flag: str | None = _LOG_FILE_FLAG,
+    log_level_flag: str | None = _LOG_LEVEL_FLAG,
 ) -> str:
     """The one detached command line that runs the copy on VPS1.
 
@@ -416,15 +526,33 @@ def build_copy_command(
     thing is wrapped so the job survives the SSH session dying.
 
     ``--ignore-existing`` keeps a re-push cheap and, above all, never
-    overwrites; ``--log``/``--loglevel INFO`` leaves the post-mortem on VPS1
-    because a detached process has no stdout anyone can read.
+    overwrites. The two LOGGING FLAGS are not hardcoded strings any more:
+    `log_file_flag` / `log_level_flag` carry what VPS1's own rclone reported
+    having (`_capability_probe_command` → `preflight`), `None` means "this
+    build does not have it — emit nothing", and the defaults are the
+    verified-correct spellings `--log-file` / `--log-level`, so a caller that
+    never probed still gets a valid line. `_usable_log_flag` then refuses any
+    spelling outside the whitelist, which is what makes a wrong flag impossible
+    rather than unlikely: this line used to read ``--log <path> --loglevel
+    INFO``, rclone has never had a bare ``--log``, and VPS1 answered every one
+    of 28 launches with `Error: unknown flag: --log` and died in 0.4 s.
+
+    DROPPING AN UNSUPPORTED FLAG IS SAFE, AND HERE IS WHY: the wrapper already
+    redirects the job's OWN stdout/stderr into that very path
+    (``… </dev/null >> <log> 2>&1 &``), so even with NO rclone logging flag at
+    all the post-mortem still lands in the file `push_liveness` and the launch
+    proof read — rclone's level/usage output goes to stderr, and stderr is that
+    log. That redirect is the mechanism that PRODUCED this bug report: it is
+    where `Error: unknown flag: --log` was found in the first place. What a
+    missing `--log-file` costs is rclone's own timestamped, `--log-level`
+    filtered detail, nothing more; what an invented one costs is the copy.
 
     WHY THE SHELL'S OWN OUTPUT GOES INTO THAT LOG, NOT /dev/null: this exact
     incident. The wrapper used to end ``</dev/null >/dev/null 2>&1 &``, so every
     byte the LOGIN SHELL wrote — `setsid: command not found`, `rclone: unknown
     long flag '--error-on-no-transfer'`, a quoting failure, even a /tmp that
-    would not open — vanished, while rclone's `--log` file only ever appears
-    once rclone itself starts. 28 launches were reported as successes, 282
+    would not open — vanished, while rclone's log file only ever appears once
+    rclone itself starts. 28 launches were reported as successes, 282
     polls read `has 0/1 file(s)`, and nothing could say which of the three
     candidate causes was real (no setsid, an rclone too old for the flag, a job
     killed when the exec channel closed). Redirecting the wrapper into the job's
@@ -490,7 +618,16 @@ def build_copy_command(
     ]
     if limit.strip():
         argv += ["--bwlimit", limit.strip()]
-    argv += ["--log", str(log_path), "--loglevel", "INFO"]
+    # The logging flags VPS1's own rclone reported having — each looked up in
+    # the whitelist for its ROLE (a level flag handed a path would be read as a
+    # level), each omitted when the probe said it does not exist. See the
+    # docstring: the wrapper's `>> <log> 2>&1` is what makes omitting one safe.
+    file_flag = _usable_log_flag(log_file_flag, _LOG_FILE_FLAG_CHOICES, "log file")
+    level_flag = _usable_log_flag(log_level_flag, _LOG_LEVEL_FLAG_CHOICES, "log level")
+    if file_flag:
+        argv += [file_flag, str(log_path)]
+    if level_flag:
+        argv += [level_flag, "INFO"]
     if error_on_no_transfer is not False:
         argv += [
             # Fail loudly when the copy transfers nothing: an rc=0 that moved zero
@@ -509,9 +646,11 @@ def build_copy_command(
     # its own session (setsid) or at least immunity to SIGHUP (nohup),
     # </dev/null drops stdin and the trailing & lets the login shell exit, so
     # closing our channel cannot kill the transfer. The shell's stdout/stderr
-    # are APPENDED to the job's own log (see above): rclone writes its log with
-    # `--log`, so this only ever adds the wrapper's words to the same file, and
-    # a zero-byte log stays the "rclone never spoke" evidence the poll reads.
+    # are APPENDED to the job's own log (see above): rclone writes that log with
+    # its `--log-file` when the probe says it has one, so this only ever adds the
+    # wrapper's words — and, with no logging flag at all, ALL of rclone's own
+    # words — to the same file, and a zero-byte log stays the "rclone never
+    # spoke" evidence the poll reads.
     return (
         f"{wrapper} {quoted} -- {shlex.quote(src)} {shlex.quote(dst)} "
         f"</dev/null >> {shlex.quote(log_path)} 2>&1 &"
@@ -530,6 +669,14 @@ def _guard_copy_only(argv: Sequence[str]) -> None:
         raise ValueError("push refused: the rclone command looks like a move (would delete VPS1)")
     if "copy" not in tokens:
         raise ValueError("push refused: the rclone command is not a copy")
+    # Defence in depth for the flag that caused the incident: `--log` is not an
+    # rclone flag at all (`--log-file` is), and one invented long flag makes
+    # rclone print a usage block and exit before transferring anything. The
+    # whitelist in `_usable_log_flag` means this line is unreachable by
+    # construction; it is here so that a future caller that assembles its own
+    # argv is refused out loud rather than launching 28 dead copies.
+    if any(t in ("--log", "--logfile") for t in tokens):
+        raise ValueError("push refused: --log is not an rclone flag (the spelling is --log-file)")
 
 
 #: The dial attribute every push shell call goes through. Deliberately NOT the
@@ -580,17 +727,29 @@ async def _remote_shell(
 def _capability_probe_command(rclone_bin: str) -> str:
     """ONE shell that says what VPS1 can actually run a detached copy with.
 
-    Answers three questions with tagged lines, so a stray word of shell noise
+    Answers four questions with tagged lines, so a stray word of shell noise
     cannot be read as an answer:
 
     * does `setsid` exist? does `nohup`? (the wrapper the launch may use);
     * what rclone does VPS1 have? `rclone version` first, `rclone --version`
       as the fallback for a build that predates the subcommand, each cut to
       one line so a long `--version` banner never floods the channel.
+    * WHICH LOGGING FLAGS DOES ITS RCLONE ACTUALLY ACCEPT? Asked of rclone
+      itself — `rclone help logging`, falling back to `rclone help flags` for a
+      build without that topic — quoted back between this probe's own begin/end
+      markers and cut to `_CAP_HELP_MAX_BYTES`. NOT asked of a version table:
+      the incident this closes was one invented character (`--log`), and a
+      hardcoded guess about a build we have never met is the same mistake in
+      slower clothing. Reading the names out of the help text also settles
+      `--log-level` vs the pre-1.55 `--loglevel` alias for free, which a version
+      comparison only approximates.
 
     Everything here is best-effort by construction: a probe that cannot answer
     is missing tags, which the caller reads as "unknown" (and unknown means
-    refuse the LAUNCH path or omit the optional flag, never launch blind).
+    refuse the LAUNCH path or omit the optional flag, never launch blind). For
+    the logging flags specifically, no answer means BOTH are unsupported:
+    omitting a logging flag is harmless (the wrapper already redirects the
+    job's own stdout/stderr into the log file), inventing one is fatal.
     """
     binary = shlex.quote(str(rclone_bin or "rclone"))
     parts: list[str] = []
@@ -602,22 +761,47 @@ def _capability_probe_command(rclone_bin: str) -> str:
     parts.append(f"echo '{_CAP_TAG}rclone-version='")
     parts.append(f"{binary} version 2>/dev/null | head -n 1")
     parts.append(f"{binary} --version 2>/dev/null | head -n 1")
+    # The help dump last, so a stray version-shaped line inside it can never be
+    # read as the version answer (`_parse_capability_output` closes the version
+    # window the moment this marker appears). `|| true` keeps a rclone that has
+    # neither topic — or is not on PATH at all — from making the whole probe
+    # exit non-zero: an empty block is the honest "no answer", not a failure.
+    parts.append(f"echo '{_CAP_HELP_BEGIN}'")
+    parts.append(
+        f"{{ {binary} help logging 2>/dev/null || {binary} help flags 2>/dev/null || true; }} "
+        f"2>/dev/null | head -c {_CAP_HELP_MAX_BYTES}"
+    )
+    parts.append(f"echo '{_CAP_HELP_END}'")
     return "; ".join(parts)
 
 
 def _parse_capability_output(text: object) -> dict[str, str]:
-    """{setsid/nohup: "yes"|"no", version: the first line that looks like one}.
+    """{setsid/nohup: "yes"|"no", version: the first line that looks like one,
+    log-help: the rclone help block the probe quoted back}.
 
     Only this module's own tagged lines are trusted; anything else in the
-    output is noise. A missing key means VPS1 did not answer that question.
+    output is noise. A missing key means VPS1 did not answer that question —
+    which for `log-help` (absent, empty, or a help call that printed nothing)
+    `preflight` reads as "neither logging flag exists", the safe direction.
     """
     found: dict[str, str] = {}
     after_version_tag = False
+    in_help = False
+    help_lines: list[str] = []
     for line in str(text or "").splitlines():
         flat = line.strip()
         if flat.startswith(_CAP_TAG):
             key, sep, value = flat[len(_CAP_TAG) :].partition("=")
             key = key.strip().lower()
+            if not sep:
+                # A bare marker: the help block's begin/end. The begin also
+                # shuts the version window, so help text is never a version.
+                if key == "log-help-begin":
+                    in_help = True
+                    after_version_tag = False
+                elif key == "log-help-end":
+                    in_help = False
+                continue
             if sep and key == "rclone-version":
                 after_version_tag = True
                 if _VERSION_RE.search(value):
@@ -626,9 +810,45 @@ def _parse_capability_output(text: object) -> dict[str, str]:
             if sep and key in _DETACHER_CANDIDATES and value.strip().lower() in ("yes", "no"):
                 found[key] = value.strip().lower()
             continue
+        if in_help:
+            if flat:
+                help_lines.append(flat)
+            continue
         if after_version_tag and "version" not in found and _VERSION_RE.search(flat):
             found["version"] = flat
+    if help_lines:
+        found[_CAP_HELP_KEY] = "\n".join(help_lines)
     return found
+
+
+def _detect_log_flags(help_text: object) -> tuple[str | None, str | None]:
+    """(`log_file_flag`, `log_level_flag`) from rclone's own help words.
+
+    Read from the flag DEFINITIONS `rclone help logging` / `rclone help flags`
+    prints — matched by NAME and at the start of a line (`_help_flag_pattern`),
+    never from a version table and never as a substring: `--log-file-max-size`
+    is not `--log-file`, and the `--loglevel` line is described as "alias for
+    --log-level" without that making the modern spelling exist. `--loglevel` is
+    accepted only as the ALIAS it is: when — and only when — `--log-level` is
+    absent from the definitions.
+
+    Anything unproven comes back as None, meaning "emit nothing", which is the
+    safe direction on both counts: no logging flag is harmless because the
+    wrapper redirects the job's stdout/stderr into the very log file this
+    module reads, while one wrong flag makes rclone print a usage block and
+    die before transferring a byte.
+    """
+    text = str(help_text or "")
+    if not text.strip():
+        return None, None
+    file_flag = _LOG_FILE_FLAG if _LOG_FILE_HELP_RE.search(text) else None
+    if _LOG_LEVEL_HELP_RE.search(text):
+        level_flag: str | None = _LOG_LEVEL_FLAG
+    elif _LOG_LEVEL_ALIAS_HELP_RE.search(text):
+        level_flag = _LOG_LEVEL_ALIAS
+    else:
+        level_flag = None
+    return file_flag, level_flag
 
 
 def _rclone_version_tuple(text: object) -> tuple[int, int] | None:
@@ -696,9 +916,12 @@ async def preflight(
     `could not list VPS1 rclone remotes: Timeout opening channel` — a refusal
     that cost the push nothing but read as "push unavailable" forever. The
     third one exists because the launch used to be a guess: it asks VPS1 which
-    session-surviving wrapper it has and what its own rclone version is, and
-    puts the answers on the returned check for `start_copy` (and
-    `build_copy_command`) to obey.
+    session-surviving wrapper it has, what its own rclone version is, and — read
+    out of rclone's own `help logging` / `help flags` words rather than a version
+    table — WHICH SPELLINGS its logging flags have. All of it goes on the
+    returned check for `start_copy` (and `build_copy_command`) to obey, because
+    a flag this rclone does not have kills the copy where it stands, and the 28
+    dead launches of the incident were one character of exactly that.
     """
     files = list(getattr(request, "files", ()) or ())
     if not files:
@@ -743,10 +966,12 @@ async def preflight(
 
     # ... and VPS1 must be able to run it DETACHED, with flags it understands.
     # One more dedicated probe, because the launch is exactly where guessing
-    # costs an incident: `setsid` missing and an rclone too old for
-    # `--error-on-no-transfer` both look like a successful launch whose copy
-    # never existed. The detacher is mandatory (refuse without it); the version
-    # only gates an optional flag (unknown is an omission, never a refusal).
+    # costs an incident: `setsid` missing, an rclone too old for
+    # `--error-on-no-transfer` and — the one that actually happened — a logging
+    # flag this rclone does not spell all look like a successful launch whose
+    # copy never existed. The detacher is mandatory (refuse without it); the
+    # version and the flag names only gate OPTIONAL flags (unknown is an
+    # omission, never a refusal, and never an invention either).
     status, out, err = await _remote_shell(ssh, _capability_probe_command(rclone_bin), timeout_s)
     caps = _parse_capability_output(out) if status is not None else {}
     detacher = next((name for name in _DETACHER_CANDIDATES if caps.get(name) == "yes"), "")
@@ -755,14 +980,24 @@ async def preflight(
     version_text = caps.get("version", "")
     version = _rclone_version_tuple(version_text)
     error_on_no_transfer = _supports_error_on_no_transfer(version)
+    # The logging flags rclone SAYS it has. No help block (the call errored, or
+    # answered nothing) means neither: `_detect_log_flags` returns (None, None),
+    # which `build_copy_command` reads as "emit no logging flag at all" — safe,
+    # because the wrapper's `>> <log> 2>&1` already puts this run's post-mortem
+    # in the file the poll reads. That is the whole asymmetry this probe exists
+    # to enforce: omitting a flag costs detail, inventing one costs the copy.
+    log_file_flag, log_level_flag = _detect_log_flags(caps.get(_CAP_HELP_KEY, ""))
+    flags_text = ", ".join(f or "(none)" for f in (log_file_flag, log_level_flag))
     # Once per push, and only at debug: the operator reads this when a launch
     # is refused or a copy never starts, and must not have to guess what the
     # wrapper was built from.
     log.debug(
-        "push preflight: VPS1 wrapper=%s, rclone version=%s, --error-on-no-transfer=%s",
+        "push preflight: VPS1 wrapper=%s, rclone version=%s, --error-on-no-transfer=%s, "
+        "logging flags=%s",
         detacher,
         _one_line(version_text) or "unknown",
         "included" if error_on_no_transfer else "omitted",
+        flags_text,
     )
 
     # ... and it must know the remote under that name.
@@ -804,6 +1039,8 @@ async def preflight(
         files_total=len(accepted),
         detacher=detacher,
         error_on_no_transfer=error_on_no_transfer,
+        log_file_flag=log_file_flag,
+        log_level_flag=log_level_flag,
     )
 
 
@@ -818,6 +1055,8 @@ async def start_copy(
     write_timeout_s: float = _WRITE_TIMEOUT_S,
     detacher: str = "setsid",
     error_on_no_transfer: bool = True,
+    log_file_flag: str | None = _LOG_FILE_FLAG,
+    log_level_flag: str | None = _LOG_LEVEL_FLAG,
     proof_delay_s: float | None = None,
 ) -> PushCheck:
     """Write the file list on VPS1, launch the detached copy and PROVE it ran.
@@ -837,12 +1076,25 @@ async def start_copy(
     this check cannot judge reports `alive (unproven)` in `reason` and stays
     successful — the poll, with its grace, decides later.
 
+    DEAD includes the launch that wrote its own death sentence: a non-empty log
+    is not proof of life, it is evidence, and `_confirm_launch` reads it with
+    `push_liveness`'s fatal-line table (`_fatal_log_line`). That is precisely
+    the incident this closes — rclone answered the bad `--log` flag with
+    `Error: unknown flag: --log`, a usage block and exit in 0.4 s, the proof
+    saw bytes and called it "alive", `start_copy` returned ok, the checkpoint
+    squatted a slot for `timeout_seconds` and the operator was told "push
+    started". Now the same reason comes back as a refusal within seconds.
+
     The list goes out over SFTP on the DEDICATED dial and the copy starts on
     its own throwaway transport, so neither can be starved by (or starve) a
     racing .torrent fetch — the `sftp: write of /tmp/racing-sync-push-….lst
     failed: TimeoutError()` refusals in the production log were pooled writes.
-    `detacher` and `error_on_no_transfer` carry what `preflight` learned, so
-    the wrapper is one VPS1 has rather than one this daemon hoped for.
+    `detacher`, `error_on_no_transfer` and the two `log_*_flag` names carry what
+    `preflight` learned, so the wrapper is one VPS1 has and every flag is one
+    its rclone reports, rather than anything this daemon hoped for; a caller
+    that never probed gets the verified-correct spellings (`_usable_log_flag`
+    drops any name outside the whitelist, so a wrong flag cannot be emitted
+    even by accident).
     """
     files = list(getattr(request, "files", ()) or ())
     accepted, why = sanitize_push_files(files)
@@ -851,6 +1103,11 @@ async def start_copy(
 
     list_path, log_path = _push_scratch_paths(request, now)
     payload = ("\n".join(f.name for f in accepted) + "\n").encode("utf-8")
+    # Normalise HERE as well as in `build_copy_command` (idempotent: a value it
+    # accepts is already on its whitelist) so the check we hand back reports the
+    # flags the launched line actually carries, not whatever we were told.
+    file_flag = _usable_log_flag(log_file_flag, _LOG_FILE_FLAG_CHOICES, "log file")
+    level_flag = _usable_log_flag(log_level_flag, _LOG_LEVEL_FLAG_CHOICES, "log level")
 
     try:
         command = build_copy_command(
@@ -862,6 +1119,8 @@ async def start_copy(
             log_path=log_path,
             detacher=detacher,
             error_on_no_transfer=error_on_no_transfer,
+            log_file_flag=file_flag,
+            log_level_flag=level_flag,
         )
     except ValueError as e:
         return _fail(str(e))
@@ -930,6 +1189,8 @@ async def start_copy(
         files_total=len(accepted),
         detacher=detacher,
         error_on_no_transfer=error_on_no_transfer,
+        log_file_flag=file_flag,
+        log_level_flag=level_flag,
     )
 
 
@@ -985,9 +1246,14 @@ def _launch_proof_command(list_path: str, log_path: str) -> str:
       do it" (2+: a syntax error, a `-f` this pgrep does not implement). The
       last case must never be read as a dead copy.
     * the job log: `test -s` (non-empty), `test -f` (there but empty) or
-      neither. Since the wrapper appends the login shell's output to this very
-      file, a shell-level failure makes it non-empty, which is exactly the
-      evidence that says something ran.
+      neither, then its first `_PROOF_LOG_LINES` lines. Since the wrapper
+      appends the login shell's output to this very file, a shell-level failure
+      makes it non-empty — and since rclone prints a run that never STARTED the
+      same way (`Error: unknown flag: …`, then a usage dump, then exit 0.4 s
+      later), those lines are read as EVIDENCE by `_confirm_launch` rather than
+      as proof of life. "Has bytes" on its own only ever meant "something wrote
+      here", which is exactly how 28 dead launches got reported as "push
+      started".
 
     Never a glob, never a directory walk, never the mount, never content.
     """
@@ -1064,6 +1330,21 @@ def _proof_dead_reason(
     )
 
 
+def _proof_log_death_reason(log_path: str, pgrep: str, fatal: str) -> str:
+    """A launch that wrote its own death sentence, said in one readable line.
+
+    The fatal line comes FIRST on purpose: `_fail` caps a reason at 400
+    characters, and an operator's reply is worth nothing if the one line that
+    explains the failure — `Error: unknown flag: --log` — is what got trimmed.
+    Same wording as `push_liveness`'s "failed" verdict, so the phrase an
+    operator searches the logs for is the same on both paths.
+    """
+    return (
+        f"push refused: the copy died at once, rclone reported a fatal line: {fatal} "
+        f"(job log {log_path}, pgrep answered {pgrep or 'nothing'})"
+    )
+
+
 async def _confirm_launch(
     *, ssh: object, list_path: str, log_path: str, delay_s: float | None
 ) -> tuple[str, str]:
@@ -1072,17 +1353,23 @@ async def _confirm_launch(
     One short confirmation, a few seconds after the launch, on the push's own
     dedicated dial:
 
-    * `("alive", note)` — pgrep found this job's process, OR the job log has
-      bytes of its own (rclone opened it, or the login shell wrote its failure
-      there — either way something ran and the poll can read it).
+    * `("alive", note)` — pgrep found this job's process (process evidence beats
+      log evidence, always), OR the job log has bytes that do NOT read as a
+      give-up (rclone opened it, or the login shell wrote its failure there —
+      either way something ran and the poll can read it).
     * `("dead", reason)` — pgrep ran cleanly and did not find it, and the log is
-      absent or empty. Nothing is running and nothing would ever be written:
-      the reason names both checks and quotes the first log lines if any.
+      absent or empty: nothing is running and nothing would ever be written, and
+      the reason names both checks and quotes the first log lines if any. OR the
+      log has bytes whose own words are a fatal line by `push_liveness`'s table
+      (`_log_verdict`): a non-empty log is NOT proof of life, it is rclone
+      talking, and `Error: unknown flag: --log` is it saying it never started.
+      That reason — the fatal line first — is what the operator then sees.
     * `("unproven", note)` — anything else, and deliberately NOT death: no
       dial, a wedged or unparsable answer, a pgrep that is not installed or
-      errored with no log to fall back on. The existing `push_liveness` poll,
+      errored with no log to fall back on, a log that cannot be READ (absent,
+      empty or unreadable content). The existing `push_liveness` poll,
       with its grace window, decides later; missing evidence never kills a
-      possibly-live copy.
+      possibly-live copy, and only a recognised fatal line ever does.
 
     The wait is an `asyncio.sleep` on the push's own task — bounded,
     cancellable, and holding no pool lease (nothing here leases a member). No
@@ -1115,8 +1402,25 @@ async def _confirm_launch(
 
     pgrep, log_state, captured = _parse_proof_output(out)
     if pgrep == "found":
+        # PROCESS EVIDENCE BEATS LOG EVIDENCE: a copy VPS1 says is running wins
+        # over anything its log says, fatal lines included (a long run can hold
+        # a retry that reads like a give-up). Checked first, always.
         return "alive", f"VPS1 has the copy running ({_pgrep_pattern(list_path)})"
     if log_state == "bytes":
+        # NOT "a non-empty log means life" any more — that was the second half of
+        # the incident. Bytes are EVIDENCE, and the first lines are rclone's own
+        # words, so they get judged by the SAME fatal table the poll uses
+        # (`_log_verdict` → `_fatal_log_line`). rclone answered the bad flag with
+        # `Error: unknown flag: --log` plus a usage dump and exited in 0.4 s: the
+        # log had bytes, `start_copy` said ok, the checkpoint squatted a slot and
+        # the operator read "push started". Now that same log is a refusal, in
+        # the same seconds, on the path that already frees the checkpoint.
+        # Only `failed` kills. A closing `finished` summary is left ALONE: a
+        # genuinely tiny copy can complete inside this delay, and the poll plus
+        # the progress check are the ones that know whether bytes landed.
+        verdict, fatal = _log_verdict("\n".join(captured))
+        if verdict == "failed":
+            return "dead", _proof_log_death_reason(log_path, pgrep, fatal)
         return "alive", f"the job log at {log_path} already has content"
     if pgrep == "notfound" and log_state in ("absent", "empty"):
         return "dead", _proof_dead_reason(list_path, log_path, pgrep, log_state, captured)
@@ -1204,6 +1508,30 @@ def _finished_log_line(tail: str) -> str:
     return found
 
 
+def _log_verdict(tail: str) -> tuple[str, str]:
+    """rclone's own words, judged by ONE table: ("failed"|"finished"|"alive", line).
+
+    The single classifier behind both readers of a job log — `push_liveness`
+    (a poll, reading the END of a log that may have run for hours) and
+    `_confirm_launch` (a launch proof, reading its FIRST lines seconds after the
+    exec was accepted). The same `_FATAL_MARKERS` decide both, so "this line
+    means the run gave up" cannot mean one thing to the poll and another to the
+    launch — and a launch that died printing a usage error is caught by the
+    proof instead of waiting for the first poll to notice an empty remote.
+
+    Nothing here is a second opinion about liveness: a job that is merely SILENT
+    — or merely slow, or merely unreadable — is `alive`, always. Only a
+    recognised fatal line is death.
+    """
+    fatal = _fatal_log_line(tail)
+    if fatal:
+        return "failed", fatal
+    summary = _finished_log_line(tail)
+    if summary:
+        return "finished", summary
+    return "alive", ""
+
+
 async def push_liveness(
     *,
     ssh: object,
@@ -1223,8 +1551,11 @@ async def push_liveness(
       the log; the caller keeps the slot.
     * `("missing", reason)` — no log file at all, or a log that is still empty,
       past the grace: the copy never started or died before writing anything.
-    * `("failed", reason)` — a fatal line in the tail (`ERROR`, `Fatal`,
-      `panic:`, `exit status`, `Failed to`), quoted scrubbed and length-capped.
+    * `("failed", reason)` — a fatal line in the tail (`ERROR`, `Error:`,
+      `Fatal`, `panic:`, `exit status`, `Failed to`), quoted scrubbed and
+      length-capped. THE SAME TABLE the launch proof reads
+      (`_confirm_launch` → `_log_verdict`), so a copy that died printing its
+      complaint seconds after the launch is refused there rather than here.
     * `("finished", reason)` — the tail holds rclone's closing stats summary
       and no fatal line. The run ended; only the caller knows whether anything
       landed, so it must treat this as death ONLY when no file arrived (a
@@ -1232,7 +1563,7 @@ async def push_liveness(
 
     WHY SILENCE IS NOT DEATH: the remotes seeded here are Telegram-backed, and
     such a remote creates the destination object only when a large upload
-    COMPLETES. A multi-GB copy therefore writes nothing at `--loglevel INFO`
+    COMPLETES. A multi-GB copy therefore writes nothing at `--log-level INFO`
     for the better part of an hour and then everything at once — the production
     window this fix was written for saw exactly one `1/1` success 46 minutes
     after launch, after 64 polls of `0/1`. This exists to catch a job that is
@@ -1289,12 +1620,11 @@ async def push_liveness(
             "and wrote nothing, so it is not running",
         )
 
-    fatal = _fatal_log_line(tail)
-    if fatal:
-        return "failed", f"rclone reported a fatal line: {fatal}"
-    summary = _finished_log_line(tail)
-    if summary:
-        return "finished", f"the copy wrote its closing summary and nothing since: {summary}"
+    verdict, line = _log_verdict(tail)
+    if verdict == "failed":
+        return "failed", f"rclone reported a fatal line: {line}"
+    if verdict == "finished":
+        return "finished", f"the copy wrote its closing summary and nothing since: {line}"
     return ("alive", "")
 
 

@@ -19,7 +19,13 @@ could be squatted for the full 6 h `timeout_seconds`. Two fixes, one lane:
   (`run_shell_dedicated` / `write_remote_file_dedicated`), never a pooled
   member, so the push lane can neither queue behind a racing .torrent fetch
   nor starve one. Pinned by a `_lease` counter that stays at zero across a
-  full start-and-poll cycle.
+  full start-and-poll cycle;
+* the fatal table below is the ONE classifier both readers of a job log use
+  (`vps1_push._log_verdict`): the poll, and — since a non-empty log turned out
+  to be a usage error rather than a heartbeat — the launch proof seconds after
+  the exec was accepted. Which is also why `Error: unknown flag: --log` is in
+  the set: rclone's own words for "I never started", found in the log only
+  because the wrapper redirects the job's stdout/stderr into it.
 
 Plus the shipped defaults that stopped three 4-way unthrottled copies eating
 the uplink the races are won on: `transfers` 2, `max_concurrent_pushes` 1,
@@ -30,6 +36,7 @@ the uplink the races are won on: `transfers` 2, `max_concurrent_pushes` 1,
 from __future__ import annotations
 
 import datetime as dt
+import shlex
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -84,9 +91,19 @@ _SUMMARY_TAIL = (
 
 #: What a healthy VPS1 answers the two probes the launch depends on: both
 #: wrappers exist, its rclone knows the optional flag, and the copy is running.
+#: The help block is rclone's own `help logging` output — the ONLY place the
+#: lane now takes its logging-flag spellings from (a version table is a guess,
+#: and the guess that cost 28 copies was spelling the flag `--log`).
+_CAP_HELP = (
+    "Logging:\n"
+    "      --log-file string                Log to file\n"
+    "      --log-file-max-size SizeSuffix   Max size of log before rotation\n"
+    "      --log-level Level                Log level DEBUG|INFO|NOTICE|WARNING\n"
+)
 _CAP_ANSWER = (
     "SYNC-PUSH-CAP:setsid=yes\nSYNC-PUSH-CAP:nohup=yes\n"
     "SYNC-PUSH-CAP:rclone-version=\nrclone v1.66.0\n"
+    "SYNC-PUSH-CAP:log-help-begin\n" + _CAP_HELP + "SYNC-PUSH-CAP:log-help-end\n"
 )
 _PROOF_ANSWER = (
     "SYNC-PUSH-PROOF:pgrep=found\nSYNC-PUSH-PROOF:log=absent\nSYNC-PUSH-PROOF:log-begin\n"
@@ -257,6 +274,7 @@ async def test_a_fatal_line_is_scrubbed_and_capped():
     "line",
     [
         "ERROR : something",
+        "Error: unknown flag: --log",
         "Fatal error: cannot continue",
         "panic: runtime error: index out of range",
         "rclone exited with exit status 1",
@@ -268,6 +286,53 @@ async def test_the_fatal_set_is_small_and_documented(line):
     dial = _LogDial(_probe("512", f"INFO : fine so far\n{line}"))
     verdict, _why = await push_liveness(ssh=dial, log_path=LOG_PATH, age_s=900.0)
     assert verdict == "failed", line
+
+
+@pytest.mark.anyio
+async def test_the_usage_error_that_killed_28_launches_reads_as_fatal():
+    """`Error: unknown flag: --log` + a usage dump: a run that never started.
+
+    This is the text that production actually wrote, found in the log ONLY
+    because the wrapper redirects the job's own stdout/stderr into it. It is
+    fatal to the poll and (via the shared `_log_verdict`) to the launch proof.
+    """
+    usage = (
+        "Error: unknown flag: --log\n"
+        "Usage:\n"
+        "  rclone copy source:path dest:path [flags]\n"
+        "\n"
+        "Run 'rclone copy --help' for more information.\n"
+    )
+    dial = _LogDial(_probe("512", usage))
+    verdict, reason = await push_liveness(ssh=dial, log_path=LOG_PATH, age_s=900.0)
+    assert verdict == "failed"
+    assert "Error: unknown flag: --log" in reason
+    # … and the shared classifier says exactly the same thing to the proof.
+    assert vps1_push._log_verdict(usage)[0] == "failed"
+    assert vps1_push._fatal_log_line(usage) == "Error: unknown flag: --log"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "Errors:                                 0",
+        "Transferred:            1 / 1, 100%",
+        "Checks:               1 / 1, 100%",
+        "Elapsed time:          46m1.0s",
+        "INFO : Example.Show.S01E01.1080p.WEB-DL-GROUP.mkv: Copied (new)",
+    ],
+)
+@pytest.mark.anyio
+async def test_the_stats_words_are_not_the_fatal_ones_errors_is_not_error(tail):
+    """`Errors:` (a stats key) must not be read as `Error:` (a give-up).
+
+    One character of case-sensitivity is the difference between a copy that
+    finished cleanly and a copy that is declared dead, so the closing block —
+    which every healthy multi-GB run writes exactly once — stays non-fatal.
+    """
+    dial = _LogDial(_probe("4096", tail))
+    verdict, _why = await push_liveness(ssh=dial, log_path=LOG_PATH, age_s=900.0)
+    assert verdict != "failed", tail
 
 
 @pytest.mark.anyio
@@ -798,6 +863,8 @@ async def test_a_full_start_and_poll_cycle_never_leases_a_pool_member(tmp_path, 
         rclone_bin="/usr/bin/rclone",
     )
     assert check.ok, check.reason
+    # What VPS1's own help words said, handed on exactly as the coordinator does.
+    assert (check.log_file_flag, check.log_level_flag) == ("--log-file", "--log-level")
     started = await start_copy(
         request,
         ssh=exporter,
@@ -805,6 +872,8 @@ async def test_a_full_start_and_poll_cycle_never_leases_a_pool_member(tmp_path, 
         now=1762000000.0,
         detacher=check.detacher,
         error_on_no_transfer=check.error_on_no_transfer,
+        log_file_flag=check.log_file_flag,
+        log_level_flag=check.log_level_flag,
         proof_delay_s=0.0,
     )
     assert started.ok, started.reason
@@ -822,6 +891,11 @@ async def test_a_full_start_and_poll_cycle_never_leases_a_pool_member(tmp_path, 
     assert vps1.commands[3].startswith("setsid /usr/bin/rclone copy ")
     assert vps1.commands[3].endswith(f"</dev/null >> {LOG_PATH} 2>&1 &")
     assert "move" not in vps1.commands[3].split()
+    # The logging flags are the ones VPS1's help text named, pointing at the
+    # same file the poll is about to read — and the unprobed spelling, the one
+    # that cost 28 copies, is nowhere on the line.
+    assert f"--log-file {LOG_PATH}" in vps1.commands[3]
+    assert "--log " not in vps1.commands[3] and "--loglevel" not in vps1.commands[3]
     assert vps1.writes == [(LIST_PATH, f"{EPISODE_TOP}/{EPISODE_NAME}\n".encode())]
     # The proof of life ran, on the same dedicated dial, and found the job.
     assert any("SYNC-PUSH-PROOF" in c for c in vps1.commands)
@@ -1090,11 +1164,17 @@ async def test_the_copy_is_still_a_copy_and_still_gated_after_the_defaults_chang
     assert "--files-from-raw" in command
     assert "--error-on-no-transfer" in command
     assert "--ignore-existing" in command
+    # The logging flags VPS1's own help text named — and never the one that
+    # caused the incident. `--log ` (bare, plus a space) is the exact string
+    # rclone rejected 28 times, so it is pinned out of the line here too.
+    assert "--log-file" in tokens and "--log-level" in tokens
+    assert "--log " not in command and "--log" not in shlex.split(command)
     assert command.startswith("setsid ") and command.endswith(
         f"</dev/null >> {started.log_path} 2>&1 &"
     )
     # The launcher's own output is never discarded: nothing points at /dev/null
-    # for writing, only stdin comes from it.
+    # for writing, only stdin comes from it. That redirect is what makes an
+    # omitted logging flag harmless, and what produced this bug report.
     assert ">/dev/null" not in command
 
 

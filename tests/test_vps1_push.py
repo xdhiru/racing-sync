@@ -35,16 +35,50 @@ TARGET = "seedremote:TV/Example Show (2020)"
 LIST_PATH = "/tmp/racing-sync-push-ab12cd34ef-1762000000.lst"
 LOG_PATH = "/tmp/racing-sync-push-ab12cd34ef-1762000000.log"
 
+
 #: The canned answers a healthy VPS1 gives the two NEW pre-launch probes: both
 #: wrappers exist, and its rclone is new enough for the optional flag. Keyed by
 #: their own tag so a test that only spells `command -v` cannot accidentally
 #: answer them (the capability probe asks `command -v setsid`, too).
-CAP_REPLY = (
-    0,
-    "SYNC-PUSH-CAP:setsid=yes\nSYNC-PUSH-CAP:nohup=yes\n"
-    "SYNC-PUSH-CAP:rclone-version=\nrclone v1.66.0\n",
-    "",
-)
+#:
+#: The help block is what `rclone help logging` actually prints (only the
+#: spellings a build HAS are in it, and `--log-file-max-size` is there to prove
+#: the probe matches flag NAMES and not substrings), because that block — not a
+#: version table — is where `build_copy_command` gets its logging flags from.
+#: The bug this pins: the shipped line used `--log`, rclone has never had a bare
+#: `--log`, and 28 launches died printing `Error: unknown flag: --log`.
+def _help_block(*, file_flag: bool = True, level_flag: bool = True, alias: bool = False) -> str:
+    lines = ["Logging:"]
+    if file_flag:
+        lines.append("      --log-file string                Log to file")
+        lines.append("      --log-file-max-size SizeSuffix   Max size of log before rotation")
+    if level_flag:
+        lines.append("      --log-level Level                Log level DEBUG|INFO|NOTICE|WARNING")
+    if alias:
+        lines.append("      --loglevel Level                 Deprecated alias for --log-level")
+    return "\n".join(lines)
+
+
+def _cap(
+    *,
+    setsid: str = "yes",
+    nohup: str = "yes",
+    version: str | None = "rclone v1.69.2",
+    help_block: str | None = None,
+) -> tuple[int | None, str, str]:
+    """One canned capability-probe answer, its help block included or omitted."""
+    lines = [f"SYNC-PUSH-CAP:setsid={setsid}", f"SYNC-PUSH-CAP:nohup={nohup}"]
+    lines.append("SYNC-PUSH-CAP:rclone-version=")
+    if version:
+        lines.append(version)
+    if help_block is not None:
+        lines.append("SYNC-PUSH-CAP:log-help-begin")
+        lines.extend(help_block.splitlines())
+        lines.append("SYNC-PUSH-CAP:log-help-end")
+    return (0, "\n".join(lines) + "\n", "")
+
+
+CAP_REPLY = _cap(help_block=_help_block())
 PROOF_REPLY = (
     0,
     "SYNC-PUSH-PROOF:pgrep=found\nSYNC-PUSH-PROOF:log=absent\nSYNC-PUSH-PROOF:log-begin\n",
@@ -216,8 +250,11 @@ def test_build_copy_command_is_a_copy_and_never_a_move():
     assert "--ignore-existing" in tokens
     assert tokens[tokens.index("--transfers") + 1] == "4"
     assert tokens[tokens.index("--bwlimit") + 1] == "42M"
-    assert tokens[tokens.index("--log") + 1] == "/tmp/push.log"
-    assert tokens[tokens.index("--loglevel") + 1] == "INFO"
+    # The logging flags, spelled the way rclone spells them (see the next test
+    # for the one that must NEVER appear).
+    assert tokens[tokens.index("--log-file") + 1] == "/tmp/push.log"
+    assert tokens[tokens.index("--log-level") + 1] == "INFO"
+    assert "--loglevel" not in tokens
     assert "--error-on-no-transfer" in tokens
     # positionals come last, after the end-of-flags marker.
     assert tokens.index("--") < tokens.index(SRC_DIR)
@@ -225,6 +262,114 @@ def test_build_copy_command_is_a_copy_and_never_a_move():
     # THE FIX: nothing the LOGIN SHELL writes is discarded any more.
     assert ">/dev/null" not in cmd
     assert ">> /tmp/push.log 2>&1" in cmd
+
+
+def _launch(**kwargs) -> str:
+    """One built command line with the probe results the caller decides."""
+    args: dict = {
+        "rclone_bin": "/usr/bin/rclone",
+        "transfers": 2,
+        "bwlimit": "",
+        "list_path": LIST_PATH,
+        "log_path": "/tmp/push.log",
+    }
+    args.update(kwargs)
+    return build_copy_command(_request(), **args)
+
+
+#: Every capability outcome — probed modern, probed legacy alias, probed
+#: "nothing at all", never probed — plus what a caller that HOPES for a bad
+#: flag asks for. A wrong flag must not be possible, so the last rows are not
+#: hypothetical: they are the point.
+_EVERY_CAPABILITY_OUTCOME = [
+    {},  # a caller that never probed: the verified defaults
+    {"log_file_flag": "--log-file", "log_level_flag": "--log-level"},
+    {"log_file_flag": "--log-file", "log_level_flag": "--loglevel"},
+    {"log_file_flag": "--log-file", "log_level_flag": None},
+    {"log_file_flag": None, "log_level_flag": None},
+    {"log_file_flag": "--log", "log_level_flag": "--log"},
+    {"log_file_flag": "--log "},
+    {"log_file_flag": "", "log_level_flag": ""},
+    {"log_file_flag": "--log-file-max-size", "log_level_flag": "--logfile"},
+    {"log_file_flag": "--log-file", "log_level_flag": "--log"},
+    {"log_file_flag": 0, "log_level_flag": object()},
+    {"log_file_flag": "--log-file; rm -rf /", "log_level_flag": "--log-level\nINFO"},
+]
+
+
+@pytest.mark.parametrize("outcome", _EVERY_CAPABILITY_OUTCOME)
+def test_a_built_command_can_never_carry_a_bare_log_flag(outcome):
+    """THE regression: `--log` + a space is not an rclone flag and never ships.
+
+    VPS1 answered 28 launches with `Error: unknown flag: --log` because this
+    line spelled its log flag as `--log`. Any spelling that is not on the
+    whitelist is dropped — never emitted, never guessed at — so the string a
+    build must not contain cannot be produced by any caller at all.
+    """
+    cmd = _launch(**outcome)
+    assert "--log " not in cmd
+    assert "--log\n" not in cmd
+    assert not any(token == "--log" for token in cmd.split())
+    assert "--log" not in shlex.split(cmd)
+    # A dropped flag never smuggles shell text in either: the only `--log*`
+    # tokens present are the two whitelisted spellings.
+    for token in shlex.split(cmd):
+        if token.startswith("--log"):
+            assert token in ("--log-file", "--log-level", "--loglevel"), token
+
+
+@pytest.mark.parametrize(
+    "outcome, expects",
+    [
+        ({}, ("--log-file", "--log-level")),
+        (
+            {"log_file_flag": "--log-file", "log_level_flag": "--log-level"},
+            ("--log-file", "--log-level"),
+        ),
+        (
+            {"log_file_flag": "--log-file", "log_level_flag": "--loglevel"},
+            ("--log-file", "--loglevel"),
+        ),
+        ({"log_file_flag": "--log-file", "log_level_flag": None}, ("--log-file",)),
+        ({"log_file_flag": None, "log_level_flag": None}, ()),
+    ],
+)
+def test_the_logging_flags_emit_exactly_what_was_probed_and_nothing_else(outcome, expects):
+    cmd = _launch(**outcome)
+    tokens = shlex.split(cmd)
+    for flag in ("--log-file", "--log-level", "--loglevel"):
+        assert (flag in tokens) is (flag in expects), flag
+    if "--log-file" in expects:
+        assert tokens[tokens.index("--log-file") + 1] == "/tmp/push.log"
+    if "--log-level" in expects:
+        assert tokens[tokens.index("--log-level") + 1] == "INFO"
+    if "--loglevel" in expects:
+        assert tokens[tokens.index("--loglevel") + 1] == "INFO"
+
+
+def test_a_build_with_no_logging_flags_at_all_still_leaves_the_post_mortem():
+    """Dropping BOTH flags is safe, and this redirect is why.
+
+    The wrapper appends the job's own stdout/stderr to the very log path
+    `push_liveness` reads, so rclone's words (stderr, including the usage error
+    that produced this bug) still land there with no `--log-file` in sight:
+    omitting a logging flag costs detail, inventing one costs the copy.
+    """
+    cmd = _launch(log_file_flag=None, log_level_flag=None)
+    assert cmd.endswith("</dev/null >> /tmp/push.log 2>&1 &")
+    assert ">> /tmp/push.log 2>&1" in cmd
+    assert "log-file" not in cmd and "log-level" not in cmd
+    # Still a copy, still detached, still the same list file.
+    tokens = shlex.split(cmd)
+    assert "copy" in tokens and "move" not in tokens
+    assert LIST_PATH in tokens
+
+
+def test_guard_copy_only_refuses_a_bare_log_flag_too():
+    """Defence in depth: an argv assembled elsewhere cannot ship `--log`."""
+    with pytest.raises(ValueError, match="not an rclone flag"):
+        _guard_copy_only(["rclone", "copy", "--log", "/tmp/push.log"])
+    _guard_copy_only(["rclone", "copy", "--log-file", "/tmp/push.log", "--log-level", "INFO"])
 
 
 def test_build_copy_command_omits_bwlimit_when_unset():
