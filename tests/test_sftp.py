@@ -330,6 +330,55 @@ def test_fetch_torrent_uses_posix_path_and_caps_read():
     assert data_oversize is None
 
 
+def test_fetch_torrent_redials_after_a_transport_error():
+    """A failed read re-dials the connection and retries the same path.
+
+    A half-dead SFTP channel looks active while every read stalls and then
+    fails; retrying on the same transport just fails again.
+    """
+    import threading
+    from unittest.mock import MagicMock
+
+    import paramiko
+
+    exporter = object.__new__(_SFTPConnection)
+    exporter._lock = threading.RLock()
+    exporter._closed = False
+    exporter._cfg = _sftp_cfg()
+    mock_client = MagicMock()
+    mock_client.get_transport().is_active.return_value = True
+    mock_sftp = MagicMock()
+    exporter._client = mock_client
+    exporter._sftp = mock_sftp
+
+    good_file = MagicMock()
+    good_file.read.return_value = SAMPLE_TORRENT
+    good_file.__enter__.return_value = good_file
+    calls = {"n": 0}
+
+    def _open(path, mode):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise paramiko.SSHException("channel closed")
+        return good_file
+
+    mock_sftp.open.side_effect = _open
+    reconnects = {"n": 0}
+
+    def _connect():
+        reconnects["n"] += 1
+        exporter._client = mock_client
+        exporter._sftp = mock_sftp
+
+    exporter.connect = _connect  # type: ignore[assignment]
+
+    data = exporter.fetch_torrent("1" * 40)
+
+    assert data == SAMPLE_TORRENT
+    assert reconnects["n"] == 1
+    assert calls["n"] == 2
+
+
 def test_disk_free_bytes_prefers_statvfs():
     import threading
     from unittest.mock import MagicMock

@@ -331,6 +331,24 @@ class _SFTPConnection:
             pass
         raise TimeoutError(f"sftp busy: {what} gave up waiting for the connection lock")
 
+    def _reconnect_for_retry(self) -> bool:
+        """Drop a dead transport and dial again; True when usable.
+
+        A half-dead SFTP channel can look active while every read stalls
+        until the IO timeout and then fails. Re-dialling gives the retry a
+        fresh transport instead of the same broken one.
+        """
+        try:
+            self.close()
+        except Exception:
+            pass
+        try:
+            self.connect()
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("sftp: reconnect failed: %s", e)
+            return False
+
     # ---- torrent file ----
 
     def fetch_torrent(self, infohash: str) -> bytes | None:
@@ -381,37 +399,47 @@ class _SFTPConnection:
             ]
             for path in candidates:
                 path_str = path.as_posix()
-                try:
-                    with self._sftp.open(path_str, "rb") as f:  # type: ignore[union-attr]
-                        data = f.read(MAX_TORRENT_BYTES + 1)
-                    if len(data) > MAX_TORRENT_BYTES:
-                        log.warning("sftp: %s exceeds %d bytes limit", path_str, MAX_TORRENT_BYTES)
-                        continue
-                    from .watchdir import is_bencoded_torrent
+                data: bytes | None = None
+                for _attempt in (1, 2):
+                    try:
+                        with self._sftp.open(path_str, "rb") as f:  # type: ignore[union-attr]
+                            data = f.read(MAX_TORRENT_BYTES + 1)
+                        break
+                    except FileNotFoundError:
+                        data = None
+                        break
+                    except OSError as e:
+                        # Paramiko surfaces missing files as IOError(errno 2),
+                        # which may not subclass FileNotFoundError — treat
+                        # as a miss.
+                        if getattr(e, "errno", None) == 2:
+                            data = None
+                            break
+                        log.warning("sftp: read %s failed: %s", path_str, e)
+                        if not self._reconnect_for_retry():
+                            break
+                    except (paramiko.SSHException, EOFError) as e:
+                        log.warning("sftp: read %s failed: %s", path_str, e)
+                        if not self._reconnect_for_retry():
+                            break
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("sftp: unexpected error reading %s: %s", path_str, e)
+                        break
+                if data is None:
+                    continue
+                if len(data) > MAX_TORRENT_BYTES:
+                    log.warning("sftp: %s exceeds %d bytes limit", path_str, MAX_TORRENT_BYTES)
+                    continue
+                from .watchdir import is_bencoded_torrent
 
-                    if is_bencoded_torrent(data):
-                        return data
-                    log.warning(
-                        "sftp: %s does not look like a bencoded torrent (%d bytes, head=%s)",
-                        path_str,
-                        len(data),
-                        data[:12].hex(),
-                    )
-                except FileNotFoundError:
-                    continue
-                except OSError as e:
-                    # Paramiko surfaces missing files as IOError(errno 2),
-                    # which may not subclass FileNotFoundError — treat as miss.
-                    if getattr(e, "errno", None) == 2:
-                        continue
-                    log.warning("sftp: read %s failed: %s", path_str, e)
-                    continue
-                except (paramiko.SSHException, EOFError) as e:
-                    log.warning("sftp: read %s failed: %s", path_str, e)
-                    continue
-                except Exception as e:  # noqa: BLE001
-                    log.warning("sftp: unexpected error reading %s: %s", path_str, e)
-                    continue
+                if is_bencoded_torrent(data):
+                    return data
+                log.warning(
+                    "sftp: %s does not look like a bencoded torrent (%d bytes, head=%s)",
+                    path_str,
+                    len(data),
+                    data[:12].hex(),
+                )
             return None
 
     def fetch_many(self, infohashes: Iterable[str]) -> dict[str, bytes]:
