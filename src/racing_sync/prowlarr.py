@@ -99,6 +99,12 @@ _MAX_DOWNLOAD_REDIRECTS = 5
 #: whereas qB 500s are application errors that must surface.
 _INDEXER_TRANSIENT_STATUSES = (408, 425, 429, 500, 502, 503, 504)
 
+#: Per-indexer cooldown after a 429. One rate-limited row must not turn
+#: every other row into another 429: the first hit parks the indexer for a
+#: minute, and consecutive hits back off exponentially (capped at 15m).
+_RATE_LIMIT_COOLDOWN_MIN_S = 60.0
+_RATE_LIMIT_COOLDOWN_MAX_S = 900.0
+
 #: Lifetime search counters for /metrics (module-level: the client is
 #: rebuilt across coordinator restarts, the counters must not reset).
 _PROWLARR_COUNTERS = {"searches": 0, "hits": 0, "errors": 0}
@@ -181,6 +187,11 @@ class ProwlarrClient:
         # target goes missing (see _schedule_indexer_refresh).
         self._indexer_refresh_attempted_at: float = 0.0
         self._refresh_task: asyncio.Task | None = None
+        # Rate-limit circuit breaker: indexer name (lower) -> monotonic
+        # deadline and consecutive-429 count. Rows search independently, so
+        # without this every parked row re-hits a throttled indexer.
+        self._cooldown_until: dict[str, float] = {}
+        self._rate_limit_hits: dict[str, int] = {}
 
     # ---------- lifecycle ----------
 
@@ -415,6 +426,45 @@ class ProwlarrClient:
 
     # ---------- search ----------
 
+    def _cooldown_remaining(self, indexer: Indexer) -> float:
+        try:
+            until = self._cooldown_until.get(indexer.name.lower(), 0.0)
+            return max(0.0, float(until) - time.monotonic())
+        except Exception:
+            return 0.0
+
+    def _note_rate_limited(self, indexer: Indexer, exc: BaseException | None, attempt: int) -> None:
+        """Park a throttled indexer: 60s, doubling on consecutive 429s."""
+        try:
+            key = indexer.name.lower()
+            hits = min(4, int(self._rate_limit_hits.get(key, 0)) + 1)
+            self._rate_limit_hits[key] = hits
+            delay = min(
+                _RATE_LIMIT_COOLDOWN_MAX_S,
+                _RATE_LIMIT_COOLDOWN_MIN_S * (2 ** (hits - 1)),
+            )
+            try:
+                delay = max(delay, _retry_delay_from_exc(exc, attempt))
+            except Exception:
+                pass
+            self._cooldown_until[key] = time.monotonic() + delay
+            log.warning(
+                "prowlarr: indexer %r is rate-limited; cooling down for %.0fs (%d consecutive)",
+                indexer.name,
+                delay,
+                hits,
+            )
+        except Exception:
+            pass
+
+    def _note_indexer_ok(self, indexer: Indexer) -> None:
+        try:
+            key = indexer.name.lower()
+            self._rate_limit_hits.pop(key, None)
+            self._cooldown_until.pop(key, None)
+        except Exception:
+            pass
+
     async def search_indexer(
         self,
         indexer: Indexer,
@@ -428,6 +478,15 @@ class ProwlarrClient:
                 "prowlarr: skipping search on %s for %r (matches skip_query_substrings)",
                 indexer.name,
                 query,
+            )
+            return []
+        remaining = self._cooldown_remaining(indexer)
+        if remaining > 0:
+            log.debug(
+                "prowlarr: skipping %r for %r (%ds rate-limit cooldown left)",
+                indexer.name,
+                query,
+                int(remaining),
             )
             return []
         if not self._session:
@@ -517,6 +576,8 @@ class ProwlarrClient:
                 # Rate-limit / gateway hiccups are retryable (500 included:
                 # flaky indexers, and a miss only parks); anything else
                 # fails fast so bad queries don't burn 3 attempts.
+                if e.status == 429:
+                    self._note_rate_limited(indexer, e, attempt)
                 if e.status not in _INDEXER_TRANSIENT_STATUSES:
                     raise ProwlarrError(
                         f"prowlarr search on {indexer.name!r} failed: HTTP {e.status}"
@@ -527,6 +588,7 @@ class ProwlarrClient:
                     f"prowlarr search on {indexer.name!r} failed: {last_exc}"
                 ) from last_exc
             await asyncio.sleep(_retry_delay_from_exc(last_exc, attempt))
+        self._note_indexer_ok(indexer)
         return await asyncio.to_thread(_parse_newznab, text, indexer)
 
     async def download_torrent(self, hit: TorrentHit) -> bytes:
