@@ -1266,7 +1266,7 @@ async def test_rclone_move_error_carries_headline_and_tail(tmp_path):
         stderr="NOTICE: headline here\nline2\nERROR: tail detail",
         duration=1.0,
     )
-    with patch("racing_sync.coordinator_move.move_local_to_remote", AsyncMock(return_value=res)):
+    with patch("racing_sync.transfer.move_local_to_remote", AsyncMock(return_value=res)):
         with pytest.raises(RuntimeError) as exc:
             await coord._rclone_move(tmp_path, "remote:x", ts)
     assert "headline here" in str(exc.value)
@@ -1395,9 +1395,7 @@ async def test_heal_move_bypasses_bulk_semaphore(tmp_path):
     ts = TorrentState(source_infohash="h" * 40, source_name="H", state=State.RE_ADDING)
     res = RcloneResult(returncode=0, stdout="", stderr="", duration=0.1)
     try:
-        with patch(
-            "racing_sync.coordinator_move.move_local_to_remote", AsyncMock(return_value=res)
-        ):
+        with patch("racing_sync.transfer.move_local_to_remote", AsyncMock(return_value=res)):
             await asyncio.wait_for(
                 coord._rclone_move(tmp_path, "remote:x", ts, heal=True), timeout=5
             )

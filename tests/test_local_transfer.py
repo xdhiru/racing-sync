@@ -226,8 +226,8 @@ async def test_the_mover_uses_the_local_provider(tmp_path, monkeypatch):
         return LocalMoveResult(0)
 
     rclone = AsyncMock()
-    monkeypatch.setattr("racing_sync.coordinator_move.move_local_to_local", fake_local)
-    monkeypatch.setattr("racing_sync.coordinator_move.move_local_to_remote", rclone)
+    monkeypatch.setattr("racing_sync.transfer.move_local_to_local", fake_local)
+    monkeypatch.setattr("racing_sync.transfer.move_local_to_remote", rclone)
     local = tmp_path / "local"
     _write(local / "a.mkv", b"abc")
     ts = TorrentState(source_infohash="f" * 40, source_name="Local.Move")
