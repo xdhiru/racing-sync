@@ -171,6 +171,11 @@ state_dir = "/home/deluge/.config/deluge/state"
 # Concurrent re-inject fetches share the pool instead of serializing on
 # one transport; a wedged member fails over instead of wedging everyone.
 pool_size = 3
+# Bulk fetch: one tar stream over the existing SSH session replaces the
+# fragile per-file SFTP reads. false = per-file reads only.
+bulk_fetch_enabled = true
+# How often the bulk fetch runs (seconds, default 900). 0 = never.
+bulk_fetch_interval_seconds = 900
 
 # ============================================================
 # Destination (VPS2) — long-term seed client (qbittorrent)

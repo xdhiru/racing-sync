@@ -433,3 +433,104 @@ unsorted_path = "/mnt/fuse/unsorted"
 
     with pytest.raises(ValueError, match=r"\[seed\]\.path"):
         AppConfig.from_toml(cfg_file)
+
+
+# --- bulk racing-.torrent fetch: the new keys survive both spellings ---
+#
+# The alias layer prunes keys the model does not know, so a switch that
+# only exists in the new spelling would be dropped (with a "possible
+# typo" warning) before validation. These pin that the bulk-fetch
+# switches reach the model under both table names.
+
+
+_BULK_FETCH_NEW = """\
+[general]
+
+[client]
+type = "deluge"
+host = "http://127.0.0.1:8080"
+
+[client.deluge_sftp]
+enabled = true
+ssh_password = "bulk-fetch-test-pass"
+state_dir = "/home/deluge/.config/deluge/state"
+{bulk}
+
+[dest]
+host = "http://127.0.0.1:8080"
+
+[storage]
+path = "/downloads"
+save_path = "/downloads"
+max_inflight_bytes = 1000000000
+skip_movie_larger_than_bytes = 1000000000
+
+[remote]
+path = "remote:movies/"
+unsorted = "remote:unsorted/"
+
+[seed]
+path = "/mnt/fuse"
+"""
+
+_BULK_FETCH_OLD = """\
+[general]
+
+[source]
+type = "deluge"
+host = "http://127.0.0.1:8080"
+
+[source.deluge_sftp]
+enabled = true
+ssh_password = "bulk-fetch-test-pass"
+state_dir = "/home/deluge/.config/deluge/state"
+{bulk}
+
+[dest]
+host = "http://127.0.0.1:8080"
+save_path = "/downloads"
+
+[ssd]
+path = "/downloads"
+max_inflight_bytes = 1000000000
+skip_movie_larger_than_bytes = 1000000000
+
+[rclone.remote]
+default = "remote:movies/"
+unsorted = "remote:unsorted/"
+
+[rclone.fuse]
+mount = "/mnt/fuse"
+mount_unsorted = "/mnt/fuse/unsorted"
+"""
+
+_BULK_FETCH_TEMPLATES = {"client": _BULK_FETCH_NEW, "source": _BULK_FETCH_OLD}
+
+
+@pytest.mark.parametrize("spelling", ["client", "source"])
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("bulk_fetch_enabled", "false"),
+        ("bulk_fetch_interval_seconds", "300"),
+    ],
+)
+def test_bulk_fetch_keys_survive_both_spellings(
+    spelling: str, key: str, value: str, tmp_path: Path
+):
+    """The bulk-fetch switches are known keys under either table name."""
+    text = _BULK_FETCH_TEMPLATES[spelling].format(bulk=f"{key} = {value}")
+    cfg_file = _config_file(tmp_path, text)
+
+    normalized = normalize_config(tomllib.loads(text))
+    assert normalized.unknown == ()
+
+    cfg = AppConfig.from_toml(cfg_file)
+    sftp = cfg.source.deluge_sftp
+    assert sftp is not None
+    if key == "bulk_fetch_enabled":
+        assert sftp.bulk_fetch_enabled is False
+        assert sftp.bulk_fetch_interval_seconds == 900
+    else:
+        assert sftp.bulk_fetch_interval_seconds == 300
+        assert sftp.bulk_fetch_enabled is True

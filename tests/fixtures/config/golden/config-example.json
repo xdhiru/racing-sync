@@ -1,13 +1,13 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:aa4ebfe389889bb8",
+  "digest": "sha256:95357fd9015102a6",
   "keys": {
     "by_section": {
       "acquire": 9,
       "api": 8,
       "classifier": 1,
       "cleanup": 21,
-      "client": 21,
+      "client": 23,
       "dest": 8,
       "general": 8,
       "indexers": 16,
@@ -21,8 +21,8 @@
       "watch": 5
     },
     "defaulted": 14,
-    "explicit": 146,
-    "model": 147,
+    "explicit": 148,
+    "model": 149,
     "unknown": []
   },
   "resolved": {
@@ -194,6 +194,8 @@
       "category": "",
       "deluge_sftp": {
         "auto_add_host_key": false,
+        "bulk_fetch_enabled": true,
+        "bulk_fetch_interval_seconds": 900,
         "enabled": false,
         "known_hosts_path": null,
         "pool_size": 3,

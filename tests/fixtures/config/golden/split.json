@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:49900a9ea9b31269",
+  "digest": "sha256:2b8b9a1b90801a8b",
   "keys": {
     "by_section": {
       "api": 5,
@@ -15,9 +15,9 @@
       "telegram": 3,
       "watch_dir": 2
     },
-    "defaulted": 94,
+    "defaulted": 96,
     "explicit": 55,
-    "model": 147,
+    "model": 149,
     "unknown": []
   },
   "resolved": {
@@ -180,6 +180,8 @@
       "category": "racing",
       "deluge_sftp": {
         "auto_add_host_key": false,
+        "bulk_fetch_enabled": true,
+        "bulk_fetch_interval_seconds": 900,
         "enabled": true,
         "known_hosts_path": null,
         "pool_size": 3,

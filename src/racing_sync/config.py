@@ -140,6 +140,15 @@ class DelugeSFTPConfig(BaseModel):
     # (15s-timeout clusters); 3 lets a few fetches fly in parallel while
     # a wedged member fails over instead of wedging everyone.
     pool_size: int = Field(default=3, ge=1, le=8)
+    # Bulk racing-.torrent fetch: one `tar` stream over the existing SSH
+    # session replaces the fragile per-file SFTP reads (one read per
+    # torrent). The VPS1 link drops packets, and N small reads multiply
+    # that loss; a single stream does not.
+    bulk_fetch_enabled: bool = True
+    # How often the bulk warm-up runs (seconds). 0 disables it and leaves
+    # only the per-file fallback. The fetch itself is a single `tar`
+    # stream over the existing SSH session.
+    bulk_fetch_interval_seconds: int = Field(default=900, ge=0)
 
     @field_validator("ssh_key_path", "known_hosts_path", "state_dir", mode="before")
     @classmethod
