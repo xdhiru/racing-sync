@@ -226,6 +226,17 @@ class Coordinator(
     # (rolling intake-velocity signal for spam-burst grace shortening).
     _cleanup_last_run: float = field(default=0.0, init=False)
     _arrival_times: list = field(default_factory=list, init=False)
+    # Parallel arrival sizes [(monotonic, bytes)]: the janitor turns them
+    # into a bytes/hour intake rate and a projected hours-to-fill, which
+    # drive burst cadence/cap and the oversized-arrival warning.
+    _arrival_bytes: list = field(default_factory=list, init=False)
+    # Set when a newly discovered release cannot fit in the free space the
+    # janitor last probed: the next pass prioritises cleanup (MOVING rows
+    # allowed early) even before the watermark is crossed.
+    _cleanup_urgent: bool = field(default=False, init=False)
+    # Last VPS1 free-space reading (bytes): the oversized-arrival check
+    # compares each new release against it. None = never probed / unknown.
+    _last_source_free_bytes: int | None = field(default=None, init=False)
     # Serializes the periodic tick against API-triggered ops (recover /
     # scan-watch / retry) so they can't double-schedule or clobber rows.
     _ops_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)

@@ -27,26 +27,118 @@ log = logging.getLogger("racing_sync.coordinator")
 class CleanupMixin:
     """VPS1 janitor (duck-typed ``self``: cfg/store/source_client/dest_client)."""
 
-    def _cleanup_arrivals_per_hour(self, now_mono: float) -> float:
-        """Rolling intake velocity: new racing releases in the trailing hour.
+    def _cleanup_arrival_rates(self, now_mono: float) -> tuple[float, float]:
+        """Rolling intake velocity: (releases/hour, bytes/hour) over 1 h.
 
-        Spam-uploader bursts raise this; the janitor shortens deletion grace
-        accordingly. Prunes entries older than one hour (bounded memory).
-        Tolerant of object.__new__ test doubles (missing attribute).
+        Spam-uploader bursts raise the rate; the janitor shortens deletion
+        grace and switches to burst cadence/cap accordingly. Both arrival
+        lists are pruned with the SAME cutoff so counts and bytes always
+        describe the same window (bounded memory either way). Tolerant of
+        object.__new__ test doubles (missing attributes).
+        """
+        cutoff = now_mono - 3600.0
+        arrivals = 0.0
+        try:
+            times = getattr(self, "_arrival_times", None)
+            if times:
+                kept = [t for t in times if t >= cutoff]
+                try:
+                    self._arrival_times = kept
+                except Exception:
+                    pass
+                arrivals = float(len(kept))
+        except Exception:
+            arrivals = 0.0
+        bytes_rate = 0.0
+        try:
+            sizes = getattr(self, "_arrival_bytes", None)
+            if sizes:
+                kept_b = [e for e in sizes if e[0] >= cutoff]
+                try:
+                    self._arrival_bytes = kept_b
+                except Exception:
+                    pass
+                bytes_rate = float(sum(int(e[1] or 0) for e in kept_b))
+        except Exception:
+            bytes_rate = 0.0
+        return arrivals, bytes_rate
+
+    def _note_cleanup_arrival(self, size_bytes: int) -> None:
+        """Flag a newly discovered release that does not fit on VPS1.
+
+        Compares the arrival against the free space the janitor last
+        probed. Exceeding free-minus-safety (or plain free, whichever is
+        stricter) means the disk will overflow before the normal hourly
+        tick: warn once and mark the next pass urgent so it runs early and
+        may reclaim MOVING rows. Never raises (discovery must not fail on
+        bookkeeping).
         """
         try:
-            arrivals = getattr(self, "_arrival_times", None)
-            if not arrivals:
-                return 0.0
-            cutoff = now_mono - 3600.0
-            kept = [t for t in arrivals if t >= cutoff]
+            last_free = getattr(self, "_last_source_free_bytes", None)
+            if last_free is None:
+                return
+            free = int(last_free)
+            size = int(size_bytes or 0)
+            if size <= 0:
+                return
             try:
-                self._arrival_times = kept
-            except Exception:
-                pass
-            return float(len(kept))
+                safety = int(getattr(self.rt.storage, "disk_safety_margin_bytes", 0) or 0)
+            except (TypeError, ValueError):
+                safety = 0
+            if size > max(0, free - safety):
+                self._cleanup_urgent = True
+                log.warning(
+                    "cleanup: new release ~%d MB exceeds VPS1 free ~%d MB; "
+                    "the next janitor pass will prioritise cleanup",
+                    size // (1024 * 1024),
+                    free // (1024 * 1024),
+                )
         except Exception:
-            return 0.0
+            return
+
+    def _cleanup_arrivals_per_hour(self, now_mono: float) -> float:
+        """Arrival-count half of `_cleanup_arrival_rates` (kept for callers)."""
+        return self._cleanup_arrival_rates(now_mono)[0]
+
+    def _cleanup_pressure(
+        self, cfg: object, free_bytes: int | None
+    ) -> tuple[float, float, float | None, bool, bool]:
+        """Intake/disk pressure snapshot: (arrivals/h, bytes/h, projected
+        hours-to-fill | None, urgent, bursting).
+
+        Bursting (shorter cadence, bigger cap) when any of:
+          - free space is below the low watermark;
+          - a recent arrival did not fit (`_cleanup_urgent`);
+          - arrivals/hour reached `burst_arrivals_per_hour`;
+          - the recent bytes/hour fill the remaining space inside
+            `fill_lookahead_hours` (0 disables this trigger).
+        Unknown free space never projects (fail-closed: no guess).
+        """
+        arrivals, bytes_rate = self._cleanup_arrival_rates(time.monotonic())
+        projected: float | None = None
+        if free_bytes is not None and bytes_rate > 0:
+            try:
+                projected = float(free_bytes) / bytes_rate * 3600.0
+            except (TypeError, ValueError, ZeroDivisionError):
+                projected = None
+        try:
+            low = int(getattr(cfg, "low_watermark_free_bytes", 0) or 0)
+            burst_arrivals = float(getattr(cfg, "burst_arrivals_per_hour", 8.0) or 0.0)
+            lookahead = float(getattr(cfg, "fill_lookahead_hours", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            low, burst_arrivals, lookahead = 0, 8.0, 0.0
+        try:
+            urgent = bool(getattr(self, "_cleanup_urgent", False))
+        except Exception:
+            urgent = False
+        pressured = bool(free_bytes is not None and low > 0 and free_bytes < low)
+        bursting = bool(
+            pressured
+            or urgent
+            or arrivals >= burst_arrivals
+            or (lookahead > 0 and projected is not None and projected < lookahead * 3600.0)
+        )
+        return arrivals, bytes_rate, projected, urgent, bursting
 
     def _source_probe_path(self) -> str | None:
         try:
@@ -148,7 +240,7 @@ class CleanupMixin:
             pass
 
     async def _maybe_cleanup_source(self) -> None:
-        """Hourly gate for the VPS1 cleanup janitor; no-op unless enabled.
+        """Gate for the VPS1 cleanup janitor; no-op unless enabled.
 
         The cadence clock persists in store_meta, so a restart resumes the
         schedule instead of resetting it (a minutes-long reboot for an
@@ -157,6 +249,11 @@ class CleanupMixin:
         polls settle. Both use wall-clock epoch (monotonic clocks don't
         survive restarts). Times survive only as early as the oldest
         reading: memory, then meta, else 0 (run).
+
+        Each tick probes VPS1 free space once and derives intake pressure
+        from it: calm runs keep `janitor_interval_seconds`, pressured ones
+        switch to the shorter `burst_janitor_interval_seconds`. The probe
+        value is cached for the oversized-arrival check.
         """
         cfg = getattr(self.rt.cleanup, "config", None)
         if cfg is None or not getattr(cfg, "enabled", False):
@@ -179,6 +276,12 @@ class CleanupMixin:
         if interval < 60:
             interval = 60
         try:
+            burst_interval = int(getattr(cfg, "burst_janitor_interval_seconds", 300) or 300)
+        except (TypeError, ValueError):
+            burst_interval = 300
+        if burst_interval < 60:
+            burst_interval = 60
+        try:
             startup_delay = float(getattr(cfg, "janitor_startup_delay_seconds", 300) or 0)
         except (TypeError, ValueError):
             startup_delay = 300.0
@@ -194,28 +297,81 @@ class CleanupMixin:
             gate_t0 = now_mono
         if startup_delay > 0 and now_mono - gate_t0 < startup_delay:
             return
+        # One probe per tick: the pressure decision, the cadence gate and
+        # `_run_source_cleanup` all share this reading (and the arrival
+        # check compares new releases against it).
+        free_bytes = await self._source_free_bytes()
+        try:
+            self._last_source_free_bytes = free_bytes
+        except Exception:
+            pass
+        arrivals, bytes_rate, projected, urgent, bursting = self._cleanup_pressure(cfg, free_bytes)
+        effective = burst_interval if bursting else interval
         now_wall = time.time()
-        if now_wall - self._cleanup_last_run_wall() < interval:
+        if now_wall - self._cleanup_last_run_wall() < effective:
             return
         self._remember_cleanup_run(now_wall)
-        await self._run_source_cleanup(cfg)
+        # A run is starting: it consumes the urgency flag (a still-cramped
+        # disk re-trips the watermark trigger next tick).
+        try:
+            self._cleanup_urgent = False
+        except Exception:
+            pass
+        await self._run_source_cleanup(
+            cfg,
+            free_bytes=free_bytes,
+            arrivals=arrivals,
+            bytes_rate=bytes_rate,
+            projected=projected,
+            bursting=bursting,
+            urgent=urgent,
+        )
 
-    async def _run_source_cleanup(self, cfg: object) -> None:
+    async def _run_source_cleanup(
+        self,
+        cfg: object,
+        *,
+        free_bytes: int | None = None,
+        arrivals: float | None = None,
+        bytes_rate: float | None = None,
+        projected: float | None = None,
+        bursting: bool | None = None,
+        urgent: bool | None = None,
+    ) -> None:
         """Delete VPS1 racing torrents whose content VPS2 fully secured.
 
         Two deletion classes (see [cleanup] docs): normal DONE rows past
         adaptive grace (or verifiably idle), and early MOVING rows under disk
-        pressure. Dry-run only logs. Fail-closed throughout: any doubt about
-        bytes, health, identity or activity skips the row for this run.
+        pressure (or when an arrival did not fit). Dry-run only logs.
+        Fail-closed throughout: any doubt about bytes, health, identity or
+        activity skips the row for this run.
+
+        The pressure values are optional so direct callers/tests can pass
+        only `cfg`; the janitor passes its single probe down so this method
+        never re-probes.
         """
         now_utc = dt.datetime.now(dt.UTC)
-        arrivals = self._cleanup_arrivals_per_hour(time.monotonic())
-        free_bytes = await self._source_free_bytes()
+        if arrivals is None:
+            # Direct call with no pressure snapshot: probe and derive it
+            # here (the janitor always passes its single probe down).
+            if free_bytes is None:
+                free_bytes = await self._source_free_bytes()
+                try:
+                    self._last_source_free_bytes = free_bytes
+                except Exception:
+                    pass
+            arrivals, bytes_rate, projected, urgent, bursting = self._cleanup_pressure(
+                cfg, free_bytes
+            )
+        bytes_rate = float(bytes_rate or 0.0)
+        bursting = bool(bursting)
+        urgent = bool(urgent)
         # Calm-and-roomy short-circuit: plenty of free space and a quiet
         # intake mean no deletion could help anything — skip the scan and
-        # the deletes entirely (next hourly tick re-evaluates). Unknown
-        # free space never skips (fail-closed), and active H&R minimums
-        # still enforce regardless of pressure.
+        # the deletes entirely (next tick re-evaluates). Unknown free space
+        # never skips (fail-closed), and active H&R minimums still enforce
+        # regardless of pressure. Never short-circuits a burst (projected
+        # fill or a just-arrived release would otherwise be ignored).
         try:
             _high = float(getattr(cfg, "high_watermark_free_bytes", 0) or 0)
             _calm = float(getattr(cfg, "calm_arrivals_per_hour", 2.0) or 0.0)
@@ -228,6 +384,8 @@ class CleanupMixin:
             and _high > 0
             and free_bytes >= _high
             and arrivals <= _calm
+            and not urgent
+            and not bursting
             and _min_ratio <= 0
             and _min_hours <= 0
         ):
@@ -250,12 +408,41 @@ class CleanupMixin:
                     "cleanup: VPS1 disk CRITICAL (%d bytes free); grace floored at minimum",
                     free_bytes,
                 )
+        try:
+            cap_field = "burst_per_run_cap" if bursting else "per_run_cap"
+            cap_default = 25 if bursting else 10
+            cap = max(1, int(getattr(cfg, cap_field, cap_default) or cap_default))
+        except (TypeError, ValueError):
+            cap = 10
+        try:
+            eff_interval = max(
+                60,
+                min(
+                    int(getattr(cfg, "burst_janitor_interval_seconds", 300) or 300),
+                    int(getattr(cfg, "janitor_interval_seconds", 3600) or 3600),
+                ),
+            )
+        except (TypeError, ValueError):
+            eff_interval = 300
         log.info(
-            "cleanup janitor: VPS1 free=%s arrivals=%.1f/h grace=%ds",
+            "cleanup janitor: VPS1 free=%s arrivals=%.1f/h bytes=%.1f MB/h projected=%s grace=%ds",
             f"{free_bytes} B" if free_bytes is not None else "unknown",
             arrivals,
+            bytes_rate / (1024 * 1024),
+            f"{projected / 3600.0:.1f}h" if projected is not None else "unknown",
             int(grace_s),
         )
+        if bursting:
+            log.info(
+                "cleanup janitor: burst mode (free=%s, arrivals=%.1f/h, "
+                "bytes=%.1f MB/h, projected=%s, interval=%ds, cap=%d)",
+                f"{free_bytes} B" if free_bytes is not None else "unknown",
+                arrivals,
+                bytes_rate / (1024 * 1024),
+                f"{projected / 3600.0:.1f}h" if projected is not None else "unknown",
+                eff_interval,
+                cap,
+            )
 
         try:
             rows = [
@@ -277,10 +464,6 @@ class CleanupMixin:
             return
         by_hash = {t.infohash.lower(): t for t in src_torrents}
 
-        try:
-            cap = max(1, int(getattr(cfg, "per_run_cap", 10) or 10))
-        except (TypeError, ValueError):
-            cap = 10
         dry_run = bool(getattr(cfg, "dry_run", True))
 
         candidates: list[tuple[float, float, TorrentState, list[Torrent]]] = []
@@ -303,7 +486,7 @@ class CleanupMixin:
                     return None
                 try:
                     return await self._cleanup_verdict(
-                        ts, group, grace_s, now_utc, dry_run, free_bytes
+                        ts, group, grace_s, now_utc, dry_run, free_bytes, urgent=urgent
                     )
                 except asyncio.CancelledError:
                     raise
@@ -322,13 +505,14 @@ class CleanupMixin:
 
         if not candidates:
             return
-        # Biggest-first under disk pressure (a finished 50GB pack beats ten
-        # 3GB episodes when the next race needs a landing zone), else oldest.
-        pressured = free_bytes is not None and low_free and free_bytes < low_free
-        if pressured:
-            candidates.sort(key=lambda c: (-c[1], c[0]))
-        else:
-            candidates.sort(key=lambda c: (c[0], -c[1]))
+        pressured = bool(free_bytes is not None and low_free and free_bytes < low_free)
+        # Under disk pressure (or any burst) DONE rows go first: their
+        # content is fully secured and normally already re-added, so they
+        # reclaim space with the least risk. Within a class, biggest-first
+        # (a finished 50GB pack beats ten 3GB episodes when the next race
+        # needs a landing zone), then oldest. Calm and roomy keeps today's
+        # oldest-first.
+        candidates = self._cleanup_sort_candidates(candidates, pressured or bursting)
 
         deleted = 0
         try:
@@ -400,6 +584,26 @@ class CleanupMixin:
             deleted,
             f" (cap {cap})" if deleted >= cap else "",
         )
+
+    @staticmethod
+    def _cleanup_sort_candidates(
+        candidates: list[tuple[float, float, TorrentState, list[Torrent]]],
+        pressured: bool,
+    ) -> list[tuple[float, float, TorrentState, list[Torrent]]]:
+        """Order deletion candidates for one janitor run.
+
+        Calm and roomy: oldest-first (seed time preserved), biggest among
+        equal ages. Under pressure or burst: DONE rows before MOVING rows
+        (fully secured/re-added content first), then biggest-first, then
+        oldest. Candidates are `(sort_key, size, ts, group)`.
+        """
+
+        def _key(c: tuple[float, float, TorrentState, list[Torrent]]):
+            if pressured:
+                return (0 if c[2].state == State.DONE else 1, -c[1], c[0])
+            return (c[0], -c[1])
+
+        return sorted(candidates, key=_key)
 
     def _cleanup_group_for(self, ts: TorrentState, by_hash: dict[str, Torrent]) -> list[Torrent]:
         """Live VPS1 torrents holding this row's content.
@@ -559,12 +763,15 @@ class CleanupMixin:
         now_utc: dt.datetime,
         dry_run: bool,
         free_bytes: int | None,
+        urgent: bool | None = None,
     ) -> tuple[float, float, TorrentState, list[Torrent]] | None:
         """Decide deletion for one row; None = keep this run.
 
         Returns (completed_sort_key, size_bytes, ts, group) for candidates.
         Updates vps1_last_activity_at when swarm activity is observed (skipped
-        in dry-run mode, which performs zero state mutations).
+        in dry-run mode, which performs zero state mutations). `urgent`
+        (None = read the live flag) lets the MOVING early path run when a
+        newly discovered release did not fit, even above the low watermark.
         """
         cfg = self.rt.cleanup.config
         # 1. Observe swarm activity first: any active member bumps the stamp
@@ -628,13 +835,20 @@ class CleanupMixin:
         elif ts.state == State.MOVING:
             # Early pressure path: bytes are 100% on the VPS2 SSD (MOVING is
             # only entered after full completion) but not yet moved. Allowed
-            # exclusively under disk pressure with an idle swarm, and only
-            # while the SSD bytes are verifiably still present.
+            # when VPS1 is under disk pressure, or when a newly discovered
+            # release did not fit at all (urgent), with an idle swarm and
+            # only while the SSD bytes are verifiably still present.
             try:
                 low_free = int(getattr(cfg, "low_watermark_free_bytes", 0) or 0)
             except (TypeError, ValueError):
                 low_free = 0
-            if not (low_free and free_bytes is not None and free_bytes < low_free):
+            pressured = bool(low_free and free_bytes is not None and free_bytes < low_free)
+            if urgent is None:
+                try:
+                    urgent = bool(getattr(self, "_cleanup_urgent", False))
+                except Exception:
+                    urgent = False
+            if not (pressured or urgent):
                 return None
             if not self._cleanup_idle_confirmed(ts, group, now_utc, cfg):
                 return None
