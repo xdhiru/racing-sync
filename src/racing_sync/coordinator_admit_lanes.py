@@ -288,7 +288,10 @@ class LaneAdmitMixin:
             n_down = await self._live_download_count(exclude=key)
             others = len(adm - {key}) if key else len(adm)
             if n_down + others >= max_dl:
-                log.info(
+                # Internal gate: the waiter path logs the one operator-
+                # facing "downloads full" line. Keep the counts at debug so
+                # a count disagreement cannot flood the log every second.
+                log.debug(
                     "downloads full (%d/%d); %s stays queued",
                     n_down + others,
                     max_dl,
@@ -598,26 +601,30 @@ class LaneAdmitMixin:
                 except Exception:
                     pass
                 # Second gate (DB-truth edge): the handle count won the
-                # race but the live count says full — back to the queue
-                # instead of over-admitting (the M2 burst incident).
+                # race but the live count says full. Join the lane queue and
+                # event-park; re-checking every second only re-logged the
+                # same "downloads full" line for every waiting row.
                 try:
-                    if await self._try_admit_download(ts):
-                        return False
+                    admitted = await self._try_admit_download(ts)
                 except Exception:
+                    admitted = False
+                if admitted:
                     return False
-                if not _ever_queued:
-                    # No waiter identity: classic park-exit (row stays
-                    # QUEUED; the next tick respawns) — never spin.
-                    return True
-                # Briefly breather before re-queueing (disagreement
-                # between handle/live counts must not tight-loop).
                 try:
-                    await asyncio.sleep(1.0)
-                except asyncio.CancelledError:
-                    raise
+                    if self._abandoned(ts):
+                        return True
                 except Exception:
                     pass
-                continue
+                ev = self._queue_lane_event("dl", key)
+                if ev is None:
+                    # No waiter identity: classic park-exit (row stays
+                    # QUEUED; the next tick respawns).
+                    return True
+            if not _ever_queued:
+                log.info(
+                    "downloads full; %s waits for a slot (no churn)",
+                    (getattr(ts, "source_name", "") or key)[:60],
+                )
             _ever_queued = True
             try:
                 from .task import handles_for
@@ -631,10 +638,6 @@ class LaneAdmitMixin:
                 pass
             if ev is None:
                 return True
-            log.info(
-                "downloads full; %s waits for a slot (no churn)",
-                (getattr(ts, "source_name", "") or key)[:60],
-            )
             try:
 
                 async def _wait_ev(ev=ev) -> None:

@@ -119,6 +119,57 @@ async def test_park_waits_without_db_churn_and_wakes_by_priority():
 
 
 @pytest.mark.anyio
+async def test_count_disagreement_parks_once_without_log_spam(tmp_path, caplog):
+    """Handle count says free, live admission says full: park, log once.
+
+    The old second-gate path slept 1 s and re-ran the admission check in a
+    loop, emitting ``downloads full (n/n); ... stays queued`` at INFO every
+    second for every waiting row while the two counts disagreed.
+    """
+    import logging
+
+    from racing_sync.state import State, StateStore, TorrentState
+    from racing_sync.task import register_handle, unregister_handle
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _coord()
+        coord.store = store
+        coord.cfg.max_active_downloads = 1
+        store.upsert(
+            TorrentState(source_infohash="a" * 40, source_name="busy", state=State.DOWNLOADING)
+        )
+        ts_b = _row("b" * 40, State.QUEUED)
+        store.upsert(ts_b)
+        # Live admission sees A (DB DOWNLOADING ∩ running); the handle
+        # count below sees one non-parked handle until it is removed.
+        coord._running_infohashes = {"a" * 40}
+        ha = _handle("a" * 40, "downloading")
+        register_handle(coord, ha)
+        hb = _handle("b" * 40, "queued")
+        register_handle(coord, hb)
+
+        with caplog.at_level(logging.INFO, logger="racing_sync.coordinator"):
+            park = asyncio.ensure_future(coord._park_queued_for_download_slot(ts_b))
+            await asyncio.sleep(0.1)
+            assert not park.done()
+            assert "b" * 40 in coord._queued_lane["dl"]
+            # Wake it while the counts still disagree: A's handle is gone
+            # (handle count free) but A is still live in the admission set.
+            unregister_handle(coord, ha)
+            hb.event.set()
+            await asyncio.sleep(1.2)
+            assert not park.done()
+            infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+            assert sum("downloads full" in m for m in infos) == 1
+            assert not any("stays queued" in m for m in infos)
+            park.cancel()
+            await asyncio.gather(park, return_exceptions=True)
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_try_admit_honors_force():
     coord = _coord()
     from racing_sync.state import State
