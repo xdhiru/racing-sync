@@ -109,7 +109,7 @@ def test_blob_helpers_bad_blob():
 
 
 def test_looks_like_single_file():
-    folder = "Example.Show.S24E32.1080p.WEB.H264-DUMMYGRP"
+    folder = "Example.Show.S24E32.1080p.WEB.H264-GROUP"
     assert looks_like_single_file(folder) is False
     assert looks_like_single_file(folder + ".mkv") is True
     assert looks_like_single_file("Movie.MKV") is True
