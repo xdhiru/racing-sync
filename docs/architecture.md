@@ -101,7 +101,7 @@ the files gone) → re-add pointing at the fuse mount with `skip_check=True`
 after the fuse gate passes → `DONE`. Public torrents land paused when
 `cross_seed.pause_public_torrents_on_fuse` is set (default).
 
-## Invariants (the audit's single rules)
+## Invariants (the single rules)
 
 **Destructive steps.** Before any delete or wipe: re-read the row's state
 and version, and classify the path with `path_ownership.classify_save_path`
