@@ -135,19 +135,35 @@ def _push_cfg(
 
 
 class _Dial:
-    """Enough of the pooled SFTP exporter for the transport's duck-typing."""
+    """Enough of the SFTP exporter for the transport's duck-typing.
+
+    Only the DEDICATED half is ever called by the push lane (the pooled
+    `run_shell` / `write_remote_file` are here so a test can prove they are
+    NOT: `tests/test_push_liveness.py` counts them).
+    """
 
     def __init__(self) -> None:
         self.commands: list[str] = []
+        self.pooled_calls: list[str] = []
 
     def run_shell(self, command: str, timeout: float = 30.0):
-        self.commands.append(command)
+        self.pooled_calls.append(command)
         return (0, "", "")
 
     def write_remote_file(self, path: str, data: bytes) -> bool:
+        self.pooled_calls.append(path)
+        return True
+
+    def run_shell_dedicated(self, command: str, timeout: float = 30.0):
+        self.commands.append(command)
+        return (0, "", "")
+
+    def write_remote_file_dedicated(self, path: str, data: bytes) -> bool:
+        self.commands.append(path)
         return True
 
     def launch_detached(self, command: str) -> bool:
+        self.commands.append("launch")
         return True
 
 

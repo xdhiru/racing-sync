@@ -105,7 +105,7 @@ _COMMON = {
     "push.timeout_seconds": 21600,
     "push.remote_name": "",
     "push.rclone_bin": "rclone",
-    "push.transfers": 4,
+    "push.transfers": 2,
     "push.bwlimit": "",
     "push.max_concurrent_pushes": 1,
     "push.poll_seconds": 120,

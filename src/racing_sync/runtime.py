@@ -319,7 +319,8 @@ class PushSettings:
 
     @property
     def transfers(self) -> int:
-        return int(self._field("transfers", 4) or 4)
+        """rclone --transfers for one push; the shipped conservative default."""
+        return int(self._field("transfers", 2) or 2)
 
     @property
     def bwlimit(self) -> str:

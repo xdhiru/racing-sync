@@ -616,12 +616,12 @@ _PUSH_TEMPLATES = {"client": _PUSH_NEW, "source": _PUSH_OLD}
 
 # (field, TOML value, expected value, a sibling left alone, that sibling's default)
 _PUSH_FIELDS = [
-    ("timeout_seconds", "900", 900, "transfers", 4),
+    ("timeout_seconds", "900", 900, "transfers", 2),
     ("remote_name", '"other-remote"', "other-remote", "rclone_bin", "rclone"),
-    ("rclone_bin", '"/opt/local/bin/rclone"', "/opt/local/bin/rclone", "transfers", 4),
+    ("rclone_bin", '"/opt/local/bin/rclone"', "/opt/local/bin/rclone", "transfers", 2),
     ("transfers", "9", 9, "max_concurrent_pushes", 1),
     ("bwlimit", '"42M"', "42M", "poll_seconds", 120),
-    ("max_concurrent_pushes", "3", 3, "transfers", 4),
+    ("max_concurrent_pushes", "3", 3, "transfers", 2),
     ("poll_seconds", "90", 90, "timeout_seconds", 21600),
     ("auto_on_prowlarr_timeout", "true", True, "timeout_seconds", 21600),
     ("push_on_janitor_pressure", "true", True, "timeout_seconds", 21600),

@@ -115,7 +115,14 @@ timeout leech, no `FAILED` for an expired indexer wait — and same-content
 siblings defer to it, so one copy serves the group. Two of the section's own
 timers bound it: `timeout_seconds` is the ceiling for one push (same verb as
 `[transfer].timeout_seconds`, never the same value) and `poll_seconds` is the
-cadence of the metadata-only progress listing — never a content read. The
+cadence of the metadata-only progress listing — never a content read. A poll
+that sees nothing new on a running push also reads that copy's own rclone log
+on VPS1 (one bounded `test -f` / `wc -c` / `tail -c`, never a glob, never the
+mount) and fails a provably dead job on the spot, so a stalled copy can no
+longer squat a push slot until the ceiling; silence from a big in-flight
+upload is treated as alive, and `timeout_seconds` stays the backstop. Preflight,
+the file-list write and that log read run on a dedicated SSH dial of their own,
+never on the pooled members the racing .torrent fetches use. The
 existing fuse-evidence path then admits the row and injects. `/push_source`
 or the act-sheet button starts one by hand; `auto_on_prowlarr_timeout` makes
 the timeout — `[acquire].indexer_wait_seconds` counted from the first query,

@@ -213,6 +213,14 @@ push_on_janitor_pressure = false
 # may take — but a separate value: deliberately independent of the
 # manual-move wait and of the indexer clock, because a multi-GB remote copy
 # fails differently and must not inherit either timer's tuning.
+# YOU NO LONGER NEED A GIANT VALUE HERE. A stalled copy used to squat one of
+# the push slots for the whole ceiling because nothing could tell "slow" from
+# "dead"; the poll now reads the copy's own log on VPS1 and frees the slot as
+# soon as the job is provably gone (no log at all, a log that stayed empty,
+# or rclone's own fatal line). This ceiling is the backstop for the case the
+# log cannot settle — a silent multi-GB upload to a Telegram-backed remote —
+# so on a fast link a shorter value like 3600 is now the better choice. The
+# default stays 6 h: killing a slow-but-alive copy costs a full re-download.
 timeout_seconds = 21600
 # The rclone remote to copy into, spelled as VPS1's rclone.conf names it.
 # Empty = derive it from [remote].path / [remote].unsorted (the part before
@@ -222,11 +230,18 @@ remote_name = ""
 # Path to the rclone binary ON VPS1 (this daemon never runs it locally).
 # Plain "rclone" = whatever VPS1's login shell resolves.
 rclone_bin = "rclone"
-# rclone --transfers per push (1-16, default 4). VPS1's uplink also carries
-# the racing swarms and this daemon's SSH session, so keep it modest.
-transfers = 4
+# rclone --transfers per push (1-16, default 2). VPS1's uplink also carries
+# the racing swarms and this daemon's SSH session, so keep it modest: the
+# measured failure was 4 transfers x 3 concurrent copies starving the link
+# the races are won on (and the SSH channel the push itself runs on).
+transfers = 2
 # rclone --bwlimit, passed through verbatim ("42M", or a schedule like
 # "8M,24:00-08:00"). Empty = unset (rclone runs flat out).
+# SAY IT PLAINLY: empty is the WORKING default, not the safe one. An
+# unthrottled copy competes head-on with the races VPS1 exists to win, so
+# on a box that also races, set a value — e.g.
+#     bwlimit = "30M"
+# and re-measure what your uplink has left for the swarms.
 bwlimit = ""
 # Pushes running at once (1-4, default 1). Each is a bulk copy on the link
 # the races depend on; above 1 a burst of arrivals divides one uplink.
@@ -234,6 +249,9 @@ max_concurrent_pushes = 1
 # Seconds between progress polls (default 120, minimum 60). A poll is
 # metadata-only — it compares the remote listing against the torrent's file
 # sizes and never reads content bytes — but listing a remote is not free.
+# Each poll of a still-running copy that saw nothing new also reads that
+# copy's own rclone log on VPS1 (bounded tail, one call) and frees the slot
+# the moment the job is provably dead.
 poll_seconds = 120
 
 # ============================================================

@@ -29,6 +29,14 @@ Contract this module keeps:
   instead of raising, because its callers (a Telegram command, an /act
   button, the indexer-timeout fallback, the janitor-pressure sweep) must all
   be able to fall back to today's behaviour.
+* **a slot cannot be squatted.** A poll that sees nothing new asks the copy's
+  own rclone log whether the job is still there (`vps1_push.push_liveness`),
+  and a provably dead copy is FAILED on that same sweep so the next release
+  gets the slot; `timeout_seconds` stays the backstop for anything the log
+  cannot prove, and a slow-but-silent big upload is never killed.
+* **never on the pooled members.** Preflight, the file-list write and the log
+  read all go through the dial's DEDICATED runners, so the push lane can
+  neither queue behind a racing .torrent fetch nor starve one.
 * **no live checkpoint outlives a failed attempt.** Every branch after
   `claim_push` settles the record (abandoned/failed/done), so a broken push
   can never leave the pipeline suppressing work for nothing.
@@ -55,6 +63,7 @@ from .vps1_push import (
     PushFile,
     PushRequest,
     preflight,
+    push_liveness,
     remote_progress,
     sanitize_push_files,
     start_copy,
@@ -99,6 +108,24 @@ _PRESSURE_BACKOFF_MULTIPLIER = 4.0
 #: process must not grow with the number of refusals ever seen. Expired
 #: entries are pruned on every insert; past the cap the oldest go first.
 _PRESSURE_BACKOFF_CAP = 200
+
+#: How many IDENTICAL dead verdicts free a slot. `missing` (no log, or a log
+#: nothing ever wrote to) and `failed` (rclone's own fatal line) are conclusive
+#: on the first read. `finished` rests on a stats-summary line in the log tail,
+#: which is the weakest evidence of the three, so it must repeat: a copy that
+#: is really still running either has no summary yet or writes a NEW one whose
+#: text differs (elapsed time, byte counts), so its verdict never repeats and
+#: it is never killed for being slow.
+_LIVENESS_DEATH_COUNTS = {"missing": 1, "failed": 1, "finished": 2}
+
+#: Floor for the "not started yet" grace, in polls: a couple of them, and never
+#: under 300 s, so a fast cadence cannot turn a slow rclone start into a
+#: false death. No new config key — this is derived from `poll_seconds`.
+_LIVENESS_GRACE_POLLS = 2.0
+_LIVENESS_GRACE_FLOOR_S = 300.0
+
+#: Bound for the verdict memo, mirroring `_PUSH_WANTED_CAP`.
+_LIVENESS_SEEN_CAP = 200
 
 
 def _one_line(text: object) -> str:
@@ -255,12 +282,15 @@ class PushMixin:
             return ""
 
     def _push_dial(self) -> object | None:
-        """The SSH dial the command travels on (`self.sftp`), or None.
+        """The DEDICATED SSH dial the push runs on (`self.sftp`), or None.
 
         `rt.push.ssh_dial` re-checks the config side (an enabled section is
-        validated against an enabled `deluge_sftp`); the object with
-        `run_shell` / `write_remote_file` / `launch_detached` is the pooled
-        exporter the coordinator already holds.
+        validated against an enabled `deluge_sftp`); the object is the pooled
+        exporter the coordinator already holds, but the push only ever uses
+        its non-pooled half — `run_shell_dedicated` / `write_remote_file_
+        dedicated` / `launch_detached`. A dial that cannot answer on its own
+        transport is refused here rather than quietly sharing a member with
+        the racing .torrent fetches (see `sftp_source`).
         """
         try:
             if self.rt.push.ssh_dial is None:
@@ -268,8 +298,11 @@ class PushMixin:
         except Exception:
             return None
         dial = getattr(self, "sftp", None)
-        if dial is None or not callable(getattr(dial, "run_shell", None)):
+        if dial is None:
             return None
+        for attr in ("run_shell_dedicated", "write_remote_file_dedicated"):
+            if not callable(getattr(dial, attr, None)):
+                return None
         return dial
 
     # ---- entry point ---------------------------------------------------- #
@@ -349,7 +382,10 @@ class PushMixin:
             return False, f"push refused: {running}/{cap} push(es) already running"
         ssh = self._push_dial()
         if ssh is None:
-            return False, "push refused: no SSH dial to VPS1 ([client.deluge_sftp] enabled)"
+            return False, (
+                "push refused: no dedicated SSH dial to VPS1 "
+                "([client.deluge_sftp] enabled, run_shell_dedicated)"
+            )
 
         request = PushRequest(
             infohash=h,
@@ -456,7 +492,9 @@ class PushMixin:
         try:
             return int(self.rt.push.transfers)
         except Exception:
-            return 4
+            # The shipped default, never rclone's: a copy must not take the
+            # uplink the races are run on just because a setting was unreadable.
+            return 2
 
     def _push_bwlimit(self) -> str:
         try:
@@ -843,6 +881,7 @@ class PushMixin:
             pass
         if state not in LIVE_PUSH_STATES:
             self._forget_wanted(infohash)
+            self._forget_liveness(infohash)
 
     def _remember_wanted(self, infohash: str, files: Sequence[PushFile]) -> None:
         """What this push is accountable for (names, never content)."""
@@ -879,9 +918,15 @@ class PushMixin:
         the remote holds every expected file the push goes `verifying` and
         the EXISTING evidence path (`_fuse_content_evidence` ->
         `_admit_fuse_existing` -> the all-remote shortcut) admits the row
-        straight away instead of waiting for the next sweep tick. Past the
-        deadline the checkpoint is `failed`, which switches the suppression
-        off and leaves the row exactly where today's behaviour picks up.
+        straight away instead of waiting for the next sweep tick. When a poll
+        sees NOTHING new on a `running` checkpoint, the sweep also reads the
+        copy's own rclone log (`push_liveness`, one bounded read on the
+        dedicated dial) and fails a provably dead copy right here, so its slot
+        frees on the same sweep instead of squatting it for the whole
+        `timeout_seconds`. Past the deadline the checkpoint is `failed`, which
+        switches the suppression off and leaves the row exactly where today's
+        behaviour picks up — and the deadline stays the backstop for every
+        verdict this probe cannot make (a silent-but-alive big upload).
         """
         if not self._push_switch_on():
             return
@@ -981,6 +1026,7 @@ class PushMixin:
             # live and let the deadline fail it (the row keeps today's
             # behaviour the moment suppression lifts).
             return
+        landed_before = int(getattr(push, "files_present", 0) or 0)
         present, total = await remote_progress(getattr(self, "cfg", None), target, files)
         try:
             await offload(
@@ -994,9 +1040,141 @@ class PushMixin:
         log.debug(
             "push: %s has %d/%d file(s) on %s", h[:10], int(present or 0), int(total or 0), target
         )
-        if total <= 0 or present < total:
+        if total > 0 and present >= total:
+            await self._push_handoff(store, h, ts, present, total)
             return
-        await self._push_handoff(store, h, ts, present, total)
+        # Nothing new landed. That is NOT yet evidence of a dead copy (a
+        # Telegram-backed remote shows nothing until a big upload completes),
+        # so ask the one thing that can prove it: the job's own log.
+        if int(present or 0) > landed_before:
+            # Progress is progress: the copy is alive by definition, and the
+            # log read is skipped outright this poll.
+            self._forget_liveness(h)
+            return
+        await self._push_liveness(store, push, h, now, present=int(present or 0))
+
+    async def _push_liveness(
+        self, store, push, infohash: str, now: dt.datetime, *, present: int
+    ) -> None:
+        """Consult the copy's own rclone log and free the slot when it is dead.
+
+        The production failure this answers: a stalled copy was invisible, so
+        it squatted one of the (few) push slots for the whole `timeout_seconds`
+        — 3 slots, 3 dead copies, and 64 polls of `has 0/1 file(s)` for a single
+        success. `push_liveness` turns "provably gone" into a FAILED checkpoint
+        on the very sweep that sees it, so the next release gets the slot.
+
+        Rules kept strict here (see `push_liveness` for the verdict table):
+        * only a `running` checkpoint is judged — `verifying` is the handover's
+          business and a dead verdict must not undo a finished copy;
+        * `alive` (including "could not tell": no dial, a wedged channel) keeps
+          the slot: the `deadline_at` ceiling stays the backstop;
+        * `finished` while files HAVE landed is not a failure — the poll above
+          is what hands the row over, and it gets the next tick to agree;
+        * the weakest verdict (`finished`) must repeat before anything is freed.
+        """
+        if getattr(push, "state", None) != PushState.RUNNING:
+            return
+        log_path = str(getattr(push, "log_path", "") or "")
+        if not log_path:
+            # A checkpoint from before the transport stamped its log: nothing
+            # to read, so nothing to prove. The deadline still bounds it.
+            return
+        ssh = self._push_dial()
+        if ssh is None:
+            log.debug("push: no dedicated dial for %s; keeping the slot", infohash[:10])
+            return
+        age = self._push_age_seconds(push, now)
+        grace = max(_LIVENESS_GRACE_FLOOR_S, _LIVENESS_GRACE_POLLS * self._push_poll_seconds())
+        try:
+            verdict, reason = await push_liveness(
+                ssh=ssh, log_path=log_path, age_s=age, grace_s=grace
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            # The read is a judgement call, never a pipeline failure: an
+            # unexpected error must not cost a running copy its slot.
+            log.debug("push: liveness read failed for %s: %s", infohash[:10], e)
+            return
+        if verdict == "alive":
+            self._forget_liveness(infohash)
+            if reason:
+                log.debug("push: %s kept running (%s)", infohash[:10], _one_line(reason))
+            return
+        if verdict == "finished" and present > 0:
+            self._forget_liveness(infohash)
+            log.info(
+                "push: %s reported a closing summary with %d file(s) landed; leaving it "
+                "to the poll instead of failing it",
+                infohash[:10],
+                present,
+            )
+            return
+        count = self._note_liveness(infohash, (verdict, reason))
+        needed = _LIVENESS_DEATH_COUNTS.get(verdict, 1)
+        if count < needed:
+            log.info(
+                "push: %s looks %s (%s); confirming next poll",
+                infohash[:10],
+                verdict,
+                _one_line(reason),
+            )
+            return
+        self._forget_liveness(infohash)
+        await self._push_settle(
+            store, infohash, PushState.FAILED, f"the copy is dead ({_one_line(reason)})"
+        )
+        log.warning(
+            "push: %s is %s (%s); the slot is free again and the row falls back to the normal path",
+            infohash[:10],
+            verdict,
+            _one_line(reason),
+        )
+
+    @staticmethod
+    def _push_age_seconds(push, now: dt.datetime) -> float | None:
+        """How long this copy has been running, or None when the stamp is lost."""
+        try:
+            started = push.started_at
+            if started is None:
+                return None
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=dt.UTC)
+            return max(0.0, (now - started).total_seconds())
+        except Exception:
+            return None
+
+    def _note_liveness(self, infohash: str, key: tuple[str, str]) -> int:
+        """How many polls in a row this exact dead verdict has been seen.
+
+        Bounded like `_push_wanted` (oldest shed first) so a long-lived daemon
+        cannot grow with the number of pushes ever run. Never raises: this is
+        bookkeeping on the way to a judgement, not the judgement itself.
+        """
+        try:
+            memo = getattr(self, "_push_liveness_seen", None)
+            if not isinstance(memo, dict):
+                memo = {}
+                self._push_liveness_seen = memo  # type: ignore[attr-defined]
+            entry = memo.get(infohash)
+            count = int(entry[1]) + 1 if isinstance(entry, tuple) and entry[0] == key else 1
+            memo[infohash] = (key, count)
+            if len(memo) > _LIVENESS_SEEN_CAP:
+                for stale in list(memo.keys())[: len(memo) - _LIVENESS_SEEN_CAP]:
+                    memo.pop(stale, None)
+            return count
+        except Exception:
+            return 1
+
+    def _forget_liveness(self, infohash: str) -> None:
+        """Drop the verdict memo: progress, a handover or an end means restart."""
+        try:
+            memo = getattr(self, "_push_liveness_seen", None)
+            if isinstance(memo, dict):
+                memo.pop((infohash or "").lower(), None)
+        except Exception:
+            pass
 
     async def _push_wanted_files(self, push, ts: TorrentState) -> list[PushFile]:
         """The names this push must deliver, as recorded at launch.

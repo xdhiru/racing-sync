@@ -56,7 +56,12 @@ def _request(**overrides) -> PushRequest:
 
 
 class FakeDial:
-    """Records every command string; replies from canned substrings."""
+    """Records every command string; replies from canned substrings.
+
+    The push lane only ever calls the DEDICATED runners; they are here as thin
+    delegates so a test can drive them with the same canned replies (the real
+    non-pooled behaviour is pinned in tests/test_push_liveness.py).
+    """
 
     def __init__(self, replies: dict[str, tuple[int | None, str, str]] | None = None, **flags):
         self.commands: list[str] = []
@@ -76,9 +81,15 @@ class FakeDial:
                 return reply
         return (0, "", "")
 
+    def run_shell_dedicated(self, command: str, timeout: float = 30.0):
+        return self.run_shell(command, timeout)
+
     def write_remote_file(self, path: str, data: bytes) -> bool:
         self.written.append((path, data))
         return self.write_ok
+
+    def write_remote_file_dedicated(self, path: str, data: bytes) -> bool:
+        return self.write_remote_file(path, data)
 
     def launch_detached(self, command: str) -> bool:
         self.launched.append(command)
@@ -92,6 +103,35 @@ def _ok_dial(**flags) -> FakeDial:
         "listremotes": (0, "otherremote:\nseedremote:\n", ""),
     }
     return FakeDial(replies, **flags)
+
+
+class _PooledDialBase:
+    """A dial with the dedicated SHELL but no dedicated writer (and no pooling).
+
+    Used to pin that a lane missing any part of the dedicated API is refused
+    instead of quietly falling back to a pooled member.
+    """
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+        self.written: list[tuple[str, bytes]] = []
+        self.launched: list[str] = []
+
+    def run_shell_dedicated(self, command: str, timeout: float = 30.0):
+        self.commands.append(command)
+        if "command -v" in command:
+            return (0, "/usr/bin/rclone\n", "")
+        if "listremotes" in command:
+            return (0, "seedremote:\n", "")
+        return (0, "", "")
+
+    def write_remote_file(self, path: str, data: bytes) -> bool:
+        self.written.append((path, data))
+        return True
+
+    def launch_detached(self, command: str) -> bool:
+        self.launched.append(command)
+        return True
 
 
 def _sftp_cfg(**overrides) -> DelugeSFTPConfig:
@@ -512,9 +552,15 @@ class _LaunchOnlyProxy:
     def run_shell(self, command: str, timeout: float = 30.0):
         return (0, "", "")
 
+    def run_shell_dedicated(self, command: str, timeout: float = 30.0):
+        return self.run_shell(command, timeout)
+
     def write_remote_file(self, path: str, data: bytes) -> bool:
         self.written.append((path, data))
         return True
+
+    def write_remote_file_dedicated(self, path: str, data: bytes) -> bool:
+        return self.write_remote_file(path, data)
 
     def launch_detached(self, command: str) -> bool:
         self.launched.append(command)
@@ -652,25 +698,90 @@ def test_member_launch_detached_also_dials_its_own_transport():
 
 
 @pytest.mark.anyio
-async def test_preflight_probes_through_a_leased_pool_member():
+async def test_preflight_probes_go_through_the_dedicated_dial_not_the_pool(monkeypatch):
+    """The fix: preflight may no longer compete with the racing .torrent fetches.
+
+    Both probes are answered by a transport dialled for this call only, and the
+    pooled member is provably untouched (its exec_command never fires and its
+    lock stays free, while `_lease` is wired to raise).
+    """
     cfg = _sftp_cfg()
     exporter = SFTPExporter(cfg, pool_size=1)
     member = _live_member(cfg)
     exporter._members = [member]
-    member._client.exec_command.side_effect = [
+
+    monkeypatch.setattr(
+        SFTPExporter,
+        "_lease",
+        lambda _self, what: (_ for _ in ()).throw(AssertionError(f"must not lease: {what}")),
+    )
+    dedicated = MagicMock()
+    dedicated.exec_command.side_effect = [
         _fake_exec(b"/usr/bin/rclone\n", status=0),
         _fake_exec(b"seedremote:\n", status=0),
     ]
-    with patch("racing_sync.vps1_push._remote_has_bytes", AsyncMock(return_value=False)):
+    with (
+        patch("racing_sync.sftp_source._dial_client", return_value=dedicated) as dial,
+        patch("racing_sync.vps1_push._remote_has_bytes", AsyncMock(return_value=False)),
+    ):
         check = await preflight(
             _request(), ssh=exporter, cfg=MagicMock(), rclone_bin="/usr/bin/rclone"
         )
+
     assert check.ok, check.reason
-    asked = [c.args[0] for c in member._client.exec_command.call_args_list]
+    # Two probes, one throwaway transport each, dialled from the config.
+    assert dial.call_count == 2 and dial.call_args_list[0].args == (cfg,)
+    asked = [c.args[0] for c in dedicated.exec_command.call_args_list]
     assert asked == ["command -v /usr/bin/rclone", "/usr/bin/rclone listremotes"]
-    # The lease is gone again: probes never pin a member.
+    assert dedicated.close.call_count == 2
+    # The pooled member saw nothing at all.
+    member._client.exec_command.assert_not_called()
     assert member._lock.acquire(blocking=False) is True
     member._lock.release()
+
+
+@pytest.mark.anyio
+async def test_preflight_refuses_a_dial_without_a_dedicated_runner():
+    """No silent fallback onto a pooled member: the push is refused instead."""
+
+    class _PooledOnly:
+        """A dial that only offers the pooled (leased) entry points."""
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def run_shell(self, command: str, timeout: float = 30.0):
+            self.calls.append(command)
+            return (0, "/usr/bin/rclone\n", "")
+
+        def write_remote_file(self, path: str, data: bytes) -> bool:
+            self.calls.append(path)
+            return True
+
+        def launch_detached(self, command: str) -> bool:
+            self.calls.append("launch")
+            return True
+
+    dial = _PooledOnly()
+    check = await preflight(_request(), ssh=dial, cfg=None)
+    assert not check.ok
+    assert "dedicated" in check.reason
+    assert dial.calls == []
+
+
+@pytest.mark.anyio
+async def test_start_copy_refuses_a_dial_that_cannot_write_dedicated():
+    """The list write is a dedicated call too, and refuses rather than lease."""
+
+    class _NoDedicatedWriter(_PooledDialBase):
+        """Answers the probes, but offers no dedicated writer at all."""
+
+    dial = _NoDedicatedWriter()
+    check = await start_copy(_request(), ssh=dial, now=1762000000.0)
+    assert not check.ok
+    assert "dedicated" in check.reason
+    assert dial.launched == []
+    assert dial.written == []
 
 
 def test_write_remote_file_goes_over_sftp_not_a_shell():

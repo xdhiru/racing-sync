@@ -25,10 +25,11 @@ Contract rules this module enforces by construction:
   records and the concurrency cap belong to the coordinator, and this module
   does not import it (nor ``asyncio.sleep``).
 
-All remote calls go through the SSH dial already configured for torrent
-fetches (``source.deluge_sftp``); ``launch_detached`` uses its own dedicated
-transport so a multi-hour copy never occupies — and never gets orphaned by —
-a pooled member.
+All remote calls go through a DEDICATED SSH dial built from the same config as
+the torrent-fetch dial (``source.deluge_sftp``): ``run_shell_dedicated``,
+``write_remote_file_dedicated`` and ``launch_detached``. None of them leases a
+pooled member, so a push can never queue behind — or be starved by — a racing
+.torrent fetch, and can never steal one of those members from the race.
 """
 
 from __future__ import annotations
@@ -59,6 +60,7 @@ __all__ = [
     "PushRequest",
     "build_copy_command",
     "preflight",
+    "push_liveness",
     "remote_progress",
     "sanitize_push_files",
     "start_copy",
@@ -80,6 +82,10 @@ _MAX_LIST_ENTRIES = 5000
 _PROBE_TIMEOUT_S = 30.0
 _WRITE_TIMEOUT_S = 60.0
 _LIST_TIMEOUT_S = 120.0
+#: The liveness read is deliberately the cheapest thing this module does
+#: remotely: one shell on one small file. A slow read must degrade to "alive",
+#: never to a killed copy, so its budget is short and its failure is benign.
+_LIVENESS_TIMEOUT_S = 20.0
 
 # How much slack past an inner timeout before the coroutine gives up.
 _WAIT_MARGIN_S = 20.0
@@ -91,6 +97,41 @@ _WAIT_MARGIN_S = 20.0
 _SHELL_METACHARS = (";", "`", "$", "\\", "\n", "\r")
 
 _HEX_RE = re.compile(r"[0-9a-f]")
+
+#: How many bytes of the log the liveness probe reads (the END of it: a dead
+#: job says so in its last lines, and a multi-hour log is never pulled whole).
+_LIVENESS_TAIL_BYTES = 8192
+
+#: How long a push may look "not started yet" before its absent/empty log
+#: counts as death. A couple of polls at the shipped 120 s cadence, so a slow
+#: VPS1 (or an rclone that has not opened its log the instant the poll lands)
+#: is never read as a dead job. The caller may widen it with the cadence.
+_LIVENESS_GRACE_S = 300.0
+
+#: rclone's own failure vocabulary, kept SMALL on purpose: every one of these
+#: is a line rclone writes for a run that has given up (an `ERROR`/`Fatal`
+#: prefix, a Go panic, a child exit status, a `Failed to <verb>` summary).
+#: Anything else in the tail is silence, and silence is NORMAL here.
+_FATAL_MARKERS = ("ERROR", "Fatal", "panic:", "exit status", "Failed to")
+
+#: rclone's stats-summary block keys. At `--loglevel INFO` with rclone's own
+#: default `--stats-loglevel` (error) this block is written ONCE, as the run
+#: exits, which is exactly the evidence `finished` needs; if a build did log
+#: the periodic blocks, their text differs poll to poll and the caller's
+#: two-same-verdicts rule never fires, so a slow copy still survives. An error
+#: summary (`Failed to copy with N errors`) is NOT here: it carries the `Failed
+#: to` fatal marker and is reported as `failed`, which says more.
+_FINISHED_MARKERS = ("Transferred:", "Errors:", "Checks:", "Elapsed time:")
+
+#: Prefix the liveness probe's own output is tagged with, so a log line that
+#: happens to look like a number can never be mistaken for the size it reports.
+_SIZE_TAG = "SYNC-LIVENESS-SIZE:"
+
+#: The probe's stand-in size for "there is no log file at all".
+_SIZE_ABSENT = -1
+
+#: Control characters in a log line (scrubbed before anything is stored).
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 @dataclass(frozen=True)
@@ -343,7 +384,9 @@ def build_copy_command(
     try:
         workers = int(transfers)
     except (TypeError, ValueError):
-        workers = 4
+        # Garbage falls back to the SHIPPED default, not to rclone's: one copy
+        # must never grab the whole uplink the races are run on.
+        workers = 2
     workers = max(1, min(64, workers))
 
     argv: list[str] = [
@@ -392,11 +435,40 @@ def _guard_copy_only(argv: Sequence[str]) -> None:
         raise ValueError("push refused: the rclone command is not a copy")
 
 
-async def _remote_shell(ssh: object, command: str, timeout_s: float) -> tuple[int | None, str, str]:
-    """One leased remote probe off the event loop; never raises."""
-    run = getattr(ssh, "run_shell", None)
+#: The dial attribute every push shell call goes through. Deliberately NOT the
+#: pooled `run_shell`: preflight and the liveness read used to lease members,
+#: so on a busy VPS1 they died with `Timeout opening channel` while competing
+#: with the racing .torrent fetches — the exact opposite of what the race needs.
+_SHELL_ATTR = "run_shell_dedicated"
+_WRITE_ATTR = "write_remote_file_dedicated"
+
+
+def _no_dial_reason(attr: str) -> str:
+    """Why the dial cannot run this lane's own kind of call (no prefix).
+
+    Returned bare, because it is embedded in other refusals (and in a
+    `push_liveness` "cannot tell" note) as often as it is a refusal itself.
+    """
+    return (
+        f"the SSH dial to VPS1 offers no dedicated runner ({attr}); the pooled "
+        "members are the racing path's and the push must not share them "
+        "([client.deluge_sftp])"
+    )
+
+
+async def _remote_shell(
+    ssh: object, command: str, timeout_s: float, *, attr: str = _SHELL_ATTR
+) -> tuple[int | None, str, str]:
+    """One DEDICATED-dial remote probe off the event loop; never raises.
+
+    A dial without `attr` is a refusal (the reason is returned in stderr, the
+    way every other failure here is), never a silent fallback onto a pooled
+    member: a push that had to queue behind a .torrent fetch is the bug this
+    exists to fix.
+    """
+    run = getattr(ssh, attr, None)
     if not callable(run):
-        return (None, "", "no SSH dial to the racing box")
+        return (None, "", _no_dial_reason(attr))
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(run, command, timeout_s),
@@ -423,6 +495,11 @@ async def preflight(
     and the remote listing last. Every step is best-effort: an unreachable
     VPS1 or an unlistable remote is a failed check with a reason, never an
     exception, because the caller falls back to the normal chain.
+
+    The two probes run on the DEDICATED dial (see `_remote_shell`): preflight
+    used to lease pooled members, so a saturated racing path turned it into
+    `could not list VPS1 rclone remotes: Timeout opening channel` — a refusal
+    that cost the push nothing but read as "push unavailable" forever.
     """
     files = list(getattr(request, "files", ()) or ())
     if not files:
@@ -506,7 +583,7 @@ async def start_copy(
     *,
     ssh: object,
     rclone_bin: str = "rclone",
-    transfers: int = 4,
+    transfers: int = 2,
     bwlimit: str = "",
     now: float | None = None,
     write_timeout_s: float = _WRITE_TIMEOUT_S,
@@ -515,7 +592,12 @@ async def start_copy(
 
     On success the PushCheck carries `list_path` / `log_path` / `files_total`
     for the caller's checkpoint. Nothing here verifies the transfer: that is
-    `remote_progress` and the caller's deadline.
+    `remote_progress`, `push_liveness` and the caller's deadline.
+
+    The list goes out over SFTP on the DEDICATED dial and the copy starts on
+    its own throwaway transport, so neither can be starved by (or starve) a
+    racing .torrent fetch — the `sftp: write of /tmp/racing-sync-push-….lst
+    failed: TimeoutError()` refusals in the production log were pooled writes.
     """
     files = list(getattr(request, "files", ()) or ())
     accepted, why = sanitize_push_files(files)
@@ -537,9 +619,9 @@ async def start_copy(
     except ValueError as e:
         return _fail(str(e))
 
-    write = getattr(ssh, "write_remote_file", None)
+    write = getattr(ssh, _WRITE_ATTR, None)
     if not callable(write):
-        return _fail("push refused: the SSH dial cannot write remote files")
+        return _fail(f"push refused: {_no_dial_reason(_WRITE_ATTR)}")
     try:
         written = await asyncio.wait_for(
             asyncio.to_thread(write, list_path, payload),
@@ -598,6 +680,177 @@ async def _drop_list_file(ssh: object, list_path: str) -> tuple[bool, str]:
     if status == 0:
         return True, ""
     return False, _one_line(err or f"exit {status}")
+
+
+def _scrub_log_line(line: object) -> str:
+    """One safe, bounded, operator-readable line taken from the rclone log."""
+    flat = _CONTROL_RE.sub(" ", str(line or ""))
+    return " ".join(flat.split())[:200]
+
+
+def _liveness_probe_command(log_path: str) -> str:
+    """The ONE bounded shell that judges a copy: does it exist, how big, tail?
+
+    Reads only our own job log — `test -f`, `wc -c`, `tail -c` on one quoted
+    path. Never a glob, never a directory listing, never the rclone mount, and
+    never more than the last `_LIVENESS_TAIL_BYTES` of a log a multi-hour copy
+    can grow long. The size line carries our own tag so a log line that looks
+    like a number can never be read as one.
+    """
+    quoted = shlex.quote(log_path)
+    return (
+        f"if test -f {quoted}; then "
+        f"printf '%s%s\\n' '{_SIZE_TAG}' \"$(wc -c < {quoted} 2>/dev/null)\"; "
+        f"tail -c {_LIVENESS_TAIL_BYTES} {quoted}; "
+        f"else printf '%sabsent\\n' '{_SIZE_TAG}'; fi"
+    )
+
+
+def _parse_liveness_output(text: object) -> tuple[bool, int, str]:
+    """(usable, size_bytes, tail) from the probe's own output.
+
+    `usable` False means the answer was not the shape we asked for, which the
+    caller reads as "unknown" — never as "dead". `size_bytes` is
+    `_SIZE_ABSENT` when the log file does not exist and 0 when it is empty.
+    """
+    lines = str(text or "").splitlines()
+    for index, line in enumerate(lines):
+        flat = line.strip()
+        if not flat.startswith(_SIZE_TAG):
+            continue
+        value = flat[len(_SIZE_TAG) :].strip()
+        tail = "\n".join(lines[index + 1 :])
+        if value == "absent":
+            return True, _SIZE_ABSENT, tail
+        try:
+            return True, max(0, int(value)), tail
+        except (TypeError, ValueError):
+            return False, 0, ""
+    return False, 0, ""
+
+
+def _fatal_log_line(tail: str) -> str:
+    """The LAST rclone line saying this run is over with a problem, "" if none.
+
+    Last, not first: a tail can still hold a transient retry from earlier in a
+    run that is going fine, and the most recent statement is the one that
+    describes the job.
+    """
+    found = ""
+    for line in tail.splitlines():
+        flat = _scrub_log_line(line)
+        if any(marker in flat for marker in _FATAL_MARKERS):
+            found = flat
+    return found
+
+
+def _finished_log_line(tail: str) -> str:
+    """The rclone summary line a run writes as it exits, "" when there is none.
+
+    Deliberately the stats keys only (see `_FINISHED_MARKERS`): a per-file
+    `Copied (new)` line is NOT evidence, because a two-file copy writes one of
+    those while the second file is still in flight.
+    """
+    found = ""
+    for line in tail.splitlines():
+        flat = _scrub_log_line(line)
+        if any(marker in flat for marker in _FINISHED_MARKERS):
+            found = flat
+    return found
+
+
+async def push_liveness(
+    *,
+    ssh: object,
+    log_path: str,
+    age_s: float | None = None,
+    grace_s: float = _LIVENESS_GRACE_S,
+) -> tuple[str, str]:
+    """Is the detached copy behind `log_path` still a job worth waiting for?
+
+    One bounded shell on VPS1 (see `_liveness_probe_command`), over the push's
+    own dedicated dial, at most once per push per poll. It reads rclone's log —
+    the job's post-mortem, never content — and answers `(verdict, reason)`:
+
+    * `("alive", note)` — anything this function cannot prove: no dial, a
+      wedged channel, a non-zero probe exit, output it cannot parse, an absent
+      or empty log INSIDE the grace window, or plain silence. The note is for
+      the log; the caller keeps the slot.
+    * `("missing", reason)` — no log file at all, or a log that is still empty,
+      past the grace: the copy never started or died before writing anything.
+    * `("failed", reason)` — a fatal line in the tail (`ERROR`, `Fatal`,
+      `panic:`, `exit status`, `Failed to`), quoted scrubbed and length-capped.
+    * `("finished", reason)` — the tail holds rclone's closing stats summary
+      and no fatal line. The run ended; only the caller knows whether anything
+      landed, so it must treat this as death ONLY when no file arrived (a
+      summary plus landed files is a job that is about to be handed over).
+
+    WHY SILENCE IS NOT DEATH: the remotes seeded here are Telegram-backed, and
+    such a remote creates the destination object only when a large upload
+    COMPLETES. A multi-GB copy therefore writes nothing at `--loglevel INFO`
+    for the better part of an hour and then everything at once — the production
+    window this fix was written for saw exactly one `1/1` success 46 minutes
+    after launch, after 64 polls of `0/1`. This exists to catch a job that is
+    provably gone, never one that is merely slow.
+
+    `age_s` is how long the copy has been running; `None` (unknown) is read as
+    "still inside the grace", so an absent log can never be judged from a
+    checkpoint without a start stamp. `grace_s` is a couple of polls at the
+    shipped cadence; the caller widens it to its own cadence.
+    """
+    path = str(log_path or "")
+    unsafe = _unsafe_path_reason(path, "log_path")
+    if unsafe:
+        return "alive", f"{unsafe} (the log cannot be read, so the copy stays alive)"
+
+    status, out, err = await _remote_shell(ssh, _liveness_probe_command(path), _LIVENESS_TIMEOUT_S)
+    if status is None:
+        # Transport trouble says nothing about the copy: VPS1 may be happily
+        # uploading while its SSH channel is wedged. Never free a slot on one.
+        return "alive", f"liveness unknown: {_one_line(err) or 'no answer from VPS1'}"
+    if status != 0:
+        return "alive", f"liveness probe exited {status}: {_one_line(err or out)}"
+
+    usable, size, tail = _parse_liveness_output(out)
+    if not usable:
+        return "alive", "liveness probe answer was unreadable"
+
+    try:
+        grace = max(0.0, float(grace_s))
+    except (TypeError, ValueError):
+        grace = _LIVENESS_GRACE_S
+    try:
+        age: float | None = None if age_s is None else max(0.0, float(age_s))
+    except (TypeError, ValueError):
+        age = None
+    past_grace = age is not None and age >= grace
+    age_text = f"{int(age)}s elapsed" if age is not None else "elapsed age unknown"
+    note = f"{age_text}, {int(grace)}s grace"
+
+    if size == _SIZE_ABSENT:
+        if not past_grace:
+            return "alive", f"no rclone log at {path} yet ({note})"
+        return (
+            "missing",
+            f"the rclone log at {path} never appeared ({note}): the copy did not "
+            "start or died before writing anything",
+        )
+    if size == 0:
+        if not past_grace:
+            return "alive", f"the rclone log at {path} is still empty ({note})"
+        return (
+            "missing",
+            f"the rclone log at {path} is still empty ({note}): the copy started "
+            "and wrote nothing, so it is not running",
+        )
+
+    fatal = _fatal_log_line(tail)
+    if fatal:
+        return "failed", f"rclone reported a fatal line: {fatal}"
+    summary = _finished_log_line(tail)
+    if summary:
+        return "finished", f"the copy wrote its closing summary and nothing since: {summary}"
+    return ("alive", "")
 
 
 async def remote_progress(

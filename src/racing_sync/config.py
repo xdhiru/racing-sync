@@ -221,6 +221,11 @@ class RclonePushConfig(BaseModel):
     # box set on a capped home link is still copying long past 10 minutes.
     # Same verb as `[transfer].timeout_seconds`: how long one rclone
     # operation may take; the two never share a value.
+    # It is only the BACKSTOP now: a copy whose log never appears, stays empty
+    # or reports a fatal line is failed by the poll that sees it (see
+    # `vps1_push.push_liveness`), so an operator no longer needs a giant
+    # ceiling here to avoid squatting a slot — 3600 is plenty on a fast link.
+    # The default stays 6 h: a stalled-but-silent big upload must not be killed.
     timeout_seconds: int = Field(default=21600, ge=600)  # 6 h
     # The rclone remote to copy into, spelled exactly as VPS1's rclone.conf
     # names it. Empty = derive it from the configured remote prefix (the
@@ -236,11 +241,17 @@ class RclonePushConfig(BaseModel):
     # rclone --transfers for a single push. VPS1's uplink is also carrying
     # the racing swarms and this daemon's own SSH session, so the default is
     # small; the cap keeps one release from saturating the shared link.
-    transfers: int = Field(default=4, ge=1, le=16)
+    # 2, not 4: production measured three concurrent 4-way copies holding the
+    # link the races are won on, and a starved uplink shows up on the very
+    # SSH channel the push itself needs (channel-open timeouts).
+    transfers: int = Field(default=2, ge=1, le=16)
     # rclone --bwlimit syntax, passed through verbatim ("42M", or a schedule
     # like "8M,24:00-08:00"). Empty = unset, i.e. rclone runs flat out. A
     # string rather than a number because schedules are the common case
     # here and parsing them into fields would only lose information.
+    # THE TRAP: "" is a WORKING default, not a safe one. An unthrottled copy
+    # competes head-on with the races VPS1 exists to win, so set a value on
+    # any box that also races (e.g. bwlimit = "30M").
     bwlimit: str = ""
     # Pushes allowed to run at once. Each is a bulk copy on the link the
     # racing client needs to stay competitive, so this stays far below the

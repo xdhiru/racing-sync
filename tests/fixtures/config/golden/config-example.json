@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:646cfde97d105c9a",
+  "digest": "sha256:8a17aed4e0809219",
   "keys": {
     "by_section": {
       "acquire": 9,
@@ -228,7 +228,7 @@
         "rclone_bin": "rclone",
         "remote_name": "",
         "timeout_seconds": 21600,
-        "transfers": 4
+        "transfers": 2
       },
       "type": "qbittorrent",
       "use_ipv6": false,

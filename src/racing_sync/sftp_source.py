@@ -382,6 +382,154 @@ def _launch_detached(cfg: DelugeSFTPConfig, command: str) -> bool:
                 pass
 
 
+def _remote_write_refusal(path: object, data: object) -> str:
+    """Reason this (path, payload) pair must never be written remotely; "" = safe.
+
+    Shared by the pooled member and the dedicated writer below, so the two
+    paths cannot drift into different safety rules — both refuse relative,
+    flag-looking, metacharacter-bearing paths, empty files and content-sized
+    payloads.
+    """
+    if not isinstance(path, str) or not path.strip():
+        return "refusing to write a remote file with an empty path"
+    clean = path.strip()
+    if clean != path or "\n" in clean or "\r" in clean or "\0" in clean:
+        return "refusing to write a remote file to an unsafe path"
+    if not clean.startswith("/"):
+        # Absolute POSIX only: a relative path resolves against the SSH
+        # user's home, and a `-`-leading one reads as a flag.
+        return f"refusing to write remote file {clean} (want an absolute path)"
+    if any(c in clean for c in (";", "`", "$")):
+        return f"refusing to write remote file {clean} (shell metacharacters)"
+    payload = bytes(data or b"")
+    if not payload:
+        return f"refusing to write an empty remote file {clean}"
+    if len(payload) > _MAX_REMOTE_WRITE_BYTES:
+        return (
+            f"refusing to write {len(payload)} bytes to {clean} "
+            f"(cap {_MAX_REMOTE_WRITE_BYTES}: content never goes over SSH)"
+        )
+    return ""
+
+
+def _bound_shell_timeout(timeout: object) -> float:
+    """A sane positive bound for one remote shell call (never raises)."""
+    try:
+        return max(1.0, float(timeout))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return _SHELL_CMD_TIMEOUT_S
+
+
+def _run_shell_dedicated(
+    cfg: DelugeSFTPConfig, command: str, timeout: float = _SHELL_CMD_TIMEOUT_S
+) -> tuple[int | None, str, str]:
+    """Run one short command on a DEDICATED transport; never a pool lease.
+
+    Why this exists next to `_launch_detached`: the push lane's *short* calls
+    (preflight's `command -v` / `listremotes`, the log liveness read) are not
+    the launch, and until now they leased a pooled member — so they queued
+    behind, and competed with, the racing client's .torrent fetches. On a
+    saturated VPS1 uplink those leases died with `Timeout opening channel`,
+    which read as "push unavailable". A dial of its own cannot be starved by
+    the pool and can never starve it.
+
+    Same contract as the pooled `run_shell`: (exit status, stdout, stderr),
+    never raises, streams always closed (a leaked channel pins a server-side
+    session). Reuses `_dial_client`, so host-key policy and credentials keep
+    exactly one implementation. Best-effort by design: an unreachable host
+    comes back as (None, "", reason) and the caller turns it into a refusal.
+    """
+    if not command or not command.strip():
+        return (None, "", "empty command")
+    bound = _bound_shell_timeout(timeout)
+    client: paramiko.SSHClient | None = None
+    try:
+        client = _dial_client(cfg)
+    except Exception as e:  # noqa: BLE001
+        # socket.timeout stringifies to "" — repr keeps the diagnosis usable.
+        return (None, "", f"dedicated dial failed: {type(e).__name__}: {e!r}")
+    stdin = stdout = stderr = None
+    try:
+        transport = client.get_transport()
+        if transport is None or not transport.is_active():
+            return (None, "", "dedicated dial has no live transport")
+        stdin, stdout, stderr = client.exec_command(command, timeout=bound)
+        try:
+            stdout.channel.settimeout(bound)
+        except Exception:
+            pass
+        # Both streams before the status: a full stdout buffer deadlocks
+        # against a status wait (same ordering as the pooled member).
+        try:
+            out = (stdout.read() or b"").decode("utf-8", errors="replace")
+        except Exception as e:  # noqa: BLE001
+            return (None, "", f"stdout read failed: {type(e).__name__}: {e}")
+        try:
+            err = (stderr.read() or b"").decode("utf-8", errors="replace")
+        except Exception:
+            err = ""
+        try:
+            status = stdout.channel.recv_exit_status()
+        except Exception:
+            status = None
+        return (status, out, err)
+    except Exception as e:  # noqa: BLE001
+        return (None, "", f"command failed to run: {type(e).__name__}: {e}")
+    finally:
+        _close_exec_streams(stdin, stdout, stderr)
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _write_remote_file_dedicated(cfg: DelugeSFTPConfig, path: str, data: bytes) -> bool:
+    """Write a SMALL remote file over a DEDICATED transport (see above).
+
+    The push file list is the only payload this may carry; the shared
+    `_remote_write_refusal` gate enforces that. True only when the bytes
+    landed, and the tightening chmod is best-effort exactly like the pooled
+    writer's. Never touches (or revives) a pool member, so it stays available
+    while the pool is closed.
+    """
+    refusal = _remote_write_refusal(path, data)
+    clean = str(path or "").strip()
+    if refusal:
+        log.warning("sftp: %s", refusal)
+        return False
+    payload = bytes(data or b"")
+    client: paramiko.SSHClient | None = None
+    sftp: paramiko.SFTPClient | None = None
+    try:
+        client = _dial_client(cfg)
+        sftp = client.open_sftp()
+        try:
+            channel = sftp.get_channel()
+            if channel is not None:
+                channel.settimeout(_SFTP_IO_TIMEOUT_S)
+        except Exception:
+            pass
+        with sftp.open(clean, "wb") as fh:
+            fh.write(payload)
+        # 0600: the list is a path inventory of the racing box, so it stays
+        # unreadable to other accounts on a shared host.
+        try:
+            sftp.chmod(clean, 0o600)
+        except Exception as e:  # noqa: BLE001
+            log.warning("sftp: could not chmod %s to 0600: %r", clean, e)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("sftp: dedicated write of %s failed: %r", clean, e)
+        return False
+    finally:
+        for closer in (sftp, client):
+            if closer is not None:
+                try:
+                    closer.close()
+                except Exception:
+                    pass
+
+
 class _SFTPConnection:
     """One SSH/SFTP connection (single transport, lock-guarded).
 
@@ -1043,34 +1191,14 @@ class _SFTPConnection:
 
         Used for the push file list only — never content (see the project's
         no-content-over-the-push rule), which the byte cap also enforces.
+        The push lane itself uses `write_remote_file_dedicated` below.
         """
-        if not isinstance(path, str) or not path.strip():
-            log.warning("sftp: refusing to write a remote file with an empty path")
-            return False
-        clean = path.strip()
-        if clean != path or "\n" in clean or "\r" in clean or "\0" in clean:
-            log.warning("sftp: refusing to write a remote file to an unsafe path")
-            return False
-        if not clean.startswith("/"):
-            # Absolute POSIX only: a relative path resolves against the
-            # SSH user's home, and a `-`-leading one reads as a flag.
-            log.warning("sftp: refusing to write remote file %s (want an absolute path)", clean)
-            return False
-        if any(c in clean for c in (";", "`", "$")):
-            log.warning("sftp: refusing to write remote file %s (shell metacharacters)", clean)
+        refusal = _remote_write_refusal(path, data)
+        clean = str(path or "").strip()
+        if refusal:
+            log.warning("sftp: %s", refusal)
             return False
         payload = bytes(data or b"")
-        if not payload:
-            log.warning("sftp: refusing to write an empty remote file %s", clean)
-            return False
-        if len(payload) > _MAX_REMOTE_WRITE_BYTES:
-            log.warning(
-                "sftp: refusing to write %d bytes to %s (cap %d: content never goes over SSH)",
-                len(payload),
-                clean,
-                _MAX_REMOTE_WRITE_BYTES,
-            )
-            return False
         try:
             self._acquire_or_busy(self._lock, f"write {clean}")
         except Exception as e:  # noqa: BLE001
@@ -1124,6 +1252,20 @@ class _SFTPConnection:
         """
         return _launch_detached(self._cfg, command)
 
+    def run_shell_dedicated(
+        self, command: str, timeout: float = _SHELL_CMD_TIMEOUT_S
+    ) -> tuple[int | None, str, str]:
+        """`run_shell` on a throwaway transport — this member is never used.
+
+        See `_run_shell_dedicated`; identical shape and identical
+        never-raises contract, so a caller can switch dial without a branch.
+        """
+        return _run_shell_dedicated(self._cfg, command, timeout)
+
+    def write_remote_file_dedicated(self, path: str, data: bytes) -> bool:
+        """`write_remote_file` on a throwaway transport (see the module fn)."""
+        return _write_remote_file_dedicated(self._cfg, path, data)
+
 
 class SFTPExporter:
     """Pooled SFTP exporter: N independent SSH/SFTP connections.
@@ -1139,6 +1281,12 @@ class SFTPExporter:
     (connect/close/start_torrent/start_many/disk_free_bytes/list_state_dir
     plus the context manager), so all existing call sites keep working.
     `pool_size` defaults to `[source.deluge_sftp].pool_size` (3).
+
+    The push lane is the deliberate exception to the pooling: its short calls
+    go through `run_shell_dedicated` / `write_remote_file_dedicated` (and its
+    launch through `launch_detached`), none of which lease a member, so a
+    push can never queue behind — or be starved by — a racing .torrent fetch,
+    and a saturated pool can never make a push look unavailable.
     """
 
     def __init__(self, cfg: DelugeSFTPConfig, pool_size: int | None = None):
@@ -1459,3 +1607,28 @@ class SFTPExporter:
         racing box regardless of what this process does).
         """
         return _launch_detached(self._cfg, command)
+
+    def run_shell_dedicated(
+        self, command: str, timeout: float = _SHELL_CMD_TIMEOUT_S
+    ) -> tuple[int | None, str, str]:
+        """One short remote command on a DEDICATED transport; never a lease.
+
+        The push lane's preflight (`command -v`, `rclone listremotes`) and
+        its log liveness read run here, so they can neither queue behind a
+        racing .torrent fetch nor steal a member from one. Same
+        (status, stdout, stderr) shape and same never-raises contract as
+        `run_shell`, and — like `launch_detached` — it works with the pool
+        closed, because it only ever dials from the config through
+        `_dial_client` (the one host-key/credential path).
+        """
+        return _run_shell_dedicated(self._cfg, command, timeout)
+
+    def write_remote_file_dedicated(self, path: str, data: bytes) -> bool:
+        """Write a small remote file on a DEDICATED transport; never a lease.
+
+        The push's `--files-from-raw` list goes this way for the same reason
+        the probes do: the pooled members are the racing path's bandwidth, and
+        a `TimeoutError()` on a list write used to be a refused push. The
+        pooled `write_remote_file` stays available for every other caller.
+        """
+        return _write_remote_file_dedicated(self._cfg, path, data)
