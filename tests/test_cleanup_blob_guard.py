@@ -331,6 +331,47 @@ async def test_source_member_uses_the_racing_loader(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_admit_caches_the_racing_torrent_bytes(tmp_path: Path):
+    """A private release keeps its racing .torrent from the moment it lands.
+
+    Fetching it while VPS1 is reachable means an outage at injection time
+    cannot lose the race.
+    """
+    store = StateStore(tmp_path / "state.db")
+    try:
+        racing = _torrent_bytes()
+        h = _hash_of(racing)
+        ts = _row(store, infohash=h)
+        coord = make_coordinator(store=store, cfg=AppConfig.from_toml(FIXTURES / "minimal.toml"))
+        coord._fetch_racing_torrent_bytes = AsyncMock(return_value=racing)
+
+        await coord._cache_racing_bytes(ts)
+
+        assert store.get_racing_blob(h) == racing
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_admit_does_not_cache_a_mismatched_fetch(tmp_path: Path):
+    """Bytes belonging to another torrent never enter the racing cache."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        racing = _torrent_bytes()
+        h = _hash_of(racing)
+        other = _torrent_bytes(name="Example.Other.S01E01.mkv", size=SIZE + 1)
+        ts = _row(store, infohash=h)
+        coord = make_coordinator(store=store, cfg=AppConfig.from_toml(FIXTURES / "minimal.toml"))
+        coord._fetch_racing_torrent_bytes = AsyncMock(return_value=other)
+
+        await coord._cache_racing_bytes(ts)
+
+        assert store.get_racing_blob(h) == b""
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_loader_prefers_db_blob(tmp_path: Path):
     """A persisted racing blob is returned without touching VPS1."""
     racing = _torrent_bytes()

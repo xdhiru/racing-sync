@@ -38,6 +38,69 @@ log = logging.getLogger("racing_sync.coordinator")
 
 
 class AdmitMixin(FuseAdmitMixin, WatchAdmitMixin, QueueAdmitMixin, LaneAdmitMixin, RetryAdmitMixin):
+    async def _cache_racing_bytes(self, ts: TorrentState, decision=None) -> None:
+        """Keep the racing torrent's own .torrent bytes early.
+
+        A private release needs its racing .torrent later (to seed it on
+        VPS2). Fetching it while the row is admitted means a VPS1/SFTP
+        outage at injection time cannot lose the race. Best-effort: a
+        failure only means the racing seed is fetched later (or not).
+        """
+        try:
+            h = (ts.source_infohash or "").lower()
+            if not h:
+                return
+            store = getattr(self, "store", None)
+            if store is not None:
+                cached = await asyncio.to_thread(store.get_racing_blob, h)
+                if isinstance(cached, (bytes, bytearray)) and cached:
+                    return
+            blob = None
+            if decision is not None:
+                label = str(getattr(decision, "source_label", "") or "")
+                # These labels mean the racing torrent's own bytes were used
+                # as the SSD source; a Prowlarr copy is a different torrent.
+                if label in ("public-racing", "private-sftp-fallback", "private-export-fallback"):
+                    cand = getattr(decision, "torrent_bytes", None)
+                    if isinstance(cand, (bytes, bytearray)) and cand:
+                        blob = bytes(cand)
+            if blob is None:
+                blob = await self._load_racing_torrent_bytes(h)
+            if not blob:
+                return
+            if store is not None:
+                matched = self._blob_matches_infohash(bytes(blob), h)
+                if matched is False:
+                    log.warning(
+                        "racing bytes for %s belong to a different torrent; not caching",
+                        h[:10],
+                    )
+                    return
+                if matched is True:
+                    await asyncio.to_thread(store.set_racing_blob, h, bytes(blob))
+            log.info("cached the racing .torrent for %s (%d B)", h[:10], len(blob))
+        except Exception as e:  # noqa: BLE001
+            log.debug("racing bytes not cached for %s: %s", (ts.source_infohash or "")[:10], e)
+
+    def _spawn_racing_byte_cache(self, ts: TorrentState, decision=None) -> None:
+        """Cache the racing .torrent in the background (intake never waits).
+
+        The fetch can take seconds on a slow VPS1 link; the racing row must
+        reach the download queue now. The cached bytes are only needed
+        later, when the content is seeded on VPS2.
+        """
+        try:
+            task = asyncio.create_task(self._cache_racing_bytes(ts, decision))
+        except RuntimeError:
+            return
+        tasks = getattr(self, "_tasks", None)
+        if isinstance(tasks, set):
+            tasks.add(task)
+            try:
+                task.add_done_callback(tasks.discard)
+            except Exception:
+                pass
+
     async def _pick_and_admit(
         self,
         ts: TorrentState,
@@ -81,6 +144,9 @@ class AdmitMixin(FuseAdmitMixin, WatchAdmitMixin, QueueAdmitMixin, LaneAdmitMixi
             source_client=self.source_client,
             attempt_prowlarr=attempt_prowlarr,
         )
+        # Keep the racing torrent's own .torrent while VPS1 is reachable: a
+        # private release needs those bytes later to seed it on VPS2.
+        self._spawn_racing_byte_cache(ts, decision)
         if decision is None:
             # No SSD source right now → park and retry.
             if park_reason is None:
