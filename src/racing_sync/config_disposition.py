@@ -11,6 +11,11 @@ cannot be silently dropped or forgotten while the config is re-spelled:
 - **new-only**: `NEW_ONLY` — keys that exist only in the new spelling
   (link switches and provider choices), consumed by `config_alias`.
 
+The same module owns the link/provider registry (`LINK_PROVIDERS`,
+`SUPPORTED_PROVIDERS`, `DEFAULT_PROVIDER`) and the optional feature sections
+(`FEATURE_SECTIONS`), so `config_alias` and `config_ux` import one table
+instead of each keeping a copy that can drift.
+
 Paths are dotted field paths of the *internal* schema (`rclone.fuse.mount`).
 Alias direction is new -> internal; the tables read old -> new because that
 is the direction a reader (and `config migrate`) needs.
@@ -71,18 +76,57 @@ DEPRECATED: dict[str, str] = {
 #: Refused at load with the hint as the message. Empty today.
 REMOVED: dict[str, str] = {}
 
+#: Provider names each link's file surface knows (the full chain vocabulary).
+#: Later phases enable the rest — see `SUPPORTED_PROVIDERS`.
+LINK_PROVIDERS: dict[str, tuple[str, ...]] = {
+    "acquire": ("auto", "cross_seed", "local", "direct_export", "external", "none"),
+    "transfer": ("rclone", "local_move", "none", "external"),
+    "seed": ("path", "existing", "none"),
+}
+
+#: Providers this release can actually run per link (a subset of
+#: `LINK_PROVIDERS`). Everything else is refused as "not available yet".
+SUPPORTED_PROVIDERS: dict[str, tuple[str, ...]] = {
+    "acquire": ("auto", "local", "external"),
+    "transfer": ("rclone", "local_move", "none", "external"),
+    "seed": ("path", "existing", "none"),
+}
+
+#: What an unset provider means per link (legacy behaviour).
+DEFAULT_PROVIDER: dict[str, str] = {
+    "acquire": "auto",
+    "transfer": "rclone",
+    "seed": "path",
+}
+
+#: The optional sections `config enable|disable` toggles, in listing order.
+FEATURE_SECTIONS: tuple[str, ...] = (
+    "indexers",
+    "watch",
+    "telegram",
+    "api",
+    "cleanup",
+    "logging_sink",
+)
+
+#: `NEW_ONLY` hints for the provider keys, generated from the registry so the
+#: text cannot advertise names the alias layer refuses (or hide one it runs).
+PROVIDER_HINTS: dict[str, str] = {
+    f"{link}.provider": " | ".join(names) for link, names in SUPPORTED_PROVIDERS.items()
+}
+
 #: Keys that exist only in the new spelling; resolved by `config_alias`.
 NEW_ONLY: dict[str, str] = {
     "watch.enabled": "absent = on when the section is non-empty",
     "indexers.enabled": "absent = on when the section carries content",
     "acquire.enabled": 'false is refused — use provider = "external" for adopt-only',
-    "acquire.provider": "auto | local | external",
+    "acquire.provider": PROVIDER_HINTS["acquire.provider"],
     "transfer.enabled": 'false is the same as provider = "none"',
-    "transfer.provider": "rclone | local_move | none | external",
+    "transfer.provider": PROVIDER_HINTS["transfer.provider"],
     "transfer.path": "local_move destination root (absolute)",
     "transfer.unsorted": "defaults to <path>/unsorted",
     "seed.enabled": 'false is the same as provider = "none"',
-    "seed.provider": "path | existing | none",
+    "seed.provider": PROVIDER_HINTS["seed.provider"],
     "seed.unsorted_path": "defaults to <seed.path>/unsorted",
 }
 

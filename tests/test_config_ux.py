@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from racing_sync.config import AppConfig
+from racing_sync.config_disposition import FEATURE_SECTIONS
 from racing_sync.config_ux import (
+    FEATURES,
     ConfigUxError,
     check_report,
     explain,
@@ -23,6 +25,29 @@ def _starter(tmp_path: Path) -> Path:
     path = tmp_path / "config.toml"
     init_config(path)
     return path
+
+
+def test_features_cover_the_section_registry_exactly():
+    assert tuple(FEATURES) == FEATURE_SECTIONS
+    for name, spec in FEATURES.items():
+        assert spec.section == name
+        assert spec.block.strip().startswith(f"[{name}]")
+        assert spec.title.strip() and spec.summary.strip()
+        assert name in explain(), name
+
+
+@pytest.mark.parametrize("name", FEATURE_SECTIONS)
+def test_every_registry_feature_can_be_toggled(tmp_path: Path, name: str):
+    path = _starter(tmp_path)
+
+    changed, missing = set_enabled(path, name, True)
+    assert changed
+    assert set(missing) <= set(FEATURES[name].required)
+    assert f"[{name}]\nenabled = true" in path.read_text(encoding="utf-8")
+
+    changed, _missing = set_enabled(path, name, False)
+    assert changed
+    assert f"[{name}]\nenabled = false" in path.read_text(encoding="utf-8")
 
 
 def test_init_writes_a_loadable_single_box_starter(tmp_path):
