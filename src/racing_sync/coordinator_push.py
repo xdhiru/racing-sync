@@ -63,6 +63,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import math
 import time
 from collections.abc import Iterable, Sequence
 
@@ -168,10 +169,58 @@ _PUSH_LAUNCH_FAIL_CAP = 200
 _PUSH_LAUNCH_FAIL_MULTIPLIER = 10.0
 _PUSH_LAUNCH_FAIL_FLOOR_S = 600.0
 
+# ---- measured push throughput (no config key: it is OBSERVED) ------------ #
+
+#: Smoothing weight for the byte-delta EMA. Under 0.5 so one unlucky poll
+#: (a remote that publishes the whole object at once) cannot outvote the
+#: history of every real copy this daemon has run.
+_PUSH_THROUGHPUT_ALPHA = 0.3
+
+#: Hard ceiling on ONE sample, in bytes/second (500 MiB/s). The point is not
+#: to model a fast link — it is that a copy which "delivered" a terabyte in a
+#: poll is a listing artefact, and feeding it through unclamped would make the
+#: estimate a rounding error and the push deadline effectively zero.
+_PUSH_THROUGHPUT_MAX_BPS = 500.0 * 1024.0 * 1024.0
+
+#: The documented CONSERVATIVE speed used only by `push_seconds_estimate` when
+#: nothing has been measured yet: 5 MiB/s is slower than any link this daemon
+#: has ever pushed over, so an unmeasured push is always estimated LONG. The
+#: indexer-wait deadline never uses it: unknown means no push term at all.
+_PUSH_THROUGHPUT_DEFAULT_BPS = 5.0 * 1024.0 * 1024.0
+
+#: Cap for the "this copy was judged dead" memory, mirroring
+#: `_PRESSURE_BACKOFF_CAP`: bounded, oldest shed first.
+_PUSH_THROUGHPUT_DEAD_CAP = 200
+
+#: How much of the push poll cadence the indexer deadline keeps as slack:
+#: TWO polls. A push is only ever observed at a poll boundary, so its real
+#: finish time can be a full cadence later than the last sample said, plus
+#: one cadence of handover/verification before the bytes are actually VPS2's.
+#: No new config key — `poll_seconds` is already the push's clock.
+_PUSH_DEADLINE_MARGIN_POLLS = 2.0
+#: Floor for that slack, so a fast cadence cannot make the margin vanish.
+_PUSH_DEADLINE_MARGIN_FLOOR_S = 300.0
+
 
 def _one_line(text: object) -> str:
     flat = " ".join(str(text or "").split())
     return flat[:300]
+
+
+def _optional_count(value: object) -> int | None:
+    """A metadata counter a poll could answer, or None when it could not.
+
+    None means "no observation", which the checkpoint stores as "keep the
+    last reading" — a 0 would be a lie about a copy that is mid-flight, and a
+    lie that goes DOWN is what drags a byte-delta estimate to nothing.
+    """
+    if value is None:
+        return None
+    try:
+        count = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return count if count >= 0 else None
 
 
 class PushMixin:
@@ -303,6 +352,22 @@ class PushMixin:
             return dt.timedelta(seconds=int(self.rt.push.timeout_seconds))
         except Exception:
             return dt.timedelta(seconds=_DEFAULT_TIMEOUT_S)
+
+    def push_deadline_margin_seconds(self) -> float | None:
+        """Slack the indexer wait keeps for a push: two poll cadences.
+
+        Derived from `poll_seconds` alone (no new key), floored so a fast
+        cadence cannot make it vanish. None — never a small number — when the
+        cadence itself is unreadable, which makes the caller drop the push
+        term instead of guessing at the margin.
+        """
+        try:
+            return max(
+                _PUSH_DEADLINE_MARGIN_FLOOR_S,
+                _PUSH_DEADLINE_MARGIN_POLLS * float(self._push_poll_seconds()),
+            )
+        except Exception:
+            return None
 
     def _push_max_concurrent(self) -> int:
         try:
@@ -445,6 +510,7 @@ class PushMixin:
             target_remote=target_remote,
             files=tuple(files),
         )
+        expected_bytes = self._push_expected_bytes(files)
         deadline_at = dt.datetime.now(dt.UTC) + self._push_timeout()
         try:
             claimed = await offload(
@@ -456,6 +522,7 @@ class PushMixin:
                 target_remote=target_remote,
                 deadline_at=deadline_at,
                 files_total=len(files),
+                bytes_total=expected_bytes,
             )
         except Exception as e:  # noqa: BLE001
             return False, f"push refused: could not claim the checkpoint ({_one_line(e)})"
@@ -508,6 +575,10 @@ class PushMixin:
             self._note_push_launch_failure(h, started.reason)
             return False, started.reason
 
+        # A launch that runs is a fresh opinion about this group: forget that
+        # an earlier copy of it was ever judged dead, so its byte deltas are
+        # eligible to train the throughput estimate again.
+        self._push_throughput_alive(h)
         # The copy is detached and running: stamp the scratch paths + counters
         # the transport generated, then hand the row over. A launch that
         # started ends the failure streak, so a lane that was broken and got
@@ -525,6 +596,7 @@ class PushMixin:
                 log_path=started.log_path,
                 deadline_at=deadline_at,
                 files_total=started.files_total or len(files),
+                bytes_total=expected_bytes,
             )
         except Exception as e:  # noqa: BLE001
             log.warning("push: could not stamp the checkpoint for %s: %s", h[:10], e)
@@ -567,6 +639,29 @@ class PushMixin:
             return f"{name}|{size}"
         except Exception:
             return ""
+
+    @staticmethod
+    def _push_expected_bytes(files: Sequence[PushFile]) -> int:
+        """The payload this push owes the remote, in bytes, from the torrent.
+
+        Stamped on the checkpoint at launch so `bytes_total` is meaningful
+        from the first poll. 0 (unknowable) whenever any wanted file carries
+        no size — a partial sum would read as a copy that is nearly done,
+        and a push estimate must never be built on an invented denominator.
+        """
+        total = 0
+        try:
+            for item in files or ():
+                size = getattr(item, "size_bytes", None)
+                if size is None:
+                    size = getattr(item, "size", 0)
+                size = int(size or 0)
+                if size <= 0:
+                    return 0
+                total += size
+        except (TypeError, ValueError, AttributeError):
+            return 0
+        return total
 
     def _push_transfers(self) -> int:
         try:
@@ -1097,9 +1192,12 @@ class PushMixin:
 
         Runs once per poll next to the manual-move sweep and does nothing at
         all while the switch is off. Progress is one metadata-only
-        ``rclone lsf -R --files-only`` per push against the seed remote —
+        ``rclone lsjson --files-only -R`` per push against the seed remote —
         never the fuse mount, never VPS2's SSD, never a content read — so at
-        most one remote listing per push per `poll_seconds`. When
+        most one remote listing per push per `poll_seconds`, and that single
+        listing answers both questions: which names have landed (completion
+        stays name coverage) and how many BYTES of them have (the file counts
+        alone read `0/1` for the whole of a single-file copy). When
         the remote holds every expected file the push goes `verifying` and
         the EXISTING evidence path (`_fuse_content_evidence` ->
         `_admit_fuse_existing` -> the all-remote shortcut) admits the row
@@ -1212,31 +1310,273 @@ class PushMixin:
             # behaviour the moment suppression lifts).
             return
         landed_before = int(getattr(push, "files_present", 0) or 0)
-        present, total = await remote_progress(getattr(self, "cfg", None), target, files)
+        bytes_before = int(getattr(push, "bytes_present", 0) or 0)
+        progress = await remote_progress(getattr(self, "cfg", None), target, files)
+        present, total = progress[0], progress[1]
+        # The same listing that names the files also publishes their sizes, so
+        # the byte counters are free metadata. A poll that cannot answer about
+        # bytes (no `lsjson` sizes, a mocked/legacy 2-tuple, an unreadable
+        # remote) passes None and leaves the stored reading alone — 0 would
+        # look like a copy that went backwards and drag the estimate down.
+        bytes_now = _optional_count(getattr(progress, "bytes_total", None))
+        landed_bytes = _optional_count(getattr(progress, "bytes_present", None))
+        if not bytes_now:
+            landed_bytes = None
         try:
             await offload(
                 store.note_push_progress,
                 h,
                 files_present=int(present or 0),
                 files_total=int(total or len(files)),
+                bytes_present=landed_bytes,
+                bytes_total=bytes_now,
             )
         except Exception as e:  # noqa: BLE001
             log.debug("push: could not note progress for %s: %s", h[:10], e)
         log.debug(
-            "push: %s has %d/%d file(s) on %s", h[:10], int(present or 0), int(total or 0), target
+            "push: %s has %d/%d file(s) (%s B/%s B) on %s",
+            h[:10],
+            int(present or 0),
+            int(total or 0),
+            "-" if landed_bytes is None else int(landed_bytes),
+            "-" if bytes_now is None else int(bytes_now),
+            target,
         )
+        if landed_bytes is not None and bytes_now:
+            # Δbytes / Δseconds between two polls of THIS checkpoint is the
+            # only throughput measurement the push lane can make without
+            # guessing: the stamp it compares against is the one the previous
+            # note wrote.
+            self._note_push_throughput_sample(
+                h, landed_bytes - bytes_before, self._push_note_gap_seconds(push, now)
+            )
         if total > 0 and present >= total:
             await self._push_handoff(store, h, ts, present, total)
             return
         # Nothing new landed. That is NOT yet evidence of a dead copy (a
         # Telegram-backed remote shows nothing until a big upload completes),
         # so ask the one thing that can prove it: the job's own log.
-        if int(present or 0) > landed_before:
+        if int(present or 0) > landed_before or (
+            landed_bytes is not None and landed_bytes > bytes_before
+        ):
             # Progress is progress: the copy is alive by definition, and the
             # log read is skipped outright this poll.
             self._forget_liveness(h)
             return
         await self._push_liveness(store, push, h, now, present=int(present or 0))
+
+    @staticmethod
+    def _push_note_gap_seconds(push, now: dt.datetime) -> float | None:
+        """Seconds since this checkpoint last reported progress (or None).
+
+        `updated_at` is the stamp every `note_push_progress` writes, so this is
+        the elapsed time BETWEEN two polls of the same record — the exact
+        denominator a byte delta needs. None (a missing/unsane stamp) means the
+        sample cannot be computed and must be dropped, never guessed at.
+        """
+        try:
+            updated = push.updated_at
+            if updated is None:
+                return None
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=dt.UTC)
+            gap = (now - updated).total_seconds()
+            return gap if gap > 0 else None
+        except Exception:
+            return None
+
+    # ---- measured push throughput (the deadline's only speed opinion) ---- #
+
+    def _measured_push_throughput_bps(self) -> float | None:
+        """The EMA of observed push speed, or None while it is UNKNOWN.
+
+        None is a real answer with teeth: callers must treat it as "no
+        measurement", never as "fast". Only two or more plausible byte deltas
+        from live pushes ever produce a number (see
+        `_note_push_throughput_sample`), and nothing here consults a
+        configured speed — the link this daemon races on is not a constant.
+        """
+        value = getattr(self, "_push_throughput_bps", None)
+        try:
+            if value is None:
+                return None
+            speed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if speed <= 0.0 or not math.isfinite(speed):
+            return None
+        return speed
+
+    def _note_push_throughput_sample(
+        self, infohash: str, delta_bytes: int, delta_seconds: float | None
+    ) -> None:
+        """Fold one live-push byte delta into the throughput estimate.
+
+        Rules, all of them fail-closed (a sample that is not obviously real
+        simply does not count):
+
+        * `delta_bytes <= 0` or a missing/non-positive interval ⇒ ignored. A
+          poll that saw nothing land carries no information, and the
+          byte-aware poll of a Telegram-backed remote sees exactly that for
+          most of an upload.
+        * a hash `push_liveness` judged dead is ignored, and the sample it
+          just contributed is rolled back (`_push_throughput_retract`): a
+          copy that died printing a usage error must not train the estimate
+          to infinity on its few bytes-per-second noise.
+        * the sample is CLAMPED to `_PUSH_THROUGHPUT_MAX_BPS` before it is
+          used, so one absurd reading (a remote-side cache flush landing a
+          whole tree in one poll) cannot outvote every real measurement.
+        * the first valid sample only SEEDS the estimate — it stays None.
+          The second turns it into an exponential moving average, so a
+          single lucky poll is never a number the deadline trusts.
+        """
+        h = (infohash or "").strip().lower()
+        try:
+            if delta_bytes is None or delta_seconds is None:
+                return
+            step_bytes = int(delta_bytes)
+            step_seconds = float(delta_seconds)
+            if step_bytes <= 0 or step_seconds <= 0.0:
+                return
+            sample = float(step_bytes) / step_seconds
+            if not math.isfinite(sample) or sample <= 0.0:
+                return
+            sample = min(sample, _PUSH_THROUGHPUT_MAX_BPS)
+            if h and h in getattr(self, "_push_throughput_dead", ()):
+                return
+            snapshot = (
+                h,
+                getattr(self, "_push_throughput_bps", None),
+                getattr(self, "_push_throughput_seed", None),
+            )
+            seed = snapshot[2]
+            ema = snapshot[1]
+            if ema is None and seed is None:
+                self._push_throughput_seed = sample
+                self._push_throughput_bps = None
+                self._push_throughput_snapshot = snapshot
+                log.debug("push: throughput seed %.0f B/s from %s", sample, h[:10])
+                return
+            base = float(ema) if ema is not None else float(seed)
+            self._push_throughput_bps = (
+                base * (1.0 - _PUSH_THROUGHPUT_ALPHA) + sample * _PUSH_THROUGHPUT_ALPHA
+            )
+            self._push_throughput_seed = None
+            self._push_throughput_snapshot = snapshot
+            log.debug(
+                "push: throughput now %.0f B/s (sample %.0f B/s)", self._push_throughput_bps, sample
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug("push: throughput sample ignored (%s)", _one_line(e))
+
+    def _push_throughput_retract(self, infohash: str) -> None:
+        """Undo the last folded-in sample when its copy is judged dead.
+
+        One deep: the snapshot is the state immediately before the most recent
+        accepted sample, and only the hash that produced it may consume it.
+        The hash is then remembered (bounded) so no later delta from that same
+        checkpoint trains the estimate either.
+        """
+        h = (infohash or "").strip().lower()
+        if not h:
+            return
+        try:
+            dead = getattr(self, "_push_throughput_dead", None)
+            if not isinstance(dead, set):
+                dead = set()
+                self._push_throughput_dead = dead  # type: ignore[attr-defined]
+            dead.add(h)
+            if len(dead) > _PUSH_THROUGHPUT_DEAD_CAP:
+                for stale in list(dead)[: len(dead) - _PUSH_THROUGHPUT_DEAD_CAP]:
+                    dead.discard(stale)
+            snapshot = getattr(self, "_push_throughput_snapshot", None)
+            if not isinstance(snapshot, tuple) or len(snapshot) != 3 or snapshot[0] != h:
+                return
+            _who, ema, seed = snapshot
+            self._push_throughput_bps = ema
+            self._push_throughput_seed = seed
+            self._push_throughput_snapshot = None
+            log.info(
+                "push: throughput sample from %s dropped; the copy was judged dead",
+                h[:10],
+            )
+        except Exception:
+            pass
+
+    def _push_throughput_alive(self, infohash: str) -> None:
+        """A fresh launch resets the dead-hash memory for this group."""
+        h = (infohash or "").strip().lower()
+        if not h:
+            return
+        try:
+            dead = getattr(self, "_push_throughput_dead", None)
+            if isinstance(dead, set):
+                dead.discard(h)
+            self._push_throughput_snapshot = None
+        except Exception:
+            pass
+
+    def push_term_for_deadline(self, size_bytes: object) -> tuple[float, float, float] | None:
+        """`(push_seconds, margin_seconds, throughput_bps)` or None for "don't".
+
+        The ONLY form the indexer wait may consult a push speed through, and
+        it answers with a real triple exactly when all three inputs are known:
+
+        * a MEASURED throughput (`_measured_push_throughput_bps`, i.e. two or
+          more plausible live samples) — the conservative fallback speed is
+          deliberately not allowed here, because inventing a speed is how a
+          wait gets shortened for a copy nobody has timed yet;
+        * a positive size for the row being waited on;
+        * a readable poll cadence to derive the margin from.
+
+        Anything else — a half-built config, a row with no bytes, a daemon
+        that has not finished two polls yet — returns None and the caller
+        keeps today's projection-only deadline. Fail-closed in both
+        directions: None never shortens AND never lengthens a wait.
+        """
+        try:
+            speed = self._measured_push_throughput_bps()
+            if speed is None:
+                return None
+            size = int(size_bytes or 0)  # type: ignore[arg-type]
+            if size <= 0:
+                return None
+            margin = self.push_deadline_margin_seconds()
+            if margin is None:
+                return None
+            needed = float(size) / float(speed)
+            if not math.isfinite(needed) or not math.isfinite(margin):
+                return None
+            return needed, margin, speed
+        except Exception:
+            return None
+
+    def push_seconds_estimate(self, size_bytes: object) -> float | None:
+        """How long a push of `size_bytes` would take, or None when unknowable.
+
+        `size / throughput`, with the divisor falling back to
+        `_PUSH_THROUGHPUT_DEFAULT_BPS` — the documented conservative (slow)
+        speed — whenever no measurement exists. The fallback is deliberately
+        SLOW, so an unknown speed means a LONG estimate and never a small one,
+        and an unknown size means None: no size is never a "quick push".
+
+        The indexer-wait deadline does NOT use the fallback (it refuses the
+        push term outright while the estimate is unknown); this helper is the
+        readable answer for operators and cards.
+        """
+        try:
+            size = int(size_bytes or 0)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        if size <= 0:
+            return None
+        speed = self._measured_push_throughput_bps()
+        if speed is None:
+            speed = _PUSH_THROUGHPUT_DEFAULT_BPS
+        try:
+            return float(size) / float(speed)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
 
     async def _push_liveness(
         self, store, push, infohash: str, now: dt.datetime, *, present: int
@@ -1307,6 +1647,10 @@ class PushMixin:
             )
             return
         self._forget_liveness(infohash)
+        # A copy this probe judged dead must not have trained the throughput
+        # estimate, and its hash is remembered so no later delta from the same
+        # checkpoint can either (see `_push_throughput_retract`).
+        self._push_throughput_retract(infohash)
         await self._push_settle(
             store, infohash, PushState.FAILED, f"the copy is dead ({_one_line(reason)})"
         )

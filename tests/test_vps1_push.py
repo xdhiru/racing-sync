@@ -1122,6 +1122,14 @@ def test_write_remote_file_reports_a_failed_write():
 
 @pytest.mark.anyio
 async def test_remote_progress_counts_partial_nested_listings(monkeypatch):
+    """The poll is byte-aware from ONE metadata listing, and no narrower.
+
+    The canned listing is what `rclone lsjson --files-only -R` really prints:
+    a JSON array, one object per landed object, with `Path` and `Size`. Two
+    of three wanted files are on the remote (one only part-copied, which a
+    name-only poll could never have told from a finished one), plus a stray
+    file that belongs to somebody else.
+    """
     seen: dict = {}
 
     async def _fake_run(cfg, cmd, **kwargs):
@@ -1129,9 +1137,13 @@ async def test_remote_progress_counts_partial_nested_listings(monkeypatch):
         return RcloneResult(
             returncode=0,
             stdout=(
-                "./Example Show/Season 01/Example.Show.S01E01.mkv\n"
-                "Example Show/Season 01/\n"
-                "Example Show/Season 01/Example.Show.S01E02.mkv\n"
+                '[{"Path":"Example Show/Season 01/","Size":0,"IsDir":true},'
+                '{"Path":"./Example Show/Season 01/Example.Show.S01E01.mkv",'
+                '"Name":"Example.Show.S01E01.mkv","Size":4000,"IsDir":false},'
+                '{"Path":"Example Show/Season 01/Example.Show.S01E02.mkv",'
+                '"Name":"Example.Show.S01E02.mkv","Size":1500,"IsDir":false},'
+                '{"Path":"Example Show/Season 01/Other.Show.S01E09.mkv",'
+                '"Name":"Other.Show.S01E09.mkv","Size":999999,"IsDir":false}]'
             ),
             stderr="",
             duration=0.1,
@@ -1139,15 +1151,41 @@ async def test_remote_progress_counts_partial_nested_listings(monkeypatch):
 
     monkeypatch.setattr("racing_sync.vps1_push.run_rclone", _fake_run)
     files = [
-        PushFile("Example Show/Season 01/Example.Show.S01E01.mkv", 1),
-        PushFile("Example Show/Season 01/Example.Show.S01E02.mkv", 1),
-        PushFile("Example Show/Season 01/Example.Show.S01E03.mkv", 1),
+        PushFile("Example Show/Season 01/Example.Show.S01E01.mkv", 4000),
+        PushFile("Example Show/Season 01/Example.Show.S01E02.mkv", 3000),
+        PushFile("Example Show/Season 01/Example.Show.S01E03.mkv", 3000),
     ]
-    present, total = await remote_progress(MagicMock(), TARGET, files)
+    progress = await remote_progress(MagicMock(), TARGET, files)
+    present, total = progress
+    # Completion is still NAME coverage — the byte counters are extra, not a
+    # substitute (a partial object on a remote is not a delivered file).
     assert (present, total) == (2, 3)
-    # Metadata-only listing, run locally against the remote: never the mount.
-    assert seen["cmd"][1:] == ["lsf", "-R", "--files-only", TARGET]
-    assert "size" not in " ".join(seen["cmd"])
+    # Landed = the two wanted files' reported sizes, with the part-copied one
+    # counted as it is; the stray 999999 B object is not this push's bytes.
+    assert (progress.bytes_present, progress.bytes_total) == (5500, 10000)
+    # Metadata-only listing, run locally against the remote: never the mount,
+    # never a content read, never a hash.
+    assert seen["cmd"][1:] == ["lsjson", "--files-only", "-R", TARGET]
+    for forbidden in ("hashsum", "cat", "copy", "--checksum", "/mnt"):
+        assert forbidden not in " ".join(seen["cmd"])
+
+
+@pytest.mark.anyio
+async def test_remote_progress_reports_no_bytes_for_an_unparsable_listing(monkeypatch):
+    """Malformed JSON is "no observation", not "zero bytes landed".
+
+    The checkpoint keeps its last reading instead of going backwards, so a
+    listing hiccup can never look like progress in reverse and cannot feed a
+    bogus sample into the throughput estimate.
+    """
+
+    async def _garbage(cfg, cmd, **kwargs):
+        return RcloneResult(returncode=0, stdout="not json at all\n{", stderr="", duration=0.1)
+
+    monkeypatch.setattr("racing_sync.vps1_push.run_rclone", _garbage)
+    progress = await remote_progress(MagicMock(), TARGET, _files())
+    assert tuple(progress) == (0, 2)
+    assert (progress.bytes_present, progress.bytes_total) == (0, 0)
 
 
 @pytest.mark.anyio

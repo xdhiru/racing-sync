@@ -531,3 +531,165 @@ def test_source_push_row_round_trips_every_column(tmp_path: Path):
             assert row[name] == want[name], name
     finally:
         store.close()
+
+
+# --------------------------------------------------------------------------- #
+# byte counters (schema v7)
+# --------------------------------------------------------------------------- #
+
+
+def test_v6_db_upgrades_the_push_byte_columns(tmp_path: Path):
+    """A checkpoint table written before the byte columns gains them, idempotently.
+
+    `CREATE TABLE IF NOT EXISTS` never backfills, so without the column diff a
+    v7 build would INSERT columns the v6 table does not have and every push
+    note would fail. The v6 row must survive untouched, and reopening must not
+    ALTER twice.
+    """
+    from racing_sync.state_schema import _SOURCE_PUSH_COLUMN_SPECS
+
+    byte_columns = {"bytes_present", "bytes_total"}
+    db = tmp_path / "v6-state.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        body = ",\n    ".join(f"{name} {ddl}" for name, ddl in _TORRENT_STATE_COLUMN_SPECS)
+        conn.execute(f"CREATE TABLE torrent_state (\n    {body}\n);")
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+        push_body = ",\n    ".join(
+            f"{name} {ddl}" for name, ddl in _SOURCE_PUSH_COLUMN_SPECS if name not in byte_columns
+        )
+        conn.execute(f"CREATE TABLE source_push (\n    {push_body}\n);")
+        conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '6')")
+        conn.execute(
+            "INSERT INTO source_push "
+            "(infohash, group_key, src_dir, target_remote, list_path, log_path, state, "
+            "started_at, updated_at, deadline_at, files_total, files_present, last_error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                HASH,
+                PUSH["group_key"],
+                PUSH["src_dir"],
+                PUSH["target_remote"],
+                PUSH["list_path"],
+                PUSH["log_path"],
+                "running",
+                STAMP,
+                STAMP,
+                "",
+                11,
+                4,
+                "",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = StateStore(db)
+    try:
+        cols = [row[1] for row in store._conn.execute("PRAGMA table_info(source_push)").fetchall()]
+        assert cols == list(SOURCE_PUSH_COLUMNS)
+        assert store.get_meta("schema_version") == str(_SCHEMA_VERSION)
+
+        # The pre-upgrade checkpoint reads back with the new counters at zero,
+        # i.e. "never observed" — not as a copy that lost all its bytes.
+        before = store.get_push(HASH)
+        assert before is not None
+        assert (before.files_total, before.files_present) == (11, 4)
+        assert (before.bytes_total, before.bytes_present) == (0, 0)
+        assert before.state is PushState.RUNNING
+        assert before.target_remote == PUSH["target_remote"]
+
+        # And the new columns are immediately writable.
+        assert store.note_push_progress(HASH, bytes_present=900, bytes_total=4096) is True
+        after = store.get_push(HASH)
+        assert after is not None
+        assert (after.bytes_present, after.bytes_total) == (900, 4096)
+        # A narrow note still touches nothing else.
+        assert after.state is PushState.RUNNING
+        assert after.files_present == 4
+    finally:
+        store.close()
+
+    # Reopening an already-v7 database is a no-op (idempotent column diff).
+    store = StateStore(db)
+    try:
+        again = store.get_push(HASH)
+        assert again is not None
+        assert (again.bytes_present, again.bytes_total) == (900, 4096)
+    finally:
+        store.close()
+
+
+def test_push_byte_counters_persist_update_and_survive_a_reopen(tmp_path: Path):
+    db = tmp_path / "state.db"
+    store = StateStore(db)
+    try:
+        assert store.start_push(HASH, **PUSH, files_total=2, bytes_total=6000) is not None
+        got = store.get_push(HASH)
+        assert got is not None
+        # Stamped at launch, so `bytes_total` means something from poll one.
+        assert (got.bytes_total, got.bytes_present) == (6000, 0)
+
+        assert store.note_push_progress(HASH, files_present=1, bytes_present=1500) is True
+        got = store.get_push(HASH)
+        assert got is not None
+        assert (got.bytes_present, got.bytes_total, got.files_present) == (1500, 6000, 1)
+
+        # Bytes only: the file counters keep their last reading (and reverse).
+        assert store.note_push_progress(HASH, bytes_present=5100) is True
+        got = store.get_push(HASH)
+        assert got is not None
+        assert (got.bytes_present, got.files_present) == (5100, 1)
+
+        # No observation is not zero: passing nothing leaves the byte pair.
+        assert store.note_push_progress(HASH, files_present=2) is True
+        got = store.get_push(HASH)
+        assert got is not None
+        assert (got.bytes_present, got.bytes_total, got.files_present) == (5100, 6000, 2)
+
+        # Clamped like the file counters; a negative reading lands at 0.
+        assert store.note_push_progress(HASH, bytes_present=-9, bytes_total=-1) is True
+        got = store.get_push(HASH)
+        assert got is not None
+        assert (got.bytes_present, got.bytes_total) == (0, 0)
+    finally:
+        store.close()
+
+    # Restart: the byte counters are durable, which is the whole point.
+    store = StateStore(db)
+    try:
+        assert store.start_push(HASH, **PUSH, bytes_total=8000) is not None
+        assert store.note_push_progress(HASH, bytes_present=3000, files_present=1) is True
+    finally:
+        store.close()
+
+    store = StateStore(db)
+    try:
+        got = store.get_push(HASH)
+        assert got is not None
+        assert (got.bytes_present, got.bytes_total, got.files_present) == (3000, 8000, 1)
+        # A claim RESETs them exactly like the file counters do: the previous
+        # copy's residue must never price a brand-new one.
+        assert store.claim_push(OTHER, **PUSH, files_total=3, bytes_total=9000) is not None
+        fresh = store.get_push(OTHER)
+        assert fresh is not None
+        assert (fresh.bytes_present, fresh.bytes_total) == (0, 9000)
+    finally:
+        store.close()
+
+
+def test_finish_push_leaves_the_byte_counters_readable(tmp_path: Path):
+    """The post-mortem card (and a stalled-copy report) needs both pairs."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        assert store.start_push(HASH, **PUSH, files_total=2, bytes_total=6000) is not None
+        assert store.note_push_progress(HASH, files_present=1, bytes_present=1500) is True
+        assert store.finish_push(HASH, PushState.FAILED, last_error="copy died") is True
+        got = store.get_push(HASH)
+        assert got is not None
+        assert got.state is PushState.FAILED
+        assert (got.bytes_present, got.bytes_total) == (1500, 6000)
+        assert (got.files_present, got.files_total) == (1, 2)
+    finally:
+        store.close()

@@ -33,8 +33,10 @@ Contract rules this module enforces by construction:
   lines already say "give up" is reported DEAD on the spot
   (`_confirm_launch`) instead of "push started".
 * **metadata only.** Nothing here reads or hashes content — not over SSH,
-  not against the rclone mount or VPS2's SSD. Progress is a name comparison
-  against ``rclone lsf -R --files-only``.
+  not against the rclone mount or VPS2's SSD. Progress is one name+size
+  listing (``rclone lsjson --files-only -R``) against the remote: completion
+  stays name coverage, and the sizes are metadata the remote already
+  publishes, not a read of the file.
 * **no remote paths from untrusted text.** ``target_remote`` always comes
   from ``seed_layout.decide_seed_layout`` (or is handed over already
   computed). Names inside the list are validated by ``rclone_ops``' own
@@ -54,6 +56,7 @@ pooled member, so a push can never queue behind — or be starved by — a racin
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shlex
@@ -76,9 +79,12 @@ log = logging.getLogger(__name__)
 __all__ = [
     "PushCheck",
     "PushFile",
+    "PushProgress",
     "PushRequest",
     "build_copy_command",
+    "parse_remote_sizes",
     "preflight",
+    "push_byte_totals",
     "push_liveness",
     "remote_progress",
     "sanitize_push_files",
@@ -258,6 +264,46 @@ class PushFile:
 
     name: str
     size_bytes: int
+
+
+class PushProgress(tuple):
+    """One poll's metadata progress: a 2-tuple of FILE counts.
+
+    `(files_present, files_total)` exactly as `remote_progress` always
+    returned — completion is still name coverage — and the byte counters ride
+    along as attributes because they come from the SAME listing: rclone's
+    `lsjson` publishes each object's size, so being byte-aware costs no second
+    remote call and no content read.
+
+    A tuple subclass rather than a dataclass on purpose: every caller (and
+    every existing test) unpacks `present, total = await remote_progress(...)`,
+    and a poll that cannot answer about bytes still compares equal to `(0, n)`.
+    """
+
+    def __new__(
+        cls,
+        files_present: int,
+        files_total: int,
+        *,
+        bytes_present: int = 0,
+        bytes_total: int = 0,
+    ) -> PushProgress:
+        obj = super().__new__(cls, (_count(files_present), _count(files_total)))
+        obj.files_present = _count(files_present)
+        obj.files_total = _count(files_total)
+        # Clamped and non-negative: a byte counter is only ever an observation
+        # of "this much has landed", never a signed quantity.
+        obj.bytes_present = _count(bytes_present)
+        obj.bytes_total = _count(bytes_total)
+        return obj
+
+
+def _count(value: object) -> int:
+    """A metadata counter as a non-negative int; anything unreadable is 0."""
+    try:
+        return max(0, int(value or 0))  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 @dataclass(frozen=True)
@@ -1634,29 +1680,33 @@ async def remote_progress(
     files: Iterable[PushFile],
     *,
     timeout_s: float = _LIST_TIMEOUT_S,
-) -> tuple[int, int]:
-    """Metadata-only (present, total) file counts on the seed remote.
+) -> PushProgress:
+    """Metadata-only progress on the seed remote: file counts AND byte totals.
 
-    One recursive ``lsf -R --files-only`` against the *remote* (never the
-    fuse mount, never VPS2's SSD, never a content read) compared by
-    normalized relative name, so nested paths (``Show/Season/ep.mkv``)
-    count individually. Sizes travel with the listing's caller: the
-    completion check is name coverage, and the byte-level verification stays
-    in the caller's verifying stage.
+    One recursive ``lsjson --files-only -R`` against the *remote* (never the
+    fuse mount, never VPS2's SSD, never a content read, never a hash). The
+    listing is name+size in a single pass, so a mid-copy poll is byte-aware
+    at no extra remote cost: the completion check stays NAME coverage (the
+    previous behaviour), and the sizes are what the coordinator's throughput
+    estimate is derived from.
+
+    Why bytes at all: ``lsf`` can only answer "is the name there yet", which
+    for the common single-file release reads `0/1` for the whole copy. The
+    sizes are the only progress signal a one-file push has.
     """
     accepted = [f for f in (files or ()) if str(getattr(f, "name", "") or "")]
     want = {_norm_listed_path(str(f.name)) for f in accepted}
     want.discard("")
     total = len(want)
     if not total:
-        return 0, 0
+        return PushProgress(0, 0)
     remote = str(target_remote or "").strip()
     if not remote or remote.startswith("-"):
-        return 0, total
+        return PushProgress(0, total)
     try:
         result = await run_rclone(
             cfg,  # type: ignore[arg-type]
-            [_local_rclone_binary(cfg), "lsf", "-R", "--files-only", remote],
+            [_local_rclone_binary(cfg), "lsjson", "--files-only", "-R", remote],
             timeout=timeout_s,
             tree=None,
         )
@@ -1664,19 +1714,101 @@ async def remote_progress(
         raise
     except Exception as e:  # noqa: BLE001
         log.warning("push progress: remote listing of %s failed: %s", remote, e)
-        return 0, total
+        return PushProgress(0, total)
     if getattr(result, "returncode", 1) != 0:
         log.warning(
             "push progress: remote listing of %s exited %s",
             remote,
             getattr(result, "returncode", "?"),
         )
-        return 0, total
-    listed = {
-        _norm_listed_path(line) for line in str(getattr(result, "stdout", "") or "").splitlines()
-    }
+        return PushProgress(0, total)
+    sizes = parse_remote_sizes(getattr(result, "stdout", ""))
+    listed = set(sizes)
     listed.discard("")
-    return len(want & listed), total
+    present = len(want & listed)
+    landed, expected = push_byte_totals(accepted, sizes)
+    return PushProgress(present, total, bytes_present=landed, bytes_total=expected)
+
+
+def parse_remote_sizes(text: object) -> dict[str, int]:
+    """{normalized remote path: size in bytes} from ``lsjson`` output.
+
+    Metadata the remote already publishes — rclone's own JSON, one entry per
+    object, with `Path` and `Size`. Nothing is read, hashed or guessed:
+
+    * malformed / truncated / non-JSON output ⇒ {} (no crash, no bytes);
+    * a directory entry, a non-object entry, a missing/blank path ⇒ skipped;
+    * a missing, non-numeric, negative or non-finite `Size` ⇒ that entry is
+      skipped rather than counted as 0: an unknown size must never be
+      invented, and a bogus 0 would drag a byte delta down;
+    * paths are normalized exactly like every other listing comparison in
+      this module (`_norm_listed_path`), so ``./A/B/ep.mkv`` and
+      ``A/B/ep.mkv`` are one object.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(decoded, list):
+        return {}
+    sizes: dict[str, int] = {}
+    for entry in decoded:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("IsDir") is True:
+            continue
+        path = _norm_listed_path(str(entry.get("Path") or entry.get("Name") or ""))
+        if not path:
+            continue
+        value = entry.get("Size")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        try:
+            size = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if size < 0:
+            continue
+        sizes[path] = size
+    return sizes
+
+
+def push_byte_totals(files: Sequence[PushFile], sizes: dict[str, int]) -> tuple[int, int]:
+    """(landed_bytes, expected_bytes) for one push, from metadata alone.
+
+    `expected` is the sum of the wanted files' own sizes — and it is 0 (i.e.
+    "unknowable", callers must not build a deadline on it) as soon as ANY
+    wanted file carries no size, because a partial expectation would read as
+    a copy that is further along than it is.
+
+    `landed` counts only the WANTED names, and only those whose size the
+    listing actually reported; an object the push never asked for is somebody
+    else's bytes and is ignored. A name that is present but whose size is
+    unknown to the parser contributes nothing.
+    """
+    if not files or not sizes:
+        return 0, 0
+    expected = 0
+    landed = 0
+    for item in files:
+        name, size = _entry_name_size(item)
+        norm = _norm_listed_path(name)
+        if not norm:
+            continue
+        if size <= 0:
+            return 0, 0
+        expected += size
+        # A landed object may be SMALLER than expected (the copy is mid-file
+        # on a remote that publishes partial objects). Take what is there,
+        # never more than the file's own size: an over-count could push a
+        # delta upwards on nothing and train the throughput estimate.
+        found = sizes.get(norm)
+        if found is not None:
+            landed += min(int(found), size)
+    return landed, expected
 
 
 def _local_rclone_binary(cfg: object) -> str:

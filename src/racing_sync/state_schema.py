@@ -364,9 +364,20 @@ class SourcePush:
     # Watchdog expiry for the live states. "" means no expiry: the record
     # stays live until finish_push/clear_push says otherwise.
     deadline_at: dt.datetime | None = None
-    # Metadata-only progress counters (file counts, never bytes).
+    # Metadata-only progress counters (file counts, never a content read).
     files_total: int = 0
     files_present: int = 0
+    # Metadata-only BYTE counters, from the remote listing's own size column
+    # (`rclone lsjson --files-only -R`): how much of the expected payload has
+    # actually landed. The file counts are useless mid-copy for the common
+    # single-file release (0/1 for hours), and these are what let the
+    # coordinator measure a real push throughput. 0 = never observed.
+    #
+    # LAST in the record, like in the column spec: an ALTER ADD COLUMN
+    # appends, so a v6 checkpoint table upgraded at open ends up with exactly
+    # the same column ORDER a fresh database gets.
+    bytes_total: int = 0
+    bytes_present: int = 0
     last_error: str = ""
 
     def to_row(self) -> dict:
@@ -384,6 +395,8 @@ class SourcePush:
             "deadline_at": self.deadline_at.isoformat() if self.deadline_at else "",
             "files_total": int(self.files_total or 0),
             "files_present": int(self.files_present or 0),
+            "bytes_total": int(self.bytes_total or 0),
+            "bytes_present": int(self.bytes_present or 0),
             "last_error": self.last_error,
         }
         # Same guarantee as TorrentState.to_row(): a column added to the spec
@@ -464,6 +477,11 @@ _SOURCE_PUSH_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
     ("files_total", "INTEGER NOT NULL DEFAULT 0"),
     ("files_present", "INTEGER NOT NULL DEFAULT 0"),
     ("last_error", "TEXT NOT NULL DEFAULT ''"),
+    # v7. LAST on purpose: an ALTER ADD COLUMN appends, so keeping the new
+    # counters at the end means a pre-v7 table upgraded at open has the exact
+    # same column ORDER as a fresh one (the schema test asserts the order).
+    ("bytes_total", "INTEGER NOT NULL DEFAULT 0"),
+    ("bytes_present", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 SOURCE_PUSH_COLUMNS: tuple[str, ...] = tuple(name for name, _ddl in _SOURCE_PUSH_COLUMN_SPECS)
@@ -476,7 +494,7 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = ", ".join(
 #: Bumped whenever a column spec or a data migration changes. Recorded in
 #: `meta` so an upgraded or downgraded DB shows up in the log; the column
 #: diff at open is the actual migration mechanism.
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 
 #: Persisted TorrentState fields: everything except the transient blob copy.
 _PERSISTED_FIELDS = frozenset(f.name for f in dataclass_fields(TorrentState)) - {"_blob"}

@@ -22,6 +22,7 @@ from .coordinator_errors import AbandonedError
 from .state_schema import (
     _FLAP_WINDOW_SECONDS,
     _SCHEMA_VERSION,
+    _SOURCE_PUSH_COLUMN_SPECS,
     _TORRENT_STATE_COLUMN_SPECS,
     _TORRENT_STATE_COLUMNS_NO_BLOB,
     LIVE_PUSH_STATES,
@@ -137,6 +138,25 @@ class StateStore:
                 # corrupt) must be loud.
                 if "duplicate column" not in str(e).lower():
                     log.warning("state DB migration %r failed: %s", _name, e)
+        # Same additive, idempotent column diff for source_push (v7 added the
+        # metadata-only byte counters): CREATE TABLE IF NOT EXISTS never
+        # backfills an existing table, so a v6 checkpoint table would keep
+        # writing through an INSERT that names columns it does not have.
+        try:
+            _have_push = {
+                _r[1] for _r in self._conn.execute("PRAGMA table_info(source_push)").fetchall()
+            }
+        except Exception as e:  # noqa: BLE001
+            _have_push = set()
+            log.warning("state DB: could not read source_push columns: %s", e)
+        for _name, _ddl in _SOURCE_PUSH_COLUMN_SPECS:
+            if _name in _have_push or "PRIMARY KEY" in _ddl.upper():
+                continue
+            try:
+                self._conn.execute(f"ALTER TABLE source_push ADD COLUMN {_name} {_ddl}")
+            except Exception as e:
+                if "duplicate column" not in str(e).lower():
+                    log.warning("state DB push migration %r failed: %s", _name, e)
         # Indexes last: they need every migrated column above. Existing DBs
         # may also be missing an index whose columns only just appeared.
         self._conn.executescript(SCHEMA_INDEXES)
@@ -1360,6 +1380,7 @@ class StateStore:
         log_path: str = "",
         deadline_at: dt.datetime | None = None,
         files_total: int = 0,
+        bytes_total: int = 0,
     ) -> SourcePush | None:
         """Force a fresh checkpoint for `infohash`, RESETing any prior record.
 
@@ -1379,6 +1400,7 @@ class StateStore:
             log_path=log_path,
             deadline_at=deadline_at,
             files_total=files_total,
+            bytes_total=bytes_total,
         )
         if push is None:
             return None
@@ -1408,6 +1430,7 @@ class StateStore:
         log_path: str = "",
         deadline_at: dt.datetime | None = None,
         files_total: int = 0,
+        bytes_total: int = 0,
     ) -> SourcePush | None:
         """Atomically claim the hash; None when a live push already owns it.
 
@@ -1429,6 +1452,7 @@ class StateStore:
             log_path=log_path,
             deadline_at=deadline_at,
             files_total=files_total,
+            bytes_total=bytes_total,
         )
         if push is None:
             return None
@@ -1509,13 +1533,24 @@ class StateStore:
             return []
 
     def note_push_progress(
-        self, infohash: str, *, files_present: int | None = None, files_total: int | None = None
+        self,
+        infohash: str,
+        *,
+        files_present: int | None = None,
+        files_total: int | None = None,
+        bytes_present: int | None = None,
+        bytes_total: int | None = None,
     ) -> bool:
         """Update the metadata-only counters; True when a record was written.
 
         Narrow UPDATE (counters + updated_at only): a progress note never
         touches state, paths or the deadline, so it cannot clobber a
         concurrent finish/claim.
+
+        The byte counters are the remote listing's own sizes (metadata, never
+        a content read) and are what the throughput estimate is derived from,
+        so a poll that has no byte answer must pass None and leave the last
+        reading in place rather than zeroing it.
         """
         self._ensure_open()
         norm = (infohash or "").strip().lower()
@@ -1523,7 +1558,12 @@ class StateStore:
             return False
         sets: list[str] = []
         params: list = []
-        for column, value in (("files_present", files_present), ("files_total", files_total)):
+        for column, value in (
+            ("files_present", files_present),
+            ("files_total", files_total),
+            ("bytes_present", bytes_present),
+            ("bytes_total", bytes_total),
+        ):
             if value is None:
                 continue
             try:
@@ -2007,6 +2047,7 @@ def _new_push(
     log_path: str,
     deadline_at: dt.datetime | None,
     files_total: int,
+    bytes_total: int = 0,
 ) -> SourcePush | None:
     """Build the checkpoint every push writer stores; None without a hash.
 
@@ -2033,6 +2074,8 @@ def _new_push(
         deadline_at=_push_utc(deadline_at),
         files_total=_safe_int(files_total),
         files_present=0,
+        bytes_total=_safe_int(bytes_total),
+        bytes_present=0,
         last_error="",
     )
 
@@ -2064,5 +2107,9 @@ def _row_to_push(row: sqlite3.Row) -> SourcePush:
         deadline_at=_push_utc(row["deadline_at"]) if "deadline_at" in keys else None,
         files_total=_safe_int(row["files_total"]) if "files_total" in keys else 0,
         files_present=_safe_int(row["files_present"]) if "files_present" in keys else 0,
+        # Added at v7: a pre-v7 row simply has no byte counters (the column
+        # diff adds them at 0), which reads as "never observed", not as "0 B".
+        bytes_total=_safe_int(row["bytes_total"]) if "bytes_total" in keys else 0,
+        bytes_present=_safe_int(row["bytes_present"]) if "bytes_present" in keys else 0,
         last_error=text("last_error"),
     )

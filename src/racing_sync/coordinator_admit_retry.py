@@ -4,6 +4,7 @@ Extracted from coordinator_admit.py; `AdmitMixin` composes this mixin."""
 
 import datetime as dt
 import logging
+import math
 import time
 
 from .content_keys import same_content as _same_content_key
@@ -53,6 +54,47 @@ class RetryAdmitMixin:
         except (TypeError, ValueError):
             return 1800.0
 
+    def _push_deadline_term(self, ts: TorrentState) -> tuple[float, float, float, int] | None:
+        """`(push_seconds, margin_seconds, throughput_bps, size)` to charge, or None.
+
+        The wait asks the push lane one question: how long would a push of
+        THIS release take, measured on this link? Only the push module can
+        answer it (it owns the byte-delta EMA), and its answer is None —
+        meaning "charge nothing" — unless:
+
+        * the throughput is MEASURED (two or more plausible live samples;
+          the conservative fallback speed is explicitly not used here), and
+        * a positive size for this row, and
+        * the push poll cadence is readable (the margin is two polls of it).
+
+        Anything missing, anything raising, or a coordinator double without
+        the push lane at all returns None, and the deadline stays exactly the
+        projection-only rule it is today. An unmeasured push may never shorten
+        a wait — and may never lengthen one either.
+        """
+        probe = getattr(self, "push_term_for_deadline", None)
+        if not callable(probe):
+            return None
+        try:
+            size = int(getattr(ts, "total_bytes", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        try:
+            term = probe(size)
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(term, tuple) or len(term) != 3:
+            return None
+        try:
+            needed, margin, speed = float(term[0]), float(term[1]), float(term[2])
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(v) for v in (needed, margin, speed)):
+            return None
+        if needed < 0.0 or margin < 0.0 or speed <= 0.0:
+            return None
+        return needed, margin, speed, size
+
     def _indexer_effective_wait_seconds(self, ts: TorrentState) -> tuple[float, str]:
         """The indexer wait this row should honour NOW: `(seconds, reason)`.
 
@@ -62,13 +104,26 @@ class RetryAdmitMixin:
         holds the only copy of those bytes on VPS1 and the janitor cannot
         touch a non-DONE row:
 
-            effective = max(floor, min(indexer_wait_seconds, seconds_to_fill))
+            effective = max(floor, min(indexer_wait_seconds, runway))
+            runway    = seconds_to_fill − push_estimate − push_margin
             floor     = max(_INDEXER_WAIT_COLLAPSE_FLOOR_S,
                             2 * prowlarr_retry_interval_seconds)
 
-        No new key and no new tunable: both numbers are already derived, and
-        the floor keeps the collapse from firing before at least a couple of
-        retries have run.
+        `runway` is the projection ONCE THE PUSH HAS BEEN PAID FOR. Waiting
+        for a cross-seed only makes sense while a push could still land the
+        bytes before the space is needed, so a measured push time for THIS
+        release plus the push's own poll slack comes off the runway first.
+        `push_estimate` and `push_margin` are charged only when both are known
+        (see `_push_deadline_term`); otherwise `runway` is the bare projection
+        and the collapse is exactly what it was before the push term existed.
+        Because the clamp keeps its floor, a push term can never take the
+        window under the floor or past the configured ceiling in either
+        direction: it only ever shortens the runway, never lengthens it.
+
+        No new key and no new tunable: the projection, the floor, the byte
+        deltas the estimate is built from and the margin's cadence are all
+        already derived, and the floor keeps the collapse from firing before
+        at least a couple of retries have run.
 
         Pressure comes from the SAME sources as `pressure_push_sweep`: the
         janitor's cached free-space probe (`_last_source_free_bytes`, never a
@@ -78,9 +133,12 @@ class RetryAdmitMixin:
         mean NO collapse — never guess.
 
         `reason` is a one-line, self-contained explanation, empty when
-        nothing collapsed. Both call sites — `_prowlarr_timed_out` (the
-        racing-torrent/push trigger) and `_park_for_indexer_retry` (the
-        FAILED escalation) — read only this helper, so they cannot drift.
+        nothing collapsed, and it names the push term whenever that term is
+        what shortened the wait — an operator reading "why was this 40 minutes
+        and not 8 hours" gets the arithmetic, not just the verdict. Both call
+        sites — `_prowlarr_timed_out` (the racing-torrent/push trigger) and
+        `_park_for_indexer_retry` (the FAILED escalation) — read only this
+        helper, so they cannot drift.
         """
         configured = self._indexer_configured_wait_seconds()
         try:
@@ -93,7 +151,17 @@ class RetryAdmitMixin:
             if not (bursting or urgent) or projected is None:
                 return configured, ""
             floor = max(_INDEXER_WAIT_COLLAPSE_FLOOR_S, 2.0 * self._indexer_retry_gap_seconds())
-            effective = max(floor, min(configured, float(projected)))
+            runway = float(projected)
+            push_note = ""
+            term = self._push_deadline_term(ts)
+            if term is not None:
+                needed, margin, speed, size = term
+                runway -= needed + margin
+                push_note = (
+                    f", minus {needed:.0f}s to push {size} B at {speed:.0f} B/s "
+                    f"plus {margin:.0f}s poll margin"
+                )
+            effective = max(floor, min(configured, runway))
             if effective >= configured:
                 return configured, ""
             verdict = "+".join(
@@ -102,7 +170,7 @@ class RetryAdmitMixin:
             return effective, (
                 f"indexer wait collapsed under VPS1 disk pressure: effective {effective:.0f}s "
                 f"vs configured {configured:.0f}s (VPS1 free {int(free)} B, {verdict}, "
-                f"projected to fill in {float(projected):.0f}s)"
+                f"projected to fill in {float(projected):.0f}s{push_note})"
             )
         except Exception:
             # Fail closed to the configured window: a half-built double or a
