@@ -33,6 +33,7 @@ src/racing_sync/
     coordinator_inject.py      manual inject-to-fuse flow
     coordinator_picker.py      cross-seed source picker
     coordinator_content.py     stateless helpers (names, grace, notify)
+    coordinator_push.py        VPS1 push lane (copy, suppression, handoff)
     coordinator_racing_blobs.py bulk warm-up of the racing .torrent cache
   content_keys.py     One same-content rule (explicit size modes)
   fuse_gate.py        One fuse verifier (mount probe, expected files, confirm)
@@ -40,10 +41,12 @@ src/racing_sync/
   recovery.py         Startup reconciler
   forget.py           Abandon-torrent off-switch
   rclone_ops.py       rclone subprocess wrapper (timeouts, kill/reap)
+  seed_layout.py      One rule: which remote and which top folder a release lands in
   local_transfer.py   verified move to a mounted local dir/NAS (local_move)
   io_bounds.py        RPC/thread deadlines and chunking
   safety.py           Delete guards, daemon lock, reset refusals
   sftp_source.py      Pooled .torrent export + bulk tar fetch over SSH
+  vps1_push.py        Preflight + detached `rclone copy` run on the racing box
   prowlarr.py         Indexer search + validated download
   watchdir.py         Watch-dir scanner + the one bencoded parser
   telegram_*.py       Control plane (commands, actions, routing, views)
@@ -101,6 +104,19 @@ to `DONE`) → reserve SSD budget → add to VPS2 paused → download in batches
 the files gone) → re-add pointing at the fuse mount with `skip_check=True`
 after the fuse gate passes → `DONE`. Public torrents land paused when
 `cross_seed.pause_public_torrents_on_fuse` is set (default).
+
+**Push from VPS1** (`[source.rclone_push]`, off by default). When no
+download-target indexer carries the release, the racing box already holds
+the bytes, so VPS1 can run a detached `rclone copy` onto the same remote
+VPS2 seeds from instead of leeching them a second time. It is a copy, never
+a move: deleting VPS1's files mid-race would cost the ratio, and deletion
+stays the janitor's job. A live push parks its row — no SSD reservation, no
+timeout leech, no max-age `FAILED` — and same-content siblings defer to it,
+so one copy serves the group. Progress is one metadata listing per check
+interval (never a content read), and the existing fuse-evidence path admits
+the row and injects. `/push_source` or the act-sheet button starts one by
+hand; `auto_on_prowlarr_timeout` makes the timeout prefer it over the VPS2
+leech, which stays as the fallback.
 
 ## Invariants (the single rules)
 
