@@ -287,6 +287,15 @@ skips only the activity keep — a full scratch disk outranks a leecher, and
 VPS2 takes over serving — while verification, protection, unknown stats and
 `.torrent` preservation stay fail-closed. A pass that finds nothing
 eligible reports why in one line (`nothing eligible (activity 17, grace 3)`).
+An EMERGENCY — free space at/below `critical_watermark_free_bytes`, or a
+release that arrived too big to fit — is a third, separately-named signal above
+`pressured`/`bursting` and changes timing only: the janitor runs on its
+emergency wake (bounded to `burst_janitor_interval_seconds / 5`, floor 15 s)
+instead of the next cadence tick, and a `DONE` row whose bytes already verify
+on fuse becomes eligible without the grace wait or the idle fast lane.
+Unverified rows, rows adopted without `completed_at` and rows with peers
+attached are still kept exactly as before, and the report line says
+`... ; emergency on` when the state is live.
 
 ## Telegram
 

@@ -409,11 +409,16 @@ async def test_nothing_eligible_breakdown_separates_activity_from_grace(tmp_path
     assert store.set_blob(waiting, _blob(other)) is True
     try:
         with caplog.at_level(logging.INFO, logger="racing_sync.coordinator"):
-            summary = await _scan(coord, cfg, free=TIGHT, bursting=False)
+            # 10 GiB: below the 15 GiB low watermark, ABOVE the 8 GiB critical
+            # one. At `TIGHT` the same scan is an emergency, where a verified
+            # row skips the grace wait (see tests/test_cleanup_emergency.py);
+            # this test measures the two keeps, so it stays out of emergency.
+            summary = await _scan(coord, cfg, free=10 * GiB, bursting=False)
         assert summary["deleted"] == 0
         assert summary["reason"].startswith("nothing eligible (")
         assert "activity 1" in summary["reason"]
         assert "grace 1" in summary["reason"]
+        assert "emergency" not in summary["reason"]
         assert "cleanup janitor: nothing eligible" in caplog.text
     finally:
         store.close()

@@ -6,6 +6,11 @@ MOVING under disk pressure with bytes verified on SSD). Fail-closed
 throughout: any doubt keeps VPS1 — except, when the operator opts in, the
 activity keep alone lifts under real pressure (VPS1 is a scratch disk and
 VPS2 takes over serving the peer).
+
+Under an EMERGENCY (free space at/below `critical_watermark_free_bytes`, or a
+newly discovered release that cannot fit) a fuse-VERIFIED DONE row stops
+waiting out the grace period, and the janitor acts on its next wake instead of
+its next cadence: timing only, never a safety gate.
 """
 
 from __future__ import annotations
@@ -20,6 +25,11 @@ from typing import Any
 from .clients.abstract import Torrent
 from .coordinator_content import cleanup_grace_seconds
 from .coordinator_paths import _safe_ssd_join
+
+# The 1 s wake slice the racing-blob warm-up loop already uses: reused here so
+# the janitor's emergency wake follows the file's existing prompt-wakeup
+# convention instead of inventing a second one.
+from .coordinator_racing_blobs import _BULK_FETCH_SLEEP_STEP_S
 from .io_bounds import chunked, offload, rpc
 from .state import State, TorrentState
 
@@ -31,6 +41,14 @@ log = logging.getLogger("racing_sync.coordinator")
 #: older than this means the source poll is dead: the 🗄 tab must say
 #: "listing unavailable" instead of guessing presence from a ghost.
 _VPS1_LISTING_MAX_AGE_S = 120.0
+
+#: Floor (seconds) for the emergency janitor spacing, which is otherwise
+#: derived from `burst_janitor_interval_seconds / 5` (see
+#: `_cleanup_emergency_spacing_seconds`). The floor only matters for a tiny
+#: burst interval: every extra pass re-probes VPS1 free space and re-scans the
+#: whole state, and both the cadence gate and the loop's sleep read this one
+#: number, so an emergency wake can never degrade into a hot loop.
+_EMERGENCY_WAKE_MIN_FLOOR_S = 15.0
 
 
 class CleanupMixin:
@@ -96,6 +114,10 @@ class CleanupMixin:
                 safety = 0
             if size > max(0, free - safety):
                 self._cleanup_urgent = True
+                # Wake the janitor loop on its next slice instead of up to
+                # `burst_janitor_interval_seconds` later. A flag, not a task:
+                # the janitor lane keeps owning its one-pass-at-a-time lock.
+                self._cleanup_emergency_wake = True
                 log.warning(
                     "cleanup: new release ~%d MB exceeds VPS1 free ~%d MB; "
                     "the next janitor pass will prioritise cleanup",
@@ -148,6 +170,117 @@ class CleanupMixin:
             or (lookahead > 0 and projected is not None and projected < lookahead * 3600.0)
         )
         return arrivals, bytes_rate, projected, urgent, bursting
+
+    # ---------------------------------------------------------------- emergency
+
+    @staticmethod
+    def _cleanup_emergency_trigger(cfg: object, free_bytes: int | None, urgent: bool) -> str | None:
+        """Which emergency applies right now: `"critical"` / `"arrival-did-not-fit"` / None.
+
+        The one emergency predicate (the cadence gate, the wake logic and the
+        verdict all call this, so "pressured", "bursting" and "emergency" stay
+        three distinct, honestly-named things):
+
+          - `bursting` answers "tighten the cadence and the per-run cap";
+          - `pressured` answers "lift the activity keep (opt-in)";
+          - an EMERGENCY answers "VPS1 cannot land the next race right now" —
+            the only state in which a fuse-VERIFIED DONE row skips the grace
+            wait (and the idle-confirm fast lane that stands in for it).
+
+        An emergency changes TIMING only: verification, protection, unknown
+        stats, H&R minimums and the activity gate (still governed by
+        `ignore_activity_under_pressure`) are untouched by it. A disabled
+        watermark (`critical_watermark_free_bytes = 0`) and unknown free space
+        never guess: only the arrival trigger can then apply.
+        """
+        try:
+            crit = int(getattr(cfg, "critical_watermark_free_bytes", 0) or 0)
+        except (TypeError, ValueError):
+            crit = 0
+        if crit > 0 and free_bytes is not None and free_bytes <= crit:
+            return "critical"
+        if bool(urgent):
+            return "arrival-did-not-fit"
+        return None
+
+    def _cleanup_emergency_is_live(self, cfg: object) -> bool:
+        """Emergency from what the janitor already knows — never a fresh probe.
+
+        Reads the cached free-space reading (`_last_source_free_bytes`, written
+        once per tick by `_maybe_cleanup_source`) plus the arrival flag, so the
+        hot path (the loop's sleep) adds no VPS1 RPC.
+        """
+        try:
+            free = getattr(self, "_last_source_free_bytes", None)
+            urgent = bool(getattr(self, "_cleanup_urgent", False))
+        except Exception:
+            return False
+        return self._cleanup_emergency_trigger(cfg, free, urgent) is not None
+
+    def _cleanup_emergency_spacing_seconds(self, cfg: object) -> float:
+        """Minimum spacing between emergency janitor passes (seconds).
+
+        Derived from the cadence that already exists — one fifth of
+        `burst_janitor_interval_seconds` (300 s burst -> 60 s), floored at
+        `_EMERGENCY_WAKE_MIN_FLOOR_S` — so an emergency acts within about a
+        minute instead of up to a whole burst window late, while a disk with
+        nothing reclaimable still costs at most five extra scans per burst
+        window. The gate and the loop's sleep share this number.
+        """
+        try:
+            burst = int(getattr(cfg, "burst_janitor_interval_seconds", 300) or 300)
+        except (TypeError, ValueError):
+            burst = 300
+        if burst < 60:
+            burst = 60
+        return max(burst / 5.0, _EMERGENCY_WAKE_MIN_FLOOR_S)
+
+    def _cleanup_emergency_wake_seconds(self, cfg: object, normal_wake: float) -> float:
+        """The janitor loop's next sleep: `normal_wake`, shortened if emergency.
+
+        Never longer than the cadence the loop already chose, and never faster
+        than the emergency spacing (same bound the cadence gate applies).
+        """
+        try:
+            normal = float(normal_wake)
+        except (TypeError, ValueError):
+            return 300.0
+        if not self._cleanup_emergency_is_live(cfg):
+            return normal
+        spacing = self._cleanup_emergency_spacing_seconds(cfg)
+        return max(min(normal, spacing), _EMERGENCY_WAKE_MIN_FLOOR_S)
+
+    async def _cleanup_emergency_wait(self, seconds: float) -> None:
+        """Sleep the janitor cadence, waking early on an emergency signal.
+
+        The wait is chopped into the same 1 s slices the racing-blob warm-up
+        loop uses, so `_cleanup_emergency_wake` — set by another lane (the
+        discovery path flagging a release that cannot fit, never a spawned
+        task) — is honoured within a second instead of after the whole cadence.
+        The flag is CONSUMED here: a pass was the point of the flag, and an
+        uncleared one would make every later slice return instantly. How often
+        emergency passes may actually run is bounded by
+        `_cleanup_emergency_spacing_seconds` (the cadence gate refuses a pass
+        closer than that), so this cannot become a hot loop. Also returns on a
+        stop request, like every other sliced sleep in the daemon.
+        """
+        try:
+            remaining = float(seconds)
+        except (TypeError, ValueError):
+            remaining = 300.0
+        while remaining > 0 and not getattr(self, "_stop", False):
+            if bool(getattr(self, "_cleanup_emergency_wake", False)):
+                try:
+                    self._cleanup_emergency_wake = False
+                except Exception:
+                    pass
+                return
+            step = min(_BULK_FETCH_SLEEP_STEP_S, remaining)
+            try:
+                await asyncio.sleep(step)
+            except asyncio.CancelledError:
+                raise
+            remaining -= step
 
     # Report order for the "nothing eligible" breakdown (`_cleanup_blocked_reason`).
     _CLEANUP_BLOCK_ORDER = (
@@ -208,6 +341,31 @@ class CleanupMixin:
             len(lively),
             group_size,
             f"{free_bytes} B" if free_bytes is not None else "unknown",
+        )
+
+    def _cleanup_note_emergency_rescue(
+        self,
+        ts: TorrentState,
+        free_bytes: int | None,
+        trigger: str,
+        age_s: float,
+        grace_s: float,
+    ) -> None:
+        """One INFO line per row the emergency rescued from the grace wait.
+
+        Same shape as the pressure-override note (one line per row, emitted
+        only once the row really is a candidate), and it says exactly what was
+        skipped so an operator reading the log can tell a politeness bypass
+        from a lost safety gate.
+        """
+        log.info(
+            "emergency: deleting %s after %ds of a %ds grace (VPS1 free=%s, trigger=%s); "
+            "fuse-verified, grace and idle-confirm skipped",
+            (ts.source_name or "")[:60],
+            int(age_s),
+            int(grace_s),
+            f"{free_bytes} B" if free_bytes is not None else "unknown",
+            trigger,
         )
 
     def _source_probe_path(self) -> str | None:
@@ -327,8 +485,12 @@ class CleanupMixin:
 
         `force` (operator `/cleanup`) skips ONLY the startup-delay and
         cadence gates: every safety, grace, H&R and blob-preservation rule
-        in `_run_source_cleanup` still applies. Returns the run summary
-        dict, or None when cleanup is disabled, unavailable (no seed
+        in `_run_source_cleanup` still applies. An EMERGENCY (free space at or
+        below `critical_watermark_free_bytes`, or an arrival that did not fit)
+        also skips the cadence gate — bounded by `_cleanup_emergency_spacing_*`
+        — because waiting a whole burst interval for a disk that cannot land
+        the next race is the failure this path exists to avoid. Returns the run
+        summary dict, or None when cleanup is disabled, unavailable (no seed
         entry), still settling, or not due.
         """
         cfg = getattr(self.rt.cleanup, "config", None)
@@ -382,15 +544,46 @@ class CleanupMixin:
         except Exception:
             pass
         arrivals, bytes_rate, projected, urgent, bursting = self._cleanup_pressure(cfg, free_bytes)
+        # Emergency (critical watermark, or an arrival that did not fit) on
+        # THIS tick's single probe — the same predicate the verdict and the
+        # loop wake use.
+        emergency = self._cleanup_emergency_trigger(cfg, free_bytes, urgent)
+        if emergency is not None:
+            # The signal has reached the janitor lane: consume it now, whether
+            # or not this tick actually runs. A spacing-refused pass must not
+            # leave it armed, or every later sleep slice would return
+            # instantly. The emergency LEVEL stays readable from `_cleanup_urgent`
+            # and the watermark, so nothing is lost.
+            try:
+                self._cleanup_emergency_wake = False
+            except Exception:
+                pass
         effective = burst_interval if bursting else interval
         now_wall = time.time()
-        if not force and now_wall - self._cleanup_last_run_wall() < effective:
-            return None
+        since_last = now_wall - self._cleanup_last_run_wall()
+        if not force and since_last < effective:
+            if emergency is None:
+                return None
+            # Act now, not next tick: a starving disk waits out neither the
+            # calm nor the burst cadence. Bounded by the emergency spacing, so
+            # a run that keeps finding nothing eligible cannot spin.
+            if since_last < self._cleanup_emergency_spacing_seconds(cfg):
+                return None
+            log.info(
+                "cleanup janitor: emergency (%s) — running %ds early "
+                "(cadence %ds, last pass %ds ago)",
+                emergency,
+                int(effective - since_last),
+                int(effective),
+                int(since_last),
+            )
         self._remember_cleanup_run(now_wall)
         # A run is starting: it consumes the urgency flag (a still-cramped
-        # disk re-trips the watermark trigger next tick).
+        # disk re-trips the watermark trigger next tick) and with it the wake
+        # signal, so no second pass is scheduled for the same pressure.
         try:
             self._cleanup_urgent = False
+            self._cleanup_emergency_wake = False
         except Exception:
             pass
         return await self._run_source_cleanup(
@@ -432,10 +625,19 @@ class CleanupMixin:
         only `cfg`; the janitor passes its single probe down so this method
         never re-probes.
 
+        Under an EMERGENCY (`_cleanup_emergency_trigger`: free space at/below
+        `critical_watermark_free_bytes`, or an arrival that did not fit) a
+        DONE row whose bytes are already fuse-VERIFIED becomes a candidate
+        without waiting out the grace period or the idle-confirm fast lane —
+        timing only; verification still runs first and the activity keep still
+        needs `ignore_activity_under_pressure`.
+
         Returns a one-line-friendly summary (also on every early-return
         path): `{"deleted", "candidates", "dry_run", "grace_s", "free",
         "bursting", "reason"}` where `reason` is only set when nothing ran
-        ("no rows", "nothing eligible (activity 17, grace 3)", ...).
+        ("no rows", "nothing eligible (activity 17, grace 3)", ...; while an
+        emergency is on the breakdown line says so:
+        "nothing eligible (grace 19; emergency on)").
         """
         now_utc = dt.datetime.now(dt.UTC)
         if arrivals is None:
@@ -453,6 +655,9 @@ class CleanupMixin:
         bytes_rate = float(bytes_rate or 0.0)
         bursting = bool(bursting)
         urgent = bool(urgent)
+        # Emergency state for THIS run, from the same reading the cadence used
+        # (never a second probe): None = no emergency, else the trigger name.
+        emergency = self._cleanup_emergency_trigger(cfg, free_bytes, urgent)
         dry_run = bool(getattr(cfg, "dry_run", True))
         grace_s = cleanup_grace_seconds(cfg, free_bytes, arrivals)
 
@@ -500,16 +705,12 @@ class CleanupMixin:
             )
             return _summary(reason="VPS1 roomy and intake calm")
         low_free = int(getattr(cfg, "low_watermark_free_bytes", 0) or 0)
-        if free_bytes is not None:
-            try:
-                crit = int(getattr(cfg, "critical_watermark_free_bytes", 0) or 0)
-            except (TypeError, ValueError):
-                crit = 0
-            if crit and free_bytes <= crit:
-                log.warning(
-                    "cleanup: VPS1 disk CRITICAL (%d bytes free); grace floored at minimum",
-                    free_bytes,
-                )
+        if emergency == "critical":
+            log.warning(
+                "cleanup: VPS1 disk CRITICAL (%d bytes free); grace floored at minimum "
+                "and fuse-verified DONE rows skip the grace wait",
+                free_bytes,
+            )
         try:
             cap_field = "burst_per_run_cap" if bursting else "per_run_cap"
             cap_default = 25 if bursting else 10
@@ -605,6 +806,7 @@ class CleanupMixin:
                         free_bytes,
                         urgent=urgent,
                         bursting=bursting,
+                        emergency=emergency,
                         blocked=blocked,
                     )
                 except asyncio.CancelledError:
@@ -623,7 +825,7 @@ class CleanupMixin:
         candidates.extend(v for v in (_verdicts or []) if v is not None)
 
         if not candidates:
-            reason = self._cleanup_blocked_reason(blocked)
+            reason = self._cleanup_blocked_reason(blocked, emergency=emergency is not None)
             log.info("cleanup janitor: %s", reason)
             return _summary(reason=reason)
         pressured = bool(free_bytes is not None and low_free and free_bytes < low_free)
@@ -811,13 +1013,22 @@ class CleanupMixin:
         keys += sorted(k for k in counts if k not in cls._CLEANUP_BLOCK_ORDER)
         return ", ".join(f"{k} {counts[k]}" for k in keys)[:160]
 
-    def _cleanup_blocked_reason(self, blocked: dict[str, int]) -> str:
+    def _cleanup_blocked_reason(self, blocked: dict[str, int], *, emergency: bool = False) -> str:
         """`nothing eligible`, extended with what actually blocked the scan.
 
         The summary contract is untouched — `reason` stays one plain string
         the operator line prints verbatim; the breakdown only adds to it.
+
+        While an emergency is on, the line says so (`nothing eligible (grace
+        19; emergency on)`): that exact report — verified rows held by the
+        grace floor on a 16 GiB-free disk — used to be indistinguishable from
+        "nothing was ready", so the state has to be readable from the one line
+        it appears in. Still one line, still capped.
         """
         text = self._cleanup_blocked_text(blocked)
+        if emergency:
+            tail = "; emergency on"
+            text = f"{text[: 160 - len(tail)]}{tail}" if text else "emergency on"
         return f"nothing eligible ({text})" if text else "nothing eligible"
 
     def _cleanup_remaining_seconds(self, ts: object) -> tuple[bool, float | None] | None:
@@ -1454,6 +1665,7 @@ class CleanupMixin:
         free_bytes: int | None,
         urgent: bool | None = None,
         bursting: bool = False,
+        emergency: str | None = None,
         blocked: dict[str, int] | None = None,
     ) -> tuple[float, float, TorrentState, list[Torrent]] | None:
         """Decide deletion for one row; None = keep this run.
@@ -1472,6 +1684,15 @@ class CleanupMixin:
         the disk says. Accepted trade: a live peer's download is cut short
         and VPS2 takes over serving it. `blocked` (optional) counts which
         keep fired, for the one-line "nothing eligible" breakdown.
+
+        `emergency` is this run's `_cleanup_emergency_trigger` name (None =
+        no emergency). It changes TIMING and nothing else: a fuse-VERIFIED
+        DONE row stops waiting out the grace period (and no longer needs the
+        idle-confirm fast lane) because the bytes are provably served by VPS2
+        already and VPS1 has to land the next race. Rows that verification
+        cannot prove are never rescued by it, the activity keep stays under
+        `ignore_activity_under_pressure`, and MOVING keeps its own
+        early-pressure logic untouched.
         """
         cfg = self.rt.cleanup.config
 
@@ -1546,6 +1767,10 @@ class CleanupMixin:
             if (completed or ts.created_at)
             else 0.0
         )
+        # Set when the emergency (not the idle lane) is what made this row
+        # eligible: the INFO belongs to the moment the row really becomes a
+        # candidate, same as the pressure-override note below.
+        emergency_rescued = False
         if ts.state == State.DONE:
             if not await self._cleanup_fuse_healthy(ts, dry_run):
                 _keep("verification")
@@ -1554,10 +1779,20 @@ class CleanupMixin:
                 # Without a completion stamp the idle fast lane proves only
                 # that VPS1 has been quiet, not that the seed has served the
                 # grace period on VPS2 (recovery adopts DONE rows this way).
+                # The same proof is missing for an emergency bypass — an
+                # adopted row was never observed racing on VPS2 at all — so it
+                # stays blocked by grace whatever the disk says.
                 if completed is None:
                     _keep("grace")
                     return None
-                if not self._cleanup_idle_confirmed(ts, group, now_utc, cfg):
+                if emergency is not None:
+                    # Emergency: the box cannot land the next race. The bytes
+                    # are fuse-VERIFIED (the gate above passed), so VPS2 already
+                    # serves them; only the politeness delay is dropped. The
+                    # activity, unknown-stats, minimums and protection keeps
+                    # ran above and are NOT bypassed.
+                    emergency_rescued = True
+                elif not self._cleanup_idle_confirmed(ts, group, now_utc, cfg):
                     _keep("grace")
                     return None
         elif ts.state == State.MOVING:
@@ -1595,6 +1830,8 @@ class CleanupMixin:
         size = float(ts.total_bytes or 0)
         if rescued:
             self._cleanup_note_pressure_override(ts, rescued, len(group), free_bytes)
+        if emergency_rescued and emergency is not None:
+            self._cleanup_note_emergency_rescue(ts, free_bytes, emergency, age_s, grace_s)
         return (sort_key, size, ts, group)
 
     def _cleanup_idle_confirmed(

@@ -940,7 +940,12 @@ class LifecycleMixin:
                 break
 
     async def _janitor_loop(self) -> None:
-        """Janitor loop: VPS1 cleanup + tombstone GC (self-gated cadence)."""
+        """Janitor loop: VPS1 cleanup + tombstone GC (self-gated cadence).
+
+        Sleeps on the burst cadence, shortened (and sliced) while a cleanup
+        emergency is live, so a disk that cannot land the next race is acted on
+        within seconds instead of one cadence late.
+        """
         # The step self-gates on janitor_interval_seconds, so the loop
         # wakes often enough to stay responsive without busy work.
         while not self._stop:
@@ -969,9 +974,17 @@ class LifecycleMixin:
                 # burst) and returns immediately when cleanup is disabled,
                 # so a tight disk is noticed within burst_janitor_interval.
                 _wake = max(60, min(_burst, _normal))
+                # An emergency (critical watermark, or an arrival that did not
+                # fit) tightens that to the bounded emergency spacing, read
+                # from the janitor's cached free-space probe — no extra RPC on
+                # the hot path. `_cleanup_emergency_wait` then slices the sleep
+                # so a trigger set by another lane is noticed within a second.
+                # Same lock, same single step: this only moves the wake, it
+                # never starts a second concurrent janitor pass.
+                _wake = self._cleanup_emergency_wake_seconds(_cleanup, _wake)
             except (TypeError, ValueError):
                 _wake = 300
             try:
-                await asyncio.sleep(_wake)
+                await self._cleanup_emergency_wait(_wake)
             except asyncio.CancelledError:
                 break

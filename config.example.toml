@@ -664,7 +664,11 @@ max_grace_hours = 72
 # Calibrate to the VPS1 disk (example: 80 GiB disk -> 15/40 GiB).
 low_watermark_free_bytes = 16106127360    # 15 GiB
 high_watermark_free_bytes = 42949672960   # 40 GiB
-# Below this, log loudly; grace stays floored at min (never zero).
+# Emergency watermark. At/below this VPS1 cannot land the next race: the
+# janitor acts on its emergency wake (not a cadence tick later) and DONE rows
+# whose bytes are fuse-VERIFIED skip the grace wait. Timing only — unverified
+# rows, rows adopted without a completion stamp and the activity keep are
+# unchanged; grace itself stays floored at min (never zero).
 critical_watermark_free_bytes = 8589934592  # 8 GiB
 # Intake-velocity bounds (new racing releases/hour, rolling). At/above
 # burst -> min grace (spam-uploader dumps); at/below calm -> no effect.

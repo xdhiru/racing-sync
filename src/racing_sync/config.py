@@ -1356,6 +1356,14 @@ class CleanupConfig(BaseModel):
     way (bursting or below the low watermark) also drops the activity keep:
     VPS2 takes over serving the peer. Verification still gates every delete.
 
+    EMERGENCY (`critical_watermark_free_bytes` reached, or an arrival that did
+    not fit at all) changes TIMING only: the janitor runs on its emergency wake
+    instead of the next cadence tick, and a DONE row whose bytes are already
+    fuse-VERIFIED becomes eligible without waiting out grace or the idle fast
+    lane. Rows verification cannot prove, rows adopted without `completed_at`,
+    and the activity keep (still gated by `ignore_activity_under_pressure`)
+    behave exactly as before.
+
     Grace adapts to pressure so full autobrr days clear fast and quiet days
     keep seeding: `grace = max(min_grace, min(space_curve, velocity_curve))`
     where space_curve interpolates free space between the low/high
@@ -1376,7 +1384,11 @@ class CleanupConfig(BaseModel):
     # biggest-first ordering; at/above high -> max grace, oldest-first.
     low_watermark_free_bytes: int = Field(default=16106127360, ge=0)  # 15 GiB
     high_watermark_free_bytes: int = Field(default=42949672960, ge=0)  # 40 GiB
-    # Below this, log loudly; grace stays floored at min (never zero).
+    # Emergency watermark. At/below this VPS1 cannot land the next race, so the
+    # janitor acts on its emergency wake instead of the next cadence tick, and
+    # fuse-VERIFIED DONE rows skip the grace wait (timing only: unverified rows
+    # and adoption rows without completed_at still wait; grace itself stays
+    # floored at min, never zero).
     critical_watermark_free_bytes: int = Field(default=8589934592, ge=0)  # 8 GiB
     # Intake-velocity bounds (new racing releases/hour). At/above burst ->
     # min grace; at/below calm -> no shortening.
