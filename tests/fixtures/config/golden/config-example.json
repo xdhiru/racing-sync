@@ -1,13 +1,13 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:179a113af57d43ef",
+  "digest": "sha256:eeda25a320612077",
   "keys": {
     "by_section": {
       "acquire": 9,
       "api": 8,
       "classifier": 1,
       "cleanup": 21,
-      "client": 32,
+      "client": 33,
       "dest": 8,
       "general": 8,
       "indexers": 16,
@@ -21,8 +21,8 @@
       "watch": 5
     },
     "defaulted": 14,
-    "explicit": 157,
-    "model": 158,
+    "explicit": 158,
+    "model": 159,
     "unknown": []
   },
   "resolved": {
@@ -224,6 +224,7 @@
         "deadline_seconds": 21600,
         "enabled": false,
         "max_concurrent_pushes": 1,
+        "push_on_janitor_pressure": false,
         "rclone_bin": "rclone",
         "remote_name": "",
         "transfers": 4

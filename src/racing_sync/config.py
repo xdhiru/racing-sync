@@ -201,6 +201,17 @@ class RclonePushConfig(BaseModel):
     # the backup, so opting in can only save ratio and download time — it
     # never strands a release that the push cannot deliver in time.
     auto_on_prowlarr_timeout: bool = False
+    # Let the cleanup janitor's EXISTING pressure verdict start a push. Why
+    # this exists: a burst of arrivals fills VPS1 faster than the indexer
+    # wait window expires, so the rows parked on "indexer miss" keep their
+    # bytes on a disk that is already running out and the chain stalls until
+    # a human taps /push_source. The janitor already decides when space is
+    # critical ([cleanup].low_watermark_free_bytes, burst_arrivals_per_hour
+    # and fill_lookahead_hours); honouring that verdict is the point — this
+    # adds no second threshold and, deliberately, no new timer. Implies
+    # nothing about `auto_on_prowlarr_timeout`: an operator asking for a
+    # push EARLY is not the same choice as replacing the timeout path.
+    push_on_janitor_pressure: bool = False
     # The push's OWN ceiling, deliberately independent of the manual-move
     # wait (seed.manual_move_timeout_seconds) and of the indexer clock: a
     # multi-GB remote copy fails differently from a seed-path scan, so it

@@ -23,8 +23,8 @@ Contract this module keeps:
   VPS2 would; that is the whole point of the extraction.
 * **clean refusals.** `start_source_push` returns (started, one-line reason)
   instead of raising, because its callers (a Telegram command, an /act
-  button, the indexer-timeout fallback) must all be able to fall back to
-  today's behaviour.
+  button, the indexer-timeout fallback, the janitor-pressure sweep) must all
+  be able to fall back to today's behaviour.
 * **no live checkpoint outlives a failed attempt.** Every branch after
   `claim_push` settles the record (abandoned/failed/done), so a broken push
   can never leave the pipeline suppressing work for nothing.
@@ -84,6 +84,17 @@ _PUSH_WANTED_CAP = 500
 _DEFAULT_CHECK_S = 120.0
 _DEFAULT_DEADLINE_S = 21600
 
+#: How long a refused pressure push is left alone, as a MULTIPLE of the push
+#: check cadence (no new duration knob — the cadence is already the push's
+#: clock). Long enough that a push which can never run (VPS1 holds nothing
+#: complete) does not hot-loop every poll; short enough that a refusal which
+#: was only "cap full" / a preflight blip is retried within minutes.
+_PRESSURE_BACKOFF_MULTIPLIER = 4.0
+#: Cap for the refusal map, mirroring `_PUSH_WANTED_CAP`: a long-lived
+#: process must not grow with the number of refusals ever seen. Expired
+#: entries are pruned on every insert; past the cap the oldest go first.
+_PRESSURE_BACKOFF_CAP = 200
+
 
 def _one_line(text: object) -> str:
     flat = " ".join(str(text or "").split())
@@ -118,6 +129,23 @@ class PushMixin:
         try:
             section = getattr(getattr(self.cfg, "source", None), "rclone_push", None)
             return getattr(section, "auto_on_prowlarr_timeout", None) is True
+        except Exception:
+            return False
+
+    def _push_pressure_on(self) -> bool:
+        """May the janitor's pressure verdict start a push at all?
+
+        Two switches, both read exactly: the master `enabled` (the strict
+        config-side check below, so a MagicMock double can never opt in by
+        accident) and `push_on_janitor_pressure` through the typed view,
+        which already folds the master switch in and reads False when the
+        section is absent. Nothing else calls this, so with either off the
+        sweep returns before it lists a row or probes the disk.
+        """
+        if not self._push_switch_on():
+            return False
+        try:
+            return self.rt.push.push_on_janitor_pressure is True
         except Exception:
             return False
 
@@ -963,6 +991,197 @@ class PushMixin:
             )
             return
         await self._push_settle(store, infohash, PushState.DONE)
+
+    # ---- pressure-triggered starts (the janitor's verdict) --------------- #
+
+    async def _push_pressure_verdict(self) -> tuple[bool, str, int | None]:
+        """Ask the janitor's OWN pressure function: (pressured, verdict, free).
+
+        No second threshold and no re-derived arithmetic — "pressured" here
+        is literally `bursting or urgent`, the same verdict that shortens the
+        janitor's cadence and lets it reclaim MOVING rows, produced by
+        `_cleanup_pressure` with the `[cleanup]` section and the free bytes.
+        Free space comes from the janitor's cached probe
+        (`_last_source_free_bytes`); only when it has never probed does this
+        probe once itself. Unknown free space is NOT pressured: guessing at
+        the disk is how a half-filled box starts a copy it cannot finish, so
+        the sweep fails closed exactly like the janitor's deletes do.
+        """
+        try:
+            free = getattr(self, "_last_source_free_bytes", None)
+        except Exception:
+            free = None
+        if free is None:
+            try:
+                free = await self._source_free_bytes()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.debug("pressure push: VPS1 free-space probe failed: %s", _one_line(e))
+                free = None
+            try:
+                self._last_source_free_bytes = free
+            except Exception:
+                pass
+        if free is None:
+            return False, "unknown free space", None
+        try:
+            _arrivals, _bytes_rate, _projected, urgent, bursting = self._cleanup_pressure(
+                getattr(self.rt.cleanup, "config", None), free
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.debug("pressure push: no janitor verdict (%s)", _one_line(e))
+            return False, "no verdict", free
+        verdict = "+".join(name for name, on in (("bursting", bursting), ("urgent", urgent)) if on)
+        return bool(bursting or urgent), verdict or "calm", free
+
+    async def _pressure_push_rows(self) -> list[TorrentState]:
+        """Indexer-miss WAITING_INDEXER rows a pressure push may take over.
+
+        The park's own schedule is what says "indexer miss": a row parked on
+        the public-export timer never queried the download-target indexers
+        (no cross-seed is missing there), and a watch-dir drop answers to its
+        own election instead of the indexer clock. Operator-held rows
+        (`skipped`) get no automatic work. Sorted by size DESCENDING — under
+        pressure the scarce push slots should free the most bytes, the same
+        instinct as the janitor's biggest-first ordering below the low
+        watermark.
+        """
+        try:
+            lister = getattr(getattr(self, "store", None), "list_by_state", None)
+            if not callable(lister):
+                return []
+            rows = await offload(lister, State.WAITING_INDEXER)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.debug("pressure push: cannot list parked rows: %s", _one_line(e))
+            return []
+        out: list[TorrentState] = []
+        for ts in rows or []:
+            try:
+                if getattr(ts, "state", None) != State.WAITING_INDEXER:
+                    continue
+                if getattr(ts, "indexer_next_retry_at", None) is None:
+                    continue
+                if getattr(ts, "public_export_next_retry_at", None) is not None:
+                    continue
+                if getattr(ts, "skipped", 0):
+                    continue
+                if len((getattr(ts, "source_infohash", "") or "").strip()) != 40:
+                    continue
+                probe = getattr(self, "_is_watch_row", None)
+                if callable(probe) and probe(ts) is True:
+                    continue
+            except Exception:
+                continue
+            out.append(ts)
+        try:
+            out.sort(key=lambda t: int(getattr(t, "total_bytes", 0) or 0), reverse=True)
+        except Exception:
+            pass
+        return out
+
+    def _push_pressure_backoff_seconds(self) -> float:
+        """TTL for a refused pressure push: a multiple of the push cadence."""
+        try:
+            return max(60.0, float(self._push_check_interval()) * _PRESSURE_BACKOFF_MULTIPLIER)
+        except Exception:
+            return _DEFAULT_CHECK_S * _PRESSURE_BACKOFF_MULTIPLIER
+
+    def _push_pressure_backed_off(self, infohash: str) -> bool:
+        """True while a refusal for this hash is still being deferred."""
+        try:
+            memo = getattr(self, "_push_pressure_backoff", None)
+            if not isinstance(memo, dict):
+                return False
+            expiry = memo.get(infohash)
+            if expiry is None:
+                return False
+            if time.monotonic() >= float(expiry):
+                memo.pop(infohash, None)
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _note_pressure_refusal(self, infohash: str, why: str) -> None:
+        """Defer one refused hash so a push that can never run does not hot-loop.
+
+        Bounded the way `_failed_late_cross_seeds` is: expired entries are
+        pruned on every insert and the map is capped, shedding the oldest
+        first (dict insertion order). Never raises — the defer is bookkeeping.
+        """
+        try:
+            memo = getattr(self, "_push_pressure_backoff", None)
+            if not isinstance(memo, dict):
+                memo = {}
+                self._push_pressure_backoff = memo  # type: ignore[attr-defined]
+            now = time.monotonic()
+            for stale in [k for k, v in memo.items() if now >= float(v)]:
+                memo.pop(stale, None)
+            memo[infohash] = now + self._push_pressure_backoff_seconds()
+            if len(memo) > _PRESSURE_BACKOFF_CAP:
+                for stale in list(memo.keys())[: len(memo) - _PRESSURE_BACKOFF_CAP]:
+                    memo.pop(stale, None)
+            log.debug("pressure push: refused %s (%s)", infohash[:10], _one_line(why))
+        except Exception:
+            pass
+
+    async def pressure_push_sweep(self) -> int:
+        """Start pushes NOW when the janitor says VPS1 is running out of room.
+
+        Returns how many pushes started; does nothing at all (no probe, no
+        row listing) unless `push_on_janitor_pressure` is on next to the
+        master switch. Why this exists: a release that found no cross-seed
+        parks on the indexer window (up to
+        `[acquire].prowlarr_max_age_seconds`), so a burst of arrivals fills
+        VPS1 while every one of those rows calmly waits for a Prowlarr hit
+        that may never come, and the automation stalls until a human taps
+        `/push_source`. The janitor already decides when space is critical —
+        this consumes that decision.
+
+        The trade is deliberate: pushing forfeits a late Prowlarr cross-seed
+        as the *download* source for that row, which is the right call while
+        the disk is failing, and the `tracker_map` supplement path (see
+        `coordinator_reinject.py`) can still attach same-release torrents
+        afterwards. Concurrency is the push's own cap: the sweep budget is
+        `max_concurrent_pushes` minus what is already live, and a refusal
+        backs off per hash instead of retrying every poll.
+        """
+        if not self._push_pressure_on():
+            return 0
+        pressured, verdict, free = await self._push_pressure_verdict()
+        if not pressured:
+            return 0
+        rows = await self._pressure_push_rows()
+        if not rows:
+            return 0
+        slots = self._push_max_concurrent() - len(self._live_push_hashes())
+        started = 0
+        for ts in rows:
+            if slots <= 0:
+                break
+            h = (getattr(ts, "source_infohash", "") or "").strip().lower()
+            if not h or self._push_pressure_backed_off(h) or self._push_is_live(h):
+                continue
+            ok, why = await self.start_source_push(ts, reason="pressure")
+            if ok:
+                started += 1
+                slots -= 1
+            else:
+                self._note_pressure_refusal(h, why)
+        if started:
+            log.info(
+                "pressure push: janitor verdict %s (VPS1 free %d bytes) started %d push(es) "
+                "for indexer-parked rows",
+                verdict,
+                int(free or 0),
+                started,
+            )
+        return started
 
     # ---- suppression helpers ------------------------------------------- #
 

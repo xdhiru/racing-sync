@@ -203,6 +203,11 @@ enabled = false
 # as the backup, so this can only save ratio — it never strands a release
 # the push cannot deliver in time. Requires enabled = true.
 auto_on_prowlarr_timeout = false
+# Let the cleanup janitor's disk verdict start a push (default false). This
+# is NOT a timer and adds no countdown: when [cleanup] already says VPS1 is
+# running out of room, releases parked with "no cross-seed found" are pushed
+# immediately instead of waiting out their indexer window. Needs enabled = true.
+push_on_janitor_pressure = false
 # The push's own ceiling (seconds, default 21600 = 6 h, minimum 600).
 # Deliberately independent of the manual-move wait and of the indexer clock:
 # a multi-GB remote copy fails differently and must not inherit either

@@ -127,6 +127,11 @@ two questions once for the whole scope.
   the row falls back to the normal path untouched. `/push_source` refuses
   (with the reason on one line) when VPS2 is already downloading, moving
   or seeding the content.
+- A push is not only ever manual: with `auto_on_prowlarr_timeout` the
+  expired indexer window prefers one over the VPS2 leech, and with
+  `push_on_janitor_pressure` the cleanup janitor's own disk verdict starts
+  one for releases already parked on "no cross-seed found" (no extra
+  countdown involved — see `docs/architecture.md`).
 
 ## Notes
 

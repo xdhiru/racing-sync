@@ -116,7 +116,12 @@ so one copy serves the group. Progress is one metadata listing per check
 interval (never a content read), and the existing fuse-evidence path admits
 the row and injects. `/push_source` or the act-sheet button starts one by
 hand; `auto_on_prowlarr_timeout` makes the timeout prefer it over the VPS2
-leech, which stays as the fallback.
+leech, which stays as the fallback. `push_on_janitor_pressure` adds a third
+trigger that invents no clock: it consumes the cleanup janitor's existing
+verdict (`bursting`/`urgent` from `[cleanup]`'s low watermark and arrival-rate
+arms) and pushes the releases already parked on an indexer miss, biggest
+first, instead of letting a burst of arrivals fill VPS1 while each of them
+waits out its window. Unknown free space counts as no pressure.
 
 ## Invariants (the single rules)
 

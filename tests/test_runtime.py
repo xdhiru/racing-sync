@@ -89,6 +89,7 @@ _COMMON = {
     "push.config": None,
     "push.enabled": False,
     "push.auto_on_prowlarr_timeout": False,
+    "push.push_on_janitor_pressure": False,
     "push.ssh_dial": None,
     "push.deadline_seconds": 21600,
     "push.remote_name": "",
@@ -313,13 +314,17 @@ def test_push_view_follows_the_optional_section():
     assert rt.push.deadline_seconds == 21600
     assert rt.push.check_interval_seconds == 120
     assert rt.push.ssh_dial is cfg.source.deluge_sftp
+    # Off unless the operator says so, even with the push itself enabled.
+    assert rt.push.push_on_janitor_pressure is False
 
     # Switched off: the keys stay readable (re-enabling is a flip, not a
     # rewrite), but nothing claims a dial the push cannot use.
     cfg.source.rclone_push.enabled = False
     cfg.source.rclone_push.auto_on_prowlarr_timeout = True
+    cfg.source.rclone_push.push_on_janitor_pressure = True
     assert rt.push.enabled is False
     assert rt.push.auto_on_prowlarr_timeout is False
+    assert rt.push.push_on_janitor_pressure is False
     assert rt.push.ssh_dial is None
     assert rt.push.transfers == 9
 

@@ -623,6 +623,7 @@ _PUSH_FIELDS = [
     ("max_concurrent_pushes", "3", 3, "transfers", 4),
     ("check_interval_seconds", "45", 45, "deadline_seconds", 21600),
     ("auto_on_prowlarr_timeout", "true", True, "deadline_seconds", 21600),
+    ("push_on_janitor_pressure", "true", True, "deadline_seconds", 21600),
 ]
 
 

@@ -613,6 +613,19 @@ class OpsMixin:
         except Exception as e:  # noqa: BLE001
             log.warning("push sweep failed: %s", e)
 
+        # 2b-4. Pressure push: when the janitor's own verdict says VPS1 is
+        # running out of room, rows already parked on an indexer miss are
+        # pushed now instead of waiting out their window (biggest first, the
+        # push cap still applies). Returns immediately unless
+        # [source.rclone_push] is enabled AND push_on_janitor_pressure is on,
+        # so with either off this tick is byte-for-byte the one above.
+        try:
+            await self.pressure_push_sweep()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("pressure push sweep failed: %s", e)
+
         # 2c. Intake handoff: freshly discovered NEW rows start work now
         # instead of waiting out the next scheduler tick (racing is
         # time-sensitive). Production only (the scheduler remains the

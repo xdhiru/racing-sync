@@ -279,6 +279,16 @@ class PushSettings:
         return bool(self.enabled and self._field("auto_on_prowlarr_timeout", False))
 
     @property
+    def push_on_janitor_pressure(self) -> bool:
+        """Let the cleanup janitor's pressure verdict start a push.
+
+        Same shape as the other auto switch: an absent section (or a push
+        that is not `enabled`) reads False, so the pressure sweep stays
+        completely inert — it never probes free space, never lists rows.
+        """
+        return bool(self.enabled and self._field("push_on_janitor_pressure", False))
+
+    @property
     def ssh_dial(self) -> DelugeSFTPConfig | None:
         """The SSH dial the command travels on, or None when there isn't one.
 
