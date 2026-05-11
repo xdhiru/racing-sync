@@ -24,6 +24,7 @@ debug-*.toml
 # Syncthing
 .stfolder/
 .stversions/
+*.sync-conflict-*
 
 # App logs (configurable: [general].log_dir)
 *.log
