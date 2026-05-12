@@ -233,6 +233,14 @@ class RcloneConfig(BaseModel):
     # Maximum concurrent rclone move commands running simultaneously (default: 3)
     max_concurrent_moves: int = Field(default=3, ge=1)
 
+    @field_validator("config_path", mode="before")
+    @classmethod
+    def _empty_is_none(cls, v: object) -> object:
+        """Treat empty string in TOML as None so rclone uses user default config."""
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
 
 class ClassifierConfig(BaseModel):
     episode_regex: str = r"(?i)\bS\d{1,2}E\d{1,2}\b"
