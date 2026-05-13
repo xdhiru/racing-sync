@@ -1245,6 +1245,14 @@ class Coordinator:
     # ---- state: RE_ADDING ----
 
     async def _do_re_add(self, ts: TorrentState) -> None:
+        delay = self.cfg.fuse_reinject_delay_seconds
+        if delay > 0:
+            log.info(
+                "waiting %ds for fuse mount indexing before re-injection: %s",
+                delay, ts.source_name[:50],
+            )
+            await asyncio.sleep(delay)
+
         h = ts.dest_infohash or ts.source_infohash
 
         # 1) Re-inject the racing-client torrents (private or otherwise)

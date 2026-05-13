@@ -39,6 +39,8 @@ def test_concurrency_defaults():
     assert cfg.rclone.max_concurrent_moves == 3
     assert cfg.max_active_downloads == 3
     assert cfg.max_concurrent_moves == 3
+    assert cfg.rclone.fuse.reinject_delay_seconds == 30
+    assert cfg.fuse_reinject_delay_seconds == 30
 
 
 def test_concurrency_custom_overrides():
@@ -72,6 +74,7 @@ def test_concurrency_custom_overrides():
     [rclone.fuse]
     mount = "/mnt/fuse"
     mount_unsorted = "/mnt/fuse/unsorted"
+    reinject_delay_seconds = 15
     """
     import tomllib
     cfg = AppConfig.model_validate(tomllib.loads(data))
@@ -79,3 +82,4 @@ def test_concurrency_custom_overrides():
     assert cfg.rclone.max_concurrent_moves == 2
     assert cfg.max_active_downloads == 5
     assert cfg.max_concurrent_moves == 2
+    assert cfg.fuse_reinject_delay_seconds == 15
