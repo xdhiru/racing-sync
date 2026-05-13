@@ -12,6 +12,7 @@ class TorrentFile:
     name: str                # path inside the torrent (relative)
     size_bytes: int
     priority: int = 1        # qBittorrent: 0=do not download, 1=normal, 6=high, 7=max
+    progress: float = 0.0
 
 
 @dataclass(slots=True)

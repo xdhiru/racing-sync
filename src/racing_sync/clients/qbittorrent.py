@@ -93,7 +93,12 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         ) as r:
             data = await r.json()
         return [
-            TorrentFile(name=row["name"], size_bytes=row["size"], priority=row["priority"])
+            TorrentFile(
+                name=row["name"],
+                size_bytes=row["size"],
+                priority=row.get("priority", 1),
+                progress=float(row.get("progress", 0.0)),
+            )
             for row in data
         ]
 
