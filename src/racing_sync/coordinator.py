@@ -748,7 +748,8 @@ class Coordinator:
             await self._process_torrent_inner(ts)
         except Exception as e:  # noqa: BLE001
             log.exception("worker failed for %s", ts.source_infohash[:10])
-            self.transition(ts, State.FAILED, error=str(e)[:500])
+            if ts.state != State.FAILED:
+                self.transition(ts, State.FAILED, error=str(e)[:500])
             self.store.append_log("ERROR", str(e), ts.source_infohash)
             await self._notify_telegram(ts)
 
@@ -1237,10 +1238,9 @@ class Coordinator:
             log.info("rclone move %s -> %s (include=%s)", local, remote, include)
             res = await move_local_to_remote(self.cfg, local, remote, include=include)
             if not res.ok:
-                self.transition(
-                    ts, State.FAILED, error=f"rclone rc={res.returncode}",
-                )
-                raise RuntimeError(f"rclone failed: rc={res.returncode}")
+                err = res.stderr.strip()
+                last_err = [ln.strip() for ln in err.splitlines() if ln.strip()][-1] if err else f"rc={res.returncode}"
+                raise RuntimeError(f"rclone failed (rc={res.returncode}): {last_err}")
 
     # ---- state: RE_ADDING ----
 
