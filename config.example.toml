@@ -222,6 +222,9 @@ bot_token = ""
 chat_id = ""
 # How often to edit the active-tasks list (seconds).
 status_update_interval = 45
+# Number of active tasks displayed per page in the status message (default: 5).
+# Users can paginate through tasks with inline arrow buttons on the message.
+page_size = 5
 # Pin the active-tasks message so it stays at the bottom of the channel.
 pin_status_message = false
 # Pinning the active-tasks message in the chat requires the bot to
