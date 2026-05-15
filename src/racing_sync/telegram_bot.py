@@ -23,6 +23,7 @@ import datetime as dt
 import logging
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -84,6 +85,23 @@ def _bytes_human(n: int) -> str:
         f /= 1024
         idx += 1
     return f"{f:.1f} {units[idx]}"
+
+
+def _tracker_domain(url: str) -> str:
+    """Extract host/domain from announce URL (e.g. nyaa.tracker.wf)."""
+    if not url:
+        return ""
+    try:
+        raw = url.strip()
+        if "://" not in raw:
+            raw = f"http://{raw}"
+        parsed = urlsplit(raw)
+        host = (parsed.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+    except Exception:
+        return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -188,9 +206,9 @@ def render_active(
         lines.append(f"*{item_num}.* `{name}`")
 
         # 2. Size below the name, separator dot with space, and full hash copiable by click
-        lines.append(f"    ↳ {size} · `{full_hash}`")
+        lines.append(f"  {size} · `{full_hash}`")
 
-        # 3. Next line shows the state (queued, downloading etc.) and batch if applicable (not in backticks)
+        # 3. Next line shows state, batch (if applicable), and tracker domain at the last
         if ts.state == State.DOWNLOADING:
             if progress is not None:
                 state_text = f"⬇️ Downloading · {progress * 100:.1f}%"
@@ -218,7 +236,11 @@ def render_active(
         if ts.batches_total > 1:
             state_text += f" · Batch {ts.batch_index}/{ts.batches_total}"
 
-        lines.append(f"    ↳ {state_text}")
+        domain = _tracker_domain(ts.source_announce_url) or _tracker_domain(ts.source_tracker)
+        if domain:
+            state_text += f" · {domain}"
+
+        lines.append(f"  {state_text}")
         lines.append("")
 
     return "\n".join(lines).strip(), cur_page, total_pages
