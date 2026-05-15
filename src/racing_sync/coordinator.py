@@ -978,9 +978,27 @@ class Coordinator:
             return
 
         # Re-check that the torrent isn't already present on VPS2.
-        existing = await self.dest_client.list_torrents(hashes=[ts.source_infohash])
+        check_hashes = [h for h in (ts.source_infohash, ts.cross_seed_infohash, ts.dest_infohash) if h]
+        existing = await self.dest_client.list_torrents(hashes=check_hashes)
         if existing:
-            log.info("torrent already on VPS2: %s", ts.source_infohash[:10])
+            ext = existing[0]
+            fuse_mounts = [
+                str(self.cfg.rclone.fuse.mount).rstrip("/"),
+                str(self.cfg.rclone.fuse.mount_unsorted).rstrip("/"),
+            ]
+            save_path = ext.save_path.rstrip("/")
+            on_fuse = any(save_path.startswith(fm) for fm in fuse_mounts if fm)
+            if on_fuse or ext.is_complete():
+                log.info(
+                    "torrent %s is already completed on VPS2 (fuse=%s, complete=%s); marking DONE",
+                    ts.source_infohash[:10], on_fuse, ext.is_complete(),
+                )
+                ts.dest_infohash = ext.hash
+                ts.save_path = ext.save_path
+                self.transition(ts, State.DONE)
+                return
+
+            log.info("torrent already downloading on VPS2: %s", ts.source_infohash[:10])
             self.transition(ts, State.DOWNLOADING)
             return
 
@@ -1208,9 +1226,18 @@ class Coordinator:
 
         # 5. Move completed files via rclone
         if cls.kind in ("movie", "season", "unknown"):
-            local = src_dir / cls.single_file if (cls.kind == "movie" and cls.single_file and (src_dir / cls.single_file).exists()) else src_dir
-            if cls.kind in ("season", "unknown") and folder and folder.exists():
+            if cls.kind == "movie" and cls.single_file:
+                local = src_dir / cls.single_file
+                if not local.exists():
+                    if folder and (folder / cls.single_file).exists():
+                        local = folder / cls.single_file
+                    else:
+                        raise FileNotFoundError(f"completed movie file not found on SSD: {local}")
+            elif cls.kind in ("season", "unknown") and folder and folder.exists():
                 local = folder
+            else:
+                cand = src_dir / ts.source_name
+                local = cand if cand.exists() else src_dir
             await self._rclone_move(local, remote, ts)
         else:
             # Mixed — per-episode moves with --include

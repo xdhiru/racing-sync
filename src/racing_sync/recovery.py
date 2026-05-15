@@ -83,11 +83,36 @@ async def reconcile(
             else:
                 rpt.orphans.append(h)
 
-    # 3. Anything on VPS2 not in the DB? Likely an old manually-added torrent.
+    # 3. Anything on VPS2 not in the DB?
+    # If it is already seeding from the fuse mount or 100% complete, adopt it into state DB as DONE
+    # so we don't treat it as a new release and re-download/re-move it.
     db_hashes = {ts.source_infohash.lower() for ts in all_rows}
+    fuse_mounts = [
+        str(cfg.rclone.fuse.mount).rstrip("/"),
+        str(cfg.rclone.fuse.mount_unsorted).rstrip("/"),
+    ]
     for h, t in actual_by_hash.items():
         if h not in db_hashes:
-            rpt.unknowns.append(h)
+            save_path = getattr(t, "save_path", "").rstrip("/")
+            on_fuse = any(save_path.startswith(fm) for fm in fuse_mounts if fm)
+            is_done = getattr(t, "is_complete", lambda: False)()
+            if on_fuse or is_done:
+                log.info(
+                    "reconcile: adopting existing completed/fuse torrent on VPS2 as DONE: %s (%s)",
+                    getattr(t, "name", h), h[:10],
+                )
+                ts = TorrentState(
+                    source_infohash=h,
+                    source_name=getattr(t, "name", h),
+                    dest_infohash=h,
+                    save_path=save_path,
+                    total_bytes=getattr(t, "size_bytes", 0),
+                    state=State.DONE,
+                )
+                store.upsert(ts)
+                rpt.kept.append(h)
+            else:
+                rpt.unknowns.append(h)
 
     log.info("recovery: %s", rpt.summary())
     return rpt
