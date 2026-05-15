@@ -51,6 +51,8 @@ def build_move_cmd(cfg: AppConfig, source: Path, dest_remote: str,
                    *, include: list[str] | None = None,
                    extra: list[str] | None = None) -> list[str]:
     cmd = [str(cfg.rclone.binary), "move", str(source), dest_remote]
+    if cfg.rclone.config_path:
+        cmd.extend(["--config", str(cfg.rclone.config_path)])
     cmd.extend(cfg.rclone.extra_move_flags)
     if include:
         cmd.extend(include)
