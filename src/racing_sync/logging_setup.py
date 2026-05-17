@@ -15,6 +15,7 @@ import json
 import logging
 import logging.handlers
 import queue
+import sys
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -233,9 +234,6 @@ def setup_logging(cfg: AppConfig) -> None:
     # Silence overly chatty libraries
     for noisy in ("aiohttp.access", "asyncio", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-
-    # py.typed-style: allow code elsewhere to import the ring handler
-    import sys  # noqa: PLC0415
 
     logging.getLogger("racing_sync").info(
         "logging initialised: dir=%s retention=%dd",
