@@ -21,6 +21,7 @@ import asyncio
 import datetime as dt
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -124,6 +125,7 @@ async def pick_ssd_source_for_racing(
     other_source_torrents: list[Torrent],
     prowlarr: ProwlarrClient | None,
     sftp: SFTPExporter | None,
+    source_client: TorrentClient,
     attempt_prowlarr: bool = True,
 ) -> SourceDecision | None:
     """Decide which .torrent bytes to feed VPS2 SSD.
@@ -321,7 +323,7 @@ class Coordinator:
     _running_infohashes: set[str] = field(default_factory=set, init=False)
     _download_sem: asyncio.Semaphore | None = field(default=None, init=False)
     _move_sem: asyncio.Semaphore | None = field(default=None, init=False)
-    _coordinator_started = False
+    _coordinator_started: bool = field(default=False, init=False)
     _shutdown_done: bool = field(default=False, init=False)
 
     @property
@@ -846,6 +848,7 @@ class Coordinator:
             other_source_torrents=others,
             prowlarr=self.prowlarr,
             sftp=self.sftp,
+            source_client=self.source_client,
             attempt_prowlarr=True,
         )
         if decision is None:
@@ -857,8 +860,11 @@ class Coordinator:
         ts.cross_seed_source = decision.source_label
         ts.save_path = str(self.cfg.dest.save_path)
 
-        # Save the picked .torrent bytes into the state for crash safety
-        # (next stage reads them back from ts._blob — set on the instance)
+        # Persist the picked .torrent bytes so that recovery after a
+        # restart can re-add the cross-seed torrent. Also keep the
+        # transient in-memory copy as a fast-path for the immediate
+        # QUEUED stage.
+        ts.cross_seed_blob = decision.torrent_bytes
         ts._blob = decision.torrent_bytes
 
         if not ssd_has_room(self.cfg, decision.size_bytes):
@@ -942,6 +948,7 @@ class Coordinator:
             other_source_torrents=others,
             prowlarr=self.prowlarr,
             sftp=self.sftp,
+            source_client=self.source_client,
             attempt_prowlarr=True,
         )
         if decision is None:
@@ -953,6 +960,7 @@ class Coordinator:
         ts.cross_seed_infohash = decision.infohash
         ts.cross_seed_source = decision.source_label
         ts.save_path = str(self.cfg.dest.save_path)
+        ts.cross_seed_blob = decision.torrent_bytes
         ts._blob = decision.torrent_bytes
 
         if not ssd_has_room(self.cfg, decision.size_bytes):
@@ -971,7 +979,7 @@ class Coordinator:
     # ---- state: QUEUED ----
 
     async def _do_queued(self, ts: TorrentState) -> None:
-        blob: bytes = ts._blob
+        blob: bytes = ts._blob or ts.cross_seed_blob
         if not blob:
             log.error("missing _blob for %s; cannot add", ts.source_infohash[:10])
             self.transition(ts, State.FAILED, error="no blob")
@@ -1292,7 +1300,10 @@ class Coordinator:
 
         # 2) Re-add the cross-seed torrent (the one we used to download
         # on SSD) pointing at the fuse mount. Without re-check.
-        blob = ts._blob
+        # Prefer the in-memory copy (set during the current run);
+        # fall back to the persisted copy so that recovery after a
+        # restart can still re-add the cross-seed torrent.
+        blob = ts._blob or ts.cross_seed_blob
         if blob:
             target_mount = self._target_mount_for(ts)
             await self.dest_client.add_torrent(
