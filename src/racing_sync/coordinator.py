@@ -1227,20 +1227,20 @@ class Coordinator:
             self.transition(ts, State.RE_ADDING)
             return
 
-        if cls.kind == "movie" or cls.kind == "season":
+        if cls.kind in ("movie", "season"):
             remote = self.cfg.rclone.remote.default
         else:
             remote = self.cfg.rclone.remote.unsorted
 
         # 5. Move completed files via rclone
-        if cls.kind in ("movie", "season", "unknown"):
-            if cls.kind == "movie" and cls.single_file:
+        if cls.kind in ("movie", "episode", "season", "unknown"):
+            if cls.kind in ("movie", "episode") and cls.single_file:
                 local = src_dir / cls.single_file
                 if not local.exists():
                     if folder and (folder / cls.single_file).exists():
                         local = folder / cls.single_file
                     else:
-                        raise FileNotFoundError(f"completed movie file not found on SSD: {local}")
+                        raise FileNotFoundError(f"completed {cls.kind} file not found on SSD: {local}")
             elif cls.kind in ("season", "unknown") and folder and folder.exists():
                 local = folder
             else:
