@@ -94,3 +94,37 @@ async def test_fix_orphan_already_downloading(tmp_path: Path):
     assert recovered is not None
     assert recovered.state == State.DOWNLOADING
 
+
+@pytest.mark.anyio
+async def test_do_re_add_fails_if_add_torrent_rejected():
+    from unittest.mock import AsyncMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import AddResult
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.fuse_reinject_delay_seconds = 0
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
+    coord.dest_client = AsyncMock()
+    coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse"))
+
+    # When add_torrent returns accepted=False
+    coord.dest_client.add_torrent.return_value = AddResult(
+        hash=None, accepted=False, detail="invalid torrent file"
+    )
+
+    ts = TorrentState(
+        "hash1",
+        source_name="Test.Release",
+        state=State.RE_ADDING,
+        _blob=b"torrent-bytes",
+    )
+    coord.transition = lambda t, s, error=None: setattr(t, "state", s)
+
+    await coord._do_re_add(ts)
+
+    # Must transition to FAILED, NOT DONE!
+    assert ts.state == State.FAILED
+
+
