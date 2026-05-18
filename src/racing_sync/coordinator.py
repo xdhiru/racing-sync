@@ -719,8 +719,10 @@ class Coordinator:
 
     async def _refresh_live_status(self) -> None:
         """Re-query VPS2 progress and update the live map."""
+        if not self._live:
+            return
         try:
-            rows = await self.dest_client.list_torrents()
+            rows = await self.dest_client.list_torrents(hashes=list(self._live.keys()))
         except Exception as e:  # noqa: BLE001
             log.warning("list_torrents for live status failed: %s", e)
             return
