@@ -107,3 +107,30 @@ def test_coordinator_target_mount_routing():
     # Individual episodes and mixed -> mount_unsorted
     assert coord._target_mount_for(ts_ep) == Path(cfg.rclone.fuse.mount_unsorted)
     assert coord._target_mount_for(ts_mixed) == Path(cfg.rclone.fuse.mount_unsorted)
+
+
+@pytest.mark.anyio
+async def test_do_moving_raises_if_season_folder_missing(tmp_path: Path):
+    from unittest.mock import AsyncMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState
+
+    cfg = _cfg()
+    coord = object.__new__(Coordinator)
+    coord.cfg = cfg
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files.return_value = [
+        TorrentFile("Show.S01E01.mkv", 1000),
+        TorrentFile("Show.S01E02.mkv", 1000),
+    ]
+    coord.dest_client.get_torrent.return_value = None
+
+    ts = TorrentState(
+        source_infohash="hash1",
+        source_name="Show.S01.1080p",
+        classification_kind="season",
+        save_path=str(tmp_path),
+    )
+
+    with pytest.raises(FileNotFoundError, match="completed season content not found"):
+        await coord._do_moving(ts)
