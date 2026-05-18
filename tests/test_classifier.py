@@ -134,3 +134,38 @@ async def test_do_moving_raises_if_season_folder_missing(tmp_path: Path):
 
     with pytest.raises(FileNotFoundError, match="completed season content not found"):
         await coord._do_moving(ts)
+
+
+@pytest.mark.anyio
+async def test_do_queued_deletes_torrent_when_oversize_movie_skipped(tmp_path: Path):
+    from unittest.mock import AsyncMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import AddResult
+
+    cfg = _cfg()
+    cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord = object.__new__(Coordinator)
+    coord.cfg = cfg
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents.return_value = []
+    coord.dest_client.add_torrent.return_value = AddResult(hash="moviehash", accepted=True)
+    coord._await_hash_for_name = AsyncMock(return_value="moviehash")
+
+    # 200 GB movie (exceeds threshold)
+    coord.dest_client.get_torrent_files.return_value = [
+        TorrentFile("BigMovie.2024.1080p.mkv", 200_000_000_000),
+    ]
+
+    ts = TorrentState(
+        source_infohash="moviehash",
+        source_name="BigMovie.2024.1080p",
+        save_path=str(tmp_path),
+        _blob=b"fake-torrent-blob",
+    )
+    coord.transition = lambda t, s, error=None: setattr(t, "state", s)
+
+    await coord._do_queued(ts)
+
+    assert ts.state == State.FAILED
+    coord.dest_client.delete.assert_awaited_once_with("moviehash", delete_files=True)

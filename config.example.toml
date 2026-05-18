@@ -40,11 +40,10 @@ password = "change_me"
 #   category = "auto,manual"  # qBittorrent supports comma-separated names
 category = ""
 
-# Skip torrents added on the racing client more than N seconds ago.
-# Protects against accidentally re-syncing long-running seeds when
-# the category filter is empty (sync-all mode).
-# 0 = sync every age (default; matches the racing workflow where every
-#     newly-added torrent is fair game).
+# Only sync torrents added on the racing client at least N seconds ago.
+# Gives cross-seeds / secondary private trackers time to be added to the racing
+# client before sync and re-injection begin.
+# 0 = sync immediately without waiting (default).
 min_age_seconds = 0
 
 # Optional: nginx (or other reverse-proxy) auth in front of the WebUI.
