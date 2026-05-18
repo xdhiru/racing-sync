@@ -1327,7 +1327,7 @@ class Coordinator:
         blob = ts._blob or ts.cross_seed_blob
         if blob:
             target_mount = self._target_mount_for(ts)
-            await self.dest_client.add_torrent(
+            res = await self.dest_client.add_torrent(
                 torrent_files=[blob],
                 save_path=str(target_mount),
                 category="racing",
@@ -1335,6 +1335,11 @@ class Coordinator:
                 skip_check=True,
                 tags=["racing", "fuse"],
             )
+            if not res.accepted:
+                err_msg = f"fuse re-add rejected: {res.detail or 'client rejected torrent'}"
+                log.error("re-add cross-seed torrent failed for %s: %s", ts.source_name, err_msg)
+                self.transition(ts, State.FAILED, error=err_msg)
+                return
 
         self.transition(ts, State.DONE)
 
@@ -1400,7 +1405,7 @@ class Coordinator:
             if not blob:
                 continue
             try:
-                await self.dest_client.add_torrent(
+                res = await self.dest_client.add_torrent(
                     torrent_files=[blob],
                     save_path=str(target_mount),
                     category="racing",
@@ -1408,6 +1413,12 @@ class Coordinator:
                     skip_check=True,
                     tags=["racing", "fuse"],
                 )
+                if not res.accepted:
+                    log.warning(
+                        "re-inject: add %s rejected: %s",
+                        t.infohash[:10], res.detail,
+                    )
+                    continue
                 injected.append(t.infohash)
                 log.info(
                     "re-injected racing torrent %s (%s) on fuse",
