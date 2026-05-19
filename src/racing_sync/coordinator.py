@@ -567,9 +567,18 @@ class Coordinator:
                         source_infohash=item.infohash,
                         source_name=item.name,
                         total_bytes=item.size_bytes,
+                        source_announce_url=item.announce_url,
+                        source_tracker=item.announce_url,
+                        cross_seed_blob=item.torrent_bytes,
+                        cross_seed_source="watch-dir",
                         state=State.NEW,
                     )
+                    ts._blob = item.torrent_bytes
                     self.store.upsert(ts)
+                    log.info(
+                        "discovered watch-dir release: %s (%s, %d bytes) announce=%s",
+                        item.name, item.infohash[:10], item.size_bytes, item.announce_url,
+                    )
                 if self.cfg.watch_dir and self.cfg.watch_dir.delete_after_pickup:
                     await self.watch.delete_picked_up(item)
 
@@ -830,6 +839,10 @@ class Coordinator:
     # ---- state: NEW ----
 
     async def _do_new(self, ts: TorrentState) -> None:
+        if ts.cross_seed_source == "watch-dir":
+            await self._do_new_watch_dir(ts)
+            return
+
         # Make sure we have the source torrent metadata
         st = await self.source_client.get_torrent(ts.source_infohash)
         if st is None:
@@ -874,6 +887,117 @@ class Coordinator:
 
         if not ssd_has_room(self.cfg, decision.size_bytes):
             log.info("ssd cap in use; parking %s", st.name)
+            self.transition(ts, State.WAITING_DISK)
+        else:
+            self.transition(ts, State.QUEUED)
+
+    async def _do_new_watch_dir(self, ts: TorrentState) -> None:
+        """Process a manual torrent drop from the watch directory."""
+        blob = ts._blob or ts.cross_seed_blob
+        if not blob:
+            log.error("watch-dir torrent has no bytes: %s", ts.source_name)
+            self.transition(ts, State.FAILED, error="missing .torrent bytes for watch-dir drop")
+            return
+
+        ts.save_path = str(self.cfg.dest.save_path)
+        is_download_tracker = (
+            self.cfg.prowlarr.enabled
+            and self.cfg.prowlarr.is_download_indexer(ts.source_announce_url)
+        )
+
+        chosen_blob = blob
+        chosen_label = "watch-dir"
+        chosen_infohash = ts.source_infohash
+        chosen_size = ts.total_bytes
+
+        # Prepare persistence directory for cross-seed torrents
+        watch_cross_dir = Path(self.cfg.general.state_db).parent / "watch_cross_seeds" / ts.source_infohash
+        watch_cross_dir.mkdir(parents=True, exist_ok=True)
+        # Always persist the dropped .torrent so it can be seeded on FUSE
+        (watch_cross_dir / f"{ts.source_infohash}.torrent").write_bytes(blob)
+
+        # If Prowlarr is enabled, perform single parallel search
+        if self.cfg.prowlarr.enabled and self.prowlarr is not None:
+            indexers_to_query = []
+            download_idx = None
+            if not is_download_tracker:
+                try:
+                    download_idx = self.prowlarr.get_download_indexer()
+                    indexers_to_query.append(download_idx)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("could not get download indexer: %s", e)
+
+            # Add all private indexers from tracker_map
+            seen_names = {download_idx.name.lower()} if download_idx else set()
+            for name in self.cfg.prowlarr.tracker_map.entries.values():
+                idx = self.prowlarr.get_indexer_by_name(name)
+                if idx and idx.name.lower() not in seen_names and idx.enable:
+                    indexers_to_query.append(idx)
+                    seen_names.add(idx.name.lower())
+
+            hits_by_indexer = {}
+            if indexers_to_query:
+                hits_by_indexer = await self.prowlarr.search_indexers_parallel(
+                    indexers_to_query, ts.source_name
+                )
+
+            # 1. Check for sacrificial download torrent on download_indexer
+            if download_idx and download_idx.name.lower() in hits_by_indexer:
+                dl_hits = hits_by_indexer[download_idx.name.lower()]
+                ql = ts.source_name.lower()
+                dl_hits.sort(
+                    key=lambda h: (
+                        h.title.lower() != ql,
+                        abs(h.size_bytes - ts.total_bytes),
+                    )
+                )
+                if dl_hits and (
+                    dl_hits[0].title.lower() == ql
+                    or abs(dl_hits[0].size_bytes - ts.total_bytes) <= max(1024 * 1024 * 50, int(ts.total_bytes * 0.02))
+                ):
+                    best_dl = dl_hits[0]
+                    try:
+                        dl_blob = await self.prowlarr.download_torrent(best_dl)
+                        from .watchdir import _bencoded_info_hash
+                        dl_h, _, _, _ = _bencoded_info_hash(dl_blob)
+                        chosen_blob = dl_blob
+                        chosen_label = "public-prowlarr"
+                        chosen_size = best_dl.size_bytes
+                        chosen_infohash = dl_h
+                        log.info(
+                            "watch-dir: using sacrificial download torrent from %s (%s)",
+                            best_dl.indexer, best_dl.title,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        log.warning(
+                            "failed to fetch download indexer torrent: %s; using dropped file", e
+                        )
+
+            # 2. Collect other private tracker cross-seeds to inject onto FUSE
+            for idx_name, hits in hits_by_indexer.items():
+                if download_idx and idx_name == download_idx.name.lower():
+                    continue
+                for hit in hits:
+                    if hit.title.lower() == ts.source_name.lower() or abs(hit.size_bytes - ts.total_bytes) <= max(1024 * 1024 * 50, int(ts.total_bytes * 0.02)):
+                        try:
+                            cross_blob = await self.prowlarr.download_torrent(hit)
+                            from .watchdir import _bencoded_info_hash
+                            cross_h, _, _, _ = _bencoded_info_hash(cross_blob)
+                            (watch_cross_dir / f"{cross_h}.torrent").write_bytes(cross_blob)
+                            log.info(
+                                "watch-dir: discovered cross-seed from %s: %s (%s)",
+                                hit.indexer, hit.title, cross_h[:10],
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("could not download cross-seed from %s: %s", hit.indexer, e)
+
+        ts.cross_seed_infohash = chosen_infohash
+        ts.cross_seed_source = chosen_label
+        ts.cross_seed_blob = chosen_blob
+        ts._blob = chosen_blob
+
+        if not ssd_has_room(self.cfg, chosen_size):
+            log.info("ssd cap in use; parking %s", ts.source_name)
             self.transition(ts, State.WAITING_DISK)
         else:
             self.transition(ts, State.QUEUED)
@@ -1319,7 +1443,10 @@ class Coordinator:
         # otherwise just skip if the racing client was deluge and SFTP
         # is not enabled.
         if self.cfg.cross_seed.inject_racing_torrents_to_fuse:
-            await self._re_inject_racing_torrents(ts)
+            if ts.cross_seed_source == "watch-dir":
+                await self._re_inject_watch_dir_torrents(ts)
+            else:
+                await self._re_inject_racing_torrents(ts)
 
         # 2) Re-add the cross-seed torrent (the one we used to download
         # on SSD) pointing at the fuse mount. Without re-check.
@@ -1344,6 +1471,37 @@ class Coordinator:
                 return
 
         self.transition(ts, State.DONE)
+
+    async def _re_inject_watch_dir_torrents(self, ts: TorrentState) -> None:
+        """Re-add every watch-dir dropped torrent and discovered cross-seeds onto FUSE."""
+        watch_cross_dir = Path(self.cfg.general.state_db).parent / "watch_cross_seeds" / ts.source_infohash
+        if not watch_cross_dir.exists():
+            return
+        target_mount = self._target_mount_for(ts)
+        injected = [h for h in ts.injected_private_hashes.split(",") if h]
+
+        for p in sorted(watch_cross_dir.glob("*.torrent")):
+            try:
+                blob = p.read_bytes()
+                from .watchdir import _bencoded_info_hash
+                h, _, _, _ = _bencoded_info_hash(blob)
+                res = await self.dest_client.add_torrent(
+                    torrent_files=[blob],
+                    save_path=str(target_mount),
+                    category="racing",
+                    paused=False,
+                    skip_check=True,
+                    tags=["racing", "fuse"],
+                )
+                if res.accepted or "already" in res.detail.lower():
+                    injected.append(h)
+                    log.info("re-injected watch-dir torrent %s on fuse (%s)", h[:10], target_mount)
+                else:
+                    log.warning("re-inject watch-dir torrent %s rejected: %s", h[:10], res.detail)
+            except Exception as e:  # noqa: BLE001
+                log.warning("failed to re-inject watch-dir torrent %s: %s", p.name, e)
+
+        ts.injected_private_hashes = ",".join(dict.fromkeys(injected))
 
     async def _re_inject_racing_torrents(self, ts: TorrentState) -> None:
         """Re-add every racing-client torrent matching this content onto VPS2

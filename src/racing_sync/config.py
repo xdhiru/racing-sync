@@ -384,6 +384,18 @@ class ProwlarrConfig(BaseModel):
     max_results: int = 20
     # Tracker substring → indexer name map
     tracker_map: ProwlarrTrackerMap = ProwlarrTrackerMap()
+    # Announce URL substrings that identify torrents belonging to the download indexer
+    download_indexer_substrings: list[str] = Field(default_factory=list)
+
+    def is_download_indexer(self, announce_url: str) -> bool:
+        """Check if an announce URL matches the download indexer."""
+        if not announce_url:
+            return False
+        low = announce_url.lower()
+        for sub in self.download_indexer_substrings:
+            if sub and sub.lower() in low:
+                return True
+        return False
 
     @model_validator(mode="after")
     def _validate(self) -> "ProwlarrConfig":

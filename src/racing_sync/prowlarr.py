@@ -200,6 +200,24 @@ class ProwlarrClient:
         )
         return hits[0]
 
+    async def search_indexers_parallel(
+        self,
+        indexers: list[Indexer],
+        query: str,
+    ) -> dict[str, list[TorrentHit]]:
+        """Search multiple indexers concurrently and return hits keyed by indexer name (lowercase)."""
+        async def _search_one(idx: Indexer) -> tuple[str, list[TorrentHit]]:
+            try:
+                hits = await self.search_indexer(idx, query)
+                return idx.name.lower(), hits
+            except Exception as e:  # noqa: BLE001
+                log.warning("prowlarr search on indexer %r failed: %s", idx.name, e)
+                return idx.name.lower(), []
+
+        tasks = [_search_one(idx) for idx in indexers]
+        results = await asyncio.gather(*tasks)
+        return dict(results)
+
 
 # ---------- helpers ----------
 
