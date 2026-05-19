@@ -900,13 +900,16 @@ class Coordinator:
             return
 
         ts.save_path = str(self.cfg.dest.save_path)
+        tracker_list = [u for u in ts.source_announce_url.split(",") if u] or ([ts.source_tracker] if ts.source_tracker else [])
+        is_public = _looks_public(tracker_list)
         is_download_tracker = (
             self.cfg.prowlarr.enabled
-            and self.cfg.prowlarr.is_download_indexer(ts.source_announce_url)
+            and any(self.cfg.prowlarr.is_download_indexer(u) for u in tracker_list)
         )
+        needs_sacrificial_copy = not is_download_tracker and not is_public
 
         chosen_blob = blob
-        chosen_label = "watch-dir"
+        chosen_label = "public-watch-dir" if is_public else "watch-dir"
         chosen_infohash = ts.source_infohash
         chosen_size = ts.total_bytes
 
@@ -920,7 +923,7 @@ class Coordinator:
         if self.cfg.prowlarr.enabled and self.prowlarr is not None:
             indexers_to_query = []
             download_idx = None
-            if not is_download_tracker:
+            if needs_sacrificial_copy:
                 try:
                     download_idx = self.prowlarr.get_download_indexer()
                     indexers_to_query.append(download_idx)
