@@ -55,11 +55,22 @@ def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
     name = info.get(b"name", b"")
     if isinstance(name, bytes):
         name = name.decode("utf-8", errors="replace")
+    announces: list[str] = []
     announce = root.get(b"announce", b"")
     if isinstance(announce, bytes):
-        announce = announce.decode("utf-8", errors="replace")
-    elif not isinstance(announce, str):
-        announce = ""
+        announces.append(announce.decode("utf-8", errors="replace"))
+    elif isinstance(announce, str):
+        announces.append(announce)
+    announce_list = root.get(b"announce-list")
+    if isinstance(announce_list, list):
+        for tier in announce_list:
+            if isinstance(tier, list):
+                for u in tier:
+                    if isinstance(u, bytes):
+                        announces.append(u.decode("utf-8", errors="replace"))
+                    elif isinstance(u, str):
+                        announces.append(u)
+    announce_str = ",".join(dict.fromkeys(a for a in announces if a))
     pieces = info.get(b"files") or None
     total = 0
     if pieces is None:
@@ -73,7 +84,7 @@ def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
     # we used sorted dicts in `_bdecode`. So the encoded form should be stable.
     info_bytes = _bencode(info)
     infohash = hashlib.sha1(info_bytes).hexdigest().lower()
-    return infohash, name, total, announce
+    return infohash, name, total, announce_str
 
 
 def _bdecode(data: bytes, pos: int) -> tuple[int, object]:
