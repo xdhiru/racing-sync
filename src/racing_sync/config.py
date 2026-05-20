@@ -386,6 +386,8 @@ class ProwlarrConfig(BaseModel):
     tracker_map: ProwlarrTrackerMap = ProwlarrTrackerMap()
     # Announce URL substrings that identify torrents belonging to the download indexer
     download_indexer_substrings: list[str] = Field(default_factory=list)
+    # Substrings in torrent titles to skip querying Prowlarr for (case-insensitive)
+    skip_query_substrings: list[str] = Field(default_factory=list)
 
     def is_download_indexer(self, announce_url: str) -> bool:
         """Check if an announce URL matches the download indexer."""
@@ -396,6 +398,13 @@ class ProwlarrConfig(BaseModel):
             if sub and sub.lower() in low:
                 return True
         return False
+
+    def should_skip_title(self, title: str) -> bool:
+        """True iff title contains any of skip_query_substrings (case-insensitive)."""
+        if not title or not self.skip_query_substrings:
+            return False
+        low = title.lower()
+        return any(sub and sub.lower() in low for sub in self.skip_query_substrings)
 
     @model_validator(mode="after")
     def _validate(self) -> "ProwlarrConfig":
