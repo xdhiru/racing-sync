@@ -97,13 +97,28 @@ async def reconcile(
             on_fuse = any(save_path.startswith(fm) for fm in fuse_mounts if fm)
             is_done = getattr(t, "is_complete", lambda: False)()
             if on_fuse or is_done:
+                name = getattr(t, "name", h)
+                matches = store.find_by_name(name)
+                if matches:
+                    existing = matches[0]
+                    curr = [x for x in existing.injected_private_hashes.split(",") if x]
+                    if h not in curr and h.lower() != existing.source_infohash.lower():
+                        curr.append(h)
+                        existing.injected_private_hashes = ",".join(curr)
+                        store.upsert(existing)
+                        rpt.kept.append(h)
+                        log.info(
+                            "reconcile: linked existing cross-seed %s to adopted release %s",
+                            h[:10], name,
+                        )
+                        continue
                 log.info(
                     "reconcile: adopting existing completed/fuse torrent on VPS2 as DONE: %s (%s)",
-                    getattr(t, "name", h), h[:10],
+                    name, h[:10],
                 )
                 ts = TorrentState(
                     source_infohash=h,
-                    source_name=getattr(t, "name", h),
+                    source_name=name,
                     dest_infohash=h,
                     save_path=save_path,
                     total_bytes=getattr(t, "size_bytes", 0),

@@ -171,4 +171,75 @@ async def test_check_and_inject_late_cross_seeds():
     coord.store.upsert.assert_called_once_with(ts)
 
 
+@pytest.mark.anyio
+async def test_check_and_inject_late_cross_seeds_recognizes_existing_torrent():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import AddResult, Torrent
+
+    coord = object.__new__(Coordinator)
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse"))
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=b"torrent-bytes")
+    # qBittorrent returns "Fails." because torrent is already in qBittorrent
+    coord.dest_client.add_torrent.return_value = AddResult(hash=None, accepted=False, detail="Fails.")
+    # get_torrent confirms it exists on dest_client
+    coord.dest_client.get_torrent.return_value = Torrent(
+        hash="existinghash", name="Show.Release", category="racing", save_path="/mnt/fuse", size_bytes=100, state="uploading", progress=1.0
+    )
+
+    ts = TorrentState(
+        "sourcehash",
+        source_name="Show.Release",
+        dest_infohash="desthash",
+        injected_private_hashes="",
+        state=State.DONE,
+    )
+
+    group = [
+        Torrent(hash="sourcehash", name="Show.Release", category="racing", save_path="", size_bytes=100, state="", progress=1.0),
+        Torrent(hash="existinghash", name="Show.Release", category="racing", save_path="", size_bytes=100, state="", progress=1.0),
+    ]
+
+    await coord._check_and_inject_late_cross_seeds(ts, group)
+
+    # Must be marked as injected despite add_torrent returning "Fails."
+    assert "existinghash" in ts.injected_private_hashes
+    coord.store.upsert.assert_called_once_with(ts)
+
+
+@pytest.mark.anyio
+async def test_reconcile_links_same_name_torrents_to_single_state(tmp_path: Path):
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.state import StateStore, State
+    from racing_sync.recovery import reconcile
+    from racing_sync.clients.abstract import Torrent
+
+    cfg = MagicMock()
+    cfg.rclone.fuse.mount = tmp_path / "fuse"
+    cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse_unsorted"
+    db_path = tmp_path / "test.db"
+    store = StateStore(db_path)
+
+    # Destination client has 2 torrents on VPS2 with identical names (e.g. public + private)
+    t1 = Torrent(hash="hash1", name="Anime.Ep1", category="racing", save_path=str(cfg.rclone.fuse.mount), size_bytes=1000, state="seeding", progress=1.0)
+    t2 = Torrent(hash="hash2", name="Anime.Ep1", category="racing", save_path=str(cfg.rclone.fuse.mount), size_bytes=1000, state="seeding", progress=1.0)
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [t1, t2]
+
+    rpt = await reconcile(cfg, dest=dest, store=store)
+
+    assert len(rpt.kept) == 2
+    rows = store.all()
+    # Should only create 1 primary TorrentState row, with hash2 in injected_private_hashes
+    assert len(rows) == 1
+    assert rows[0].source_infohash == "hash1"
+    assert rows[0].injected_private_hashes == "hash2"
+    assert rows[0].state == State.DONE
+
+
+
 

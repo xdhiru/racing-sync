@@ -1496,9 +1496,21 @@ class Coordinator:
                     skip_check=True,
                     tags=["racing", "fuse"],
                 )
-                if res.accepted or "already" in res.detail.lower():
+                already_exists = False
+                if not res.accepted:
+                    try:
+                        dest_st = await self.dest_client.get_torrent(h)
+                        if dest_st is not None:
+                            already_exists = True
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("could not check dest client for %s: %s", h[:10], e)
+
+                if res.accepted or already_exists or "already" in res.detail.lower():
                     injected.append(h)
-                    log.info("re-injected watch-dir torrent %s on fuse (%s)", h[:10], target_mount)
+                    if already_exists:
+                        log.info("watch-dir torrent %s already exists on dest client; marking as injected", h[:10])
+                    else:
+                        log.info("re-injected watch-dir torrent %s on fuse (%s)", h[:10], target_mount)
                 else:
                     log.warning("re-inject watch-dir torrent %s rejected: %s", h[:10], res.detail)
             except Exception as e:  # noqa: BLE001
@@ -1576,17 +1588,32 @@ class Coordinator:
                     skip_check=True,
                     tags=["racing", "fuse"],
                 )
+                already_exists = False
                 if not res.accepted:
+                    try:
+                        dest_st = await self.dest_client.get_torrent(t.infohash)
+                        if dest_st is not None:
+                            already_exists = True
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("could not check dest client for %s: %s", t.infohash[:10], e)
+
+                if not res.accepted and not already_exists and "already" not in res.detail.lower():
                     log.warning(
                         "re-inject: add %s rejected: %s",
                         t.infohash[:10], res.detail,
                     )
                     continue
                 injected.append(t.infohash)
-                log.info(
-                    "re-injected racing torrent %s (%s) on fuse",
-                    t.infohash[:10], t.name[:50],
-                )
+                if already_exists:
+                    log.info(
+                        "racing torrent %s (%s) already exists on dest client; marking as injected",
+                        t.infohash[:10], t.name[:50],
+                    )
+                else:
+                    log.info(
+                        "re-injected racing torrent %s (%s) on fuse",
+                        t.infohash[:10], t.name[:50],
+                    )
             except Exception as e:  # noqa: BLE001
                 log.warning("re-inject: add %s failed: %s",
                             t.infohash[:10], e)
@@ -1614,7 +1641,13 @@ class Coordinator:
         current_injected = [h for h in ts.injected_private_hashes.split(",") if h]
         changed = False
 
+        if not hasattr(self, "_failed_late_cross_seeds"):
+            self._failed_late_cross_seeds: set[str] = set()
+
         for t in new_torrents:
+            if t.infohash.lower() in self._failed_late_cross_seeds:
+                continue
+
             log.info(
                 "detected late cross-seed for completed content '%s': %s (%s)",
                 ts.source_name[:40], t.infohash[:10], t.name[:40],
@@ -1638,11 +1671,28 @@ class Coordinator:
                     skip_check=True,
                     tags=["racing", "fuse"],
                 )
-                if res.accepted or "already" in res.detail.lower():
-                    log.info(
-                        "auto-injected late cross-seed %s (%s) onto fuse (%s)",
-                        t.infohash[:10], t.name[:40], target_mount,
-                    )
+                already_exists = False
+                if not res.accepted:
+                    # qBittorrent returns "Fails." when a torrent already exists.
+                    # Verify if it's already present on VPS2.
+                    try:
+                        dest_st = await self.dest_client.get_torrent(t.infohash)
+                        if dest_st is not None:
+                            already_exists = True
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("could not check dest client for %s: %s", t.infohash[:10], e)
+
+                if res.accepted or already_exists or "already" in res.detail.lower():
+                    if already_exists:
+                        log.info(
+                            "late cross-seed %s (%s) already exists on dest client; marking as injected",
+                            t.infohash[:10], t.name[:40],
+                        )
+                    else:
+                        log.info(
+                            "auto-injected late cross-seed %s (%s) onto fuse (%s)",
+                            t.infohash[:10], t.name[:40], target_mount,
+                        )
                     current_injected.append(t.infohash)
                     changed = True
                 else:
@@ -1650,11 +1700,13 @@ class Coordinator:
                         "late cross-seed: add %s rejected by dest client: %s",
                         t.infohash[:10], res.detail,
                     )
+                    self._failed_late_cross_seeds.add(t.infohash.lower())
             except Exception as e:  # noqa: BLE001
                 log.warning("late cross-seed: add %s failed: %s", t.infohash[:10], e)
+                self._failed_late_cross_seeds.add(t.infohash.lower())
 
         if changed:
-            ts.injected_private_hashes = ",".join(current_injected)
+            ts.injected_private_hashes = ",".join(dict.fromkeys(current_injected))
             self.store.upsert(ts)
 
     async def _fetch_racing_torrent_bytes(self, infohash: str) -> bytes | None:
