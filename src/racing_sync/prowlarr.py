@@ -139,6 +139,9 @@ class ProwlarrClient:
         limit: int | None = None,
     ) -> list[TorrentHit]:
         """Run a Newznab-style search against a single indexer."""
+        if self._cfg.should_skip_title(query):
+            log.info("prowlarr: skipping search on %s for %r (matches skip_query_substrings)", indexer.name, query)
+            return []
         if not self._session:
             raise ProwlarrError("not started")
         limit = limit or self._cfg.max_results
@@ -187,6 +190,9 @@ class ProwlarrClient:
         largest size wins. Good enough for cross-seed matching where the
         query is the original torrent name.
         """
+        if self._cfg.should_skip_title(query):
+            log.info("prowlarr: skipping best_match for %r (matches skip_query_substrings)", query)
+            return None
         idx = prefer_indexer or self.get_download_indexer()
         hits = await self.search_indexer(idx, query)
         if not hits:
@@ -206,6 +212,10 @@ class ProwlarrClient:
         query: str,
     ) -> dict[str, list[TorrentHit]]:
         """Search multiple indexers concurrently and return hits keyed by indexer name (lowercase)."""
+        if self._cfg.should_skip_title(query):
+            log.info("prowlarr: skipping parallel search for %r (matches skip_query_substrings)", query)
+            return {}
+
         async def _search_one(idx: Indexer) -> tuple[str, list[TorrentHit]]:
             try:
                 hits = await self.search_indexer(idx, query)
