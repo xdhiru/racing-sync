@@ -1148,6 +1148,8 @@ class Coordinator:
                 )
                 ts.dest_infohash = ext.hash
                 ts.save_path = ext.save_path
+                if self.cfg.cross_seed.inject_racing_torrents_to_fuse:
+                    await self._re_inject_racing_torrents(ts)
                 self.transition(ts, State.DONE)
                 return
 
