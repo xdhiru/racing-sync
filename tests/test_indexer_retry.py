@@ -107,3 +107,39 @@ async def test_list_source_torrents_caches_within_ttl():
     res3 = await coord._list_source_torrents(force_refresh=True)
     assert len(res3) == 1
     assert coord.source_client.list_torrents.await_count == 2
+
+
+@pytest.mark.anyio
+async def test_do_new_transitions_failed_when_source_vanished():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+
+    coord = object.__new__(Coordinator)
+    coord.source_client = AsyncMock()
+    coord.source_client.get_torrent.return_value = None
+    coord.transition = MagicMock()
+
+    ts = TorrentState(source_infohash="vanished_hash_12345", state=State.NEW)
+    await coord._do_new(ts)
+
+    coord.transition.assert_called_once_with(
+        ts, State.FAILED, error="source torrent vanished from client: vanished_h"
+    )
+
+
+@pytest.mark.anyio
+async def test_do_waiting_indexer_transitions_failed_when_source_vanished():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+
+    coord = object.__new__(Coordinator)
+    coord.source_client = AsyncMock()
+    coord.source_client.get_torrent.return_value = None
+    coord.transition = MagicMock()
+
+    ts = TorrentState(source_infohash="vanished_hash_67890", state=State.QUERYING)
+    await coord._do_waiting_indexer(ts)
+
+    coord.transition.assert_called_once_with(
+        ts, State.FAILED, error="source torrent vanished from client: vanished_h"
+    )
