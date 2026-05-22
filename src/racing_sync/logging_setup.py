@@ -132,37 +132,33 @@ class HTTPSinkHandler(logging.handlers.QueueHandler):
         super().emit(record)
 
     def _run(self) -> None:
-        sess = None
-        try:
-            import requests  # type: ignore
+        import urllib.request
 
-            sess = requests.Session()
-            sess.headers.update(
-                {"Content-Type": "application/json"},
-            )
-            if self._cfg.auth_token:
-                sess.headers["Authorization"] = f"Bearer {self._cfg.auth_token}"
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "racing-sync-log-sink/1.0",
+        }
+        if self._cfg.auth_token:
+            headers["Authorization"] = f"Bearer {self._cfg.auth_token}"
 
-            while not self._stop.is_set():
-                try:
-                    record: logging.LogRecord = self.queue.get(timeout=1.0)  # type: ignore[assignment]
-                except queue.Empty:
-                    continue
-                payload = {
-                    "ts": dt.datetime.fromtimestamp(record.created, tz=dt.timezone.utc).isoformat(),
-                    "level": record.levelname,
-                    "logger": record.name,
-                    "message": record.getMessage(),
-                }
-                try:
-                    sess.post(self._cfg.url, json=payload, timeout=5)
-                except Exception as e:  # noqa: BLE001
-                    sys.stderr.write(f"[log-sink] {e}\n")
-        except Exception as e:  # noqa: BLE001
-            sys.stderr.write(f"[log-sink thread] {e}\n")
-        finally:
-            if sess is not None:
-                sess.close()
+        while not self._stop.is_set():
+            try:
+                record: logging.LogRecord = self.queue.get(timeout=1.0)  # type: ignore[assignment]
+            except queue.Empty:
+                continue
+            payload = {
+                "ts": dt.datetime.fromtimestamp(record.created, tz=dt.timezone.utc).isoformat(),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+            }
+            try:
+                data = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(self._cfg.url, data=data, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    resp.read()
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"[log-sink] {e}\n")
 
 
 # --------------------------------------------------------------------------- #
