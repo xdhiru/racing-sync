@@ -46,3 +46,37 @@ def test_include_patterns_are_per_file():
     b = make_batches(eps, cap_bytes=10)[0]
     pats = b.include_patterns()
     assert pats == ["--include=S01E01.mkv", "--include=S01E02.mkv"]
+
+
+@pytest.mark.anyio
+async def test_do_downloading_iterates_batches():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord._live = {}
+    coord.store = MagicMock()
+    coord._wait_for_completion = AsyncMock()
+    coord._prepare_next_batch = AsyncMock()
+    coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
+
+    ts = TorrentState(
+        source_infohash="testhash",
+        source_name="Test.Show.S01",
+        classification_kind="season",
+        batches_total=3,
+        batch_index=0,
+        state=State.DOWNLOADING,
+    )
+
+    await coord._do_downloading(ts)
+
+    # _wait_for_completion called 3 times (once per batch)
+    assert coord._wait_for_completion.await_count == 3
+    # _prepare_next_batch called 2 times (for batch 1 and 2)
+    assert coord._prepare_next_batch.await_count == 2
+    assert ts.batch_index == 3
+    assert ts.state == State.MOVING
+    assert coord.transition.called

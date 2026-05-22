@@ -1251,33 +1251,39 @@ class Coordinator:
 
     async def _do_downloading(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
-        # Live tracking
-        self._live[h.lower()] = LiveItem(
-            source_infohash=h.lower(),
-            name=ts.source_name,
-            state="downloading",
-            progress=0.0,
-            size_mb=ts.total_bytes / (1024 * 1024),
-        )
+        while not self._stop:
+            # Live tracking
+            self._live[h.lower()] = LiveItem(
+                source_infohash=h.lower(),
+                name=ts.source_name,
+                state="downloading",
+                progress=0.0,
+                size_mb=ts.total_bytes / (1024 * 1024),
+            )
 
-        try:
-            await self._wait_for_completion(ts)
-        finally:
-            self._live.pop(h.lower(), None)
+            try:
+                await self._wait_for_completion(ts)
+            finally:
+                self._live.pop(h.lower(), None)
 
-        # If this was a season with batches, advance the batch pointer
-        if ts.classification_kind in ("season", "mixed"):
-            ts.batch_index += 1
-            self.store.upsert(ts)
-            if ts.batch_index < ts.batches_total:
-                # Set next batch's files to priority 1, drop current to 0
-                await self._prepare_next_batch(ts)
-                # The torrent is now ready to download the next batch;
-                # stay in DOWNLOADING state.
-                await self._do_downloading(ts)
+            if self._stop:
                 return
 
-        self.transition(ts, State.MOVING)
+            # If this was a season with batches, advance the batch pointer
+            if ts.classification_kind in ("season", "mixed"):
+                ts.batch_index += 1
+                self.store.upsert(ts)
+                if ts.batch_index < ts.batches_total:
+                    # Set next batch's files to priority 1, drop current to 0
+                    await self._prepare_next_batch(ts)
+                    # The torrent is now ready to download the next batch;
+                    # loop to download next batch while staying in DOWNLOADING state.
+                    continue
+
+            break
+
+        if not self._stop:
+            self.transition(ts, State.MOVING)
 
     async def _wait_for_completion(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
