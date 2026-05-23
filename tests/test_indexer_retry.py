@@ -197,3 +197,23 @@ async def test_do_re_add_accepts_when_dest_client_returns_fails_but_already_exis
     coord.dest_client.add_torrent.assert_awaited_once()
     coord.dest_client.get_torrent.assert_awaited_once_with("abc123456789")
     coord.transition.assert_called_once_with(ts, State.DONE)
+
+
+def test_should_notify_telegram_policy():
+    from racing_sync.coordinator import _should_notify_telegram
+
+    # Same-state transition should not notify
+    assert not _should_notify_telegram(State.NEW, State.NEW)
+    assert not _should_notify_telegram(State.DOWNLOADING, State.DOWNLOADING)
+
+    # Transitioning to NEW should not notify
+    assert not _should_notify_telegram(State.QUEUED, State.NEW)
+
+    # Active and terminal states should notify
+    assert _should_notify_telegram(State.NEW, State.QUEUED)
+    assert _should_notify_telegram(State.QUEUED, State.DOWNLOADING)
+    assert _should_notify_telegram(State.DOWNLOADING, State.MOVING)
+    assert _should_notify_telegram(State.MOVING, State.RE_ADDING)
+    assert _should_notify_telegram(State.RE_ADDING, State.DONE)
+    assert _should_notify_telegram(State.RE_ADDING, State.FAILED)
+    assert _should_notify_telegram(State.NEW, State.WAITING_INDEXER)
