@@ -1521,20 +1521,43 @@ class Coordinator:
         # restart can still re-add the cross-seed torrent.
         blob = ts._blob or ts.cross_seed_blob
         if blob:
-            target_mount = self._target_mount_for(ts)
-            res = await self.dest_client.add_torrent(
-                torrent_files=[blob],
-                save_path=str(target_mount),
-                category="racing",
-                paused=False,
-                skip_check=True,
-                tags=["racing", "fuse"],
-            )
-            if not res.accepted:
-                err_msg = f"fuse re-add rejected: {res.detail or 'client rejected torrent'}"
-                log.error("re-add cross-seed torrent failed for %s: %s", ts.source_name, err_msg)
-                self.transition(ts, State.FAILED, error=err_msg)
-                return
+            blob_hash = ""
+            try:
+                from .watchdir import _bencoded_info_hash
+                blob_hash, _, _, _ = _bencoded_info_hash(blob)
+            except Exception:
+                pass
+            target_hash = blob_hash or ts.cross_seed_infohash or h
+
+            injected_hashes = {x.lower() for x in ts.injected_private_hashes.split(",") if x}
+            if target_hash and target_hash.lower() in injected_hashes:
+                log.info("cross-seed torrent %s already injected on fuse in step 1", target_hash[:10])
+            else:
+                target_mount = self._target_mount_for(ts)
+                res = await self.dest_client.add_torrent(
+                    torrent_files=[blob],
+                    save_path=str(target_mount),
+                    category="racing",
+                    paused=False,
+                    skip_check=True,
+                    tags=["racing", "fuse"],
+                )
+                already_exists = False
+                if not res.accepted and (res.detail == "Fails." or "already" in res.detail.lower()):
+                    try:
+                        dest_st = await self.dest_client.get_torrent(target_hash)
+                        if dest_st is not None:
+                            already_exists = True
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("could not check dest client for %s: %s", target_hash[:10], e)
+
+                if not res.accepted and not already_exists:
+                    err_msg = f"fuse re-add rejected: {res.detail or 'client rejected torrent'}"
+                    log.error("re-add cross-seed torrent failed for %s: %s", ts.source_name, err_msg)
+                    self.transition(ts, State.FAILED, error=err_msg)
+                    return
+                elif already_exists:
+                    log.info("cross-seed torrent %s already exists on dest client; marking as injected", target_hash[:10])
 
         self.transition(ts, State.DONE)
 
