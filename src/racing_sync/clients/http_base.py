@@ -150,6 +150,9 @@ class HTTPClientBase:
                     aiohttp.ClientOSError,
                     aiohttp.ServerDisconnectedError,
                     aiohttp.ClientConnectionResetError,
+                    aiohttp.ClientConnectorError,
+                    asyncio.TimeoutError,
+                    TimeoutError,
                 ) as e:
                     if attempt == 2:
                         raise
