@@ -148,7 +148,11 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     elif ts.state == State.MOVING:
         lines.append("rclone moving to remote…")
     elif ts.state == State.RE_ADDING:
-        lines.append("Re-adding on fuse mount")
+        if ts.readd_next_retry_at and ts.readd_next_retry_at > dt.datetime.now(dt.timezone.utc):
+            mins = max(1, round((ts.readd_next_retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds() / 60))
+            lines.append(f"Re-adding on fuse mount (WebUI busy, retrying in {mins}m)")
+        else:
+            lines.append("Re-adding on fuse mount")
     elif ts.state == State.DONE:
         lines.append("✓ Seeded from fuse mount")
     elif ts.state == State.FAILED:
@@ -226,7 +230,11 @@ def render_active(
         elif ts.state == State.MOVING:
             state_text = "📦 Moving"
         elif ts.state == State.RE_ADDING:
-            state_text = "🔄 Re-adding"
+            if ts.readd_next_retry_at and ts.readd_next_retry_at > dt.datetime.now(dt.timezone.utc):
+                mins = max(1, round((ts.readd_next_retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds() / 60))
+                state_text = f"🔄 Re-adding (retry in {mins}m)"
+            else:
+                state_text = "🔄 Re-adding"
         elif ts.state == State.QUERYING:
             state_text = "🔍 Querying"
         elif ts.state == State.WAITING_INDEXER:
