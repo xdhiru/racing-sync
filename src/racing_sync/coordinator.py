@@ -751,6 +751,11 @@ class Coordinator:
             if ts.source_infohash in self._running_infohashes:
                 continue
 
+            # Skip WAITING_INDEXER rows: they are parked and woken up exclusively
+            # by Step 3 when their indexer_next_retry_at timer elapses.
+            if ts.state == State.WAITING_INDEXER:
+                continue
+
             # Skip RE_ADDING rows whose backoff timer has not yet elapsed
             if ts.state == State.RE_ADDING and ts.readd_next_retry_at:
                 now_utc = dt.datetime.now(dt.timezone.utc)
@@ -883,7 +888,7 @@ class Coordinator:
         log.info("worker start: %s state=%s", ts.source_name, ts.state.value)
         if ts.state == State.NEW:
             await self._do_new(ts)
-        if ts.state in (State.WAITING_INDEXER, State.QUERYING):
+        if ts.state == State.QUERYING:
             await self._do_waiting_indexer(ts)
         if ts.state == State.WAITING_DISK:
             await self._wait_disk_then_queue(ts)
