@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import logging
 import socket
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -55,6 +56,7 @@ class SFTPExporter:
         self._cfg = cfg
         self._client: paramiko.SSHClient | None = None
         self._sftp: paramiko.SFTPClient | None = None
+        self._lock = threading.RLock()
 
     def __enter__(self) -> "SFTPExporter":
         self.connect()
@@ -64,48 +66,50 @@ class SFTPExporter:
         self.close()
 
     def connect(self) -> None:
-        self._client = paramiko.SSHClient()
-        self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        kwargs: dict = {
-            "hostname": self._cfg.ssh_host,
-            "port": self._cfg.ssh_port,
-            "username": self._cfg.ssh_user,
-            "timeout": 15,
-            "allow_agent": True,
-        }
-        if self._cfg.ssh_key_path:
-            # Load the key manually when a passphrase is configured, so
-            # paramiko can decrypt the (possibly encrypted) private key.
-            # Without a passphrase we can let paramiko load it via
-            # `key_filename=` itself, but loading it explicitly here
-            # keeps both code paths uniform.
-            try:
-                pkey = self._load_private_key(
-                    self._cfg.ssh_key_path,
-                    passphrase=self._cfg.ssh_key_passphrase or None,
-                )
-            except paramiko.PasswordRequiredException as e:
-                raise SFTPError(
-                    f"SSH key {self._cfg.ssh_key_path} is encrypted but "
-                    f"ssh_key_passphrase is empty/missing"
-                ) from e
-            except paramiko.SSHException as e:
-                raise SFTPError(
-                    f"could not load SSH key {self._cfg.ssh_key_path}: {e}"
-                ) from e
-            kwargs["pkey"] = pkey
-        else:
-            kwargs["password"] = self._cfg.ssh_password
-        # Force IPv4 resolution: the racing VPS may not have a routable
-        # IPv6 address and paramiko defaults to getaddrinfo's first
-        # result, which can be a hung AAAA connection. We pre-resolve
-        # with AF_INET, open a socket ourselves, and pass it to connect().
-        kwargs["sock"] = _ipv4_socket(
-            self._cfg.ssh_host, self._cfg.ssh_port, timeout=15
-        )
-        self._client.connect(**kwargs)
-        self._sftp = self._client.open_sftp()
-        log.info("sftp connected to %s:%d", self._cfg.ssh_host, self._cfg.ssh_port)
+        with self._lock:
+            self.close()
+            self._client = paramiko.SSHClient()
+            self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            kwargs: dict = {
+                "hostname": self._cfg.ssh_host,
+                "port": self._cfg.ssh_port,
+                "username": self._cfg.ssh_user,
+                "timeout": 15,
+                "allow_agent": True,
+            }
+            if self._cfg.ssh_key_path:
+                # Load the key manually when a passphrase is configured, so
+                # paramiko can decrypt the (possibly encrypted) private key.
+                # Without a passphrase we can let paramiko load it via
+                # `key_filename=` itself, but loading it explicitly here
+                # keeps both code paths uniform.
+                try:
+                    pkey = self._load_private_key(
+                        self._cfg.ssh_key_path,
+                        passphrase=self._cfg.ssh_key_passphrase or None,
+                    )
+                except paramiko.PasswordRequiredException as e:
+                    raise SFTPError(
+                        f"SSH key {self._cfg.ssh_key_path} is encrypted but "
+                        f"ssh_key_passphrase is empty/missing"
+                    ) from e
+                except paramiko.SSHException as e:
+                    raise SFTPError(
+                        f"could not load SSH key {self._cfg.ssh_key_path}: {e}"
+                    ) from e
+                kwargs["pkey"] = pkey
+            else:
+                kwargs["password"] = self._cfg.ssh_password
+            # Force IPv4 resolution: the racing VPS may not have a routable
+            # IPv6 address and paramiko defaults to getaddrinfo's first
+            # result, which can be a hung AAAA connection. We pre-resolve
+            # with AF_INET, open a socket ourselves, and pass it to connect().
+            kwargs["sock"] = _ipv4_socket(
+                self._cfg.ssh_host, self._cfg.ssh_port, timeout=15
+            )
+            self._client.connect(**kwargs)
+            self._sftp = self._client.open_sftp()
+            log.info("sftp connected to %s:%d", self._cfg.ssh_host, self._cfg.ssh_port)
 
     @staticmethod
     def _load_private_key(path: Path, *, passphrase: str | None) -> paramiko.PKey:
@@ -133,10 +137,19 @@ class SFTPExporter:
         )
 
     def close(self) -> None:
-        if self._sftp is not None:
-            self._sftp.close()
-        if self._client is not None:
-            self._client.close()
+        with self._lock:
+            if self._sftp is not None:
+                try:
+                    self._sftp.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._sftp = None
+            if self._client is not None:
+                try:
+                    self._client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._client = None
 
     # ---- torrent file ----
 
@@ -145,53 +158,55 @@ class SFTPExporter:
         if not infohash or len(infohash) != 40 or not all(c in "0123456789abcdefABCDEF" for c in infohash):
             return None
 
-        # Reconnect if connection dropped
-        if (self._client is None
-                or self._sftp is None
-                or self._client.get_transport() is None
-                or not self._client.get_transport().is_active()):
-            log.info("sftp connection dropped or not active; reconnecting...")
-            try:
-                self.connect()
-            except Exception as e:
-                log.warning("sftp reconnect failed: %s", e)
-                return None
+        with self._lock:
+            # Reconnect if connection dropped
+            if (self._client is None
+                    or self._sftp is None
+                    or self._client.get_transport() is None
+                    or not self._client.get_transport().is_active()):
+                log.info("sftp connection dropped or not active; reconnecting...")
+                try:
+                    self.connect()
+                except Exception as e:
+                    log.warning("sftp reconnect failed: %s", e)
+                    return None
 
-        candidates = [
-            Path(self._cfg.state_dir) / f"{infohash}.torrent",
-        ]
-        # Some setups have the file under BT_backup/<hash>.torrent (qBittorrent)
-        candidates.append(
-            Path(self._cfg.state_dir).parent
-            / "BT_backup"
-            / f"{infohash}.torrent"
-        )
-        for path in candidates:
-            try:
-                with self._sftp.open(str(path), "rb") as f:  # type: ignore[union-attr]
-                    data = f.read()
-                if data.startswith(b"d"):
-                    return data
-                log.warning("sftp: %s does not look like a bencoded torrent", path)
-            except FileNotFoundError:
-                continue
-            except (OSError, paramiko.SSHException, EOFError) as e:
-                log.warning("sftp: read %s failed: %s", path, e)
-                continue
-            except Exception as e:  # noqa: BLE001
-                log.warning("sftp: unexpected error reading %s: %s", path, e)
-                continue
-        return None
+            candidates = [
+                Path(self._cfg.state_dir) / f"{infohash}.torrent",
+            ]
+            # Some setups have the file under BT_backup/<hash>.torrent (qBittorrent)
+            candidates.append(
+                Path(self._cfg.state_dir).parent
+                / "BT_backup"
+                / f"{infohash}.torrent"
+            )
+            for path in candidates:
+                try:
+                    with self._sftp.open(str(path), "rb") as f:  # type: ignore[union-attr]
+                        data = f.read()
+                    if data.startswith(b"d"):
+                        return data
+                    log.warning("sftp: %s does not look like a bencoded torrent", path)
+                except FileNotFoundError:
+                    continue
+                except (OSError, paramiko.SSHException, EOFError) as e:
+                    log.warning("sftp: read %s failed: %s", path, e)
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    log.warning("sftp: unexpected error reading %s: %s", path, e)
+                    continue
+            return None
 
     def fetch_many(self, infohashes: Iterable[str]) -> dict[str, bytes]:
         return {h: data for h, data in ((h, self.fetch_torrent(h)) for h in infohashes) if data}
 
     def list_state_dir(self) -> list[str]:
-        if self._sftp is None:
-            raise SFTPError("not connected")
-        out: list[str] = []
-        for entry in self._sftp.listdir_attr(str(self._cfg.state_dir)):
-            name = entry.filename
-            if name.endswith(".torrent"):
-                out.append(name[: -len(".torrent")])
-        return out
+        with self._lock:
+            if self._sftp is None:
+                raise SFTPError("not connected")
+            out: list[str] = []
+            for entry in self._sftp.listdir_attr(str(self._cfg.state_dir)):
+                name = entry.filename
+                if name.endswith(".torrent"):
+                    out.append(name[: -len(".torrent")])
+            return out
