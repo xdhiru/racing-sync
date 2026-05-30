@@ -287,3 +287,31 @@ async def test_tick_skips_waiting_indexer_in_step_4():
 
     assert "waiting_indexer" not in scheduled
     assert "queued_ready" in scheduled
+
+
+@pytest.mark.anyio
+async def test_coordinator_run_stops_immediately_when_stop_requested():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.start = AsyncMock()
+    coord.shutdown = AsyncMock()
+    coord.cfg = MagicMock()
+    # Large sleep interval: if _stop is ignored, this test would hang/timeout
+    coord.cfg.general.source_poll_interval = 9999
+
+    tick_called = False
+
+    async def fake_tick():
+        nonlocal tick_called
+        tick_called = True
+        coord.request_stop()
+
+    coord._tick = fake_tick
+
+    exit_code = await coord.run()
+    assert exit_code == 0
+    assert tick_called is True
+    coord.shutdown.assert_awaited_once()
