@@ -1450,11 +1450,6 @@ class Coordinator:
                     pass
 
         # 4. Decide target remote
-        if cls.kind in ("season", "mixed") and ts.classification_kind != "season":
-            # We moved per-batch; nothing left to do
-            self.transition(ts, State.RE_ADDING)
-            return
-
         if cls.kind in ("movie", "season"):
             remote = self.cfg.rclone.remote.default
         else:
