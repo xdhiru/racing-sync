@@ -169,3 +169,50 @@ async def test_do_queued_deletes_torrent_when_oversize_movie_skipped(tmp_path: P
 
     assert ts.state == State.FAILED
     coord.dest_client.delete.assert_awaited_once_with("moviehash", delete_files=True)
+
+
+@pytest.mark.anyio
+async def test_do_moving_moves_mixed_content_in_batches(tmp_path: Path):
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+
+    cfg = _cfg()
+    cfg.dest.save_path = str(tmp_path)
+    cfg.ssd.path = tmp_path
+    coord = object.__new__(Coordinator)
+    coord.cfg = cfg
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord._rclone_move = AsyncMock()
+    coord.transition = MagicMock()
+    coord._season_folder_for = MagicMock(return_value=None)
+
+    # Create files on disk for mixed content: 2 episodes + 2 non-episode files
+    # (< 90% episodes -> mixed)
+    f1 = tmp_path / "Show.S01E01.mkv"
+    f2 = tmp_path / "Show.S01E02.mkv"
+    f3 = tmp_path / "Extra1.mp4"
+    f4 = tmp_path / "Extra2.mp4"
+    for f in (f1, f2, f3, f4):
+        f.write_bytes(b"x" * 1000)
+
+    coord.dest_client.get_torrent_files.return_value = [
+        TorrentFile("Show.S01E01.mkv", 1000, progress=1.0),
+        TorrentFile("Show.S01E02.mkv", 1000, progress=1.0),
+        TorrentFile("Extra1.mp4", 1000, progress=1.0),
+        TorrentFile("Extra2.mp4", 1000, progress=1.0),
+    ]
+
+    ts = TorrentState(
+        source_infohash="mixed_hash",
+        source_name="Show.S01.Mixed",
+        classification_kind="mixed",
+        save_path=str(tmp_path),
+    )
+
+    await coord._do_moving(ts)
+
+    # _rclone_move must be called with include patterns for the mixed batches
+    assert coord._rclone_move.await_count > 0
+    coord.transition.assert_called_once_with(ts, State.RE_ADDING)
