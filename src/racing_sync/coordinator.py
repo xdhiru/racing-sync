@@ -1187,7 +1187,6 @@ class Coordinator:
         while not ssd_has_room(self.cfg, ts.total_bytes):
             await asyncio.sleep(60)
         self.transition(ts, State.QUEUED)
-        await self._do_queued(ts)
 
     # ---- state: QUEUED ----
 

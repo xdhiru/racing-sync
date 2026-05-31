@@ -315,3 +315,30 @@ async def test_coordinator_run_stops_immediately_when_stop_requested():
     assert exit_code == 0
     assert tick_called is True
     coord.shutdown.assert_awaited_once()
+
+@pytest.mark.anyio
+async def test_wait_disk_then_queue_transitions_to_queued_under_download_sem():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.coordinator import Coordinator
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.transition = MagicMock()
+    coord._download_sem = asyncio.Semaphore(1)
+    coord._do_queued = AsyncMock()
+    coord._do_downloading = AsyncMock()
+    coord._do_moving = AsyncMock()
+    coord._do_re_add = AsyncMock()
+
+    ts = TorrentState(source_infohash="disk_hash", state=State.WAITING_DISK)
+
+    def fake_transition(target_ts, new_state):
+        target_ts.state = new_state
+    coord.transition.side_effect = fake_transition
+
+    with patch("racing_sync.coordinator.ssd_has_room", return_value=True):
+        await coord._process_torrent_inner(ts)
+
+    assert coord.transition.call_args_list[0][0][1] == State.QUEUED
+    coord._do_queued.assert_awaited_once_with(ts)
