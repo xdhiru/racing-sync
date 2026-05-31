@@ -250,13 +250,16 @@ class RcloneConfig(BaseModel):
 
 class ClassifierConfig(BaseModel):
     episode_regex: str = r"(?i)\bS\d{1,2}E\d{1,2}\b"
-    _episode_re: re.Pattern[str] = re.compile(r"(?i)\bS\d{1,2}E\d{1,2}\b")
 
     @field_validator("episode_regex")
     @classmethod
     def _valid_regex(cls, v: str) -> str:
         re.compile(v)  # raises if invalid
         return v
+
+    @property
+    def _episode_re(self) -> re.Pattern[str]:
+        return re.compile(self.episode_regex)
 
 
 class TelegramConfig(BaseModel):

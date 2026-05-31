@@ -216,3 +216,35 @@ async def test_do_moving_moves_mixed_content_in_batches(tmp_path: Path):
     # _rclone_move must be called with include patterns for the mixed batches
     assert coord._rclone_move.await_count > 0
     coord.transition.assert_called_once_with(ts, State.RE_ADDING)
+
+
+def test_classifier_config_custom_episode_regex():
+    from racing_sync.config import ClassifierConfig
+
+    default_cfg = ClassifierConfig()
+    assert default_cfg._episode_re.search("Show.S01E05.mkv") is not None
+    assert default_cfg._episode_re.search("Show.1x05.mkv") is None
+
+    custom_cfg = ClassifierConfig(episode_regex=r"(?i)\b\d+x\d+\b")
+    assert custom_cfg._episode_re.pattern == r"(?i)\b\d+x\d+\b"
+    assert custom_cfg._episode_re.search("Show.1x05.mkv") is not None
+    assert custom_cfg._episode_re.search("Show.S01E05.mkv") is None
+
+
+def test_classify_with_custom_episode_regex():
+    cfg = _cfg()
+    # Non-standard episode naming: 1x01
+    files = [TorrentFile("Anime.Show.1x01.1080p.mkv", 500_000_000)]
+
+    # With default regex, not recognized as episode -> movie
+    cls_default = classify(files, cfg)
+    assert cls_default.kind == "movie"
+
+    # Override episode_regex to match 1x01
+    cfg.classifier.episode_regex = r"(?i)\b\d+x\d+\b"
+    assert cfg.is_episode("Anime.Show.1x01.1080p.mkv") is True
+
+    cls_custom = classify(files, cfg)
+    assert cls_custom.kind == "episode"
+    assert len(cls_custom.episodes) == 1
+    assert cls_custom.episodes[0].season == 1 and cls_custom.episodes[0].episode == 1
