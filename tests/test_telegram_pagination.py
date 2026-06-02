@@ -163,3 +163,38 @@ async def test_refresh_live_status_filters_by_hashes():
     coord.dest_client.list_torrents.assert_awaited_once_with(hashes=["hash1", "hash2"])
     assert coord._live["hash1"].progress == 0.8
 
+
+@pytest.mark.anyio
+async def test_send_one_detail_handles_timedelta_retry_after():
+    import asyncio
+    import datetime as dt
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from telegram.error import RetryAfter
+
+    bot = object.__new__(TelegramBot)
+    bot._bot = MagicMock()
+    bot._store = MagicMock()
+    bot._detail_cache = {}
+    bot._detail_queue = asyncio.Queue()
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
+
+    ts = TorrentState(source_infohash="abc123", source_name="Test")
+    bot._store.get.return_value = ts
+    bot._store.get_telegram_message_id.return_value = None
+
+    class MockRetryAfter(RetryAfter):
+        def __init__(self, retry_after):
+            self._mock_retry = retry_after
+            super().__init__(1)
+        @property
+        def retry_after(self):
+            return self._mock_retry
+
+    err = MockRetryAfter(dt.timedelta(seconds=5))
+    bot._bot.send_message = AsyncMock(side_effect=err)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        await bot._send_one_detail("abc123", 0.5)
+        mock_sleep.assert_awaited_once_with(6)
+    assert not bot._detail_queue.empty()
+
