@@ -12,19 +12,16 @@ Endpoints:
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from .coordinator import Coordinator
-from .recovery import reconcile
 from .rclone_ops import ssd_free_bytes
-from .state import State, StateStore
-from .watchdir import WatchDirScanner
+from .recovery import reconcile
+from .state import State
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +62,14 @@ def build_app(coord: Coordinator) -> FastAPI:
     @app.post("/api/recover", dependencies=[Depends(auth)])
     async def recover() -> dict[str, Any]:
         rpt = await reconcile(cfg, dest=coord.dest_client, store=coord.store)
-        return rpt.summary()
+        return {
+            "summary": rpt.summary(),
+            "kept": rpt.kept,
+            "resumed": rpt.resumed,
+            "re_added": rpt.re_added,
+            "orphans": rpt.orphans,
+            "unknowns": rpt.unknowns,
+        }
 
     @app.post("/api/scan-watch", dependencies=[Depends(auth)])
     async def scan_watch() -> dict[str, Any]:
