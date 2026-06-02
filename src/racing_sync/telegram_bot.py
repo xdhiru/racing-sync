@@ -484,7 +484,10 @@ class TelegramBot:
                             infohash[:10], e,
                         )
         except RetryAfter as e:
-            wait_s = int(e.retry_after) + 1
+            if isinstance(e.retry_after, dt.timedelta):
+                wait_s = int(e.retry_after.total_seconds()) + 1
+            else:
+                wait_s = int(e.retry_after) + 1
             log.warning("telegram flood control hit; backing off for %ds", wait_s)
             await asyncio.sleep(wait_s)
             if self._detail_queue is not None:
