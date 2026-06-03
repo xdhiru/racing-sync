@@ -222,21 +222,21 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         than the daemon's RPC since the .torrent file is immutable and
         the daemon version is irrelevant.
         """
-        from .sftp_source import SFTPExporter
+        from ..sftp_source import SFTPExporter
         if not self._sftp_cfg:
             return []
         with SFTPExporter(self._sftp_cfg) as sftp:
             blob = sftp.fetch_torrent(torrent_hash)
         if not blob:
             return []
-        from .watchdir import _bdecode
+        from ..watchdir import _bdecode
         try:
             _, root = _bdecode(blob, 0)
         except Exception as e:  # noqa: BLE001
             log.warning("deluge: failed to bencode .torrent for %s: %s",
                         torrent_hash[:10], e)
             return []
-        info = root.get(b"info")
+        info = root.get(b"info") if isinstance(root, dict) else None
         if not info:
             return []
         files = info.get(b"files")
@@ -249,11 +249,17 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     name=path,
                     size_bytes=int(f.get(b"length", 0)),
                     priority=1,
+                    progress=0.0,
                 ))
             return out
         # Single-file mode
         name = info.get(b"name", b"").decode("utf-8", "replace")
-        return [TorrentFile(name=name, size_bytes=int(info.get(b"length", 0)), priority=1)]
+        return [TorrentFile(
+            name=name,
+            size_bytes=int(info.get(b"length", 0)),
+            priority=1,
+            progress=0.0,
+        )]
 
     async def get_trackers(self, torrent_hash: str) -> list[str]:
         status = await self._rpc("core.get_torrent_status", [torrent_hash, ["trackers"]])
@@ -275,49 +281,37 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         content_layout: str | None = None,
         tags: list[str] | None = None,
     ) -> AddResult:
+        opts: dict[str, Any] = {
+            "download_location": save_path,
+            "add_paused": paused,
+            "seed_mode": skip_check,  # "skip hash check on completion"
+        }
+        if category:
+            opts["label"] = category
+
+        results: list[Any] = []
         if torrent_files:
             # Deluge has add_torrent_file (string of base64 or .torrent path).
             # We pass the bytes directly via base64.
             import base64
-            results: list[Any] = []
             for blob in torrent_files:
                 encoded = base64.b64encode(blob).decode()
-                opts: dict[str, Any] = {
-                    "download_location": save_path,
-                    "add_paused": paused,
-                    "seed_mode": skip_check,  # "skip hash check on completion"
-                }
-                if category:
-                    opts["label"] = category
                 res = await self._rpc(
                     "core.add_torrent_file", [f"{blob[:6].hex()}.torrent", encoded, opts]
                 )
                 results.append(res)
-            return AddResult(
-                hash=str(results[0]) if results and results[0] else None,
-                accepted=bool(results),
-                detail=json.dumps([str(r) for r in results]),
-            )
-
-        if urls:
-            opts: dict[str, Any] = {
-                "download_location": save_path,
-                "add_paused": paused,
-                "seed_mode": skip_check,
-            }
-            if category:
-                opts["label"] = category
-            results: list[Any] = []
+        elif urls:
             for u in urls:
                 res = await self._rpc("core.add_torrent_url", [u, opts])
                 results.append(res)
-            return AddResult(
-                hash=str(results[0]) if results and results[0] else None,
-                accepted=bool(results),
-                detail=json.dumps([str(r) for r in results]),
-            )
+        else:
+            raise ValueError("add_torrent requires urls or torrent_files")
 
-        raise ValueError("add_torrent requires urls or torrent_files")
+        return AddResult(
+            hash=str(results[0]) if results and results[0] else None,
+            accepted=bool(results),
+            detail=json.dumps([str(r) for r in results]),
+        )
 
     async def set_file_priorities(
         self, torrent_hash: str, priorities: dict[str, int]
