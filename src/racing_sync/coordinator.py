@@ -1492,7 +1492,11 @@ class Coordinator:
                 ts.batches_total = len(batches)
                 self.store.upsert(ts)
                 await self._rclone_move(
-                    src_dir, remote, ts, include=batch.include_patterns(),
+                    src_dir,
+                    remote,
+                    ts,
+                    include=batch.include_patterns(),
+                    extra=self.cfg.rclone.batch_move_extra_flags,
                 )
 
         # 6. Delete local content folder on SSD after move
@@ -1502,11 +1506,18 @@ class Coordinator:
 
         self.transition(ts, State.RE_ADDING)
 
-    async def _rclone_move(self, local: Path, remote: str, ts: TorrentState,
-                           *, include: list[str] | None = None) -> None:
+    async def _rclone_move(
+        self,
+        local: Path,
+        remote: str,
+        ts: TorrentState,
+        *,
+        include: list[str] | None = None,
+        extra: list[str] | None = None,
+    ) -> None:
         async with self.move_sem:
-            log.info("rclone move %s -> %s (include=%s)", local, remote, include)
-            res = await move_local_to_remote(self.cfg, local, remote, include=include)
+            log.info("rclone move %s -> %s (include=%s, extra=%s)", local, remote, include, extra)
+            res = await move_local_to_remote(self.cfg, local, remote, include=include, extra=extra)
             if not res.ok:
                 err = res.stderr.strip()
                 last_err = [ln.strip() for ln in err.splitlines() if ln.strip()][-1] if err else f"rc={res.returncode}"
