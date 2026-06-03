@@ -476,15 +476,17 @@ class Coordinator:
             except Exception:  # noqa: BLE001
                 pass
             self.dest_client = None  # type: ignore[assignment]
-        if getattr(self, "prowlarr", None) is not None:
+        prowlarr = getattr(self, "prowlarr", None)
+        if prowlarr is not None:
             try:
-                await self.prowlarr.close()
+                await prowlarr.close()
             except Exception:  # noqa: BLE001
                 pass
             self.prowlarr = None
-        if getattr(self, "sftp", None) is not None:
+        sftp = getattr(self, "sftp", None)
+        if sftp is not None:
             try:
-                self.sftp.close()
+                sftp.close()
             except Exception:  # noqa: BLE001
                 pass
             self.sftp = None
@@ -543,12 +545,14 @@ class Coordinator:
             t.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
-        if getattr(self, "_tg", None) is not None:
-            await self._tg.stop()
-        if getattr(self, "_api_task", None) is not None:
-            self._api_task.cancel()
+        tg = getattr(self, "_tg", None)
+        if tg is not None:
+            await tg.stop()
+        api_task = getattr(self, "_api_task", None)
+        if api_task is not None:
+            api_task.cancel()
             try:
-                await self._api_task
+                await api_task
             except (asyncio.CancelledError, Exception):
                 pass
         if self.prowlarr is not None:
@@ -667,9 +671,9 @@ class Coordinator:
             # Check if any torrent in this release group is already tracked in state store
             existing_ts: TorrentState | None = None
             for t in group:
-                ts = self.store.get(t.infohash)
-                if ts is not None:
-                    existing_ts = ts
+                found_ts = self.store.get(t.infohash)
+                if found_ts is not None:
+                    existing_ts = found_ts
                     break
             if existing_ts is None:
                 matches = self.store.find_by_name(name)
