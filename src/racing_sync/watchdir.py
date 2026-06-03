@@ -49,8 +49,10 @@ def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
     enough for top-level info extraction.
     """
     pos, root = _bdecode(data, 0)
+    if not isinstance(root, dict):
+        raise ValueError("torrent has no root dict")
     info = root.get(b"info")
-    if info is None:
+    if not isinstance(info, dict):
         raise ValueError("torrent has no info dict")
     name = info.get(b"name", b"")
     if isinstance(name, bytes):
@@ -75,9 +77,10 @@ def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
     total = 0
     if pieces is None:
         total = int(info.get(b"length", 0))
-    else:
+    elif isinstance(pieces, list):
         for f in pieces:
-            total += int(f.get(b"length", 0))
+            if isinstance(f, dict):
+                total += int(f.get(b"length", 0))
     # infohash v1 = SHA1 of bencoded info dict
     # We need to re-bencode the info dict at its original position. Easiest:
     # sniff by replaying: bencode re-encoding may differ in key order, but
@@ -94,18 +97,21 @@ def _bdecode(data: bytes, pos: int) -> tuple[int, object]:
         end = data.index(b"e", pos)
         return end + 1, int(data[pos:end])
     if ch == b"l":
-        out = []
+        out_list = []
         while data[pos:pos + 1] != b"e":
             pos, v = _bdecode(data, pos)
-            out.append(v)
-        return pos + 1, out
+            out_list.append(v)
+        return pos + 1, out_list
     if ch == b"d":
-        out: dict[bytes, object] = {}
+        out_dict: dict[bytes, object] = {}
         while data[pos:pos + 1] != b"e":
             pos, k = _bdecode(data, pos)
             pos, v = _bdecode(data, pos)
-            out[k] = v
-        return pos + 1, out
+            if isinstance(k, bytes):
+                out_dict[k] = v
+            elif isinstance(k, str):
+                out_dict[k.encode()] = v
+        return pos + 1, out_dict
     if ch.isdigit():
         colon = data.index(b":", pos)
         length = int(data[pos - 1:colon])
