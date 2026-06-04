@@ -14,9 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Iterable
-
-import aiohttp
+from collections.abc import Iterable
+from typing import Any
 
 from ..config import SourceConfig
 from .abstract import AddResult, Torrent, TorrentClient, TorrentFile
