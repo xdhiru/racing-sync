@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 from .clients.abstract import TorrentFile
 from .config import AppConfig
