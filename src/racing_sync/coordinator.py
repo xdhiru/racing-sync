@@ -58,7 +58,6 @@ class WebUIUnresponsiveError(RuntimeError):
 
 _WEBUI_RETRY_ERRORS = (
     TimeoutError,
-    asyncio.TimeoutError,
     aiohttp.ClientError,
     ConnectionError,
     OSError,
@@ -596,7 +595,7 @@ class Coordinator:
                         "auth still failing after retries; "
                         "backing off for one poll interval: %s", e,
                     )
-                except (asyncio.TimeoutError, TimeoutError) as e:
+                except TimeoutError as e:
                     log.warning(
                         "poll tick timed out (remote client connection dropped/slow); "
                         "backing off for one poll interval: %s", e,
