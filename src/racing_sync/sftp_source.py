@@ -14,7 +14,7 @@ import threading
 from collections.abc import Iterable
 from pathlib import Path
 
-import paramiko
+import paramiko  # type: ignore[import-untyped]
 
 from .config import DelugeSFTPConfig
 

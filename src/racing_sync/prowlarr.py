@@ -145,7 +145,7 @@ class ProwlarrClient:
         if not self._session:
             raise ProwlarrError("not started")
         limit = limit or self._cfg.max_results
-        params = {
+        params: dict[str, str | int] = {
             "t": "search",
             "q": query,
             "limit": limit,
