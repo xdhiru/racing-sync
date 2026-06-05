@@ -80,3 +80,40 @@ def test_find_by_name_extension_matching(tmp_path):
     # Query exact without .mkv
     matches2 = store.find_by_name("Harbor.Lights.S01E06.1080p-Raccoon")
     assert len(matches2) == 1
+
+
+def test_upsert_preserves_created_at(tmp_path):
+    import datetime as dt
+    import time
+    from racing_sync.state import StateStore, TorrentState
+
+    db_path = tmp_path / "test.db"
+    store = StateStore(db_path)
+
+    orig_time = dt.datetime(2025, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
+    ts = TorrentState(
+        source_infohash="hash456",
+        source_name="Test.Release",
+        state=State.QUEUED,
+        created_at=orig_time,
+    )
+    store.upsert(ts)
+
+    loaded = store.get("hash456")
+    assert loaded is not None
+    assert loaded.created_at == orig_time
+
+    # Subsequent upsert with different created_at in memory must NOT overwrite DB created_at
+    newer_time = dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
+    ts2 = TorrentState(
+        source_infohash="hash456",
+        source_name="Test.Release",
+        state=State.DOWNLOADING,
+        created_at=newer_time,
+    )
+    store.upsert(ts2)
+
+    reloaded = store.get("hash456")
+    assert reloaded is not None
+    assert reloaded.state == State.DOWNLOADING
+    assert reloaded.created_at == orig_time
