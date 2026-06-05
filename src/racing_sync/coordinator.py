@@ -504,11 +504,7 @@ class Coordinator:
         the source client within the same cycle.
         """
         now_mono = time.monotonic()
-        if (
-            not force_refresh
-            and hasattr(self, "_source_torrents_cached_at")
-            and (now_mono - self._source_torrents_cached_at) < 10.0
-        ):
+        if not force_refresh and (now_mono - self._source_torrents_cached_at) < 10.0:
             return list(self._source_torrents_cache)
 
         all_torrents = await self.source_client.list_torrents(
