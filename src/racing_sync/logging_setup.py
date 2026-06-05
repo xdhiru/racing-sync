@@ -120,7 +120,8 @@ class HTTPSinkHandler(logging.handlers.QueueHandler):
     """
 
     def __init__(self, cfg: LoggingSinkConfig):
-        super().__init__(queue.Queue(-1))
+        self._q: queue.Queue[logging.LogRecord] = queue.Queue(-1)
+        super().__init__(self._q)
         self._cfg = cfg
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="rs-log-sink", daemon=True)
@@ -143,7 +144,7 @@ class HTTPSinkHandler(logging.handlers.QueueHandler):
 
         while not self._stop.is_set():
             try:
-                record: logging.LogRecord = self.queue.get(timeout=1.0)  # type: ignore[assignment]
+                record = self._q.get(timeout=1.0)
             except queue.Empty:
                 continue
             payload = {
