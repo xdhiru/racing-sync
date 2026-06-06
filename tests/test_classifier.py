@@ -7,6 +7,7 @@ import pytest
 from racing_sync.config import AppConfig
 from racing_sync.classifier import classify
 from racing_sync.clients.abstract import TorrentFile
+from racing_sync.coordinator import Coordinator
 
 
 def _cfg() -> AppConfig:
@@ -248,3 +249,30 @@ def test_classify_with_custom_episode_regex():
     assert cls_custom.kind == "episode"
     assert len(cls_custom.episodes) == 1
     assert cls_custom.episodes[0].season == 1 and cls_custom.episodes[0].episode == 1
+
+
+def test_season_folder_for_security(tmp_path):
+    cfg = _cfg()
+    cfg.dest.save_path = str(tmp_path / "downloads")
+    coord = object.__new__(Coordinator)
+    coord.cfg = cfg
+
+    # Valid season folder
+    files = [
+        TorrentFile("Show.S01/ep1.mkv", 1000),
+        TorrentFile("Show.S01/ep2.mkv", 1000),
+    ]
+    folder = coord._season_folder_for(files, "Show.S01")
+    assert folder == (tmp_path / "downloads" / "Show.S01").resolve()
+
+    # Traversal attempt with ..
+    evil_files = [
+        TorrentFile("../escaped/ep1.mkv", 1000),
+        TorrentFile("../escaped/ep2.mkv", 1000),
+    ]
+    assert coord._season_folder_for(evil_files, "Evil") is None
+
+    # Custom base_path override
+    custom_base = tmp_path / "custom_save_path"
+    folder_custom = coord._season_folder_for(files, "Show.S01", base_path=custom_base)
+    assert folder_custom == (custom_base / "Show.S01").resolve()
