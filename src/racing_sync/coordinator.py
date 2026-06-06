@@ -1376,17 +1376,32 @@ class Coordinator:
         if season_folder:
             await wipe_local_tree(season_folder)
 
-    def _season_folder_for(self, files: list, torrent_name: str) -> Path | None:
+    def _season_folder_for(
+        self,
+        files: list,
+        torrent_name: str,
+        *,
+        base_path: str | Path | None = None,
+    ) -> Path | None:
         if not files:
             return None
+        base = (
+            Path(base_path).resolve()
+            if base_path
+            else Path(self.cfg.dest.save_path).resolve()
+        )
         # The top-most folder path shared by all files
-        first = files[0].name
+        first = files[0].name.replace("\\", "/")
         parts = first.split("/")
         if len(parts) <= 1:
             return None
-        top = parts[0]
-        if all(f.name.startswith(top + "/") for f in files):
-            return Path(self.cfg.dest.save_path) / top
+        top = parts[0].strip()
+        if not top or top in (".", "..") or ".." in top:
+            return None
+        if all(f.name.replace("\\", "/").startswith(top + "/") for f in files):
+            candidate = (base / top).resolve()
+            if candidate != base and candidate.is_relative_to(base):
+                return candidate
         return None
 
     # ---- state: MOVING ----
@@ -1409,8 +1424,14 @@ class Coordinator:
             log.warning("could not delete torrent from client before move: %s", e)
 
         # 2. Separate completed files from incomplete piece-boundary files
-        src_dir = Path(self.cfg.dest.save_path)
-        folder = self._season_folder_for(cls_files, ts.source_name)
+        src_dir = (
+            Path(ts.save_path).resolve()
+            if ts.save_path
+            else Path(self.cfg.dest.save_path).resolve()
+        )
+        folder = self._season_folder_for(
+            cls_files, ts.source_name, base_path=src_dir
+        )
         content_dir = folder if folder and folder.exists() else src_dir
 
         completed_files: list[TorrentFile] = []
