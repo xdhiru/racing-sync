@@ -16,6 +16,7 @@ import logging
 import os
 import shutil
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -109,31 +110,59 @@ async def move_local_to_remote(
     return await run_rclone(cfg, cmd)
 
 
-async def wipe_local_tree(path: Path) -> None:
-    """req #8: after each batch, remove the season folder before the next batch."""
-    if not path.exists():
+def validate_safe_delete_path(
+    path: Path, base_dir: Path | Iterable[Path] | None = None
+) -> None:
+    resolved = path.resolve()
+    if resolved == Path(resolved.anchor) or str(resolved) in ("/", "\\"):
+        raise ValueError(f"refusing to delete filesystem root: {path}")
+    if base_dir is not None:
+        bases = [base_dir] if isinstance(base_dir, Path) else list(base_dir)
+        bases_resolved = [b.resolve() for b in bases]
+        for br in bases_resolved:
+            if resolved == br:
+                raise ValueError(f"refusing to delete base directory: {path}")
+        if not any(resolved.is_relative_to(br) for br in bases_resolved):
+            raise ValueError(
+                f"path {path} is not within allowed base directories: {bases}"
+            )
+
+
+async def wipe_local_tree(
+    path: Path, *, base_dir: Path | Iterable[Path] | None = None
+) -> None:
+    """Remove a directory tree safely, ensuring it is within base_dir and not a filesystem root."""
+    if not path.exists() and not path.is_symlink():
+        return
+    validate_safe_delete_path(path, base_dir=base_dir)
+    if path.is_symlink():
+        path.unlink()
         return
     log.info("wiping local tree: %s", path)
-    # shutil.rmtree is async-incompatible; run in default executor.
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, shutil.rmtree, path, True)
+    await asyncio.to_thread(shutil.rmtree, path, False)
 
 
-async def wipe_local_files(paths: list[Path]) -> None:
+async def wipe_local_files(
+    paths: list[Path], *, base_dir: Path | Iterable[Path] | None = None
+) -> None:
     if not paths:
         return
-    loop = asyncio.get_running_loop()
 
     def _rm(p: Path) -> None:
         try:
-            if p.is_dir():
-                shutil.rmtree(p, ignore_errors=True)
+            if not p.exists() and not p.is_symlink():
+                return
+            validate_safe_delete_path(p, base_dir=base_dir)
+            if p.is_symlink():
+                p.unlink()
+            elif p.is_dir():
+                shutil.rmtree(p, ignore_errors=False)
             elif p.exists():
                 p.unlink()
-        except OSError as e:
+        except Exception as e:
             log.warning("rm %s: %s", p, e)
 
-    await asyncio.gather(*(loop.run_in_executor(None, _rm, p) for p in paths))
+    await asyncio.gather(*(asyncio.to_thread(_rm, p) for p in paths))
 
 
 
