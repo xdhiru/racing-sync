@@ -169,9 +169,17 @@ async def fix_orphan(
         return State.DOWNLOADING.value
 
     if ts.state == State.MOVING:
-        # The torrent was being moved. We assume rclone already ran and the
-        # files now live on the remote. Re-add to fuse.
-        log.info("orphan %s: assuming rclone move completed; will re-add", h)
+        src_path = Path(ts.save_path) if ts.save_path else Path(cfg.dest.save_path)
+        content_exists = (
+            (src_path / ts.source_name).exists()
+            or any(src_path.glob(f"{ts.source_name}*"))
+        )
+        if content_exists:
+            log.info("orphan %s: files still exist on SSD; will resume move", h)
+            return State.MOVING.value
+
+        # Files no longer on SSD; rclone move completed, proceed to re-add to fuse
+        log.info("orphan %s: files moved from SSD; will re-add to fuse", h)
         store.transition(ts, State.RE_ADDING)
         return State.RE_ADDING.value
 

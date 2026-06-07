@@ -1407,17 +1407,12 @@ class Coordinator:
         cls_files = await self.dest_client.get_torrent_files(h)
         cls = classify(cls_files, self.cfg)
 
-        # 1. Remove torrent from VPS2 client BEFORE move begins (delete_files=False).
-        # This closes file handles and stops seeding from the SSD, avoiding I/O errors.
-        log.info(
-            "pausing and deleting torrent %s from VPS2 client before move (delete_files=False)",
-            h[:10],
-        )
+        # 1. Pause torrent on VPS2 client BEFORE move begins to stop active seeding from SSD
+        log.info("pausing torrent %s on VPS2 client before move", h[:10])
         try:
             await self.dest_client.pause(h)
-            await self.dest_client.delete(h, delete_files=False)
         except Exception as e:  # noqa: BLE001
-            log.warning("could not delete torrent from client before move: %s", e)
+            log.warning("could not pause torrent in client before move: %s", e)
 
         # 2. Separate completed files from incomplete piece-boundary files
         src_dir = (
@@ -1516,7 +1511,13 @@ class Coordinator:
                     extra=self.cfg.rclone.batch_move_extra_flags,
                 )
 
-        # 6. Delete local content folder on SSD after move
+        # 6. Delete old torrent from VPS2 client (delete_files=False) before re-adding to FUSE
+        try:
+            await self.dest_client.delete(h, delete_files=False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not delete old torrent from client after move: %s", e)
+
+        # 7. Delete local content folder on SSD after move
         if folder and folder.resolve() != src_dir.resolve() and folder.exists():
             log.info("deleting content folder after move: %s", folder)
             await wipe_local_tree(
