@@ -1371,10 +1371,6 @@ class Coordinator:
         for ep in cur.episodes:
             prio_map[ep.file_name] = 1
         await self.dest_client.set_file_priorities(h, prio_map)
-        # Wipe season folder after each batch (req #8)
-        season_folder = self._season_folder_for(files, ts.source_name)
-        if season_folder:
-            await wipe_local_tree(season_folder)
 
     def _season_folder_for(
         self,
