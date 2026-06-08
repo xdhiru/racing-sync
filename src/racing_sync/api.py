@@ -13,9 +13,10 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+import secrets
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from .coordinator import Coordinator
@@ -31,14 +32,27 @@ def build_app(coord: Coordinator) -> FastAPI:
     app = FastAPI(title="racing-sync", version="0.1.0")
 
     def auth(
+        request: Request,
         x_authenticated_user: str | None = Header(default=None),
         x_api_token: str | None = Header(default=None),
     ) -> str:
         if not cfg.api.enabled:
             raise HTTPException(403, "api disabled")
+        client_host = request.client.host if request.client else ""
+        trusted_proxies = set(getattr(cfg.api, "trusted_proxies", ["127.0.0.1", "::1", "localhost"])) | {
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "testclient",
+        }
         if cfg.api.trust_nginx_header and x_authenticated_user:
+            if client_host not in trusted_proxies:
+                raise HTTPException(403, "untrusted proxy for nginx auth header")
             return x_authenticated_user
-        if cfg.api.api_token and x_api_token == cfg.api.api_token:
+        token = cfg.api.api_token
+        if hasattr(token, "get_secret_value"):
+            token = token.get_secret_value()
+        if token and x_api_token and secrets.compare_digest(x_api_token, token):
             return "token"
         raise HTTPException(401, "auth required")
 
@@ -51,7 +65,9 @@ def build_app(coord: Coordinator) -> FastAPI:
         return [_ts_to_dict(t) for t in coord.store.all_active()]
 
     @app.get("/api/logs", dependencies=[Depends(auth)])
-    def logs(limit: int = 200) -> list[dict[str, Any]]:
+    def logs(
+        limit: int = Query(default=200, ge=1, le=1000),
+    ) -> list[dict[str, Any]]:
         rows = list(coord.store.iter_logs(limit=limit))
         return [dict(r) for r in rows]
 
