@@ -17,6 +17,17 @@ from .classifier import Episode
 log = logging.getLogger(__name__)
 
 
+def escape_rclone_glob(s: str) -> str:
+    """Escape glob metacharacters for literal matching in rclone filter patterns."""
+    res = []
+    for ch in s:
+        if ch in ("*", "?", "[", "]", "{", "}"):
+            res.append(f"\\{ch}")
+        else:
+            res.append(ch)
+    return "".join(res)
+
+
 @dataclass(slots=True)
 class Batch:
     """A contiguous slice of episodes that fits in one SSD round-trip."""
@@ -40,13 +51,8 @@ class Batch:
         return self.episodes[-1].season, self.episodes[-1].episode
 
     def include_patterns(self) -> list[str]:
-        """Rclone --include patterns for this batch's episodes only.
-
-        We include the literal file name. Rclone applies filters in a
-        case-insensitive glob fashion; escaping brackets etc. is overkill
-        for typical release filenames.
-        """
-        return [f"--include={e.file_name}" for e in self.episodes]
+        """Rclone --include patterns for this batch's episodes only with glob escaping."""
+        return [f"--include={escape_rclone_glob(e.file_name)}" for e in self.episodes]
 
 
 def make_batches(

@@ -48,6 +48,19 @@ def test_include_patterns_are_per_file():
     assert pats == ["--include=S01E01.mkv", "--include=S01E02.mkv"]
 
 
+def test_include_patterns_escapes_glob_metacharacters():
+    eps = [
+        Episode("[DummySub] Show [1080p].mkv", 1, 1, 1),
+        Episode("Show?Part{1}*test.mkv", 1, 2, 1),
+    ]
+    b = make_batches(eps, cap_bytes=10)[0]
+    pats = b.include_patterns()
+    assert pats == [
+        r"--include=\[DummySub\] Show \[1080p\].mkv",
+        r"--include=Show\?Part\{1\}\*test.mkv",
+    ]
+
+
 @pytest.mark.anyio
 async def test_do_downloading_iterates_batches():
     from unittest.mock import AsyncMock, MagicMock
