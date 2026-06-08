@@ -518,8 +518,9 @@ class RecoveryConfig(BaseModel):
 class APIConfig(BaseModel):
     enabled: bool = False
     host: str = "127.0.0.1"
-    port: int = 8765
+    port: int = Field(default=8765, ge=1, le=65535)
     trust_nginx_header: bool = True
+    trusted_proxies: list[str] = ["127.0.0.1", "::1", "localhost"]
     api_token: str = ""
 
 

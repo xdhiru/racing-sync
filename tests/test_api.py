@@ -36,3 +36,86 @@ def test_api_recover_returns_dictionary():
         assert data["re_added"] == []
         assert data["orphans"] == []
         assert data["unknowns"] == []
+
+
+def test_auth_rejects_nginx_header_from_untrusted_remote_ip():
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(enabled=True, api_token="", trust_nginx_header=True)
+
+    coord = MagicMock()
+    coord.cfg = cfg
+    coord.store = MagicMock()
+    coord.store.all.return_value = []
+
+    app = build_app(coord)
+    # Remote IP 198.51.100.1 is not in trusted_proxies
+    client = TestClient(app, client=("198.51.100.1", 50000))
+
+    resp = client.get("/api/state", headers={"X-Authenticated-User": "admin"})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "untrusted proxy for nginx auth header"
+
+
+def test_auth_accepts_nginx_header_from_trusted_client():
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(enabled=True, api_token="", trust_nginx_header=True)
+
+    coord = MagicMock()
+    coord.cfg = cfg
+    coord.store = MagicMock()
+    coord.store.all.return_value = []
+
+    app = build_app(coord)
+    # Default TestClient has client.host == "testclient" which is in trusted set
+    client = TestClient(app)
+
+    resp = client.get("/api/state", headers={"X-Authenticated-User": "admin"})
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_auth_token_validation():
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(enabled=True, api_token="topsecret", trust_nginx_header=False)
+
+    coord = MagicMock()
+    coord.cfg = cfg
+    coord.store = MagicMock()
+    coord.store.all.return_value = []
+
+    app = build_app(coord)
+    client = TestClient(app)
+
+    # Missing token
+    assert client.get("/api/state").status_code == 401
+    # Wrong token
+    assert client.get("/api/state", headers={"X-Api-Token": "wrong"}).status_code == 401
+    # Correct token
+    assert client.get("/api/state", headers={"X-Api-Token": "topsecret"}).status_code == 200
+
+
+def test_logs_query_limit_bounds():
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(enabled=True, api_token="secret", trust_nginx_header=False)
+
+    coord = MagicMock()
+    coord.cfg = cfg
+    coord.store = MagicMock()
+    coord.store.iter_logs.return_value = []
+
+    app = build_app(coord)
+    client = TestClient(app)
+    headers = {"X-Api-Token": "secret"}
+
+    # Valid limits
+    resp = client.get("/api/logs?limit=50", headers=headers)
+    assert resp.status_code == 200
+    coord.store.iter_logs.assert_called_with(limit=50)
+
+    # Limit below minimum (0) -> 422
+    resp_under = client.get("/api/logs?limit=0", headers=headers)
+    assert resp_under.status_code == 422
+
+    # Limit above maximum (1001) -> 422
+    resp_over = client.get("/api/logs?limit=1001", headers=headers)
+    assert resp_over.status_code == 422
