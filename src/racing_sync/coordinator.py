@@ -47,7 +47,7 @@ from .rclone_ops import (
 )
 from .sftp_source import SFTPExporter
 from .state import State, StateStore, TorrentState
-from .watchdir import WatchDirScanner
+from .watchdir import WatchDirScanner, WatchItem
 
 log = logging.getLogger(__name__)
 
@@ -614,31 +614,41 @@ class Coordinator:
             await self.shutdown()
         return 0
 
+    async def scan_watch(self) -> list[WatchItem]:
+        """Scan watch directory for releases, ingest into state store, and return items."""
+        if self.watch is None:
+            return []
+        items = await self.watch.scan_once()
+        for item in items:
+            if self.store.get(item.infohash) is None:
+                ts = TorrentState(
+                    source_infohash=item.infohash,
+                    source_name=item.name,
+                    total_bytes=item.size_bytes,
+                    source_announce_url=item.announce_url,
+                    source_tracker=item.announce_url,
+                    cross_seed_blob=item.torrent_bytes,
+                    cross_seed_source="watch-dir",
+                    state=State.NEW,
+                )
+                ts._blob = item.torrent_bytes
+                self.store.upsert(ts)
+                log.info(
+                    "discovered watch-dir release: %s (%s, %d bytes) announce=%s",
+                    item.name,
+                    item.infohash[:10],
+                    item.size_bytes,
+                    item.announce_url,
+                )
+            if self.cfg.watch_dir and self.cfg.watch_dir.delete_after_pickup:
+                await self.watch.delete_picked_up(item)
+        return items
+
     async def _tick(self) -> None:
         """One iteration: poll sources, schedule work."""
         log.debug("tick: enter")
         # 1. Watch dir (req #3)
-        if self.watch is not None:
-            for item in await self.watch.scan_once():
-                if self.store.get(item.infohash) is None:
-                    ts = TorrentState(
-                        source_infohash=item.infohash,
-                        source_name=item.name,
-                        total_bytes=item.size_bytes,
-                        source_announce_url=item.announce_url,
-                        source_tracker=item.announce_url,
-                        cross_seed_blob=item.torrent_bytes,
-                        cross_seed_source="watch-dir",
-                        state=State.NEW,
-                    )
-                    ts._blob = item.torrent_bytes
-                    self.store.upsert(ts)
-                    log.info(
-                        "discovered watch-dir release: %s (%s, %d bytes) announce=%s",
-                        item.name, item.infohash[:10], item.size_bytes, item.announce_url,
-                    )
-                if self.cfg.watch_dir and self.cfg.watch_dir.delete_after_pickup:
-                    await self.watch.delete_picked_up(item)
+        await self.scan_watch()
 
         # 2. Source racing client (req #1 / #2)
         src_torrents = await self._list_source_torrents()

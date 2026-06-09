@@ -91,7 +91,7 @@ def build_app(coord: Coordinator) -> FastAPI:
     async def scan_watch() -> dict[str, Any]:
         if coord.watch is None:
             return {"items": 0, "note": "watch_dir not configured"}
-        items = await coord.watch.scan_once()
+        items = await coord.scan_watch()
         return {"items": len(items)}
 
     class RetryResult(BaseModel):
