@@ -116,9 +116,11 @@ class DelugeSFTPConfig(BaseModel):
     # Public-key auth
     ssh_key_path: Path | None = None
     ssh_key_passphrase: str = ""
+    known_hosts_path: Path | None = None
+    auto_add_host_key: bool = False
     state_dir: Path
 
-    @field_validator("ssh_key_path", mode="before")
+    @field_validator("ssh_key_path", "known_hosts_path", mode="before")
     @classmethod
     def _empty_path_is_none(cls, v: object) -> object:
         """TOML "" coerces to Path(".") which is truthy; treat as None."""

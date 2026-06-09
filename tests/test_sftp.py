@@ -108,3 +108,84 @@ def test_sftp_exporter_fetch_torrent_thread_safety():
 
     assert len(results) == 10
     assert all(r == b"d4:infod4:name4:teste" for r in results)
+
+
+def test_sftp_host_key_policy_defaults_to_reject():
+    import paramiko
+    from unittest.mock import MagicMock, patch
+    from racing_sync.sftp_source import SFTPExporter
+
+    cfg = DelugeSFTPConfig(
+        enabled=True,
+        ssh_host="localhost",
+        ssh_user="x",
+        ssh_password="pwd",
+        state_dir=Path("/tmp"),
+    )
+    exporter = SFTPExporter(cfg)
+
+    with patch("racing_sync.sftp_source._ipv4_socket"), \
+         patch("paramiko.SSHClient") as mock_ssh_cls:
+        client = MagicMock()
+        mock_ssh_cls.return_value = client
+        client.open_sftp.return_value = MagicMock()
+
+        exporter.connect()
+
+        client.load_system_host_keys.assert_called_once()
+        args, _ = client.set_missing_host_key_policy.call_args
+        assert isinstance(args[0], paramiko.RejectPolicy)
+
+
+def test_sftp_host_key_policy_custom_known_hosts():
+    from unittest.mock import MagicMock, patch
+    from racing_sync.sftp_source import SFTPExporter
+
+    known_hosts = Path("/tmp/custom_known_hosts")
+    cfg = DelugeSFTPConfig(
+        enabled=True,
+        ssh_host="localhost",
+        ssh_user="x",
+        ssh_password="pwd",
+        known_hosts_path=known_hosts,
+        state_dir=Path("/tmp"),
+    )
+    exporter = SFTPExporter(cfg)
+
+    with patch("racing_sync.sftp_source._ipv4_socket"), \
+         patch("paramiko.SSHClient") as mock_ssh_cls:
+        client = MagicMock()
+        mock_ssh_cls.return_value = client
+        client.open_sftp.return_value = MagicMock()
+
+        exporter.connect()
+
+        client.load_host_keys.assert_called_once_with(str(known_hosts))
+
+
+def test_sftp_host_key_policy_auto_add_opt_in():
+    import paramiko
+    from unittest.mock import MagicMock, patch
+    from racing_sync.sftp_source import SFTPExporter
+
+    cfg = DelugeSFTPConfig(
+        enabled=True,
+        ssh_host="localhost",
+        ssh_user="x",
+        ssh_password="pwd",
+        auto_add_host_key=True,
+        state_dir=Path("/tmp"),
+    )
+    exporter = SFTPExporter(cfg)
+
+    with patch("racing_sync.sftp_source._ipv4_socket"), \
+         patch("paramiko.SSHClient") as mock_ssh_cls:
+        client = MagicMock()
+        mock_ssh_cls.return_value = client
+        client.open_sftp.return_value = MagicMock()
+
+        exporter.connect()
+
+        args, _ = client.set_missing_host_key_policy.call_args
+        assert isinstance(args[0], paramiko.AutoAddPolicy)
+

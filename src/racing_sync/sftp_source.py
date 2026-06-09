@@ -69,7 +69,17 @@ class SFTPExporter:
         with self._lock:
             self.close()
             self._client = paramiko.SSHClient()
-            self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            if self._cfg.known_hosts_path:
+                self._client.load_host_keys(str(self._cfg.known_hosts_path))
+            else:
+                try:
+                    self._client.load_system_host_keys()
+                except Exception:
+                    pass
+            if self._cfg.auto_add_host_key:
+                self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            else:
+                self._client.set_missing_host_key_policy(paramiko.RejectPolicy())
             kwargs: dict = {
                 "hostname": self._cfg.ssh_host,
                 "port": self._cfg.ssh_port,
