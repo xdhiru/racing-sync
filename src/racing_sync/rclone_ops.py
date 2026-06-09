@@ -62,13 +62,50 @@ def build_move_cmd(cfg: AppConfig, source: Path, dest_remote: str,
     return cmd
 
 
+_SENSITIVE_FLAGS = {
+    "--password",
+    "--rc-pass",
+    "--s3-secret-access-key",
+    "--b2-account-key",
+    "--drive-token",
+    "--dropbox-token",
+    "--onedrive-token",
+}
+
+
+def redact_rclone_cmd(cmd: list[str]) -> str:
+    """Return a sanitized command line string with sensitive flags and values masked."""
+    out: list[str] = []
+    redact_next = False
+    for arg in cmd:
+        if redact_next:
+            out.append("******")
+            redact_next = False
+            continue
+        lower = arg.lower()
+        if any(lower == flag or lower.startswith(flag + "=") for flag in _SENSITIVE_FLAGS) or any(
+            f in lower for f in ("secret", "pass", "token", "apikey", "api_key")
+        ):
+            if "=" in arg:
+                key, _ = arg.split("=", 1)
+                out.append(f"{key}=******")
+            elif arg.startswith("-"):
+                out.append(arg)
+                redact_next = True
+            else:
+                out.append("******")
+        else:
+            out.append(arg)
+    return " ".join(out)
+
+
 async def run_rclone(
     cfg: AppConfig,
     cmd: list[str],
     *,
     timeout: float = 6 * 3600,
 ) -> RcloneResult:
-    log.info("rclone: %s", " ".join(cmd))
+    log.info("rclone: %s", redact_rclone_cmd(cmd))
     t0 = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
