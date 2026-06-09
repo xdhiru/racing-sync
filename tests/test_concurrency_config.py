@@ -185,3 +185,19 @@ def test_app_config_from_toml_falls_back_to_tomli(tmp_path: Path, monkeypatch):
     mock_tomli.load.assert_called_once()
     assert cfg.source.type == "qbittorrent"
 
+
+def test_secret_str_masking_in_repr_and_string_equality():
+    from racing_sync.config import SecretStr, SourceConfig
+
+    sec = SecretStr("mypassword")
+    assert repr(sec) == "SecretStr('**********')"
+    assert sec == "mypassword"
+    assert sec.get_secret_value() == "mypassword"
+    assert f"user:{sec}" == "user:mypassword"
+
+    cfg = SourceConfig(type="qbittorrent", host="localhost", password="mypassword")
+    assert "mypassword" not in repr(cfg)
+    assert "SecretStr('**********')" in repr(cfg)
+    assert cfg.password == "mypassword"
+
+

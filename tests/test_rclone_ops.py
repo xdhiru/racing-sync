@@ -5,6 +5,7 @@ import pytest
 
 from racing_sync.rclone_ops import (
     build_move_cmd,
+    redact_rclone_cmd,
     validate_safe_delete_path,
     wipe_local_tree,
     wipe_local_files,
@@ -73,3 +74,28 @@ async def test_wipe_local_files_safely(tmp_path: Path):
     assert not f1.exists()
     assert not f2.exists()
     assert base.exists()
+
+
+def test_redact_rclone_cmd():
+    cmd = [
+        "rclone",
+        "move",
+        "/local/path",
+        "remote:path",
+        "--password",
+        "supersecret",
+        "--rc-pass=secret123",
+        "--s3-secret-access-key",
+        "keyval",
+        "--normal-flag",
+        "normalval",
+    ]
+    sanitized = redact_rclone_cmd(cmd)
+    assert "supersecret" not in sanitized
+    assert "secret123" not in sanitized
+    assert "keyval" not in sanitized
+    assert "--password ******" in sanitized
+    assert "--rc-pass=******" in sanitized
+    assert "--s3-secret-access-key ******" in sanitized
+    assert "--normal-flag normalval" in sanitized
+
