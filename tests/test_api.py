@@ -1,11 +1,15 @@
-from __future__ import annotations
-
+import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 
 from racing_sync.api import build_app
 from racing_sync.config import APIConfig, AppConfig
 from racing_sync.recovery import RecoveryReport
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
 
 
 def test_api_recover_returns_dictionary():
@@ -119,3 +123,54 @@ def test_logs_query_limit_bounds():
     # Limit above maximum (1001) -> 422
     resp_over = client.get("/api/logs?limit=1001", headers=headers)
     assert resp_over.status_code == 422
+
+
+def test_scan_watch_endpoint():
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(enabled=True, api_token="secret", trust_nginx_header=False)
+
+    coord = MagicMock()
+    coord.cfg = cfg
+    coord.watch = MagicMock()
+    coord.scan_watch = AsyncMock(return_value=[MagicMock(), MagicMock()])
+
+    app = build_app(coord)
+    client = TestClient(app)
+    headers = {"X-Api-Token": "secret"}
+
+    resp = client.post("/api/scan-watch", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json() == {"items": 2}
+    coord.scan_watch.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_coordinator_scan_watch_ingests_and_returns_items(anyio_backend):
+    from unittest.mock import AsyncMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.watchdir import WatchItem
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock(spec=AppConfig)
+    coord.cfg.watch_dir = MagicMock(delete_after_pickup=True)
+    coord.store = MagicMock()
+    coord.store.get.return_value = None
+
+    mock_watch = MagicMock()
+    item = WatchItem(
+        infohash="a" * 40,
+        name="Test.Torrent",
+        size_bytes=1000,
+        announce_url="http://tracker/announce",
+        torrent_bytes=b"torrentdata",
+        torrent_path=MagicMock(),
+    )
+    mock_watch.scan_once = AsyncMock(return_value=[item])
+    mock_watch.delete_picked_up = AsyncMock()
+    coord.watch = mock_watch
+
+    items = await coord.scan_watch()
+    assert items == [item]
+    coord.store.upsert.assert_called_once()
+    mock_watch.delete_picked_up.assert_awaited_once_with(item)
+
