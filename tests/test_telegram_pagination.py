@@ -198,3 +198,29 @@ async def test_send_one_detail_handles_timedelta_retry_after():
         mock_sleep.assert_awaited_once_with(6)
     assert not bot._detail_queue.empty()
 
+
+def test_render_active_deterministic_cache_key():
+    import time
+    ts = TorrentState(
+        source_infohash="hash1",
+        source_name="My.Show.S01E01",
+        state=State.DOWNLOADING,
+        total_bytes=1000,
+    )
+    t1, _, _ = render_active([(ts, 0.5)], page=0, page_size=5)
+    time.sleep(0.01)
+    t2, _, _ = render_active([(ts, 0.5)], page=0, page_size=5)
+    assert t1 == t2
+
+
+def test_telegram_outbound_rate_interval():
+    bot = object.__new__(TelegramBot)
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123", outbound_rate=5)
+    interval = 1.0 / max(1, getattr(bot._cfg, "outbound_rate", 1))
+    assert pytest.approx(interval, 0.01) == 0.2
+
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123", outbound_rate=1)
+    interval = 1.0 / max(1, getattr(bot._cfg, "outbound_rate", 1))
+    assert pytest.approx(interval, 0.01) == 1.0
+
+

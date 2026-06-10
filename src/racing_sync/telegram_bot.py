@@ -189,10 +189,9 @@ def render_active(
     total_pages = max(1, (total_items + page_size - 1) // page_size)
     cur_page = max(0, min(page, total_pages - 1))
 
-    now = dt.datetime.now().strftime("%H:%M:%S")
     if not active:
         return (
-            f"*Active Tasks*\n🕒 {now}\n\n_No active tasks in flight._",
+            "*Active Tasks*\n\n_No active tasks in flight._",
             0,
             1,
         )
@@ -203,7 +202,6 @@ def render_active(
 
     lines = [
         f"*Active Tasks* · *Page {cur_page + 1}/{total_pages}* ({total_items} in flight)",
-        f"🕒 {now}",
         "",
     ]
 
@@ -406,7 +404,7 @@ class TelegramBot:
         arrive in the same chat scroll anyway).
         """
         assert self._detail_queue is not None
-        interval = max(1.0, 1.0 / max(1, getattr(self._cfg, "outbound_rate", 1)))
+        interval = 1.0 / max(0.1, float(getattr(self._cfg, "outbound_rate", 1.0)))
         while True:
             try:
                 # Batch-wait: collect whatever is in the queue up to
