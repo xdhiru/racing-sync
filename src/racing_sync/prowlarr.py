@@ -12,7 +12,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 
 import aiohttp
 
@@ -89,7 +89,7 @@ class ProwlarrClient:
         async with self._refresh_lock:
             if not self._session:
                 raise ProwlarrError("not started")
-            async with self._session.get("/api/v1/indexer") as r:
+            async with self._session.get("api/v1/indexer") as r:
                 r.raise_for_status()
                 data = await r.json()
             self._indexers_by_name.clear()
@@ -150,9 +150,9 @@ class ProwlarrClient:
             "q": query,
             "limit": limit,
             "offset": 0,
-            "cat": "5000",  # standard "movies/TV/etc" category; prowlarr maps
+            "cat": "2000,5000",  # standard movies (2000) and TV (5000) categories
         }
-        path = f"/api/v1/indexer/{indexer.id}/newznab"
+        path = f"api/v1/indexer/{indexer.id}/newznab"
         async with self._session.get(path, params=params) as r:
             r.raise_for_status()
             text = await r.text()
@@ -166,9 +166,29 @@ class ProwlarrClient:
         """Fetch the .torrent bytes for a hit (qBittorrent can accept this directly)."""
         if not self._session:
             raise ProwlarrError("not started")
+        parsed = urlsplit(hit.download_url)
+        if parsed.scheme not in ("http", "https"):
+            raise ProwlarrError(f"invalid or unsafe download_url scheme: {hit.download_url!r}")
+
         async with self._session.get(hit.download_url) as r:
             r.raise_for_status()
-            data = await r.read()
+            content_length = r.headers.get("Content-Length")
+            max_bytes = 20 * 1024 * 1024
+            if content_length and content_length.isdigit() and int(content_length) > max_bytes:
+                raise ProwlarrError(
+                    f"torrent download from {hit.download_url} exceeds max size: {content_length} bytes"
+                )
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in r.content.iter_chunked(64 * 1024):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ProwlarrError(
+                        f"torrent download from {hit.download_url} exceeded max size of {max_bytes} bytes"
+                    )
+                chunks.append(chunk)
+            data = b"".join(chunks)
+
         if not data.startswith(b"d"):
             raise ProwlarrError(
                 f"download from {hit.download_url} did not return a bencoded torrent "
@@ -235,6 +255,11 @@ def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
     """Tiny newznab XML parser. Avoids extra deps; prowlarr responses are simple."""
     import xml.etree.ElementTree as ET
 
+    # Guard against XXE and entity expansion attacks
+    lowered = xml_text.lower()
+    if "<!doctype" in lowered or "<!entity" in lowered:
+        raise ProwlarrError("untrusted XML contains DTD or entity declaration")
+
     hits: list[TorrentHit] = []
     try:
         root = ET.fromstring(xml_text)
@@ -249,6 +274,10 @@ def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
         enclosure = item.find("enclosure")
         attrs = enclosure.attrib if enclosure is not None else {}
         size = int(float(attrs.get("length", "0")))
+        download_url = attrs.get("url", "").strip()
+        parsed_url = urlsplit(download_url)
+        if download_url and parsed_url.scheme not in ("http", "https"):
+            download_url = ""
         hits.append(
             TorrentHit(
                 title=(item.findtext("title") or "").strip(),
@@ -256,7 +285,7 @@ def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
                 indexer=indexer.name,
                 indexer_id=indexer.id,
                 size_bytes=size,
-                download_url=attrs.get("url", ""),
+                download_url=download_url,
                 magnet_url=_first_attr(item, "torznab:attr", name="magneturl"),
                 info_url=item.findtext("comments") or "",
                 publish_date=item.findtext("pubDate") or "",
