@@ -138,3 +138,59 @@ async def test_do_new_watch_dir_skips_prowlarr(tmp_path: Path):
     coord.prowlarr.search_indexers_parallel.assert_not_called()
     assert ts.cross_seed_source == "watch-dir"
     assert ts.state == State.QUEUED
+
+
+def test_parse_newznab_blocks_dtd_entity_expansion():
+    from racing_sync.prowlarr import _parse_newznab, ProwlarrError, Indexer
+
+    idx = Indexer(1, "Indexer", "torrent", True, [])
+    malicious_xml = """<?xml version="1.0"?>
+    <!DOCTYPE lolz [
+     <!ENTITY lol "lol">
+     <!ELEMENT lolz (#PCDATA)>
+     <!ENTITY lol1 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+    ]>
+    <rss><channel><item><title>Test</title></item></channel></rss>"""
+
+    with pytest.raises(ProwlarrError, match="untrusted XML contains DTD or entity declaration"):
+        _parse_newznab(malicious_xml, idx)
+
+
+def test_parse_newznab_sanitizes_unsafe_download_url():
+    from racing_sync.prowlarr import _parse_newznab, Indexer
+
+    idx = Indexer(1, "Indexer", "torrent", True, [])
+    xml = """<?xml version="1.0"?>
+    <rss><channel><item>
+        <title>Safe.Show.S01E01</title>
+        <enclosure url="file:///etc/passwd" length="1234" />
+    </item></channel></rss>"""
+
+    hits = _parse_newznab(xml, idx)
+    assert len(hits) == 1
+    assert hits[0].download_url == ""
+
+
+@pytest.mark.anyio
+async def test_download_torrent_validates_scheme():
+    from racing_sync.prowlarr import ProwlarrClient, ProwlarrError, TorrentHit
+
+    cfg = ProwlarrConfig(enabled=True, base_url="http://localhost:9696", api_key="secret", download_indexer="idx")
+    client = ProwlarrClient(cfg)
+    client._session = MagicMock()
+
+    hit = TorrentHit(
+        title="Test",
+        guid="1",
+        indexer="idx",
+        indexer_id=1,
+        size_bytes=100,
+        download_url="ftp://malicious.host/file.torrent",
+        magnet_url="",
+        info_url="",
+        publish_date="",
+    )
+
+    with pytest.raises(ProwlarrError, match="invalid or unsafe download_url scheme"):
+        await client.download_torrent(hit)
+
