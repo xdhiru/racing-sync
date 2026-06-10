@@ -201,3 +201,67 @@ def test_secret_str_masking_in_repr_and_string_equality():
     assert cfg.password == "mypassword"
 
 
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+from racing_sync.coordinator import Coordinator
+from racing_sync.state import TorrentState, State
+from racing_sync.clients.abstract import AddResult, TorrentFile
+
+
+@pytest.mark.anyio
+async def test_coordinator_wait_disk_stops_on_stop():
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord._stop = True
+    ts = TorrentState(source_infohash="abc", source_name="test", total_bytes=9999999999)
+    # Should exit immediately without hanging
+    await coord._wait_disk_then_queue(ts)
+    assert ts.state != State.QUEUED
+
+
+@pytest.mark.anyio
+async def test_coordinator_do_queued_extracts_infohash_from_blob():
+    from racing_sync.watchdir import _bencode
+    from racing_sync.config import ClassifierConfig
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = "/downloads"
+    coord.cfg.classifier = ClassifierConfig()
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 0
+    coord.cfg.rclone.fuse.mount = "/fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = "/fuse/unsorted"
+    coord.transition = MagicMock()
+
+    coord.dest_client = MagicMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    # add_torrent returns accepted with no hash in result
+    coord.dest_client.add_torrent = AsyncMock(return_value=AddResult(hash=None, accepted=True, detail="ok"))
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[TorrentFile(name="ep1.mkv", size_bytes=1000, priority=1, progress=0.0)])
+    coord.dest_client.set_file_priorities = AsyncMock()
+    coord.dest_client.resume = AsyncMock()
+    coord._await_hash_for_name = AsyncMock()
+
+    # Bencoded sample torrent
+    info_dict = {b"name": b"Test.Episode", b"piece length": 16384, b"pieces": b"", b"length": 1000}
+    torrent_dict = {b"info": info_dict, b"announce": b"http://tracker.com/announce"}
+    sample_blob = _bencode(torrent_dict)
+
+    import hashlib
+    expected_hash = hashlib.sha1(_bencode(info_dict)).hexdigest().lower()
+
+    ts = TorrentState(
+        source_infohash="some_other_hash",
+        source_name="Test.Episode",
+        state=State.QUEUED,
+        save_path="/downloads",
+        cross_seed_blob=sample_blob,
+    )
+
+    await coord._do_queued(ts)
+
+    assert ts.dest_infohash == expected_hash
+    # Ensure _await_hash_for_name was never called because it extracted infohash directly from blob
+    coord._await_hash_for_name.assert_not_called()
+
+
+

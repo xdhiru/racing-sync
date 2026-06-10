@@ -12,6 +12,7 @@ configured in [source] for racing client.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Iterable
@@ -224,8 +225,13 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         from ..sftp_source import SFTPExporter
         if not self._sftp_cfg:
             return []
-        with SFTPExporter(self._sftp_cfg) as sftp:
-            blob = sftp.fetch_torrent(torrent_hash)
+        sftp_cfg = self._sftp_cfg
+
+        def _fetch() -> bytes | None:
+            with SFTPExporter(sftp_cfg) as sftp:
+                return sftp.fetch_torrent(torrent_hash)
+
+        blob = await asyncio.to_thread(_fetch)
         if not blob:
             return []
         from ..watchdir import _bdecode
