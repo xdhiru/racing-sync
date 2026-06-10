@@ -117,3 +117,52 @@ def test_upsert_preserves_created_at(tmp_path):
     assert reloaded is not None
     assert reloaded.state == State.DOWNLOADING
     assert reloaded.created_at == orig_time
+
+
+def test_iter_logs_returns_list_and_handles_pruning(tmp_path):
+    from racing_sync.state import StateStore
+
+    db_path = tmp_path / "test.db"
+    store = StateStore(db_path)
+
+    for i in range(10):
+        store.append_log("INFO", f"msg {i}", source_infohash="hash1")
+
+    logs = store.iter_logs(limit=5)
+    assert isinstance(logs, list)
+    assert len(logs) == 5
+    assert logs[0]["message"] == "msg 9"
+
+    store.prune_logs(max_records=3)
+    remaining = store.iter_logs(limit=10)
+    assert len(remaining) == 3
+
+
+def test_row_to_state_handles_string_and_none_blob(tmp_path):
+    import datetime as dt
+    from racing_sync.state import StateStore, TorrentState, State
+
+    db_path = tmp_path / "test.db"
+    store = StateStore(db_path)
+
+    ts = TorrentState(
+        source_infohash="hash789",
+        source_name="Test.Blob",
+        state=State.QUEUED,
+    )
+    store.upsert(ts)
+
+    # Manually update cross_seed_blob in SQLite to empty string TEXT
+    store._conn.execute(
+        "UPDATE torrent_state SET cross_seed_blob = '' WHERE source_infohash = 'hash789'"
+    )
+
+    loaded = store.get("hash789")
+    assert loaded is not None
+    assert isinstance(loaded.cross_seed_blob, bytes)
+    assert loaded.cross_seed_blob == b""
+
+    # All active query returns blob-less state without error
+    active = store.all_active()
+    assert len(active) == 1
+    assert active[0].cross_seed_blob == b""

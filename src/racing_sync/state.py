@@ -11,6 +11,7 @@ import datetime as dt
 import enum
 import logging
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -205,8 +206,18 @@ CREATE TABLE IF NOT EXISTS run_log (
 """
 
 
+_TORRENT_STATE_COLUMNS_NO_BLOB = (
+    "source_infohash, dest_infohash, source_name, source_tracker, source_announce_url, "
+    "classification_kind, total_bytes, save_path, cross_seed_infohash, cross_seed_source, "
+    "'' AS cross_seed_blob, injected_private_hashes, indexer_first_queried_at, "
+    "indexer_next_retry_at, indexer_attempts, readd_first_attempted_at, "
+    "readd_next_retry_at, readd_attempts, state, batch_index, batches_total, "
+    "last_error, created_at, updated_at, telegram_message_id"
+)
+
+
 class StateStore:
-    """Thin synchronous wrapper over sqlite3.
+    """SQLite-backed persistent store for TorrentState records.
 
     Async callers should run operations in a thread to keep the event loop
     unblocked. The DB is small (hundreds of rows at most) and writes are
@@ -214,17 +225,21 @@ class StateStore:
     """
 
     def __init__(self, db_path: Path):
+        self._lock = threading.RLock()
+        self._log_append_counter = 0
         self._db_path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(db_path), isolation_level=None)
+        self._conn = sqlite3.connect(str(db_path), isolation_level=None, timeout=30.0)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.executescript(SCHEMA)
         self._migrate()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # ---- migrations ----
 
@@ -257,37 +272,40 @@ class StateStore:
     # ---- CRUD ----
 
     def get(self, source_infohash: str) -> TorrentState | None:
-        row = self._conn.execute(
-            "SELECT * FROM torrent_state WHERE source_infohash = ?",
-            (source_infohash,),
-        ).fetchone()
-        return _row_to_state(row) if row else None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM torrent_state WHERE source_infohash = ?",
+                (source_infohash,),
+            ).fetchone()
+            return _row_to_state(row) if row else None
 
     def upsert(self, ts: TorrentState) -> None:
-        ts.updated_at = dt.datetime.now(dt.timezone.utc)
-        row = ts.to_row()
-        cols = ", ".join(row.keys())
-        placeholders = ", ".join(["?"] * len(row))
-        updates = ", ".join(
-            f"{k}=excluded.{k}"
-            for k in row
-            if k not in ("source_infohash", "created_at")
-        )
-        self._conn.execute(
-            f"INSERT INTO torrent_state ({cols}) VALUES ({placeholders}) "
-            f"ON CONFLICT(source_infohash) DO UPDATE SET {updates}",
-            tuple(row.values()),
-        )
+        with self._lock:
+            ts.updated_at = dt.datetime.now(dt.timezone.utc)
+            row = ts.to_row()
+            cols = ", ".join(row.keys())
+            placeholders = ", ".join(["?"] * len(row))
+            updates = ", ".join(
+                f"{k}=excluded.{k}"
+                for k in row
+                if k not in ("source_infohash", "created_at")
+            )
+            self._conn.execute(
+                f"INSERT INTO torrent_state ({cols}) VALUES ({placeholders}) "
+                f"ON CONFLICT(source_infohash) DO UPDATE SET {updates}",
+                tuple(row.values()),
+            )
 
     def list_by_state(self, *states: State) -> list[TorrentState]:
         if not states:
             return []
         qmarks = ",".join(["?"] * len(states))
-        rows = self._conn.execute(
-            f"SELECT * FROM torrent_state WHERE state IN ({qmarks}) ORDER BY updated_at",
-            [s.value for s in states],
-        ).fetchall()
-        return [_row_to_state(r) for r in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state IN ({qmarks}) ORDER BY updated_at",
+                [s.value for s in states],
+            ).fetchall()
+            return [_row_to_state(r) for r in rows]
 
     def list_indexer_ready(self, now: dt.datetime | None = None) -> list[TorrentState]:
         """Rows in WAITING_INDEXER whose retry timer has elapsed.
@@ -296,13 +314,14 @@ class StateStore:
         re-query Indexer.
         """
         now = now or dt.datetime.now(dt.timezone.utc)
-        rows = self._conn.execute(
-            "SELECT * FROM torrent_state WHERE state = 'waiting_indexer' "
-            "AND indexer_next_retry_at != '' "
-            "AND indexer_next_retry_at <= ? ORDER BY indexer_next_retry_at",
-            (now.isoformat(),),
-        ).fetchall()
-        return [_row_to_state(r) for r in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state = 'waiting_indexer' "
+                "AND indexer_next_retry_at != '' "
+                "AND indexer_next_retry_at <= ? ORDER BY indexer_next_retry_at",
+                (now.isoformat(),),
+            ).fetchall()
+            return [_row_to_state(r) for r in rows]
 
     def list_active_inflight(self) -> list[TorrentState]:
         """Rows that should appear in the active-tasks Telegram message.
@@ -310,41 +329,48 @@ class StateStore:
         Excludes DONE and FAILED — those have a settled detail message in
         chat history and should not clutter the live list.
         """
-        rows = self._conn.execute(
-            "SELECT * FROM torrent_state WHERE state NOT IN ('done','failed') "
-            "ORDER BY updated_at DESC"
-        ).fetchall()
-        return [_row_to_state(r) for r in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state NOT IN ('done','failed') "
+                "ORDER BY updated_at DESC"
+            ).fetchall()
+            return [_row_to_state(r) for r in rows]
 
     def get_telegram_message_id(self, source_infohash: str) -> int | None:
-        row = self._conn.execute(
-            "SELECT telegram_message_id FROM torrent_state WHERE source_infohash = ?",
-            (source_infohash,),
-        ).fetchone()
-        if row is None or not row["telegram_message_id"]:
-            return None
-        return int(row["telegram_message_id"])
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT telegram_message_id FROM torrent_state WHERE source_infohash = ?",
+                (source_infohash,),
+            ).fetchone()
+            if row is None or not row["telegram_message_id"]:
+                return None
+            return int(row["telegram_message_id"])
 
     def set_telegram_message_id(self, source_infohash: str, message_id: int) -> None:
-        self._conn.execute(
-            "UPDATE torrent_state SET telegram_message_id = ?, "
-            "updated_at = ? WHERE source_infohash = ?",
-            (message_id, dt.datetime.now(dt.timezone.utc).isoformat(),
-             source_infohash),
-        )
+        with self._lock:
+            self._conn.execute(
+                "UPDATE torrent_state SET telegram_message_id = ?, "
+                "updated_at = ? WHERE source_infohash = ?",
+                (message_id, dt.datetime.now(dt.timezone.utc).isoformat(),
+                 source_infohash),
+            )
 
-    def all_active(self) -> list[TorrentState]:
-        rows = self._conn.execute(
-            "SELECT * FROM torrent_state WHERE state != 'done' AND state != 'failed' "
-            "ORDER BY updated_at"
-        ).fetchall()
-        return [_row_to_state(r) for r in rows]
+    def all_active(self, include_blob: bool = False) -> list[TorrentState]:
+        cols = _TORRENT_STATE_COLUMNS_NO_BLOB if not include_blob else "*"
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {cols} FROM torrent_state WHERE state != 'done' AND state != 'failed' "
+                "ORDER BY updated_at"
+            ).fetchall()
+            return [_row_to_state(r) for r in rows]
 
-    def all(self) -> list[TorrentState]:
-        rows = self._conn.execute(
-            "SELECT * FROM torrent_state ORDER BY updated_at DESC"
-        ).fetchall()
-        return [_row_to_state(r) for r in rows]
+    def all(self, include_blob: bool = True) -> list[TorrentState]:
+        cols = "*" if include_blob else _TORRENT_STATE_COLUMNS_NO_BLOB
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {cols} FROM torrent_state ORDER BY updated_at DESC"
+            ).fetchall()
+            return [_row_to_state(r) for r in rows]
 
     def find_by_name(self, source_name: str) -> list[TorrentState]:
         clean_name = source_name
@@ -352,17 +378,19 @@ class StateStore:
             if clean_name.lower().endswith(ext):
                 clean_name = clean_name[:-len(ext)]
                 break
-        rows = self._conn.execute(
-            "SELECT * FROM torrent_state WHERE source_name = ? OR source_name = ? "
-            "OR source_name LIKE ? ORDER BY updated_at DESC",
-            (source_name, clean_name, f"{clean_name}.%"),
-        ).fetchall()
-        return [_row_to_state(r) for r in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM torrent_state WHERE source_name = ? OR source_name = ? "
+                "OR source_name LIKE ? ORDER BY updated_at DESC",
+                (source_name, clean_name, f"{clean_name}.%"),
+            ).fetchall()
+            return [_row_to_state(r) for r in rows]
 
     def delete(self, source_infohash: str) -> None:
-        self._conn.execute(
-            "DELETE FROM torrent_state WHERE source_infohash = ?", (source_infohash,)
-        )
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM torrent_state WHERE source_infohash = ?", (source_infohash,)
+            )
 
     # ---- convenience ----
 
@@ -379,16 +407,31 @@ class StateStore:
 
     def append_log(self, level: str, message: str,
                    source_infohash: str | None = None) -> None:
-        self._conn.execute(
-            "INSERT INTO run_log (ts, source_infohash, level, message) VALUES (?,?,?,?)",
-            (dt.datetime.now(dt.timezone.utc).isoformat(), source_infohash, level, message),
-        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO run_log (ts, source_infohash, level, message) VALUES (?,?,?,?)",
+                (dt.datetime.now(dt.timezone.utc).isoformat(), source_infohash, level, message),
+            )
+            self._log_append_counter += 1
+            if self._log_append_counter >= 500:
+                self._log_append_counter = 0
+                self._conn.execute(
+                    "DELETE FROM run_log WHERE id NOT IN (SELECT id FROM run_log ORDER BY id DESC LIMIT 5000)"
+                )
 
-    def iter_logs(self, limit: int = 200) -> Iterator[sqlite3.Row]:
-        return self._conn.execute(
-            "SELECT ts, source_infohash, level, message FROM run_log ORDER BY id DESC LIMIT ?",
-            (limit,),
-        )
+    def prune_logs(self, max_records: int = 5000) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM run_log WHERE id NOT IN (SELECT id FROM run_log ORDER BY id DESC LIMIT ?)",
+                (max_records,),
+            )
+
+    def iter_logs(self, limit: int = 200) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT ts, source_infohash, level, message FROM run_log ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
 
 
 def _row_to_state(row: sqlite3.Row) -> TorrentState:
@@ -397,6 +440,17 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
     ra_first = row["readd_first_attempted_at"] if "readd_first_attempted_at" in row.keys() else ""
     ra_next = row["readd_next_retry_at"] if "readd_next_retry_at" in row.keys() else ""
     ra_attempts = row["readd_attempts"] if "readd_attempts" in row.keys() else 0
+
+    blob_raw = row["cross_seed_blob"] if "cross_seed_blob" in row.keys() else b""
+    if not blob_raw:
+        blob_bytes = b""
+    elif isinstance(blob_raw, (bytes, bytearray, memoryview)):
+        blob_bytes = bytes(blob_raw)
+    elif isinstance(blob_raw, str):
+        blob_bytes = blob_raw.encode("utf-8")
+    else:
+        blob_bytes = bytes(blob_raw)
+
     return TorrentState(
         source_infohash=row["source_infohash"],
         dest_infohash=row["dest_infohash"],
@@ -408,7 +462,7 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         save_path=row["save_path"],
         cross_seed_infohash=row["cross_seed_infohash"],
         cross_seed_source=row["cross_seed_source"],
-        cross_seed_blob=bytes(row["cross_seed_blob"]) if row["cross_seed_blob"] else b"",
+        cross_seed_blob=blob_bytes,
         injected_private_hashes=row["injected_private_hashes"],
         indexer_first_queried_at=(
             dt.datetime.fromisoformat(sp_first) if sp_first else None
