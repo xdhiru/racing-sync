@@ -178,18 +178,23 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         """Set per-file priorities.
 
         `priorities` is a {file_name: priority_int}. Internally qB uses file
-        indexes, so we look up the index for each file first.
+        indexes, so we look up the index for each file first, then batch file
+        indices by priority using qBittorrent's piped id format ('0|1|2').
         """
         files = await self.get_torrent_files(torrent_hash)
         index_map = {f.name: i for i, f in enumerate(files)}
+        prio_to_ids: dict[int, list[str]] = {}
         for name, prio in priorities.items():
             idx = index_map.get(name)
             if idx is None:
                 log.warning("set_file_priorities: file %r not in torrent", name)
                 continue
+            prio_to_ids.setdefault(prio, []).append(str(idx))
+
+        for prio, ids in prio_to_ids.items():
             data = aiohttp.FormData()
             data.add_field("hash", torrent_hash)
-            data.add_field("id", str(idx))
+            data.add_field("id", "|".join(ids))
             data.add_field("priority", str(prio))
             async with await self.request(
                 "POST", "/api/v2/torrents/filePrio", data=data
