@@ -1042,7 +1042,7 @@ class Coordinator:
                 )
                 if dl_hits and (
                     dl_hits[0].title.lower() == ql
-                    or abs(dl_hits[0].size_bytes - ts.total_bytes) <= max(1024 * 1024 * 50, int(ts.total_bytes * 0.02))
+                    or abs(dl_hits[0].size_bytes - ts.total_bytes) <= min(1024 * 1024 * 50, int(ts.total_bytes * 0.02))
                 ):
                     best_dl = dl_hits[0]
                     try:
@@ -1067,7 +1067,7 @@ class Coordinator:
                 if download_idx and idx_name == download_idx.name.lower():
                     continue
                 for hit in hits:
-                    if hit.title.lower() == ts.source_name.lower() or abs(hit.size_bytes - ts.total_bytes) <= max(1024 * 1024 * 50, int(ts.total_bytes * 0.02)):
+                    if hit.title.lower() == ts.source_name.lower() or abs(hit.size_bytes - ts.total_bytes) <= min(1024 * 1024 * 50, int(ts.total_bytes * 0.02)):
                         try:
                             cross_blob = await self.prowlarr.download_torrent(hit)
                             from .watchdir import _bencoded_info_hash

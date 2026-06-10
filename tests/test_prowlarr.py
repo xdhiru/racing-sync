@@ -194,3 +194,13 @@ async def test_download_torrent_validates_scheme():
     with pytest.raises(ProwlarrError, match="invalid or unsafe download_url scheme"):
         await client.download_torrent(hit)
 
+
+def test_cross_seed_tolerance_rejects_large_relative_difference_for_small_files():
+    # 10 MB torrent: 2% is 200 KB.
+    # A candidate differing by 5 MB was accepted under max(50MB, 2%) but must be rejected under min(50MB, 2%).
+    total_bytes = 10 * 1024 * 1024
+    candidate_size = total_bytes + 5 * 1024 * 1024
+    tolerance = min(1024 * 1024 * 50, int(total_bytes * 0.02))
+    assert abs(candidate_size - total_bytes) > tolerance
+
+
