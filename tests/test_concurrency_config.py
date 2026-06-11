@@ -264,4 +264,46 @@ async def test_coordinator_do_queued_extracts_infohash_from_blob():
     coord._await_hash_for_name.assert_not_called()
 
 
+@pytest.mark.anyio
+async def test_late_cross_seeds_handles_none_detail_and_expires_failures():
+    from racing_sync.clients.abstract import Torrent
+    import datetime as dt
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.rclone.fuse.mount = "/fuse"
+    coord._target_mount_for = MagicMock(return_value=Path("/fuse"))
+    coord.dest_client = MagicMock()
+    coord.store = MagicMock()
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=b"d8:announce7:http...e")
+    coord._failed_late_cross_seeds = {}
+
+    # add_torrent returns accepted=False and detail=None
+    coord.dest_client.add_torrent = AsyncMock(return_value=AddResult(hash=None, accepted=False, detail=None))
+    coord.dest_client.get_torrent = AsyncMock(return_value=None)
+
+    ts = TorrentState(
+        source_infohash="src1",
+        source_name="Movie.Title",
+        injected_private_hashes="",
+    )
+    group = [Torrent(hash="late1", name="Movie.Title", category="", save_path="", size_bytes=1000, state="seeding", progress=1.0)]
+
+    # Run injection - must not raise AttributeError: 'NoneType' object has no attribute 'lower'
+    await coord._check_and_inject_late_cross_seeds(ts, group)
+
+    assert "late1" in coord._failed_late_cross_seeds
+
+    # Simulate 31 minutes passing
+    coord._failed_late_cross_seeds["late1"] = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=31)
+
+    # Now add_torrent succeeds with detail=None
+    coord.dest_client.add_torrent = AsyncMock(return_value=AddResult(hash="late1", accepted=True, detail=None))
+    await coord._check_and_inject_late_cross_seeds(ts, group)
+
+    assert "late1" in ts.injected_private_hashes
+    assert "late1" not in coord._failed_late_cross_seeds
+
+
+
 

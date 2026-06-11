@@ -356,6 +356,7 @@ class Coordinator:
     _shutdown_done: bool = field(default=False, init=False)
     _source_torrents_cache: list[Torrent] = field(default_factory=list, init=False)
     _source_torrents_cached_at: float = field(default=0.0, init=False)
+    _failed_late_cross_seeds: dict[str, dt.datetime] = field(default_factory=dict, init=False)
 
     @property
     def download_sem(self) -> asyncio.Semaphore:
@@ -1693,7 +1694,7 @@ class Coordinator:
             tags=["racing", "fuse"],
         )
         already_exists = False
-        if not res.accepted and (res.detail == "Fails." or "already" in res.detail.lower()):
+        if not res.accepted and (res.detail == "Fails." or "already" in (res.detail or "").lower()):
             try:
                 dest_st = await self.dest_client.get_torrent(target_hash)
                 if dest_st is not None:
@@ -1749,7 +1750,7 @@ class Coordinator:
                     except Exception as e:  # noqa: BLE001
                         log.debug("could not check dest client for %s: %s", h[:10], e)
 
-                if res.accepted or already_exists or "already" in res.detail.lower():
+                if res.accepted or already_exists or "already" in (res.detail or "").lower():
                     injected.append(h)
                     if already_exists:
                         log.info("watch-dir torrent %s already exists on dest client; marking as injected", h[:10])
@@ -1805,7 +1806,7 @@ class Coordinator:
                     except Exception as e:  # noqa: BLE001
                         log.debug("could not check dest client for %s: %s", t.infohash[:10], e)
 
-                if not res.accepted and not already_exists and "already" not in res.detail.lower():
+                if not res.accepted and not already_exists and "already" not in (res.detail or "").lower():
                     log.warning(
                         "re-inject: add %s rejected: %s",
                         t.infohash[:10], res.detail,
@@ -1847,10 +1848,14 @@ class Coordinator:
         changed = False
 
         if not hasattr(self, "_failed_late_cross_seeds"):
-            self._failed_late_cross_seeds: set[str] = set()
+            self._failed_late_cross_seeds = {}
+
+        now_utc = dt.datetime.now(dt.timezone.utc)
 
         for t in new_torrents:
-            if t.infohash.lower() in self._failed_late_cross_seeds:
+            h_low = t.infohash.lower()
+            failed_at = self._failed_late_cross_seeds.get(h_low)
+            if failed_at and (now_utc - failed_at).total_seconds() < 1800:
                 continue
 
             log.info(
@@ -1887,7 +1892,7 @@ class Coordinator:
                     except Exception as e:  # noqa: BLE001
                         log.debug("could not check dest client for %s: %s", t.infohash[:10], e)
 
-                if res.accepted or already_exists or "already" in res.detail.lower():
+                if res.accepted or already_exists or "already" in (res.detail or "").lower():
                     if already_exists:
                         log.info(
                             "late cross-seed %s (%s) already exists on dest client; marking as injected",
@@ -1900,15 +1905,21 @@ class Coordinator:
                         )
                     current_injected.append(t.infohash)
                     changed = True
+                    self._failed_late_cross_seeds.pop(h_low, None)
                 else:
                     log.warning(
                         "late cross-seed: add %s rejected by dest client: %s",
                         t.infohash[:10], res.detail,
                     )
-                    self._failed_late_cross_seeds.add(t.infohash.lower())
+                    self._failed_late_cross_seeds[h_low] = now_utc
+                    if len(self._failed_late_cross_seeds) > 5000:
+                        cutoff = now_utc - dt.timedelta(minutes=30)
+                        self._failed_late_cross_seeds = {
+                            k: v for k, v in self._failed_late_cross_seeds.items() if v >= cutoff
+                        }
             except Exception as e:  # noqa: BLE001
                 log.warning("late cross-seed: add %s failed: %s", t.infohash[:10], e)
-                self._failed_late_cross_seeds.add(t.infohash.lower())
+                self._failed_late_cross_seeds[h_low] = now_utc
 
         if changed:
             ts.injected_private_hashes = ",".join(dict.fromkeys(current_injected))
