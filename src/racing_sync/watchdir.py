@@ -152,15 +152,32 @@ class WatchDirScanner:
         self._cfg = cfg
         self._prowlarr = prowlarr
         self._seen: set[str] = set()  # infohashes already picked up
+        self._file_cache: dict[Path, tuple[float, int, str, str, int, str, bytes]] = {}
 
     async def scan_once(self) -> list[WatchItem]:
         out: list[WatchItem] = []
+        current_files: set[Path] = set()
         for entry in sorted(Path(self._cfg.path).glob(self._cfg.glob)):
+            if not entry.is_file():
+                continue
+            current_files.add(entry)
             try:
-                infohash, name, size, announce, data = parse_torrent_file(entry)
+                st = entry.stat()
+                mtime, fsize = st.st_mtime, st.st_size
+                if fsize == 0:
+                    continue
+                cached = self._file_cache.get(entry)
+                if cached and cached[0] == mtime and cached[1] == fsize:
+                    infohash, name, size, announce, data = (
+                        cached[2], cached[3], cached[4], cached[5], cached[6]
+                    )
+                else:
+                    infohash, name, size, announce, data = parse_torrent_file(entry)
+                    self._file_cache[entry] = (mtime, fsize, infohash, name, size, announce, data)
             except Exception as e:  # noqa: BLE001
                 log.warning("watch-dir: skipping %s (%s)", entry, e)
                 continue
+
             if infohash in self._seen:
                 continue
             self._seen.add(infohash)
@@ -178,6 +195,11 @@ class WatchDirScanner:
                 "watch-dir picked up: %s (%s) announce=%s",
                 name, infohash[:10], announce,
             )
+
+        # Prune deleted files from cache
+        for k in set(self._file_cache.keys()) - current_files:
+            self._file_cache.pop(k, None)
+
         return out
 
     async def delete_picked_up(self, item: WatchItem) -> None:

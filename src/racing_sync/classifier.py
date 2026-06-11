@@ -9,6 +9,7 @@ We also reject single-file torrents (movies) larger than `skip_movie_larger_than
 
 from __future__ import annotations
 
+import functools
 import logging
 import re
 from collections.abc import Iterable
@@ -46,12 +47,18 @@ class Classification:
 EP_RE = re.compile(r"(?i)\bS(\d{1,2})E(\d{1,2})\b")
 
 
+@functools.lru_cache(maxsize=128)
+def _compile_pattern(pattern_str: str) -> re.Pattern[str]:
+    return re.compile(pattern_str)
+
+
+@functools.lru_cache(maxsize=2048)
 def parse_episode(name: str, regex: re.Pattern[str] | str | None = None) -> tuple[int, int] | None:
     """Return (season, episode) parsed from filename, or None."""
     if regex is None:
         pattern = EP_RE
     elif isinstance(regex, str):
-        pattern = re.compile(regex)
+        pattern = _compile_pattern(regex)
     else:
         pattern = regex
 
