@@ -433,3 +433,32 @@ async def test_re_inject_watch_dir_torrents(tmp_path: Path):
     assert coord.dest_client.add_torrent.await_count == 2
     injected = ts.injected_private_hashes.split(",")
     assert len(injected) == 2
+
+
+@pytest.mark.anyio
+async def test_watchdir_scanner_caches_by_mtime_and_size(tmp_path: Path):
+    from unittest.mock import patch
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    tfile = watch_dir / "sample.torrent"
+    raw_data = _create_sample_torrent_data("Cached.Release", 4000)
+    tfile.write_bytes(raw_data)
+
+    empty_file = watch_dir / "empty.torrent"
+    empty_file.write_bytes(b"")
+
+    cfg = WatchDirConfig(path=watch_dir, glob="*.torrent", delete_after_pickup=False)
+    scanner = WatchDirScanner(cfg, prowlarr=None)
+
+    # First scan: picks up sample.torrent, skips 0-byte empty.torrent
+    items = await scanner.scan_once()
+    assert len(items) == 1
+    assert items[0].name == "Cached.Release"
+    assert tfile in scanner._file_cache
+
+    # Second scan: file_cache should be used without calling parse_torrent_file again
+    with patch("racing_sync.watchdir.parse_torrent_file") as mock_parse:
+        items2 = await scanner.scan_once()
+        assert len(items2) == 0  # already seen
+        mock_parse.assert_not_called()
+
