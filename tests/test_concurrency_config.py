@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import pytest
 from racing_sync.config import AppConfig
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
 
 
 def test_concurrency_defaults():
@@ -303,6 +309,55 @@ async def test_late_cross_seeds_handles_none_detail_and_expires_failures():
 
     assert "late1" in ts.injected_private_hashes
     assert "late1" not in coord._failed_late_cross_seeds
+
+
+@pytest.mark.anyio
+async def test_process_torrent_handles_illegal_transition_to_failed():
+    coord = object.__new__(Coordinator)
+    coord.store = MagicMock()
+    coord.store.transition.side_effect = ValueError("illegal transition: done -> failed")
+    coord._notify_telegram = AsyncMock()
+
+    # ts is in DONE state, which has no legal transition to FAILED
+    ts = TorrentState(source_infohash="h1", source_name="DoneItem", state=State.DONE)
+
+    async def raise_boom(_):
+        raise RuntimeError("boom!")
+
+    coord._process_torrent_inner = raise_boom
+
+    # Must catch ValueError from check_transition(DONE -> FAILED) and not crash
+    await coord._process_torrent(ts)
+
+    coord.store.upsert.assert_called_once_with(ts)
+    assert ts.last_error == "boom!"
+    coord.store.append_log.assert_called_once_with("ERROR", "boom!", "h1")
+    coord._notify_telegram.assert_awaited_once_with(ts)
+
+
+@pytest.mark.anyio
+async def test_wait_for_completion_stall_timeout():
+    from racing_sync.clients.abstract import Torrent
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.general.download_stall_timeout_seconds = 0.05
+    coord.cfg.general.dest_poll_interval = 0.01
+    coord._stop = False
+    coord._live = {"h1": MagicMock()}
+
+    ts = TorrentState(source_infohash="h1", source_name="StalledItem", state=State.DOWNLOADING)
+
+    # Torrent stays at 50%
+    stalled_torrent = Torrent(
+        hash="h1", name="StalledItem", category="", save_path="", size_bytes=1000, state="downloading", progress=0.5
+    )
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=stalled_torrent)
+
+    with pytest.raises(TimeoutError, match="stalled"):
+        await coord._wait_for_completion(ts)
+
 
 
 

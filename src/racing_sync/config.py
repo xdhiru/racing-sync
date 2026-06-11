@@ -557,6 +557,7 @@ class GeneralConfig(BaseModel):
     # Optional overrides if specified under [general]
     max_active_downloads: int | None = Field(default=None, ge=1)
     max_concurrent_moves: int | None = Field(default=None, ge=1)
+    download_stall_timeout_seconds: int = Field(default=0, ge=0)
 
 
 class AppConfig(BaseModel):

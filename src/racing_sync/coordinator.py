@@ -844,7 +844,15 @@ class Coordinator:
         except Exception as e:  # noqa: BLE001
             log.exception("worker failed for %s", ts.source_infohash[:10])
             if ts.state != State.FAILED:
-                self.transition(ts, State.FAILED, error=str(e)[:500])
+                try:
+                    self.transition(ts, State.FAILED, error=str(e)[:500])
+                except ValueError as ve:
+                    log.warning(
+                        "could not transition %s (%s) to FAILED: %s",
+                        ts.source_infohash[:10], ts.state.value, ve,
+                    )
+                    ts.last_error = str(e)[:500]
+                    self.store.upsert(ts)
             self.store.append_log("ERROR", str(e), ts.source_infohash)
             await self._notify_telegram(ts)
 
@@ -1360,6 +1368,11 @@ class Coordinator:
     async def _wait_for_completion(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
         last_log = 0.0
+        last_progress = 0.0
+        last_progress_time = time.monotonic()
+        last_stall_warn = 0.0
+        stall_timeout = getattr(self.cfg.general, "download_stall_timeout_seconds", 0)
+
         while not self._stop:
             t = await self.dest_client.get_torrent(h)
             if t is None:
@@ -1370,6 +1383,23 @@ class Coordinator:
                 log.info("download %s: %.1f%% (%d MB)",
                          ts.source_name, t.progress * 100, t.size_bytes // (1024 * 1024))
                 last_log = now
+
+            if t.progress > last_progress:
+                last_progress = t.progress
+                last_progress_time = now
+            elif t.progress < 0.999:
+                stalled_for = now - last_progress_time
+                if stall_timeout > 0 and stalled_for > stall_timeout:
+                    raise TimeoutError(
+                        f"download {ts.source_name} stalled at {t.progress * 100:.1f}% for {int(stalled_for)}s"
+                    )
+                if stalled_for > 900 and now - last_stall_warn > 900:
+                    log.warning(
+                        "download %s may be stalled: progress has remained at %.1f%% for %dm",
+                        ts.source_name, t.progress * 100, int(stalled_for / 60)
+                    )
+                    last_stall_warn = now
+
             if t.is_complete():
                 return
             await asyncio.sleep(self.cfg.general.dest_poll_interval)
