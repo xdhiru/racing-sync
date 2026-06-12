@@ -14,6 +14,41 @@ from .coordinator import Coordinator
 from .logging_setup import setup_logging
 
 
+async def _runner(coord: Coordinator) -> int:
+    log = logging.getLogger("racing_sync")
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.create_task(coord.run())
+
+    def _signal_handler(*_args: object) -> None:
+        log.info("Signal received, stopping...")
+        coord.request_stop()
+        if not main_task.done():
+            loop.call_soon_threadsafe(main_task.cancel)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except (NotImplementedError, RuntimeError):
+            try:
+                signal.signal(sig, _signal_handler)
+            except (ValueError, OSError):
+                pass
+
+    try:
+        res = await main_task
+        return int(res or 0)
+    except asyncio.CancelledError:
+        return 130
+    finally:
+        if not main_task.done():
+            main_task.cancel()
+            try:
+                await main_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await coord.shutdown()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="racing-sync")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -36,38 +71,10 @@ def main(argv: list[str] | None = None) -> int:
     log.info("starting racing-sync")
 
     coord = Coordinator(cfg)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    main_task = None
-    
-    def _signal_handler(*_args: object) -> None:
-        nonlocal main_task
-        log.info("Signal received, stopping...")
-        coord.request_stop()
-        if main_task and not main_task.done():
-            loop.call_soon_threadsafe(main_task.cancel)
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _signal_handler)
-        except (NotImplementedError, RuntimeError):
-            try:
-                signal.signal(sig, _signal_handler)
-            except (ValueError, OSError):
-                pass
-
     try:
-        main_task = loop.create_task(coord.run())
-        return loop.run_until_complete(main_task)
+        return asyncio.run(_runner(coord))
     except KeyboardInterrupt:
         return 130
-    finally:
-        if main_task and not main_task.done():
-            main_task.cancel()
-        loop.run_until_complete(coord.shutdown())
-        loop.close()
-    return 0
 
 
 if __name__ == "__main__":

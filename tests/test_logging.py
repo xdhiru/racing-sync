@@ -39,8 +39,8 @@ def test_http_sink_handler_posts_log():
                 break
             time.sleep(0.05)
 
-        handler._stop.set()
-        handler._thread.join(timeout=2.0)
+        handler.close()
+        assert not handler._thread.is_alive()
 
         assert mock_urlopen.called
         req = mock_urlopen.call_args[0][0]
