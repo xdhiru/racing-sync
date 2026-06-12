@@ -1281,21 +1281,22 @@ class Coordinator:
         ts.classification_kind = cls.kind
 
         # Apply batch file priorities for seasons
-        if cls.kind in ("season", "mixed"):
+        if cls.kind in ("season", "mixed") and cls.episodes:
             from .classifier import parse_episode  # local import to avoid cycles
             episodes = [e for e in cls.episodes]
             cap = ssd_max_inflight_bytes(self.cfg)
             batches = make_batches(episodes, cap_bytes=cap)
             ts.batches_total = len(batches)
             ts.batch_index = 0
-            # First batch only: priority 1; rest: 0
-            first = batches[0]
-            prio_map = {f.name: 0 for f in files}
-            for ep in first.episodes:
-                prio_map[ep.file_name] = 1
-            await self.dest_client.set_file_priorities(
-                ts.dest_infohash or ts.source_infohash, prio_map,
-            )
+            if batches:
+                # First batch only: priority 1; rest: 0
+                first = batches[0]
+                prio_map = {f.name: 0 for f in files}
+                for ep in first.episodes:
+                    prio_map[ep.file_name] = 1
+                await self.dest_client.set_file_priorities(
+                    ts.dest_infohash or ts.source_infohash, prio_map,
+                )
 
         # Skip movies that are too big (req #7)
         if should_skip_movie(cls, self.cfg):
@@ -1530,7 +1531,7 @@ class Coordinator:
                         local = folder / cls.single_file
                     else:
                         raise FileNotFoundError(f"completed {cls.kind} file not found on SSD: {local}")
-            elif cls.kind in ("season", "unknown"):
+            elif cls.kind in ("season", "unknown") or (cls.kind == "movie" and not cls.single_file):
                 if folder and folder.exists():
                     local = folder
                 elif (src_dir / ts.source_name).exists():
