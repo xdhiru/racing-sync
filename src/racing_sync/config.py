@@ -54,7 +54,7 @@ class NginxAuthConfig(BaseModel):
     `url = ""` entirely. Mode 2 is for unusual setups.
     """
 
-    mode: Literal["basic", "form_post", "off"] = "basic"
+    mode: Literal["basic", "form_post", "off"] = "off"
     # Mode 2 only: the POST endpoint.
     url: str = ""
     # Mode 2 only: HTML form field names.
@@ -125,7 +125,7 @@ class DelugeSFTPConfig(BaseModel):
 
     enabled: bool = False
     ssh_host: str = "127.0.0.1"
-    ssh_port: int = 22
+    ssh_port: int = Field(default=22, ge=1, le=65535)
     ssh_user: str = "deluge"
     # Plain password auth (used only when no key file is provided).
     ssh_password: SecretStr = SecretStr("")
@@ -310,6 +310,17 @@ class TelegramConfig(BaseModel):
     # Number of active tasks displayed per page in the status message (default: 5)
     page_size: int = Field(default=5, ge=1)
 
+    @model_validator(mode="after")
+    def _validate(self) -> "TelegramConfig":
+        if self.enabled:
+            token = self.bot_token.get_secret_value().strip()
+            if not token or token.upper() in ("CHANGE_ME", "YOUR_BOT_TOKEN"):
+                raise ValueError("telegram.bot_token is required and cannot be a placeholder when enabled")
+            chat = self.chat_id.strip()
+            if not chat or chat.upper() in ("CHANGE_ME", "YOUR_CHAT_ID"):
+                raise ValueError("telegram.chat_id is required and cannot be a placeholder when enabled")
+        return self
+
 
 class LoggingSinkConfig(BaseModel):
     enabled: bool = False
@@ -318,6 +329,13 @@ class LoggingSinkConfig(BaseModel):
     forward_min_level: Literal[
         "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
     ] = "INFO"
+
+    @model_validator(mode="after")
+    def _validate(self) -> "LoggingSinkConfig":
+        if self.enabled:
+            if not self.url or not self.url.strip().startswith(("http://", "https://")):
+                raise ValueError("logging_sink.url must be a valid http(s) URL when enabled")
+        return self
 
 
 class WatchDirConfig(BaseModel):
@@ -411,9 +429,9 @@ class ProwlarrConfig(BaseModel):
     # calls the indexer (it's case-sensitive).
     download_indexer: str = ""
     # Timeout for HTTP calls to prowlarr
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
     # How many results to consider from a search
-    max_results: int = 20
+    max_results: int = Field(default=20, ge=1, le=1000)
     # Tracker substring → indexer name map
     tracker_map: ProwlarrTrackerMap = ProwlarrTrackerMap()
     # Announce URL substrings that identify torrents belonging to the download indexer
@@ -443,8 +461,9 @@ class ProwlarrConfig(BaseModel):
         if self.enabled:
             if not self.base_url.startswith(("http://", "https://")):
                 raise ValueError("prowlarr.base_url must start with http(s)://")
-            if not self.api_key:
-                raise ValueError("prowlarr.api_key required when enabled")
+            key = self.api_key.get_secret_value().strip() if isinstance(self.api_key, SecretStr) else str(self.api_key).strip()
+            if not key or key.upper() in ("CHANGE_ME", "YOUR_PROWLARR_API_KEY"):
+                raise ValueError("prowlarr.api_key required and cannot be a placeholder when enabled")
             if not self.download_indexer:
                 raise ValueError(
                     "prowlarr.download_indexer required when enabled. "
@@ -545,6 +564,14 @@ class APIConfig(BaseModel):
     trust_nginx_header: bool = True
     trusted_proxies: list[str] = ["127.0.0.1", "::1", "localhost"]
     api_token: SecretStr = SecretStr("")
+
+    @model_validator(mode="after")
+    def _validate(self) -> "APIConfig":
+        if self.enabled and self.api_token:
+            token = self.api_token.get_secret_value().strip()
+            if token.upper() in ("CHANGE_ME", "YOUR_API_TOKEN"):
+                raise ValueError("api.api_token cannot be a placeholder when enabled")
+        return self
 
 
 class GeneralConfig(BaseModel):

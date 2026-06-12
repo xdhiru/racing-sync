@@ -281,7 +281,7 @@ prefer_prowlarr_result = true
 # ============================================================
 
 [prowlarr]
-enabled = true
+enabled = false
 base_url = "http://127.0.0.1:9696"
 api_key = "CHANGE_ME"
 # Indexer used for SSD downloads and cross-seed searches. Must match
