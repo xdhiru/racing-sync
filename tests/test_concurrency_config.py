@@ -359,6 +359,53 @@ async def test_wait_for_completion_stall_timeout():
         await coord._wait_for_completion(ts)
 
 
+def test_config_strict_validations():
+    from pydantic import ValidationError
+    from racing_sync.config import (
+        NginxAuthConfig,
+        DelugeSFTPConfig,
+        ProwlarrConfig,
+        TelegramConfig,
+        LoggingSinkConfig,
+        APIConfig,
+    )
 
+    # 1. Nginx auth mode defaults to "off"
+    nginx = NginxAuthConfig()
+    assert nginx.mode == "off"
 
+    # 2. DelugeSFTP port bounds
+    with pytest.raises(ValidationError):
+        DelugeSFTPConfig(state_dir=Path("/srv/deluge"), ssh_port=0)
+    with pytest.raises(ValidationError):
+        DelugeSFTPConfig(state_dir=Path("/srv/deluge"), ssh_port=70000)
+    assert DelugeSFTPConfig(state_dir=Path("/srv/deluge"), ssh_port=2222).ssh_port == 2222
 
+    # 3. Prowlarr bounds and placeholders
+    with pytest.raises(ValidationError):
+        ProwlarrConfig(timeout_seconds=0.5)
+    with pytest.raises(ValidationError):
+        ProwlarrConfig(max_results=0)
+    with pytest.raises(ValidationError, match="placeholder"):
+        ProwlarrConfig(
+            enabled=True,
+            base_url="http://localhost:9696",
+            api_key="CHANGE_ME",
+            download_indexer="Index",
+        )
+
+    # 4. Telegram placeholder and missing check
+    with pytest.raises(ValidationError, match="placeholder"):
+        TelegramConfig(enabled=True, bot_token="CHANGE_ME", chat_id="12345")
+    with pytest.raises(ValidationError, match="placeholder"):
+        TelegramConfig(enabled=True, bot_token="12345:ABCDE", chat_id="CHANGE_ME")
+
+    # 5. LoggingSink url validation
+    with pytest.raises(ValidationError, match="http"):
+        LoggingSinkConfig(enabled=True, url="ftp://invalid")
+    with pytest.raises(ValidationError, match="http"):
+        LoggingSinkConfig(enabled=True, url="")
+
+    # 6. APIConfig token placeholder
+    with pytest.raises(ValidationError, match="placeholder"):
+        APIConfig(enabled=True, api_token="CHANGE_ME")
