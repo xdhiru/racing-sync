@@ -15,10 +15,17 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from pathlib import Path
+
 from .clients.abstract import TorrentFile
 from .config import AppConfig
 
 log = logging.getLogger(__name__)
+
+NON_VIDEO_EXTENSIONS = {
+    ".nfo", ".srt", ".sub", ".idx", ".txt", ".jpg", ".jpeg", ".png",
+    ".torrent", ".sfv", ".md5", ".sha", ".sha1",
+}
 
 
 @dataclass(slots=True)
@@ -31,20 +38,18 @@ class Episode:
 
 @dataclass(slots=True)
 class Classification:
-    kind: str                 # "movie" | "episode" | "season" | "mixed" | "unknown"
-    # When kind in ("season", "episode", "mixed"), episode details live here.
-    episodes: list[Episode]
-    # When kind in ("movie", "episode", "unknown"), the single-file fallback
-    single_file: str | None
+    kind: str                 # "movie" | "season" | "episode" | "mixed" | "unknown"
+    episodes: list[Episode]   # populated for season / episode / mixed
+    single_file: str | None   # populated for movie and episode
     total_bytes: int
 
-    @property
-    def target_remote(self) -> str:
-        # Resolved by the coordinator with config.
-        return ""
 
-
-EP_RE = re.compile(r"(?i)\bS(\d{1,2})E(\d{1,2})\b")
+EP_RE = re.compile(
+    r"[Ss](\d{1,2})[Ee](\d{1,2})"       # S01E08, s1e2
+    r"|(\d{1,2})x(\d{1,2})"             # 1x08
+    r"|[Ee][Pp]?(\d{1,3})"              # E08, EP08
+    r"|(?:\b|_)[Ss]eason\s*(\d{1,2})\s*[Ee]pisode\s*(\d{1,2})"
+)
 
 
 @functools.lru_cache(maxsize=128)
@@ -85,7 +90,7 @@ def parse_episode(name: str, regex: re.Pattern[str] | str | None = None) -> tupl
         return int(nums[0]), int(nums[1])
     elif len(nums) == 1:
         return 1, int(nums[0])
-    return 1, 1
+    return None
 
 
 def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
@@ -107,20 +112,31 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
 
     ep_regex = getattr(cfg.classifier, "_episode_re", None) or EP_RE
 
-    # Check for episode matches across all files
+    # Filter out non-video files (.srt, .nfo, etc.) when evaluating episodes
+    video_files = [f for f in files if Path(f.name).suffix.lower() not in NON_VIDEO_EXTENSIONS]
+    eval_files = video_files if video_files else files
+
+    # Check for episode matches across evaluated files
     eps: list[Episode] = []
-    for f in files:
+    for f in eval_files:
         parsed = parse_episode(f.name, ep_regex)
         if parsed:
             eps.append(Episode(f.name, parsed[0], parsed[1], f.size_bytes))
     eps.sort(key=lambda e: (e.season, e.episode))
 
-    distinct_eps = {(e.season, e.episode) for e in eps}
+    # Deduplicate eps per (season, episode), keeping the largest file
+    best_by_ep: dict[tuple[int, int], Episode] = {}
+    for ep in eps:
+        key = (ep.season, ep.episode)
+        if key not in best_by_ep or ep.size_bytes > best_by_ep[key].size_bytes:
+            best_by_ep[key] = ep
+    deduped_eps = sorted(best_by_ep.values(), key=lambda e: (e.season, e.episode))
+
+    distinct_eps = {(e.season, e.episode) for e in deduped_eps}
 
     # Case 1: Exactly 1 distinct episode found -> individual episode torrent (routes to unsorted)
     if len(distinct_eps) == 1:
-        # Pick the largest file as the primary episode file (e.g. video over .nfo/.srt)
-        main_ep = max(eps, key=lambda e: e.size_bytes)
+        main_ep = deduped_eps[0]
         return Classification(
             kind="episode",
             episodes=[main_ep],
@@ -129,7 +145,7 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
         )
 
     # Case 2: No episodes found at all
-    if not eps:
+    if not deduped_eps:
         # If single file -> movie
         if len(files) == 1:
             f = files[0]
@@ -141,19 +157,19 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
             return Classification(
                 kind="movie", episodes=[], single_file=f.name, total_bytes=total,
             )
-        # Multi-file but no episode tag -> treat as movie/season bundle (default remote)
+        # Multi-file but no episode tag -> treat as movie bundle (default remote)
         return Classification(
-            kind="season", episodes=[], single_file=None, total_bytes=total,
+            kind="movie", episodes=[], single_file=None, total_bytes=total,
         )
 
     # Case 3: Multiple distinct episodes found (len(distinct_eps) >= 2) -> full season pack
-    # If >= 90% of files carry an episode tag, treat as a season.
+    # If >= 90% of evaluated files carry an episode tag, treat as a season.
     # Use ceiling: e.g. 4 files where 3 are episodes is still a season.
-    if len(eps) >= max(1, int(-(-len(files) * 9 // 10))):
-        return Classification(kind="season", episodes=eps, single_file=None, total_bytes=total)
+    if len(deduped_eps) >= max(1, int(-(-len(eval_files) * 9 // 10))):
+        return Classification(kind="season", episodes=deduped_eps, single_file=None, total_bytes=total)
 
     # Mixed (rare): multiple episodes with lots of non-episode files
-    return Classification(kind="mixed", episodes=eps, single_file=None, total_bytes=total)
+    return Classification(kind="mixed", episodes=deduped_eps, single_file=None, total_bytes=total)
 
 
 def should_skip_movie(classification: Classification, cfg: AppConfig) -> bool:

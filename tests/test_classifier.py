@@ -276,3 +276,42 @@ def test_season_folder_for_security(tmp_path):
     custom_base = tmp_path / "custom_save_path"
     folder_custom = coord._season_folder_for(files, "Show.S01", base_path=custom_base)
     assert folder_custom == (custom_base / "Show.S01").resolve()
+
+
+def test_parse_episode_without_digits_returns_none():
+    from racing_sync.classifier import parse_episode
+    import re
+    # Custom regex matching words without digits
+    regex = re.compile(r"SPECIAL")
+    assert parse_episode("Show.SPECIAL.mkv", regex) is None
+
+
+def test_multi_file_without_episode_tags_is_movie():
+    files = [
+        TorrentFile("Movie.Name.2024/Movie.Name.2024.1080p.mkv", 4_000_000_000),
+        TorrentFile("Movie.Name.2024/Sample/sample.mkv", 50_000_000),
+        TorrentFile("Movie.Name.2024/Movie.Name.2024.nfo", 2_000),
+    ]
+    cls = classify(files, _cfg())
+    assert cls.kind == "movie"
+    assert cls.single_file is None
+    assert cls.episodes == []
+
+
+def test_season_with_subtitles_filters_non_video_from_episodes():
+    # 5 episodes with corresponding .srt subtitles and an .nfo file
+    files = []
+    for i in range(1, 6):
+        files.append(TorrentFile(f"Show.S01E{i:02d}.1080p.mkv", 1_000_000_000))
+        files.append(TorrentFile(f"Show.S01E{i:02d}.1080p.srt", 50_000))
+    files.append(TorrentFile("Show.S01.nfo", 2_000))
+
+    cls = classify(files, _cfg())
+    assert cls.kind == "season"
+    assert len(cls.episodes) == 5
+    # Ensure every episode in cls.episodes is the mkv video file, not srt/nfo
+    for i, ep in enumerate(cls.episodes, start=1):
+        assert ep.season == 1
+        assert ep.episode == i
+        assert ep.file_name.endswith(".mkv")
+        assert ep.size_bytes == 1_000_000_000
