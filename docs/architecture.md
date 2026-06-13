@@ -28,11 +28,11 @@ src/racing_sync/
 ## State machine
 
 ```
-NEW ──┬─> QUERYING ──> WAITING_DISK ──> QUEUED ──> DOWNLOADING ──> MOVING ──> RE_ADDING ──> DONE
-      │       │                            │              │            │
-      └───────┴────────────────────────────┴──────────────┴────────────┴──> (any) ──> FAILED
-                                                                                  │
-                                                                                  └──> QUEUED (retry)
+NEW ──┬─> QUERYING ──> WAITING_INDEXER ──> WAITING_DISK ──> QUEUED ──> DOWNLOADING ──> MOVING ──> RE_ADDING ──> DONE
+      │       │                │                  │              │            │
+      └───────┴────────────────┴──────────────────┴──────────────┴────────────┴──> (any) ──> FAILED
+                                                                                              │
+                                                                                              └──> QUEUED (retry)
 ```
 
 `DONE` and `FAILED` are terminal-ish: `FAILED → QUEUED` is allowed for manual retry.
@@ -42,7 +42,7 @@ audited in the `run_log` table.
 
 ## Per-torrent workflow
 
-1. **Discover** — VPS1 racing client lists torrents with category=`racing`.
+1. **Discover** — VPS1 racing client lists torrents matching configured category (or all if category="").
    Insert/update row in `state.db` at `state=NEW`.
 
 2. **Decide SSD source** (`pick_ssd_source_for_racing`):
@@ -61,9 +61,10 @@ audited in the `run_log` table.
    - `category = "racing"`
 
 4. **Classify** (`classifier.classify`):
-   - Single file → `movie`
-   - All/most files carry `S00E00` → `season`
-   - Otherwise → `mixed`
+   - Individual episode matching episode regex -> `episode`
+   - Single file or multi-file bundle without episode tags -> `movie`
+   - Multi-episode pack (>= 90% episodes) -> `season`
+   - Multiple episodes with many extras -> `mixed`
    - Skip movie if total size > `ssd.skip_movie_larger_than_bytes` (req #7)
 
 5. **Batch & download**:
@@ -94,25 +95,25 @@ audited in the `run_log` table.
 
 ## Recovery (req #4)
 
-On startup `reconcile()` walks VPS2's torrents and:
+On startup `reconcile()` audits active states against destination client torrents and the local/remote filesystem:
 
-- `state=downloading` + missing on VPS2 → re-add (orchestrator's responsibility).
-- `state=moving` + missing → assume rclone completed, jump to `RE_ADDING`.
-- `state=done` + missing → re-add to fuse (data already on remote).
+- `state=downloading` + missing on destination -> re-add torrent to continue download.
+- `state=moving` + missing on SSD -> verify if data arrived on remote; transition to `RE_ADDING` if complete.
+- `state=done` + missing on fuse -> re-add to fuse mount via `RE_ADDING` (data already on remote).
+- Torrents on destination client not tracked in `state.db` are audited and logged as orphans.
 
 The state DB is the source of truth; VPS2 + filesystem are reality. The
 reconciler bridges them.
 
 ## SSD cap
 
-`ssd_max_inflight_bytes()` is called every state transition:
+`ssd_max_inflight_bytes(cfg)` calculates dynamic disk headroom:
 
 ```
 min(ssd.max_inflight_bytes, ssd_free - general.disk_safety_margin_bytes)
 ```
 
-So even if the user misconfigures the cap above their actual disk size, the
-batcher still respects real free space.
+This is used by `batcher.make_batches` and disk space checks so the coordinator always respects actual disk headroom.
 
 ## Logging
 
@@ -152,13 +153,11 @@ when the Telegram bot isn't enough. Auth via nginx-injected
 
 ## Cross-seed tracker map
 
-`[prowlarr.tracker_map]` is a flat dict where keys are announce-URL substrings
-and values are prowlarr indexer names. First substring match wins. Resolution
-order:
+`[prowlarr.tracker_map]` is a mapping where keys are announce-URL substrings
+and values are Prowlarr indexer names. The first matching substring wins
+(evaluated in insertion order).
 
-1. Built-ins (`beta`, `alpha`, `gamma`).
-2. `overrides` (insertion order).
-
+Keys match case-insensitively against the announce URLs of racing torrents.
 This is what `prowlarr.resolve_indexer_for_announce(url)` uses internally.
 
 ## Operational notes

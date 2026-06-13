@@ -34,7 +34,8 @@ src/racing_sync/
   watchdir.py         # Manual torrent drop scanner
   api.py              # Optional FastAPI control plane
   clients/
-    base.py           # TorrentClient ABC
+    abstract.py       # TorrentClient ABC + dataclasses
+    http_base.py      # HTTP client base with auth
     qbittorrent.py    # qBittorrent WebUI wrapper
     deluge.py         # Deluge JSON-RPC wrapper
   telegram_bot.py     # Live status + log forwarder

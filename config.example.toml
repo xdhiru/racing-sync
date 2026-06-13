@@ -69,7 +69,7 @@ min_age_seconds = 0
 # use), you don't need to set anything here other than leaving the
 # defaults — credentials come from [source].username / password.
 [source.nginx]
-mode         = "basic"
+mode         = "off"
 url          = ""           # only used when mode="form_post"
 user_field   = "username"   # only used when mode="form_post"
 pass_field   = "password"   # only used when mode="form_post"
@@ -258,7 +258,7 @@ pin_status_message = false
 enabled = false
 url = ""                    # e.g. "https://logs.example.com/ingest"
 auth_token = ""
-# Event levels to forward (must be >= telegram.log_min_level)
+# Event levels to forward: "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
 forward_min_level = "INFO"
 
 # ============================================================
