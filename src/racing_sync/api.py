@@ -27,6 +27,11 @@ from .state import State
 log = logging.getLogger(__name__)
 
 
+class RetryResult(BaseModel):
+    source_infohash: str
+    new_state: str
+
+
 def build_app(coord: Coordinator) -> FastAPI:
     cfg = coord.cfg
     app = FastAPI(title="racing-sync", version="0.1.0")
@@ -91,10 +96,6 @@ def build_app(coord: Coordinator) -> FastAPI:
             return {"items": 0, "note": "watch_dir not configured"}
         items = await coord.scan_watch()
         return {"items": len(items)}
-
-    class RetryResult(BaseModel):
-        source_infohash: str
-        new_state: str
 
     @app.post("/api/retry/{source_infohash}", dependencies=[Depends(auth)])
     async def retry(source_infohash: str) -> RetryResult:
