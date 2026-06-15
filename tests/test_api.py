@@ -174,3 +174,45 @@ async def test_coordinator_scan_watch_ingests_and_returns_items(anyio_backend):
     coord.store.upsert.assert_called_once()
     mock_watch.delete_picked_up.assert_awaited_once_with(item)
 
+
+def test_api_retry_and_ssd_endpoints():
+    from racing_sync.state import State, TorrentState
+
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(enabled=True, api_token="secret", trust_nginx_header=False)
+    cfg.ssd = MagicMock(path="/downloads")
+
+    coord = MagicMock()
+    coord.cfg = cfg
+    coord.store = MagicMock()
+
+    app = build_app(coord)
+    client = TestClient(app)
+    headers = {"X-Api-Token": "secret"}
+
+    # 1. /api/ssd
+    with patch("racing_sync.api.ssd_free_bytes", return_value=500_000_000):
+        resp_ssd = client.get("/api/ssd", headers=headers)
+        assert resp_ssd.status_code == 200
+        assert resp_ssd.json() == {"free_bytes": 500_000_000, "path": "/downloads"}
+
+    # 2. /api/retry/{hash} 404 (unknown hash)
+    coord.store.get.return_value = None
+    resp_404 = client.post("/api/retry/unknown123", headers=headers)
+    assert resp_404.status_code == 404
+    assert resp_404.json()["detail"] == "unknown hash"
+
+    # 3. /api/retry/{hash} 409 (not FAILED)
+    ts_downloading = TorrentState(source_infohash="down123", state=State.DOWNLOADING)
+    coord.store.get.return_value = ts_downloading
+    resp_409 = client.post("/api/retry/down123", headers=headers)
+    assert resp_409.status_code == 409
+    assert resp_409.json()["detail"] == "state is downloading"
+
+    # 4. /api/retry/{hash} 200 (in FAILED state)
+    ts_failed = TorrentState(source_infohash="fail123", state=State.FAILED)
+    coord.store.get.return_value = ts_failed
+    resp_200 = client.post("/api/retry/fail123", headers=headers)
+    assert resp_200.status_code == 200
+    coord.store.transition.assert_called_once_with(ts_failed, State.QUEUED, error="")
+
