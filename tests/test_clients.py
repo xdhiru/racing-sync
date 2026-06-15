@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+
 from racing_sync.config import DestConfig, SourceConfig
 from racing_sync.clients.qbittorrent import QBittorrentClient
 from racing_sync.clients.deluge import DelugeClient
+from racing_sync.clients.abstract import TorrentFile
 
 
 def test_instantiate_qbittorrent_client():
@@ -18,18 +22,95 @@ def test_instantiate_deluge_client():
         password="secret",
         deluge_sftp={
             "enabled": True,
-            "host": "127.0.0.1",
+            "ssh_host": "127.0.0.1",
             "ssh_password": "pwd",
             "state_dir": "/var/lib/deluged/state",
         },
     )
     client = DelugeClient(cfg)
     assert client is not None
+    assert cfg.deluge_sftp.ssh_host == "127.0.0.1"
 
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock
-from racing_sync.clients.abstract import TorrentFile
+@pytest.mark.anyio
+async def test_qbittorrent_export_torrent():
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+
+    class DummyResponseContext:
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.read = AsyncMock(return_value=b"d8:announce...")
+            return resp
+
+        async def __aexit__(self, *args):
+            pass
+
+    async def mock_request(method, endpoint, params=None, **kwargs):
+        assert method == "GET"
+        assert endpoint == "/api/v2/torrents/export"
+        assert params == {"hash": "abc12345"}
+        return DummyResponseContext()
+
+    client.request = mock_request
+    data = await client.export_torrent("abc12345")
+    assert data == b"d8:announce..."
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_http_client_base_nginx_modes():
+    from racing_sync.clients.http_base import HTTPClientBase, AuthError
+    from racing_sync.config import HTTPClientConfig
+
+    # mode="off": no Authorization header
+    cfg_off = HTTPClientConfig(
+        host="http://127.0.0.1:8080",
+        username="user",
+        password="pass",
+        nginx_mode="off",
+    )
+    client_off = HTTPClientBase(cfg_off)
+    await client_off.start()
+    try:
+        assert "Authorization" not in client_off.session.headers
+    finally:
+        await client_off.close()
+
+    # mode="basic": Authorization header present
+    cfg_basic = HTTPClientConfig(
+        host="http://127.0.0.1:8080",
+        username="user",
+        password="pass",
+        nginx_mode="basic",
+    )
+    client_basic = HTTPClientBase(cfg_basic)
+    await client_basic.start()
+    try:
+        assert "Authorization" in client_basic.session.headers
+        assert client_basic.session.headers["Authorization"].startswith("Basic ")
+    finally:
+        await client_basic.close()
+
+    # mode="form_post" without nginx_url raises AuthError
+    cfg_form = HTTPClientConfig(
+        host="http://127.0.0.1:8080",
+        username="user",
+        password="pass",
+        nginx_mode="form_post",
+        nginx_url="",
+    )
+    client_form = HTTPClientBase(cfg_form)
+    await client_form.start()
+    try:
+        with pytest.raises(AuthError, match="no nginx_url"):
+            await client_form._auth()
+    finally:
+        await client_form.close()
 
 
 @pytest.mark.anyio

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import pytest
+from unittest.mock import MagicMock
 
 from racing_sync.rclone_ops import (
     build_move_cmd,
@@ -98,4 +99,27 @@ def test_redact_rclone_cmd():
     assert "--rc-pass=******" in sanitized
     assert "--s3-secret-access-key ******" in sanitized
     assert "--normal-flag normalval" in sanitized
+
+
+def test_build_move_cmd(tmp_path: Path):
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+    cfg.rclone.binary = Path("/usr/bin/rclone")
+    cfg.rclone.config_path = Path("/etc/rclone.conf")
+    cfg.rclone.extra_move_flags = ["--transfers=4", "--checkers=8"]
+
+    cmd = build_move_cmd(
+        cfg,
+        tmp_path / "src",
+        "remote:dest",
+        include=["--include=*.mkv"],
+        extra=["--dry-run"],
+    )
+    assert cmd[0] == str(Path("/usr/bin/rclone"))
+    assert cmd[1:4] == ["move", str(tmp_path / "src"), "remote:dest"]
+    assert "--config" in cmd
+    assert str(Path("/etc/rclone.conf")) in cmd
+    assert "--transfers=4" in cmd
+    assert "--include=*.mkv" in cmd
+    assert "--dry-run" in cmd
 
