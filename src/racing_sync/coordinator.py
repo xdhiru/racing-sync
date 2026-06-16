@@ -172,10 +172,11 @@ async def pick_ssd_source_for_racing(
     # redundant. The only exception is the rare case where the racing
     # client's .torrent is unreachable on VPS1 (then refetch_public_via_prowlarr
     # can fall back to Prowlarr as a last resort).
-    publics = [t for t in other_source_torrents + [source_torrent]
+    publics = [t for t in [source_torrent] + other_source_torrents
                if _looks_public(t.trackers)]
 
     if publics:
+        chosen = publics[0]
         # req #1: when a public torrent exists on VPS1, use IT for the
         # SSD download directly. We do NOT consult Prowlarr by default
         # — the racing public torrent already works, fetching a Indexer
@@ -189,47 +190,47 @@ async def pick_ssd_source_for_racing(
             log.info(
                 "public racing torrent present; "
                 "SFTP-exporting %s from VPS1 for SSD download",
-                source_torrent.infohash[:10],
+                chosen.infohash[:10],
             )
-            blob = await asyncio.to_thread(sftp.fetch_torrent, source_torrent.infohash)
+            blob = await asyncio.to_thread(sftp.fetch_torrent, chosen.infohash)
             if blob:
                 return SourceDecision(
                     torrent_bytes=blob,
                     source_label="public-racing",
-                    name=source_torrent.name,
-                    size_bytes=source_torrent.size_bytes,
-                    infohash=source_torrent.infohash,
+                    name=chosen.name,
+                    size_bytes=chosen.size_bytes,
+                    infohash=chosen.infohash,
                     announce_url=(
-                        source_torrent.trackers[0]
-                        if source_torrent.trackers else ""
+                        chosen.trackers[0]
+                        if chosen.trackers else ""
                     ),
                 )
         # If allow_ssh_export=false (or SFTP returned nothing for the
         # source_infohash), try to use qBittorrent's WebUI
         # /torrents/export endpoint directly via the source_client.
         try:
-            blob = await source_client.export_torrent(source_torrent.infohash)
+            blob = await source_client.export_torrent(chosen.infohash)
         except AttributeError:
             blob = None
         except Exception as e:  # noqa: BLE001
             log.warning("qB export_torrent failed for %s: %s",
-                        source_torrent.infohash[:10], e)
+                        chosen.infohash[:10], e)
             blob = None
         if blob:
             log.info(
                 "public racing torrent present; "
                 "fetched %s via qB export endpoint for SSD download",
-                source_torrent.infohash[:10],
+                chosen.infohash[:10],
             )
             return SourceDecision(
                 torrent_bytes=blob,
                 source_label="public-racing",
-                name=source_torrent.name,
-                size_bytes=source_torrent.size_bytes,
-                infohash=source_torrent.infohash,
+                name=chosen.name,
+                size_bytes=chosen.size_bytes,
+                infohash=chosen.infohash,
                 announce_url=(
-                    source_torrent.trackers[0]
-                    if source_torrent.trackers else ""
+                    chosen.trackers[0]
+                    if chosen.trackers else ""
                 ),
             )
 
@@ -240,17 +241,17 @@ async def pick_ssd_source_for_racing(
         if (cfg.cross_seed.refetch_public_via_prowlarr
                 and cfg.cross_seed.allow_prowlarr_cross_seed
                 and prowlarr is not None
-                and not cfg.prowlarr.should_skip_title(source_torrent.name)):
+                and not cfg.prowlarr.should_skip_title(chosen.name)):
             log.warning(
                 "racing client's public .torrent unavailable; "
                 "falling back to Prowlarr cross-seed for %s",
-                source_torrent.name,
+                chosen.name,
             )
             try:
-                hit = await prowlarr.best_match(source_torrent.name)
+                hit = await prowlarr.best_match(chosen.name)
             except Exception as e:  # noqa: BLE001
                 log.warning("indexer search failed for %s: %s",
-                            source_torrent.name, e)
+                            chosen.name, e)
                 hit = None
             if hit:
                 blob = await prowlarr.download_torrent(hit)
@@ -262,7 +263,7 @@ async def pick_ssd_source_for_racing(
                 return SourceDecision(
                     torrent_bytes=blob,
                     source_label="public-indexer-fallback",
-                    name=source_torrent.name,
+                    name=chosen.name,
                     size_bytes=hit.size_bytes,
                     infohash=real_hash,
                     announce_url=hit.download_url,
