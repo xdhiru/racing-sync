@@ -496,18 +496,11 @@ async def test_wait_disk_then_queue_false_branch():
 
     ts = TorrentState(source_infohash="h1", state=State.WAITING_DISK, total_bytes=1000)
 
-    call_count = 0
-    def fake_has_room(cfg, size):
-        nonlocal call_count
-        call_count += 1
-        coord._stop = True
-        return False
-
-    with patch("racing_sync.coordinator.ssd_has_room", side_effect=fake_has_room), \
+    with patch("racing_sync.coordinator.ssd_has_room", return_value=False), \
          patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        # Should check room once, not sleep, and return immediately to release worker slot
         await coord._wait_disk_then_queue(ts)
-        assert call_count == 1
-        mock_sleep.assert_awaited_once_with(10)
+        mock_sleep.assert_not_called()
         coord.transition.assert_not_called()
 
 
@@ -579,6 +572,23 @@ async def test_pick_ssd_source_private_primary_with_public_dupe():
     assert dec_webui.infohash == "pub_hash_2222"
     assert dec_webui.torrent_bytes == b"pub_torrent_bytes"
     source_client.export_torrent.assert_awaited_once_with("pub_hash_2222")
+
+
+@pytest.mark.anyio
+async def test_wait_disk_then_queue_does_not_block_worker():
+    from unittest.mock import patch
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord._stop = False
+    coord.transition = MagicMock()
+
+    ts = TorrentState(source_infohash="h1", state=State.WAITING_DISK, total_bytes=1000)
+
+    # When SSD has no room, _process_torrent_inner finishes immediately
+    with patch("racing_sync.coordinator.ssd_has_room", return_value=False):
+        await coord._process_torrent_inner(ts)
+    coord.transition.assert_not_called()
 
 
 @pytest.mark.anyio
