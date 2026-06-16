@@ -155,3 +155,38 @@ async def test_qbittorrent_set_file_priorities_batched():
     assert posted_requests[0] == ("/api/v2/torrents/filePrio", {"hash": "hash1", "id": "0|1", "priority": "0"})
     assert posted_requests[1] == ("/api/v2/torrents/filePrio", {"hash": "hash1", "id": "2|3", "priority": "1"})
 
+
+@pytest.mark.anyio
+async def test_http_client_auth_retry_releases_initial_response():
+    from racing_sync.clients.http_base import HTTPClientBase
+    from racing_sync.config import HTTPClientConfig
+
+    cfg = HTTPClientConfig(
+        host="http://127.0.0.1:8080",
+        username="user",
+        password="pass",
+        nginx_mode="off",
+    )
+    client = HTTPClientBase(cfg, label="test-auth-retry")
+    client._authed = True
+    client._session = MagicMock()
+    client._auth = AsyncMock()
+
+    resp_401 = MagicMock()
+    resp_401.status = 401
+    resp_401.read = AsyncMock(return_value=b"Unauthorized")
+    resp_401.close = MagicMock()
+
+    resp_200 = MagicMock()
+    resp_200.status = 200
+    resp_200.read = AsyncMock(return_value=b"OK")
+    resp_200.close = MagicMock()
+
+    client._session.request = AsyncMock(side_effect=[resp_401, resp_200])
+
+    res = await client.request("GET", "/test", retry_auth=True)
+    assert res == resp_200
+    resp_401.read.assert_awaited_once()
+    resp_401.close.assert_called_once()
+    client._auth.assert_awaited_once()
+

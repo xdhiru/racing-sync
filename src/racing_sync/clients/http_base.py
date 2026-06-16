@@ -168,6 +168,8 @@ class HTTPClientBase:
                 "[%s] %s %s -> %d; re-authenticating",
                 self._label, method, path, r.status,
             )
+            await r.read()
+            r.close()
             # Retry the full login+request sequence a few times with
             # backoff. The WebUI can transiently refuse auth during
             # startup, after a settings change, or while a session
@@ -217,13 +219,6 @@ class HTTPClientBase:
                 message=body[:500],
             )
         return r
-
-
-def get_json(client: HTTPClientBase, path: str, **params: Any) -> "asyncio.Future[Any]":
-    async def _go() -> Any:
-        async with await client.request("GET", path, params=params or None) as r:
-            return await r.json()
-    return asyncio.ensure_future(_go())
 
 
 async def get_json_async(client: HTTPClientBase, path: str, **params: Any) -> Any:
