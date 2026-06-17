@@ -315,3 +315,87 @@ async def test_http_base_request_retries_on_timeout_and_connector_error():
         resp = await client.request("GET", "/api/v2/test")
         assert resp.status == 200
         assert call_count == 3
+
+
+@pytest.mark.anyio
+async def test_await_hash_for_name_normalizes_to_lower():
+    coord = object.__new__(Coordinator)
+    coord.dest_client = MagicMock()
+    t = Torrent(
+        hash="ABCD1234EF",
+        name="Test.Movie.2026",
+        category="",
+        save_path="",
+        size_bytes=1000,
+        state="racing",
+        progress=1.0,
+    )
+    coord.dest_client.list_torrents = AsyncMock(return_value=[t])
+    h = await coord._await_hash_for_name("Test.Movie.2026")
+    assert h == "abcd1234ef"
+
+
+@pytest.mark.anyio
+async def test_re_inject_racing_torrents_case_insensitive():
+    coord = object.__new__(Coordinator)
+    coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse/Test.Movie.2026"))
+    coord.dest_client = MagicMock()
+    coord.dest_client.add_torrent = AsyncMock()
+    coord._fetch_racing_torrent_bytes = AsyncMock()
+
+    # ts already has lowercase injected hash
+    ts = TorrentState(
+        source_infohash="src_1",
+        source_name="Test.Movie.2026",
+        injected_private_hashes="abcd1234ef",
+    )
+
+    # racing client returns uppercase hash for the same release
+    t_upper = Torrent(
+        hash="ABCD1234EF",
+        name="Test.Movie.2026",
+        category="",
+        save_path="",
+        size_bytes=1000,
+        state="racing",
+        progress=1.0,
+    )
+    coord._list_source_torrents = AsyncMock(return_value=[t_upper])
+
+    await coord._re_inject_racing_torrents(ts)
+
+    # Should recognize ABCD1234EF is already in abcd1234ef and skip re-injection
+    coord.dest_client.add_torrent.assert_not_called()
+    coord._fetch_racing_torrent_bytes.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_check_and_inject_late_cross_seeds_normalizes_hash():
+    coord = object.__new__(Coordinator)
+    coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse/Test.Movie.2026"))
+    coord.dest_client = MagicMock()
+    coord.dest_client.add_torrent = AsyncMock(return_value=AddResult(hash="new_h", accepted=True))
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=b"torrent_bytes")
+    coord.store = MagicMock()
+
+    ts = TorrentState(
+        source_infohash="src_1",
+        source_name="Test.Movie.2026",
+        injected_private_hashes="",
+    )
+
+    t_upper = Torrent(
+        hash="LATE1234EF",
+        name="Test.Movie.2026",
+        category="",
+        save_path="",
+        size_bytes=1000,
+        state="racing",
+        progress=1.0,
+    )
+
+    await coord._check_and_inject_late_cross_seeds(ts, [t_upper])
+
+    # Injected hash should be stored in lowercase
+    assert ts.injected_private_hashes == "late1234ef"
+    coord.store.upsert.assert_called_once_with(ts)
