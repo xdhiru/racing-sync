@@ -229,7 +229,9 @@ class StateStore:
         self._log_append_counter = 0
         self._db_path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(db_path), isolation_level=None, timeout=30.0)
+        self._conn = sqlite3.connect(
+            str(db_path), isolation_level=None, timeout=30.0, check_same_thread=False
+        )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -271,13 +273,24 @@ class StateStore:
 
     # ---- CRUD ----
 
-    def get(self, source_infohash: str) -> TorrentState | None:
+    def get(self, source_infohash: str, include_blob: bool = True) -> TorrentState | None:
+        cols = "*" if include_blob else _TORRENT_STATE_COLUMNS_NO_BLOB
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM torrent_state WHERE source_infohash = ?",
+                f"SELECT {cols} FROM torrent_state WHERE source_infohash = ?",
                 (source_infohash,),
             ).fetchone()
             return _row_to_state(row) if row else None
+
+    def get_blob(self, source_infohash: str) -> bytes:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT cross_seed_blob FROM torrent_state WHERE source_infohash = ?",
+                (source_infohash,),
+            ).fetchone()
+            if row and row["cross_seed_blob"]:
+                return bytes(row["cross_seed_blob"])
+            return b""
 
     def upsert(self, ts: TorrentState) -> None:
         with self._lock:
@@ -285,14 +298,20 @@ class StateStore:
             row = ts.to_row()
             cols = ", ".join(row.keys())
             placeholders = ", ".join(["?"] * len(row))
-            updates = ", ".join(
-                f"{k}=excluded.{k}"
-                for k in row
-                if k not in ("source_infohash", "created_at")
-            )
+            updates = []
+            for k in row:
+                if k in ("source_infohash", "created_at"):
+                    continue
+                if k == "cross_seed_blob":
+                    updates.append(
+                        f"{k} = CASE WHEN length(excluded.{k}) > 0 THEN excluded.{k} ELSE torrent_state.{k} END"
+                    )
+                else:
+                    updates.append(f"{k} = excluded.{k}")
+            updates_str = ", ".join(updates)
             self._conn.execute(
                 f"INSERT INTO torrent_state ({cols}) VALUES ({placeholders}) "
-                f"ON CONFLICT(source_infohash) DO UPDATE SET {updates}",
+                f"ON CONFLICT(source_infohash) DO UPDATE SET {updates_str}",
                 tuple(row.values()),
             )
 
@@ -364,7 +383,7 @@ class StateStore:
             ).fetchall()
             return [_row_to_state(r) for r in rows]
 
-    def all(self, include_blob: bool = True) -> list[TorrentState]:
+    def all(self, include_blob: bool = False) -> list[TorrentState]:
         cols = "*" if include_blob else _TORRENT_STATE_COLUMNS_NO_BLOB
         with self._lock:
             rows = self._conn.execute(

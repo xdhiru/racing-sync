@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
 import pytest
 
-from racing_sync.state import State, check_transition
+from racing_sync.state import State, StateStore, TorrentState, check_transition
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
 
 
 def test_terminal_done_has_no_outgoing():
@@ -166,3 +172,108 @@ def test_row_to_state_handles_string_and_none_blob(tmp_path):
     active = store.all_active()
     assert len(active) == 1
     assert active[0].cross_seed_blob == b""
+
+
+def test_state_store_blob_lazy_load_and_preservation(tmp_path: Path):
+    db_path = tmp_path / "test.db"
+    store = StateStore(db_path)
+
+    test_blob = b"d8:announce25:http://tracker.example.com4:infod4:name4:testeee"
+    ts = TorrentState(
+        source_infohash="hash_blob_1",
+        source_name="Test.Blob.Release",
+        cross_seed_blob=test_blob,
+        state=State.QUEUED,
+    )
+    store.upsert(ts)
+
+    # get_blob returns the stored blob
+    assert store.get_blob("hash_blob_1") == test_blob
+    assert store.get_blob("non_existent") == b""
+
+    # all() defaults to include_blob=False (prevents OOM)
+    all_default = store.all()
+    assert len(all_default) == 1
+    assert all_default[0].cross_seed_blob == b""
+
+    # all(include_blob=True) returns blob
+    all_with_blob = store.all(include_blob=True)
+    assert len(all_with_blob) == 1
+    assert all_with_blob[0].cross_seed_blob == test_blob
+
+    # Upserting a row loaded without blob does NOT overwrite or wipe the DB blob
+    ts_loaded_no_blob = all_default[0]
+    ts_loaded_no_blob.state = State.DOWNLOADING
+    store.upsert(ts_loaded_no_blob)
+
+    # DB blob is preserved
+    assert store.get_blob("hash_blob_1") == test_blob
+    loaded_again = store.get("hash_blob_1")
+    assert loaded_again is not None
+    assert loaded_again.cross_seed_blob == test_blob
+    assert loaded_again.state == State.DOWNLOADING
+
+    # Upserting with a new non-empty blob DOES overwrite
+    new_blob = b"new_blob_content"
+    ts_loaded_no_blob.cross_seed_blob = new_blob
+    store.upsert(ts_loaded_no_blob)
+    assert store.get_blob("hash_blob_1") == new_blob
+
+
+@pytest.mark.anyio
+async def test_coordinator_lazy_loads_blob_on_queued_and_re_adding(tmp_path: Path):
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.config import AppConfig
+
+    cfg = AppConfig.from_toml(Path(__file__).parent.parent / "config.example.toml")
+    store = StateStore(tmp_path / "test.db")
+
+    test_blob = b"d8:announce25:http://tracker.example.com4:infod4:name4:testeee"
+    ts = TorrentState(
+        source_infohash="hash_resumed_1",
+        source_name="Test.Resumed",
+        cross_seed_blob=test_blob,
+        state=State.QUEUED,
+    )
+    store.upsert(ts)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = cfg
+    coord.store = store
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents.return_value = []
+    coord.dest_client.add_torrent.return_value = MagicMock(accepted=True, hash="hash_resumed_1")
+    coord._await_hash_for_name = AsyncMock(return_value="hash_resumed_1")
+    coord.transition = MagicMock(side_effect=lambda t, s, **kwargs: setattr(t, "state", s))
+
+    # Simulate resuming from DB without blob (as returned by all_active())
+    ts_resumed = store.all_active()[0]
+    assert ts_resumed.cross_seed_blob == b""
+    assert ts_resumed._blob == b""
+
+    # _do_queued should lazily fetch blob from store instead of failing with 'no blob'
+    await coord._do_queued(ts_resumed)
+    assert ts_resumed.cross_seed_blob == test_blob
+    coord.dest_client.add_torrent.assert_awaited_once()
+
+    # Now test RE_ADDING lazy load
+    coord.dest_client.add_torrent.reset_mock()
+    ts_readding = TorrentState(
+        source_infohash="hash_readd_1",
+        source_name="Test.Readd",
+        cross_seed_blob=test_blob,
+        state=State.RE_ADDING,
+    )
+    store.upsert(ts_readding)
+
+    active_rows = [r for r in store.all_active() if r.source_infohash == "hash_readd_1"]
+    assert len(active_rows) == 1
+    ts_readd_resumed = active_rows[0]
+    assert ts_readd_resumed.cross_seed_blob == b""
+    assert ts_readd_resumed._blob == b""
+
+    coord._target_mount_for = MagicMock(return_value=Path("/mnt/remote"))
+    await coord._re_add_cross_seed_torrent(ts_readd_resumed)
+    assert ts_readd_resumed.cross_seed_blob == test_blob
+    coord.dest_client.add_torrent.assert_awaited_once()
