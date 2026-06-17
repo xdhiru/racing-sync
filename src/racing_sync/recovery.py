@@ -12,6 +12,7 @@ This is the safety net against prior crashes.
 
 from __future__ import annotations
 
+import glob
 import logging
 from collections.abc import Iterable
 from pathlib import Path
@@ -81,16 +82,21 @@ async def reconcile(
         elif ts.state == State.FAILED:
             # Leave for manual retry
             rpt.kept.append(h)
+        elif ts.state in (State.NEW, State.QUERYING, State.WAITING_DISK):
+            # Not yet added to VPS2 — safe to leave for coordinator to process
+            rpt.resumed.append(h)
         else:
-            # In-flight: check if torrent still exists
+            # In-flight (QUEUED, DOWNLOADING, MOVING, RE_ADDING): check if torrent still exists
             if present:
                 rpt.resumed.append(h)
             else:
                 rpt.orphans.append(h)
+                sftp_bytes = store.get_blob(ts.source_infohash) or None
+                await fix_orphan(ts, cfg, dest=dest, store=store, sftp_bytes=sftp_bytes)
 
     # 3. Anything on VPS2 not in the DB?
-    # If it is already seeding from the fuse mount or 100% complete, adopt it into state DB as DONE
-    # so we don't treat it as a new release and re-download/re-move it.
+    # If it is already seeding from the fuse mount, adopt it as DONE.
+    # If it is 100% complete on SSD, adopt it as MOVING so coordinator can move it to remote.
     db_hashes: set[str] = set()
     for ts in all_rows:
         for k in (ts.source_infohash, ts.dest_infohash, ts.cross_seed_infohash):
@@ -102,12 +108,13 @@ async def reconcile(
                     db_hashes.add(iph.strip().lower())
 
     fuse_mounts = [
-        str(cfg.rclone.fuse.mount).rstrip("/"),
-        str(cfg.rclone.fuse.mount_unsorted).rstrip("/"),
+        str(fm).rstrip("/\\").replace("\\", "/")
+        for fm in (cfg.rclone.fuse.mount, cfg.rclone.fuse.mount_unsorted)
+        if fm
     ]
     for h, t in actual_by_hash.items():
         if h not in db_hashes:
-            save_path = getattr(t, "save_path", "").rstrip("/")
+            save_path = getattr(t, "save_path", "").rstrip("/\\").replace("\\", "/")
             on_fuse = any(save_path.startswith(fm) for fm in fuse_mounts if fm)
             comp = getattr(t, "is_complete", False)
             is_done = comp() if callable(comp) else bool(comp)
@@ -127,9 +134,10 @@ async def reconcile(
                             h[:10], name,
                         )
                         continue
+                adopt_state = State.DONE if on_fuse else State.MOVING
                 log.info(
-                    "reconcile: adopting existing completed/fuse torrent on VPS2 as DONE: %s (%s)",
-                    name, h[:10],
+                    "reconcile: adopting existing completed/fuse torrent on VPS2 as %s: %s (%s)",
+                    adopt_state.value, name, h[:10],
                 )
                 ts = TorrentState(
                     source_infohash=h,
@@ -137,7 +145,7 @@ async def reconcile(
                     dest_infohash=h,
                     save_path=save_path,
                     total_bytes=getattr(t, "size_bytes", 0),
-                    state=State.DONE,
+                    state=adopt_state,
                 )
                 store.upsert(ts)
                 rpt.kept.append(h)
@@ -183,11 +191,16 @@ async def fix_orphan(
             store.upsert(ts)
         return State.DOWNLOADING.value
 
+    if ts.state == State.RE_ADDING:
+        log.info("orphan %s: already in RE_ADDING; will re-add to fuse", h)
+        return State.RE_ADDING.value
+
     if ts.state == State.MOVING:
         src_path = Path(ts.save_path) if ts.save_path else Path(cfg.dest.save_path)
+        escaped_name = glob.escape(ts.source_name)
         content_exists = (
             (src_path / ts.source_name).exists()
-            or any(src_path.glob(f"{ts.source_name}*"))
+            or any(src_path.glob(f"{escaped_name}*"))
         )
         if content_exists:
             log.info("orphan %s: files still exist on SSD; will resume move", h)
