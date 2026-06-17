@@ -104,7 +104,7 @@ async def test_watchdir_pickup_in_tick(tmp_path: Path):
     await coord._tick()
 
     # The torrent should be in state store as NEW and watch-dir
-    rows = store.all()
+    rows = store.all(include_blob=True)
     assert len(rows) == 1
     ts = rows[0]
     assert ts.source_name == "My.Release"
