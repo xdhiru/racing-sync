@@ -260,3 +260,141 @@ async def test_prowlarr_best_match_ranking():
     assert best.size_bytes == 8_000_000_000
 
 
+@pytest.mark.anyio
+async def test_prowlarr_headers_not_leaked_to_external_hosts():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.prowlarr import ProwlarrClient, TorrentHit, Indexer
+
+    cfg = ProwlarrConfig(
+        enabled=True,
+        base_url="http://prowlarr.local:9696",
+        api_key="super_secret_prowlarr_key",
+        download_indexer="indexer1",
+    )
+    client = ProwlarrClient(cfg)
+    client._session = MagicMock()
+
+    # When calling Prowlarr API (search_indexer), headers should include X-Api-Key
+    mock_resp = AsyncMock()
+    mock_resp.text = AsyncMock(return_value="<xml></xml>")
+    mock_resp.raise_for_status = MagicMock()
+    client._session.get.return_value.__aenter__.return_value = mock_resp
+
+    idx = Indexer(1, "indexer1", "torrent", True, [])
+    await client.search_indexer(idx, "query")
+    call_args = client._session.get.call_args
+    assert call_args.kwargs.get("headers") == {"X-Api-Key": "super_secret_prowlarr_key"}
+
+    # When downloading from external URL, headers must NOT be passed
+    hit = TorrentHit(
+        title="Test",
+        guid="1",
+        indexer="indexer1",
+        indexer_id=1,
+        size_bytes=100,
+        download_url="https://external.tracker.org/download.php?id=123&passkey=abc",
+        magnet_url="",
+        info_url="",
+        publish_date="",
+    )
+
+    class _MockAsyncChunks:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            if not hasattr(self, "_done"):
+                self._done = True
+                return b"d8:announcee"
+            raise StopAsyncIteration
+
+    mock_dl_resp = AsyncMock()
+    mock_dl_resp.raise_for_status = MagicMock()
+    mock_dl_resp.headers = {"Content-Length": "12"}
+    mock_dl_resp.content.iter_chunked = MagicMock(return_value=_MockAsyncChunks())
+    client._session.get.return_value.__aenter__.return_value = mock_dl_resp
+
+    data = await client.download_torrent(hit)
+    assert data == b"d8:announcee"
+    dl_call_args = client._session.get.call_args
+    # Verify no headers were passed to external GET
+    assert "headers" not in dl_call_args.kwargs or dl_call_args.kwargs["headers"] is None
+
+
+@pytest.mark.anyio
+async def test_prowlarr_download_url_scrubbed_in_exceptions():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.prowlarr import ProwlarrClient, ProwlarrError, TorrentHit
+
+    cfg = ProwlarrConfig(
+        enabled=True,
+        base_url="http://prowlarr.local:9696",
+        api_key="prowlarr_key",
+        download_indexer="indexer1",
+    )
+    client = ProwlarrClient(cfg)
+    client._session = MagicMock()
+
+    hit = TorrentHit(
+        title="Test",
+        guid="1",
+        indexer="indexer1",
+        indexer_id=1,
+        size_bytes=100,
+        download_url="https://tracker.org/download?torrent_id=42&apikey=LEAKED_KEY_12345&passkey=SECRET",
+        magnet_url="",
+        info_url="",
+        publish_date="",
+    )
+
+    class _MockErrorChunks:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            if not hasattr(self, "_done"):
+                self._done = True
+                return b"<html>error</html>"
+            raise StopAsyncIteration
+
+    # 1. Invalid bencoded data
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.headers = {"Content-Length": "18"}
+    mock_resp.content.iter_chunked = MagicMock(return_value=_MockErrorChunks())
+    client._session.get.return_value.__aenter__.return_value = mock_resp
+
+    with pytest.raises(ProwlarrError) as exc_info:
+        await client.download_torrent(hit)
+    err_msg = str(exc_info.value)
+    assert "LEAKED_KEY_12345" not in err_msg
+    assert "SECRET" not in err_msg
+    assert "https://tracker.org/download" in err_msg
+
+    # 2. Oversize torrent
+    mock_resp.headers = {"Content-Length": str(50 * 1024 * 1024)}
+    with pytest.raises(ProwlarrError) as exc_info:
+        await client.download_torrent(hit)
+    err_msg = str(exc_info.value)
+    assert "LEAKED_KEY_12345" not in err_msg
+    assert "SECRET" not in err_msg
+    assert "https://tracker.org/download" in err_msg
+
+    # 3. Invalid scheme
+    hit_bad_scheme = TorrentHit(
+        title="Test",
+        guid="2",
+        indexer="indexer1",
+        indexer_id=1,
+        size_bytes=100,
+        download_url="ftp://tracker.org/dl?key=SECRET_KEY",
+        magnet_url="",
+        info_url="",
+        publish_date="",
+    )
+    with pytest.raises(ProwlarrError) as exc_info:
+        await client.download_torrent(hit_bad_scheme)
+    err_msg = str(exc_info.value)
+    assert "SECRET_KEY" not in err_msg
+    assert "ftp://tracker.org/dl" in err_msg
+
+
+
