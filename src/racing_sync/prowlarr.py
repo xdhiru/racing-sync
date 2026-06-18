@@ -12,11 +12,22 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote_plus, urlsplit
+from urllib.parse import quote_plus, urlsplit, urlunsplit
 
 import aiohttp
 
 from .config import ProwlarrConfig
+
+
+def _scrub_url(url: str) -> str:
+    """Scrub query parameters from URL to prevent leaking API keys or passkeys in logs."""
+    try:
+        parts = urlsplit(url)
+        if not parts.scheme and not parts.netloc:
+            return url
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    except Exception:
+        return "<scrubbed_url>"
 
 log = logging.getLogger(__name__)
 
@@ -70,14 +81,16 @@ class ProwlarrClient:
         if not self._cfg.enabled:
             raise ProwlarrError("prowlarr disabled in config")
         import socket
-        headers = {"X-Api-Key": self._cfg.api_key}
         self._session = aiohttp.ClientSession(
             base_url=self._cfg.base_url.rstrip("/") + "/",
-            headers=headers,
             timeout=aiohttp.ClientTimeout(total=self._cfg.timeout_seconds),
             connector=aiohttp.TCPConnector(family=socket.AF_INET),
         )
         await self._refresh_indexers()
+
+    @property
+    def _auth_headers(self) -> dict[str, str]:
+        return {"X-Api-Key": self._cfg.api_key}
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
@@ -89,7 +102,7 @@ class ProwlarrClient:
         async with self._refresh_lock:
             if not self._session:
                 raise ProwlarrError("not started")
-            async with self._session.get("api/v1/indexer") as r:
+            async with self._session.get("api/v1/indexer", headers=self._auth_headers) as r:
                 r.raise_for_status()
                 data = await r.json()
             self._indexers_by_name.clear()
@@ -153,7 +166,7 @@ class ProwlarrClient:
             "cat": "2000,5000",  # standard movies (2000) and TV (5000) categories
         }
         path = f"api/v1/indexer/{indexer.id}/newznab"
-        async with self._session.get(path, params=params) as r:
+        async with self._session.get(path, params=params, headers=self._auth_headers) as r:
             r.raise_for_status()
             text = await r.text()
         return _parse_newznab(text, indexer)
@@ -166,32 +179,42 @@ class ProwlarrClient:
         """Fetch the .torrent bytes for a hit (qBittorrent can accept this directly)."""
         if not self._session:
             raise ProwlarrError("not started")
+        safe_url = _scrub_url(hit.download_url)
         parsed = urlsplit(hit.download_url)
         if parsed.scheme not in ("http", "https"):
-            raise ProwlarrError(f"invalid or unsafe download_url scheme: {hit.download_url!r}")
+            raise ProwlarrError(f"invalid or unsafe download_url scheme: {safe_url!r}")
 
-        async with self._session.get(hit.download_url) as r:
-            r.raise_for_status()
-            content_length = r.headers.get("Content-Length")
-            max_bytes = 20 * 1024 * 1024
-            if content_length and content_length.isdigit() and int(content_length) > max_bytes:
-                raise ProwlarrError(
-                    f"torrent download from {hit.download_url} exceeds max size: {content_length} bytes"
-                )
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in r.content.iter_chunked(64 * 1024):
-                total += len(chunk)
-                if total > max_bytes:
+        try:
+            async with self._session.get(hit.download_url) as r:
+                r.raise_for_status()
+                content_length = r.headers.get("Content-Length")
+                max_bytes = 20 * 1024 * 1024
+                if content_length and content_length.isdigit() and int(content_length) > max_bytes:
                     raise ProwlarrError(
-                        f"torrent download from {hit.download_url} exceeded max size of {max_bytes} bytes"
+                        f"torrent download from {safe_url} exceeds max size: {content_length} bytes"
                     )
-                chunks.append(chunk)
-            data = b"".join(chunks)
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in r.content.iter_chunked(64 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ProwlarrError(
+                            f"torrent download from {safe_url} exceeded max size of {max_bytes} bytes"
+                        )
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+        except aiohttp.ClientResponseError as e:
+            raise ProwlarrError(
+                f"torrent download from {safe_url} failed with HTTP status {e.status}"
+            ) from None
+        except aiohttp.ClientError as e:
+            raise ProwlarrError(
+                f"torrent download from {safe_url} failed: {type(e).__name__}"
+            ) from None
 
         if not data.startswith(b"d"):
             raise ProwlarrError(
-                f"download from {hit.download_url} did not return a bencoded torrent "
+                f"download from {safe_url} did not return a bencoded torrent "
                 f"(first bytes: {data[:8]!r})"
             )
         return data
