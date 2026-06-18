@@ -197,14 +197,16 @@ def test_secret_str_masking_in_repr_and_string_equality():
 
     sec = SecretStr("mypassword")
     assert repr(sec) == "SecretStr('**********')"
-    assert sec == "mypassword"
+    assert str(sec) == "**********"
+    assert f"user:{sec}" == "user:**********"
     assert sec.get_secret_value() == "mypassword"
-    assert f"user:{sec}" == "user:mypassword"
 
     cfg = SourceConfig(type="qbittorrent", host="localhost", password="mypassword")
     assert "mypassword" not in repr(cfg)
+    assert "mypassword" not in str(cfg)
     assert "SecretStr('**********')" in repr(cfg)
-    assert cfg.password == "mypassword"
+    assert "mypassword" not in cfg.model_dump_json()
+    assert cfg.password.get_secret_value() == "mypassword"
 
 
 import pytest

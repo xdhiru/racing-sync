@@ -11,22 +11,7 @@ import re
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
-from pydantic_core import core_schema
-
-
-class SecretStr(str):
-    """A string subclass that masks its value in __repr__ and serialization."""
-
-    def __repr__(self) -> str:
-        return "SecretStr('**********')" if self else "SecretStr('')"
-
-    def get_secret_value(self) -> str:
-        return str(self)
-
-    @classmethod
-    def __get_pydantic_core_schema__(cls, source_type: Any, handler: Any) -> core_schema.CoreSchema:
-        return core_schema.no_info_after_validator_function(cls, core_schema.str_schema())
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
 
 class NginxAuthConfig(BaseModel):
