@@ -145,8 +145,9 @@ class HTTPSinkHandler(logging.handlers.QueueHandler):
             "Content-Type": "application/json",
             "User-Agent": "racing-sync-log-sink/1.0",
         }
-        if self._cfg.auth_token:
-            headers["Authorization"] = f"Bearer {self._cfg.auth_token}"
+        auth_token = self._cfg.auth_token.get_secret_value() if hasattr(self._cfg.auth_token, "get_secret_value") else str(self._cfg.auth_token)
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
 
         while not self._stop.is_set():
             try:

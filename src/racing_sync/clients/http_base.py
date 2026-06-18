@@ -65,7 +65,8 @@ class HTTPClientBase:
         # other proxy that follows RFC 7617.
         if self._cfg.nginx_mode == "basic" and self._cfg.username:
             import base64
-            creds = f"{self._cfg.username}:{self._cfg.password}".encode()
+            pw = self._cfg.password.get_secret_value() if hasattr(self._cfg.password, "get_secret_value") else str(self._cfg.password)
+            creds = f"{self._cfg.username}:{pw}".encode()
             headers["Authorization"] = "Basic " + base64.b64encode(creds).decode()
         # Set Origin and Referer to satisfy WebUI CSRF protection (e.g. qBittorrent)
         host_clean = str(self._cfg.host).rstrip("/")
@@ -104,7 +105,8 @@ class HTTPClientBase:
                 )
                 form = dict(self._cfg.nginx_extra_fields)
                 form[self._cfg.nginx_user_field] = self._cfg.username
-                form[self._cfg.nginx_pass_field] = self._cfg.password
+                pw = self._cfg.password.get_secret_value() if hasattr(self._cfg.password, "get_secret_value") else str(self._cfg.password)
+                form[self._cfg.nginx_pass_field] = pw
                 async with self.session.post(self._cfg.nginx_url, data=form) as r:
                     if r.status >= 400:
                         raise AuthError(

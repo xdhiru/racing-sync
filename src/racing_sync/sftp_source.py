@@ -94,9 +94,14 @@ class SFTPExporter:
                 # `key_filename=` itself, but loading it explicitly here
                 # keeps both code paths uniform.
                 try:
+                    passphrase = (
+                        self._cfg.ssh_key_passphrase.get_secret_value()
+                        if hasattr(self._cfg.ssh_key_passphrase, "get_secret_value")
+                        else str(self._cfg.ssh_key_passphrase)
+                    ) or None
                     pkey = self._load_private_key(
                         self._cfg.ssh_key_path,
-                        passphrase=self._cfg.ssh_key_passphrase or None,
+                        passphrase=passphrase,
                     )
                 except paramiko.PasswordRequiredException as e:
                     raise SFTPError(
@@ -109,7 +114,11 @@ class SFTPExporter:
                     ) from e
                 kwargs["pkey"] = pkey
             else:
-                kwargs["password"] = self._cfg.ssh_password
+                kwargs["password"] = (
+                    self._cfg.ssh_password.get_secret_value()
+                    if hasattr(self._cfg.ssh_password, "get_secret_value")
+                    else str(self._cfg.ssh_password)
+                )
             # Force IPv4 resolution: the racing VPS may not have a routable
             # IPv6 address and paramiko defaults to getaddrinfo's first
             # result, which can be a hung AAAA connection. We pre-resolve

@@ -310,7 +310,8 @@ class TelegramBot:
         if not self._cfg.enabled:
             return
         self._stopped = False
-        self._bot = Bot(token=self._cfg.bot_token)
+        bot_token = self._cfg.bot_token.get_secret_value() if hasattr(self._cfg.bot_token, "get_secret_value") else str(self._cfg.bot_token)
+        self._bot = Bot(token=bot_token)
         # Per-torrent message queue: bounded so a torrent flood doesn't
         # grow memory. 256 is well over what any operator needs.
         self._detail_queue = asyncio.Queue(maxsize=256)
