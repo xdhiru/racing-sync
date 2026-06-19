@@ -44,12 +44,7 @@ def build_app(coord: Coordinator) -> FastAPI:
         if not cfg.api.enabled:
             raise HTTPException(403, "api disabled")
         client_host = request.client.host if request.client else ""
-        trusted_proxies = set(getattr(cfg.api, "trusted_proxies", ["127.0.0.1", "::1", "localhost"])) | {
-            "127.0.0.1",
-            "::1",
-            "localhost",
-            "testclient",
-        }
+        trusted_proxies = set(getattr(cfg.api, "trusted_proxies", ["127.0.0.1", "::1", "localhost"]))
         if cfg.api.trust_nginx_header and x_authenticated_user:
             if client_host not in trusted_proxies:
                 raise HTTPException(403, "untrusted proxy for nginx auth header")

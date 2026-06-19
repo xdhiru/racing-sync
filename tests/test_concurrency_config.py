@@ -408,9 +408,12 @@ def test_config_strict_validations():
     with pytest.raises(ValidationError, match="http"):
         LoggingSinkConfig(enabled=True, url="")
 
-    # 6. APIConfig token placeholder
+    # 6. APIConfig token validation
     with pytest.raises(ValidationError, match="placeholder"):
         APIConfig(enabled=True, api_token="CHANGE_ME")
+    with pytest.raises(ValidationError, match="api.api_token is required"):
+        APIConfig(enabled=True, api_token="")
+
 
 
 @pytest.mark.anyio
