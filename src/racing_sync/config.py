@@ -543,18 +543,36 @@ class RecoveryConfig(BaseModel):
 
 
 class APIConfig(BaseModel):
+    """Configuration for the HTTP API daemon.
+
+    When `trust_nginx_header` is True, `X-Authenticated-User` is accepted
+    from reverse proxies listed in `trusted_proxies`.
+
+    SECURITY WARNING:
+    Nginx MUST be configured to overwrite (never forward) `X-Authenticated-User`:
+        proxy_set_header X-Authenticated-User $remote_user;
+    Otherwise, an untrusted client can spoof the header and bypass authentication.
+    """
     enabled: bool = False
     host: str = "127.0.0.1"
     port: int = Field(default=8765, ge=1, le=65535)
-    trust_nginx_header: bool = True
+    trust_nginx_header: bool = False
     trusted_proxies: list[str] = ["127.0.0.1", "::1", "localhost"]
     api_token: SecretStr = SecretStr("")
 
     @model_validator(mode="after")
     def _validate(self) -> "APIConfig":
-        if self.enabled and self.api_token:
-            token = self.api_token.get_secret_value().strip()
-            if token.upper() in ("CHANGE_ME", "YOUR_API_TOKEN"):
+        if self.enabled:
+            token = (
+                self.api_token.get_secret_value().strip()
+                if hasattr(self.api_token, "get_secret_value")
+                else str(self.api_token).strip()
+            )
+            if not token and not self.trust_nginx_header:
+                raise ValueError(
+                    "api.api_token is required when api is enabled and trust_nginx_header is False"
+                )
+            if token and token.upper() in ("CHANGE_ME", "YOUR_API_TOKEN"):
                 raise ValueError("api.api_token cannot be a placeholder when enabled")
         return self
 
