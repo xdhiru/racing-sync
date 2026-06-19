@@ -120,7 +120,7 @@ async def run_rclone(
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        raise RcloneError(f"rclone timeout after {timeout}s: {cmd}")
+        raise RcloneError(f"rclone timeout after {timeout}s: {redact_rclone_cmd(cmd)}")
     dt = time.monotonic() - t0
     stdout = stdout_b.decode("utf-8", errors="replace")
     stderr = stderr_b.decode("utf-8", errors="replace")

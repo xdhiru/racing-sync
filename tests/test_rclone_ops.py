@@ -123,3 +123,28 @@ def test_build_move_cmd(tmp_path: Path):
     assert "--include=*.mkv" in cmd
     assert "--dry-run" in cmd
 
+
+@pytest.mark.anyio
+async def test_run_rclone_timeout_redacts_command(monkeypatch):
+    from unittest.mock import AsyncMock
+    from racing_sync.rclone_ops import run_rclone, RcloneError
+
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+    cfg.rclone.env = {}
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate.side_effect = TimeoutError()
+    mock_proc.kill = MagicMock()
+    mock_proc.wait = AsyncMock()
+
+    with monkeypatch.context() as m:
+        m.setattr("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc))
+        cmd = ["rclone", "move", "/src", "remote:dst", "--password", "supersecret123"]
+        with pytest.raises(RcloneError) as exc_info:
+            await run_rclone(cfg, cmd, timeout=0.01)
+        err_msg = str(exc_info.value)
+        assert "supersecret123" not in err_msg
+        assert "--password ******" in err_msg
+
+
