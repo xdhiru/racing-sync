@@ -162,7 +162,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     save_path=status.get("save_path", "") or "",
                     size_bytes=int(status.get("total_size", 0) or 0),
                     state=status.get("state", ""),
-                    progress=float(status.get("progress", 0.0)),
+                    progress=min(1.0, max(0.0, float(status.get("progress", 0.0) or 0.0) / 100.0)),
                     ratio=float(status.get("ratio", 0.0)),
                     trackers=_extract_tracker_urls(
                         status.get("trackers", []) or []
@@ -171,15 +171,18 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     added_on=int(status.get("time_added", 0) or 0),
                 )
             )
+        if hashes:
+            hash_set = {h.lower() for h in hashes}
+            out = [t for t in out if t.hash.lower() in hash_set]
         return out
 
     async def get_torrent(self, torrent_hash: str) -> Torrent | None:
         rows = await self.list_torrents(hashes=[torrent_hash])
-        if not rows:
-            return None
-        t = rows[0]
-        t.files = await self.get_torrent_files(torrent_hash)
-        return t
+        for t in rows:
+            if t.hash.lower() == torrent_hash.lower():
+                t.files = await self.get_torrent_files(torrent_hash)
+                return t
+        return None
 
     async def get_torrent_files(self, torrent_hash: str) -> list[TorrentFile]:
         """Fetch files for `torrent_hash`.
@@ -321,11 +324,28 @@ class DelugeClient(TorrentClient, HTTPClientBase):
     async def set_file_priorities(
         self, torrent_hash: str, priorities: dict[str, int]
     ) -> None:
-        for name, prio in priorities.items():
-            await self._rpc(
-                "core.set_torrent_file_priority",
-                [torrent_hash, name, int(prio)],
+        try:
+            status = await self._rpc(
+                "core.get_torrent_status",
+                [torrent_hash, ["files", "file_priorities"]],
             )
+            if status and "files" in status:
+                files = status.get("files", [])
+                curr_prios = list(status.get("file_priorities", []))
+                if len(curr_prios) < len(files):
+                    curr_prios = [1] * len(files)
+                name_to_idx = {
+                    item.get("path", ""): item.get("index", i)
+                    for i, item in enumerate(files)
+                }
+                for name, prio in priorities.items():
+                    if name in name_to_idx:
+                        idx = name_to_idx[name]
+                        if 0 <= idx < len(curr_prios):
+                            curr_prios[idx] = int(prio)
+                await self._rpc("core.set_torrent_file_priorities", [torrent_hash, curr_prios])
+        except Exception as e:
+            log.warning("deluge set_torrent_file_priorities failed for %s: %s", torrent_hash, e)
 
     async def pause(self, torrent_hash: str) -> None:
         await self._rpc("core.pause_torrent", [torrent_hash])
