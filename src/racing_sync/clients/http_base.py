@@ -59,6 +59,8 @@ class HTTPClientBase:
         self._authed = False
 
     async def start(self) -> None:
+        if self._session and not self._session.closed:
+            return
         headers: dict[str, str] = {}
         # mode="basic": send the Authorization header on every request
         # preemptively. This works against nginx `auth_basic` and any
@@ -107,10 +109,26 @@ class HTTPClientBase:
                 form[self._cfg.nginx_user_field] = self._cfg.username
                 pw = self._cfg.password.get_secret_value() if hasattr(self._cfg.password, "get_secret_value") else str(self._cfg.password)
                 form[self._cfg.nginx_pass_field] = pw
-                async with self.session.post(self._cfg.nginx_url, data=form) as r:
+                async with self.session.post(
+                    self._cfg.nginx_url, data=form, allow_redirects=True
+                ) as r:
                     if r.status >= 400:
                         raise AuthError(
                             f"nginx auth failed for {self._label}: HTTP {r.status}"
+                        )
+                    body = await r.text()
+                    body_lower = body.lower()
+                    if any(
+                        marker in body_lower
+                        for marker in (
+                            "invalid password",
+                            "invalid credentials",
+                            "login failed",
+                            'type="password"',
+                        )
+                    ):
+                        raise AuthError(
+                            f"nginx form auth rejected credentials for {self._label} (HTTP {r.status})"
                         )
             # mode="basic": nothing to do here; the Authorization header
             # was set in start() and travels with every request.
@@ -134,6 +152,21 @@ class HTTPClientBase:
     ) -> aiohttp.ClientResponse:
         if not self._authed:
             await self._auth()
+
+        if files is not None:
+            if not isinstance(data, aiohttp.FormData):
+                fd = aiohttp.FormData()
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        fd.add_field(k, str(v))
+                data = fd
+            if isinstance(files, dict):
+                for k, v in files.items():
+                    data.add_field(k, v)
+            elif isinstance(files, (list, tuple)):
+                for item in files:
+                    if isinstance(item, tuple) and len(item) >= 2:
+                        data.add_field(item[0], item[1])
 
         path_clean = path.lstrip("/")
 
@@ -188,7 +221,10 @@ class HTTPClientBase:
                     continue
                 r2 = await _do()
                 if r2.status in (401, 403):
-                    await r2.read()
+                    try:
+                        await r2.read()
+                    finally:
+                        r2.close()
                     last_exc = AuthError(
                         f"[{self._label}] auth failed: HTTP {r2.status} on {path}"
                     )
@@ -203,7 +239,10 @@ class HTTPClientBase:
                 raise last_exc
             # If we broke out of the loop with r set, fall through.
             if r.status >= 400:
-                body = await r.text()
+                try:
+                    body = await r.text()
+                finally:
+                    r.close()
                 raise aiohttp.ClientResponseError(
                     request_info=r.request_info,
                     history=r.history,
@@ -213,7 +252,10 @@ class HTTPClientBase:
             return r
 
         if r.status >= 400:
-            body = await r.text()
+            try:
+                body = await r.text()
+            finally:
+                r.close()
             raise aiohttp.ClientResponseError(
                 request_info=r.request_info,
                 history=r.history,

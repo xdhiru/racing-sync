@@ -192,6 +192,107 @@ async def test_http_client_auth_retry_releases_initial_response():
 
 
 @pytest.mark.anyio
+async def test_http_client_start_idempotent():
+    from racing_sync.clients.http_base import HTTPClientBase
+    from racing_sync.config import HTTPClientConfig
+
+    cfg = HTTPClientConfig(host="http://127.0.0.1:8080", nginx_mode="off")
+    client = HTTPClientBase(cfg)
+    await client.start()
+    s1 = client.session
+    await client.start()
+    s2 = client.session
+    assert s1 is s2
+    await client.close()
+
+
+@pytest.mark.anyio
+async def test_http_client_form_post_verifies_login_body():
+    from racing_sync.clients.http_base import HTTPClientBase, AuthError
+    from racing_sync.config import HTTPClientConfig
+
+    cfg = HTTPClientConfig(
+        host="http://127.0.0.1:8080",
+        nginx_mode="form_post",
+        nginx_url="http://127.0.0.1:8080/login",
+        username="u",
+        password="p",
+    )
+    client = HTTPClientBase(cfg)
+    client._session = MagicMock()
+    client._do_client_auth = AsyncMock()
+
+    class MockResp:
+        def __init__(self, text):
+            self.status = 200
+            self._text = text
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def text(self):
+            return self._text
+
+    client._session.post = MagicMock(return_value=MockResp('<html><input type="password"/>Invalid password</html>'))
+    with pytest.raises(AuthError, match="rejected credentials"):
+        await client._auth(force=True)
+
+
+@pytest.mark.anyio
+async def test_http_client_request_releases_connection_on_4xx():
+    import aiohttp
+    from racing_sync.clients.http_base import HTTPClientBase
+    from racing_sync.config import HTTPClientConfig
+
+    cfg = HTTPClientConfig(host="http://127.0.0.1:8080", nginx_mode="off")
+    client = HTTPClientBase(cfg)
+    client._authed = True
+    client._session = MagicMock()
+
+    resp_500 = MagicMock()
+    resp_500.status = 500
+    resp_500.text = AsyncMock(return_value="Server Error")
+    resp_500.close = MagicMock()
+    resp_500.request_info = MagicMock()
+    resp_500.history = ()
+
+    client._session.request = AsyncMock(return_value=resp_500)
+
+    with pytest.raises(aiohttp.ClientResponseError):
+        await client.request("GET", "/fail", retry_auth=False)
+    resp_500.close.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_http_client_files_param_handling():
+    import aiohttp
+    from racing_sync.clients.http_base import HTTPClientBase
+    from racing_sync.config import HTTPClientConfig
+
+    cfg = HTTPClientConfig(host="http://127.0.0.1:8080", nginx_mode="off")
+    client = HTTPClientBase(cfg)
+    client._authed = True
+    client._session = MagicMock()
+
+    resp_200 = MagicMock()
+    resp_200.status = 200
+    resp_200.close = MagicMock()
+
+    recorded_kwargs = {}
+
+    async def mock_req(method, url, **kwargs):
+        recorded_kwargs.update(kwargs)
+        return resp_200
+
+    client._session.request = mock_req
+
+    res = await client.request("POST", "/upload", files={"torrent": b"d8:announce...e"})
+    assert res == resp_200
+    assert isinstance(recorded_kwargs.get("data"), aiohttp.FormData)
+
+
+
+@pytest.mark.anyio
 async def test_deluge_list_torrents_progress_and_hash_filtering():
     cfg = SourceConfig(
         type="deluge",
