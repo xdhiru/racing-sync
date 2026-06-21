@@ -74,3 +74,34 @@ def test_primary_election_prefers_public():
     group = [t_private1, t_public, t_private2]
     primary = next((t for t in group if _looks_public(t.trackers)), group[0])
     assert primary.hash == t_public.hash
+
+
+def test_normalize_content_name():
+    from racing_sync.coordinator import normalize_content_name
+
+    assert normalize_content_name("Movie.2024.1080p-GROUP") == "movie.2024.1080p-group"
+    assert normalize_content_name("Movie.2024.1080p-GROUP [Indexer]") == "movie.2024.1080p-group"
+    assert normalize_content_name("Movie.2024.1080p-GROUP [FL].torrent") == "movie.2024.1080p-group"
+    assert normalize_content_name("Movie.2024.1080p-GROUP.mkv") == "movie.2024.1080p-group"
+    assert normalize_content_name("  Movie.2024.1080p-GROUP [Indexer]  ") == "movie.2024.1080p-group"
+
+
+def test_find_by_name_with_bracketed_tags():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "test.db"
+        store = StateStore(db_path)
+        try:
+            ts1 = TorrentState(
+                source_infohash="1" * 40,
+                source_name="Movie.2024.1080p-GROUP.mkv",
+                state=State.NEW,
+            )
+            store.upsert(ts1)
+
+            # Query with [Indexer] variant matches the stored entry
+            results = store.find_by_name("Movie.2024.1080p-GROUP [Indexer]")
+            assert len(results) == 1
+            assert results[0].source_infohash == "1" * 40
+        finally:
+            store.close()
+
