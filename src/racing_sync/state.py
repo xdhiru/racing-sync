@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import enum
 import logging
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass, field
@@ -392,16 +393,18 @@ class StateStore:
             return [_row_to_state(r) for r in rows]
 
     def find_by_name(self, source_name: str) -> list[TorrentState]:
-        clean_name = source_name
-        for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v"):
+        clean_name = source_name.strip()
+        for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v", ".torrent"):
             if clean_name.lower().endswith(ext):
-                clean_name = clean_name[:-len(ext)]
+                clean_name = clean_name[:-len(ext)].strip()
                 break
+        stripped_name = re.sub(r"\s*\[[^\]]+\]\s*$", "", clean_name).strip()
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM torrent_state WHERE source_name = ? OR source_name = ? "
-                "OR source_name LIKE ? ORDER BY updated_at DESC",
-                (source_name, clean_name, f"{clean_name}.%"),
+                "OR source_name = ? OR source_name LIKE ? OR source_name LIKE ? "
+                "ORDER BY updated_at DESC",
+                (source_name, clean_name, stripped_name, f"{clean_name}.%", f"{stripped_name}%"),
             ).fetchall()
             return [_row_to_state(r) for r in rows]
 
