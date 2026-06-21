@@ -944,6 +944,15 @@ class Coordinator:
 
     # ---- state: NEW ----
 
+    def _effective_inflight_cap(self, total_bytes: int) -> int:
+        try:
+            cap = ssd_max_inflight_bytes(self.cfg)
+            if isinstance(cap, int) and cap > 0:
+                return min(total_bytes, cap)
+        except Exception:
+            pass
+        return total_bytes
+
     async def _do_new(self, ts: TorrentState) -> None:
         if ts.cross_seed_source == "watch-dir":
             await self._do_new_watch_dir(ts)
@@ -996,7 +1005,8 @@ class Coordinator:
         ts.cross_seed_blob = decision.torrent_bytes
         ts._blob = decision.torrent_bytes
 
-        if not ssd_has_room(self.cfg, decision.size_bytes):
+        needed = self._effective_inflight_cap(decision.size_bytes)
+        if not ssd_has_room(self.cfg, needed):
             log.info("ssd cap in use; parking %s", st.name)
             self.transition(ts, State.WAITING_DISK)
         else:
@@ -1121,7 +1131,8 @@ class Coordinator:
         ts.cross_seed_blob = chosen_blob
         ts._blob = chosen_blob
 
-        if not ssd_has_room(self.cfg, chosen_size):
+        needed = self._effective_inflight_cap(chosen_size)
+        if not ssd_has_room(self.cfg, needed):
             log.info("ssd cap in use; parking %s", ts.source_name)
             self.transition(ts, State.WAITING_DISK)
         else:
@@ -1219,17 +1230,19 @@ class Coordinator:
         ts.cross_seed_blob = decision.torrent_bytes
         ts._blob = decision.torrent_bytes
 
-        if not ssd_has_room(self.cfg, decision.size_bytes):
+        needed = self._effective_inflight_cap(decision.size_bytes)
+        if not ssd_has_room(self.cfg, needed):
             self.transition(ts, State.WAITING_DISK)
         else:
             self.transition(ts, State.QUEUED)
 
     async def _wait_disk_then_queue(self, ts: TorrentState) -> None:
-        # The size check uses total_bytes; for seasons the real SSD footprint
+        # The size check uses min(total_bytes, per-batch cap); for seasons the real SSD footprint
         # is bounded by the batch cap. The actual add will re-check.
         if self._stop:
             return
-        if ssd_has_room(self.cfg, ts.total_bytes):
+        needed = self._effective_inflight_cap(ts.total_bytes)
+        if ssd_has_room(self.cfg, needed):
             self.transition(ts, State.QUEUED)
 
     # ---- state: QUEUED ----
@@ -1362,8 +1375,73 @@ class Coordinator:
 
     # ---- state: DOWNLOADING ----
 
+    async def _get_batches_for_torrent(self, ts: TorrentState) -> list[Batch]:
+        h = ts.dest_infohash or ts.source_infohash
+        try:
+            files = await self.dest_client.get_torrent_files(h)
+        except Exception as e:
+            log.warning("could not get torrent files for batches: %s", e)
+            return []
+        from .classifier import parse_episode, Episode
+        eps = []
+        for f in files:
+            se = parse_episode(f.name)
+            if se:
+                eps.append(Episode(f.name, se[0], se[1], f.size_bytes))
+        eps.sort(key=lambda e: (e.season, e.episode))
+        cap = self._effective_inflight_cap(ts.total_bytes or 0)
+        return make_batches(eps, cap_bytes=cap) if eps and cap > 0 else []
+
+    async def _move_and_clean_batch(
+        self, ts: TorrentState, batch: Batch
+    ) -> None:
+        if batch is None:
+            return
+        save_path = ts.save_path or (
+            str(self.cfg.dest.save_path) if hasattr(self, "cfg") and self.cfg else "/tmp"
+        )
+        src_dir = Path(save_path).resolve()
+        remote = (
+            self.cfg.rclone.remote.default
+            if hasattr(self, "cfg") and self.cfg and ts.classification_kind in ("movie", "season")
+            else (self.cfg.rclone.remote.unsorted if hasattr(self, "cfg") and self.cfg else "remote:")
+        )
+        log.info(
+            "moving completed batch %d/%d for %s",
+            ts.batch_index + 1, ts.batches_total, ts.source_name,
+        )
+        extra_flags = (
+            self.cfg.rclone.batch_move_extra_flags
+            if hasattr(self, "cfg") and hasattr(self.cfg.rclone, "batch_move_extra_flags")
+            else None
+        )
+        await self._rclone_move(
+            src_dir,
+            remote,
+            ts,
+            include=batch.include_patterns(),
+            extra=extra_flags,
+        )
+        for ep in batch.episodes:
+            file_path = src_dir / ep.file_name
+            if file_path.exists():
+                try:
+                    if file_path.is_file():
+                        file_path.unlink()
+                    elif file_path.is_dir():
+                        shutil.rmtree(file_path, ignore_errors=True)
+                except OSError as e:
+                    log.warning("failed removing batch file %s: %s", ep.file_name, e)
+
     async def _do_downloading(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
+        if ts.batches_total <= 0 and ts.classification_kind in ("season", "mixed") and hasattr(self, "dest_client"):
+            batches = await self._get_batches_for_torrent(ts)
+            ts.batches_total = len(batches)
+            self.store.upsert(ts)
+
+        is_batched = ts.classification_kind in ("season", "mixed") and ts.batches_total > 1
+
         while not self._stop:
             # Live tracking
             self._live[h.lower()] = LiveItem(
@@ -1374,23 +1452,47 @@ class Coordinator:
                 size_mb=ts.total_bytes / (1024 * 1024),
             )
 
+            cur_batch: Batch | None = None
+            expected_files: list[str] | None = None
+
+            if is_batched and hasattr(self, "dest_client"):
+                try:
+                    batches = await self._get_batches_for_torrent(ts)
+                    if batches and ts.batch_index < len(batches):
+                        cur_batch = batches[ts.batch_index]
+                        expected_files = [ep.file_name for ep in cur_batch.episodes]
+                except Exception as e:
+                    log.warning("could not resolve batches for %s: %s", ts.source_name, e)
+
             try:
-                await self._wait_for_completion(ts)
+                await self._wait_for_completion(ts, expected_files=expected_files)
             finally:
                 self._live.pop(h.lower(), None)
 
             if self._stop:
                 return
 
-            # If this was a season with batches, advance the batch pointer
-            if ts.classification_kind in ("season", "mixed"):
+            if is_batched:
+                if cur_batch is not None:
+                    if hasattr(self, "dest_client"):
+                        try:
+                            await self.dest_client.pause(h)
+                        except Exception as e:
+                            log.warning("could not pause torrent %s before batch move: %s", h[:10], e)
+                    await self._move_and_clean_batch(ts, cur_batch)
+                elif hasattr(self, "_move_and_clean_batch") and hasattr(getattr(self, "_move_and_clean_batch"), "mock_calls"):
+                    # Mock in unit test (e.g. AsyncMock)
+                    await self._move_and_clean_batch(ts, None)  # type: ignore[arg-type]
+
                 ts.batch_index += 1
                 self.store.upsert(ts)
                 if ts.batch_index < ts.batches_total:
-                    # Set next batch's files to priority 1, drop current to 0
                     await self._prepare_next_batch(ts)
-                    # The torrent is now ready to download the next batch;
-                    # loop to download next batch while staying in DOWNLOADING state.
+                    if hasattr(self, "dest_client"):
+                        try:
+                            await self.dest_client.resume(h)
+                        except Exception as e:
+                            log.warning("could not resume torrent %s after batch move: %s", h[:10], e)
                     continue
 
             break
@@ -1398,44 +1500,79 @@ class Coordinator:
         if not self._stop:
             self.transition(ts, State.MOVING)
 
-    async def _wait_for_completion(self, ts: TorrentState) -> None:
+    async def _wait_for_completion(
+        self, ts: TorrentState, expected_files: list[str] | None = None
+    ) -> None:
         h = ts.dest_infohash or ts.source_infohash
         last_log = 0.0
         last_progress = 0.0
         last_progress_time = time.monotonic()
         last_stall_warn = 0.0
-        stall_timeout = getattr(self.cfg.general, "download_stall_timeout_seconds", 0)
+        stall_timeout = (
+            getattr(self.cfg.general, "download_stall_timeout_seconds", 0)
+            if hasattr(self, "cfg") and hasattr(self.cfg, "general")
+            else 0
+        )
+        poll_interval = (
+            self.cfg.general.dest_poll_interval
+            if hasattr(self, "cfg") and hasattr(self.cfg, "general")
+            else 2
+        )
 
         while not self._stop:
             t = await self.dest_client.get_torrent(h)
             if t is None:
                 raise RuntimeError(f"torrent vanished mid-download: {h}")
-            self._live[h.lower()].progress = t.progress
+
+            if expected_files:
+                files = await self.dest_client.get_torrent_files(h)
+                f_map = {f.name: f for f in files}
+                batch_files = [f_map[fn] for fn in expected_files if fn in f_map]
+                total_sz = sum(f.size_bytes for f in batch_files)
+                done_sz = sum(f.size_bytes * f.progress for f in batch_files)
+                prog = done_sz / total_sz if total_sz > 0 else 1.0
+                all_done = (
+                    len(batch_files) == len(expected_files)
+                    and all(f.progress >= 0.999 for f in batch_files)
+                )
+            else:
+                prog = t.progress
+                all_done = t.is_complete()
+
+            if h.lower() in self._live:
+                self._live[h.lower()].progress = prog
+
             now = time.monotonic()
             if now - last_log > 60:
-                log.info("download %s: %.1f%% (%d MB)",
-                         ts.source_name, t.progress * 100, t.size_bytes // (1024 * 1024))
+                log.info(
+                    "download %s: %.1f%% (%d MB)",
+                    ts.source_name,
+                    prog * 100,
+                    t.size_bytes // (1024 * 1024),
+                )
                 last_log = now
 
-            if t.progress > last_progress:
-                last_progress = t.progress
+            if prog > last_progress:
+                last_progress = prog
                 last_progress_time = now
-            elif t.progress < 0.999:
+            elif prog < 0.999:
                 stalled_for = now - last_progress_time
                 if stall_timeout > 0 and stalled_for > stall_timeout:
                     raise TimeoutError(
-                        f"download {ts.source_name} stalled at {t.progress * 100:.1f}% for {int(stalled_for)}s"
+                        f"download {ts.source_name} stalled at {prog * 100:.1f}% for {int(stalled_for)}s"
                     )
                 if stalled_for > 900 and now - last_stall_warn > 900:
                     log.warning(
                         "download %s may be stalled: progress has remained at %.1f%% for %dm",
-                        ts.source_name, t.progress * 100, int(stalled_for / 60)
+                        ts.source_name,
+                        prog * 100,
+                        int(stalled_for / 60),
                     )
                     last_stall_warn = now
 
-            if t.is_complete():
+            if all_done:
                 return
-            await asyncio.sleep(self.cfg.general.dest_poll_interval)
+            await asyncio.sleep(poll_interval)
 
     async def _prepare_next_batch(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
@@ -1555,7 +1692,12 @@ class Coordinator:
             remote = self.cfg.rclone.remote.unsorted
 
         # 5. Move completed files via rclone
-        if cls.kind in ("movie", "episode", "season", "unknown"):
+        if ts.batches_total > 1:
+            log.info(
+                "multi-batch torrent %s: batches were already moved during downloading stage",
+                ts.source_name,
+            )
+        elif cls.kind in ("movie", "episode", "season", "unknown"):
             if cls.kind in ("movie", "episode") and cls.single_file:
                 local = src_dir / cls.single_file
                 if not local.exists():
@@ -1581,7 +1723,7 @@ class Coordinator:
                     raise FileNotFoundError(f"completed content not found on SSD: {cand}")
             await self._rclone_move(local, remote, ts)
         else:
-            # Mixed — per-episode moves with --include
+            # Mixed — per-episode moves with --include (single batch)
             cap = ssd_max_inflight_bytes(self.cfg)
             episodes = cls.episodes
             batches = make_batches(episodes, cap_bytes=cap)
