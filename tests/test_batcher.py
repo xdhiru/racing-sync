@@ -93,3 +93,182 @@ async def test_do_downloading_iterates_batches():
     assert ts.batch_index == 3
     assert ts.state == State.MOVING
     assert coord.transition.called
+
+
+@pytest.mark.anyio
+async def test_batch_interleaved_download_move_and_clean(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.batcher import Batch
+    from racing_sync.classifier import Episode
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord._live = {}
+    coord.store = MagicMock()
+    coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
+    coord._wait_for_completion = AsyncMock()
+    coord._prepare_next_batch = AsyncMock()
+    coord._rclone_move = AsyncMock()
+    coord.dest_client = MagicMock()
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.resume = AsyncMock()
+
+    # Create dummy files on disk in tmp_path
+    save_dir = tmp_path / "downloads"
+    save_dir.mkdir()
+    ep1_path = save_dir / "S01E01.mkv"
+    ep2_path = save_dir / "S01E02.mkv"
+    ep1_path.write_bytes(b"ep1_data")
+    ep2_path.write_bytes(b"ep2_data")
+
+    # Mock get_torrent_files
+    tf1 = TorrentFile(name="S01E01.mkv", size_bytes=8, progress=1.0)
+    tf2 = TorrentFile(name="S01E02.mkv", size_bytes=8, progress=0.0)
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[tf1, tf2])
+
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = save_dir
+    coord.cfg.rclone.remote.default = "remote:tv"
+    coord.cfg.rclone.batch_move_extra_flags = []
+    coord._effective_inflight_cap = MagicMock(return_value=10)
+
+    ts = TorrentState(
+        source_infohash="testhash",
+        source_name="Test.Show.S01",
+        classification_kind="season",
+        save_path=str(save_dir),
+        batches_total=2,
+        batch_index=0,
+        state=State.DOWNLOADING,
+    )
+
+    await coord._do_downloading(ts)
+
+    # Both batches moved via rclone
+    assert coord._rclone_move.await_count == 2
+    # Client paused before move and resumed for next batch
+    assert coord.dest_client.pause.await_count == 2
+    assert coord.dest_client.resume.await_count == 1
+    # Local files wiped after batch move
+    assert not ep1_path.exists()
+    assert not ep2_path.exists()
+    assert ts.batch_index == 2
+    assert ts.state == State.MOVING
+
+
+@pytest.mark.anyio
+async def test_coordinator_gate_uses_min_total_and_batch_cap():
+    from unittest.mock import MagicMock, patch
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
+    coord.cfg = MagicMock()
+
+    # Total season is 100 GB, batch cap is 20 GB
+    total_season_bytes = 100 * 1024 * 1024 * 1024
+    batch_cap = 20 * 1024 * 1024 * 1024
+
+    with patch("racing_sync.coordinator.ssd_max_inflight_bytes", return_value=batch_cap):
+        effective = coord._effective_inflight_cap(total_season_bytes)
+        assert effective == batch_cap
+
+        # ssd_has_room is called with the batch cap (20GB), NOT the full 100GB
+        ts = TorrentState(
+            source_infohash="seasonhash",
+            source_name="Big.Show.S01",
+            total_bytes=total_season_bytes,
+            state=State.WAITING_DISK,
+        )
+
+        with patch("racing_sync.coordinator.ssd_has_room") as mock_has_room:
+            # Mock room only for 25 GB (enough for 20 GB batch cap, but NOT 100 GB)
+            mock_has_room.side_effect = lambda cfg, needed: needed <= 25 * 1024 * 1024 * 1024
+
+            await coord._wait_disk_then_queue(ts)
+
+            # Should have transitioned to QUEUED because 20 GB <= 25 GB
+            assert ts.state == State.QUEUED
+            mock_has_room.assert_called_once_with(coord.cfg, batch_cap)
+
+
+@pytest.mark.anyio
+async def test_wait_for_completion_resolves_when_expected_files_complete():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState
+    from racing_sync.clients.abstract import TorrentFile, Torrent
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord._live = {}
+    coord.cfg = MagicMock()
+    coord.cfg.general.dest_poll_interval = 0.01
+    coord.cfg.general.download_stall_timeout_seconds = 0
+
+    t_item = Torrent(
+        hash="hash1",
+        name="Show.S01",
+        size_bytes=2000,
+        progress=0.5,  # Overall torrent only 50%
+        state="downloading",
+        category="racing",
+        save_path="/tmp",
+    )
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=t_item)
+
+    # Batch only includes S01E01, which is at 100%
+    f1 = TorrentFile(name="S01E01.mkv", size_bytes=1000, progress=1.0)
+    f2 = TorrentFile(name="S01E02.mkv", size_bytes=1000, progress=0.0)
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[f1, f2])
+
+    ts = TorrentState(source_infohash="hash1", source_name="Show.S01")
+    # Waiting for only S01E01 should return immediately because S01E01 is complete
+    await coord._wait_for_completion(ts, expected_files=["S01E01.mkv"])
+
+
+@pytest.mark.anyio
+async def test_do_moving_skips_move_when_already_batched(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.delete = AsyncMock()
+    coord._rclone_move = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="hash1",
+        source_name="Show.S01",
+        classification_kind="season",
+        batches_total=2,  # Multi-batch: batches were already moved during downloading
+        batch_index=2,
+        state=State.MOVING,
+    )
+
+    with patch("racing_sync.coordinator.classify") as mock_classify:
+        mock_cls = MagicMock()
+        mock_cls.kind = "season"
+        mock_classify.return_value = mock_cls
+
+        await coord._do_moving(ts)
+
+        # _rclone_move should NOT be called because batches were already moved
+        coord._rclone_move.assert_not_called()
+        # Old torrent is deleted from client and state transitions to RE_ADDING
+        coord.dest_client.delete.assert_called_once_with("hash1", delete_files=False)
+        assert ts.state == State.RE_ADDING
