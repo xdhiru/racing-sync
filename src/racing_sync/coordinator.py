@@ -259,7 +259,7 @@ async def pick_ssd_source_for_racing(
                     from .watchdir import _bencoded_info_hash
                     real_hash, _, _, _ = _bencoded_info_hash(blob)
                 except Exception:
-                    real_hash = hit.guid if len(hit.guid) == 40 else ""
+                    real_hash = ""
                 return SourceDecision(
                     torrent_bytes=blob,
                     source_label="public-indexer-fallback",
@@ -300,7 +300,7 @@ async def pick_ssd_source_for_racing(
                 from .watchdir import _bencoded_info_hash
                 real_hash, _, _, _ = _bencoded_info_hash(blob)
             except Exception:
-                real_hash = hit.guid if len(hit.guid) == 40 else ""
+                real_hash = ""
             return SourceDecision(
                 torrent_bytes=blob,
                 source_label="indexer-cross-seed",
