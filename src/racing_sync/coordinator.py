@@ -452,9 +452,7 @@ class Coordinator:
                         len(failed_rows),
                     )
                     for ts in failed_rows:
-                        ts.state = State.NEW
-                        ts.last_error = ""
-                        self.store.upsert(ts)
+                        self.transition(ts, State.NEW)
 
             # Optional Telegram bot
             from .telegram_bot import TelegramBot
