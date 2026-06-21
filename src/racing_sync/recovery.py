@@ -77,8 +77,7 @@ async def reconcile(
             else:
                 # Lost — re-add pointing at fuse. The data is on remote.
                 rpt.re_added.append(h)
-                ts.state = State.RE_ADDING
-                store.upsert(ts)
+                store.transition(ts, State.RE_ADDING)
         elif ts.state == State.FAILED:
             # Leave for manual retry
             rpt.kept.append(h)

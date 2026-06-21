@@ -58,7 +58,7 @@ class State(str, enum.Enum):
 ALLOWED: dict[State, set[State]] = {
     State.NEW: {State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK,
                 State.QUEUED, State.DOWNLOADING, State.MOVING, State.RE_ADDING,
-                State.DONE, State.FAILED},
+                State.FAILED},
     State.QUERYING: {State.WAITING_INDEXER, State.WAITING_DISK, State.QUEUED,
                 State.DOWNLOADING, State.FAILED},
     State.WAITING_INDEXER: {State.QUERYING, State.WAITING_DISK,
@@ -68,8 +68,8 @@ ALLOWED: dict[State, set[State]] = {
     State.DOWNLOADING: {State.MOVING, State.FAILED},
     State.MOVING: {State.RE_ADDING, State.FAILED},
     State.RE_ADDING: {State.DONE, State.FAILED},
-    State.DONE: set(),
-    State.FAILED: {State.QUEUED},  # allow manual retry
+    State.DONE: {State.RE_ADDING},
+    State.FAILED: {State.QUEUED, State.NEW},  # allow manual and auto retry
 }
 
 
@@ -165,7 +165,7 @@ class TorrentState:
         }
 
 
-SCHEMA = """
+SCHEMA_TABLES = """
 CREATE TABLE IF NOT EXISTS torrent_state (
     source_infohash          TEXT PRIMARY KEY,
     dest_infohash            TEXT NOT NULL DEFAULT '',
@@ -193,9 +193,6 @@ CREATE TABLE IF NOT EXISTS torrent_state (
     created_at               TEXT NOT NULL,
     updated_at               TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS ix_state ON torrent_state(state);
-CREATE INDEX IF NOT EXISTS ix_indexer_retry
-    ON torrent_state(state, indexer_next_retry_at);
 
 CREATE TABLE IF NOT EXISTS run_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -205,6 +202,14 @@ CREATE TABLE IF NOT EXISTS run_log (
     message TEXT NOT NULL
 );
 """
+
+SCHEMA_INDEXES = """
+CREATE INDEX IF NOT EXISTS ix_state ON torrent_state(state);
+CREATE INDEX IF NOT EXISTS ix_indexer_retry
+    ON torrent_state(state, indexer_next_retry_at);
+"""
+
+SCHEMA = SCHEMA_TABLES + SCHEMA_INDEXES
 
 
 _TORRENT_STATE_COLUMNS_NO_BLOB = (
@@ -237,8 +242,9 @@ class StateStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=30000")
-        self._conn.executescript(SCHEMA)
+        self._conn.executescript(SCHEMA_TABLES)
         self._migrate()
+        self._conn.executescript(SCHEMA_INDEXES)
 
     def close(self) -> None:
         with self._lock:
@@ -255,22 +261,37 @@ class StateStore:
         cols = {row["name"] for row in self._conn.execute(
             "PRAGMA table_info(torrent_state)"
         ).fetchall()}
-        if "cross_seed_blob" not in cols:
-            self._conn.execute(
-                "ALTER TABLE torrent_state ADD COLUMN cross_seed_blob BLOB NOT NULL DEFAULT ''"
-            )
-        if "readd_first_attempted_at" not in cols:
-            self._conn.execute(
-                "ALTER TABLE torrent_state ADD COLUMN readd_first_attempted_at TEXT NOT NULL DEFAULT ''"
-            )
-        if "readd_next_retry_at" not in cols:
-            self._conn.execute(
-                "ALTER TABLE torrent_state ADD COLUMN readd_next_retry_at TEXT NOT NULL DEFAULT ''"
-            )
-        if "readd_attempts" not in cols:
-            self._conn.execute(
-                "ALTER TABLE torrent_state ADD COLUMN readd_attempts INTEGER NOT NULL DEFAULT 0"
-            )
+        EXPECTED_COLUMNS = {
+            "dest_infohash": "TEXT NOT NULL DEFAULT ''",
+            "source_name": "TEXT NOT NULL DEFAULT ''",
+            "source_tracker": "TEXT NOT NULL DEFAULT ''",
+            "source_announce_url": "TEXT NOT NULL DEFAULT ''",
+            "classification_kind": "TEXT NOT NULL DEFAULT 'unknown'",
+            "total_bytes": "INTEGER NOT NULL DEFAULT 0",
+            "save_path": "TEXT NOT NULL DEFAULT ''",
+            "cross_seed_infohash": "TEXT NOT NULL DEFAULT ''",
+            "cross_seed_source": "TEXT NOT NULL DEFAULT ''",
+            "cross_seed_blob": "BLOB NOT NULL DEFAULT ''",
+            "injected_private_hashes": "TEXT NOT NULL DEFAULT ''",
+            "indexer_first_queried_at": "TEXT NOT NULL DEFAULT ''",
+            "indexer_next_retry_at": "TEXT NOT NULL DEFAULT ''",
+            "indexer_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "readd_first_attempted_at": "TEXT NOT NULL DEFAULT ''",
+            "readd_next_retry_at": "TEXT NOT NULL DEFAULT ''",
+            "readd_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "state": "TEXT NOT NULL DEFAULT 'new'",
+            "batch_index": "INTEGER NOT NULL DEFAULT 0",
+            "batches_total": "INTEGER NOT NULL DEFAULT 0",
+            "last_error": "TEXT NOT NULL DEFAULT ''",
+            "telegram_message_id": "INTEGER NOT NULL DEFAULT 0",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+            "updated_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        for col, col_def in EXPECTED_COLUMNS.items():
+            if col not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE torrent_state ADD COLUMN {col} {col_def}"
+                )
 
     # ---- CRUD ----
 
@@ -420,8 +441,14 @@ class StateStore:
                    *, error: str = "", batch_index: int | None = None) -> None:
         check_transition(ts.state, dst)
         ts.state = dst
-        if error:
-            ts.last_error = error
+        ts.last_error = error
+        if dst in (State.NEW, State.QUEUED):
+            ts.indexer_first_queried_at = None
+            ts.indexer_next_retry_at = None
+            ts.indexer_attempts = 0
+            ts.readd_first_attempted_at = None
+            ts.readd_next_retry_at = None
+            ts.readd_attempts = 0
         if batch_index is not None:
             ts.batch_index = batch_index
         self.upsert(ts)
@@ -457,13 +484,14 @@ class StateStore:
 
 
 def _row_to_state(row: sqlite3.Row) -> TorrentState:
-    sp_first = row["indexer_first_queried_at"]
-    sp_next = row["indexer_next_retry_at"]
-    ra_first = row["readd_first_attempted_at"] if "readd_first_attempted_at" in row.keys() else ""
-    ra_next = row["readd_next_retry_at"] if "readd_next_retry_at" in row.keys() else ""
-    ra_attempts = row["readd_attempts"] if "readd_attempts" in row.keys() else 0
+    keys = row.keys()
+    sp_first = row["indexer_first_queried_at"] if "indexer_first_queried_at" in keys else ""
+    sp_next = row["indexer_next_retry_at"] if "indexer_next_retry_at" in keys else ""
+    ra_first = row["readd_first_attempted_at"] if "readd_first_attempted_at" in keys else ""
+    ra_next = row["readd_next_retry_at"] if "readd_next_retry_at" in keys else ""
+    ra_attempts = row["readd_attempts"] if "readd_attempts" in keys else 0
 
-    blob_raw = row["cross_seed_blob"] if "cross_seed_blob" in row.keys() else b""
+    blob_raw = row["cross_seed_blob"] if "cross_seed_blob" in keys else b""
     if not blob_raw:
         blob_bytes = b""
     elif isinstance(blob_raw, (bytes, bytearray, memoryview)):
@@ -474,37 +502,45 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         blob_bytes = bytes(blob_raw)
 
     return TorrentState(
-        source_infohash=row["source_infohash"],
-        dest_infohash=row["dest_infohash"],
-        source_name=row["source_name"],
-        source_tracker=row["source_tracker"],
-        source_announce_url=row["source_announce_url"],
-        classification_kind=row["classification_kind"],
-        total_bytes=row["total_bytes"],
-        save_path=row["save_path"],
-        cross_seed_infohash=row["cross_seed_infohash"],
-        cross_seed_source=row["cross_seed_source"],
+        source_infohash=row["source_infohash"] if "source_infohash" in keys else "",
+        dest_infohash=row["dest_infohash"] if "dest_infohash" in keys else "",
+        source_name=row["source_name"] if "source_name" in keys else "",
+        source_tracker=row["source_tracker"] if "source_tracker" in keys else "",
+        source_announce_url=row["source_announce_url"] if "source_announce_url" in keys else "",
+        classification_kind=row["classification_kind"] if "classification_kind" in keys else "unknown",
+        total_bytes=int(row["total_bytes"] or 0) if "total_bytes" in keys else 0,
+        save_path=row["save_path"] if "save_path" in keys else "",
+        cross_seed_infohash=row["cross_seed_infohash"] if "cross_seed_infohash" in keys else "",
+        cross_seed_source=row["cross_seed_source"] if "cross_seed_source" in keys else "",
         cross_seed_blob=blob_bytes,
-        injected_private_hashes=row["injected_private_hashes"],
+        injected_private_hashes=row["injected_private_hashes"] if "injected_private_hashes" in keys else "",
         indexer_first_queried_at=(
             dt.datetime.fromisoformat(sp_first) if sp_first else None
         ),
         indexer_next_retry_at=(
             dt.datetime.fromisoformat(sp_next) if sp_next else None
         ),
-        indexer_attempts=row["indexer_attempts"],
+        indexer_attempts=int(row["indexer_attempts"] or 0) if "indexer_attempts" in keys else 0,
         readd_first_attempted_at=(
             dt.datetime.fromisoformat(ra_first) if ra_first else None
         ),
         readd_next_retry_at=(
             dt.datetime.fromisoformat(ra_next) if ra_next else None
         ),
-        readd_attempts=ra_attempts,
-        state=State(row["state"]),
-        batch_index=row["batch_index"],
-        batches_total=row["batches_total"],
-        last_error=row["last_error"],
-        created_at=dt.datetime.fromisoformat(row["created_at"]),
-        updated_at=dt.datetime.fromisoformat(row["updated_at"]),
-        telegram_message_id=row["telegram_message_id"],
+        readd_attempts=int(ra_attempts or 0),
+        state=State(row["state"]) if "state" in keys else State.NEW,
+        batch_index=int(row["batch_index"] or 0) if "batch_index" in keys else 0,
+        batches_total=int(row["batches_total"] or 0) if "batches_total" in keys else 0,
+        last_error=row["last_error"] if "last_error" in keys else "",
+        created_at=(
+            dt.datetime.fromisoformat(row["created_at"])
+            if ("created_at" in keys and row["created_at"])
+            else dt.datetime.now(dt.timezone.utc)
+        ),
+        updated_at=(
+            dt.datetime.fromisoformat(row["updated_at"])
+            if ("updated_at" in keys and row["updated_at"])
+            else dt.datetime.now(dt.timezone.utc)
+        ),
+        telegram_message_id=int(row["telegram_message_id"] or 0) if "telegram_message_id" in keys else 0,
     )
