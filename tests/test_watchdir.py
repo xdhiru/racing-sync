@@ -462,3 +462,104 @@ async def test_watchdir_scanner_caches_by_mtime_and_size(tmp_path: Path):
         assert len(items2) == 0  # already seen
         mock_parse.assert_not_called()
 
+
+def test_bencoded_info_hash_preserves_raw_unsorted_info_bytes():
+    import hashlib
+    # Construct an info dict with keys intentionally NOT sorted according to bencode standard:
+    # 'zeta' before 'alpha'
+    raw_info = b"d4:zetai100e5:alphai200ee"
+    raw_torrent = b"d8:announce16:http://tracker/a4:info" + raw_info + b"e"
+
+    expected_hash = hashlib.sha1(raw_info).hexdigest().lower()
+    infohash, name, total, announce = _bencoded_info_hash(raw_torrent)
+    assert infohash == expected_hash
+    assert announce == "http://tracker/a"
+
+
+def test_bdecode_security_caps():
+    import pytest
+    from racing_sync.watchdir import _bdecode, MAX_BENCODE_DEPTH
+
+    # String length pointing past EOF
+    bad_str = b"50:short"
+    with pytest.raises(ValueError, match="extends past EOF"):
+        _bdecode(bad_str, 0)
+
+    # Negative string length
+    bad_neg = b"-5:hello"
+    with pytest.raises(ValueError):
+        _bdecode(bad_neg, 0)
+
+    # Depth recursion cap
+    nested = b"l" * (MAX_BENCODE_DEPTH + 5) + b"i1e" + b"e" * (MAX_BENCODE_DEPTH + 5)
+    with pytest.raises(ValueError, match="recursion depth"):
+        _bdecode(nested, 0)
+
+    # Empty torrent / oversize torrent
+    with pytest.raises(ValueError, match="empty torrent"):
+        _bencoded_info_hash(b"")
+
+    oversize = b"d4:info" + (b"0" * (21 * 1024 * 1024)) + b"e"
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        _bencoded_info_hash(oversize)
+
+
+@pytest.mark.anyio
+async def test_watchdir_bad_file_caching_and_half_write(tmp_path: Path):
+    import time
+    import os
+    from unittest.mock import patch
+
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    corrupt_file = watch_dir / "corrupt.torrent"
+    corrupt_file.write_bytes(b"d4:infonot_valid_bencode")
+
+    # If mtime is right now, it should be treated as half-write and not added to bad_files immediately
+    cfg = WatchDirConfig(path=watch_dir, glob="*.torrent", delete_after_pickup=False)
+    scanner = WatchDirScanner(cfg, prowlarr=None)
+
+    items = await scanner.scan_once()
+    assert len(items) == 0
+    # Because mtime is recent, bad_files doesn't cache yet (allowing write to finish)
+    assert corrupt_file not in scanner._bad_files
+
+    # Set mtime back by 5 seconds
+    old_time = time.time() - 5.0
+    os.utime(corrupt_file, (old_time, old_time))
+
+    items2 = await scanner.scan_once()
+    assert len(items2) == 0
+    # Now it is recorded as bad file
+    assert corrupt_file in scanner._bad_files
+
+    # Scan again; corrupt file should be skipped from bad_files cache without re-parsing
+    with patch("racing_sync.watchdir.parse_torrent_file") as mock_parse:
+        items3 = await scanner.scan_once()
+        assert len(items3) == 0
+        mock_parse.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_watchdir_prunes_seen_on_delete(tmp_path: Path):
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    tfile = watch_dir / "test.torrent"
+    raw_data = _create_sample_torrent_data("Release1", 1000)
+    tfile.write_bytes(raw_data)
+
+    cfg = WatchDirConfig(path=watch_dir, glob="*.torrent", delete_after_pickup=True)
+    scanner = WatchDirScanner(cfg, prowlarr=None)
+
+    items = await scanner.scan_once()
+    assert len(items) == 1
+    infohash = items[0].infohash
+    assert infohash in scanner._seen
+
+    # Delete the picked-up item
+    await scanner.delete_picked_up(items[0])
+    assert not tfile.exists()
+    assert infohash not in scanner._seen
+
+
+
