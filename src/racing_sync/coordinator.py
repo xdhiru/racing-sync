@@ -1726,7 +1726,15 @@ class Coordinator:
             # Mixed — per-episode moves with --include (single batch)
             cap = ssd_max_inflight_bytes(self.cfg)
             episodes = cls.episodes
+            if not episodes:
+                raise RuntimeError(
+                    f"cannot move torrent {ts.source_name}: classification is '{cls.kind}' but no episodes found"
+                )
             batches = make_batches(episodes, cap_bytes=cap)
+            if not batches:
+                raise RuntimeError(
+                    f"cannot move torrent {ts.source_name}: batching produced 0 batches for {len(episodes)} episodes"
+                )
             for i, batch in enumerate(batches):
                 ts.batch_index = i
                 ts.batches_total = len(batches)
