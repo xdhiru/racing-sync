@@ -238,3 +238,11 @@ def test_api_retry_and_ssd_endpoints():
     assert resp_200.status_code == 200
     coord.store.transition.assert_called_once_with(ts_failed, State.QUEUED, error="")
 
+
+def test_build_app_without_fastapi_raises_error():
+    coord = MagicMock()
+    with patch("racing_sync.api.HAS_FASTAPI", False):
+        with pytest.raises(RuntimeError, match="FastAPI is required"):
+            build_app(coord)
+
+
