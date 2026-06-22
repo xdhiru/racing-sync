@@ -17,11 +17,14 @@ from .classifier import Episode
 log = logging.getLogger(__name__)
 
 
+DEFAULT_MAX_BATCH_FILES = 100
+
+
 def escape_rclone_glob(s: str) -> str:
     """Escape glob metacharacters for literal matching in rclone filter patterns."""
     res = []
     for ch in s:
-        if ch in ("*", "?", "[", "]", "{", "}"):
+        if ch in ("\\", "*", "?", "[", "]", "{", "}"):
             res.append(f"\\{ch}")
         else:
             res.append(ch)
@@ -51,28 +54,44 @@ class Batch:
         return self.episodes[-1].season, self.episodes[-1].episode
 
     def include_patterns(self) -> list[str]:
-        """Rclone --include patterns for this batch's episodes only with glob escaping."""
-        return [f"--include={escape_rclone_glob(e.file_name)}" for e in self.episodes]
+        """Rclone --include patterns for this batch's episodes with subfolder and glob escaping."""
+        patterns: list[str] = []
+        for e in self.episodes:
+            # Normalize path separators to POSIX forward slashes
+            normalized = e.file_name.replace("\\", "/").strip("/")
+            parts = normalized.split("/")
+            escaped_path = "/".join(escape_rclone_glob(p) for p in parts if p)
+            if not escaped_path.startswith("**/"):
+                escaped_path = f"**/{escaped_path}"
+            patterns.append(f"--include={escaped_path}")
+        return patterns
 
 
 def make_batches(
-    episodes: list[Episode], *, cap_bytes: int
+    episodes: list[Episode], *, cap_bytes: int, max_files: int = DEFAULT_MAX_BATCH_FILES
 ) -> list[Batch]:
     """Greedy first-fit-decreasing on already-sorted episodes.
 
     Episodes are already (season, episode) sorted by the classifier.
     Since (season, episode) order is roughly monotonic, a greedy linear pass
-    works well. If a single episode exceeds `cap_bytes`, it gets its own
+    works well. Batches are bounded by both `cap_bytes` and `max_files`
+    to prevent exceeding OS argument limits (ARG_MAX) when constructing rclone CLI flags.
+    If a single episode exceeds `cap_bytes`, it gets its own
     batch (and will fail at the SSD free check upstream).
     """
     if cap_bytes <= 0:
         raise ValueError("cap_bytes must be positive")
+    if max_files <= 0:
+        raise ValueError("max_files must be positive")
+
+    if not episodes:
+        return []
 
     batches: list[Batch] = []
     cur: list[Episode] = []
     cur_size = 0
     for ep in episodes:
-        if cur and cur_size + ep.size_bytes > cap_bytes:
+        if cur and (cur_size + ep.size_bytes > cap_bytes or len(cur) >= max_files):
             batches.append(Batch(episodes=cur))
             cur, cur_size = [], 0
         cur.append(ep)
@@ -85,8 +104,8 @@ def make_batches(
         batches.append(Batch(episodes=cur))
 
     log.info(
-        "batched %d episodes into %d batches (cap=%d B)",
-        len(episodes), len(batches), cap_bytes,
+        "batched %d episodes into %d batches (cap=%d B, max_files=%d)",
+        len(episodes), len(batches), cap_bytes, max_files,
     )
     for i, b in enumerate(batches):
         log.debug(

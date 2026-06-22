@@ -45,7 +45,7 @@ def test_include_patterns_are_per_file():
     eps = [Episode("S01E01.mkv", 1, 1, 1), Episode("S01E02.mkv", 1, 2, 1)]
     b = make_batches(eps, cap_bytes=10)[0]
     pats = b.include_patterns()
-    assert pats == ["--include=S01E01.mkv", "--include=S01E02.mkv"]
+    assert pats == ["--include=**/S01E01.mkv", "--include=**/S01E02.mkv"]
 
 
 def test_include_patterns_escapes_glob_metacharacters():
@@ -56,9 +56,84 @@ def test_include_patterns_escapes_glob_metacharacters():
     b = make_batches(eps, cap_bytes=10)[0]
     pats = b.include_patterns()
     assert pats == [
-        r"--include=\[DummySub\] Show \[1080p\].mkv",
-        r"--include=Show\?Part\{1\}\*test.mkv",
+        r"--include=**/\[DummySub\] Show \[1080p\].mkv",
+        r"--include=**/Show\?Part\{1\}\*test.mkv",
     ]
+
+
+def test_include_patterns_subfolders_and_backslashes():
+    from racing_sync.batcher import escape_rclone_glob
+
+    # Direct escape_rclone_glob escapes backslashes
+    assert escape_rclone_glob(r"dir\file*") == r"dir\\file\*"
+
+    eps = [
+        Episode("Season 1/S01E01.mkv", 1, 1, 100),
+        Episode(r"Season 1\S01E02 [1080p].mkv", 1, 2, 100),
+    ]
+    b = make_batches(eps, cap_bytes=1000)[0]
+    pats = b.include_patterns()
+    assert pats == [
+        "--include=**/Season 1/S01E01.mkv",
+        r"--include=**/Season 1/S01E02 \[1080p\].mkv",
+    ]
+
+
+def test_make_batches_caps_file_count():
+    eps = [Episode(f"S01E{i:03d}.mkv", 1, i, 10) for i in range(1, 251)]
+    # With a massive byte cap, batches should still be capped at max_files=100
+    batches = make_batches(eps, cap_bytes=1_000_000, max_files=100)
+    assert len(batches) == 3
+    assert len(batches[0].episodes) == 100
+    assert len(batches[1].episodes) == 100
+    assert len(batches[2].episodes) == 50
+
+
+def test_make_batches_empty_input():
+    assert make_batches([], cap_bytes=1000) == []
+
+
+@pytest.mark.anyio
+async def test_moving_empty_episodes_raises_and_prevents_wipe(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.classifier import Classification
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 100_000_000
+    coord.cfg.general.disk_safety_margin_bytes = 1000
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.rclone.remote.default = "remote:TV"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
+    coord._season_folder_for = MagicMock(return_value=None)
+    coord.store = MagicMock()
+    coord.transition = MagicMock()
+
+    ts = TorrentState(
+        source_infohash="testhash",
+        source_name="Empty.Show.S01",
+        classification_kind="mixed",
+        batches_total=0,
+        state=State.MOVING,
+    )
+
+    with patch(
+        "racing_sync.coordinator.classify",
+        return_value=Classification(kind="mixed", episodes=[], single_file=None, total_bytes=0),
+    ):
+        with pytest.raises(RuntimeError, match="no episodes found"):
+            await coord._do_moving(ts)
+
+    # Client delete and wipe must not be called
+    coord.dest_client.delete.assert_not_called()
+    coord.transition.assert_not_called()
+
+
 
 
 @pytest.mark.anyio
