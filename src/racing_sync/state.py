@@ -201,6 +201,11 @@ CREATE TABLE IF NOT EXISTS run_log (
     level TEXT NOT NULL,
     message TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 SCHEMA_INDEXES = """
@@ -481,6 +486,24 @@ class StateStore:
                 "SELECT ts, source_infohash, level, message FROM run_log ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
+
+    def get_meta(self, key: str, default: str | None = None) -> str | None:
+        """Get a metadata value by key."""
+        with self._lock:
+            cur = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,))
+            row = cur.fetchone()
+            if row is None:
+                return default
+            return str(row["value"])
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Set or update a metadata key/value."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+
 
 
 def _row_to_state(row: sqlite3.Row) -> TorrentState:
