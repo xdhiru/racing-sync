@@ -7,6 +7,11 @@ from racing_sync.telegram_bot import render_active, TelegramBot
 from racing_sync.config import TelegramConfig
 
 
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
 def test_render_active_empty():
     text, cur_page, total_pages = render_active([], page=0, page_size=5)
     assert cur_page == 0
@@ -222,5 +227,106 @@ def test_telegram_outbound_rate_interval():
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123", outbound_rate=1)
     interval = 1.0 / max(1, getattr(bot._cfg, "outbound_rate", 1))
     assert pytest.approx(interval, 0.01) == 1.0
+
+
+def test_render_detail_and_active_4096_char_cap():
+    from racing_sync.telegram_bot import render_detail
+    ts = TorrentState(
+        source_infohash="longhash123",
+        source_name="A" * 5000,
+        last_error="E" * 5000,
+    )
+    detail_text = render_detail(ts)
+    assert len(detail_text) <= 4096
+    assert detail_text.endswith("...")
+
+    active_text, _, _ = render_active([(ts, 0.5)], page=0, page_size=1)
+    assert len(active_text) <= 4096
+    assert active_text.endswith("...")
+
+
+@pytest.mark.anyio
+async def test_callback_authentication_and_throttling():
+    from unittest.mock import AsyncMock, MagicMock
+    bot = object.__new__(TelegramBot)
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
+    bot._last_callback_time = 0.0
+    bot._store = MagicMock()
+    bot._store.list_active_inflight.return_value = []
+    bot._refresh_active_message = AsyncMock()
+
+    # Unauthorized callback from wrong chat
+    unauth_query = MagicMock()
+    unauth_query.message.chat.id = 99999
+    unauth_query.from_user.id = 99999
+    unauth_query.answer = AsyncMock()
+
+    await bot._handle_callback(unauth_query)
+    unauth_query.answer.assert_awaited_once_with("Unauthorized", show_alert=True)
+    bot._refresh_active_message.assert_not_called()
+
+    # Authorized callback
+    auth_query = MagicMock()
+    auth_query.message.chat.id = 12345
+    auth_query.data = "page:refresh"
+    auth_query.answer = AsyncMock()
+
+    await bot._handle_callback(auth_query)
+    bot._refresh_active_message.assert_called_once()
+
+    # Immediate second click (throttled)
+    bot._refresh_active_message.reset_mock()
+    await bot._handle_callback(auth_query)
+    bot._refresh_active_message.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_detail_queue_overflow_evicts_oldest():
+    import asyncio
+    bot = object.__new__(TelegramBot)
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
+    bot._bot = object()
+    bot._detail_queue = asyncio.Queue(maxsize=2)
+
+    ts1 = TorrentState(source_infohash="hash1", source_name="Show 1")
+    ts2 = TorrentState(source_infohash="hash2", source_name="Show 2")
+    ts3 = TorrentState(source_infohash="hash3", source_name="Show 3")
+
+    await bot.ensure_detail_message(ts1, 0.1)
+    await bot.ensure_detail_message(ts2, 0.2)
+    assert bot._detail_queue.full()
+
+    # Adding ts3 when full should evict ts1 and keep ts2, ts3
+    await bot.ensure_detail_message(ts3, 0.3)
+    assert bot._detail_queue.full()
+
+    item1 = bot._detail_queue.get_nowait()
+    assert item1 == ("hash2", 0.2)
+    item2 = bot._detail_queue.get_nowait()
+    assert item2 == ("hash3", 0.3)
+
+
+@pytest.mark.anyio
+async def test_active_msg_id_restored_from_store():
+    from unittest.mock import AsyncMock, MagicMock, patch
+    bot = object.__new__(TelegramBot)
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
+    bot._store = MagicMock()
+    bot._store.all.return_value = []
+    bot._store.get_meta.return_value = "778899"
+    bot._detail_cache = {}
+
+    with patch("racing_sync.telegram_bot.Bot") as mock_bot_cls:
+        mock_bot = MagicMock()
+        mock_bot.send_message = AsyncMock()
+        mock_bot_cls.return_value = mock_bot
+
+        with patch("asyncio.create_task", return_value=MagicMock()):
+            await bot.start()
+
+    assert bot._active_msg_id == 778899
+    assert bot._prev_active_msg_id == 778899
+    bot._store.get_meta.assert_called_with("telegram_active_msg_id")
+
 
 

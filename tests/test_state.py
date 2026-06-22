@@ -357,3 +357,20 @@ def test_migrate_handles_old_schema_without_telegram_or_indexer(tmp_path: Path):
         assert row.indexer_attempts == 0
     finally:
         store.close()
+
+
+def test_state_store_meta(tmp_path: Path):
+    db_path = tmp_path / "meta_test.db"
+    store = StateStore(db_path)
+    try:
+        assert store.get_meta("nonexistent") is None
+        assert store.get_meta("nonexistent", default="def") == "def"
+
+        store.set_meta("key1", "val1")
+        assert store.get_meta("key1") == "val1"
+
+        # Overwrite key
+        store.set_meta("key1", "val2")
+        assert store.get_meta("key1") == "val2"
+    finally:
+        store.close()
