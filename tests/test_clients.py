@@ -57,6 +57,35 @@ async def test_qbittorrent_export_torrent():
     assert data == b"d8:announce..."
 
 
+@pytest.mark.anyio
+async def test_qbittorrent_set_save_path_uses_hashes_field():
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+
+    class DummyResponseContext:
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.read = AsyncMock(return_value=b"")
+            return resp
+
+        async def __aexit__(self, *args):
+            pass
+
+    async def mock_request(method, endpoint, data=None, **kwargs):
+        assert method == "POST"
+        assert endpoint == "/api/v2/torrents/setLocation"
+        fields = {field[0]["name"]: field[2] for field in data._fields}
+        assert "hashes" in fields
+        assert "hash" not in fields
+        assert fields["hashes"] == "abc12345"
+        assert fields["location"] == "/new/path"
+        return DummyResponseContext()
+
+    client.request = mock_request
+    await client.set_save_path("abc12345", "/new/path")
+
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"

@@ -256,7 +256,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
 
     async def set_save_path(self, torrent_hash: str, save_path: str) -> None:
         data = aiohttp.FormData()
-        data.add_field("hash", torrent_hash)
+        data.add_field("hashes", torrent_hash)
         data.add_field("location", save_path)
         async with await self.request(
             "POST", "/api/v2/torrents/setLocation", data=data
