@@ -1677,13 +1677,24 @@ class Coordinator:
                 except OSError as e:
                     log.warning("failed removing incomplete file %s: %s", f.name, e)
 
-        # Also purge any leftover temporary extension files like .!qB or .parts
-        if content_dir.exists():
-            for temp_file in list(content_dir.glob("**/*.!qB")) + list(content_dir.glob("**/*.parts")):
+        # Also purge any leftover temporary extension files like .!qB or .parts for this torrent
+        if folder and folder.exists() and folder.resolve() != src_dir.resolve():
+            for temp_file in list(folder.glob("**/*.!qB")) + list(folder.glob("**/*.parts")):
                 try:
                     temp_file.unlink()
                 except OSError:
                     pass
+        else:
+            # Scoped to torrent-owned files only to avoid deleting concurrent downloads in shared save_path
+            for f in cls_files:
+                base_file = src_dir / f.name
+                for ext in (".!qB", ".parts"):
+                    temp_file = base_file.parent / f"{base_file.name}{ext}"
+                    if temp_file.exists():
+                        try:
+                            temp_file.unlink()
+                        except OSError:
+                            pass
 
         # 4. Decide target remote
         if cls.kind in ("movie", "season"):
