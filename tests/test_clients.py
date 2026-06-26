@@ -384,6 +384,13 @@ async def test_deluge_list_torrents_progress_and_hash_filtering():
     assert got_t2 is not None
     assert got_t2.hash == "hash_2"
 
+    # 4. Generator in hashes: does not get exhausted before client-side filtering
+    gen = (h for h in ["HASH_1"])
+    from_gen = await client.list_torrents(hashes=gen)
+    assert len(from_gen) == 1
+    assert from_gen[0].hash == "hash_1"
+
+
 
 @pytest.mark.anyio
 async def test_deluge_set_file_priorities_indexed():
