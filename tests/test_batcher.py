@@ -347,3 +347,61 @@ async def test_do_moving_skips_move_when_already_batched(tmp_path):
         # Old torrent is deleted from client and state transitions to RE_ADDING
         coord.dest_client.delete.assert_called_once_with("hash1", delete_files=False)
         assert ts.state == State.RE_ADDING
+
+
+@pytest.mark.anyio
+async def test_do_moving_purges_only_own_temp_files_when_no_season_folder(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.dest_client = MagicMock()
+
+    own_file = tmp_path / "My.Movie.2024.1080p.mkv"
+    own_file.write_bytes(b"x" * 100)
+    own_temp = tmp_path / "My.Movie.2024.1080p.mkv.!qB"
+    own_temp.write_bytes(b"temp")
+
+    concurrent_temp1 = tmp_path / "Other.Download.2024.mkv.!qB"
+    concurrent_temp1.write_bytes(b"other temp")
+    concurrent_temp2 = tmp_path / "Another.Download.2024.mkv.parts"
+    concurrent_temp2.write_bytes(b"parts")
+
+    cls_file = TorrentFile(
+        name="My.Movie.2024.1080p.mkv",
+        size_bytes=100,
+        progress=1.0,
+        priority=1,
+    )
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[cls_file])
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.delete = AsyncMock()
+    coord._rclone_move = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="hash2",
+        source_name="My.Movie.2024.1080p",
+        classification_kind="movie",
+        state=State.MOVING,
+    )
+
+    with patch("racing_sync.coordinator.classify") as mock_classify:
+        mock_cls = MagicMock()
+        mock_cls.kind = "movie"
+        mock_cls.single_file = "My.Movie.2024.1080p.mkv"
+        mock_classify.return_value = mock_cls
+
+        await coord._do_moving(ts)
+
+    # Torrent's own temporary file should be unlinked
+    assert not own_temp.exists()
+    # Concurrent downloads' temporary files must NOT be unlinked
+    assert concurrent_temp1.exists()
+    assert concurrent_temp2.exists()
