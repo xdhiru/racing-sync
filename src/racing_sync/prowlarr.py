@@ -318,10 +318,15 @@ def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
     return hits
 
 
-def _first_attr(item, tag: str, *, name: str) -> str:
-    for child in item.findall(tag):
-        if child.attrib.get("name") == name:
-            return child.attrib.get("value", "")
+def _first_attr(item: Any, tag: str, *, name: str) -> str:
+    target_tag = tag.rpartition("}")[2].split(":")[-1]
+    for child in item:
+        child_tag = getattr(child, "tag", None)
+        if not isinstance(child_tag, str):
+            continue
+        if child_tag.rpartition("}")[2].split(":")[-1] == target_tag:
+            if child.attrib.get("name") == name:
+                return child.attrib.get("value", "")
     return ""
 
 
