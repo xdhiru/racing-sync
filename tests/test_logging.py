@@ -120,3 +120,24 @@ def test_jsonl_formatter_scrubs_secrets_and_extra():
     assert data["custom_token"] == "***"
     assert data["safe_field"] == "safe_value"
 
+
+def test_sanitizing_formatter_scrubs_secrets_in_text_logs():
+    from racing_sync.logging_setup import SanitizingFormatter, LOG_FORMAT, DATE_FORMAT
+
+    formatter = SanitizingFormatter(LOG_FORMAT, DATE_FORMAT)
+    record = logging.LogRecord(
+        name="racing_sync.test",
+        level=logging.INFO,
+        pathname="test.py",
+        lineno=15,
+        msg="Connecting with token=SUPER_SECRET_TOKEN and Authorization: Bearer MY_SECRET_AUTH_BEARER",
+        args=(),
+        exc_info=None,
+    )
+    formatted = formatter.format(record)
+    assert "SUPER_SECRET_TOKEN" not in formatted
+    assert "token=***" in formatted
+    assert "MY_SECRET_AUTH_BEARER" not in formatted
+    assert "Bearer ***" in formatted
+
+

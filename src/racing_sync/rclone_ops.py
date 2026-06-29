@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import AppConfig
+from .logging_setup import sanitize_log_text
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ async def run_rclone(
     res = RcloneResult(returncode=proc.returncode or 0,
                        stdout=stdout, stderr=stderr, duration=dt)
     if not res.ok:
-        log.error("rclone failed (%d) in %.1fs:\n%s", res.returncode, dt, stderr[-2000:])
+        log.error("rclone failed (%d) in %.1fs:\n%s", res.returncode, dt, sanitize_log_text(stderr[-2000:]))
     else:
         log.info("rclone ok in %.1fs", dt)
     return res
