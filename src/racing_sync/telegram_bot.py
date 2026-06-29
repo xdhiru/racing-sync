@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -65,6 +66,54 @@ def _esc(text: str) -> str:
         .replace("[", "\\[")
         .replace("]", "\\]")
     )
+
+
+def _safe_truncate_markdown(text: str, max_len: int = 4096) -> str:
+    """Truncate text to max_len while keeping markdown tags properly closed and ending with '...'."""
+    if len(text) <= max_len:
+        return text
+
+    lines = text.split("\n")
+    acc: list[str] = []
+    curr_len = 0
+    suffix = "\n..."
+    budget = max(0, max_len - len(suffix))
+    for line in lines:
+        added = len(line) + (1 if acc else 0)
+        if curr_len + added <= budget:
+            acc.append(line)
+            curr_len += added
+        else:
+            break
+
+    if acc and len(acc) > 1:
+        truncated = "\n".join(acc)
+        suffix = "\n..."
+    else:
+        suffix = "..."
+        truncated = text[: max(0, max_len - len(suffix))]
+
+    to_close = ""
+    if len(re.findall(r"(?<!\\)`", truncated)) % 2 != 0:
+        to_close += "`"
+    if len(re.findall(r"(?<!\\)\*", truncated)) % 2 != 0:
+        to_close += "*"
+    if len(re.findall(r"(?<!\\)_", truncated)) % 2 != 0:
+        to_close += "_"
+
+    if to_close:
+        excess = (len(truncated) + len(to_close) + len(suffix)) - max_len
+        if excess > 0:
+            truncated = truncated[:-excess]
+            to_close = ""
+            if len(re.findall(r"(?<!\\)`", truncated)) % 2 != 0:
+                to_close += "`"
+            if len(re.findall(r"(?<!\\)\*", truncated)) % 2 != 0:
+                to_close += "*"
+            if len(re.findall(r"(?<!\\)_", truncated)) % 2 != 0:
+                to_close += "_"
+
+    return truncated + to_close + suffix
 
 
 def _short_name(name: str, limit: int = 56) -> str:
@@ -113,7 +162,7 @@ def _tracker_domain(url: str) -> str:
 def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     """Per-torrent detail message (edited in place as state advances)."""
     icon = _STATE_ICON.get(ts.state, ts.state.value.upper())
-    name = ts.source_name.replace("`", "'")
+    name = ts.source_name.replace("`", "'").rstrip("\\")
     size = _bytes_human(ts.total_bytes)
     full_hash = (ts.source_infohash or "").lower()
 
@@ -164,23 +213,20 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     if ts.cross_seed_source:
         cs_hash = (ts.cross_seed_infohash or "").lower()
         if cs_hash and len(cs_hash) >= 20:
-            lines.append(f"SSD source: {ts.cross_seed_source} · `{cs_hash}`")
+            lines.append(f"SSD source: {_esc(ts.cross_seed_source)} · `{cs_hash}`")
         else:
-            lines.append(f"SSD source: {ts.cross_seed_source}")
+            lines.append(f"SSD source: {_esc(ts.cross_seed_source)}")
 
     # Classifier
     if ts.classification_kind and ts.classification_kind != "unknown":
-        lines.append(f"Classifier: {ts.classification_kind}")
+        lines.append(f"Classifier: {_esc(ts.classification_kind)}")
 
     # Tracker domain only (not full announce URL)
     domain = _tracker_domain(ts.source_tracker) or _tracker_domain(ts.source_announce_url)
     if domain:
-        lines.append(f"Source: {domain}")
+        lines.append(f"Source: {_esc(domain)}")
 
-    text = "\n".join(lines)
-    if len(text) > 4096:
-        text = text[:4093] + "..."
-    return text
+    return _safe_truncate_markdown("\n".join(lines))
 
 
 def render_active(
@@ -211,7 +257,7 @@ def render_active(
 
     for i, (ts, progress) in enumerate(page_items):
         item_num = start_idx + i + 1
-        name = ts.source_name.replace("`", "'")
+        name = ts.source_name.replace("`", "'").rstrip("\\")
         size = _bytes_human(ts.total_bytes)
         full_hash = (ts.source_infohash or "").lower()
 
@@ -255,14 +301,12 @@ def render_active(
 
         domain = _tracker_domain(ts.source_announce_url) or _tracker_domain(ts.source_tracker)
         if domain:
-            state_text += f" · {domain}"
+            state_text += f" · {_esc(domain)}"
 
         lines.append(f"  {state_text}")
         lines.append("")
 
-    rendered = "\n".join(lines).strip()
-    if len(rendered) > 4096:
-        rendered = rendered[:4093] + "..."
+    rendered = _safe_truncate_markdown("\n".join(lines).strip())
     return rendered, cur_page, total_pages
 
 
@@ -466,17 +510,24 @@ class TelegramBot:
         if ts is None:
             return
         text = render_detail(ts, progress)
-        if len(text) > 4096:
-            text = text[:4093] + "..."
         msg_id = self._detail_cache.get(infohash)
         if msg_id is None:
             msg_id = await asyncio.to_thread(self._store.get_telegram_message_id, infohash)
         try:
             if msg_id is None:
-                sent = await self._bot.send_message(
-                    self._cfg.chat_id, text,
-                    parse_mode=ParseMode.MARKDOWN,
-                )
+                try:
+                    sent = await self._bot.send_message(
+                        self._cfg.chat_id, text,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except TelegramError as e:
+                    msg = str(e).lower()
+                    if "can't parse" in msg or "entity" in msg:
+                        sent = await self._bot.send_message(
+                            self._cfg.chat_id, text,
+                        )
+                    else:
+                        raise
                 self._detail_cache[infohash] = sent.message_id
                 await asyncio.to_thread(
                     self._store.set_telegram_message_id,
@@ -496,14 +547,29 @@ class TelegramBot:
                         return
                     if "not found" in msg or "invalid" in msg:
                         # Message was deleted; resend.
-                        sent = await self._bot.send_message(
-                            self._cfg.chat_id, text,
-                            parse_mode=ParseMode.MARKDOWN,
-                        )
+                        try:
+                            sent = await self._bot.send_message(
+                                self._cfg.chat_id, text,
+                                parse_mode=ParseMode.MARKDOWN,
+                            )
+                        except TelegramError as e2:
+                            msg2 = str(e2).lower()
+                            if "can't parse" in msg2 or "entity" in msg2:
+                                sent = await self._bot.send_message(
+                                    self._cfg.chat_id, text,
+                                )
+                            else:
+                                raise
                         self._detail_cache[infohash] = sent.message_id
                         await asyncio.to_thread(
                             self._store.set_telegram_message_id,
                             infohash, sent.message_id,
+                        )
+                    elif "can't parse" in msg or "entity" in msg:
+                        await self._bot.edit_message_text(
+                            text,
+                            chat_id=self._cfg.chat_id,
+                            message_id=msg_id,
                         )
                     else:
                         log.warning(
@@ -686,7 +752,23 @@ class TelegramBot:
             except (TimedOut, NetworkError) as e:
                 log.warning("active-tasks send timed out (%s); will retry next interval", e)
             except TelegramError as e:
-                log.warning("active-tasks send failed: %s", e)
+                msg = str(e).lower()
+                if "can't parse" in msg or "entity" in msg:
+                    try:
+                        sent = await self._bot.send_message(
+                            self._cfg.chat_id, text,
+                            reply_markup=keyboard,
+                        )
+                        self._active_msg_id = sent.message_id
+                        self._prev_active_msg_id = sent.message_id
+                        self._last_active_cache = cache_key
+                        await asyncio.to_thread(
+                            self._store.set_meta, "telegram_active_msg_id", str(sent.message_id)
+                        )
+                    except Exception as e2:
+                        log.warning("active-tasks plain send failed: %s", e2)
+                else:
+                    log.warning("active-tasks send failed: %s", e)
         else:
             try:
                 await self._bot.edit_message_text(
@@ -703,6 +785,19 @@ class TelegramBot:
                 if "not modified" in msg:
                     self._last_active_cache = cache_key
                     return
+
+                if "can't parse" in msg or "entity" in msg:
+                    try:
+                        await self._bot.edit_message_text(
+                            text,
+                            chat_id=self._cfg.chat_id,
+                            message_id=self._active_msg_id,
+                            reply_markup=keyboard,
+                        )
+                        self._last_active_cache = cache_key
+                        return
+                    except Exception as e2:
+                        log.warning("active-tasks plain edit failed: %s", e2)
 
                 # Rate limit / timeout / network error:
                 # NEVER clear _active_msg_id on temporary glitches!
@@ -766,9 +861,16 @@ class TelegramBot:
     async def notify(self, message: str) -> None:
         if not self._cfg.enabled or self._bot is None:
             return
+        truncated = _safe_truncate_markdown(message)
         try:
             await self._bot.send_message(
-                self._cfg.chat_id, message, parse_mode=ParseMode.MARKDOWN,
+                self._cfg.chat_id, truncated, parse_mode=ParseMode.MARKDOWN,
             )
         except TelegramError as e:
-            log.warning("telegram notify failed: %s", e)
+            # Fallback without parse_mode if Markdown parsing or entity error occurs
+            log.warning("telegram notify markdown failed (%s); retrying as plain text", e)
+            try:
+                plain_text = message[:4093] + "..." if len(message) > 4096 else message
+                await self._bot.send_message(self._cfg.chat_id, plain_text)
+            except TelegramError as e2:
+                log.warning("telegram notify failed: %s", e2)
