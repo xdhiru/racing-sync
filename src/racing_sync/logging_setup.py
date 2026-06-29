@@ -56,6 +56,14 @@ def is_sensitive_key(key: str) -> bool:
     return any(w in k_lower for w in SENSITIVE_KEY_WORDS)
 
 
+class SanitizingFormatter(logging.Formatter):
+    """Formatter that sanitizes sensitive tokens, passkeys, and passwords from formatted text."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        return sanitize_log_text(formatted)
+
+
 # --------------------------------------------------------------------------- #
 # Ring buffer
 # --------------------------------------------------------------------------- #
@@ -238,7 +246,7 @@ def setup_logging(cfg: AppConfig) -> None:
     # Console (stderr) at INFO
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
-    console.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
+    console.setFormatter(SanitizingFormatter(LOG_FORMAT, DATE_FORMAT))
     root.addHandler(console)
 
     # Rotating human-readable log
@@ -249,7 +257,7 @@ def setup_logging(cfg: AppConfig) -> None:
         encoding="utf-8",
     )
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
+    fh.setFormatter(SanitizingFormatter(LOG_FORMAT, DATE_FORMAT))
     root.addHandler(fh)
 
     # Structured JSONL
