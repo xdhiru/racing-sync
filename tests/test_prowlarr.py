@@ -12,6 +12,13 @@ from racing_sync.clients.abstract import Torrent
 from racing_sync.watchdir import _bencode, _bencoded_info_hash
 
 
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+
+
 def test_prowlarr_config_should_skip_title():
     cfg = ProwlarrConfig(
         enabled=True,
@@ -417,6 +424,169 @@ async def test_prowlarr_download_url_scrubbed_in_exceptions():
     err_msg = str(exc_info.value)
     assert "SECRET_KEY" not in err_msg
     assert "ftp://tracker.org/dl" in err_msg
+
+
+@pytest.mark.anyio
+async def test_pick_ssd_source_public_failure_does_not_fall_through():
+    from racing_sync.clients.abstract import Torrent
+    cfg = MagicMock()
+    cfg.cross_seed.allow_ssh_export = False
+    cfg.cross_seed.refetch_public_via_prowlarr = False
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+
+    prowlarr = AsyncMock()
+    source_client = AsyncMock()
+    source_client.export_torrent.side_effect = RuntimeError("qB unreachable")
+
+    t_pub = Torrent(
+        hash="pubhash123",
+        name="Public.Release",
+        category="racing",
+        save_path="",
+        size_bytes=1000,
+        state="racing",
+        progress=1.0,
+        trackers=["udp://tracker.opentrackr.org:1337/announce"],
+    )
+
+    dec = await pick_ssd_source_for_racing(
+        cfg=cfg,
+        source_torrent=t_pub,
+        other_source_torrents=[],
+        prowlarr=prowlarr,
+        sftp=None,
+        source_client=source_client,
+        attempt_prowlarr=True,
+    )
+    # Must return None and NEVER call Prowlarr (no fallthrough to private indexer logic)
+    assert dec is None
+    prowlarr.best_match.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_pick_ssd_source_sftp_error_handled_gracefully():
+    from racing_sync.clients.abstract import Torrent
+    cfg = MagicMock()
+    cfg.cross_seed.allow_ssh_export = True
+    cfg.cross_seed.refetch_public_via_prowlarr = False
+
+    sftp = MagicMock()
+    sftp.fetch_torrent.side_effect = ConnectionResetError("SSH connection dropped")
+    source_client = AsyncMock()
+    source_client.export_torrent.return_value = b"exported_torrent_bytes"
+
+    t_pub = Torrent(
+        hash="pubhash123",
+        name="Public.Release",
+        category="racing",
+        save_path="",
+        size_bytes=1000,
+        state="racing",
+        progress=1.0,
+        trackers=["udp://tracker.opentrackr.org:1337/announce"],
+    )
+
+    dec = await pick_ssd_source_for_racing(
+        cfg=cfg,
+        source_torrent=t_pub,
+        other_source_torrents=[],
+        prowlarr=None,
+        sftp=sftp,
+        source_client=source_client,
+        attempt_prowlarr=True,
+    )
+    # SFTP failed, but handled gracefully and fell back to source_client.export_torrent
+    assert dec is not None
+    assert dec.torrent_bytes == b"exported_torrent_bytes"
+
+
+@pytest.mark.anyio
+async def test_pick_ssd_source_extracts_announce_url():
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.watchdir import _bencode
+    cfg = MagicMock()
+    cfg.prowlarr.enabled = True
+    cfg.prowlarr.should_skip_title.return_value = False
+    cfg.prowlarr.download_indexer = "Indexer (API)"
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+
+    blob = _bencode({
+        b"announce": b"http://tracker.indexer.org/announce",
+        b"info": {
+            b"name": b"Private.Release",
+            b"length": 5000,
+            b"piece length": 16384,
+            b"pieces": b"12345678901234567890",
+        },
+    })
+    hit = MagicMock(
+        title="Private.Release",
+        size_bytes=5000,
+        download_url="http://prowlarr.local/api/v1/download?apikey=secret",
+    )
+    prowlarr = AsyncMock()
+    prowlarr.best_match.return_value = hit
+    prowlarr.download_torrent.return_value = blob
+
+    t_priv = Torrent(
+        hash="privhash123",
+        name="Private.Release",
+        category="racing",
+        save_path="",
+        size_bytes=5000,
+        state="racing",
+        progress=1.0,
+        trackers=["https://alpha.cc/announce"],
+    )
+
+    dec = await pick_ssd_source_for_racing(
+        cfg=cfg,
+        source_torrent=t_priv,
+        other_source_torrents=[],
+        prowlarr=prowlarr,
+        sftp=None,
+        source_client=AsyncMock(),
+        attempt_prowlarr=True,
+    )
+    assert dec is not None
+    # Announce URL must be extracted from bencoded torrent, NOT the Prowlarr download_url API endpoint
+    assert dec.announce_url == "http://tracker.indexer.org/announce"
+    assert "apikey=secret" not in dec.announce_url
+
+
+@pytest.mark.anyio
+async def test_pick_ssd_source_private_sftp_fallback_when_not_attempting_prowlarr():
+    from racing_sync.clients.abstract import Torrent
+    cfg = MagicMock()
+    cfg.cross_seed.allow_ssh_export = True
+    sftp = MagicMock()
+    sftp.fetch_torrent.return_value = b"private_sftp_blob"
+
+    t_priv = Torrent(
+        hash="privhash456",
+        name="Private.Release.Only",
+        category="racing",
+        save_path="",
+        size_bytes=5000,
+        state="racing",
+        progress=1.0,
+        trackers=["https://alpha.cc/announce"],
+    )
+
+    dec = await pick_ssd_source_for_racing(
+        cfg=cfg,
+        source_torrent=t_priv,
+        other_source_torrents=[],
+        prowlarr=None,
+        sftp=sftp,
+        source_client=AsyncMock(),
+        attempt_prowlarr=False,
+    )
+    assert dec is not None
+    assert dec.source_label == "private-sftp-fallback"
+    assert dec.torrent_bytes == b"private_sftp_blob"
+    assert dec.announce_url == "https://alpha.cc/announce"
+
 
 
 
