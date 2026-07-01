@@ -191,6 +191,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         Tries Deluge's native `core.get_torrent_status(..., ['files', 'file_priorities'])`.
         Falls back to decoding the .torrent file from SFTP if unavailable.
         """
+        from .http_base import AuthError
         try:
             status = await self._rpc(
                 "core.get_torrent_status",
@@ -203,17 +204,20 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 for item in status["files"]:
                     idx = item.get("index", len(out))
                     prio = prios[idx] if idx < len(prios) else item.get("priority", 1)
-                    prog = progs[idx] if idx < len(progs) else 0.0
+                    raw_prog = float(progs[idx]) if idx < len(progs) else 0.0
+                    prog = raw_prog / 100.0 if raw_prog > 1.0 else raw_prog
                     out.append(
                         TorrentFile(
                             name=item.get("path", ""),
                             size_bytes=int(item.get("size", 0)),
                             priority=int(prio),
-                            progress=float(prog),
+                            progress=min(1.0, max(0.0, float(prog))),
                         )
                     )
                 if out:
                     return out
+        except AuthError:
+            raise
         except Exception as e:
             log.debug("deluge get_torrent_status files failed: %s; falling back to .torrent file", e)
         return await self._files_from_torrent_file(torrent_hash)
@@ -235,7 +239,12 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             with SFTPExporter(sftp_cfg) as sftp:
                 return sftp.fetch_torrent(torrent_hash)
 
-        blob = await asyncio.to_thread(_fetch)
+        try:
+            blob = await asyncio.to_thread(_fetch)
+        except Exception as e:
+            log.warning("deluge: failed to fetch .torrent via SFTP for %s: %s", torrent_hash, e)
+            return []
+
         if not blob:
             return []
         from ..watchdir import _bdecode
@@ -303,10 +312,11 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             # Deluge has add_torrent_file (string of base64 or .torrent path).
             # We pass the bytes directly via base64.
             import base64
+            import uuid
             for blob in torrent_files:
                 encoded = base64.b64encode(blob).decode()
                 res = await self._rpc(
-                    "core.add_torrent_file", [f"{blob[:6].hex()}.torrent", encoded, opts]
+                    "core.add_torrent_file", [f"{uuid.uuid4().hex}.torrent", encoded, opts]
                 )
                 results.append(res)
         elif urls:
@@ -316,15 +326,17 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         else:
             raise ValueError("add_torrent requires urls or torrent_files")
 
+        first_hash = str(results[0]) if (results and results[0]) else None
         return AddResult(
-            hash=str(results[0]) if results and results[0] else None,
-            accepted=bool(results),
+            hash=first_hash,
+            accepted=bool(results and results[0]),
             detail=json.dumps([str(r) for r in results]),
         )
 
     async def set_file_priorities(
         self, torrent_hash: str, priorities: dict[str, int]
     ) -> None:
+        from .http_base import AuthError
         try:
             status = await self._rpc(
                 "core.get_torrent_status",
@@ -345,6 +357,8 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                         if 0 <= idx < len(curr_prios):
                             curr_prios[idx] = int(prio)
                 await self._rpc("core.set_torrent_file_priorities", [torrent_hash, curr_prios])
+        except AuthError:
+            raise
         except Exception as e:
             log.warning("deluge set_torrent_file_priorities failed for %s: %s", torrent_hash, e)
 
