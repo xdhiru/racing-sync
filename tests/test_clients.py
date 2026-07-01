@@ -427,3 +427,119 @@ async def test_deluge_set_file_priorities_indexed():
     rpc_mock.assert_any_call("core.set_torrent_file_priorities", ["hash_abc", [1, 0]])
 
 
+@pytest.mark.anyio
+async def test_deluge_add_torrent_rejects_none_result_and_uses_uuid_filename():
+    from unittest.mock import AsyncMock
+    from racing_sync.clients.deluge import DelugeClient
+    from racing_sync.config import SourceConfig
+
+    cfg = SourceConfig(
+        type="deluge",
+        host="http://localhost:8112",
+        password="secret",
+        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+    )
+    client = DelugeClient(cfg)
+
+    # 1. Deluge returns [None] on rejection -> accepted should be False
+    client._rpc = AsyncMock(return_value=None)
+    res_rejected = await client.add_torrent(urls=["http://example.com/rejected.torrent"], save_path="/downloads")
+    assert res_rejected.accepted is False
+    assert res_rejected.hash is None
+
+    # 2. Deluge returns unique uuid filenames for multiple .torrent files
+    blob1 = b"d8:announce11:http://test1e"
+    blob2 = b"d8:announce11:http://test2e"
+    filenames_used: list[str] = []
+
+    async def mock_rpc(method, params=None):
+        if method == "core.add_torrent_file":
+            filenames_used.append(params[0])
+            return "hash_123"
+        return None
+
+    client._rpc = AsyncMock(side_effect=mock_rpc)
+    res_success = await client.add_torrent(torrent_files=[blob1, blob2], save_path="/downloads")
+    assert res_success.accepted is True
+    assert res_success.hash == "hash_123"
+    assert len(filenames_used) == 2
+    # Filenames must be unique and not match identical blob[:6].hex() prefix
+    assert filenames_used[0] != filenames_used[1]
+    assert not filenames_used[0].startswith("64383a616e6e")
+
+
+@pytest.mark.anyio
+async def test_deluge_set_file_priorities_propagates_auth_error():
+    from unittest.mock import AsyncMock
+    from racing_sync.clients.deluge import DelugeClient
+    from racing_sync.clients.http_base import AuthError
+    from racing_sync.config import SourceConfig
+
+    cfg = SourceConfig(
+        type="deluge",
+        host="http://localhost:8112",
+        password="secret",
+        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+    )
+    client = DelugeClient(cfg)
+    client._rpc = AsyncMock(side_effect=AuthError("session expired"))
+
+    with pytest.raises(AuthError, match="session expired"):
+        await client.set_file_priorities("hash_123", {"file1.mkv": 1})
+
+
+@pytest.mark.anyio
+async def test_deluge_get_torrent_files_scales_progress_and_propagates_auth():
+    from unittest.mock import AsyncMock
+    from racing_sync.clients.deluge import DelugeClient
+    from racing_sync.clients.http_base import AuthError
+    from racing_sync.config import SourceConfig
+
+    cfg = SourceConfig(
+        type="deluge",
+        host="http://localhost:8112",
+        password="secret",
+        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+    )
+    client = DelugeClient(cfg)
+
+    # 1. Progress scaled from 0-100 down to 0-1.0
+    client._rpc = AsyncMock(return_value={
+        "files": [
+            {"path": "ep1.mkv", "size": 1000, "index": 0},
+            {"path": "ep2.mkv", "size": 2000, "index": 1},
+        ],
+        "file_priorities": [1, 1],
+        "file_progress": [50.0, 100.0],  # 50% and 100% in Deluge
+    })
+    files = await client.get_torrent_files("hash_123")
+    assert len(files) == 2
+    assert pytest.approx(files[0].progress, 0.001) == 0.5
+    assert pytest.approx(files[1].progress, 0.001) == 1.0
+
+    # 2. AuthError is not swallowed as fallback
+    client._rpc = AsyncMock(side_effect=AuthError("unauthorized"))
+    with pytest.raises(AuthError, match="unauthorized"):
+        await client.get_torrent_files("hash_123")
+
+
+@pytest.mark.anyio
+async def test_deluge_files_from_torrent_file_catches_sftp_error():
+    from unittest.mock import patch
+    from racing_sync.clients.deluge import DelugeClient
+    from racing_sync.config import SourceConfig
+
+    cfg = SourceConfig(
+        type="deluge",
+        host="http://localhost:8112",
+        password="secret",
+        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+    )
+    client = DelugeClient(cfg)
+
+    with patch("racing_sync.sftp_source.SFTPExporter.fetch_torrent", side_effect=ConnectionRefusedError("SSH server down")):
+        files = await client._files_from_torrent_file("hash_123")
+        assert files == []
+
+
+
