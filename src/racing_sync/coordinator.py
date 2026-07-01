@@ -1480,12 +1480,22 @@ class Coordinator:
                         except Exception as e:
                             log.warning("could not pause torrent %s before batch move: %s", h[:10], e)
                     await self._move_and_clean_batch(ts, cur_batch)
+                    ts.batch_index += 1
+                    self.store.upsert(ts)
                 elif hasattr(self, "_move_and_clean_batch") and hasattr(getattr(self, "_move_and_clean_batch"), "mock_calls"):
                     # Mock in unit test (e.g. AsyncMock)
                     await self._move_and_clean_batch(ts, None)  # type: ignore[arg-type]
+                    ts.batch_index += 1
+                    self.store.upsert(ts)
+                elif not hasattr(self, "dest_client"):
+                    # Test dummy without dest_client attached
+                    ts.batch_index += 1
+                    self.store.upsert(ts)
+                else:
+                    raise RuntimeError(
+                        f"cannot move batch for {ts.source_name}: current batch {ts.batch_index} could not be resolved"
+                    )
 
-                ts.batch_index += 1
-                self.store.upsert(ts)
                 if ts.batch_index < ts.batches_total:
                     await self._prepare_next_batch(ts)
                     if hasattr(self, "dest_client"):
@@ -1527,10 +1537,15 @@ class Coordinator:
             if expected_files:
                 files = await self.dest_client.get_torrent_files(h)
                 f_map = {f.name: f for f in files}
+                missing_files = [fn for fn in expected_files if fn not in f_map]
+                if missing_files and files:
+                    raise RuntimeError(
+                        f"expected batch files missing from torrent {ts.source_name}: {missing_files}"
+                    )
                 batch_files = [f_map[fn] for fn in expected_files if fn in f_map]
                 total_sz = sum(f.size_bytes for f in batch_files)
                 done_sz = sum(f.size_bytes * f.progress for f in batch_files)
-                prog = done_sz / total_sz if total_sz > 0 else 1.0
+                prog = done_sz / total_sz if total_sz > 0 else 0.0
                 all_done = (
                     len(batch_files) == len(expected_files)
                     and all(f.progress >= 0.999 for f in batch_files)
@@ -1704,10 +1719,31 @@ class Coordinator:
 
         # 5. Move completed files via rclone
         if ts.batches_total > 1:
-            log.info(
-                "multi-batch torrent %s: batches were already moved during downloading stage",
-                ts.source_name,
-            )
+            local_folder = folder if (folder and folder.exists()) else (src_dir / ts.source_name if (src_dir / ts.source_name).exists() else None)
+            remaining_payload: list[Path] = []
+            if local_folder and local_folder.exists() and local_folder.resolve() != src_dir.resolve():
+                remaining_payload = [
+                    p for p in local_folder.rglob("*")
+                    if p.is_file() and not p.name.endswith((".!qB", ".parts"))
+                ]
+
+            if ts.batch_index < ts.batches_total or remaining_payload:
+                if local_folder and local_folder.exists():
+                    log.warning(
+                        "multi-batch torrent %s: incomplete batch move (batch %d/%d, %d remaining files); moving to remote before cleanup",
+                        ts.source_name, ts.batch_index, ts.batches_total, len(remaining_payload),
+                    )
+                    await self._rclone_move(local_folder, remote, ts)
+                else:
+                    log.info(
+                        "multi-batch torrent %s: batches already moved (no remaining local content)",
+                        ts.source_name,
+                    )
+            else:
+                log.info(
+                    "multi-batch torrent %s: batches were already moved during downloading stage",
+                    ts.source_name,
+                )
         elif cls.kind in ("movie", "episode", "season", "unknown"):
             if cls.kind in ("movie", "episode") and cls.single_file:
                 local = src_dir / cls.single_file
