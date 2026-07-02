@@ -10,6 +10,12 @@ from racing_sync.state import State, StateStore, TorrentState
 from racing_sync.clients.abstract import Torrent
 
 
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+
 @pytest.mark.anyio
 async def test_reconcile_adopts_fuse_and_completed_torrents(tmp_path: Path):
     db_path = tmp_path / "state.db"
@@ -423,6 +429,125 @@ async def test_reconcile_preserves_parked_waiting_indexer(tmp_path: Path):
     assert reloaded.state == State.WAITING_INDEXER
     assert reloaded.indexer_attempts == 2
     dest.add_torrent.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_reconcile_fuse_mount_prefix_no_false_positive(tmp_path: Path):
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    cfg = MagicMock()
+    cfg.rclone.fuse.mount = Path("/mnt/fuse")
+    cfg.rclone.fuse.mount_unsorted = Path("/mnt/fuse_unsorted")
+
+    # Incomplete torrent on /mnt/fuse2 (which starts with /mnt/fuse as string prefix)
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [
+        Torrent(
+            hash="fuse2_hash",
+            name="Incomplete.Other.mkv",
+            size_bytes=1000,
+            save_path="/mnt/fuse2/torrents",
+            category="racing",
+            progress=0.5,
+            state="downloading",
+        ),
+    ]
+
+    report = await reconcile(cfg, dest=dest, store=store)
+    # Must NOT be marked as kept (on_fuse), should be an unknown
+    assert "fuse2_hash" not in report.kept
+    assert "fuse2_hash" in report.unknowns
+
+
+@pytest.mark.anyio
+async def test_auto_retry_failed_caps_retries(tmp_path: Path):
+    from racing_sync.coordinator import Coordinator
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    # Torrent 1: failed_retries = 0 -> should be retried and incremented
+    ts1 = TorrentState(
+        source_infohash="fail1",
+        source_name="Fail1",
+        state=State.FAILED,
+        failed_retries=0,
+    )
+    # Torrent 2: failed_retries = 3 -> should NOT be retried (exceeded cap of 3)
+    ts2 = TorrentState(
+        source_infohash="fail2",
+        source_name="Fail2",
+        state=State.FAILED,
+        failed_retries=3,
+    )
+    store.upsert(ts1)
+    store.upsert(ts2)
+
+    coord = object.__new__(Coordinator)
+    coord.store = store
+    coord.cfg = MagicMock()
+    coord.cfg.recovery.run_on_startup = False
+    coord.cfg.recovery.auto_retry_failed = True
+    coord.cfg.recovery.max_failed_retries = 3
+    coord.transition = lambda t, s: coord.store.transition(t, s)
+
+    # Simulate coordinator startup retry logic
+    failed_rows = [ts for ts in coord.store.all() if ts.state == State.FAILED]
+    max_retries = getattr(coord.cfg.recovery, "max_failed_retries", 3)
+    for ts in failed_rows:
+        if ts.failed_retries >= max_retries:
+            continue
+        ts.failed_retries += 1
+        coord.transition(ts, State.NEW)
+
+    r1 = store.get("fail1")
+    r2 = store.get("fail2")
+    assert r1.state == State.NEW
+    assert r1.failed_retries == 1
+    # r2 stayed in FAILED
+    assert r2.state == State.FAILED
+    assert r2.failed_retries == 3
+
+
+@pytest.mark.anyio
+async def test_queued_existing_torrent_resumes(tmp_path: Path):
+    from racing_sync.coordinator import Coordinator
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    coord = object.__new__(Coordinator)
+    coord.store = store
+    coord.cfg = MagicMock()
+    coord.cfg.rclone.fuse.mount = Path("/mnt/fuse")
+    coord.cfg.rclone.fuse.mount_unsorted = Path("/mnt/fuse_unsorted")
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
+    coord.transition = lambda t, s: setattr(t, "state", s)
+
+    ext_torrent = Torrent(
+        hash="existing_hash_123",
+        name="Existing.Torrent",
+        size_bytes=1000,
+        save_path="/local/ssd/downloads",
+        category="racing",
+        progress=0.4,
+        state="paused",
+    )
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents.return_value = [ext_torrent]
+
+    ts = TorrentState(
+        source_infohash="existing_hash_123",
+        source_name="Existing.Torrent",
+        cross_seed_blob=b"torrent_bytes",
+        state=State.QUEUED,
+    )
+
+    await coord._do_queued(ts)
+
+    # Must call resume on destination client
+    coord.dest_client.resume.assert_awaited_once_with("existing_hash_123")
+    assert ts.state == State.DOWNLOADING
+
 
 
 

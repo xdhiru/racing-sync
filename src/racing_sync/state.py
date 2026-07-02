@@ -113,6 +113,8 @@ class TorrentState:
     readd_first_attempted_at: dt.datetime | None = None
     readd_next_retry_at: dt.datetime | None = None
     readd_attempts: int = 0
+    # Failure retry tracking
+    failed_retries: int = 0
     # Lifecycle
     state: State = State.NEW
     batch_index: int = 0
@@ -155,6 +157,7 @@ class TorrentState:
                 if self.readd_next_retry_at else ""
             ),
             "readd_attempts": self.readd_attempts,
+            "failed_retries": self.failed_retries,
             "state": self.state.value,
             "batch_index": self.batch_index,
             "batches_total": self.batches_total,
@@ -185,6 +188,7 @@ CREATE TABLE IF NOT EXISTS torrent_state (
     readd_first_attempted_at  TEXT NOT NULL DEFAULT '',
     readd_next_retry_at       TEXT NOT NULL DEFAULT '',
     readd_attempts            INTEGER NOT NULL DEFAULT 0,
+    failed_retries           INTEGER NOT NULL DEFAULT 0,
     state                    TEXT NOT NULL,
     batch_index              INTEGER NOT NULL DEFAULT 0,
     batches_total            INTEGER NOT NULL DEFAULT 0,
@@ -222,7 +226,7 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = (
     "classification_kind, total_bytes, save_path, cross_seed_infohash, cross_seed_source, "
     "'' AS cross_seed_blob, injected_private_hashes, indexer_first_queried_at, "
     "indexer_next_retry_at, indexer_attempts, readd_first_attempted_at, "
-    "readd_next_retry_at, readd_attempts, state, batch_index, batches_total, "
+    "readd_next_retry_at, readd_attempts, failed_retries, state, batch_index, batches_total, "
     "last_error, created_at, updated_at, telegram_message_id"
 )
 
@@ -284,6 +288,7 @@ class StateStore:
             "readd_first_attempted_at": "TEXT NOT NULL DEFAULT ''",
             "readd_next_retry_at": "TEXT NOT NULL DEFAULT ''",
             "readd_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "failed_retries": "INTEGER NOT NULL DEFAULT 0",
             "state": "TEXT NOT NULL DEFAULT 'new'",
             "batch_index": "INTEGER NOT NULL DEFAULT 0",
             "batches_total": "INTEGER NOT NULL DEFAULT 0",
@@ -454,6 +459,8 @@ class StateStore:
             ts.readd_first_attempted_at = None
             ts.readd_next_retry_at = None
             ts.readd_attempts = 0
+        elif dst == State.DONE:
+            ts.failed_retries = 0
         if batch_index is not None:
             ts.batch_index = batch_index
         self.upsert(ts)
@@ -551,6 +558,7 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
             dt.datetime.fromisoformat(ra_next) if ra_next else None
         ),
         readd_attempts=int(ra_attempts or 0),
+        failed_retries=int(row["failed_retries"] or 0) if "failed_retries" in keys else 0,
         state=State(row["state"]) if "state" in keys else State.NEW,
         batch_index=int(row["batch_index"] or 0) if "batch_index" in keys else 0,
         batches_total=int(row["batches_total"] or 0) if "batches_total" in keys else 0,

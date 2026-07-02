@@ -545,6 +545,10 @@ class RecoveryConfig(BaseModel):
     # Set false if you want FAILED rows to stay failed for manual
     # intervention.
     auto_retry_failed: bool = True
+    # Maximum number of times a FAILED row will be auto-retried on boot
+    # before being left in FAILED to avoid infinite failure loops.
+    max_failed_retries: int = 3
+
 
 
 class APIConfig(BaseModel):
