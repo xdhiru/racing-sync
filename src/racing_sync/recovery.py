@@ -114,7 +114,7 @@ async def reconcile(
     for h, t in actual_by_hash.items():
         if h not in db_hashes:
             save_path = getattr(t, "save_path", "").rstrip("/\\").replace("\\", "/")
-            on_fuse = any(save_path.startswith(fm) for fm in fuse_mounts if fm)
+            on_fuse = any(save_path == fm or save_path.startswith(fm + "/") for fm in fuse_mounts if fm)
             comp = getattr(t, "is_complete", False)
             is_done = comp() if callable(comp) else bool(comp)
             if on_fuse or is_done:
