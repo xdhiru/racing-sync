@@ -399,3 +399,79 @@ async def test_check_and_inject_late_cross_seeds_normalizes_hash():
     # Injected hash should be stored in lowercase
     assert ts.injected_private_hashes == "late1234ef"
     coord.store.upsert.assert_called_once_with(ts)
+
+
+@pytest.mark.anyio
+async def test_do_moving_raises_when_pause_fails(tmp_path: Path):
+    from racing_sync.clients.abstract import TorrentFile
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files.return_value = [
+        TorrentFile(name="Movie.mkv", size_bytes=1000, progress=1.0)
+    ]
+    coord.dest_client.pause.side_effect = RuntimeError("qB webui error")
+    coord._rclone_move = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="hash_pause_fail",
+        source_name="Movie",
+        save_path=str(tmp_path),
+        state=State.MOVING,
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        await coord._do_moving(ts)
+    assert "failed to pause torrent" in str(exc.value)
+    # Rclone move must NOT proceed
+    coord._rclone_move.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_do_re_add_timer_delay_parks_without_sleeping():
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.fuse_reinject_delay_seconds = 30  # > 5s -> timer pattern
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="timer_test_hash",
+        source_name="Timer.Show.2026",
+        state=State.RE_ADDING,
+        readd_attempts=0,
+        readd_next_retry_at=None,
+    )
+
+    await coord._do_re_add(ts)
+
+    # Must set readd_next_retry_at into the future and return without adding torrents
+    assert ts.readd_next_retry_at is not None
+    coord.dest_client.add_torrent.assert_not_called()
+    coord.store.upsert.assert_called()
+
+
+@pytest.mark.anyio
+async def test_re_add_cross_seed_missing_blob_fails():
+    coord = object.__new__(Coordinator)
+    coord.store = MagicMock()
+    coord.store.get_blob.return_value = None  # No blob
+    coord.dest_client = AsyncMock()
+    coord.transition = MagicMock(side_effect=lambda ts, s, error="": setattr(ts, "state", s))
+
+    ts = TorrentState(
+        source_infohash="missing_blob_hash",
+        source_name="No.Blob.Show",
+        cross_seed_blob=b"",
+        state=State.RE_ADDING,
+    )
+
+    await coord._re_add_cross_seed_torrent(ts)
+
+    # Must transition to FAILED, NOT silently succeed
+    assert ts.state == State.FAILED
+    coord.transition.assert_called_once()
+    assert coord.transition.call_args[0][1] == State.FAILED
+
