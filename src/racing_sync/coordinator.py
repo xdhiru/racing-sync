@@ -1006,6 +1006,22 @@ class Coordinator:
             pass
         return total_bytes
 
+    def _batch_cap_bytes(self) -> int:
+        try:
+            cap = ssd_max_inflight_bytes(self.cfg)
+            if isinstance(cap, int) and cap > 0:
+                return cap
+        except Exception:
+            pass
+        if hasattr(self, "_effective_inflight_cap"):
+            try:
+                res = self._effective_inflight_cap(0)
+                if isinstance(res, int) and res > 0:
+                    return res
+            except Exception:
+                pass
+        return 0
+
     async def _do_new(self, ts: TorrentState) -> None:
         if ts.cross_seed_source == "watch-dir":
             await self._do_new_watch_dir(ts)
@@ -1381,9 +1397,8 @@ class Coordinator:
 
         # Apply batch file priorities for seasons
         if cls.kind in ("season", "mixed") and cls.episodes:
-            from .classifier import parse_episode  # local import to avoid cycles
             episodes = [e for e in cls.episodes]
-            cap = ssd_max_inflight_bytes(self.cfg)
+            cap = self._batch_cap_bytes()
             batches = make_batches(episodes, cap_bytes=cap)
             ts.batches_total = len(batches)
             ts.batch_index = 0
@@ -1437,13 +1452,18 @@ class Coordinator:
             log.warning("could not get torrent files for batches: %s", e)
             return []
         from .classifier import parse_episode, Episode
+        ep_re = None
+        if hasattr(self, "cfg") and self.cfg and hasattr(self.cfg, "classifier"):
+            candidate = getattr(self.cfg.classifier, "_episode_re", None)
+            if isinstance(candidate, (re.Pattern, str)):
+                ep_re = candidate
         eps = []
         for f in files:
-            se = parse_episode(f.name)
+            se = parse_episode(f.name, ep_re)
             if se:
                 eps.append(Episode(f.name, se[0], se[1], f.size_bytes))
         eps.sort(key=lambda e: (e.season, e.episode))
-        cap = self._effective_inflight_cap(ts.total_bytes or 0)
+        cap = self._batch_cap_bytes()
         return make_batches(eps, cap_bytes=cap) if eps and cap > 0 else []
 
     async def _move_and_clean_batch(
@@ -1646,15 +1666,19 @@ class Coordinator:
     async def _prepare_next_batch(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
         files = await self.dest_client.get_torrent_files(h)
-        from .classifier import parse_episode  # noqa: F401
+        from .classifier import parse_episode, Episode  # noqa: F401
+        ep_re = None
+        if hasattr(self, "cfg") and self.cfg and hasattr(self.cfg, "classifier"):
+            candidate = getattr(self.cfg.classifier, "_episode_re", None)
+            if isinstance(candidate, (re.Pattern, str)):
+                ep_re = candidate
         eps = []
         for f in files:
-            se = parse_episode(f.name)
+            se = parse_episode(f.name, ep_re)
             if se:
-                from .classifier import Episode
                 eps.append(Episode(f.name, se[0], se[1], f.size_bytes))
         eps.sort(key=lambda e: (e.season, e.episode))
-        cap = ssd_max_inflight_bytes(self.cfg)
+        cap = self._batch_cap_bytes()
         batches = make_batches(eps, cap_bytes=cap)
         if ts.batch_index >= len(batches):
             return
@@ -1825,7 +1849,7 @@ class Coordinator:
             await self._rclone_move(local, remote, ts)
         else:
             # Mixed — per-episode moves with --include (single batch)
-            cap = ssd_max_inflight_bytes(self.cfg)
+            cap = self._batch_cap_bytes()
             episodes = cls.episodes
             if not episodes:
                 raise RuntimeError(

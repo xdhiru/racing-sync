@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from racing_sync.batcher import make_batches
 from racing_sync.classifier import Episode
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
 
 
 def test_batches_fit_under_cap():
@@ -524,3 +531,42 @@ async def test_do_moving_moves_remaining_files_when_batches_incomplete(tmp_path)
     # Incomplete batches with remaining payload files MUST be moved before cleanup
     coord._rclone_move.assert_called_once()
     assert ts.state == State.RE_ADDING
+
+
+@pytest.mark.anyio
+async def test_batch_cap_bytes_single_helper():
+    from racing_sync.coordinator import Coordinator
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.ssd.max_inflight_bytes = 50_000_000_000
+    coord.cfg.general.disk_safety_margin_bytes = 0
+
+    with patch("racing_sync.coordinator.ssd_max_inflight_bytes", return_value=50_000_000_000):
+        assert coord._batch_cap_bytes() == 50_000_000_000
+
+
+@pytest.mark.anyio
+async def test_get_batches_respects_custom_episode_regex():
+    import re
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import TorrentState
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    # Custom episode regex for e.g. "Show - 01.mkv" (no 'S01E' prefix)
+    coord.cfg.classifier._episode_re = re.compile(r"Show\s+-\s+(\d+)")
+    coord._batch_cap_bytes = MagicMock(return_value=10_000_000_000)
+
+    files = [
+        TorrentFile(name="Show - 01.mkv", size_bytes=1000, progress=1.0),
+        TorrentFile(name="Show - 02.mkv", size_bytes=1000, progress=1.0),
+    ]
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files.return_value = files
+
+    ts = TorrentState(source_infohash="custom_ep_hash", total_bytes=2000)
+    batches = await coord._get_batches_for_torrent(ts)
+    assert len(batches) == 1
+    assert len(batches[0].episodes) == 2
+    assert batches[0].episodes[0].file_name == "Show - 01.mkv"
