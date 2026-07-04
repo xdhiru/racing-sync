@@ -96,6 +96,48 @@ def _populate_form_data(fd: aiohttp.FormData, data: Any, files: Any) -> None:
                     _add_single_file_field(fd, str(item[0]), item[1:])
 
 
+def _clone_formdata(fd: aiohttp.FormData) -> aiohttp.FormData:
+    """Rebuild a FormData so retries send a fresh (unconsumed) body.
+
+    aiohttp payload objects can be consumed on the first send; reusing the
+    same FormData across network/transient retries risks truncated re-sends
+    (notably `torrents/add` with 20MiB blobs). Re-add each stored field.
+    """
+    try:
+        fields = list(getattr(fd, "_fields", []) or [])
+    except Exception:
+        return fd
+    if not fields:
+        return fd
+    out = aiohttp.FormData()
+    try:
+        out._quote_fields = getattr(fd, "_quote_fields", True)
+        out._charset = getattr(fd, "_charset", None)
+    except Exception:
+        pass
+    for entry in fields:
+        try:
+            dtype, headers, value = entry
+        except Exception:
+            continue
+        try:
+            name = dtype.get("name") if hasattr(dtype, "get") else None
+            filename = dtype.get("filename") if hasattr(dtype, "get") else None
+        except Exception:
+            name, filename = None, None
+        if name is None:
+            continue
+        ctype = headers.get("Content-Type") if isinstance(headers, dict) else None
+        try:
+            out.add_field(name, value, filename=filename, content_type=ctype)
+        except Exception:
+            try:
+                out.add_field(name, value)
+            except Exception:
+                pass
+    return out
+
+
 
 
 
@@ -220,6 +262,8 @@ class HTTPClientBase:
                 fd = aiohttp.FormData()
                 _populate_form_data(fd, data, files)
                 return fd
+            if isinstance(data, aiohttp.FormData):
+                return _clone_formdata(data)
             return data
 
         path_clean = path.lstrip("/")
@@ -319,6 +363,27 @@ class HTTPClientBase:
                 # All attempts exhausted.
                 assert last_exc is not None
                 raise last_exc
+
+        # A post-login response can still be a transient gateway/rate-limit
+        # error — retry it instead of surfacing a hard failure.
+        for attempt in range(3):
+            if r.status not in _TRANSIENT_STATUSES:
+                break
+            delay = 0.5 * (2 ** attempt)
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    delay = min(5.0, float(retry_after))
+                except ValueError:
+                    pass
+            log.warning(
+                "[%s] %s %s -> HTTP %d after re-auth; retrying in %.1fs (attempt %d/3)",
+                self._label, method, path, r.status, delay, attempt + 1,
+            )
+            await r.read()
+            r.close()
+            await asyncio.sleep(delay)
+            r = await _do()
 
         if r.status >= 400:
             try:

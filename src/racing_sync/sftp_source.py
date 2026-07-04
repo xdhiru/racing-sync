@@ -195,6 +195,8 @@ class SFTPExporter:
         """Return the .torrent bytes for `infohash` or None if missing."""
         if not infohash or len(infohash) != 40 or not all(c in "0123456789abcdefABCDEF" for c in infohash):
             return None
+        # State dirs live on case-sensitive filesystems with lowercase names.
+        infohash = infohash.lower()
 
         with self._lock:
             # Reconnect if connection dropped
@@ -245,7 +247,20 @@ class SFTPExporter:
         return {h: data for h, data in ((h, self.fetch_torrent(h)) for h in infohashes) if data}
 
     def list_state_dir(self) -> list[str]:
+        import re
+
+        _HEX40 = re.compile(r"[0-9a-fA-F]{40}")
         with self._lock:
+            # Mirror fetch_torrent: reconnect if the connection dropped.
+            if (self._client is None
+                    or self._sftp is None
+                    or self._client.get_transport() is None
+                    or not self._client.get_transport().is_active()):
+                log.info("sftp connection dropped or not active; reconnecting...")
+                try:
+                    self.connect()
+                except Exception as e:
+                    raise SFTPError(f"sftp reconnect failed: {e}") from e
             if self._sftp is None:
                 raise SFTPError("not connected")
             out: list[str] = []
@@ -254,8 +269,14 @@ class SFTPExporter:
                 if hasattr(self._cfg.state_dir, "as_posix")
                 else str(self._cfg.state_dir).replace("\\", "/")
             ).as_posix()
-            for entry in self._sftp.listdir_attr(remote_dir):
+            try:
+                entries = self._sftp.listdir_attr(remote_dir)
+            except OSError as e:
+                raise SFTPError(f"sftp listdir failed for {remote_dir}: {e}") from e
+            for entry in entries:
                 name = entry.filename
                 if name.endswith(".torrent"):
-                    out.append(name[: -len(".torrent")])
+                    digest = name[: -len(".torrent")]
+                    if _HEX40.fullmatch(digest):
+                        out.append(digest)
             return out
