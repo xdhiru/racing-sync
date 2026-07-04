@@ -37,7 +37,7 @@ from .clients.http_base import AuthError
 from .clients.qbittorrent import QBittorrentClient, build_qbtorrent_from_dest
 from .config import AppConfig
 from .logging_setup import get_ring_buffer
-from .prowlarr import ProwlarrClient
+from .prowlarr import ProwlarrClient, TorrentHit
 from .recovery import reconcile
 from .rclone_ops import (
     move_local_to_remote,
@@ -80,6 +80,22 @@ def normalize_content_name(name: str) -> str:
             s = s[:-len(ext)].strip()
             break
     return s.lower()
+
+
+def _matches_release(hit_title: str, hit_size: int, target_name: str, target_size: int) -> bool:
+    """Check if a Prowlarr hit matches the target release by title and size."""
+    ht_norm = normalize_content_name(hit_title)
+    tg_norm = normalize_content_name(target_name)
+    title_matches = (
+        ht_norm == tg_norm
+        or hit_title.strip().lower() == target_name.strip().lower()
+    )
+    if not title_matches:
+        return False
+    if hit_size > 0 and target_size > 0:
+        tolerance = min(1024 * 1024 * 50, int(target_size * 0.02))
+        return abs(hit_size - target_size) <= tolerance
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -1110,13 +1126,25 @@ class Coordinator:
 
         # Prepare persistence directory for cross-seed torrents
         watch_cross_dir = Path(self.cfg.general.state_db).parent / "watch_cross_seeds" / ts.source_infohash
-        watch_cross_dir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(watch_cross_dir.mkdir, parents=True, exist_ok=True)
         # Always persist the dropped .torrent so it can be seeded on FUSE
-        (watch_cross_dir / f"{ts.source_infohash}.torrent").write_bytes(blob)
+        await asyncio.to_thread((watch_cross_dir / f"{ts.source_infohash}.torrent").write_bytes, blob)
+
+        query_prowlarr = True
+        prefer_prowlarr = True
+        if hasattr(self.cfg, "watch_dir") and self.cfg.watch_dir is not None:
+            qp = getattr(self.cfg.watch_dir, "query_prowlarr", True)
+            if isinstance(qp, bool):
+                query_prowlarr = qp
+            pp = getattr(self.cfg.watch_dir, "prefer_prowlarr_result", True)
+            if isinstance(pp, bool):
+                prefer_prowlarr = pp
 
         # If Prowlarr is enabled and not skipped, perform single parallel search
         should_skip_prowlarr = self.cfg.prowlarr.should_skip_title(ts.source_name)
-        if should_skip_prowlarr:
+        if not query_prowlarr:
+            log.info("prowlarr: skipping search for watch-dir release %r (watch_dir.query_prowlarr is False)", ts.source_name)
+        elif should_skip_prowlarr:
             log.info(
                 "prowlarr: skipping search for watch-dir release %r (matches skip_query_substrings)",
                 ts.source_name,
@@ -1124,7 +1152,7 @@ class Coordinator:
         elif self.cfg.prowlarr.enabled and self.prowlarr is not None:
             indexers_to_query = []
             download_idx = None
-            if needs_sacrificial_copy:
+            if needs_sacrificial_copy and prefer_prowlarr:
                 try:
                     download_idx = self.prowlarr.get_download_indexer()
                     indexers_to_query.append(download_idx)
@@ -1139,27 +1167,31 @@ class Coordinator:
                     indexers_to_query.append(idx)
                     seen_names.add(idx.name.lower())
 
-            hits_by_indexer = {}
+            hits_by_indexer: dict[str, list[TorrentHit]] = {}
             if indexers_to_query:
-                hits_by_indexer = await self.prowlarr.search_indexers_parallel(
-                    indexers_to_query, ts.source_name
-                )
+                try:
+                    hits_by_indexer = await self.prowlarr.search_indexers_parallel(
+                        indexers_to_query, ts.source_name
+                    )
+                except Exception as e:
+                    log.warning("watch-dir: prowlarr search failed for %s: %s", ts.source_name, e)
+                    hits_by_indexer = {}
 
             # 1. Check for sacrificial download torrent on download_indexer
-            if download_idx and download_idx.name.lower() in hits_by_indexer:
+            if prefer_prowlarr and download_idx and download_idx.name.lower() in hits_by_indexer:
                 dl_hits = hits_by_indexer[download_idx.name.lower()]
-                ql = ts.source_name.lower()
-                dl_hits.sort(
+                matching_dl = [
+                    h for h in dl_hits
+                    if _matches_release(h.title, h.size_bytes, ts.source_name, ts.total_bytes)
+                ]
+                matching_dl.sort(
                     key=lambda h: (
-                        h.title.lower() != ql,
+                        normalize_content_name(h.title) != normalize_content_name(ts.source_name),
                         abs(h.size_bytes - ts.total_bytes),
                     )
                 )
-                if dl_hits and (
-                    dl_hits[0].title.lower() == ql
-                    or abs(dl_hits[0].size_bytes - ts.total_bytes) <= min(1024 * 1024 * 50, int(ts.total_bytes * 0.02))
-                ):
-                    best_dl = dl_hits[0]
+                if matching_dl:
+                    best_dl = matching_dl[0]
                     try:
                         dl_blob = await self.prowlarr.download_torrent(best_dl)
                         from .watchdir import _bencoded_info_hash
@@ -1182,18 +1214,32 @@ class Coordinator:
                 if download_idx and idx_name == download_idx.name.lower():
                     continue
                 for hit in hits:
-                    if hit.title.lower() == ts.source_name.lower() or abs(hit.size_bytes - ts.total_bytes) <= min(1024 * 1024 * 50, int(ts.total_bytes * 0.02)):
+                    if _matches_release(hit.title, hit.size_bytes, ts.source_name, ts.total_bytes):
                         try:
                             cross_blob = await self.prowlarr.download_torrent(hit)
                             from .watchdir import _bencoded_info_hash
                             cross_h, _, _, _ = _bencoded_info_hash(cross_blob)
-                            (watch_cross_dir / f"{cross_h}.torrent").write_bytes(cross_blob)
+                            await asyncio.to_thread((watch_cross_dir / f"{cross_h}.torrent").write_bytes, cross_blob)
                             log.info(
                                 "watch-dir: discovered cross-seed from %s: %s (%s)",
                                 hit.indexer, hit.title, cross_h[:10],
                             )
                         except Exception as e:  # noqa: BLE001
                             log.warning("could not download cross-seed from %s: %s", hit.indexer, e)
+
+        # Classify the chosen torrent metadata and apply movie skip upfront
+        try:
+            from .watchdir import extract_torrent_files_from_bencoded
+            parsed_files = extract_torrent_files_from_bencoded(chosen_blob)
+            if parsed_files:
+                cls = classify(parsed_files, self.cfg)
+                ts.classification_kind = cls.kind
+                if should_skip_movie(cls, self.cfg):
+                    log.warning("watch-dir: skipping oversize movie: %s (%d B)", ts.source_name, ts.total_bytes)
+                    self.transition(ts, State.FAILED, error="movie larger than skip threshold")
+                    return
+        except Exception as e:
+            log.warning("watch-dir: failed to classify %s: %s", ts.source_name, e)
 
         ts.cross_seed_infohash = chosen_infohash.lower()
         ts.cross_seed_source = chosen_label
@@ -2098,7 +2144,7 @@ class Coordinator:
         try:
             for p in sorted(watch_cross_dir.glob("*.torrent")):
                 try:
-                    blob = p.read_bytes()
+                    blob = await asyncio.to_thread(p.read_bytes)
                     from .watchdir import _bencoded_info_hash
                     h, _, _, _ = _bencoded_info_hash(blob)
                 except Exception as e:  # noqa: BLE001
