@@ -18,7 +18,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Iterable
+from typing import Any, AsyncIterator, Iterable
 
 import aiohttp
 
@@ -187,6 +187,56 @@ def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
 
     infohash = hashlib.sha1(raw_info_bytes).hexdigest().lower()
     return infohash, name, total, announce_str
+
+
+def extract_torrent_files_from_bencoded(data: bytes) -> list[Any]:
+    """Extract list of TorrentFile entries from a bencoded .torrent payload."""
+    from .clients.abstract import TorrentFile
+
+    if not data or not data.startswith(b"d"):
+        return []
+    pos = 1
+    root: dict[bytes, object] = {}
+    while True:
+        if pos >= len(data) or data[pos:pos + 1] == b"e":
+            break
+        pos, k = _bdecode(data, pos, depth=1)
+        if not isinstance(k, (bytes, str)):
+            break
+        k_bytes = k if isinstance(k, bytes) else k.encode("utf-8")
+        pos, v = _bdecode(data, pos, depth=1)
+        root[k_bytes] = v
+
+    info = root.get(b"info")
+    if not isinstance(info, dict):
+        return []
+
+    top_name = info.get(b"name", b"")
+    if isinstance(top_name, bytes):
+        top_name = top_name.decode("utf-8", errors="replace")
+
+    files_list: list[TorrentFile] = []
+    pieces = info.get(b"files")
+    if isinstance(pieces, list):
+        for f in pieces:
+            if isinstance(f, dict):
+                length = int(f.get(b"length", 0))
+                path_parts = f.get(b"path", [])
+                parts_str: list[str] = []
+                if isinstance(path_parts, list):
+                    for p in path_parts:
+                        if isinstance(p, bytes):
+                            parts_str.append(p.decode("utf-8", errors="replace"))
+                        elif isinstance(p, str):
+                            parts_str.append(p)
+                rel_path = "/".join(parts_str) if parts_str else "file"
+                full_name = f"{top_name}/{rel_path}" if top_name else rel_path
+                files_list.append(TorrentFile(name=full_name, size_bytes=length, progress=1.0))
+    else:
+        length = int(info.get(b"length", 0))
+        files_list.append(TorrentFile(name=str(top_name), size_bytes=length, progress=1.0))
+
+    return files_list
 
 
 def _bencode(obj: object) -> bytes:

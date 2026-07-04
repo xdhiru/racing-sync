@@ -562,4 +562,298 @@ async def test_watchdir_prunes_seen_on_delete(tmp_path: Path):
     assert infohash not in scanner._seen
 
 
+def test_matches_release_helper():
+    from racing_sync.coordinator import _matches_release
+
+    # Matching titles
+    assert _matches_release("Show.Name.S01E01.1080p", 1000, "Show.Name.S01E01.1080p", 1000)
+    assert _matches_release("Show.Name.S01E01.1080p.mkv", 1000, "Show.Name.S01E01.1080p", 1000)
+    assert _matches_release("Show.Name.S01E01.1080p [Indexer]", 1000, "Show.Name.S01E01.1080p", 1000)
+
+    # Size tolerance: within 2% or 50MB
+    assert _matches_release("Show.Name", 100000000, "Show.Name", 100500000)
+    # Size difference too large
+    assert not _matches_release("Show.Name", 100000000, "Show.Name", 200000000)
+
+    # CRITICAL: Title mismatch MUST return False even if size is exactly identical
+    assert not _matches_release("Completely.Different.Movie", 1000, "Show.Name.S01E01.1080p", 1000)
+
+
+def test_extract_torrent_files_from_bencoded():
+    from racing_sync.watchdir import extract_torrent_files_from_bencoded
+
+    # Single file
+    data_single = _create_sample_torrent_data("Movie.1080p.mkv", 25000)
+    files = extract_torrent_files_from_bencoded(data_single)
+    assert len(files) == 1
+    assert files[0].name == "Movie.1080p.mkv"
+    assert files[0].size_bytes == 25000
+
+    # Multi file
+    torrent_dict = {
+        b"info": {
+            b"name": b"Show.S01",
+            b"files": [
+                {b"length": 1000, b"path": [b"Show.S01E01.mkv"]},
+                {b"length": 2000, b"path": [b"Season 1", b"Show.S01E02.mkv"]},
+            ],
+        }
+    }
+    data_multi = _bencode(torrent_dict)
+    files_multi = extract_torrent_files_from_bencoded(data_multi)
+    assert len(files_multi) == 2
+    assert files_multi[0].name == "Show.S01/Show.S01E01.mkv"
+    assert files_multi[0].size_bytes == 1000
+    assert files_multi[1].name == "Show.S01/Season 1/Show.S01E02.mkv"
+    assert files_multi[1].size_bytes == 2000
+
+
+@pytest.mark.anyio
+async def test_do_new_watch_dir_rejects_wrong_title_matching_size(tmp_path: Path):
+    raw_data = _create_sample_torrent_data("Target.Release.1080p", 5000, "http://alpha.cc/announce")
+    infohash, name, total, announce = _bencoded_info_hash(raw_data)
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 100000000
+    coord.cfg.general.state_db = db_path
+    coord.cfg.general.disk_safety_margin_bytes = 1000
+    coord.cfg.prowlarr.enabled = True
+    coord.cfg.prowlarr.is_download_indexer = lambda url: False
+    coord.cfg.prowlarr.should_skip_title.return_value = False
+    coord.cfg.prowlarr.tracker_map.entries = {"beta": "Beta"}
+    coord.cfg.watch_dir = WatchDirConfig(path=tmp_path / "watch", query_prowlarr=True, prefer_prowlarr_result=True)
+    coord.store = store
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+
+    dl_idx = Indexer(1, "Indexer (API)", "torrent", True, [])
+    coord.prowlarr = MagicMock()
+    coord.prowlarr.get_download_indexer = MagicMock(return_value=dl_idx)
+    coord.prowlarr.get_indexer_by_name = MagicMock(return_value=None)
+    coord.prowlarr.search_indexers_parallel = AsyncMock()
+    coord.prowlarr.download_torrent = AsyncMock()
+
+    # Hit has identical size (5000) but WRONG title
+    wrong_hit = TorrentHit(
+        title="Completely.Unrelated.Release",
+        guid="1",
+        indexer="Indexer (API)",
+        indexer_id=1,
+        size_bytes=5000,
+        download_url="http://prowlarr/dl/1",
+        magnet_url="",
+        info_url="",
+        publish_date="",
+    )
+    coord.prowlarr.search_indexers_parallel.return_value = {
+        "indexer (api)": [wrong_hit],
+    }
+
+    ts = TorrentState(
+        source_infohash=infohash,
+        source_name=name,
+        total_bytes=total,
+        source_announce_url=announce,
+        cross_seed_blob=raw_data,
+        cross_seed_source="watch-dir",
+        state=State.NEW,
+    )
+
+    await coord._do_new_watch_dir(ts)
+
+    # download_torrent should NEVER have been called for the unrelated release
+    coord.prowlarr.download_torrent.assert_not_called()
+    assert ts.cross_seed_source == "watch-dir"
+    assert ts.cross_seed_blob == raw_data
+
+
+@pytest.mark.anyio
+async def test_do_new_watch_dir_query_prowlarr_disabled(tmp_path: Path):
+    raw_data = _create_sample_torrent_data("Target.Release.1080p", 5000, "http://alpha.cc/announce")
+    infohash, name, total, announce = _bencoded_info_hash(raw_data)
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 100000000
+    coord.cfg.general.state_db = db_path
+    coord.cfg.general.disk_safety_margin_bytes = 1000
+    coord.cfg.prowlarr.enabled = True
+    coord.cfg.prowlarr.is_download_indexer = lambda url: False
+    coord.cfg.prowlarr.should_skip_title.return_value = False
+    coord.cfg.watch_dir = WatchDirConfig(path=tmp_path / "watch", query_prowlarr=False)
+    coord.store = store
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+
+    coord.prowlarr = MagicMock()
+    coord.prowlarr.search_indexers_parallel = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash=infohash,
+        source_name=name,
+        total_bytes=total,
+        source_announce_url=announce,
+        cross_seed_blob=raw_data,
+        cross_seed_source="watch-dir",
+        state=State.NEW,
+    )
+
+    await coord._do_new_watch_dir(ts)
+
+    # Prowlarr search should NOT be called when query_prowlarr is False
+    coord.prowlarr.search_indexers_parallel.assert_not_called()
+    assert ts.cross_seed_source == "watch-dir"
+    assert ts.state == State.QUEUED
+
+
+@pytest.mark.anyio
+async def test_do_new_watch_dir_prefer_prowlarr_result_disabled(tmp_path: Path):
+    raw_data = _create_sample_torrent_data("Target.Release.1080p", 5000, "http://alpha.cc/announce")
+    infohash, name, total, announce = _bencoded_info_hash(raw_data)
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 100000000
+    coord.cfg.general.state_db = db_path
+    coord.cfg.general.disk_safety_margin_bytes = 1000
+    coord.cfg.prowlarr.enabled = True
+    coord.cfg.prowlarr.is_download_indexer = lambda url: False
+    coord.cfg.prowlarr.should_skip_title.return_value = False
+    coord.cfg.prowlarr.tracker_map.entries = {}
+    coord.cfg.watch_dir = WatchDirConfig(path=tmp_path / "watch", query_prowlarr=True, prefer_prowlarr_result=False)
+    coord.store = store
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+
+    dl_idx = Indexer(1, "Indexer (API)", "torrent", True, [])
+    coord.prowlarr = MagicMock()
+    coord.prowlarr.get_download_indexer = MagicMock(return_value=dl_idx)
+    coord.prowlarr.search_indexers_parallel = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash=infohash,
+        source_name=name,
+        total_bytes=total,
+        source_announce_url=announce,
+        cross_seed_blob=raw_data,
+        cross_seed_source="watch-dir",
+        state=State.NEW,
+    )
+
+    await coord._do_new_watch_dir(ts)
+
+    # When prefer_prowlarr_result is False, download indexer should not even be queried for sacrificial copy
+    coord.prowlarr.get_download_indexer.assert_not_called()
+    assert ts.cross_seed_source == "watch-dir"
+    assert ts.cross_seed_blob == raw_data
+
+
+@pytest.mark.anyio
+async def test_do_new_watch_dir_classifies_and_skips_oversize_movie(tmp_path: Path):
+    from racing_sync.config import ClassifierConfig
+    raw_data = _create_sample_torrent_data("Massive.Movie.2024.1080p", 2 * 1024 * 1024 * 1024)
+    infohash, name, total, announce = _bencoded_info_hash(raw_data)
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 10000000000
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 1024 * 1024 * 1024  # 1 GB max, torrent is 2 GB
+    coord.cfg.general.state_db = db_path
+    coord.cfg.general.disk_safety_margin_bytes = 1000
+    coord.cfg.prowlarr.enabled = False
+    coord.cfg.classifier = ClassifierConfig()
+    coord.cfg.watch_dir = WatchDirConfig(path=tmp_path / "watch")
+    coord.store = store
+    def _tr(t, s, error=""):
+        t.state = s
+        t.last_error = error
+    coord.transition = _tr
+
+    ts = TorrentState(
+        source_infohash=infohash,
+        source_name=name,
+        total_bytes=total,
+        source_announce_url=announce,
+        cross_seed_blob=raw_data,
+        cross_seed_source="watch-dir",
+        state=State.NEW,
+    )
+
+    await coord._do_new_watch_dir(ts)
+
+    # Oversize movie must be classified as "movie" and rejected upfront
+    assert ts.classification_kind == "movie"
+    assert ts.state == State.FAILED
+    assert "movie larger than skip threshold" in ts.last_error
+
+
+@pytest.mark.anyio
+async def test_do_new_watch_dir_classifies_season(tmp_path: Path):
+    from racing_sync.config import ClassifierConfig
+    torrent_dict = {
+        b"announce": b"http://indexer.net/announce",
+        b"info": {
+            b"name": b"Show.S01",
+            b"piece length": 16384,
+            b"pieces": b"12345678901234567890",
+            b"files": [
+                {b"length": 1000, b"path": [b"Show.S01E01.mkv"]},
+                {b"length": 1000, b"path": [b"Show.S01E02.mkv"]},
+            ],
+        },
+    }
+    raw_data = _bencode(torrent_dict)
+    infohash, name, total, announce = _bencoded_info_hash(raw_data)
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 10000000000
+    coord.cfg.general.state_db = db_path
+    coord.cfg.general.disk_safety_margin_bytes = 1000
+    coord.cfg.prowlarr.enabled = False
+    coord.cfg.classifier = ClassifierConfig()
+    coord.cfg.watch_dir = WatchDirConfig(path=tmp_path / "watch")
+    coord.store = store
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+
+    ts = TorrentState(
+        source_infohash=infohash,
+        source_name=name,
+        total_bytes=total,
+        source_announce_url=announce,
+        cross_seed_blob=raw_data,
+        cross_seed_source="watch-dir",
+        state=State.NEW,
+    )
+
+    await coord._do_new_watch_dir(ts)
+
+    # Season must be classified as "season" and queued
+    assert ts.classification_kind == "season"
+    assert ts.state == State.QUEUED
+
+
 
