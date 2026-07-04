@@ -120,7 +120,19 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         async with await self.request(
             "POST", "json", json_body=payload
         ) as r:
-            data = await r.json()
+            try:
+                data = await r.json()
+            except Exception as e:
+                from .http_base import AuthError
+                body = ""
+                try:
+                    body = await r.text()
+                except Exception:
+                    pass
+                raise AuthError(
+                    f"deluge rpc {method} returned non-JSON (likely expired "
+                    f"session/login page): {e}. Body: {body[:200]}"
+                ) from e
         if "error" in data and data["error"]:
             raise RuntimeError(f"deluge rpc {method} error: {data['error']}")
         return data.get("result")
@@ -200,12 +212,19 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             if status and "files" in status:
                 prios = status.get("file_priorities", []) or []
                 progs = status.get("file_progress", []) or []
+                # Deluge reports file_progress on a 0-100 scale (same as the
+                # torrent-level progress normalized in list_torrents). Decide
+                # the scale once: if any value exceeds 1, all are 0-100.
+                scale_100 = any(
+                    (float(progs[i]) if i < len(progs) else 0.0) > 1.0
+                    for i in range(max(len(status["files"]), len(progs)))
+                )
                 out: list[TorrentFile] = []
                 for item in status["files"]:
                     idx = item.get("index", len(out))
                     prio = prios[idx] if idx < len(prios) else item.get("priority", 1)
                     raw_prog = float(progs[idx]) if idx < len(progs) else 0.0
-                    prog = raw_prog / 100.0 if raw_prog > 1.0 else raw_prog
+                    prog = raw_prog / 100.0 if scale_100 else raw_prog
                     out.append(
                         TorrentFile(
                             name=item.get("path", ""),
@@ -258,20 +277,24 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         if not info:
             return []
         files = info.get(b"files")
+        top_name = info.get(b"name", b"").decode("utf-8", "replace")
         if files:
-            # Multi-file mode
+            # Multi-file mode: RPC `files[].path` values include the top-level
+            # directory (e.g. `Show/ep1.mkv`), while .torrent paths are
+            # relative to it — prefix so set_file_priorities keys match.
             out: list[TorrentFile] = []
             for f in files:
-                path = b"/".join(f.get(b"path", [])).decode("utf-8", "replace")
+                rel = b"/".join(f.get(b"path", [])).decode("utf-8", "replace")
+                full = f"{top_name}/{rel}" if top_name else rel
                 out.append(TorrentFile(
-                    name=path,
+                    name=full,
                     size_bytes=int(f.get(b"length", 0)),
                     priority=1,
                     progress=0.0,
                 ))
             return out
         # Single-file mode
-        name = info.get(b"name", b"").decode("utf-8", "replace")
+        name = top_name
         return [TorrentFile(
             name=name,
             size_bytes=int(info.get(b"length", 0)),
@@ -346,7 +369,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 files = status.get("files", [])
                 curr_prios = list(status.get("file_priorities", []))
                 if len(curr_prios) < len(files):
-                    curr_prios = [1] * len(files)
+                    curr_prios += [1] * (len(files) - len(curr_prios))
                 name_to_idx = {
                     item.get("path", ""): item.get("index", i)
                     for i, item in enumerate(files)
