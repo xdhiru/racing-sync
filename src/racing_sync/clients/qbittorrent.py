@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
+import re
 from typing import Any, Iterable
 from urllib.parse import urlencode
 
@@ -82,9 +84,13 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         if not rows:
             return None
         t = rows[0]
-        # Fill files and trackers for parity
-        t.files = await self.get_torrent_files(torrent_hash)
-        t.trackers = await self.get_trackers(torrent_hash)
+        # Concurrently fetch files and trackers to avoid serial RTT latency
+        files, trackers = await asyncio.gather(
+            self.get_torrent_files(torrent_hash),
+            self.get_trackers(torrent_hash),
+        )
+        t.files = files
+        t.trackers = trackers
         return t
 
     async def get_torrent_files(self, torrent_hash: str) -> list[TorrentFile]:
@@ -165,12 +171,43 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 "POST", "/api/v2/torrents/add", data=data
             ) as r:
                 text = (await r.text()).strip()
+        is_hex40 = len(text) == 40 and all(c in "0123456789abcdefABCDEF" for c in text)
+        if is_hex40:
+            return AddResult(hash=text.lower(), accepted=True, detail=text)
         if text == "Ok." or text == "":
             return AddResult(hash=None, accepted=True, detail=text)
         if text == "Fails.":
+            # qBittorrent returns "Fails." for both invalid torrents and duplicate torrents.
+            # Check if the torrent already exists in qBittorrent.
+            candidate_hash: str | None = None
+            if torrent_files:
+                try:
+                    from ..watchdir import _bencoded_info_hash
+                    candidate_hash, _, _, _ = _bencoded_info_hash(torrent_files[0])
+                except Exception:
+                    candidate_hash = None
+            elif urls:
+                for u in urls:
+                    m = re.search(r"xt=urn:btih:([0-9a-zA-Z]{32,40})", u)
+                    if m:
+                        candidate_hash = m.group(1)
+                        break
+
+            if candidate_hash:
+                try:
+                    existing = await self.get_torrent(candidate_hash)
+                    if existing is not None:
+                        log.info(
+                            "qB add_torrent returned 'Fails.' but torrent %s already exists",
+                            candidate_hash[:10],
+                        )
+                        return AddResult(hash=candidate_hash.lower(), accepted=True, detail="already added")
+                except Exception as e:
+                    log.debug("could not check if torrent %s exists after Fails: %s", candidate_hash[:10], e)
+
             return AddResult(hash=None, accepted=False, detail=text)
-        # Some versions return the new torrent hash on success
-        return AddResult(hash=text if len(text) == 40 else None, accepted=True, detail=text)
+
+        return AddResult(hash=None, accepted=True, detail=text)
 
     async def set_file_priorities(
         self, torrent_hash: str, priorities: dict[str, int]
@@ -293,11 +330,17 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
         d.get("state")
         or ("completed" if d.get("progress", 0) >= 1.0 else "downloading")
     )
+    sp = str(d.get("save_path") or "").strip()
+    if not sp and d.get("content_path"):
+        cp = Path(str(d["content_path"]).strip())
+        sp = str(cp.parent) if cp.suffix else str(cp)
+    elif sp and Path(sp).suffix:
+        sp = str(Path(sp).parent)
     return Torrent(
         hash=d["hash"],
         name=d["name"],
         category=d.get("category", ""),
-        save_path=d.get("save_path") or d.get("content_path") or "",
+        save_path=sp,
         size_bytes=int(d.get("size", d.get("total_size", 0)) or 0),
         state=str(state),
         progress=float(d.get("progress", 0.0)),
