@@ -6,6 +6,7 @@ import asyncio
 import logging
 import socket
 from typing import Any
+import urllib.parse
 
 import aiohttp
 
@@ -41,6 +42,60 @@ def _ensure_base_url(host: str) -> str:
     return host.rstrip("/") + "/"
 
 
+def _add_single_file_field(fd: aiohttp.FormData, field_name: str, file_spec: Any) -> None:
+    """Add a file field preserving filename, content_type, and encoding if present."""
+    if isinstance(file_spec, (tuple, list)):
+        if len(file_spec) == 1:
+            val = file_spec[0]
+            fname = field_name if isinstance(val, (bytes, bytearray)) else None
+            fd.add_field(field_name, val, filename=fname)
+        elif len(file_spec) == 2:
+            # (filename, content)
+            fd.add_field(field_name, file_spec[1], filename=str(file_spec[0]))
+        elif len(file_spec) == 3:
+            # (filename, content, content_type)
+            fd.add_field(
+                field_name,
+                file_spec[1],
+                filename=str(file_spec[0]),
+                content_type=str(file_spec[2]) if file_spec[2] else None,
+            )
+        elif len(file_spec) >= 4:
+            # (filename, content, content_type, headers_or_encoding)
+            encoding = (
+                file_spec[3]
+                if isinstance(file_spec[3], str)
+                else (file_spec[3].get("Content-Transfer-Encoding") if isinstance(file_spec[3], dict) else None)
+            )
+            fd.add_field(
+                field_name,
+                file_spec[1],
+                filename=str(file_spec[0]),
+                content_type=str(file_spec[2]) if file_spec[2] else None,
+                content_transfer_encoding=encoding,
+            )
+    else:
+        fname = field_name if isinstance(file_spec, (bytes, bytearray)) else None
+        fd.add_field(field_name, file_spec, filename=fname)
+
+
+def _populate_form_data(fd: aiohttp.FormData, data: Any, files: Any) -> None:
+    if isinstance(data, dict):
+        for k, v in data.items():
+            fd.add_field(k, str(v))
+    if isinstance(files, dict):
+        for k, v in files.items():
+            _add_single_file_field(fd, k, v)
+    elif isinstance(files, (list, tuple)):
+        for item in files:
+            if isinstance(item, (list, tuple)):
+                if len(item) == 2:
+                    _add_single_file_field(fd, str(item[0]), item[1])
+                elif len(item) >= 3:
+                    # Flat tuple: (fieldname, filename, content, [content_type], [headers])
+                    _add_single_file_field(fd, str(item[0]), item[1:])
+
+
 
 
 
@@ -61,6 +116,7 @@ class HTTPClientBase:
     async def start(self) -> None:
         if self._session and not self._session.closed:
             return
+        self._authed = False
         headers: dict[str, str] = {}
         # mode="basic": send the Authorization header on every request
         # preemptively. This works against nginx `auth_basic` and any
@@ -71,8 +127,12 @@ class HTTPClientBase:
             creds = f"{self._cfg.username}:{pw}".encode()
             headers["Authorization"] = "Basic " + base64.b64encode(creds).decode()
         # Set Origin and Referer to satisfy WebUI CSRF protection (e.g. qBittorrent)
-        host_clean = str(self._cfg.host).rstrip("/")
-        headers["Origin"] = host_clean
+        # RFC 6454: Origin must be scheme://netloc without any path component.
+        host_str = str(self._cfg.host)
+        host_clean = host_str.rstrip("/")
+        parsed = urllib.parse.urlsplit(host_str)
+        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else host_clean
+        headers["Origin"] = origin
         headers["Referer"] = host_clean + "/"
 
         self._session = aiohttp.ClientSession(
@@ -86,6 +146,8 @@ class HTTPClientBase:
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
+        self._session = None
+        self._authed = False
 
     @property
     def session(self) -> aiohttp.ClientSession:
@@ -153,31 +215,24 @@ class HTTPClientBase:
         if not self._authed:
             await self._auth()
 
-        if files is not None:
-            if not isinstance(data, aiohttp.FormData):
+        def _get_request_data() -> Any:
+            if files is not None:
                 fd = aiohttp.FormData()
-                if isinstance(data, dict):
-                    for k, v in data.items():
-                        fd.add_field(k, str(v))
-                data = fd
-            if isinstance(files, dict):
-                for k, v in files.items():
-                    data.add_field(k, v)
-            elif isinstance(files, (list, tuple)):
-                for item in files:
-                    if isinstance(item, tuple) and len(item) >= 2:
-                        data.add_field(item[0], item[1])
+                _populate_form_data(fd, data, files)
+                return fd
+            return data
 
         path_clean = path.lstrip("/")
 
         async def _do() -> aiohttp.ClientResponse:
             for attempt in range(3):
+                req_data = _get_request_data()
                 try:
                     return await self.session.request(
                         method,
                         path_clean,
                         params=params,
-                        data=data,
+                        data=req_data,
                         json=json_body,
                         headers=headers,
                     )
@@ -198,6 +253,28 @@ class HTTPClientBase:
             raise RuntimeError("unreachable")
 
         r = await _do()
+
+        # Retry transient gateway / rate-limit errors
+        _TRANSIENT_STATUSES = (429, 502, 503, 504)
+        for attempt in range(3):
+            if r.status not in _TRANSIENT_STATUSES:
+                break
+            delay = 0.5 * (2 ** attempt)
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    delay = min(5.0, float(retry_after))
+                except ValueError:
+                    pass
+            log.warning(
+                "[%s] %s %s -> HTTP %d; retrying in %.1fs (attempt %d/3)",
+                self._label, method, path, r.status, delay, attempt + 1,
+            )
+            await r.read()
+            r.close()
+            await asyncio.sleep(delay)
+            r = await _do()
+
         if r.status in (401, 403) and retry_auth:
             log.warning(
                 "[%s] %s %s -> %d; re-authenticating",
@@ -209,7 +286,7 @@ class HTTPClientBase:
             # backoff. The WebUI can transiently refuse auth during
             # startup, after a settings change, or while a session
             # cookie is being rotated; a single retry is often not
-            # enough. Only AuthError (or persistent 401/403) escapes.
+            # enough. Only AuthError (or persistent 401) escapes.
             last_exc: AuthError | None = None
             for attempt in range(3):
                 self._authed = False
@@ -220,36 +297,28 @@ class HTTPClientBase:
                     await asyncio.sleep(0.5 * (2 ** attempt))
                     continue
                 r2 = await _do()
-                if r2.status in (401, 403):
+                if r2.status == 401:
                     try:
                         await r2.read()
                     finally:
                         r2.close()
                     last_exc = AuthError(
-                        f"[{self._label}] auth failed: HTTP {r2.status} on {path}"
+                        f"[{self._label}] auth failed: HTTP 401 on {path}"
                     )
                     await asyncio.sleep(0.5 * (2 ** attempt))
                     continue
-                # Success — return r2 (or fall through to error path below).
+                elif r2.status == 403:
+                    # 403 after successful login indicates permission/CSRF denial,
+                    # not an auth credential failure. Do not conflate with AuthError.
+                    r = r2
+                    break
+                # Success or other status — return r2 (or fall through to error path below).
                 r = r2
                 break
             else:
                 # All attempts exhausted.
                 assert last_exc is not None
                 raise last_exc
-            # If we broke out of the loop with r set, fall through.
-            if r.status >= 400:
-                try:
-                    body = await r.text()
-                finally:
-                    r.close()
-                raise aiohttp.ClientResponseError(
-                    request_info=r.request_info,
-                    history=r.history,
-                    status=r.status,
-                    message=body[:500],
-                )
-            return r
 
         if r.status >= 400:
             try:

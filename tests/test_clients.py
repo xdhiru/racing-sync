@@ -542,4 +542,149 @@ async def test_deluge_files_from_torrent_file_catches_sftp_error():
         assert files == []
 
 
+@pytest.mark.anyio
+async def test_http_client_authed_reset_on_close_and_origin_rfc6454():
+    from racing_sync.clients.http_base import HTTPClientBase
+    from racing_sync.config import HTTPClientConfig
+
+    cfg = HTTPClientConfig(host="http://seedbox.lan:8080/qbittorrent/path", nginx_mode="off")
+    client = HTTPClientBase(cfg)
+    await client.start()
+    client._authed = True
+
+    # Origin header must not contain sub-path
+    assert client.session.headers["Origin"] == "http://seedbox.lan:8080"
+    assert client.session.headers["Referer"] == "http://seedbox.lan:8080/qbittorrent/path/"
+
+    await client.close()
+    assert client._authed is False
+    assert client._session is None
+
+    # Restarting must also keep _authed False until auth completes
+    await client.start()
+    assert client._authed is False
+    await client.close()
+
+
+@pytest.mark.anyio
+async def test_http_client_form_data_rebuilt_per_attempt_and_tuple_specs():
+    import aiohttp
+    from racing_sync.clients.http_base import HTTPClientBase
+    from racing_sync.config import HTTPClientConfig
+
+    cfg = HTTPClientConfig(host="http://127.0.0.1:8080", nginx_mode="off")
+    client = HTTPClientBase(cfg)
+    client._authed = True
+    client._session = MagicMock()
+
+    resp_fail = MagicMock()
+    resp_fail.status = 500
+    resp_fail.close = MagicMock()
+
+    resp_ok = MagicMock()
+    resp_ok.status = 200
+    resp_ok.close = MagicMock()
+
+    attempts_data: list[aiohttp.FormData] = []
+
+    async def mock_req(method, url, data=None, **kwargs):
+        attempts_data.append(data)
+        if len(attempts_data) == 1:
+            raise aiohttp.ClientOSError("network glitch")
+        return resp_ok
+
+    client._session.request = mock_req
+
+    files = [
+        ("t1", ("file1.torrent", b"content1", "application/x-bittorrent")),
+        ("t2", "file2.torrent", b"content2", "application/x-bittorrent", {"X-Custom": "val"}),
+    ]
+    res = await client.request("POST", "/upload", data={"key": "val"}, files=files)
+    assert res == resp_ok
+    assert len(attempts_data) == 2
+    # Ensure distinct FormData objects were passed on each attempt
+    assert attempts_data[0] is not attempts_data[1]
+
+    # Verify field extraction on the successful FormData
+    fd = attempts_data[1]
+    field_names = [f[0]["name"] for f in fd._fields]
+    assert "key" in field_names
+    assert "t1" in field_names
+    assert "t2" in field_names
+
+    t1_field = next(f for f in fd._fields if f[0]["name"] == "t1")
+    assert t1_field[0]["filename"] == "file1.torrent"
+    assert t1_field[1].get("Content-Type") == "application/x-bittorrent"
+
+    t2_field = next(f for f in fd._fields if f[0]["name"] == "t2")
+    assert t2_field[0]["filename"] == "file2.torrent"
+    assert t2_field[1].get("Content-Type") == "application/x-bittorrent"
+
+
+@pytest.mark.anyio
+async def test_http_client_retries_transient_status_codes():
+    from racing_sync.clients.http_base import HTTPClientBase
+    from racing_sync.config import HTTPClientConfig
+
+    cfg = HTTPClientConfig(host="http://127.0.0.1:8080", nginx_mode="off")
+    client = HTTPClientBase(cfg)
+    client._authed = True
+    client._session = MagicMock()
+
+    resp_502 = MagicMock()
+    resp_502.status = 502
+    resp_502.headers = {}
+    resp_502.read = AsyncMock(return_value=b"Bad Gateway")
+    resp_502.close = MagicMock()
+
+    resp_429 = MagicMock()
+    resp_429.status = 429
+    resp_429.headers = {"Retry-After": "0.01"}
+    resp_429.read = AsyncMock(return_value=b"Too Many Requests")
+    resp_429.close = MagicMock()
+
+    resp_200 = MagicMock()
+    resp_200.status = 200
+    resp_200.close = MagicMock()
+
+    client._session.request = AsyncMock(side_effect=[resp_502, resp_429, resp_200])
+
+    res = await client.request("GET", "/transient")
+    assert res == resp_200
+    assert resp_502.read.await_count == 1
+    assert resp_429.read.await_count == 1
+
+
+@pytest.mark.anyio
+async def test_http_client_does_not_conflate_403_with_auth_error():
+    import aiohttp
+    from racing_sync.clients.http_base import HTTPClientBase, AuthError
+    from racing_sync.config import HTTPClientConfig
+
+    cfg = HTTPClientConfig(host="http://127.0.0.1:8080", nginx_mode="off")
+    client = HTTPClientBase(cfg)
+    client._authed = True
+    client._session = MagicMock()
+    client._auth = AsyncMock()  # Login succeeds!
+
+    resp_403_initial = MagicMock()
+    resp_403_initial.status = 403
+    resp_403_initial.read = AsyncMock(return_value=b"Forbidden")
+    resp_403_initial.close = MagicMock()
+
+    resp_403_after_login = MagicMock()
+    resp_403_after_login.status = 403
+    resp_403_after_login.text = AsyncMock(return_value="Permission denied")
+    resp_403_after_login.close = MagicMock()
+    resp_403_after_login.request_info = MagicMock()
+    resp_403_after_login.history = ()
+
+    client._session.request = AsyncMock(side_effect=[resp_403_initial, resp_403_after_login])
+
+    # Must raise aiohttp.ClientResponseError (status 403), NOT AuthError
+    with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+        await client.request("POST", "/admin_action", retry_auth=True)
+    assert exc_info.value.status == 403
+
+
 
