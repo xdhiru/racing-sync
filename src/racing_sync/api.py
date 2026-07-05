@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from pydantic import BaseModel
@@ -33,6 +36,45 @@ from .recovery import reconcile
 from .state import State
 
 log = logging.getLogger(__name__)
+
+
+_INFOHASH_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def _host_is_trusted(client_host: str, trusted_proxies: set[str]) -> bool:
+    """Normalize both sides before comparing.
+
+    `request.client.host` is an IP literal (never the string "localhost")
+    and may arrive as IPv6-mapped IPv4 (`::ffff:127.0.0.1`) behind dual-stack
+    servers; "localhost" in config means loopback (127.0.0.1/::1).
+    """
+    host = (client_host or "").strip().lower()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    if host.startswith("::ffff:"):
+        host = host[7:]
+    expanded: set[str] = set()
+    for entry in trusted_proxies:
+        e = (entry or "").strip().lower().strip("[]")
+        if e == "localhost":
+            expanded.update({"127.0.0.1", "::1"})
+        elif e:
+            expanded.add(e)
+    return host in expanded
+
+
+@asynccontextmanager
+async def _hold_ops_lock(coord: Coordinator) -> AsyncIterator[None]:
+    """Serialize API-triggered ops against the coordinator tick.
+
+    Tolerates hand-built test doubles without a real lock.
+    """
+    lock = getattr(coord, "_ops_lock", None)
+    if lock is None or not hasattr(lock, "__aenter__"):
+        yield
+    else:
+        async with lock:
+            yield
 
 
 class RetryResult(BaseModel):
@@ -59,7 +101,7 @@ def build_app(coord: Coordinator) -> FastAPI:
         client_host = request.client.host if request.client else ""
         trusted_proxies = set(getattr(cfg.api, "trusted_proxies", ["127.0.0.1", "::1", "localhost"]))
         if cfg.api.trust_nginx_header and x_authenticated_user:
-            if client_host not in trusted_proxies:
+            if not _host_is_trusted(client_host, trusted_proxies):
                 raise HTTPException(403, "untrusted proxy for nginx auth header")
             return x_authenticated_user
         token_str = (
@@ -95,7 +137,8 @@ def build_app(coord: Coordinator) -> FastAPI:
 
     @app.post("/api/recover", dependencies=[Depends(auth)])
     async def recover() -> dict[str, Any]:
-        rpt = await reconcile(cfg, dest=coord.dest_client, store=coord.store)
+        async with _hold_ops_lock(coord):
+            rpt = await reconcile(cfg, dest=coord.dest_client, store=coord.store)
         return {
             "summary": rpt.summary(),
             "kept": rpt.kept,
@@ -109,19 +152,33 @@ def build_app(coord: Coordinator) -> FastAPI:
     async def scan_watch() -> dict[str, Any]:
         if coord.watch is None:
             return {"items": 0, "note": "watch_dir not configured"}
-        items = await coord.scan_watch()
+        async with _hold_ops_lock(coord):
+            items = await coord.scan_watch()
         return {"items": len(items)}
 
     @app.post("/api/retry/{source_infohash}", dependencies=[Depends(auth)])
     async def retry(source_infohash: str) -> RetryResult:
-        ts = await asyncio.to_thread(coord.store.get, source_infohash)
-        if ts is None:
-            raise HTTPException(404, "unknown hash")
-        if ts.state != State.FAILED:
-            raise HTTPException(409, f"state is {ts.state.value}")
-        ts.failed_retries = 0
-        await asyncio.to_thread(coord.store.transition, ts, State.QUEUED, error="")
-        return RetryResult(source_infohash=source_infohash, new_state=ts.state.value)
+        normalized = (source_infohash or "").strip().lower()
+        if not _INFOHASH_RE.fullmatch(normalized):
+            raise HTTPException(422, "must be 40-char hex infohash")
+
+        def _do_retry() -> str:
+            ts = coord.store.get(normalized)
+            if ts is None:
+                raise HTTPException(404, "unknown hash")
+            if ts.state != State.FAILED:
+                raise HTTPException(409, f"state is {ts.state.value}")
+            ts.failed_retries = 0
+            try:
+                coord.store.transition(ts, State.QUEUED, error="")
+            except ValueError as e:
+                # Row moved concurrently (e.g. tick rescheduled it).
+                raise HTTPException(409, f"state changed concurrently: {e}") from e
+            return ts.state.value
+
+        async with _hold_ops_lock(coord):
+            new_state = await asyncio.to_thread(_do_retry)
+        return RetryResult(source_infohash=normalized, new_state=new_state)
 
     return app
 

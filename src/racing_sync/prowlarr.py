@@ -96,6 +96,7 @@ class ProwlarrClient:
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
+        self._session = None
 
     # ---------- indexers ----------
 
@@ -114,7 +115,7 @@ class ProwlarrClient:
                     name=raw["name"],
                     protocol=raw.get("protocol", "torrent"),
                     enable=raw.get("enable", True),
-                    capabilities=list(raw.get("caps", {}).get("categories", {}).keys()),
+                    capabilities=list(((raw.get("caps") or {}).get("categories") or {}).keys()),
                 )
                 self._indexers_by_name[idx.name.lower()] = idx
                 self._indexers_by_id[idx.id] = idx
@@ -208,7 +209,7 @@ class ProwlarrClient:
             raise ProwlarrError(
                 f"torrent download from {safe_url} failed with HTTP status {e.status}"
             ) from None
-        except aiohttp.ClientError as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             raise ProwlarrError(
                 f"torrent download from {safe_url} failed: {type(e).__name__}"
             ) from None
@@ -295,26 +296,41 @@ def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
         return hits
 
     for item in channel.findall("item"):
-        enclosure = item.find("enclosure")
-        attrs = enclosure.attrib if enclosure is not None else {}
-        size = int(float(attrs.get("length", "0")))
-        download_url = attrs.get("url", "").strip()
-        parsed_url = urlsplit(download_url)
-        if download_url and parsed_url.scheme not in ("http", "https"):
+        try:
+            enclosure = item.find("enclosure")
+            attrs = enclosure.attrib if enclosure is not None else {}
+            try:
+                size = int(float(attrs.get("length") or 0))
+            except (ValueError, TypeError):
+                size = 0
+            raw_url = (attrs.get("url") or "").strip()
+            magnet_url = _first_attr(item, "torznab:attr", name="magneturl")
             download_url = ""
-        hits.append(
-            TorrentHit(
-                title=(item.findtext("title") or "").strip(),
-                guid=(item.findtext("guid") or "").strip(),
-                indexer=indexer.name,
-                indexer_id=indexer.id,
-                size_bytes=size,
-                download_url=download_url,
-                magnet_url=_first_attr(item, "torznab:attr", name="magneturl"),
-                info_url=item.findtext("comments") or "",
-                publish_date=item.findtext("pubDate") or "",
+            scheme = urlsplit(raw_url).scheme if raw_url else ""
+            if raw_url and scheme in ("http", "https"):
+                download_url = raw_url
+            elif raw_url and scheme == "magnet" and not magnet_url:
+                magnet_url = raw_url
+            if not download_url and not magnet_url:
+                # Unusable for our flows (download_torrent needs http(s));
+                # skip instead of emitting a hit that hard-fails later.
+                continue
+            hits.append(
+                TorrentHit(
+                    title=(item.findtext("title") or "").strip(),
+                    guid=(item.findtext("guid") or "").strip(),
+                    indexer=indexer.name,
+                    indexer_id=indexer.id,
+                    size_bytes=size,
+                    download_url=download_url,
+                    magnet_url=magnet_url,
+                    info_url=item.findtext("comments") or "",
+                    publish_date=item.findtext("pubDate") or "",
+                )
             )
-        )
+        except Exception as e:
+            log.warning("prowlarr: skipping malformed feed item: %s", e)
+            continue
     return hits
 
 

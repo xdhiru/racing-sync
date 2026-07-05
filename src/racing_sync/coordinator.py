@@ -440,6 +440,9 @@ class Coordinator:
     _source_torrents_cache: list[Torrent] = field(default_factory=list, init=False)
     _source_torrents_cached_at: float = field(default=0.0, init=False)
     _failed_late_cross_seeds: dict[str, dt.datetime] = field(default_factory=dict, init=False)
+    # Serializes the periodic tick against API-triggered ops (recover /
+    # scan-watch / retry) so they can't double-schedule or clobber rows.
+    _ops_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 
     @property
     def download_sem(self) -> asyncio.Semaphore:
@@ -732,6 +735,15 @@ class Coordinator:
         return items
 
     async def _tick(self) -> None:
+        """One iteration: poll sources, schedule work (serialized vs API ops)."""
+        lock = getattr(self, "_ops_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._ops_lock = lock
+        async with lock:
+            await self._tick_inner()
+
+    async def _tick_inner(self) -> None:
         """One iteration: poll sources, schedule work."""
         log.debug("tick: enter")
         # 1. Watch dir (req #3)
@@ -1324,8 +1336,11 @@ class Coordinator:
         ts.total_bytes = st.size_bytes
 
         all_source = await self._list_source_torrents()
-        others = [t for t in all_source
-                  if t.infohash != st.infohash and t.name == st.name]
+        st_norm = normalize_content_name(st.name)
+        others = [
+            t for t in all_source
+            if t.infohash != st.infohash and (t.name == st.name or normalize_content_name(t.name) == st_norm)
+        ]
 
         decision = await pick_ssd_source_for_racing(
             cfg=self.cfg,
@@ -1383,10 +1398,10 @@ class Coordinator:
         if existing:
             ext = existing[0]
             fuse_mounts = [
-                str(self.cfg.rclone.fuse.mount).rstrip("/"),
-                str(self.cfg.rclone.fuse.mount_unsorted).rstrip("/"),
+                str(self.cfg.rclone.fuse.mount).rstrip("/\\").replace("\\", "/"),
+                str(self.cfg.rclone.fuse.mount_unsorted).rstrip("/\\").replace("\\", "/"),
             ]
-            save_path = ext.save_path.rstrip("/")
+            save_path = ext.save_path.rstrip("/\\").replace("\\", "/")
             on_fuse = any(save_path == fm or save_path.startswith(fm + "/") for fm in fuse_mounts if fm)
             if on_fuse and ext.is_complete():
                 log.info(

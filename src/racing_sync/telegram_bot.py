@@ -68,6 +68,28 @@ def _esc(text: str) -> str:
     )
 
 
+def _strip_code_spans(text: str) -> str:
+    """Remove `...` spans so delimiter balancing ignores literal * / _ inside code."""
+    return re.sub(r"`[^`]*`", "", text)
+
+
+def _unclosed_markdown_delims(text: str) -> str:
+    """Return closers needed for delimiters left open in `text`.
+
+    `*` and `_` inside `code` spans are literal and must not be counted —
+    otherwise we append a spurious closer outside the span and break parsing.
+    """
+    to_close = ""
+    if len(re.findall(r"(?<!\\)`", text)) % 2 != 0:
+        to_close += "`"
+    outside_code = _strip_code_spans(text)
+    if len(re.findall(r"(?<!\\)\*", outside_code)) % 2 != 0:
+        to_close += "*"
+    if len(re.findall(r"(?<!\\)_", outside_code)) % 2 != 0:
+        to_close += "_"
+    return to_close
+
+
 def _safe_truncate_markdown(text: str, max_len: int = 4096) -> str:
     """Truncate text to max_len while keeping markdown tags properly closed and ending with '...'."""
     if len(text) <= max_len:
@@ -93,25 +115,13 @@ def _safe_truncate_markdown(text: str, max_len: int = 4096) -> str:
         suffix = "..."
         truncated = text[: max(0, max_len - len(suffix))]
 
-    to_close = ""
-    if len(re.findall(r"(?<!\\)`", truncated)) % 2 != 0:
-        to_close += "`"
-    if len(re.findall(r"(?<!\\)\*", truncated)) % 2 != 0:
-        to_close += "*"
-    if len(re.findall(r"(?<!\\)_", truncated)) % 2 != 0:
-        to_close += "_"
+    to_close = _unclosed_markdown_delims(truncated)
 
     if to_close:
         excess = (len(truncated) + len(to_close) + len(suffix)) - max_len
         if excess > 0:
             truncated = truncated[:-excess]
-            to_close = ""
-            if len(re.findall(r"(?<!\\)`", truncated)) % 2 != 0:
-                to_close += "`"
-            if len(re.findall(r"(?<!\\)\*", truncated)) % 2 != 0:
-                to_close += "*"
-            if len(re.findall(r"(?<!\\)_", truncated)) % 2 != 0:
-                to_close += "_"
+            to_close = _unclosed_markdown_delims(truncated)
 
     return truncated + to_close + suffix
 
@@ -355,6 +365,9 @@ class TelegramBot:
         self._last_active_text: str = ""
         self._last_active_cache: tuple[int, int, str] | None = None
         self._last_callback_time: float = 0.0
+        # Serializes periodic active-message refresh vs callback-triggered
+        # refresh so they can't interleave edits / race the dedup cache.
+        self._active_lock = asyncio.Lock()
 
     # ---- lifecycle ----
 
@@ -449,18 +462,54 @@ class TelegramBot:
         # will pull the row from the store and use the latest state.
         # To keep things simple, we always enqueue. The worker pulls the
         # freshest state at send time, so duplicates are harmless.
+        self._enqueue_detail(ts.source_infohash, progress)
+
+    def _enqueue_detail(self, infohash: str, progress: float | None) -> None:
+        """Enqueue a detail update, coalescing by infohash when full.
+
+        On overflow, an older queued entry for the SAME torrent is dropped
+        first (its state is stale anyway — the worker re-reads the store),
+        so one hot torrent can't evict other torrents' updates. Only when
+        no same-hash entry exists is the oldest entry evicted, with a log.
+        """
+        q = self._detail_queue
+        if q is None:
+            return
         try:
-            self._detail_queue.put_nowait((ts.source_infohash, progress))
+            q.put_nowait((infohash, progress))
+            return
         except asyncio.QueueFull:
-            # Queue is full: evict oldest entry to prevent dropping freshest updates
+            pass
+        try:
+            pending: list[tuple[str, float | None]] = []
+            coalesced = False
+            while True:
+                try:
+                    item = q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if item[0] == infohash and not coalesced:
+                    coalesced = True
+                    continue
+                pending.append(item)
+            for item in pending:
+                try:
+                    q.put_nowait(item)
+                except asyncio.QueueFull:
+                    break
+            q.put_nowait((infohash, progress))
+        except asyncio.QueueFull:
             try:
-                self._detail_queue.get_nowait()
+                q.get_nowait()
             except asyncio.QueueEmpty:
                 pass
             try:
-                self._detail_queue.put_nowait((ts.source_infohash, progress))
+                q.put_nowait((infohash, progress))
             except asyncio.QueueFull:
-                pass
+                log.warning(
+                    "telegram detail queue full; dropping update for %s",
+                    infohash[:10],
+                )
 
     async def _detail_worker_loop(self) -> None:
         """Drain the per-torrent detail-message queue.
@@ -583,18 +632,10 @@ class TelegramBot:
                 wait_s = int(e.retry_after) + 1
             log.warning("telegram flood control hit; backing off for %ds", wait_s)
             await asyncio.sleep(wait_s)
-            if self._detail_queue is not None:
-                try:
-                    self._detail_queue.put_nowait((infohash, progress))
-                except asyncio.QueueFull:
-                    pass
+            self._enqueue_detail(infohash, progress)
         except (TimedOut, NetworkError) as e:
             log.warning("telegram detail send timed out (%s); will retry next interval", e)
-            if self._detail_queue is not None:
-                try:
-                    self._detail_queue.put_nowait((infohash, progress))
-                except asyncio.QueueFull:
-                    pass
+            self._enqueue_detail(infohash, progress)
         except TelegramError as e:
             log.warning("telegram detail send failed for %s: %s",
                         infohash[:10], e)
@@ -700,6 +741,17 @@ class TelegramBot:
     # ---- active tasks list ----
 
     async def _refresh_active_message(self) -> None:
+        # Serialize periodic refresh vs callback-triggered refresh so
+        # concurrent edits can't interleave or race the dedup cache.
+        # (Lazy: unit tests build the bot via object.__new__.)
+        lock = getattr(self, "_active_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._active_lock = lock
+        async with lock:
+            await self._refresh_active_message_inner()
+
+    async def _refresh_active_message_inner(self) -> None:
         assert self._bot is not None
         # Sentinel -1 means "stop trying to edit" (e.g. chat permission issue)
         if self._active_msg_id == -1:
@@ -715,7 +767,7 @@ class TelegramBot:
             items, page=self._current_page, page_size=self._cfg.page_size
         )
         if len(text) > 4096:
-            text = text[:4093] + "..."
+            text = _safe_truncate_markdown(text)
         self._current_page = cur_page
         keyboard = self._build_keyboard(cur_page, total_pages)
 
