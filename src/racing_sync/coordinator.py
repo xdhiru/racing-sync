@@ -1029,13 +1029,16 @@ class Coordinator:
                 return cap
         except Exception:
             pass
-        if hasattr(self, "_effective_inflight_cap"):
-            try:
-                res = self._effective_inflight_cap(0)
-                if isinstance(res, int) and res > 0:
-                    return res
-            except Exception:
-                pass
+        # ssd_max_inflight_bytes folds free-space into the cap, so it
+        # reports 0 both when the disk is full and when nothing is
+        # configured. Fall back to the configured cap so batching never
+        # crashes with "cap_bytes must be positive".
+        try:
+            configured = int(getattr(self.cfg.ssd, "max_inflight_bytes", 0) or 0)
+            if configured > 0:
+                return configured
+        except Exception:
+            pass
         return 0
 
     async def _do_new(self, ts: TorrentState) -> None:
@@ -1445,6 +1448,15 @@ class Coordinator:
         if cls.kind in ("season", "mixed") and cls.episodes:
             episodes = [e for e in cls.episodes]
             cap = self._batch_cap_bytes()
+            if cap <= 0:
+                # No usable batch cap: re-check SSD room (disk may have
+                # filled since scheduling). Park if full, else one batch.
+                total_ep = sum(e.size_bytes for e in episodes)
+                if not ssd_has_room(self.cfg, min(total_ep, ts.total_bytes or total_ep)):
+                    log.info("ssd cap in use; parking %s", ts.source_name)
+                    self.transition(ts, State.WAITING_DISK)
+                    return
+                cap = total_ep or ts.total_bytes or 1
             batches = make_batches(episodes, cap_bytes=cap)
             ts.batches_total = len(batches)
             ts.batch_index = 0
@@ -1497,20 +1509,23 @@ class Coordinator:
         except Exception as e:
             log.warning("could not get torrent files for batches: %s", e)
             return []
-        from .classifier import parse_episode, Episode
-        ep_re = None
-        if hasattr(self, "cfg") and self.cfg and hasattr(self.cfg, "classifier"):
-            candidate = getattr(self.cfg.classifier, "_episode_re", None)
-            if isinstance(candidate, (re.Pattern, str)):
-                ep_re = candidate
-        eps = []
-        for f in files:
-            se = parse_episode(f.name, ep_re)
-            if se:
-                eps.append(Episode(f.name, se[0], se[1], f.size_bytes))
-        eps.sort(key=lambda e: (e.season, e.episode))
+        # Use classify() — the same filtering/dedup/regex as _do_queued —
+        # so batch counts stay consistent across the download loop.
+        try:
+            eps = list(classify(files, self.cfg).episodes)
+        except Exception as e:
+            log.warning("could not classify files for batches: %s", e)
+            return []
+        if not eps:
+            return []
         cap = self._batch_cap_bytes()
-        return make_batches(eps, cap_bytes=cap) if eps and cap > 0 else []
+        if cap <= 0:
+            cap = sum(e.size_bytes for e in eps) or 1
+        try:
+            return make_batches(eps, cap_bytes=cap)
+        except Exception as e:
+            log.warning("could not make batches for %s: %s", ts.source_name, e)
+            return []
 
     async def _move_and_clean_batch(
         self, ts: TorrentState, batch: Batch
@@ -1595,10 +1610,24 @@ class Coordinator:
             if is_batched:
                 if cur_batch is not None:
                     if hasattr(self, "dest_client"):
-                        try:
-                            await self.dest_client.pause(h)
-                        except Exception as e:
-                            log.warning("could not pause torrent %s before batch move: %s", h[:10], e)
+                        paused_ok = False
+                        pause_err: Exception | None = None
+                        for _ in range(3):
+                            try:
+                                await self.dest_client.pause(h)
+                                paused_ok = True
+                                break
+                            except Exception as e:
+                                pause_err = e
+                        if not paused_ok:
+                            # Never move while qB is still writing — retry
+                            # shortly instead of corrupting the remote.
+                            log.warning(
+                                "could not pause torrent %s before batch move (%s); retrying shortly",
+                                h[:10], pause_err,
+                            )
+                            await asyncio.sleep(5)
+                            continue
                     await self._move_and_clean_batch(ts, cur_batch)
                     ts.batch_index += 1
                     self.store.upsert(ts)
@@ -1612,9 +1641,16 @@ class Coordinator:
                     ts.batch_index += 1
                     self.store.upsert(ts)
                 else:
-                    raise RuntimeError(
-                        f"cannot move batch for {ts.source_name}: current batch {ts.batch_index} could not be resolved"
+                    # Batch resolution is transient (RPC/cap hiccup) but the
+                    # wait above already covered the full torrent, so fall
+                    # through to MOVING for a full move instead of failing
+                    # after successful downloads.
+                    log.warning(
+                        "current batch %d could not be resolved for %s; "
+                        "falling back to full move",
+                        ts.batch_index, ts.source_name,
                     )
+                    break
 
                 if ts.batch_index < ts.batches_total:
                     await self._prepare_next_batch(ts)
@@ -1711,21 +1747,26 @@ class Coordinator:
 
     async def _prepare_next_batch(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
-        files = await self.dest_client.get_torrent_files(h)
-        from .classifier import parse_episode, Episode  # noqa: F401
-        ep_re = None
-        if hasattr(self, "cfg") and self.cfg and hasattr(self.cfg, "classifier"):
-            candidate = getattr(self.cfg.classifier, "_episode_re", None)
-            if isinstance(candidate, (re.Pattern, str)):
-                ep_re = candidate
-        eps = []
-        for f in files:
-            se = parse_episode(f.name, ep_re)
-            if se:
-                eps.append(Episode(f.name, se[0], se[1], f.size_bytes))
-        eps.sort(key=lambda e: (e.season, e.episode))
+        try:
+            files = await self.dest_client.get_torrent_files(h)
+        except Exception as e:
+            log.warning("could not get torrent files for next batch: %s", e)
+            return
+        try:
+            eps = list(classify(files, self.cfg).episodes)
+        except Exception as e:
+            log.warning("could not classify files for next batch: %s", e)
+            return
+        if not eps:
+            return
         cap = self._batch_cap_bytes()
-        batches = make_batches(eps, cap_bytes=cap)
+        if cap <= 0:
+            cap = sum(e.size_bytes for e in eps) or 1
+        try:
+            batches = make_batches(eps, cap_bytes=cap)
+        except Exception as e:
+            log.warning("could not make batches for next batch: %s", e)
+            return
         if ts.batch_index >= len(batches):
             return
         cur = batches[ts.batch_index]
@@ -1783,9 +1824,15 @@ class Coordinator:
                 log.warning("attempt %d: could not pause torrent in client before move: %s", attempt + 1, e)
                 await asyncio.sleep(1)
         if not paused:
-            raise RuntimeError(
-                f"failed to pause torrent {h[:10]} before move; aborting move to prevent remote corruption: {pause_err}"
+            # Never move while the client is still writing, but don't fail
+            # terminally on a transient WebUI hiccup — stay in MOVING so the
+            # next tick retries (preserves downloaded bytes on SSD).
+            log.warning(
+                "could not pause torrent %s before move (%s); will retry on next tick",
+                h[:10], pause_err,
             )
+            self.store.upsert(ts)
+            return
 
         # 2. Separate completed files from incomplete piece-boundary files
         src_dir = (
@@ -1912,6 +1959,9 @@ class Coordinator:
                 raise RuntimeError(
                     f"cannot move torrent {ts.source_name}: classification is '{cls.kind}' but no episodes found"
                 )
+            if cap <= 0:
+                # Files are already on SSD; cap only affects move grouping.
+                cap = sum(e.size_bytes for e in episodes) or 1
             batches = make_batches(episodes, cap_bytes=cap)
             if not batches:
                 raise RuntimeError(

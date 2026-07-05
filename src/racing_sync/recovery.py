@@ -176,14 +176,32 @@ async def fix_orphan(
             log.error("orphan %s: no .torrent bytes available to re-add", h)
             store.transition(ts, State.FAILED, error="orphan: no .torrent bytes")
             return State.FAILED.value
-        # Add paused, then resume and let coordinator drive.
-        await dest.add_torrent(
+        # Add paused, then resolve the new hash, resume, and let coordinator drive.
+        res = await dest.add_torrent(
             torrent_files=[sftp_bytes],
             save_path=ts.save_path or str(cfg.dest.save_path),
             category="racing",
             paused=True,
             skip_check=False,
         )
+        new_hash = ""
+        if res is not None and getattr(res, "hash", None):
+            new_hash = str(res.hash).lower()
+        if not new_hash:
+            try:
+                from .watchdir import _bencoded_info_hash
+                new_hash, _, _, _ = _bencoded_info_hash(sftp_bytes)
+                new_hash = (new_hash or "").lower()
+            except Exception:
+                new_hash = ""
+        if new_hash:
+            ts.dest_infohash = new_hash
+        if not ts.save_path:
+            ts.save_path = str(cfg.dest.save_path)
+        try:
+            await dest.resume(new_hash or h)
+        except Exception as e:
+            log.warning("orphan %s: resume after re-add failed: %s", h, e)
         if ts.state != State.DOWNLOADING:
             store.transition(ts, State.DOWNLOADING)
         else:
@@ -196,11 +214,27 @@ async def fix_orphan(
 
     if ts.state == State.MOVING:
         src_path = Path(ts.save_path) if ts.save_path else Path(cfg.dest.save_path)
-        escaped_name = glob.escape(ts.source_name)
-        content_exists = (
-            (src_path / ts.source_name).exists()
-            or any(src_path.glob(f"{escaped_name}*"))
-        )
+        # Torrent display name often differs from the on-disk top folder, so
+        # prefer the exact file list decoded from the stored .torrent bytes.
+        expected_names: list[str] | None = None
+        if sftp_bytes:
+            try:
+                from .watchdir import extract_torrent_files_from_bencoded
+                expected_names = [
+                    f.name for f in extract_torrent_files_from_bencoded(sftp_bytes)
+                ]
+            except Exception:
+                expected_names = None
+        if expected_names:
+            content_exists = any(
+                (src_path / name).exists() for name in expected_names
+            )
+        else:
+            escaped_name = glob.escape(ts.source_name)
+            content_exists = (
+                (src_path / ts.source_name).exists()
+                or any(src_path.glob(f"{escaped_name}*"))
+            )
         if content_exists:
             log.info("orphan %s: files still exist on SSD; will resume move", h)
             return State.MOVING.value

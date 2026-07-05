@@ -402,12 +402,13 @@ async def test_check_and_inject_late_cross_seeds_normalizes_hash():
 
 
 @pytest.mark.anyio
-async def test_do_moving_raises_when_pause_fails(tmp_path: Path):
+async def test_do_moving_parks_when_pause_fails(tmp_path: Path):
     from racing_sync.clients.abstract import TorrentFile
     coord = object.__new__(Coordinator)
     coord.cfg = MagicMock()
     coord.cfg.dest.save_path = tmp_path
     coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     coord.dest_client.get_torrent_files.return_value = [
         TorrentFile(name="Movie.mkv", size_bytes=1000, progress=1.0)
@@ -422,11 +423,13 @@ async def test_do_moving_raises_when_pause_fails(tmp_path: Path):
         state=State.MOVING,
     )
 
-    with pytest.raises(RuntimeError) as exc:
-        await coord._do_moving(ts)
-    assert "failed to pause torrent" in str(exc.value)
-    # Rclone move must NOT proceed
+    # Transient pause failure must NOT raise/FAILED (would waste SSD bytes);
+    # it parks in MOVING for the next tick to retry.
+    await coord._do_moving(ts)
+    assert ts.state == State.MOVING
+    # Rclone move must NOT proceed while the client is still writing.
     coord._rclone_move.assert_not_called()
+    coord.store.upsert.assert_called()
 
 
 @pytest.mark.anyio

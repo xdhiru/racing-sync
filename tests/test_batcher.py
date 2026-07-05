@@ -415,7 +415,7 @@ async def test_do_moving_purges_only_own_temp_files_when_no_season_folder(tmp_pa
 
 
 @pytest.mark.anyio
-async def test_do_downloading_fails_fast_when_batch_unresolvable():
+async def test_do_downloading_falls_back_to_full_move_when_batch_unresolvable():
     from unittest.mock import AsyncMock, MagicMock
     from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
@@ -423,6 +423,7 @@ async def test_do_downloading_fails_fast_when_batch_unresolvable():
     coord = object.__new__(Coordinator)
     coord._stop = False
     coord._live = {}
+    coord._tg = None
     coord.store = MagicMock()
     coord.dest_client = MagicMock()
     coord._get_batches_for_torrent = AsyncMock(return_value=[])
@@ -437,11 +438,14 @@ async def test_do_downloading_fails_fast_when_batch_unresolvable():
         state=State.DOWNLOADING,
     )
 
-    with pytest.raises(RuntimeError, match="could not be resolved"):
-        await coord._do_downloading(ts)
+    # Transient batch-resolution failure must NOT raise/FAILED after
+    # successful downloads; it falls back to a full move via MOVING.
+    await coord._do_downloading(ts)
 
     # Batch index must NOT be advanced when batch move cannot be resolved
     assert ts.batch_index == 0
+    coord.store.transition.assert_called_once()
+    assert coord.store.transition.call_args[0][1] == State.MOVING
 
 
 @pytest.mark.anyio
