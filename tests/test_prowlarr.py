@@ -174,8 +174,25 @@ def test_parse_newznab_sanitizes_unsafe_download_url():
     </item></channel></rss>"""
 
     hits = _parse_newznab(xml, idx)
+    # file:// enclosures are unusable for download_torrent (http(s) only);
+    # the item is skipped instead of poisoning best_match into a hard FAILED.
+    assert hits == []
+
+
+def test_parse_newznab_preserves_magnet_enclosure_url():
+    from racing_sync.prowlarr import _parse_newznab, Indexer
+
+    idx = Indexer(1, "Indexer", "torrent", True, [])
+    xml = """<?xml version="1.0"?>
+    <rss><channel><item>
+        <title>Magnet.Show.S01E01</title>
+        <enclosure url="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567" length="1234" />
+    </item></channel></rss>"""
+
+    hits = _parse_newznab(xml, idx)
     assert len(hits) == 1
     assert hits[0].download_url == ""
+    assert hits[0].magnet_url == "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
 
 
 def test_parse_newznab_extracts_namespaced_magnet_url():
