@@ -2056,13 +2056,45 @@ class Coordinator:
                     extra=self.cfg.rclone.batch_move_extra_flags,
                 )
 
-        # 6. Delete old torrent from VPS2 client (delete_files=False) before re-adding to FUSE
+        # 6. Persist the SSD torrent's bytes for RE_ADDING before the client
+        # entry is deleted below. Rows adopted by recovery (fresh state.db)
+        # carry no blob — without this, _re_add_cross_seed_torrent fails on
+        # "missing blob" and the fuse gate has nothing to verify against.
+        # Best-effort: a failed export only warns; downstream fails loudly.
+        if not (ts._blob or ts.cross_seed_blob):
+            try:
+                stored = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
+            except Exception:
+                stored = None
+            if isinstance(stored, (bytes, bytearray)) and stored:
+                ts.cross_seed_blob = bytes(stored)
+                ts._blob = bytes(stored)
+        if not (ts._blob or ts.cross_seed_blob):
+            export_fn = getattr(self.dest_client, "export_torrent", None)
+            if callable(export_fn):
+                try:
+                    exported = await export_fn(h)
+                    if isinstance(exported, (bytes, bytearray)) and exported:
+                        ts.cross_seed_blob = bytes(exported)
+                        ts._blob = bytes(exported)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "could not export .torrent for %s before deleting SSD entry: %s",
+                        h[:10], e,
+                    )
+        if ts._blob or ts.cross_seed_blob:
+            try:
+                self.store.upsert(ts)
+            except Exception as e:  # noqa: BLE001
+                log.warning("could not persist cross-seed blob for %s: %s", h[:10], e)
+
+        # 7. Delete old torrent from VPS2 client (delete_files=False) before re-adding to FUSE
         try:
             await self.dest_client.delete(h, delete_files=False)
         except Exception as e:  # noqa: BLE001
             log.warning("could not delete old torrent from client after move: %s", e)
 
-        # 7. Delete local content folder on SSD after move
+        # 8. Delete local content folder on SSD after move
         if folder and folder.resolve() != src_dir.resolve() and folder.exists():
             log.info("deleting content folder after move: %s", folder)
             await wipe_local_tree(

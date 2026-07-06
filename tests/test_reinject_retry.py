@@ -559,6 +559,69 @@ async def test_do_re_add_proceeds_when_fuse_content_present(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_do_moving_persists_blob_for_adopted_rows_without_one(tmp_path: Path):
+    """Fresh-DB adoption (recovery) creates MOVING rows with no .torrent blob.
+
+    _do_moving deletes the SSD client entry before RE_ADDING, so it must
+    persist the torrent bytes first — otherwise _re_add_cross_seed_torrent
+    fails and the fuse gate has nothing to verify against.
+    """
+    from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.watchdir import _bencode
+
+    ssd_dir = tmp_path / "ssd"
+    ssd_dir.mkdir()
+    (ssd_dir / "Adopted.Movie.2026.mkv").write_bytes(b"y" * 64)
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    blob = _bencode({
+        b"announce": b"http://tracker.example/announce",
+        b"info": {
+            b"name": b"Adopted.Movie.2026.mkv",
+            b"length": 64,
+            b"piece length": 16384,
+            b"pieces": b"12345678901234567890",
+        },
+    })
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd_dir
+    coord.cfg.ssd.path = ssd_dir
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.store = store
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Adopted.Movie.2026.mkv", size_bytes=64, progress=1.0),
+    ])
+    coord.dest_client.export_torrent = AsyncMock(return_value=blob)
+    coord._rclone_move = AsyncMock(
+        return_value=MagicMock(ok=True, returncode=0, stdout="", stderr="")
+    )
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    # Adopted-style row: hashes known, but no blob anywhere (fresh DB).
+    ts = TorrentState(
+        source_infohash="d" * 40,
+        source_name="Adopted.Movie.2026",
+        dest_infohash="d" * 40,
+        save_path=str(ssd_dir),
+        total_bytes=64,
+        state=State.MOVING,
+    )
+    store.upsert(ts)
+    assert not store.get_blob("d" * 40)
+
+    with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock):
+        await coord._do_moving(ts)
+
+    assert ts.state == State.RE_ADDING
+    assert store.get_blob("d" * 40) == blob
+
+
+@pytest.mark.anyio
 async def test_do_queued_fails_when_fuse_complete_torrent_has_no_files(tmp_path: Path):
     """A fuse torrent reporting complete with missing bytes must NOT mark DONE."""
     from racing_sync.clients.abstract import TorrentFile
