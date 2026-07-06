@@ -406,7 +406,12 @@ async def test_re_inject_watch_dir_torrents(tmp_path: Path):
     coord.cfg = MagicMock()
     coord.cfg.general.state_db = db_path
     coord.store = store
-    coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse"))
+    # Fuse target holds the moved content (single-file torrents land by name).
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    (fuse_dir / "Movie.Part1").write_bytes(b"x" * 2000)
+    (fuse_dir / "Movie.Part2").write_bytes(b"x" * 2000)
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord.dest_client = AsyncMock()
     coord.dest_client.add_torrent.return_value = AddResult(hash="h1", accepted=True)
 
@@ -433,6 +438,42 @@ async def test_re_inject_watch_dir_torrents(tmp_path: Path):
     assert coord.dest_client.add_torrent.await_count == 2
     injected = ts.injected_private_hashes.split(",")
     assert len(injected) == 2
+
+
+@pytest.mark.anyio
+async def test_re_inject_watch_dir_torrents_skips_missing_fuse_content(tmp_path: Path):
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.general.state_db = db_path
+    coord.store = store
+    # Fuse target is empty: content was never moved -> no blind injection.
+    fuse_dir = tmp_path / "fuse-empty"
+    fuse_dir.mkdir()
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
+    coord.dest_client = AsyncMock()
+    coord.dest_client.add_torrent.return_value = AddResult(hash="h1", accepted=True)
+
+    infohash = "2222333344445555666677778888999900001111"
+    watch_cross_dir = tmp_path / "watch_cross_seeds" / infohash
+    watch_cross_dir.mkdir(parents=True)
+
+    t1 = _create_sample_torrent_data("Movie.Part1", 2000, "http://tracker1/announce")
+    (watch_cross_dir / "t1.torrent").write_bytes(t1)
+
+    ts = TorrentState(
+        source_infohash=infohash,
+        source_name="Movie",
+        cross_seed_source="watch-dir",
+        state=State.RE_ADDING,
+    )
+
+    await coord._re_inject_watch_dir_torrents(ts)
+
+    coord.dest_client.add_torrent.assert_not_called()
+    assert ts.injected_private_hashes == ""
 
 
 @pytest.mark.anyio
