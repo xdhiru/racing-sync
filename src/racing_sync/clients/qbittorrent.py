@@ -345,18 +345,22 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
         d.get("state")
         or ("completed" if d.get("progress", 0) >= 1.0 else "downloading")
     )
-    # qB `save_path` is always a directory — never truncate it. Only fall
-    # back to content_path when save_path is missing, and only take the
-    # parent when content_path is clearly a single file (its basename
-    # matches the torrent name).
+    # qB `save_path` is always a directory — never truncate it on suffix
+    # alone (that corrupts dotted dirs like `/data/My.Show.S01`). The only
+    # exception is the single-file case where save_path itself points at
+    # the file (basename == torrent name == content_path basename).
     sp = str(d.get("save_path") or "").strip()
-    if not sp and d.get("content_path"):
-        cp = Path(str(d["content_path"]).strip())
-        torrent_name = str(d.get("name") or "").strip()
+    torrent_name = str(d.get("name") or "").strip()
+    cp_raw = str(d.get("content_path") or "").strip()
+    if not sp and cp_raw:
+        cp = Path(cp_raw)
         if torrent_name and cp.name == torrent_name:
             sp = str(cp.parent)
         else:
             sp = str(cp)
+    elif sp and torrent_name and cp_raw:
+        if Path(sp).name == torrent_name and Path(cp_raw).name == torrent_name:
+            sp = str(Path(sp).parent)
     return Torrent(
         hash=d["hash"],
         name=d["name"],
