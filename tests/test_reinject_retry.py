@@ -478,3 +478,170 @@ async def test_re_add_cross_seed_missing_blob_fails():
     coord.transition.assert_called_once()
     assert coord.transition.call_args[0][1] == State.FAILED
 
+
+def _single_file_torrent_bytes(name: str, length: int) -> bytes:
+    from racing_sync.watchdir import _bencode
+    return _bencode({
+        b"announce": b"http://tracker.example/announce",
+        b"info": {
+            b"name": name.encode("utf-8"),
+            b"length": length,
+            b"piece length": 16384,
+            b"pieces": b"12345678901234567890",
+        },
+    })
+
+
+@pytest.mark.anyio
+async def test_do_re_add_parks_when_fuse_content_missing(tmp_path: Path):
+    """SSD-complete data that never reached the fuse mount must NOT be injected."""
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.fuse_reinject_delay_seconds = 0
+    coord.cfg.fuse_reinject_retry_gap_seconds = 120
+    coord.cfg.fuse_reinject_backoff_seconds = 1800
+    coord.cfg.fuse_reinject_max_age_seconds = 86400
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
+    coord._stop = False
+    coord.dest_client = AsyncMock()
+    coord.store = MagicMock()
+    fuse_dir = tmp_path / "fuse-empty"
+    fuse_dir.mkdir()
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(
+        source_infohash="gate_park_hash",
+        source_name="Gated.Movie.2026",
+        state=State.RE_ADDING,
+        cross_seed_blob=_single_file_torrent_bytes("Gated.Movie.2026.mkv", 100),
+    )
+
+    await coord._do_re_add(ts)
+
+    # No blind injection, no DONE — parked for retry with a timer.
+    coord.dest_client.add_torrent.assert_not_called()
+    assert ts.state == State.RE_ADDING
+    assert ts.readd_next_retry_at is not None
+    coord.store.upsert.assert_called()
+
+
+@pytest.mark.anyio
+async def test_do_re_add_proceeds_when_fuse_content_present(tmp_path: Path):
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.fuse_reinject_delay_seconds = 0
+    coord.cfg.fuse_reinject_retry_gap_seconds = 120
+    coord.cfg.fuse_reinject_backoff_seconds = 1800
+    coord.cfg.fuse_reinject_max_age_seconds = 86400
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
+    coord._stop = False
+    coord.dest_client = AsyncMock()
+    coord.dest_client.add_torrent.return_value = AddResult(hash=None, accepted=True, detail="Ok.")
+    coord.store = MagicMock()
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    (fuse_dir / "Gated.Movie.2026.mkv").write_bytes(b"x" * 100)
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(
+        source_infohash="gate_pass_hash",
+        source_name="Gated.Movie.2026",
+        state=State.RE_ADDING,
+        cross_seed_blob=_single_file_torrent_bytes("Gated.Movie.2026.mkv", 100),
+    )
+
+    await coord._do_re_add(ts)
+
+    assert coord.dest_client.add_torrent.call_count == 1
+    assert ts.state == State.DONE
+
+
+@pytest.mark.anyio
+async def test_do_queued_fails_when_fuse_complete_torrent_has_no_files(tmp_path: Path):
+    """A fuse torrent reporting complete with missing bytes must NOT mark DONE."""
+    from racing_sync.clients.abstract import TorrentFile
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    ssd_dir = tmp_path / "ssd"
+    ssd_dir.mkdir()
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd_dir
+    coord.cfg.rclone.fuse.mount = str(fuse_dir)
+    coord.cfg.rclone.fuse.mount_unsorted = str(fuse_dir / "unsorted")
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    ext = Torrent(
+        hash="e" * 40,
+        name="Ghost.Show.S01",
+        category="racing",
+        save_path=str(fuse_dir),
+        size_bytes=100,
+        state="seeding",
+        progress=1.0,
+    )
+    coord.dest_client.list_torrents = AsyncMock(return_value=[ext])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Ghost.Show.S01/S01E01.mkv", size_bytes=100, progress=1.0),
+    ])
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(
+        source_infohash="f" * 40,
+        source_name="Ghost.Show.S01",
+        cross_seed_blob=b"fake-blob",
+        save_path=str(ssd_dir),
+        state=State.QUEUED,
+    )
+
+    await coord._do_queued(ts)
+
+    assert ts.state == State.FAILED
+    coord.transition.assert_called_once()
+    assert coord.transition.call_args[0][1] == State.FAILED
+    assert "reports complete on fuse" in coord.transition.call_args[1].get("error", "")
+    # No blind re-injection of matches, SSD save_path untouched for triage.
+    coord.dest_client.add_torrent.assert_not_called()
+    assert ts.save_path == str(ssd_dir)
+
+
+@pytest.mark.anyio
+async def test_re_inject_racing_torrents_skips_missing_fuse_content(tmp_path: Path):
+    coord = object.__new__(Coordinator)
+    fuse_dir = tmp_path / "fuse-empty"
+    fuse_dir.mkdir()
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
+    coord.dest_client = MagicMock()
+    coord.dest_client.add_torrent = AsyncMock()
+    coord._fetch_racing_torrent_bytes = AsyncMock(
+        return_value=_single_file_torrent_bytes("Late.Ep.mkv", 50)
+    )
+
+    ts = TorrentState(
+        source_infohash="src_gate_1",
+        source_name="Late.Show.S01",
+        injected_private_hashes="",
+    )
+
+    t_match = Torrent(
+        hash="a" * 40,
+        name="Late.Show.S01",
+        category="",
+        save_path="",
+        size_bytes=50,
+        state="racing",
+        progress=1.0,
+    )
+    coord._list_source_torrents = AsyncMock(return_value=[t_match])
+
+    await coord._re_inject_racing_torrents(ts)
+
+    # Content absent at fuse target -> no blind injection, hash not recorded.
+    coord.dest_client.add_torrent.assert_not_called()
+    assert ts.injected_private_hashes == ""
+
