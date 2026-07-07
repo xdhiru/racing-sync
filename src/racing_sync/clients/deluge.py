@@ -134,6 +134,11 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     f"session/login page): {e}. Body: {body[:200]}"
                 ) from e
         if "error" in data and data["error"]:
+            err_text = str(data["error"])
+            low = err_text.lower()
+            if any(s in low for s in ("not authenticated", "not authorized", "login", "session")):
+                from .http_base import AuthError
+                raise AuthError(f"deluge session expired: {err_text[:200]}")
             raise RuntimeError(f"deluge rpc {method} error: {data['error']}")
         return data.get("result")
 
@@ -145,13 +150,14 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         category: str | None = None,
         hashes: Iterable[str] | None = None,
     ) -> list[Torrent]:
-        # Deluge uses filter_dict: {"label": "racing"} for category
+        # Deluge `filter_dict` supports state/label/tracker_host — `hash`
+        # is filtered client-side below (daemon ignores unknown keys).
         filt: dict[str, Any] = {}
         if category:
             filt["label"] = category
         hash_list = list(hashes) if hashes is not None else None
-        if hash_list:
-            filt["hash"] = hash_list
+        # NOTE: Deluge daemon does not support server-side hash filtering;
+        # we fetch (possibly all) and filter client-side.
         status_keys = [
             "name",
             "total_size",
@@ -176,7 +182,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     size_bytes=int(status.get("total_size", 0) or 0),
                     state=status.get("state", ""),
                     progress=min(1.0, max(0.0, float(status.get("progress", 0.0) or 0.0) / 100.0)),
-                    ratio=float(status.get("ratio", 0.0)),
+                    ratio=float(status.get("ratio", 0.0) or 0.0),
                     trackers=_extract_tracker_urls(
                         status.get("trackers", []) or []
                     ),
@@ -215,21 +221,37 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 # Deluge reports file_progress on a 0-100 scale (same as the
                 # torrent-level progress normalized in list_torrents). Decide
                 # the scale once: if any value exceeds 1, all are 0-100.
+                def _fnum(v: object) -> float:
+                    try:
+                        return float(v or 0.0)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        return 0.0
                 scale_100 = any(
-                    (float(progs[i]) if i < len(progs) else 0.0) > 1.0
+                    (_fnum(progs[i]) if i < len(progs) else 0.0) > 1.0
                     for i in range(max(len(status["files"]), len(progs)))
                 )
                 out: list[TorrentFile] = []
                 for item in status["files"]:
                     idx = item.get("index", len(out))
-                    prio = prios[idx] if idx < len(prios) else item.get("priority", 1)
-                    raw_prog = float(progs[idx]) if idx < len(progs) else 0.0
+                    try:
+                        idx = int(idx)
+                    except (TypeError, ValueError):
+                        idx = len(out)
+                    prio = prios[idx] if 0 <= idx < len(progs) and idx < len(prios) else item.get("priority", 1)
+                    # Map qB-scale priorities (0/1/6/7) to Deluge scale (0/1):
+                    # 0=skip stays 0, anything else becomes 1 (normal).
+                    try:
+                        prio_int = int(prio)
+                    except (TypeError, ValueError):
+                        prio_int = 1
+                    prio_int = 0 if prio_int == 0 else 1
+                    raw_prog = _fnum(progs[idx]) if 0 <= idx < len(progs) else 0.0
                     prog = raw_prog / 100.0 if scale_100 else raw_prog
                     out.append(
                         TorrentFile(
                             name=item.get("path", ""),
-                            size_bytes=int(item.get("size", 0)),
-                            priority=int(prio),
+                            size_bytes=int(item.get("size", 0) or 0),
+                            priority=prio_int,
                             progress=min(1.0, max(0.0, float(prog))),
                         )
                     )
@@ -248,6 +270,9 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         already have SFTP access; reuse it. This is also more reliable
         than the daemon's RPC since the .torrent file is immutable and
         the daemon version is irrelevant.
+
+        NOTE: opens a fresh SFTP connection per call — callers fetching
+        many torrents should reuse/pool the exporter where possible.
         """
         from ..sftp_source import SFTPExporter
         if not self._sftp_cfg:
@@ -285,19 +310,30 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             out: list[TorrentFile] = []
             for f in files:
                 rel = b"/".join(f.get(b"path", [])).decode("utf-8", "replace")
+                if not rel:
+                    continue
                 full = f"{top_name}/{rel}" if top_name else rel
+                length_raw = f.get(b"length", 0)
+                try:
+                    length = int(length_raw or 0)
+                except (TypeError, ValueError):
+                    length = 0
                 out.append(TorrentFile(
                     name=full,
-                    size_bytes=int(f.get(b"length", 0)),
+                    size_bytes=length,
                     priority=1,
                     progress=0.0,
                 ))
             return out
         # Single-file mode
         name = top_name
+        try:
+            length = int(info.get(b"length", 0) or 0)
+        except (TypeError, ValueError):
+            length = 0
         return [TorrentFile(
             name=name,
-            size_bytes=int(info.get(b"length", 0)),
+            size_bytes=length,
             priority=1,
             progress=0.0,
         )]
@@ -329,6 +365,13 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         }
         if category:
             opts["label"] = category
+        if content_layout is not None or tags:
+            # Deluge RPC has no content-layout/tags equivalent — qB and Deluge
+            # paths will diverge here. Log so layout bugs are visible.
+            log.warning(
+                "deluge add_torrent ignoring content_layout=%r tags=%r (no Deluge equivalent)",
+                content_layout, tags,
+            )
 
         results: list[Any] = []
         if torrent_files:
@@ -352,7 +395,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         first_hash = str(results[0]) if (results and results[0]) else None
         return AddResult(
             hash=first_hash,
-            accepted=bool(results and results[0]),
+            accepted=any(bool(r) for r in results),
             detail=json.dumps([str(r) for r in results]),
         )
 
@@ -377,13 +420,24 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 for name, prio in priorities.items():
                     if name in name_to_idx:
                         idx = name_to_idx[name]
+                        try:
+                            idx = int(idx)
+                        except (TypeError, ValueError):
+                            continue
                         if 0 <= idx < len(curr_prios):
-                            curr_prios[idx] = int(prio)
+                            try:
+                                p = int(prio)
+                            except (TypeError, ValueError):
+                                continue
+                            # Deluge scale is 0 (skip) / 1 (download);
+                            # map qB 6/7 down to 1.
+                            curr_prios[idx] = 0 if p == 0 else 1
                 await self._rpc("core.set_torrent_file_priorities", [torrent_hash, curr_prios])
         except AuthError:
             raise
         except Exception as e:
             log.warning("deluge set_torrent_file_priorities failed for %s: %s", torrent_hash, e)
+            raise RuntimeError(f"deluge set_file_priorities failed for {torrent_hash}: {e}") from e
 
     async def pause(self, torrent_hash: str) -> None:
         await self._rpc("core.pause_torrent", [torrent_hash])
