@@ -25,6 +25,8 @@ log = logging.getLogger(__name__)
 NON_VIDEO_EXTENSIONS = {
     ".nfo", ".srt", ".sub", ".idx", ".txt", ".jpg", ".jpeg", ".png",
     ".torrent", ".sfv", ".md5", ".sha", ".sha1",
+    ".ass", ".ssa", ".vtt", ".smi", ".sup",
+    ".rar", ".zip", ".par2", ".cue", ".m3u",
 }
 
 
@@ -44,29 +46,29 @@ class Classification:
     total_bytes: int
 
 
-_DELIM_START = r"(?:(?<=[._\-\s\[\(])|^)"
-_DELIM_END = r"(?:(?=[._\-\s\]\)])|$)"
+_DELIM_START = r"(?:(?<=[._\-\s\[\(/\\])|^)"
+_DELIM_END = r"(?:(?=[._\-\s\]\)/\\])|$)"
 
 _BLACKLIST_TAGS_RE = re.compile(
-    r"(?i)(?:(?<=[._\-\s\[\(])|^)"
+    r"(?i)(?:(?<=[._\-\s\[\(/\\])|^)"
     r"(?:"
     r"\d{3,4}x\d{3,4}"                   # 1920x1080, 3840x2160, 1280x720, etc.
     r"|\d{3,4}[pi]"                      # 720p, 1080p, 1080i, 2160p, 480p, 576p
     r"|[xh]\.?26[45]"                    # x264, x265, h264, h265, x.264
-    r"|[0-9]\.[0-1]"                     # 5.1, 7.1, 2.0 (audio channels)
+    r"|(?:5\.1|7\.1|2\.0)"               # audio channels (narrow: avoid matching versions like 1.0)
     r"|4k|8k"                            # 4k, 8k
     r")"
-    r"(?:(?=[._\-\s\]\)])|$)"
+    r"(?:(?=[._\-\s\]\)/\\])|$)"
 )
 
 EP_RE = re.compile(
     r"(?i)"
     + _DELIM_START
     + r"(?:"
-    r"[Ss](\d{1,2})[._\-\s]*[Ee](\d{1,2})"
+    r"[Ss](\d{1,2})[._\-\s]*[Ee][Pp]?(\d{1,3})"
     r"|(?<!\d)(\d{1,2})x(\d{1,2})(?!\d)"
     r"|(?:[Ee][Pp]?|[Ee]pisode)[._\-\s]*(\d{1,3})(?!\d)"
-    r"|[Ss]eason[._\-\s]*(\d{1,2})[._\-\s]*[Ee]pisode[._\-\s]*(\d{1,2})"
+    r"|[Ss]eason[._\-\s]*(\d{1,2})[._\-\s]*[Ee]pisode[._\-\s]*(\d{1,3})"
     r")"
     + _DELIM_END
 )
@@ -157,14 +159,19 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
     distinct_eps = {(e.season, e.episode) for e in deduped_eps}
 
     # Case 1: Exactly 1 distinct episode found -> individual episode torrent (routes to unsorted)
+    # Guard: a single episode tag alongside other unrelated videos (e.g. S01E01.mkv
+    # + Movie.mkv) must NOT be classified as a lone episode — fall through to
+    # mixed/season logic below.
     if len(distinct_eps) == 1:
         main_ep = deduped_eps[0]
-        return Classification(
-            kind="episode",
-            episodes=[main_ep],
-            single_file=main_ep.file_name,
-            total_bytes=total,
-        )
+        if len(eval_files) == 1 or main_ep.size_bytes >= int(0.9 * total):
+            return Classification(
+                kind="episode",
+                episodes=[main_ep],
+                single_file=main_ep.file_name,
+                total_bytes=total,
+            )
+        # else: fall through — episode is a minority of the payload
 
     # Case 2: No episodes found at all
     if not deduped_eps:
@@ -187,7 +194,9 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
     # Case 3: Multiple distinct episodes found (len(distinct_eps) >= 2) -> full season pack
     # If >= 90% of evaluated files carry an episode tag, treat as a season.
     # Use ceiling: e.g. 4 files where 3 are episodes is still a season.
-    if len(deduped_eps) >= max(1, int(-(-len(eval_files) * 9 // 10))):
+    # NOTE: use pre-dedup `eps` count — deduped count undercounts when 2 files
+    # map to the same (season, episode) (e.g. mkv + mp4 per episode).
+    if len(eps) >= max(1, int(-(-len(eval_files) * 9 // 10))):
         return Classification(kind="season", episodes=deduped_eps, single_file=None, total_bytes=total)
 
     # Mixed (rare): multiple episodes with lots of non-episode files
