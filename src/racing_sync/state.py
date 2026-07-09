@@ -216,6 +216,7 @@ SCHEMA_INDEXES = """
 CREATE INDEX IF NOT EXISTS ix_state ON torrent_state(state);
 CREATE INDEX IF NOT EXISTS ix_indexer_retry
     ON torrent_state(state, indexer_next_retry_at);
+CREATE INDEX IF NOT EXISTS ix_source_name ON torrent_state(source_name);
 """
 
 SCHEMA = SCHEMA_TABLES + SCHEMA_INDEXES
@@ -430,12 +431,25 @@ class StateStore:
                 clean_name = clean_name[:-len(ext)].strip()
                 break
         stripped_name = re.sub(r"\s*\[[^\]]+\]\s*$", "", clean_name).strip()
+
+        def _escape_like(s: str) -> str:
+            # Escape LIKE wildcards so `100%` / `S01_E01` match literally.
+            return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM torrent_state WHERE source_name = ? OR source_name = ? "
-                "OR source_name = ? OR source_name LIKE ? OR source_name LIKE ? "
+                f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state "
+                "WHERE source_name = ? OR source_name = ? "
+                "OR source_name = ? OR source_name LIKE ? ESCAPE '\\' "
+                "OR source_name LIKE ? ESCAPE '\\' "
                 "ORDER BY updated_at DESC",
-                (source_name, clean_name, stripped_name, f"{clean_name}.%", f"{stripped_name}%"),
+                (
+                    source_name,
+                    clean_name,
+                    stripped_name,
+                    f"{_escape_like(clean_name)}.%",
+                    f"{_escape_like(stripped_name)}%",
+                ),
             ).fetchall()
             return [_row_to_state(r) for r in rows]
 
@@ -524,6 +538,15 @@ class StateStore:
 
 
 
+def _safe_state(value: object) -> State:
+    """Parse a state string without crashing startup on corrupt/legacy rows."""
+    try:
+        return State(str(value))
+    except ValueError:
+        log.warning("state DB has unknown state %r; treating as FAILED", value)
+        return State.FAILED
+
+
 def _row_to_state(row: sqlite3.Row) -> TorrentState:
     keys = row.keys()
     sp_first = row["indexer_first_queried_at"] if "indexer_first_queried_at" in keys else ""
@@ -570,7 +593,7 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         ),
         readd_attempts=int(ra_attempts or 0),
         failed_retries=int(row["failed_retries"] or 0) if "failed_retries" in keys else 0,
-        state=State(row["state"]) if "state" in keys else State.NEW,
+        state=_safe_state(row["state"]) if "state" in keys else State.NEW,
         batch_index=int(row["batch_index"] or 0) if "batch_index" in keys else 0,
         batches_total=int(row["batches_total"] or 0) if "batches_total" in keys else 0,
         last_error=row["last_error"] if "last_error" in keys else "",
