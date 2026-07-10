@@ -116,7 +116,7 @@ def test_build_move_cmd(tmp_path: Path):
         extra=["--dry-run"],
     )
     assert cmd[0] == str(Path("/usr/bin/rclone"))
-    assert cmd[1:4] == ["move", str(tmp_path / "src"), "remote:dest"]
+    assert cmd[1:5] == ["move", "--", str(tmp_path / "src"), "remote:dest"]
     assert "--config" in cmd
     assert str(Path("/etc/rclone.conf")) in cmd
     assert "--transfers=4" in cmd
@@ -132,6 +132,7 @@ async def test_run_rclone_timeout_redacts_command(monkeypatch):
     cfg = MagicMock(spec=AppConfig)
     cfg.rclone = MagicMock()
     cfg.rclone.env = {}
+    cfg.rclone.binary = Path("/usr/bin/rclone")
 
     mock_proc = AsyncMock()
     mock_proc.communicate.side_effect = TimeoutError()
