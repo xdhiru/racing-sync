@@ -12,6 +12,7 @@ This is the safety net against prior crashes.
 
 from __future__ import annotations
 
+import asyncio
 import glob
 import logging
 from collections.abc import Iterable
@@ -90,8 +91,25 @@ async def reconcile(
                 rpt.resumed.append(h)
             else:
                 rpt.orphans.append(h)
-                sftp_bytes = store.get_blob(ts.source_infohash) or None
-                await fix_orphan(ts, cfg, dest=dest, store=store, sftp_bytes=sftp_bytes)
+                try:
+                    sftp_bytes = await asyncio.to_thread(store.get_blob, ts.source_infohash) or None
+                except Exception as e:
+                    log.warning("reconcile: get_blob failed for %s: %s", h[:10], e)
+                    sftp_bytes = None
+                try:
+                    await fix_orphan(ts, cfg, dest=dest, store=store, sftp_bytes=sftp_bytes)
+                except Exception as e:
+                    # One bad orphan must never kill startup — park it FAILED.
+                    log.error("reconcile: fix_orphan failed for %s: %s", h[:10], e)
+                    try:
+                        store.transition(ts, State.FAILED, error=f"recovery failed: {e}")
+                    except Exception:
+                        try:
+                            ts.state = State.FAILED
+                            ts.last_error = f"recovery failed: {e}"
+                            store.upsert(ts)
+                        except Exception:
+                            pass
 
     # 3. Anything on VPS2 not in the DB?
     # If it is already seeding from the fuse mount, adopt it as DONE.
@@ -106,13 +124,15 @@ async def reconcile(
                 if iph.strip():
                     db_hashes.add(iph.strip().lower())
 
+    # DONE rows re-added below must not lose their cross-seed blob — fetch it
+    # lazily only when we actually adopt, to avoid pulling MB blobs per row.
     fuse_mounts = [
         str(fm).rstrip("/\\").replace("\\", "/")
         for fm in (cfg.rclone.fuse.mount, cfg.rclone.fuse.mount_unsorted)
         if fm
     ]
     for h, t in actual_by_hash.items():
-        if h not in db_hashes:
+        if h.lower() not in db_hashes:
             save_path = getattr(t, "save_path", "").rstrip("/\\").replace("\\", "/")
             on_fuse = any(save_path == fm or save_path.startswith(fm + "/") for fm in fuse_mounts if fm)
             comp = getattr(t, "is_complete", False)
@@ -123,7 +143,8 @@ async def reconcile(
                 if matches:
                     existing = matches[0]
                     curr = [x for x in existing.injected_private_hashes.split(",") if x]
-                    if h not in curr and h.lower() != existing.source_infohash.lower():
+                    curr_lower = {x.lower() for x in curr}
+                    if h.lower() not in curr_lower and h.lower() != existing.source_infohash.lower():
                         curr.append(h)
                         existing.injected_private_hashes = ",".join(curr)
                         store.upsert(existing)
@@ -174,16 +195,31 @@ async def fix_orphan(
         # We need to re-add it. Caller (coordinator) provides .torrent bytes.
         if sftp_bytes is None:
             log.error("orphan %s: no .torrent bytes available to re-add", h)
-            store.transition(ts, State.FAILED, error="orphan: no .torrent bytes")
+            try:
+                store.transition(ts, State.FAILED, error="orphan: no .torrent bytes")
+            except ValueError:
+                ts.state = State.FAILED
+                ts.last_error = "orphan: no .torrent bytes"
+                store.upsert(ts)
             return State.FAILED.value
         # Add paused, then resolve the new hash, resume, and let coordinator drive.
-        res = await dest.add_torrent(
-            torrent_files=[sftp_bytes],
-            save_path=ts.save_path or str(cfg.dest.save_path),
-            category="racing",
-            paused=True,
-            skip_check=False,
-        )
+        try:
+            res = await dest.add_torrent(
+                torrent_files=[sftp_bytes],
+                save_path=ts.save_path or str(cfg.dest.save_path),
+                category="racing",
+                paused=True,
+                skip_check=False,
+            )
+        except Exception as e:
+            log.error("orphan %s: re-add failed: %s", h[:10] if len(h) > 10 else h, e)
+            try:
+                store.transition(ts, State.FAILED, error=f"orphan re-add failed: {e}")
+            except ValueError:
+                ts.state = State.FAILED
+                ts.last_error = f"orphan re-add failed: {e}"
+                store.upsert(ts)
+            return State.FAILED.value
         new_hash = ""
         if res is not None and getattr(res, "hash", None):
             new_hash = str(res.hash).lower()
@@ -203,7 +239,11 @@ async def fix_orphan(
         except Exception as e:
             log.warning("orphan %s: resume after re-add failed: %s", h, e)
         if ts.state != State.DOWNLOADING:
-            store.transition(ts, State.DOWNLOADING)
+            try:
+                store.transition(ts, State.DOWNLOADING)
+            except ValueError:
+                ts.state = State.DOWNLOADING
+                store.upsert(ts)
         else:
             store.upsert(ts)
         return State.DOWNLOADING.value
@@ -225,26 +265,39 @@ async def fix_orphan(
                 ]
             except Exception:
                 expected_names = None
-        if expected_names:
-            content_exists = any(
-                (src_path / name).exists() for name in expected_names
-            )
-        else:
+
+        def _content_exists() -> bool:
+            if expected_names:
+                return any((src_path / name).exists() for name in expected_names)
             escaped_name = glob.escape(ts.source_name)
-            content_exists = (
-                (src_path / ts.source_name).exists()
-                or any(src_path.glob(f"{escaped_name}*"))
+            return (src_path / ts.source_name).exists() or any(
+                src_path.glob(f"{escaped_name}*")
             )
+
+        try:
+            content_exists = await asyncio.to_thread(_content_exists)
+        except Exception as e:
+            log.warning("orphan %s: SSD check failed: %s", h, e)
+            return State.MOVING.value
         if content_exists:
             log.info("orphan %s: files still exist on SSD; will resume move", h)
             return State.MOVING.value
 
         # Files no longer on SSD; rclone move completed, proceed to re-add to fuse
         log.info("orphan %s: files moved from SSD; will re-add to fuse", h)
-        store.transition(ts, State.RE_ADDING)
+        try:
+            store.transition(ts, State.RE_ADDING)
+        except ValueError:
+            ts.state = State.RE_ADDING
+            store.upsert(ts)
         return State.RE_ADDING.value
 
     log.warning("orphan %s: cannot infer recovery path from state %s",
                 h, ts.state.value)
-    store.transition(ts, State.FAILED, error=f"orphan in state {ts.state.value}")
+    try:
+        store.transition(ts, State.FAILED, error=f"orphan in state {ts.state.value}")
+    except ValueError:
+        ts.state = State.FAILED
+        ts.last_error = f"orphan in state {ts.state.value}"
+        store.upsert(ts)
     return State.FAILED.value
