@@ -22,6 +22,11 @@ log = logging.getLogger(__name__)
 
 MAX_TORRENT_BYTES: int = 20 * 1024 * 1024  # 20 MiB safety cap, matching Prowlarr
 
+_HEX40_RE = None  # lazy compiled in list_state_dir to avoid import cost
+
+import re as _re
+_HEX40_RE = _re.compile(r"[0-9a-fA-F]{40}")
+
 
 class SFTPError(RuntimeError):
     pass
@@ -73,9 +78,21 @@ class SFTPExporter:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    def _creds_present(self) -> bool:
+        if self._cfg.ssh_key_path:
+            return True
+        pwd = (
+            self._cfg.ssh_password.get_secret_value()
+            if hasattr(self._cfg.ssh_password, "get_secret_value")
+            else str(self._cfg.ssh_password)
+        )
+        return bool((pwd or "").strip())
+
     def connect(self) -> None:
         with self._lock:
             self.close()
+            if not self._creds_present():
+                raise SFTPError("no SSH credentials: set ssh_key_path or ssh_password")
             sock: socket.socket | None = None
             try:
                 self._client = paramiko.SSHClient()
@@ -87,6 +104,10 @@ class SFTPExporter:
                     except Exception:
                         pass
                 if self._cfg.auto_add_host_key:
+                    log.warning(
+                        "sftp: auto-adding host key for %s (MITM risk; pin via known_hosts_path)",
+                        self._cfg.ssh_host,
+                    )
                     self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                 else:
                     self._client.set_missing_host_key_policy(paramiko.RejectPolicy())
@@ -95,7 +116,12 @@ class SFTPExporter:
                     "port": self._cfg.ssh_port,
                     "username": self._cfg.ssh_user,
                     "timeout": 15,
-                    "allow_agent": True,
+                    "banner_timeout": 15,
+                    "auth_timeout": 15,
+                    # Never offer agent keys / ~/.ssh keys by surprise — only
+                    # the explicitly configured credential.
+                    "allow_agent": False,
+                    "look_for_keys": False,
                 }
                 if self._cfg.ssh_key_path:
                     # Load the key manually when a passphrase is configured, so
@@ -235,7 +261,14 @@ class SFTPExporter:
                     log.warning("sftp: %s does not look like a bencoded torrent", path_str)
                 except FileNotFoundError:
                     continue
-                except (OSError, paramiko.SSHException, EOFError) as e:
+                except OSError as e:
+                    # Paramiko surfaces missing files as IOError(errno 2),
+                    # which may not subclass FileNotFoundError — treat as miss.
+                    if getattr(e, "errno", None) == 2:
+                        continue
+                    log.warning("sftp: read %s failed: %s", path_str, e)
+                    continue
+                except (paramiko.SSHException, EOFError) as e:
                     log.warning("sftp: read %s failed: %s", path_str, e)
                     continue
                 except Exception as e:  # noqa: BLE001
@@ -247,9 +280,6 @@ class SFTPExporter:
         return {h: data for h, data in ((h, self.fetch_torrent(h)) for h in infohashes) if data}
 
     def list_state_dir(self) -> list[str]:
-        import re
-
-        _HEX40 = re.compile(r"[0-9a-fA-F]{40}")
         with self._lock:
             # Mirror fetch_torrent: reconnect if the connection dropped.
             if (self._client is None
@@ -273,10 +303,12 @@ class SFTPExporter:
                 entries = self._sftp.listdir_attr(remote_dir)
             except OSError as e:
                 raise SFTPError(f"sftp listdir failed for {remote_dir}: {e}") from e
+            except (paramiko.SSHException, EOFError) as e:
+                raise SFTPError(f"sftp listdir failed for {remote_dir}: {e}") from e
             for entry in entries:
                 name = entry.filename
                 if name.endswith(".torrent"):
                     digest = name[: -len(".torrent")]
-                    if _HEX40.fullmatch(digest):
-                        out.append(digest)
+                    if _HEX40_RE is not None and _HEX40_RE.fullmatch(digest):
+                        out.append(digest.lower())
             return out
