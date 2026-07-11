@@ -44,11 +44,18 @@ class WatchItem:
 
 MAX_TORRENT_BYTES: int = 20 * 1024 * 1024  # 20 MiB safety cap
 MAX_BENCODE_DEPTH: int = 64
+MAX_BENCODE_ITEMS: int = 200_000  # cap total list/dict elements to bound DoS
 
 
 def _bdecode(
-    data: bytes, pos: int = 0, *, depth: int = 0
+    data: bytes, pos: int = 0, *, depth: int = 0, _items: list[int] | None = None
 ) -> tuple[int, object]:
+    if _items is None:
+        _items = [0]
+    def _count(n: int = 1) -> None:
+        _items[0] += n
+        if _items[0] > MAX_BENCODE_ITEMS:
+            raise ValueError(f"bencode item limit exceeded ({MAX_BENCODE_ITEMS})")
     if depth > MAX_BENCODE_DEPTH:
         raise ValueError(f"bencode recursion depth exceeded: {depth}")
     if pos >= len(data):
@@ -77,7 +84,8 @@ def _bdecode(
                 raise ValueError(f"unexpected EOF in list at position {pos}")
             if data[pos:pos + 1] == b"e":
                 return pos + 1, out_list
-            pos, item = _bdecode(data, pos, depth=depth + 1)
+            pos, item = _bdecode(data, pos, depth=depth + 1, _items=_items)
+            _count(1)
             out_list.append(item)
 
     if ch == b"d":
@@ -87,11 +95,12 @@ def _bdecode(
                 raise ValueError(f"unexpected EOF in dict at position {pos}")
             if data[pos:pos + 1] == b"e":
                 return pos + 1, out_dict
-            pos, k = _bdecode(data, pos, depth=depth + 1)
+            pos, k = _bdecode(data, pos, depth=depth + 1, _items=_items)
             if not isinstance(k, (bytes, str)):
                 raise ValueError(f"dict key must be bytes/str, got {type(k)} at position {pos}")
             k_bytes = k if isinstance(k, bytes) else k.encode("utf-8")
-            pos, v = _bdecode(data, pos, depth=depth + 1)
+            pos, v = _bdecode(data, pos, depth=depth + 1, _items=_items)
+            _count(1)
             out_dict[k_bytes] = v
 
     if ch.isdigit():
@@ -179,11 +188,14 @@ def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
     pieces = info.get(b"files") or None
     total = 0
     if pieces is None:
-        total = int(info.get(b"length", 0))
+        length_raw = info.get(b"length", 0)
+        total = length_raw if isinstance(length_raw, int) and length_raw >= 0 else 0
     elif isinstance(pieces, list):
         for f in pieces:
             if isinstance(f, dict):
-                total += int(f.get(b"length", 0))
+                length_raw = f.get(b"length", 0)
+                if isinstance(length_raw, int) and length_raw >= 0:
+                    total += length_raw
 
     infohash = hashlib.sha1(raw_info_bytes).hexdigest().lower()
     return infohash, name, total, announce_str
@@ -194,6 +206,8 @@ def extract_torrent_files_from_bencoded(data: bytes) -> list[Any]:
     from .clients.abstract import TorrentFile
 
     if not data or not data.startswith(b"d"):
+        return []
+    if len(data) > MAX_TORRENT_BYTES:
         return []
     pos = 1
     root: dict[bytes, object] = {}
@@ -220,7 +234,8 @@ def extract_torrent_files_from_bencoded(data: bytes) -> list[Any]:
     if isinstance(pieces, list):
         for f in pieces:
             if isinstance(f, dict):
-                length = int(f.get(b"length", 0))
+                length_raw = f.get(b"length", 0)
+                length = length_raw if isinstance(length_raw, int) and length_raw >= 0 else 0
                 path_parts = f.get(b"path", [])
                 parts_str: list[str] = []
                 if isinstance(path_parts, list):
@@ -233,7 +248,8 @@ def extract_torrent_files_from_bencoded(data: bytes) -> list[Any]:
                 full_name = f"{top_name}/{rel_path}" if top_name else rel_path
                 files_list.append(TorrentFile(name=full_name, size_bytes=length, progress=1.0))
     else:
-        length = int(info.get(b"length", 0))
+        length_raw = info.get(b"length", 0)
+        length = length_raw if isinstance(length_raw, int) and length_raw >= 0 else 0
         files_list.append(TorrentFile(name=str(top_name), size_bytes=length, progress=1.0))
 
     return files_list
@@ -258,7 +274,13 @@ def _bencode(obj: object) -> bytes:
 
 
 def parse_torrent_file(path: Path) -> tuple[str, str, int, str, bytes]:
+    # Reject symlinks — watch-dir must not follow links to /etc/passwd etc.
+    if path.is_symlink():
+        raise ValueError(f"refusing symlink torrent: {path}")
     data = path.read_bytes()
+    # Re-check after read (TOCTOU): file may have grown between stat and read.
+    if len(data) > MAX_TORRENT_BYTES:
+        raise ValueError(f"torrent file exceeds maximum allowed size ({len(data)} > {MAX_TORRENT_BYTES})")
     infohash, name, total, announce = _bencoded_info_hash(data)
     return infohash, name, total, announce, data
 
@@ -279,6 +301,9 @@ class WatchDirScanner:
         current_files: set[Path] = set()
         current_infohashes: set[str] = set()
         for entry in sorted(Path(self._cfg.path).glob(self._cfg.glob)):
+            if entry.is_symlink():
+                log.warning("watch-dir: skipping symlink %s", entry.name)
+                continue
             if not entry.is_file():
                 continue
             current_files.add(entry)
@@ -286,6 +311,11 @@ class WatchDirScanner:
                 st = entry.stat()
                 mtime, fsize = st.st_mtime, st.st_size
                 if fsize == 0 or fsize > MAX_TORRENT_BYTES:
+                    if fsize > MAX_TORRENT_BYTES:
+                        log.warning(
+                            "watch-dir: skipping oversize torrent %s (%d B)",
+                            entry.name, fsize,
+                        )
                     continue
 
                 # Skip known bad files unless they have been modified
@@ -328,9 +358,12 @@ class WatchDirScanner:
                 prefer_dropped=False,
             )
             out.append(item)
+            from .logging_setup import sanitize_log_text
+            safe_name = sanitize_log_text(name.replace("\n", " ").replace("\r", " "))[:200]
+            safe_announce = sanitize_log_text(announce.replace("\n", " ").replace("\r", " "))[:200]
             log.info(
                 "watch-dir picked up: %s (%s) announce=%s",
-                name, infohash[:10], announce,
+                safe_name, infohash[:10], safe_announce,
             )
 
         # Prune deleted files from caches
@@ -340,11 +373,17 @@ class WatchDirScanner:
             self._bad_files.pop(k, None)
 
         # Prune _seen for items no longer in watchdir if delete_after_pickup is active,
-        # or cap _seen size to prevent memory leak
+        # or cap _seen size to prevent memory leak (deterministic FIFO by
+        # insertion order is impossible on a set — keep the intersection plus
+        # an arbitrary-but-bounded sample).
         if self._cfg.delete_after_pickup:
             self._seen &= current_infohashes
         elif len(self._seen) > 5000:
-            self._seen = (self._seen & current_infohashes) | set(list(self._seen)[-2500:])
+            # Deterministic: keep currently-present hashes, then fill up to
+            # 2500 with sorted overflow for reproducibility.
+            keep = set(self._seen & current_infohashes)
+            overflow = sorted(self._seen - keep)[: max(0, 2500 - len(keep))]
+            self._seen = keep | set(overflow)
 
         return out
 
