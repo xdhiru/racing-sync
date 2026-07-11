@@ -25,7 +25,14 @@ def _scrub_url(url: str) -> str:
         parts = urlsplit(url)
         if not parts.scheme and not parts.netloc:
             return url
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        # Strip userinfo (user:pass@) — never log credentials.
+        netloc = parts.hostname or ""
+        try:
+            if parts.port:
+                netloc += f":{parts.port}"
+        except ValueError:
+            pass
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
     except Exception:
         return "<scrubbed_url>"
 
@@ -80,13 +87,22 @@ class ProwlarrClient:
     async def start(self) -> None:
         if not self._cfg.enabled:
             raise ProwlarrError("prowlarr disabled in config")
+        if self._session is not None and not self._session.closed:
+            return
         import socket
         self._session = aiohttp.ClientSession(
             base_url=self._cfg.base_url.rstrip("/") + "/",
             timeout=aiohttp.ClientTimeout(total=self._cfg.timeout_seconds),
             connector=aiohttp.TCPConnector(family=socket.AF_INET),
         )
-        await self._refresh_indexers()
+        try:
+            await self._refresh_indexers()
+        except Exception:
+            try:
+                await self.close()
+            except Exception:
+                pass
+            raise
 
     @property
     def _auth_headers(self) -> dict[str, str]:
@@ -104,21 +120,43 @@ class ProwlarrClient:
         async with self._refresh_lock:
             if not self._session:
                 raise ProwlarrError("not started")
-            async with self._session.get("api/v1/indexer", headers=self._auth_headers) as r:
-                r.raise_for_status()
-                data = await r.json()
-            self._indexers_by_name.clear()
-            self._indexers_by_id.clear()
+            last_exc: Exception | None = None
+            data: Any = None
+            for attempt in range(3):
+                try:
+                    async with self._session.get("api/v1/indexer", headers=self._auth_headers) as r:
+                        r.raise_for_status()
+                        data = await r.json()
+                    break
+                except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+                    last_exc = e
+                    if attempt == 2:
+                        raise ProwlarrError(f"prowlarr indexer refresh failed: {e}") from e
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+            if data is None:
+                if last_exc:
+                    raise ProwlarrError(f"prowlarr indexer refresh failed: {last_exc}") from last_exc
+                raise ProwlarrError("prowlarr indexer refresh returned no data")
+            # Build temp dicts then swap atomically so readers never see empty.
+            by_name: dict[str, Indexer] = {}
+            by_id: dict[int, Indexer] = {}
             for raw in data:
+                try:
+                    idx_id = raw["id"]
+                    idx_name = raw["name"]
+                except (KeyError, TypeError):
+                    continue
                 idx = Indexer(
-                    id=raw["id"],
-                    name=raw["name"],
+                    id=idx_id,
+                    name=idx_name,
                     protocol=raw.get("protocol", "torrent"),
                     enable=raw.get("enable", True),
                     capabilities=list(((raw.get("caps") or {}).get("categories") or {}).keys()),
                 )
-                self._indexers_by_name[idx.name.lower()] = idx
-                self._indexers_by_id[idx.id] = idx
+                by_name[idx.name.lower()] = idx
+                by_id[idx.id] = idx
+            self._indexers_by_name = by_name
+            self._indexers_by_id = by_id
             log.debug("prowlarr: loaded %d indexers", len(self._indexers_by_id))
 
     def get_indexer_by_name(self, name: str) -> Indexer | None:
@@ -168,9 +206,18 @@ class ProwlarrClient:
             "cat": "2000,5000",  # standard movies (2000) and TV (5000) categories
         }
         path = f"api/v1/indexer/{indexer.id}/newznab"
-        async with self._session.get(path, params=params, headers=self._auth_headers) as r:
-            r.raise_for_status()
-            text = await r.text()
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                async with self._session.get(path, params=params, headers=self._auth_headers) as r:
+                    r.raise_for_status()
+                    text = await r.text()
+                break
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+                last_exc = e
+                if attempt == 2:
+                    raise ProwlarrError(f"prowlarr search on {indexer.name!r} failed: {e}") from e
+                await asyncio.sleep(0.5 * (2 ** attempt))
         return _parse_newznab(text, indexer)
 
     async def search_download_indexer(self, query: str) -> list[TorrentHit]:
@@ -191,10 +238,12 @@ class ProwlarrClient:
                 r.raise_for_status()
                 content_length = r.headers.get("Content-Length")
                 max_bytes = 20 * 1024 * 1024
-                if content_length and content_length.isdigit() and int(content_length) > max_bytes:
-                    raise ProwlarrError(
-                        f"torrent download from {safe_url} exceeds max size: {content_length} bytes"
-                    )
+                if content_length:
+                    cl = content_length.replace(",", "").strip()
+                    if cl.isdigit() and int(cl) > max_bytes:
+                        raise ProwlarrError(
+                            f"torrent download from {safe_url} exceeds max size: {content_length} bytes"
+                        )
                 chunks: list[bytes] = []
                 total = 0
                 async for chunk in r.content.iter_chunked(64 * 1024):
@@ -208,11 +257,11 @@ class ProwlarrClient:
         except aiohttp.ClientResponseError as e:
             raise ProwlarrError(
                 f"torrent download from {safe_url} failed with HTTP status {e.status}"
-            ) from None
-        except (TimeoutError, aiohttp.ClientError) as e:
+            ) from e
+        except (TimeoutError, asyncio.TimeoutError, aiohttp.ClientError) as e:
             raise ProwlarrError(
                 f"torrent download from {safe_url} failed: {type(e).__name__}"
-            ) from None
+            ) from e
 
         if not data.startswith(b"d"):
             raise ProwlarrError(
@@ -261,13 +310,16 @@ class ProwlarrClient:
             log.info("prowlarr: skipping parallel search for %r (matches skip_query_substrings)", query)
             return {}
 
+        sem = asyncio.Semaphore(4)
+
         async def _search_one(idx: Indexer) -> tuple[str, list[TorrentHit]]:
-            try:
-                hits = await self.search_indexer(idx, query)
-                return idx.name.lower(), hits
-            except Exception as e:  # noqa: BLE001
-                log.warning("prowlarr search on indexer %r failed: %s", idx.name, e)
-                return idx.name.lower(), []
+            async with sem:
+                try:
+                    hits = await self.search_indexer(idx, query)
+                    return idx.name.lower(), hits
+                except Exception as e:  # noqa: BLE001
+                    log.warning("prowlarr search on indexer %r failed: %s", idx.name, e)
+                    return idx.name.lower(), []
 
         tasks = [_search_one(idx) for idx in indexers]
         results = await asyncio.gather(*tasks)
@@ -293,18 +345,36 @@ def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
 
     channel = root.find("channel")
     if channel is None:
+        # Fall back to namespace-blind search (feeds using a default ns).
+        for child in root:
+            tag = child.tag if isinstance(child.tag, str) else ""
+            if tag.rpartition("}")[2].split(":")[-1] == "channel":
+                channel = child
+                break
+    if channel is None:
         return hits
 
-    for item in channel.findall("item"):
+    for item in list(channel):
+        item_tag = item.tag if isinstance(item.tag, str) else ""
+        if item_tag.rpartition("}")[2].split(":")[-1] != "item":
+            continue
         try:
-            enclosure = item.find("enclosure")
+            enclosure = None
+            for child in item:
+                ctag = child.tag if isinstance(child.tag, str) else ""
+                if ctag.rpartition("}")[2].split(":")[-1] == "enclosure":
+                    enclosure = child
+                    break
             attrs = enclosure.attrib if enclosure is not None else {}
             try:
-                size = int(float(attrs.get("length") or 0))
+                size = int(float((attrs.get("length") or "0").replace(",", "").strip() or 0))
             except (ValueError, TypeError):
                 size = 0
             raw_url = (attrs.get("url") or "").strip()
             magnet_url = _first_attr(item, "torznab:attr", name="magneturl")
+            if not magnet_url:
+                # Spec/indexers vary case: magnetUrl vs magneturl.
+                magnet_url = _first_attr(item, "torznab:attr", name="magnetUrl")
             download_url = ""
             scheme = urlsplit(raw_url).scheme if raw_url else ""
             if raw_url and scheme in ("http", "https"):
@@ -335,14 +405,18 @@ def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
 
 
 def _first_attr(item: Any, tag: str, *, name: str) -> str:
-    target_tag = tag.rpartition("}")[2].split(":")[-1]
+    target_tag = tag.rpartition("}")[2].split(":")[-1].lower()
+    target_name = name.lower()
     for child in item:
         child_tag = getattr(child, "tag", None)
         if not isinstance(child_tag, str):
             continue
-        if child_tag.rpartition("}")[2].split(":")[-1] == target_tag:
-            if child.attrib.get("name") == name:
-                return child.attrib.get("value", "")
+        if child_tag.rpartition("}")[2].split(":")[-1].lower() != target_tag:
+            continue
+        attrib = child.attrib or {}
+        for k, v in attrib.items():
+            if k.lower() == "name" and str(v).lower() == target_name:
+                return attrib.get("value", "") or attrib.get("Value", "")
     return ""
 
 
