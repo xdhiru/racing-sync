@@ -114,9 +114,9 @@ def build_app(coord: Coordinator) -> FastAPI:
         raise HTTPException(401, "auth required")
 
     @app.get("/api/state", dependencies=[Depends(auth)])
-    async def state() -> list[dict[str, Any]]:
+    async def state(limit: int = Query(default=5000, ge=1, le=50000)) -> list[dict[str, Any]]:
         rows = await asyncio.to_thread(coord.store.all)
-        return [_ts_to_dict(t) for t in rows]
+        return [_ts_to_dict(t) for t in rows[:limit]]
 
     @app.get("/api/active", dependencies=[Depends(auth)])
     async def active() -> list[dict[str, Any]]:
@@ -132,7 +132,10 @@ def build_app(coord: Coordinator) -> FastAPI:
 
     @app.get("/api/ssd", dependencies=[Depends(auth)])
     async def ssd() -> dict[str, Any]:
-        free_bytes = await asyncio.to_thread(ssd_free_bytes, cfg)
+        try:
+            free_bytes = await asyncio.to_thread(ssd_free_bytes, cfg)
+        except OSError as e:
+            raise HTTPException(503, f"ssd path unavailable: {e}") from e
         return {"free_bytes": free_bytes, "path": str(cfg.ssd.path)}
 
     @app.post("/api/recover", dependencies=[Depends(auth)])
