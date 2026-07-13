@@ -1869,14 +1869,22 @@ class Coordinator:
             if base_path
             else Path(self.cfg.dest.save_path).resolve()
         )
-        # The top-most folder path shared by all files
-        first = files[0].name.replace("\\", "/")
-        parts = first.split("/")
-        if len(parts) <= 1:
+        # The top-most folder shared by all files. Derived from ALL files
+        # (most common first component), not files[0] — qB file order is
+        # not guaranteed and files[0] may be a root-level extra while the
+        # pack lives under Top/ (returning None then falls back to a bare
+        # folder move that strips the top dir on the remote).
+        from collections import Counter
+        tops: Counter[str] = Counter()
+        for f in files:
+            parts = (f.name or "").replace("\\", "/").split("/")
+            if len(parts) > 1:
+                top = parts[0].strip()
+                if top and top not in (".", "..") and ".." not in top:
+                    tops[top] += 1
+        if not tops:
             return None
-        top = parts[0].strip()
-        if not top or top in (".", "..") or ".." in top:
-            return None
+        top = tops.most_common(1)[0][0]
         if all(f.name.replace("\\", "/").startswith(top + "/") for f in files):
             candidate = (base / top).resolve()
             if candidate != base and candidate.is_relative_to(base):
@@ -1983,6 +1991,7 @@ class Coordinator:
         # (local_include preserves the top dir for whole-folder moves so the
         # remote layout matches torrent-relative names; see helper above.)
         local_include: list[str] | None = None
+        move_base: Path = src_dir
         if ts.batches_total > 1:
             local_folder = folder if (folder and folder.exists()) else (src_dir / ts.source_name if (src_dir / ts.source_name).exists() else None)
             remaining_payload: list[Path] = []
@@ -1998,13 +2007,16 @@ class Coordinator:
                         "multi-batch torrent %s: incomplete batch move (batch %d/%d, %d remaining files); moving to remote before cleanup",
                         ts.source_name, ts.batch_index, ts.batches_total, len(remaining_payload),
                     )
-                    # Preserve the top dir so the remote layout matches
-                    # torrent-relative names (same as batch moves).
-                    top_include = _top_include_for_folder(src_dir, local_folder)
-                    if top_include is not None:
-                        await self._rclone_move(src_dir, remote, ts, include=top_include)
-                    else:
-                        await self._rclone_move(local_folder, remote, ts)
+                    # Never bare-move the folder (`rclone move <dir>
+                    # <remote>` strips the top dir). Move from the parent
+                    # with `<top>/**` so the remote keeps the folder.
+                    move_base = local_folder.parent
+                    top_include = _top_include_for_folder(move_base, local_folder)
+                    if top_include is None:  # only if local_folder is a fs root
+                        raise RuntimeError(
+                            f"cannot preserve top dir moving {local_folder} to {remote}"
+                        )
+                    await self._rclone_move(move_base, remote, ts, include=top_include)
                 else:
                     log.info(
                         "multi-batch torrent %s: batches already moved (no remaining local content)",
@@ -2026,16 +2038,28 @@ class Coordinator:
             elif cls.kind in ("season", "unknown") or (cls.kind == "movie" and not cls.single_file):
                 if folder and folder.exists():
                     local = folder
-                    # Preserve the top dir (same layout as batch moves);
-                    # a bare folder move would strip it and fuse re-adds
-                    # would point at missing paths.
-                    local_include = _top_include_for_folder(src_dir, folder)
                 elif (src_dir / ts.source_name).exists():
                     local = src_dir / ts.source_name
                 else:
                     raise FileNotFoundError(
                         f"completed {cls.kind} content not found on SSD: "
                         f"neither {folder} nor {src_dir / ts.source_name} exists"
+                    )
+                # Never bare-move a folder: `rclone move <dir> <remote>`
+                # uploads the dir's CONTENTS (top dir stripped) while batch
+                # moves preserve torrent-relative paths — the remote/fuse
+                # layouts would diverge and re-adds would point at missing
+                # data (season packs landing flat in the remote root).
+                # Move from the parent with `<top>/**` instead. This also
+                # covers the folder-detection fallback above: even when
+                # `folder` is None (e.g. a root-level extra broke the
+                # all-share check), `src_dir/<torrent>` still moves with
+                # its top dir intact.
+                move_base = local.parent
+                local_include = _top_include_for_folder(move_base, local)
+                if local_include is None:  # only if local is a fs root
+                    raise RuntimeError(
+                        f"cannot preserve top dir moving {local} to {remote}"
                     )
             else:
                 cand = src_dir / ts.source_name
@@ -2044,7 +2068,7 @@ class Coordinator:
                 else:
                     raise FileNotFoundError(f"completed content not found on SSD: {cand}")
             if local_include is not None:
-                await self._rclone_move(src_dir, remote, ts, include=local_include)
+                await self._rclone_move(move_base, remote, ts, include=local_include)
             else:
                 await self._rclone_move(local, remote, ts)
         else:
