@@ -2338,32 +2338,18 @@ class Coordinator:
             return
 
         target_mount = self._target_mount_for(ts)
-        res = await self.dest_client.add_torrent(
-            torrent_files=[blob],
-            save_path=str(target_mount),
-            category="racing",
-            paused=False,
-            skip_check=True,
-            tags=["racing", "fuse"],
+        ok, detail = await self._ensure_fuse_entry(
+            blob=blob, infohash=target_hash, target_mount=target_mount,
+            label="cross-seed torrent",
         )
-        already_exists = False
-        if not res.accepted and (res.detail == "Fails." or "already" in (res.detail or "").lower()):
-            try:
-                dest_st = await self.dest_client.get_torrent(target_hash)
-                if dest_st is not None:
-                    already_exists = True
-            except Exception as e:  # noqa: BLE001
-                log.debug("could not check dest client for %s: %s", target_hash[:10], e)
 
-        if not res.accepted and not already_exists:
-            err_msg = f"fuse re-add rejected: {res.detail or 'client rejected torrent'}"
+        if not ok:
+            err_msg = f"fuse re-add rejected: {detail or 'client rejected torrent'}"
             log.error("re-add cross-seed torrent failed for %s: %s", ts.source_name, err_msg)
-            if res.detail == "Fails." or not res.detail:
+            if detail == "Fails." or not detail:
                 raise WebUIUnresponsiveError(err_msg)
             self.transition(ts, State.FAILED, error=err_msg)
             return
-        elif already_exists:
-            log.info("cross-seed torrent %s already exists on dest client; marking as injected", target_hash[:10])
 
     async def _re_inject_watch_dir_torrents(self, ts: TorrentState) -> None:
         """Re-add every watch-dir dropped torrent and discovered cross-seeds onto FUSE."""
@@ -2399,33 +2385,17 @@ class Coordinator:
                         )
                         continue
 
-                res = await self.dest_client.add_torrent(
-                    torrent_files=[blob],
-                    save_path=str(target_mount),
-                    category="racing",
-                    paused=False,
-                    skip_check=True,
-                    tags=["racing", "fuse"],
+                ok, detail = await self._ensure_fuse_entry(
+                    blob=blob, infohash=h_low, target_mount=target_mount,
+                    label="watch-dir torrent",
                 )
-                already_exists = False
-                if not res.accepted:
-                    try:
-                        dest_st = await self.dest_client.get_torrent(h_low)
-                        if dest_st is not None:
-                            already_exists = True
-                    except Exception as e:  # noqa: BLE001
-                        log.debug("could not check dest client for %s: %s", h[:10], e)
 
-                if res.accepted or already_exists or "already" in (res.detail or "").lower():
+                if ok:
                     injected.append(h_low)
                     injected_set.add(h_low)
-                    if already_exists:
-                        log.info("watch-dir torrent %s already exists on dest client; marking as injected", h[:10])
-                    else:
-                        log.info("re-injected watch-dir torrent %s on fuse (%s)", h[:10], target_mount)
                 else:
-                    log.warning("re-inject watch-dir torrent %s rejected: %s", h[:10], res.detail)
-                    raise WebUIUnresponsiveError(f"re-inject watch-dir torrent {h[:10]} rejected: {res.detail}")
+                    log.warning("re-inject watch-dir torrent %s rejected: %s", h[:10], detail)
+                    raise WebUIUnresponsiveError(f"re-inject watch-dir torrent {h[:10]} rejected: {detail}")
         finally:
             ts.injected_private_hashes = ",".join(dict.fromkeys(injected))
 
@@ -2474,41 +2444,18 @@ class Coordinator:
                             t.infohash[:10], t.name[:50], target_mount, len(match_missing),
                         )
                         continue
-                res = await self.dest_client.add_torrent(
-                    torrent_files=[blob],
-                    save_path=str(target_mount),
-                    category="racing",
-                    paused=False,
-                    skip_check=True,
-                    tags=["racing", "fuse"],
+                ok, detail = await self._ensure_fuse_entry(
+                    blob=blob, infohash=h_low, target_mount=target_mount,
+                    label="racing torrent",
                 )
-                already_exists = False
-                if not res.accepted:
-                    try:
-                        dest_st = await self.dest_client.get_torrent(h_low)
-                        if dest_st is not None:
-                            already_exists = True
-                    except Exception as e:  # noqa: BLE001
-                        log.debug("could not check dest client for %s: %s", t.infohash[:10], e)
-
-                if not res.accepted and not already_exists and "already" not in (res.detail or "").lower():
+                if not ok:
                     log.warning(
                         "re-inject: add %s rejected: %s",
-                        t.infohash[:10], res.detail,
+                        t.infohash[:10], detail,
                     )
-                    raise WebUIUnresponsiveError(f"re-inject add {t.infohash[:10]} rejected: {res.detail}")
+                    raise WebUIUnresponsiveError(f"re-inject add {t.infohash[:10]} rejected: {detail}")
                 injected.append(h_low)
                 injected_set.add(h_low)
-                if already_exists:
-                    log.info(
-                        "racing torrent %s (%s) already exists on dest client; marking as injected",
-                        t.infohash[:10], t.name[:50],
-                    )
-                else:
-                    log.info(
-                        "re-injected racing torrent %s (%s) on fuse",
-                        t.infohash[:10], t.name[:50],
-                    )
         finally:
             ts.injected_private_hashes = ",".join(dict.fromkeys(injected))
 
@@ -2574,36 +2521,15 @@ class Coordinator:
                     continue
 
             try:
-                res = await self.dest_client.add_torrent(
-                    torrent_files=[blob],
-                    save_path=str(target_mount),
-                    category="racing",
-                    paused=False,
-                    skip_check=True,
-                    tags=["racing", "fuse"],
+                ok, detail = await self._ensure_fuse_entry(
+                    blob=blob, infohash=h_low, target_mount=target_mount,
+                    label="late cross-seed",
                 )
-                already_exists = False
-                if not res.accepted:
-                    # qBittorrent returns "Fails." when a torrent already exists.
-                    # Verify if it's already present on VPS2.
-                    try:
-                        dest_st = await self.dest_client.get_torrent(h_low)
-                        if dest_st is not None:
-                            already_exists = True
-                    except Exception as e:  # noqa: BLE001
-                        log.debug("could not check dest client for %s: %s", t.infohash[:10], e)
-
-                if res.accepted or already_exists or "already" in (res.detail or "").lower():
-                    if already_exists:
-                        log.info(
-                            "late cross-seed %s (%s) already exists on dest client; marking as injected",
-                            t.infohash[:10], t.name[:40],
-                        )
-                    else:
-                        log.info(
-                            "auto-injected late cross-seed %s (%s) onto fuse (%s)",
-                            t.infohash[:10], t.name[:40], target_mount,
-                        )
+                if ok:
+                    log.info(
+                        "auto-injected late cross-seed %s (%s) onto fuse (%s)",
+                        t.infohash[:10], t.name[:40], target_mount,
+                    )
                     current_injected.append(h_low)
                     current_injected_set.add(h_low)
                     changed = True
@@ -2611,7 +2537,7 @@ class Coordinator:
                 else:
                     log.warning(
                         "late cross-seed: add %s rejected by dest client: %s",
-                        t.infohash[:10], res.detail,
+                        t.infohash[:10], detail,
                     )
                     self._failed_late_cross_seeds[h_low] = now_utc
                     if len(self._failed_late_cross_seeds) > 5000:
@@ -2691,11 +2617,13 @@ class Coordinator:
         Blocking fuse stats are offloaded to a thread. A failed check itself
         counts as missing — never inject blind when the mount can't be read.
         """
+        mount = Path(target_mount)
+
         def _check() -> list[str]:
             missing: list[str] = []
             for name, want in files:
                 try:
-                    actual = (target_mount / name).stat().st_size
+                    actual = (mount / name).stat().st_size
                 except OSError:
                     missing.append(name)
                     continue
@@ -2706,8 +2634,87 @@ class Coordinator:
         try:
             return await asyncio.to_thread(_check)
         except Exception as e:  # noqa: BLE001
-            log.warning("fuse availability check failed for %s: %s", target_mount, e)
+            log.warning("fuse availability check failed for %s: %s", mount, e)
             return [f"<availability check failed: {e}>"]
+
+    def _save_path_points_at_target(self, save_path: object, target_mount: object) -> bool:
+        """Does an existing client entry point at the fuse target we inject to?
+
+        A duplicate hash may already exist pointing elsewhere (e.g. a leftover
+        SSD entry). Such entries must be replaced, never mistaken for a fuse
+        seed. Non-string save paths (shouldn't happen) never match.
+        """
+        if not isinstance(save_path, str):
+            return False
+        sp = save_path.rstrip("/\\").replace("\\", "/")
+        tm = str(target_mount).rstrip("/\\").replace("\\", "/")
+        return bool(tm) and (sp == tm or sp.startswith(tm + "/"))
+
+    async def _ensure_fuse_entry(
+        self, *, blob: bytes, infohash: str, target_mount: Path, label: str
+    ) -> tuple[bool, str]:
+        """Ensure a fuse-pointing dest entry exists for `infohash`.
+
+        Adds `blob` with skip_check. When the client reports a duplicate,
+        the existing entry is verified: fuse-pointing entries are accepted
+        as-is, but entries pointing elsewhere (stale SSD leftovers) are
+        deleted (files kept) and re-added at the fuse target — the bytes
+        were verified at the target before this call.
+
+        Returns (ok, detail). Never raises for client rejections; callers
+        apply their own retry/fail policy. Exact add kwargs are kept stable
+        for the seeding contract (category/tags/skip_check).
+        """
+        h_low = infohash.lower()
+        add_kwargs: dict[str, object] = {
+            "torrent_files": [blob],
+            "save_path": str(target_mount),
+            "category": "racing",
+            "paused": False,
+            "skip_check": True,
+            "tags": ["racing", "fuse"],
+        }
+        res = await self.dest_client.add_torrent(**add_kwargs)  # type: ignore[arg-type]
+        detail = res.detail if isinstance(res.detail, str) else ""
+        if res.accepted and "already" not in detail.lower():
+            log.info("re-injected %s %s on fuse (%s)", label, h_low[:10], target_mount)
+            return True, detail
+        if not (detail == "Fails." or "already" in detail.lower()):
+            return False, detail
+        # Possible duplicate: inspect what's actually there.
+        try:
+            dest_st = await self.dest_client.get_torrent(h_low)
+        except Exception as e:  # noqa: BLE001
+            log.debug("could not check dest client for %s: %s", h_low[:10], e)
+            dest_st = None
+        if dest_st is not None and self._save_path_points_at_target(
+            getattr(dest_st, "save_path", ""), target_mount
+        ):
+            log.info("%s %s already on fuse; marking as injected", label, h_low[:10])
+            return True, "already added"
+        if dest_st is not None:
+            log.warning(
+                "%s %s exists at %s (not the fuse target %s); replacing with fuse entry",
+                label, h_low[:10], getattr(dest_st, "save_path", "?"), target_mount,
+            )
+            try:
+                await self.dest_client.delete(h_low, delete_files=False)
+            except Exception as e:  # noqa: BLE001
+                return False, f"cannot remove non-fuse entry: {e}"
+            res2 = await self.dest_client.add_torrent(**add_kwargs)  # type: ignore[arg-type]
+            detail2 = res2.detail if isinstance(res2.detail, str) else ""
+            if res2.accepted or detail2 == "Fails." or "already" in detail2.lower():
+                try:
+                    dest_st2 = await self.dest_client.get_torrent(h_low)
+                except Exception:
+                    dest_st2 = None
+                if dest_st2 is not None and self._save_path_points_at_target(
+                    getattr(dest_st2, "save_path", ""), target_mount
+                ):
+                    log.info("re-injected %s %s on fuse (%s)", label, h_low[:10], target_mount)
+                    return True, detail2
+            return False, detail2
+        return False, detail
 
     def _target_mount_for(self, ts: TorrentState) -> Path:
         """Where on the fuse mount should this torrent's data live?"""
