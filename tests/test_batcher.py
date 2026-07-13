@@ -603,6 +603,77 @@ async def test_do_moving_preserves_top_folder_on_remote(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_do_moving_fallback_never_bare_moves_folder(tmp_path):
+    """Folder-detection fallback must still preserve the top dir.
+
+    Regression (Harbor.Lights.S03 pack): when `_season_folder_for` finds nothing
+    but `src_dir/<torrent>` exists on disk, a bare
+    `rclone move <folder> <remote>` would upload the CONTENTS and land the
+    episodes flat in the remote root. Must move from the parent with
+    `<top>/**` instead.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.dest_client = MagicMock()
+
+    pack_folder = tmp_path / "Harbor.Lights.S03.1080p.iP.WEB-DL.AAC2.0.H.264-Raccoon"
+    pack_folder.mkdir()
+    (pack_folder / "Harbor.Lights.S03E01.mkv").write_bytes(b"ep1 content")
+
+    cls_file = TorrentFile(
+        name="Harbor.Lights.S03.1080p.iP.WEB-DL.AAC2.0.H.264-Raccoon/Harbor.Lights.S03E01.mkv",
+        size_bytes=len(b"ep1 content"),
+        progress=1.0,
+        priority=1,
+    )
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[cls_file])
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.delete = AsyncMock()
+    coord._rclone_move = AsyncMock()
+    # Simulate folder detection finding nothing (e.g. odd file order).
+    coord._season_folder_for = MagicMock(return_value=None)
+
+    ts = TorrentState(
+        source_infohash="hash1",
+        source_name="Harbor.Lights.S03.1080p.iP.WEB-DL.AAC2.0.H.264-Raccoon",
+        classification_kind="season",
+        batches_total=1,
+        batch_index=0,
+        save_path=str(tmp_path),
+        state=State.MOVING,
+    )
+
+    with patch("racing_sync.coordinator.classify") as mock_classify, \
+         patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock):
+        mock_cls = MagicMock()
+        mock_cls.kind = "season"
+        mock_cls.single_file = None
+        mock_cls.episodes = []
+        mock_classify.return_value = mock_cls
+
+        await coord._do_moving(ts)
+
+    coord._rclone_move.assert_called_once()
+    call = coord._rclone_move.call_args
+    # Moved from the PARENT (not the folder itself) with top-preserving include.
+    assert call.args[0] == tmp_path
+    assert call.args[1] == "remote:media"
+    assert call.kwargs.get("include") == [
+        "--include=Harbor.Lights.S03.1080p.iP.WEB-DL.AAC2.0.H.264-Raccoon/**"
+    ]
+    assert ts.state == State.RE_ADDING
+
+
+@pytest.mark.anyio
 async def test_batch_cap_bytes_single_helper():
     from racing_sync.coordinator import Coordinator
     coord = object.__new__(Coordinator)
