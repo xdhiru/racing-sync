@@ -38,7 +38,7 @@ _SENSITIVE_PARAM_RE = re.compile(
     re.IGNORECASE,
 )
 _BEARER_TOKEN_RE = re.compile(
-    r"((?:Bearer|Token|ApiKey)\s+)[A-Za-z0-9_\-\.~\+/=]+",
+    r"((?:Bearer|Basic|Token|ApiKey)\s+)[A-Za-z0-9_\-\.~\+/=]+",
     re.IGNORECASE,
 )
 _SENSITIVE_KEY_RE = re.compile(
@@ -100,7 +100,7 @@ class RingBufferHandler(logging.Handler):
                 ts=dt.datetime.fromtimestamp(record.created, tz=dt.timezone.utc),
                 level=record.levelno,
                 logger=record.name,
-                message=sanitize_log_text(record.getMessage()),
+                message=sanitize_log_text(record.getMessage())[:2000],
             )
             with self._lock:
                 self._buf.append(ev)
@@ -162,7 +162,9 @@ class HTTPSinkHandler(logging.handlers.QueueHandler):
     """
 
     def __init__(self, cfg: LoggingSinkConfig):
-        self._q: queue.Queue[logging.LogRecord] = queue.Queue(-1)
+        # Bounded queue — an unreachable collector + log flood must not OOM.
+        # Oldest records are dropped via put_nowait fallback in emit().
+        self._q: queue.Queue[logging.LogRecord] = queue.Queue(1000)
         super().__init__(self._q)
         self._cfg = cfg
         self._stop = threading.Event()
@@ -172,7 +174,17 @@ class HTTPSinkHandler(logging.handlers.QueueHandler):
     def emit(self, record: logging.LogRecord) -> None:  # type: ignore[override]
         if not self._cfg.enabled:
             return
-        super().emit(record)
+        try:
+            self._q.put_nowait(record)
+        except queue.Full:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._q.put_nowait(record)
+            except queue.Full:
+                pass
 
     def close(self) -> None:
         self._stop.set()
@@ -287,8 +299,11 @@ def setup_logging(cfg: AppConfig) -> None:
 
     # HTTP sink
     if cfg.logging_sink.enabled:
+        level_name = str(cfg.logging_sink.forward_min_level or "INFO").upper()
+        if level_name not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            level_name = "INFO"
         sink = HTTPSinkHandler(cfg.logging_sink)
-        sink.setLevel(getattr(logging, cfg.logging_sink.forward_min_level))
+        sink.setLevel(getattr(logging, level_name))
         root.addHandler(sink)
 
     # Silence overly chatty libraries
@@ -312,5 +327,5 @@ async def post_log_event_async(
     try:
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as r:
             await r.read()
-    except aiohttp.ClientError:
+    except Exception:
         pass
