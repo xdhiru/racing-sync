@@ -622,8 +622,12 @@ async def test_do_moving_persists_blob_for_adopted_rows_without_one(tmp_path: Pa
 
 
 @pytest.mark.anyio
-async def test_do_queued_fails_when_fuse_complete_torrent_has_no_files(tmp_path: Path):
-    """A fuse torrent reporting complete with missing bytes must NOT mark DONE."""
+async def test_do_queued_parks_to_readding_when_fuse_files_missing(tmp_path: Path):
+    """A fuse-complete entry with missing bytes must NOT mark DONE — nor FAILED.
+
+    FAILED would trigger re-downloads when the mount is merely warming; the
+    row goes to RE_ADDING where the fuse gate + backoff machinery handles it.
+    """
     from racing_sync.clients.abstract import TorrentFile
 
     fuse_dir = tmp_path / "fuse"
@@ -634,6 +638,7 @@ async def test_do_queued_fails_when_fuse_complete_torrent_has_no_files(tmp_path:
     coord = object.__new__(Coordinator)
     coord.cfg = MagicMock()
     coord.cfg.dest.save_path = ssd_dir
+    coord.cfg.ssd.path = ssd_dir
     coord.cfg.rclone.fuse.mount = str(fuse_dir)
     coord.cfg.rclone.fuse.mount_unsorted = str(fuse_dir / "unsorted")
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
@@ -664,13 +669,116 @@ async def test_do_queued_fails_when_fuse_complete_torrent_has_no_files(tmp_path:
 
     await coord._do_queued(ts)
 
-    assert ts.state == State.FAILED
+    assert ts.state == State.RE_ADDING
     coord.transition.assert_called_once()
-    assert coord.transition.call_args[0][1] == State.FAILED
-    assert "reports complete on fuse" in coord.transition.call_args[1].get("error", "")
-    # No blind re-injection of matches, SSD save_path untouched for triage.
+    assert coord.transition.call_args[0][1] == State.RE_ADDING
+    # No blind re-injection of matches.
     coord.dest_client.add_torrent.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_do_queued_resumes_ssd_flow_when_fuse_entry_missing_but_ssd_has_files(tmp_path: Path):
+    """Fuse-pointing entry + bytes on SSD = never-moved data: drive SSD flow."""
+    from racing_sync.clients.abstract import TorrentFile
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    ssd_dir = tmp_path / "ssd"
+    ssd_dir.mkdir()
+    (ssd_dir / "Ghost.Movie.2026.mkv").write_bytes(b"g" * 100)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd_dir
+    coord.cfg.ssd.path = ssd_dir
+    coord.cfg.rclone.fuse.mount = str(fuse_dir)
+    coord.cfg.rclone.fuse.mount_unsorted = str(fuse_dir / "unsorted")
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    ext = Torrent(
+        hash="e" * 40,
+        name="Ghost.Movie.2026",
+        category="racing",
+        save_path=str(fuse_dir),
+        size_bytes=100,
+        state="seeding",
+        progress=1.0,
+    )
+    coord.dest_client.list_torrents = AsyncMock(return_value=[ext])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Ghost.Movie.2026.mkv", size_bytes=100, progress=1.0),
+    ])
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(
+        source_infohash="f" * 40,
+        source_name="Ghost.Movie.2026",
+        cross_seed_blob=b"fake-blob",
+        save_path=str(fuse_dir),
+        state=State.QUEUED,
+    )
+
+    await coord._do_queued(ts)
+
+    # SSD flow resumes (DOWNLOADING re-polls, then MOVING moves SSD bytes).
+    assert ts.state == State.DOWNLOADING
     assert ts.save_path == str(ssd_dir)
+    assert ts.dest_infohash == "e" * 40
+    coord.dest_client.add_torrent.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_late_cross_seeds_defer_when_fuse_content_missing(tmp_path: Path):
+    """Regression: DONE row + unknown VPS1 matches + empty fuse => defer, not inject.
+
+    Mirrors the reported incident ("detected late cross-seed ..." followed by
+    blind "auto-injected ... onto fuse" while bytes were still on SSD).
+    """
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
+    coord.dest_client = AsyncMock()
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash=None, accepted=True, detail="Ok.")
+    )
+    coord.store = MagicMock()
+    coord._failed_late_cross_seeds = {}
+
+    priv_blobs = [
+        _single_file_torrent_bytes("Late.Show.S01E01.mkv", 700 + i)
+        for i in range(3)
+    ]
+    coord._fetch_racing_torrent_bytes = AsyncMock(side_effect=list(priv_blobs))
+
+    ts = TorrentState(
+        source_infohash="a" * 40,
+        source_name="Late.Show.S01E01",
+        dest_infohash="a" * 40,
+        cross_seed_infohash="a" * 40,
+        injected_private_hashes="",
+        state=State.DONE,
+    )
+    from racing_sync.watchdir import _bencoded_info_hash
+    group = [
+        Torrent(hash="a" * 40, name="Late.Show.S01E01", category="",
+                save_path="", size_bytes=700, state="seeding", progress=1.0),
+    ]
+    for blob in priv_blobs:
+        h = _bencoded_info_hash(blob)[0].lower()
+        group.append(Torrent(hash=h, name="Late.Show.S01E01", category="",
+                             save_path="", size_bytes=700, state="seeding", progress=1.0))
+
+    await coord._check_and_inject_late_cross_seeds(ts, group)
+
+    # Nothing injected; all three deferred with backoff (no per-tick storm).
+    coord.dest_client.add_torrent.assert_not_called()
+    assert ts.injected_private_hashes == ""
+    assert len(coord._failed_late_cross_seeds) == 3
+    coord.store.upsert.assert_not_called()
 
 
 @pytest.mark.anyio

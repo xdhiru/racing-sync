@@ -42,6 +42,120 @@ class RecoveryReport:
         )
 
 
+def find_content_on_ssd(cfg: AppConfig, expected: list[tuple[str, int]]) -> Path | None:
+    """Locate single-top content under the SSD roots.
+
+    Used when a client entry claims a fuse location but the bytes aren't
+    there (never-moved SSD data with a wrong entry path). Only unambiguous
+    single-top layouts qualify; returns the SSD root dir or None.
+    Local SSD stats are cheap — no threading needed.
+    """
+    tops: set[str] = set()
+    for name, _ in expected:
+        norm = name.replace("\\", "/").strip("/")
+        if not norm:
+            continue
+        tops.add(norm.split("/")[0])
+    if len(tops) != 1:
+        return None
+    top = next(iter(tops))
+    roots: list[Path] = []
+    for raw in (getattr(cfg.dest, "save_path", None), getattr(cfg.ssd, "path", None)):
+        try:
+            p = raw if isinstance(raw, Path) else Path(str(raw))
+        except Exception:
+            continue
+        if p not in roots:
+            roots.append(p)
+    for root in roots:
+        try:
+            if (root / top).exists():
+                return root
+        except OSError:
+            continue
+    return None
+
+
+async def _missing_under(mount: Path, expected: list[tuple[str, int]]) -> list[str] | None:
+    """Files listed-but-absent under `mount`, or None when unverifiable.
+
+    Unverifiable (RPC/stat failure) returns None so callers preserve today's
+    trust behavior — absence of evidence must never manufacture terminal
+    failures (a warming/dead mount also shows nothing).
+    """
+    def _check() -> list[str]:
+        missing: list[str] = []
+        for name, want in expected:
+            try:
+                actual = (mount / name.replace("\\", "/")).stat().st_size
+            except OSError:
+                missing.append(name)
+                continue
+            if want and actual != want:
+                missing.append(f"{name} (size {actual}!={want})")
+        return missing
+
+    try:
+        return await asyncio.to_thread(_check)
+    except Exception as e:  # noqa: BLE001
+        log.warning("reconcile: fuse availability check failed for %s: %s", mount, e)
+        return None
+
+
+async def _verify_fuse_adopted(
+    cfg: AppConfig, dest: TorrentClient, t: object, save_path: str
+) -> tuple[bool, str]:
+    """Decide how to adopt an on-fuse + complete entry.
+
+    Returns (adopt_as_done, effective_save_path). A client entry added with
+    skip_check=True reports complete with zero bytes present, so bytes are
+    verified before trusting DONE. Verification may only upgrade handling
+    toward a verified-good path (SSD content found -> MOVING with corrected
+    path); every other outcome preserves today's DONE adoption while logging
+    loudly — late injections stay gated downstream regardless.
+    """
+    h = str(getattr(t, "hash", "") or "")
+    name = str(getattr(t, "name", "") or h)
+    try:
+        files = await dest.get_torrent_files(h)
+    except Exception as e:  # noqa: BLE001
+        log.warning("reconcile: cannot list files for %s; keeping DONE trust: %s",
+                    h[:10], e)
+        return True, save_path
+    try:
+        expected = [
+            (str(f.name), int(f.size_bytes or 0))
+            for f in (files or []) if getattr(f, "name", "")
+        ]
+    except Exception as e:  # noqa: BLE001
+        log.warning("reconcile: cannot decode file list for %s; keeping DONE trust: %s",
+                    h[:10], e)
+        return True, save_path
+    if not expected:
+        return True, save_path
+    try:
+        mount = Path(save_path)
+    except Exception:
+        return True, save_path
+    missing = await _missing_under(mount, expected)
+    if missing is None:
+        return True, save_path
+    if not missing:
+        return True, save_path
+    ssd_root = find_content_on_ssd(cfg, expected)
+    if ssd_root is not None:
+        log.warning(
+            "reconcile: %s claims fuse %s but %d/%d files missing; content found on SSD at %s — adopting as MOVING",
+            name[:60], save_path, len(missing), len(expected), ssd_root,
+        )
+        return False, str(ssd_root)
+    log.warning(
+        "reconcile: %s claims fuse %s but %d/%d files missing (e.g. %s); keeping DONE (mount may be warming); late injections stay gated",
+        name[:60], save_path, len(missing), len(expected), missing[0],
+    )
+    return True, save_path
+
+
 async def reconcile(
     cfg: AppConfig,
     *,
@@ -155,6 +269,13 @@ async def reconcile(
                         )
                         continue
                 adopt_state = State.DONE if on_fuse else State.MOVING
+                use_save_path = save_path
+                if on_fuse and is_done:
+                    # A skip_check entry reports complete with zero bytes —
+                    # verify before trusting DONE (never-moved SSD data behind
+                    # a fuse-pointing entry must go through MOVING instead).
+                    ok, use_save_path = await _verify_fuse_adopted(cfg, dest, t, save_path)
+                    adopt_state = State.DONE if ok else State.MOVING
                 log.info(
                     "reconcile: adopting existing completed/fuse torrent on VPS2 as %s: %s (%s)",
                     adopt_state.value, name, h[:10],
@@ -163,7 +284,7 @@ async def reconcile(
                     source_infohash=h,
                     source_name=name,
                     dest_infohash=h,
-                    save_path=save_path,
+                    save_path=use_save_path,
                     total_bytes=getattr(t, "size_bytes", 0),
                     state=adopt_state,
                 )

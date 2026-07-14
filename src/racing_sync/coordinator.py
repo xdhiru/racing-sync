@@ -38,7 +38,7 @@ from .clients.qbittorrent import QBittorrentClient, build_qbtorrent_from_dest
 from .config import AppConfig
 from .logging_setup import get_ring_buffer
 from .prowlarr import ProwlarrClient, TorrentHit
-from .recovery import reconcile
+from .recovery import find_content_on_ssd, reconcile
 from .rclone_ops import (
     move_local_to_remote,
     ssd_free_bytes,
@@ -500,8 +500,32 @@ class Coordinator:
     def __post_init__(self) -> None:
         self.store = StateStore(self.cfg.general.state_db)
 
+    def _warn_if_storage_paths_overlap(self) -> None:
+        """Warn when SSD dirs overlap fuse mounts (config footgun).
+
+        on_fuse detection, move sources, and wipe guards all assume disjoint
+        trees. A nested layout (e.g. SSD scratch inside the fuse mount path)
+        silently misclassifies every torrent. Advisory only — never fatal.
+        """
+        try:
+            ssd_dirs = [str(self.cfg.dest.save_path), str(self.cfg.ssd.path)]
+            fuse = [str(self.cfg.rclone.fuse.mount), str(self.cfg.rclone.fuse.mount_unsorted)]
+        except Exception:
+            return
+        norm = lambda p: p.rstrip("/\\").replace("\\", "/")
+        for s in ssd_dirs:
+            for fm in fuse:
+                sn, fn = norm(s or ""), norm(fm or "")
+                if sn and fn and (sn == fn or sn.startswith(fn + "/") or fn.startswith(sn + "/")):
+                    log.warning(
+                        "storage overlap: SSD path %s overlaps fuse mount %s — "
+                        "on_fuse detection and moves will misbehave; use disjoint paths",
+                        s, fm,
+                    )
+
     async def start(self) -> None:
         log.info("coordinator starting")
+        self._warn_if_storage_paths_overlap()
         self._download_sem = asyncio.Semaphore(self.cfg.max_active_downloads)
         self._move_sem = asyncio.Semaphore(self.cfg.max_concurrent_moves)
         log.info(
@@ -1446,7 +1470,9 @@ class Coordinator:
             if on_fuse and ext.is_complete():
                 # Verify the bytes are really behind the fuse path: a torrent
                 # added with skip_check=True reports complete even when its
-                # files were never moved. Never mark DONE on missing bytes.
+                # files were never moved. Missing bytes must never mark DONE —
+                # and must never FAILED either (a warming/dead mount also
+                # shows nothing, and FAILED would trigger re-downloads).
                 try:
                     fuse_files = await self.dest_client.get_torrent_files(ext.hash)
                 except Exception as e:  # noqa: BLE001
@@ -1455,19 +1481,39 @@ class Coordinator:
                         ts.source_infohash[:10], e,
                     )
                     fuse_files = []
-                fuse_expected = [(f.name, f.size_bytes) for f in fuse_files if f.name]
+                fuse_expected = [
+                    (f.name, f.size_bytes) for f in fuse_files
+                    if getattr(f, "name", "")
+                ]
                 fuse_missing = (
                     await self._missing_fuse_files(Path(save_path), fuse_expected)
                     if fuse_expected else []
                 )
                 if fuse_missing:
-                    err = (
-                        f"torrent {ts.source_infohash[:10]} reports complete on fuse mount "
-                        f"{save_path} but {len(fuse_missing)}/{len(fuse_expected)} file(s) are "
-                        f"missing (e.g. {fuse_missing[0]}); not marking DONE"
+                    ssd_root = find_content_on_ssd(self.cfg, fuse_expected)
+                    if ssd_root is not None:
+                        # The bytes sit on SSD (never-moved data behind a
+                        # fuse-pointing entry): drive the normal SSD flow so
+                        # they get moved properly. No resume — the entry
+                        # points at fuse; DOWNLOADING re-polls then MOVING
+                        # moves the SSD bytes and replaces the entry.
+                        log.warning(
+                            "torrent %s reports complete on fuse %s but %d/%d files missing; "
+                            "content found on SSD at %s — resuming SSD flow instead of DONE",
+                            ts.source_infohash[:10], save_path,
+                            len(fuse_missing), len(fuse_expected), ssd_root,
+                        )
+                        ts.dest_infohash = ext.hash.lower()
+                        ts.save_path = str(ssd_root)
+                        self.transition(ts, State.DOWNLOADING)
+                        return
+                    log.warning(
+                        "torrent %s reports complete on fuse %s but %d/%d files missing "
+                        "(e.g. %s); routing to RE_ADDING for gated retry instead of DONE",
+                        ts.source_infohash[:10], save_path,
+                        len(fuse_missing), len(fuse_expected), fuse_missing[0],
                     )
-                    log.error(err)
-                    self.transition(ts, State.FAILED, error=err)
+                    self.transition(ts, State.RE_ADDING)
                     return
                 log.info(
                     "torrent %s is already completed on VPS2 fuse mount; marking DONE",
