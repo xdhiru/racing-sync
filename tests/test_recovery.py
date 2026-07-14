@@ -135,17 +135,33 @@ async def test_do_re_add_fails_if_add_torrent_rejected():
 
 
 @pytest.mark.anyio
-async def test_check_and_inject_late_cross_seeds():
+async def test_check_and_inject_late_cross_seeds(tmp_path: Path):
     from unittest.mock import AsyncMock, MagicMock
     from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import AddResult, Torrent
+    from racing_sync.watchdir import _bencode
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    fname = "Late.New.Release.mkv"
+    fsize = 100
+    (fuse_dir / fname).write_bytes(b"x" * fsize)
+    blob = _bencode({
+        b"announce": b"http://tracker.example/announce",
+        b"info": {
+            b"name": fname.encode(),
+            b"length": fsize,
+            b"piece length": 16384,
+            b"pieces": b"12345678901234567890",
+        },
+    })
 
     coord = object.__new__(Coordinator)
     coord.store = MagicMock()
     coord.dest_client = AsyncMock()
-    coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse"))
-    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=b"torrent-bytes")
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord.dest_client.add_torrent.return_value = AddResult(hash="newhash", accepted=True)
 
     ts = TorrentState(
@@ -165,8 +181,8 @@ async def test_check_and_inject_late_cross_seeds():
     await coord._check_and_inject_late_cross_seeds(ts, group)
 
     coord.dest_client.add_torrent.assert_awaited_once_with(
-        torrent_files=[b"torrent-bytes"],
-        save_path=str(Path("/mnt/fuse")),
+        torrent_files=[blob],
+        save_path=str(fuse_dir),
         category="racing",
         paused=False,
         skip_check=True,
@@ -178,22 +194,38 @@ async def test_check_and_inject_late_cross_seeds():
 
 
 @pytest.mark.anyio
-async def test_check_and_inject_late_cross_seeds_recognizes_existing_torrent():
+async def test_check_and_inject_late_cross_seeds_recognizes_existing_torrent(tmp_path: Path):
     from unittest.mock import AsyncMock, MagicMock
     from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import AddResult, Torrent
+    from racing_sync.watchdir import _bencode
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    fname = "Existing.Show.Release.mkv"
+    fsize = 100
+    (fuse_dir / fname).write_bytes(b"y" * fsize)
+    blob = _bencode({
+        b"announce": b"http://tracker.example/announce",
+        b"info": {
+            b"name": fname.encode(),
+            b"length": fsize,
+            b"piece length": 16384,
+            b"pieces": b"12345678901234567890",
+        },
+    })
 
     coord = object.__new__(Coordinator)
     coord.store = MagicMock()
     coord.dest_client = AsyncMock()
-    coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse"))
-    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=b"torrent-bytes")
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
     # qBittorrent returns "Fails." because torrent is already in qBittorrent
     coord.dest_client.add_torrent.return_value = AddResult(hash=None, accepted=False, detail="Fails.")
     # get_torrent confirms it exists on dest_client
     coord.dest_client.get_torrent.return_value = Torrent(
-        hash="existinghash", name="Show.Release", category="racing", save_path="/mnt/fuse", size_bytes=100, state="uploading", progress=1.0
+        hash="existinghash", name="Show.Release", category="racing", save_path=str(fuse_dir), size_bytes=100, state="uploading", progress=1.0
     )
 
     ts = TorrentState(

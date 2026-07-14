@@ -273,17 +273,34 @@ async def test_coordinator_do_queued_extracts_infohash_from_blob():
 
 
 @pytest.mark.anyio
-async def test_late_cross_seeds_handles_none_detail_and_expires_failures():
+async def test_late_cross_seeds_handles_none_detail_and_expires_failures(tmp_path: Path):
     from racing_sync.clients.abstract import Torrent
+    from racing_sync.watchdir import _bencode
     import datetime as dt
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    fname = "Movie.Title.mkv"
+    fsize = 1000
+    (fuse_dir / fname).write_bytes(b"q" * fsize)
+    blob = _bencode({
+        b"announce": b"http://tracker.example/announce",
+        b"info": {
+            b"name": fname.encode(),
+            b"length": fsize,
+            b"piece length": 16384,
+            b"pieces": b"12345678901234567890",
+        },
+    })
 
     coord = object.__new__(Coordinator)
     coord.cfg = MagicMock()
-    coord.cfg.rclone.fuse.mount = "/fuse"
-    coord._target_mount_for = MagicMock(return_value=Path("/fuse"))
+    coord.cfg.rclone.fuse.mount = str(fuse_dir)
+    coord.cfg.rclone.fuse.mount_unsorted = str(fuse_dir)
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord.dest_client = MagicMock()
     coord.store = MagicMock()
-    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=b"d8:announce7:http...e")
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord._failed_late_cross_seeds = {}
 
     # add_torrent returns accepted=False and detail=None
