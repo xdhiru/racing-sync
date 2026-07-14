@@ -76,6 +76,40 @@ def find_content_on_ssd(cfg: AppConfig, expected: list[tuple[str, int]]) -> Path
     return None
 
 
+def _classify_kind_for_files(files: list, cfg: AppConfig) -> str:
+    """Best-effort classify of a dest file list; never raises.
+
+    Fresh-DB adoptions previously left `classification_kind="unknown"`, which
+    made `_target_mount_for()` route movies/seasons to the unsorted mount and
+    sent late cross-seeds (and their fuse gate) at the wrong directory.
+    Returns "unknown" when files are missing or classification fails (e.g.
+    MagicMock cfg in unit tests).
+    """
+    try:
+        if not files:
+            return "unknown"
+        from .classifier import classify as _classify
+
+        kind = _classify(files, cfg).kind
+        return kind if isinstance(kind, str) and kind else "unknown"
+    except Exception:
+        return "unknown"
+
+
+async def _classify_adopted(
+    cfg: AppConfig, dest: TorrentClient, h: str
+) -> str:
+    """Fetch dest files and classify; "unknown" on any failure."""
+    try:
+        files = await dest.get_torrent_files(h)
+    except Exception:
+        return "unknown"
+    try:
+        return _classify_kind_for_files(files, cfg)
+    except Exception:
+        return "unknown"
+
+
 async def _missing_under(mount: Path, expected: list[tuple[str, int]]) -> list[str] | None:
     """Files listed-but-absent under `mount`, or None when unverifiable.
 
@@ -104,15 +138,16 @@ async def _missing_under(mount: Path, expected: list[tuple[str, int]]) -> list[s
 
 async def _verify_fuse_adopted(
     cfg: AppConfig, dest: TorrentClient, t: object, save_path: str
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str]:
     """Decide how to adopt an on-fuse + complete entry.
 
-    Returns (adopt_as_done, effective_save_path). A client entry added with
-    skip_check=True reports complete with zero bytes present, so bytes are
-    verified before trusting DONE. Verification may only upgrade handling
-    toward a verified-good path (SSD content found -> MOVING with corrected
-    path); every other outcome preserves today's DONE adoption while logging
-    loudly — late injections stay gated downstream regardless.
+    Returns (adopt_as_done, effective_save_path, classification_kind). A
+    client entry added with skip_check=True reports complete with zero bytes
+    present, so bytes are verified before trusting DONE. Verification may
+    only upgrade handling toward a verified-good path (SSD content found ->
+    MOVING with corrected path); every other outcome preserves today's DONE
+    adoption while logging loudly — late injections stay gated downstream
+    regardless.
     """
     h = str(getattr(t, "hash", "") or "")
     name = str(getattr(t, "name", "") or h)
@@ -121,7 +156,7 @@ async def _verify_fuse_adopted(
     except Exception as e:  # noqa: BLE001
         log.warning("reconcile: cannot list files for %s; keeping DONE trust: %s",
                     h[:10], e)
-        return True, save_path
+        return True, save_path, "unknown"
     try:
         expected = [
             (str(f.name), int(f.size_bytes or 0))
@@ -130,30 +165,31 @@ async def _verify_fuse_adopted(
     except Exception as e:  # noqa: BLE001
         log.warning("reconcile: cannot decode file list for %s; keeping DONE trust: %s",
                     h[:10], e)
-        return True, save_path
+        return True, save_path, "unknown"
+    kind = _classify_kind_for_files(files, cfg)
     if not expected:
-        return True, save_path
+        return True, save_path, kind
     try:
         mount = Path(save_path)
     except Exception:
-        return True, save_path
+        return True, save_path, kind
     missing = await _missing_under(mount, expected)
     if missing is None:
-        return True, save_path
+        return True, save_path, kind
     if not missing:
-        return True, save_path
+        return True, save_path, kind
     ssd_root = find_content_on_ssd(cfg, expected)
     if ssd_root is not None:
         log.warning(
             "reconcile: %s claims fuse %s but %d/%d files missing; content found on SSD at %s — adopting as MOVING",
             name[:60], save_path, len(missing), len(expected), ssd_root,
         )
-        return False, str(ssd_root)
+        return False, str(ssd_root), kind
     log.warning(
         "reconcile: %s claims fuse %s but %d/%d files missing (e.g. %s); keeping DONE (mount may be warming); late injections stay gated",
         name[:60], save_path, len(missing), len(expected), missing[0],
     )
-    return True, save_path
+    return True, save_path, kind
 
 
 async def reconcile(
@@ -270,12 +306,19 @@ async def reconcile(
                         continue
                 adopt_state = State.DONE if on_fuse else State.MOVING
                 use_save_path = save_path
+                kind = "unknown"
                 if on_fuse and is_done:
                     # A skip_check entry reports complete with zero bytes —
                     # verify before trusting DONE (never-moved SSD data behind
                     # a fuse-pointing entry must go through MOVING instead).
-                    ok, use_save_path = await _verify_fuse_adopted(cfg, dest, t, save_path)
+                    ok, use_save_path, kind = await _verify_fuse_adopted(cfg, dest, t, save_path)
                     adopt_state = State.DONE if ok else State.MOVING
+                else:
+                    # SSD-complete (or fuse-incomplete) adoption: classify now
+                    # so _target_mount_for() routes movies/seasons to the
+                    # default mount instead of defaulting unknown->unsorted.
+                    # Best-effort; a failed file listing keeps "unknown".
+                    kind = await _classify_adopted(cfg, dest, h)
                 log.info(
                     "reconcile: adopting existing completed/fuse torrent on VPS2 as %s: %s (%s)",
                     adopt_state.value, name, h[:10],
@@ -286,6 +329,7 @@ async def reconcile(
                     dest_infohash=h,
                     save_path=use_save_path,
                     total_bytes=getattr(t, "size_bytes", 0),
+                    classification_kind=kind,
                     state=adopt_state,
                 )
                 store.upsert(ts)

@@ -34,6 +34,11 @@ FSIZE = 5_000_000
 
 
 def _mk_blob(announce: str) -> bytes:
+    # NOTE: infohash covers ONLY the info dict (not announce), so same
+    # file/size/pieces => same hash. Real cross-seeds differ (piece size,
+    # padding, `source` tag), giving distinct hashes for identical filenames.
+    # Embed the tracker in `info.source` so public+privates are distinct
+    # hashes sharing one filename — the reported incident shape.
     return _bencode({
         b"announce": announce.encode(),
         b"info": {
@@ -41,6 +46,7 @@ def _mk_blob(announce: str) -> bytes:
             b"length": FSIZE,
             b"piece length": 262144,
             b"pieces": b"12345678901234567890",
+            b"source": announce.encode(),
         },
     })
 
@@ -349,4 +355,64 @@ async def test_fresh_db_unadopted_ssd_public_moves_before_injecting(tmp_path: Pa
     last_rclone_idx = max(dest.events.index(e) for e in rclone_evts)
     first_add_idx = min(dest.events.index(e) for e in fuse_adds)
     assert last_rclone_idx < first_add_idx, "fuse injection happened before the rclone move"
+    assert row.state == State.DONE
+
+
+@pytest.mark.anyio
+async def test_false_done_with_ssd_save_path_demotes_and_moves_before_injecting(tmp_path: Path):
+    """Regression for the reported incident: falsely adopted DONE must not inject.
+
+    Fresh-DB recovery (or a pre-fix DB) may hold a DONE row whose save_path
+    still points at SSD — the rclone move never ran. Late cross-seeds from
+    VPS1 must defer (no fuse adds), the row must demote DONE->MOVING, and the
+    subsequent worker must move first and only then inject all four hashes.
+    """
+    ssd = tmp_path / "ssd"
+    fuse = tmp_path / "fuse"
+    ssd.mkdir()
+    fuse.mkdir()
+    (ssd / FNAME).write_bytes(b"D" * FSIZE)
+
+    pub_blob = _mk_blob(PUB_ANNOUNCE)
+    priv_blobs = [_mk_blob(a) for a in PRIV_ANNOUNCES]
+    pub_hash = _bencoded_info_hash(pub_blob)[0].lower()
+    priv_hashes = [_bencoded_info_hash(b)[0].lower() for b in priv_blobs]
+
+    src = _FakeSource([pub_blob, *priv_blobs], [PUB_ANNOUNCE, *PRIV_ANNOUNCES])
+    dest = _FakeDest()
+    dest.seed(pub_blob, str(ssd), "racing", progress=1.0)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = _make_coord(ssd, fuse, store, src, dest)
+    coord._rclone_move = _rclone_fake(ssd, fuse, dest.events)
+
+    # Pre-fix DONE row pointing at SSD (move never ran).
+    ts = TorrentState(
+        source_infohash=pub_hash, source_name=FNAME, dest_infohash=pub_hash,
+        save_path=str(ssd), total_bytes=FSIZE, state=State.DONE,
+    )
+    store.upsert(ts)
+
+    group = list(src.torrents)
+    assert len(group) == 4
+
+    # 1. Late tick must NOT inject; must demote to MOVING.
+    await coord._check_and_inject_late_cross_seeds(store.get(pub_hash), group)
+    row = store.get(pub_hash)
+    assert row.state == State.MOVING, "false DONE must demote to MOVING before any injection"
+    assert row.save_path == str(ssd)
+    assert [e for e in dest.events if e[0] == "add"] == []
+    assert (ssd / FNAME).exists()
+    assert not (fuse / FNAME).exists()
+
+    # 2. Worker moves first, then injects all four at fuse.
+    await coord._process_torrent_inner(store.get(pub_hash))
+    row = store.get(pub_hash)
+    rclone_evts = [e for e in dest.events if e[0] == "rclone"]
+    assert rclone_evts, "rclone move never ran after demotion"
+    assert (fuse / FNAME).exists()
+    assert not (ssd / FNAME).exists()
+    fuse_adds = [e for e in dest.events if e[0] == "add" and e[2] == str(fuse)]
+    assert {e[1] for e in fuse_adds} == {pub_hash, *priv_hashes}
+    assert max(dest.events.index(e) for e in rclone_evts) < min(dest.events.index(e) for e in fuse_adds)
     assert row.state == State.DONE

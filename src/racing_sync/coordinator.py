@@ -1943,6 +1943,15 @@ class Coordinator:
         h = ts.dest_infohash or ts.source_infohash
         cls_files = await self.dest_client.get_torrent_files(h)
         cls = classify(cls_files, self.cfg)
+        # Persist classification so RE_ADDING (_target_mount_for) routes to
+        # the same remote the files were just moved to. Fresh-DB adoptions
+        # start as "unknown" and would otherwise default to unsorted.
+        if cls.kind and cls.kind != ts.classification_kind:
+            ts.classification_kind = cls.kind
+            try:
+                self.store.upsert(ts)
+            except Exception:  # noqa: BLE001
+                pass
 
         # 1. Pause torrent on VPS2 client BEFORE move begins to stop active seeding from SSD
         log.info("pausing torrent %s on VPS2 client before move", h[:10])
@@ -2402,7 +2411,7 @@ class Coordinator:
         watch_cross_dir = Path(self.cfg.general.state_db).parent / "watch_cross_seeds" / ts.source_infohash
         if not watch_cross_dir.exists():
             return
-        target_mount = self._target_mount_for(ts)
+        ts_fallback_mount = self._target_mount_for(ts)
         injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
         injected_set = set(injected)
 
@@ -2420,16 +2429,23 @@ class Coordinator:
                 if h_low in injected_set:
                     continue
 
-                # Fuse gate: never point a re-added torrent at missing data.
+                # Fuse gate (fail-closed): never point a re-added torrent at
+                # missing/unverifiable data.
+                target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
                 watch_expected = self._expected_fuse_files(blob)
-                if watch_expected:
-                    watch_missing = await self._missing_fuse_files(target_mount, watch_expected)
-                    if watch_missing:
-                        log.warning(
-                            "re-inject watch-dir torrent %s: fuse content missing at %s (%d files); skipping blind injection",
-                            h[:10], target_mount, len(watch_missing),
-                        )
-                        continue
+                if not watch_expected:
+                    log.warning(
+                        "re-inject watch-dir torrent %s: cannot decode file list; skipping blind injection",
+                        h[:10],
+                    )
+                    continue
+                watch_missing = await self._missing_fuse_files(target_mount, watch_expected)
+                if watch_missing:
+                    log.warning(
+                        "re-inject watch-dir torrent %s: fuse content missing at %s (%d files); skipping blind injection",
+                        h[:10], target_mount, len(watch_missing),
+                    )
+                    continue
 
                 ok, detail = await self._ensure_fuse_entry(
                     blob=blob, infohash=h_low, target_mount=target_mount,
@@ -2449,7 +2465,7 @@ class Coordinator:
         """Re-add every racing-client torrent matching this content onto VPS2
         pointing at the fuse mount with skip_check=True.
         """
-        target_mount = self._target_mount_for(ts)
+        ts_fallback_mount = self._target_mount_for(ts)
         injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
         injected_set = set(injected)
 
@@ -2478,18 +2494,26 @@ class Coordinator:
                     continue
                 if not blob:
                     continue
-                # Per-match fuse gate: only inject torrents whose content is
-                # actually available at the target (same release name does not
-                # guarantee the bytes were moved).
+                # Per-torrent mount: ts.kind may be stale "unknown" (fresh
+                # adoption); the blob's own layout is authoritative.
+                target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
+                # Per-match fuse gate (fail-closed): only inject torrents
+                # whose content is actually available at the target (same
+                # release name does not guarantee the bytes were moved).
                 match_expected = self._expected_fuse_files(blob)
-                if match_expected:
-                    match_missing = await self._missing_fuse_files(target_mount, match_expected)
-                    if match_missing:
-                        log.warning(
-                            "re-inject: fuse content missing for %s (%s) at %s (%d files); skipping blind injection",
-                            t.infohash[:10], t.name[:50], target_mount, len(match_missing),
-                        )
-                        continue
+                if not match_expected:
+                    log.warning(
+                        "re-inject: cannot decode file list for %s; skipping blind injection",
+                        t.infohash[:10],
+                    )
+                    continue
+                match_missing = await self._missing_fuse_files(target_mount, match_expected)
+                if match_missing:
+                    log.warning(
+                        "re-inject: fuse content missing for %s (%s) at %s (%d files); skipping blind injection",
+                        t.infohash[:10], t.name[:50], target_mount, len(match_missing),
+                    )
+                    continue
                 ok, detail = await self._ensure_fuse_entry(
                     blob=blob, infohash=h_low, target_mount=target_mount,
                     label="racing torrent",
@@ -2522,7 +2546,20 @@ class Coordinator:
         if not new_torrents:
             return
 
-        target_mount = self._target_mount_for(ts)
+        # Ordering guard (fresh-DB trap): a DONE row whose save_path is not
+        # on fuse never completed its rclone move — injecting privates now
+        # would seed from fuse while the original bytes sit on SSD. Defer
+        # and self-heal back to MOVING so the move runs first.
+        if ts.save_path and not self._save_path_is_on_fuse(ts.save_path):
+            log.warning(
+                "late cross-seed: %s is DONE but save_path %s is not on fuse; "
+                "deferring %d late seed(s) until the SSD move completes",
+                ts.source_name[:50], ts.save_path, len(new_torrents),
+            )
+            await self._demote_false_done_to_moving(ts)
+            return
+
+        ts_fallback_mount = self._target_mount_for(ts)
         current_injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
         current_injected_set = set(current_injected)
         changed = False
@@ -2531,6 +2568,12 @@ class Coordinator:
             self._failed_late_cross_seeds = {}
 
         now_utc = dt.datetime.now(dt.timezone.utc)
+
+        # Repair the original entry first: the adopted public hash may still
+        # point at SSD while only privates get injected (reported symptom).
+        # Best-effort — a missing original blob must not block new seeds
+        # whose own fuse gate already proves the bytes are available.
+        await self._ensure_original_fuse_entry(ts, ts_fallback_mount)
 
         for t in new_torrents:
             h_low = t.infohash.lower()
@@ -2552,19 +2595,31 @@ class Coordinator:
                 log.warning("late cross-seed: no .torrent bytes available for %s", t.infohash[:10])
                 continue
 
-            # Fuse gate: a DONE row proves the original content moved, not
-            # that this late arrival's bytes did — verify before injecting.
-            # Missing content reuses the 30m failure backoff (no per-tick storm).
+            # Per-torrent mount: ts.kind may be stale "unknown" (fresh
+            # adoption) which routes movies/seasons to unsorted. The blob's
+            # own layout is authoritative.
+            target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
+
+            # Fuse gate (fail-closed): a DONE row proves the original content
+            # moved, not that this late arrival's bytes did — verify before
+            # injecting. Undecodable blobs and missing content reuse the 30m
+            # failure backoff (no per-tick storm, no blind skip_check seeds).
             late_expected = self._expected_fuse_files(blob)
-            if late_expected:
-                late_missing = await self._missing_fuse_files(target_mount, late_expected)
-                if late_missing:
-                    log.warning(
-                        "late cross-seed: fuse content missing for %s (%s) at %s (%d files); deferring injection",
-                        t.infohash[:10], t.name[:40], target_mount, len(late_missing),
-                    )
-                    self._failed_late_cross_seeds[h_low] = now_utc
-                    continue
+            if not late_expected:
+                log.warning(
+                    "late cross-seed: cannot decode file list for %s; deferring injection",
+                    t.infohash[:10],
+                )
+                self._failed_late_cross_seeds[h_low] = now_utc
+                continue
+            late_missing = await self._missing_fuse_files(target_mount, late_expected)
+            if late_missing:
+                log.warning(
+                    "late cross-seed: fuse content missing for %s (%s) at %s (%d files); deferring injection",
+                    t.infohash[:10], t.name[:40], target_mount, len(late_missing),
+                )
+                self._failed_late_cross_seeds[h_low] = now_utc
+                continue
 
             try:
                 ok, detail = await self._ensure_fuse_entry(
@@ -2598,6 +2653,110 @@ class Coordinator:
         if changed:
             ts.injected_private_hashes = ",".join(dict.fromkeys(current_injected))
             self.store.upsert(ts)
+
+    async def _demote_false_done_to_moving(self, ts: TorrentState) -> None:
+        """Self-heal a DONE row whose save_path never left SSD.
+
+        Fresh-DB recovery may have adopted an SSD-complete torrent as DONE
+        (stale save_path, pre-fix DB). The rclone move must run before any
+        fuse injection, so move the row back to MOVING when the SSD bytes
+        are still present. When the bytes cannot be confirmed, leave the row
+        alone (late seeds stay deferred by the caller).
+        """
+        h = (ts.dest_infohash or ts.source_infohash or "").lower()
+        if not h:
+            return
+        expected: list[tuple[str, int]] | None = None
+        try:
+            files = await self.dest_client.get_torrent_files(h)
+            expected = [
+                (str(f.name), int(f.size_bytes or 0))
+                for f in (files or []) if getattr(f, "name", "")
+            ] or None
+        except Exception:  # noqa: BLE001
+            expected = None
+        if not expected:
+            return
+        try:
+            from .recovery import find_content_on_ssd
+
+            ssd_root = find_content_on_ssd(self.cfg, expected)
+        except Exception:  # noqa: BLE001
+            return
+        if ssd_root is None:
+            return
+        try:
+            ts.save_path = str(ssd_root)
+            self.store.upsert(ts)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.transition(ts, State.MOVING)
+            log.warning(
+                "late cross-seed: demoted %s from DONE to MOVING; "
+                "SSD content at %s will move before fuse injection",
+                ts.source_name[:50], ssd_root,
+            )
+        except ValueError as e:
+            log.warning(
+                "late cross-seed: could not demote %s to MOVING: %s",
+                ts.source_infohash[:10], e,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "late cross-seed: demote failed for %s: %s",
+                ts.source_infohash[:10], e,
+            )
+
+    async def _ensure_original_fuse_entry(
+        self, ts: TorrentState, fallback_mount: Path
+    ) -> None:
+        """Ensure the original (adopted) hash also seeds from fuse.
+
+        The reported incident left the public SSD entry behind while only
+        privates were injected. Best-effort: missing/unverifiable original
+        blobs must not block new seeds whose own fuse gate already passed.
+        """
+        h = (ts.dest_infohash or ts.source_infohash or "").lower()
+        if not h:
+            return
+        # Dest-export only (no source RPC): the original entry's own bytes
+        # are the authoritative repair payload, and this keeps the late-tick
+        # free of extra source calls. Unavailable => skip repair; new seeds
+        # stay protected by their own per-torrent fuse gate.
+        blob: bytes | None = None
+        try:
+            export_fn = getattr(self.dest_client, "export_torrent", None)
+            if callable(export_fn):
+                candidate = await export_fn(h)
+                if isinstance(candidate, (bytes, bytearray)) and candidate:
+                    blob = bytes(candidate)
+        except Exception:  # noqa: BLE001
+            blob = None
+        if not blob:
+            return
+        target = self._target_mount_for_blob(blob, fallback_mount)
+        expected = self._expected_fuse_files(blob)
+        if not expected:
+            return
+        try:
+            missing = await self._missing_fuse_files(target, expected)
+        except Exception:  # noqa: BLE001
+            return
+        if missing:
+            return
+        try:
+            ok, detail = await self._ensure_fuse_entry(
+                blob=blob, infohash=h, target_mount=target,
+                label="original content",
+            )
+            if not ok:
+                log.warning(
+                    "late cross-seed: original %s fuse repair rejected: %s",
+                    h[:10], detail,
+                )
+        except Exception as e:  # noqa: BLE001
+            log.warning("late cross-seed: original %s fuse repair failed: %s", h[:10], e)
 
     async def _fetch_racing_torrent_bytes(self, infohash: str) -> bytes | None:
         """Fetch the raw .torrent bytes for a racing-client infohash.
@@ -2682,6 +2841,70 @@ class Coordinator:
         except Exception as e:  # noqa: BLE001
             log.warning("fuse availability check failed for %s: %s", mount, e)
             return [f"<availability check failed: {e}>"]
+
+    def _fuse_mount_strs(self) -> list[str]:
+        """Normalized fuse mount strings; [] when unconfigured/broken."""
+        try:
+            mounts = [self.cfg.rclone.fuse.mount, self.cfg.rclone.fuse.mount_unsorted]
+        except Exception:
+            return []
+        out: list[str] = []
+        for fm in mounts:
+            try:
+                s = str(fm).rstrip("/\\").replace("\\", "/")
+            except Exception:
+                continue
+            if s:
+                out.append(s)
+        return out
+
+    def _save_path_is_on_fuse(self, save_path: object) -> bool:
+        """True iff a client save_path points at a configured fuse mount."""
+        if not isinstance(save_path, str) or not save_path:
+            return False
+        sp = save_path.rstrip("/\\").replace("\\", "/")
+        for fm in self._fuse_mount_strs():
+            if sp == fm or sp.startswith(fm + "/"):
+                return True
+        return False
+
+    def _classify_blob_kind(self, blob: bytes | None) -> str:
+        """Classify .torrent bytes; "unknown" when undecodable or cfg broken."""
+        try:
+            if not blob or not isinstance(blob, (bytes, bytearray)):
+                return "unknown"
+            from .watchdir import extract_torrent_files_from_bencoded
+
+            files = extract_torrent_files_from_bencoded(bytes(blob))
+            if not files:
+                return "unknown"
+            kind = classify(files, self.cfg).kind
+            return kind if kind in ("movie", "season", "episode", "mixed", "unknown") else "unknown"
+        except Exception:
+            return "unknown"
+
+    def _target_mount_for_kind(self, kind: str, fallback: Path) -> Path:
+        """Fuse mount for a classification kind; fallback on error/unknown-cfg."""
+        try:
+            if kind in ("movie", "season"):
+                return Path(self.cfg.rclone.fuse.mount)
+            if kind in ("episode", "mixed", "unknown"):
+                return Path(self.cfg.rclone.fuse.mount_unsorted)
+        except Exception:
+            pass
+        return fallback
+
+    def _target_mount_for_blob(self, blob: bytes | None, fallback: Path) -> Path:
+        """Per-torrent fuse mount derived from the blob's own layout.
+
+        Fresh-DB adoptions start as "unknown" and would otherwise route every
+        late cross-seed to unsorted (wrong for movies/seasons, and the fuse
+        gate then checks the wrong directory). The blob is authoritative.
+        """
+        kind = self._classify_blob_kind(blob)
+        if kind == "unknown":
+            return fallback
+        return self._target_mount_for_kind(kind, fallback)
 
     def _save_path_points_at_target(self, save_path: object, target_mount: object) -> bool:
         """Does an existing client entry point at the fuse target we inject to?

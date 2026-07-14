@@ -370,12 +370,18 @@ async def test_re_inject_racing_torrents_case_insensitive():
 
 
 @pytest.mark.anyio
-async def test_check_and_inject_late_cross_seeds_normalizes_hash():
+async def test_check_and_inject_late_cross_seeds_normalizes_hash(tmp_path: Path):
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    fname = "Test.Movie.2026.mkv"
+    fsize = 1000
+    (fuse_dir / fname).write_bytes(b"m" * fsize)
+    blob = _single_file_torrent_bytes(fname, fsize)
     coord = object.__new__(Coordinator)
-    coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse/Test.Movie.2026"))
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord.dest_client = MagicMock()
     coord.dest_client.add_torrent = AsyncMock(return_value=AddResult(hash="new_h", accepted=True))
-    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=b"torrent_bytes")
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord.store = MagicMock()
 
     ts = TorrentState(
