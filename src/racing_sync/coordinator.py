@@ -2533,6 +2533,19 @@ class Coordinator:
         self, ts: TorrentState, group: list[Torrent]
     ) -> None:
         """Check if new cross-seeds arrived on VPS1 for a completed release and inject them to FUSE."""
+        # Ordering guard FIRST (before the no-new-torrents early return): a
+        # DONE row whose save_path is not on fuse never completed its rclone
+        # move. Nothing may inject until the SSD bytes move — demote so the
+        # MOVING worker runs first, even when this tick has no new arrivals.
+        if ts.save_path and not self._save_path_is_on_fuse(ts.save_path):
+            log.warning(
+                "late cross-seed: %s is DONE but save_path %s is not on fuse; "
+                "demoting to MOVING so the SSD move runs before any injection",
+                ts.source_name[:50], ts.save_path,
+            )
+            await self._demote_false_done_to_moving(ts)
+            return
+
         known_hashes = {
             h.lower() for h in (
                 ts.source_infohash,
@@ -2544,19 +2557,6 @@ class Coordinator:
 
         new_torrents = [t for t in group if t.infohash.lower() not in known_hashes]
         if not new_torrents:
-            return
-
-        # Ordering guard (fresh-DB trap): a DONE row whose save_path is not
-        # on fuse never completed its rclone move — injecting privates now
-        # would seed from fuse while the original bytes sit on SSD. Defer
-        # and self-heal back to MOVING so the move runs first.
-        if ts.save_path and not self._save_path_is_on_fuse(ts.save_path):
-            log.warning(
-                "late cross-seed: %s is DONE but save_path %s is not on fuse; "
-                "deferring %d late seed(s) until the SSD move completes",
-                ts.source_name[:50], ts.save_path, len(new_torrents),
-            )
-            await self._demote_false_done_to_moving(ts)
             return
 
         ts_fallback_mount = self._target_mount_for(ts)
@@ -2619,6 +2619,23 @@ class Coordinator:
                     t.infohash[:10], t.name[:40], target_mount, len(late_missing),
                 )
                 self._failed_late_cross_seeds[h_low] = now_utc
+                # Self-heal: content missing on fuse but still sitting on SSD
+                # (abrupt-stop leftover, or a fuse-pointing entry whose bytes
+                # never moved) must go through MOVING first — never inject
+                # around it. Best-effort; a failed SSD probe just defers.
+                try:
+                    from .recovery import find_content_on_ssd
+
+                    if find_content_on_ssd(self.cfg, late_expected) is not None:
+                        log.warning(
+                            "late cross-seed: %s missing on fuse but present on SSD; "
+                            "demoting %s to MOVING",
+                            t.infohash[:10], ts.source_name[:50],
+                        )
+                        await self._demote_false_done_to_moving(ts)
+                        return
+                except Exception:  # noqa: BLE001
+                    pass
                 continue
 
             try:
