@@ -416,3 +416,72 @@ async def test_false_done_with_ssd_save_path_demotes_and_moves_before_injecting(
     assert {e[1] for e in fuse_adds} == {pub_hash, *priv_hashes}
     assert max(dest.events.index(e) for e in rclone_evts) < min(dest.events.index(e) for e in fuse_adds)
     assert row.state == State.DONE
+
+
+@pytest.mark.anyio
+async def test_false_done_claiming_fuse_but_ssd_bytes_demotes(tmp_path: Path):
+    """DONE claims a fuse save_path but bytes never moved (SSD leftover).
+
+    Fuse gate misses, SSD probe hits → no injection, demote to MOVING so the
+    move runs first. This is the exact Tenmaku shape: nothing on the remote.
+    """
+    ssd = tmp_path / "ssd"
+    fuse = tmp_path / "fuse"
+    ssd.mkdir()
+    fuse.mkdir()
+    (ssd / FNAME).write_bytes(b"D" * FSIZE)
+
+    pub_blob = _mk_blob(PUB_ANNOUNCE)
+    priv_blobs = [_mk_blob(a) for a in PRIV_ANNOUNCES]
+    pub_hash = _bencoded_info_hash(pub_blob)[0].lower()
+
+    src = _FakeSource([pub_blob, *priv_blobs], [PUB_ANNOUNCE, *PRIV_ANNOUNCES])
+    dest = _FakeDest()
+    dest.seed(pub_blob, str(ssd), "racing", progress=1.0)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = _make_coord(ssd, fuse, store, src, dest)
+
+    # DB claims fuse, but the file only exists on SSD.
+    ts = TorrentState(
+        source_infohash=pub_hash, source_name=FNAME, dest_infohash=pub_hash,
+        save_path=str(fuse), total_bytes=FSIZE, state=State.DONE,
+    )
+    store.upsert(ts)
+
+    await coord._check_and_inject_late_cross_seeds(store.get(pub_hash), list(src.torrents))
+    row = store.get(pub_hash)
+    assert row.state == State.MOVING, "missing-on-fuse + present-on-SSD must demote to MOVING"
+    assert [e for e in dest.events if e[0] == "add"] == []
+    assert (ssd / FNAME).exists()
+    assert not (fuse / FNAME).exists()
+
+
+@pytest.mark.anyio
+async def test_false_done_with_no_new_arrivals_still_demotes(tmp_path: Path):
+    """Ordering guard runs even when this tick brings no new cross-seeds."""
+    ssd = tmp_path / "ssd"
+    fuse = tmp_path / "fuse"
+    ssd.mkdir()
+    fuse.mkdir()
+    (ssd / FNAME).write_bytes(b"D" * FSIZE)
+
+    pub_blob = _mk_blob(PUB_ANNOUNCE)
+    pub_hash = _bencoded_info_hash(pub_blob)[0].lower()
+
+    src = _FakeSource([pub_blob], [PUB_ANNOUNCE])
+    dest = _FakeDest()
+    dest.seed(pub_blob, str(ssd), "racing", progress=1.0)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = _make_coord(ssd, fuse, store, src, dest)
+
+    ts = TorrentState(
+        source_infohash=pub_hash, source_name=FNAME, dest_infohash=pub_hash,
+        save_path=str(ssd), total_bytes=FSIZE, state=State.DONE,
+    )
+    store.upsert(ts)
+
+    await coord._check_and_inject_late_cross_seeds(store.get(pub_hash), list(src.torrents))
+    row = store.get(pub_hash)
+    assert row.state == State.MOVING
