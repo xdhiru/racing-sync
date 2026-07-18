@@ -320,8 +320,10 @@ async def reconcile(
                     # Best-effort; a failed file listing keeps "unknown".
                     kind = await _classify_adopted(cfg, dest, h)
                 log.info(
-                    "reconcile: adopting existing completed/fuse torrent on VPS2 as %s: %s (%s)",
+                    "reconcile: adopting existing completed/fuse torrent on VPS2 as %s: %s (%s) "
+                    "save_path=%s on_fuse=%s complete=%s kind=%s",
                     adopt_state.value, name, h[:10],
+                    use_save_path, on_fuse, is_done, kind,
                 )
                 ts = TorrentState(
                     source_infohash=h,
