@@ -525,6 +525,9 @@ class Coordinator:
 
     async def start(self) -> None:
         log.info("coordinator starting")
+        # Build marker: proves which ordering-guarantee build a log file ran.
+        # Bump when the fresh-DB / late-seed ordering rules change.
+        log.info("build ordering-guard v3 active (move-before-inject, DONE->MOVING demotion)")
         self._warn_if_storage_paths_overlap()
         self._download_sem = asyncio.Semaphore(self.cfg.max_active_downloads)
         self._move_sem = asyncio.Semaphore(self.cfg.max_concurrent_moves)
