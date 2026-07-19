@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import shutil
 import signal
 import sys
 from pathlib import Path
@@ -49,12 +50,63 @@ async def _runner(coord: Coordinator) -> int:
         await coord.shutdown()
 
 
+def _do_reset(cfg: AppConfig) -> list[str]:
+    """Fresh start: delete state.db (+WAL/SHM) and clear the log directory.
+
+    Only touches the exact paths from the loaded config. Returns human-readable
+    lines describing what was removed (also printed to stdout by the caller).
+    Never raises on missing files — a fresh start on a clean machine is fine.
+    """
+    removed: list[str] = []
+    try:
+        db = Path(cfg.general.state_db)
+    except Exception:
+        db = None
+    if db is not None:
+        for candidate in (db, db.with_suffix(db.suffix + "-wal"), db.with_suffix(db.suffix + "-shm")):
+            try:
+                if candidate.is_file():
+                    candidate.unlink()
+                    removed.append(f"deleted file: {candidate}")
+            except OSError as e:
+                removed.append(f"could not delete {candidate}: {e}")
+    try:
+        log_dir = Path(cfg.general.log_dir)
+    except Exception:
+        log_dir = None
+    if log_dir is not None:
+        if log_dir.is_dir():
+            for child in sorted(log_dir.iterdir()):
+                try:
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child)
+                    elif child.is_file() or child.is_symlink():
+                        child.unlink()
+                    else:
+                        continue
+                    removed.append(f"deleted log entry: {child}")
+                except OSError as e:
+                    removed.append(f"could not delete {child}: {e}")
+        else:
+            removed.append(f"log dir does not exist, nothing to clear: {log_dir}")
+    if not removed:
+        removed.append("nothing to reset (no state.db or log entries found)")
+    return removed
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="racing-sync")
+    prog = Path(sys.argv[0]).name if argv is None and sys.argv else "racing-sync"
+    parser = argparse.ArgumentParser(prog=prog)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_run = sub.add_parser("run", help="Run the coordinator")
     p_run.add_argument("--config", type=Path, required=True)
+    p_run.add_argument(
+        "--reset",
+        action="store_true",
+        help="Fresh start: delete state.db (+WAL/SHM) and clear the log "
+             "directory before starting. The coordinator then starts normally.",
+    )
 
     p_check = sub.add_parser("check-config", help="Validate config and exit")
     p_check.add_argument("--config", type=Path, required=True)
@@ -73,6 +125,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "check-config":
         print(f"OK: {args.config}")
         return 0
+
+    if getattr(args, "reset", False):
+        for line in _do_reset(cfg):
+            print(line)
 
     try:
         setup_logging(cfg)

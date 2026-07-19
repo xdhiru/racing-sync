@@ -2,7 +2,13 @@
 
 Usage:
     python3 run.py run --config config.toml
+    python3 run.py run --config config.toml --reset
     python3 run.py check-config --config config.toml
+    python3 run.py --help
+    python3 run.py run --help
+
+--reset gives a fresh start: it deletes state.db (+WAL/SHM) and clears the
+log directory from the loaded config, then starts normally.
 
 Ctrl+C stops gracefully. Third-party dependencies (aiohttp, pydantic, ...)
 must exist in the active Python environment; only racing-sync itself runs

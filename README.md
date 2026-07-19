@@ -7,12 +7,50 @@ Two-VPS torrent synchroniser for racing workflows.
 
 ## Quickstart
 
+Run straight from source — no install step, so `git pull` + restart is the
+upgrade (third-party deps like `aiohttp`/`pydantic` must be in the env):
+
+```bash
+cp config.example.toml config.toml
+# edit config.toml
+python3 run.py run --config config.toml
+# Ctrl+C stops gracefully
+```
+
+Help for every command:
+
+```bash
+python3 run.py --help
+python3 run.py run --help
+```
+
+### Fresh start (`--reset`)
+
+Deletes `state.db` (+WAL/SHM sidecars) and clears the log directory from the
+loaded config, then starts normally. Use it instead of hand-deleting files:
+
+```bash
+python3 run.py run --config config.toml --reset
+```
+
+Validate a config without starting anything:
+
+```bash
+python3 run.py check-config --config config.toml
+```
+
+### Installed alternative
+
 ```bash
 pip install -e ".[api,test]"
 cp config.example.toml config.toml
 # edit config.toml
 racing-sync --config config.toml run
 ```
+
+Editable installs also track `git pull` (restart only). Avoid non-editable
+`pip install .` — it snapshots `src/` into site-packages and keeps running
+stale code after a pull.
 
 See `docs/architecture.md` for the full design.
 
