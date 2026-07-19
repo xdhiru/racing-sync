@@ -147,6 +147,34 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_runner(coord))
     except KeyboardInterrupt:
         return 130
+    except Exception as e:
+        # Startup failures (SFTP/auth/probe) previously dumped a raw
+        # traceback. Print a clean error plus the actionable hint instead.
+        print(f"Failed to start: {e}", file=sys.stderr)
+        hint = _startup_hint(e)
+        if hint:
+            print(hint, file=sys.stderr)
+        return 2
+
+
+def _startup_hint(exc: BaseException) -> str:
+    """Actionable hint for common startup failures (SFTP/host-key)."""
+    text = f"{type(exc).__name__}: {exc}"
+    if "known_hosts" in text or "host key" in text.lower():
+        return (
+            "Hint: the SSH host key is not trusted. Either pin it:\n"
+            "  ssh-keyscan -p <ssh_port> <ssh_host>"
+            " >> ~/.ssh/known_hosts\n"
+            "  (or into [source.deluge_sftp].known_hosts_path), or set\n"
+            "  [source.deluge_sftp].auto_add_host_key = true "
+            "(weaker: vulnerable to first-connection MITM)."
+        )
+    if "Authentication" in text or "auth" in text.lower():
+        return (
+            "Hint: SSH auth failed. Check [source.deluge_sftp].ssh_user plus "
+            "ssh_key_path/ssh_key_passphrase or ssh_password."
+        )
+    return ""
 
 
 if __name__ == "__main__":
