@@ -20,6 +20,87 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.mark.anyio
+async def test_fetch_retries_sftp_timeout_once():
+    """A single SFTP stall is retried; a clean miss is not."""
+    coord = object.__new__(Coordinator)
+    blob = _single_file_torrent_bytes("Retry.Show.mkv", 50)
+    coord.sftp = MagicMock()
+    coord.sftp.fetch_torrent = MagicMock(side_effect=[TimeoutError(), blob])
+    coord.source_client = MagicMock()
+    coord.source_client.export_torrent = AsyncMock(return_value=None)
+
+    out = await coord._fetch_racing_torrent_bytes("a" * 40)
+    assert out == blob
+    assert coord.sftp.fetch_torrent.call_count == 2
+    coord.source_client.export_torrent.assert_not_called()
+
+    coord.sftp.fetch_torrent = MagicMock(return_value=None)
+    out = await coord._fetch_racing_torrent_bytes("b" * 40)
+    assert out is None
+    assert coord.sftp.fetch_torrent.call_count == 1
+
+
+@pytest.mark.anyio
+async def test_fetch_deluge_export_failure_stays_debug(caplog):
+    """Deluge has no torrent-file RPC; the failed fallback must not warn."""
+    import logging
+    from racing_sync.clients.deluge import DelugeClient
+
+    coord = object.__new__(Coordinator)
+    coord.sftp = MagicMock()
+    coord.sftp.fetch_torrent = MagicMock(return_value=None)
+    coord.source_client = MagicMock(spec=DelugeClient)
+    coord.source_client.export_torrent = AsyncMock(
+        side_effect=Exception("deluge rpc core.get_torrent_file error: {'message': 'Unknown method'}")
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="racing_sync.coordinator"):
+        out = await coord._fetch_racing_torrent_bytes("c" * 40)
+    assert out is None
+    assert not [r for r in caplog.records
+                if r.levelno >= logging.WARNING and "export failed" in r.message]
+
+
+@pytest.mark.anyio
+async def test_late_fetch_failure_uses_backoff(tmp_path: Path):
+    """Unfetchable late seeds back off instead of hammering SFTP every tick."""
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord._target_mount_for = MagicMock(return_value=tmp_path)
+    coord.dest_client = AsyncMock()
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash=None, accepted=True, detail="Ok.")
+    )
+    coord.dest_client.export_torrent = AsyncMock(return_value=None)
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=None)
+    coord.store = MagicMock()
+    coord._failed_late_cross_seeds = {}
+
+    ts = TorrentState(
+        source_infohash="d" * 40,
+        source_name="Gone.Show",
+        dest_infohash="d" * 40,
+        injected_private_hashes="",
+        state=State.DONE,
+    )
+    group = [
+        Torrent(hash="d" * 40, name="Gone.Show", category="", save_path="",
+                size_bytes=10, state="seeding", progress=1.0),
+        Torrent(hash="e" * 40, name="Gone.Show", category="", save_path="",
+                size_bytes=10, state="seeding", progress=1.0),
+    ]
+
+    await coord._check_and_inject_late_cross_seeds(ts, group)
+    assert "e" * 40 in coord._failed_late_cross_seeds
+    coord.dest_client.add_torrent.assert_not_called()
+
+    # Second tick within backoff: fetch must not even be attempted.
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=None)
+    await coord._check_and_inject_late_cross_seeds(ts, group)
+    coord._fetch_racing_torrent_bytes.assert_not_called()
+
+
 def test_state_store_readd_fields_roundtrip(tmp_path: Path):
     db_path = tmp_path / "test.db"
     store = StateStore(db_path)
