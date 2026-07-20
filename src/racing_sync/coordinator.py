@@ -1524,6 +1524,21 @@ class Coordinator:
                 )
                 ts.dest_infohash = ext.hash.lower()
                 ts.save_path = ext.save_path
+                # Classify the verified fuse files so _target_mount_for()
+                # routes later RE_ADDING/late-seed gates at the right mount.
+                # Without this a season pack fast-tracked here keeps
+                # kind="unknown" (→ unsorted) while its bytes live at the
+                # default mount, and every later gate checks the wrong dir.
+                try:
+                    fast_kind = classify(fuse_files, self.cfg).kind
+                except Exception:  # noqa: BLE001
+                    fast_kind = "unknown"
+                if fast_kind and fast_kind != ts.classification_kind:
+                    ts.classification_kind = fast_kind
+                    try:
+                        self.store.upsert(ts)
+                    except Exception:  # noqa: BLE001
+                        pass
                 if self.cfg.cross_seed.inject_racing_torrents_to_fuse:
                     await self._re_inject_racing_torrents(ts)
                 self.transition(ts, State.DONE)

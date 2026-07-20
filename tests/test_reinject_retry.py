@@ -709,6 +709,66 @@ async def test_do_moving_persists_blob_for_adopted_rows_without_one(tmp_path: Pa
 
 
 @pytest.mark.anyio
+async def test_do_queued_fuse_fast_track_persists_classification(tmp_path: Path):
+    """A season pack fast-tracked QUEUED->DONE must remember kind=season.
+
+    Without this the row keeps kind="unknown" (-> unsorted mount) while its
+    bytes live at the default mount, so every later RE_ADDING/late-seed fuse
+    gate checks the wrong directory and parks forever (Chad/Harbor.Lights case).
+    """
+    from racing_sync.clients.abstract import TorrentFile
+
+    fuse_dir = tmp_path / "fuse"
+    (fuse_dir / "Pack.S01").mkdir(parents=True)
+    (fuse_dir / "Pack.S01" / "Pack.S01E01.mkv").write_bytes(b"a" * 100)
+    (fuse_dir / "Pack.S01" / "Pack.S01E02.mkv").write_bytes(b"b" * 100)
+    ssd_dir = tmp_path / "ssd"
+    ssd_dir.mkdir()
+
+    season_files = [
+        TorrentFile(name="Pack.S01/Pack.S01E01.mkv", size_bytes=100, progress=1.0),
+        TorrentFile(name="Pack.S01/Pack.S01E02.mkv", size_bytes=100, progress=1.0),
+    ]
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd_dir
+    coord.cfg.ssd.path = ssd_dir
+    coord.cfg.rclone.fuse.mount = fuse_dir
+    coord.cfg.rclone.fuse.mount_unsorted = fuse_dir / "unsorted"
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    ext = Torrent(
+        hash="b" * 40,
+        name="Pack.S01",
+        category="racing",
+        save_path=str(fuse_dir),
+        size_bytes=200,
+        state="seeding",
+        progress=1.0,
+    )
+    coord.dest_client.list_torrents = AsyncMock(return_value=[ext])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=season_files)
+    coord._list_source_torrents = AsyncMock(return_value=[])
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(
+        source_infohash="b" * 40,
+        source_name="Pack.S01",
+        save_path=str(ssd_dir),
+        state=State.QUEUED,
+    )
+    assert ts.classification_kind == "unknown"
+
+    await coord._do_queued(ts)
+
+    assert ts.state == State.DONE
+    assert ts.classification_kind == "season"
+    assert coord._target_mount_for(ts) == fuse_dir
+
+
+@pytest.mark.anyio
 async def test_do_queued_parks_to_readding_when_fuse_files_missing(tmp_path: Path):
     """A fuse-complete entry with missing bytes must NOT mark DONE — nor FAILED.
 
