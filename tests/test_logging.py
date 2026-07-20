@@ -121,6 +121,25 @@ def test_jsonl_formatter_scrubs_secrets_and_extra():
     assert data["safe_field"] == "safe_value"
 
 
+def test_setup_logging_silences_chatty_http_libraries(tmp_path):
+    from pathlib import Path
+
+    from racing_sync.config import AppConfig
+    from racing_sync.logging_setup import setup_logging
+
+    cfg = AppConfig.from_toml(Path(__file__).parent.parent / "config.example.toml")
+    cfg.general.log_dir = tmp_path / "logs"
+    cfg.logging_sink.enabled = False
+    setup_logging(cfg)
+    try:
+        for name in ("httpx", "httpcore", "httpcore.connection", "httpcore.http11"):
+            assert logging.getLogger(name).getEffectiveLevel() >= logging.WARNING
+    finally:
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+
+
 def test_sanitizing_formatter_scrubs_secrets_in_text_logs():
     from racing_sync.logging_setup import SanitizingFormatter, LOG_FORMAT, DATE_FORMAT
 
