@@ -2592,10 +2592,12 @@ class Coordinator:
                 blob = await self._fetch_racing_torrent_bytes(t.infohash)
             except Exception as e:  # noqa: BLE001
                 log.warning("late cross-seed: fetch %s failed: %s", t.infohash[:10], e)
+                self._failed_late_cross_seeds[h_low] = now_utc
                 continue
 
             if not blob:
                 log.warning("late cross-seed: no .torrent bytes available for %s", t.infohash[:10])
+                self._failed_late_cross_seeds[h_low] = now_utc
                 continue
 
             # Per-torrent mount: ts.kind may be stale "unknown" (fresh
@@ -2792,15 +2794,25 @@ class Coordinator:
             return None
 
         if self.sftp is not None:
-            try:
-                blob = await asyncio.wait_for(
-                    asyncio.to_thread(self.sftp.fetch_torrent, infohash),
-                    timeout=15.0,
-                )
-                if blob:
-                    return blob
-            except Exception as e:  # noqa: BLE001
-                log.warning("sftp fetch %s failed: %s", infohash[:10], e)
+            # One retry on timeout: several workers share a single paramiko
+            # SFTP connection behind a lock, so a burst of late/re-inject
+            # fetches can stall one call past the 15s budget. A clean miss
+            # (file absent) returns None and is not retried.
+            for attempt in (1, 2):
+                try:
+                    blob = await asyncio.wait_for(
+                        asyncio.to_thread(self.sftp.fetch_torrent, infohash),
+                        timeout=15.0,
+                    )
+                    if blob:
+                        return blob
+                    break
+                except (asyncio.TimeoutError, TimeoutError):
+                    log.warning("sftp fetch %s timed out after 15s (attempt %d/2)",
+                                infohash[:10], attempt)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("sftp fetch %s failed: %s", infohash[:10], e)
+                    break
 
         try:
             return await asyncio.wait_for(
@@ -2810,7 +2822,14 @@ class Coordinator:
         except AttributeError:
             return None
         except Exception as e:  # noqa: BLE001
-            log.warning("_fetch_racing_torrent_bytes export failed for %s: %s", infohash[:10], e)
+            # Deluge daemons expose no torrent-file RPC (SFTP is the
+            # mandatory path there, enforced by config validation), so a
+            # failed fallback is routine — keep it out of the warning log.
+            if self.sftp is not None and isinstance(self.source_client, DelugeClient):
+                log.debug("_fetch_racing_torrent_bytes deluge export unavailable for %s: %s",
+                          infohash[:10], e)
+            else:
+                log.warning("_fetch_racing_torrent_bytes export failed for %s: %s", infohash[:10], e)
             return None
 
     @staticmethod
