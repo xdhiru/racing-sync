@@ -3,7 +3,13 @@
 We drive rclone via `asyncio.create_subprocess_exec` so the coordinator can
 await moves without blocking. Each rclone invocation runs as:
 
-    rclone move <local> <remote> <extra_move_flags...>
+    rclone move <flags...> -- <local> <remote>
+
+All flags (including --config and extra_move_flags) go BEFORE the `--`
+end-of-flags marker; only the two positionals follow it. Anything after
+`--` is parsed as a positional, so flags placed there break the command
+(`Command move needs 2 arguments maximum`) — and positionals before `--`
+risk flag-injection from `-`-leading paths.
 
 Batch moves (per-episode) additionally carry `--include=...` patterns so
 only the targeted episodes of the season folder are uploaded.
@@ -85,7 +91,10 @@ def build_move_cmd(cfg: AppConfig, source: Path, dest_remote: str,
         raise RcloneError(f"refusing rclone dest_remote starting with '-': {dest_remote!r}")
     if include and not all(i.startswith("--include=") for i in include):
         raise RcloneError(f"include patterns must be '--include=...' form, got: {include!r}")
-    cmd = [str(cfg.rclone.binary), "move", "--", str(source), dest_remote]
+    # Flags first, `--` + positionals last: rclone parses everything after
+    # `--` as positionals, so --config/extra flags placed there become
+    # spurious "arguments" (rc=2). `--` still shields a `-`-leading source.
+    cmd = [str(cfg.rclone.binary), "move"]
     if cfg.rclone.config_path:
         cmd.extend(["--config", str(cfg.rclone.config_path)])
     cmd.extend(cfg.rclone.extra_move_flags)
@@ -93,6 +102,7 @@ def build_move_cmd(cfg: AppConfig, source: Path, dest_remote: str,
         cmd.extend(include)
     if extra:
         cmd.extend(extra)
+    cmd.extend(["--", str(source), dest_remote])
     return cmd
 
 
