@@ -54,11 +54,13 @@ FNAME = "Show.S01E01.mkv"
 FSIZE = 700
 
 
-def _member(h: str, upspeed: int = 0, leechers: int = 0, ratio: float = 2.0) -> Torrent:
+def _member(h: str, upspeed: int = 0, leechers: int = 0, ratio: float = 2.0,
+            added_on: int = 0) -> Torrent:
     return Torrent(
         hash=h, name=FNAME, category="", save_path="/vps1/data",
         size_bytes=FSIZE, state="seeding", progress=1.0, ratio=ratio,
         trackers=[], upspeed_bps=upspeed, num_leechers=leechers,
+        added_on=added_on,
     )
 
 
@@ -273,6 +275,46 @@ async def test_dry_run_deletes_nothing(tmp_path: Path):
 
 
 # ---- MOVING early pressure path ----
+
+@pytest.mark.anyio
+async def test_done_old_quiet_no_stamp_uses_added_on_fallback(tmp_path: Path):
+    """Pre-existing idle backlog clears on the first run, no grace wait.
+
+    No activity stamp was ever recorded, but every member was added days
+    ago and the swarm is quiet now: the race is verifiably over.
+    """
+    import time
+    pub = "a" * 40
+    added = int(time.time()) - 5 * 24 * 3600
+    store = StateStore(tmp_path / "s.db")
+    _row(store, pub, State.DONE, completed_h_ago=None, activity_h_ago=None,
+         injected="")
+    src = _FakeSource([_member(pub, added_on=added)])
+    dest = _FakeDest([pub])
+    coord = _make_coord(tmp_path, store, src, dest, _base_cfg(tmp_path))
+
+    await coord._maybe_cleanup_source()
+
+    assert [h for h, _ in src.deleted] == [pub]
+
+
+@pytest.mark.anyio
+async def test_done_fresh_torrent_no_stamp_waits_grace(tmp_path: Path):
+    """A torrent added minutes ago with no stamp can't prove idleness yet."""
+    import time
+    pub = "a" * 40
+    added = int(time.time()) - 120
+    store = StateStore(tmp_path / "s.db")
+    _row(store, pub, State.DONE, completed_h_ago=None, activity_h_ago=None,
+         injected="")
+    src = _FakeSource([_member(pub, added_on=added)])
+    dest = _FakeDest([pub])
+    coord = _make_coord(tmp_path, store, src, dest, _base_cfg(tmp_path))
+
+    await coord._maybe_cleanup_source()
+
+    assert src.deleted == []
+
 
 @pytest.mark.anyio
 async def test_moving_early_deletes_only_under_pressure(tmp_path: Path):
