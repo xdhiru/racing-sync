@@ -34,6 +34,13 @@ class Torrent:
     # Used by the coordinator to honour [source].min_age_seconds.
     # 0 means "unknown" (skips the age check).
     added_on: int = 0
+    # Live swarm activity, best-effort (0 when the client doesn't report
+    # them). Used by the VPS1 cleanup janitor to confirm a race is over
+    # before deleting: quiet = upspeed ~0 AND no leechers.
+    upspeed_bps: int = 0
+    num_leechers: int = 0
+    total_uploaded_bytes: int = 0
+    seeding_time_seconds: int = 0
 
     @property
     def infohash(self) -> str:

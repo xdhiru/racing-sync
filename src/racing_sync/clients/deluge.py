@@ -168,11 +168,26 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             "ratio",
             "trackers",
             "time_added",
+            # Swarm-activity keys for the VPS1 cleanup janitor (best-effort;
+            # a daemon that doesn't report them yields 0s, which the janitor
+            # treats as "activity unknown", never as "quiet").
+            "upload_payload_rate",
+            "num_seeds",
+            "num_peers",
+            "total_uploaded",
+            "seeding_time",
         ]
         info = await self._rpc("core.get_torrents_status", [filt, status_keys])
         rows = info or {}
         out: list[Torrent] = []
+        def _num(value: object) -> int:
+            try:
+                return int(float(value or 0))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return 0
         for h, status in rows.items():
+            peers = _num(status.get("num_peers"))
+            seeds = _num(status.get("num_seeds"))
             out.append(
                 Torrent(
                     hash=h,
@@ -188,6 +203,10 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     ),
                     files=[],
                     added_on=int(status.get("time_added", 0) or 0),
+                    upspeed_bps=_num(status.get("upload_payload_rate")),
+                    num_leechers=max(0, peers - seeds),
+                    total_uploaded_bytes=_num(status.get("total_uploaded")),
+                    seeding_time_seconds=_num(status.get("seeding_time")),
                 )
             )
         if hash_list:
