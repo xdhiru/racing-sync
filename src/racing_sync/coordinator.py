@@ -1414,7 +1414,7 @@ class Coordinator:
         if ts.state == State.DONE:
             if not await self._cleanup_fuse_healthy(ts):
                 return None
-            if age_s < grace_s and not self._cleanup_idle_confirmed(ts, now_utc, cfg):
+            if age_s < grace_s and not self._cleanup_idle_confirmed(ts, group, now_utc, cfg):
                 return None
         elif ts.state == State.MOVING:
             # Early pressure path: bytes are 100% on the VPS2 SSD (MOVING is
@@ -1427,7 +1427,7 @@ class Coordinator:
                 low_free = 0
             if not (low_free and free_bytes is not None and free_bytes < low_free):
                 return None
-            if not self._cleanup_idle_confirmed(ts, now_utc, cfg):
+            if not self._cleanup_idle_confirmed(ts, group, now_utc, cfg):
                 return None
             if not await self._cleanup_ssd_bytes_present(ts):
                 return None
@@ -1437,12 +1437,18 @@ class Coordinator:
         size = float(ts.total_bytes or sum(m.size_bytes for m in group) or 0)
         return (sort_key, size, ts, group)
 
-    def _cleanup_idle_confirmed(self, ts: TorrentState, now_utc: dt.datetime, cfg: object) -> bool:
+    def _cleanup_idle_confirmed(
+        self, ts: TorrentState, group: list[Torrent],
+        now_utc: dt.datetime, cfg: object,
+    ) -> bool:
         """Fast lane: swarm quiet now (checked by caller) AND quiet long enough.
 
-        Requires a previously recorded activity stamp older than the confirm
-        window — rows never observed active (stamp None) fail closed and wait
-        out the grace period instead.
+        Primary evidence is a previously recorded activity stamp older than
+        the confirm window. Fallback for rows that were never observed
+        active (e.g. pre-existing idle backlog): every member's client
+        `added_on` predates the window — a torrent cannot have raced before
+        it existed, so old + quiet now means finished. Unknown `added_on`
+        (<=0) fails closed and waits out the grace period instead.
         """
         try:
             window_s = float(getattr(cfg, "idle_confirm_minutes", 45) or 0) * 60.0
@@ -1451,10 +1457,22 @@ class Coordinator:
         if window_s <= 0:
             return True
         last = ts.vps1_last_activity_at
-        if last is None:
+        if last is not None:
+            try:
+                return (now_utc - last).total_seconds() >= window_s
+            except Exception:
+                return False
+        if not group:
             return False
         try:
-            return (now_utc - last).total_seconds() >= window_s
+            youngest_added = 0
+            for m in group:
+                added = int(m.added_on or 0)
+                if added <= 0:
+                    return False
+                youngest_added = max(youngest_added, added)
+            added_dt = dt.datetime.fromtimestamp(youngest_added, tz=dt.timezone.utc)
+            return (now_utc - added_dt).total_seconds() >= window_s
         except Exception:
             return False
 
