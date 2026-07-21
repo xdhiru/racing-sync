@@ -119,6 +119,12 @@ class TorrentState:
     readd_attempts: int = 0
     # Failure retry tracking
     failed_retries: int = 0
+    # VPS1 cleanup bookkeeping (see [cleanup]):
+    # - completed_at: last time the row entered DONE (grace anchor).
+    # - vps1_last_activity_at: last time the VPS1 swarm showed upload
+    #   activity (idle detection for fast-lane deletion).
+    completed_at: dt.datetime | None = None
+    vps1_last_activity_at: dt.datetime | None = None
     # Lifecycle
     state: State = State.NEW
     batch_index: int = 0
@@ -162,6 +168,12 @@ class TorrentState:
             ),
             "readd_attempts": self.readd_attempts,
             "failed_retries": self.failed_retries,
+            "completed_at":
+                self.completed_at.isoformat()
+                if self.completed_at else "",
+            "vps1_last_activity_at":
+                self.vps1_last_activity_at.isoformat()
+                if self.vps1_last_activity_at else "",
             "state": self.state.value,
             "batch_index": self.batch_index,
             "batches_total": self.batches_total,
@@ -193,6 +205,8 @@ CREATE TABLE IF NOT EXISTS torrent_state (
     readd_next_retry_at       TEXT NOT NULL DEFAULT '',
     readd_attempts            INTEGER NOT NULL DEFAULT 0,
     failed_retries           INTEGER NOT NULL DEFAULT 0,
+    completed_at             TEXT NOT NULL DEFAULT '',
+    vps1_last_activity_at    TEXT NOT NULL DEFAULT '',
     state                    TEXT NOT NULL,
     batch_index              INTEGER NOT NULL DEFAULT 0,
     batches_total            INTEGER NOT NULL DEFAULT 0,
@@ -231,7 +245,8 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = (
     "classification_kind, total_bytes, save_path, cross_seed_infohash, cross_seed_source, "
     "'' AS cross_seed_blob, injected_private_hashes, indexer_first_queried_at, "
     "indexer_next_retry_at, indexer_attempts, readd_first_attempted_at, "
-    "readd_next_retry_at, readd_attempts, failed_retries, state, batch_index, batches_total, "
+    "readd_next_retry_at, readd_attempts, failed_retries, completed_at, "
+    "vps1_last_activity_at, state, batch_index, batches_total, "
     "last_error, created_at, updated_at, telegram_message_id"
 )
 
@@ -294,6 +309,8 @@ class StateStore:
             "readd_next_retry_at": "TEXT NOT NULL DEFAULT ''",
             "readd_attempts": "INTEGER NOT NULL DEFAULT 0",
             "failed_retries": "INTEGER NOT NULL DEFAULT 0",
+            "completed_at": "TEXT NOT NULL DEFAULT ''",
+            "vps1_last_activity_at": "TEXT NOT NULL DEFAULT ''",
             "state": "TEXT NOT NULL DEFAULT 'new'",
             "batch_index": "INTEGER NOT NULL DEFAULT 0",
             "batches_total": "INTEGER NOT NULL DEFAULT 0",
@@ -483,6 +500,10 @@ class StateStore:
             ts.readd_first_attempted_at = None
             ts.readd_next_retry_at = None
             ts.readd_attempts = 0
+            # Grace anchor for the VPS1 cleanup janitor ([cleanup]): every
+            # entry into DONE restarts the clock (e.g. after a lost-fuse
+            # re-add cycle finishes seeding again).
+            ts.completed_at = dt.datetime.now(dt.timezone.utc)
         elif dst == State.RE_ADDING and src == State.DONE:
             # Fresh re-add cycle (e.g. lost fuse torrent via recovery):
             # stale timers from the previous cycle must not instantly trip
@@ -603,6 +624,16 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         ),
         readd_attempts=int(ra_attempts or 0),
         failed_retries=int(row["failed_retries"] or 0) if "failed_retries" in keys else 0,
+        completed_at=(
+            dt.datetime.fromisoformat(row["completed_at"])
+            if ("completed_at" in keys and row["completed_at"])
+            else None
+        ),
+        vps1_last_activity_at=(
+            dt.datetime.fromisoformat(row["vps1_last_activity_at"])
+            if ("vps1_last_activity_at" in keys and row["vps1_last_activity_at"])
+            else None
+        ),
         state=_safe_state(row["state"]) if "state" in keys else State.NEW,
         batch_index=int(row["batch_index"] or 0) if "batch_index" in keys else 0,
         batches_total=int(row["batches_total"] or 0) if "batches_total" in keys else 0,

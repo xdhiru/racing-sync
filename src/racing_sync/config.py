@@ -574,6 +574,84 @@ class RecoveryConfig(BaseModel):
 
 
 
+class CleanupConfig(BaseModel):
+    """VPS1 racing-client cleanup: reclaim disk after VPS2 owns the content.
+
+    Disabled by default (destructive — opt in deliberately). When enabled, an
+    hourly janitor deletes racing-client torrents (+data) whose content VPS2
+    has fully secured, oldest-eligible-first, capped per run:
+
+    - Normal path: row DONE + fuse entries re-verified + adaptive grace
+      elapsed (or race verifiably idle past `idle_confirm_minutes`).
+    - Early pressure path: row in MOVING/RE_ADDING (bytes 100% on VPS2 SSD,
+      pipeline mid-flight) + VPS1 group idle + free space under the low
+      watermark. VPS2 never pulls content bytes from VPS1 (SFTP carries only
+      the .torrent file), so a secured SSD copy makes VPS1's redundant.
+
+    Grace adapts to pressure so full autobrr days clear fast and quiet days
+    keep seeding: `grace = max(min_grace, min(space_curve, velocity_curve))`
+    where space_curve interpolates free space between the low/high
+    watermarks and velocity_curve interpolates intake arrivals/hour between
+    the calm/burst rates. Minimums (min_ratio/min_seed_hours) default to 0
+    (disabled) — valid only when both clients seed the SAME tracker account,
+    so VPS2's long-term fuse seeding keeps the account compliant.
+    """
+
+    enabled: bool = False
+    # Log what would be deleted without deleting anything. Run with true
+    # for a while and review before allowing real deletes.
+    dry_run: bool = True
+    # Grace bounds (hours) after VPS2 marks DONE.
+    min_grace_hours: float = Field(default=2.0, ge=0)
+    max_grace_hours: float = Field(default=72.0, ge=0)
+    # Free-space watermarks on VPS1 (bytes). At/below low -> min grace and
+    # biggest-first ordering; at/above high -> max grace, oldest-first.
+    low_watermark_free_bytes: int = Field(default=16106127360, ge=0)   # 15 GiB
+    high_watermark_free_bytes: int = Field(default=42949672960, ge=0)  # 40 GiB
+    # Below this, log loudly; grace stays floored at min (never zero).
+    critical_watermark_free_bytes: int = Field(default=8589934592, ge=0)  # 8 GiB
+    # Intake-velocity bounds (new racing releases/hour). At/above burst ->
+    # min grace; at/below calm -> no shortening.
+    burst_arrivals_per_hour: float = Field(default=8.0, ge=0)
+    calm_arrivals_per_hour: float = Field(default=2.0, ge=0)
+    # A race counts as finished after this many minutes with ~zero upload
+    # AND zero leechers. Fast-lanes deletion past the grace wait.
+    idle_confirm_minutes: float = Field(default=45.0, ge=0)
+    # Upload rate at/below this (B/s) counts as quiet for idle detection.
+    activity_upspeed_bps: int = Field(default=65536, ge=0)
+    # Optional H&R minimums (0 = disabled). Enable only with per-account
+    # needs; VPS2's fuse seeding normally keeps the account compliant.
+    min_ratio: float = Field(default=0.0, ge=0)
+    min_seed_hours: float = Field(default=0.0, ge=0)
+    # Case-insensitive substrings; matching release names are never deleted.
+    protected_patterns: list[str] = Field(default_factory=list)
+    # Remove data files as well as client entries (required to free disk).
+    # False = remove entries only (frees no space; useful for testing).
+    delete_files: bool = True
+    # Max content groups deleted per janitor run.
+    per_run_cap: int = Field(default=10, ge=1)
+    # Seconds between janitor runs.
+    janitor_interval_seconds: int = Field(default=3600, ge=300)
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "CleanupConfig":
+        if self.max_grace_hours < self.min_grace_hours:
+            raise ValueError("cleanup: max_grace_hours must be >= min_grace_hours")
+        if self.high_watermark_free_bytes <= self.low_watermark_free_bytes:
+            raise ValueError(
+                "cleanup: high_watermark_free_bytes must be > low_watermark_free_bytes"
+            )
+        if self.critical_watermark_free_bytes > self.low_watermark_free_bytes:
+            raise ValueError(
+                "cleanup: critical_watermark_free_bytes must be <= low_watermark_free_bytes"
+            )
+        if self.burst_arrivals_per_hour <= self.calm_arrivals_per_hour:
+            raise ValueError(
+                "cleanup: burst_arrivals_per_hour must be > calm_arrivals_per_hour"
+            )
+        return self
+
+
 class APIConfig(BaseModel):
     """Configuration for the HTTP API daemon.
 
@@ -636,6 +714,7 @@ class AppConfig(BaseModel):
     prowlarr: ProwlarrConfig = ProwlarrConfig()
     cross_seed: CrossSeedConfig = CrossSeedConfig()
     recovery: RecoveryConfig = RecoveryConfig()
+    cleanup: CleanupConfig = CleanupConfig()
 
     @classmethod
     def from_toml(cls, path: str | Path) -> "AppConfig":

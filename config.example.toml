@@ -408,6 +408,50 @@ auto_retry_failed = true
 max_failed_retries = 3
 
 # ============================================================
+# VPS1 cleanup — reclaim racing-client disk after VPS2 owns it
+# ============================================================
+
+[cleanup]
+# Master switch. Destructive — opt in deliberately, and run with
+# dry_run = true first to review "would delete" lines in the log.
+enabled = false
+# Log candidates without deleting anything.
+dry_run = true
+# Grace bounds (hours) after VPS2 marks a row DONE. The janitor
+# interpolates between them from live pressure (see below), so full
+# autobrr days clear in ~min_grace and quiet days seed up to max_grace.
+min_grace_hours = 2
+max_grace_hours = 72
+# VPS1 free-space watermarks (bytes). At/below low -> min grace and
+# biggest-first ordering; at/above high -> max grace, oldest-first.
+# Calibrate to the VPS1 disk (example: 80 GiB disk -> 15/40 GiB).
+low_watermark_free_bytes = 16106127360    # 15 GiB
+high_watermark_free_bytes = 42949672960   # 40 GiB
+# Below this, log loudly; grace stays floored at min (never zero).
+critical_watermark_free_bytes = 8589934592  # 8 GiB
+# Intake-velocity bounds (new racing releases/hour, rolling). At/above
+# burst -> min grace (spam-uploader dumps); at/below calm -> no effect.
+burst_arrivals_per_hour = 8
+calm_arrivals_per_hour = 2
+# A race counts as finished after this many minutes with ~zero upload
+# AND zero leechers. Verified-idle rows skip the grace wait (fast lane).
+idle_confirm_minutes = 45
+# Upload rate at/below this (B/s) counts as quiet for idle detection.
+activity_upspeed_bps = 65536
+# Optional H&R minimums, checked on every group member (0 = disabled).
+# Only enable with per-account needs; both clients must seed the SAME
+# tracker account for VPS2's fuse seeding to keep it compliant.
+min_ratio = 0.0
+min_seed_hours = 0.0
+# Case-insensitive substrings; matching releases are never deleted.
+protected_patterns = []
+# Remove data files as well as client entries (required to free disk).
+delete_files = true
+# Max content groups deleted per janitor run + seconds between runs.
+per_run_cap = 10
+janitor_interval_seconds = 3600
+
+# ============================================================
 # Control API (optional, FastAPI)
 # ============================================================
 

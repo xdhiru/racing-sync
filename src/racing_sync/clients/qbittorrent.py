@@ -417,6 +417,12 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
     infohash = str(d.get("hash") or "").strip().lower()
     if not infohash:
         raise ValueError(f"qB torrent row missing infohash: {d!r}")
+    def _num(value: object, default: int = 0) -> int:
+        try:
+            return int(float(value or 0))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default
+
     return Torrent(
         hash=infohash,
         name=torrent_name or infohash,
@@ -429,6 +435,10 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
         trackers=[],
         files=[],
         added_on=int(d.get("added_on") or 0),
+        upspeed_bps=_num(d.get("upspeed")),
+        num_leechers=_num(d.get("num_leechs")),
+        total_uploaded_bytes=_num(d.get("uploaded")),
+        seeding_time_seconds=_num(d.get("seeding_time")),
     )
 
 

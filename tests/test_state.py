@@ -320,6 +320,30 @@ def test_transition_resets_retry_timers(tmp_path: Path):
         store.close()
 
 
+def test_transition_to_done_sets_completed_at(tmp_path: Path):
+    import datetime as dt
+    store = StateStore(tmp_path / "test_done_at.db")
+    try:
+        ts = TorrentState(source_infohash="4" * 40, state=State.QUEUED)
+        assert ts.completed_at is None
+        store.upsert(ts)
+        before = dt.datetime.now(dt.timezone.utc)
+        store.transition(ts, State.DONE)
+        assert ts.completed_at is not None
+        assert ts.completed_at >= before
+        reloaded = store.get("4" * 40)
+        assert reloaded is not None
+        assert reloaded.completed_at is not None
+        assert reloaded.vps1_last_activity_at is None
+        # Activity timestamp round-trips too.
+        stamp = dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
+        reloaded.vps1_last_activity_at = stamp
+        store.upsert(reloaded)
+        assert store.get("4" * 40).vps1_last_activity_at == stamp
+    finally:
+        store.close()
+
+
 def test_migrate_handles_old_schema_without_telegram_or_indexer(tmp_path: Path):
     import sqlite3
     db_path = tmp_path / "old.db"
