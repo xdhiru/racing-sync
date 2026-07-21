@@ -246,6 +246,70 @@ def test_render_detail_and_active_4096_char_cap():
 
 
 @pytest.mark.anyio
+async def test_active_repost_deletes_and_resends_as_newest():
+    import time
+    from unittest.mock import AsyncMock, MagicMock
+    bot = object.__new__(TelegramBot)
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345",
+                              active_repost_interval_seconds=10)
+    bot._bot = MagicMock()
+    bot._bot.delete_message = AsyncMock()
+    bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=222))
+    bot._bot.edit_message_text = AsyncMock()
+    bot._store = MagicMock()
+    bot._store.list_active_inflight.return_value = []
+    bot._store.set_meta = MagicMock()
+    bot._coord = MagicMock()
+    bot._coord.live_progress_map.return_value = {}
+    bot._current_page = 0
+    bot._active_msg_id = 111
+    bot._prev_active_msg_id = 111
+    bot._last_active_cache = None
+    bot._last_repost_monotonic = time.monotonic() - 30.0
+
+    await bot._refresh_active_message()
+
+    bot._bot.delete_message.assert_awaited_once_with(chat_id="12345", message_id=111)
+    bot._bot.send_message.assert_awaited_once()
+    send_kwargs = bot._bot.send_message.call_args[1]
+    assert send_kwargs.get("disable_notification") is True
+    bot._bot.edit_message_text.assert_not_called()
+    assert bot._active_msg_id == 222
+
+
+@pytest.mark.anyio
+async def test_active_repost_skipped_when_disabled_or_not_due():
+    import time
+    from unittest.mock import AsyncMock, MagicMock
+    for interval, last_repost_ago in ((0, 3600.0), (60, 5.0)):
+        bot = object.__new__(TelegramBot)
+        bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345",
+                                  active_repost_interval_seconds=interval)
+        bot._bot = MagicMock()
+        bot._bot.delete_message = AsyncMock()
+        bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=333))
+        bot._bot.edit_message_text = AsyncMock()
+        bot._store = MagicMock()
+        bot._store.list_active_inflight.return_value = []
+        bot._store.set_meta = MagicMock()
+        bot._coord = MagicMock()
+        bot._coord.live_progress_map.return_value = {}
+        bot._current_page = 0
+        bot._active_msg_id = 111
+        bot._prev_active_msg_id = 111
+        bot._last_active_cache = None
+        bot._last_repost_monotonic = time.monotonic() - last_repost_ago
+
+        await bot._refresh_active_message()
+
+        bot._bot.delete_message.assert_not_called()
+        bot._bot.send_message.assert_not_called()
+        # Identical content still takes the quiet edit path, not a repost.
+        bot._bot.edit_message_text.assert_awaited_once()
+        assert bot._active_msg_id == 111
+
+
+@pytest.mark.anyio
 async def test_callback_authentication_and_throttling():
     from unittest.mock import AsyncMock, MagicMock
     bot = object.__new__(TelegramBot)

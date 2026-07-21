@@ -9,9 +9,12 @@ stays clean:
      final DONE message stays in the chat as a clean history record.
      The message_id is persisted in torrent_state.telegram_message_id.
 
-  2. **Active-tasks message** — one message at the bottom of the chat that
-     lists every torrent currently in flight (anything != DONE / FAILED).
-     Edited every status_update_interval. Pinned if pin_status_message=true.
+   2. **Active-tasks message** — one message at the bottom of the chat that
+      lists every torrent currently in flight (anything != DONE / FAILED).
+      Edited every status_update_interval. Pinned if pin_status_message=true.
+      Optionally re-posted (deleted + silently resent) every
+      active_repost_interval_seconds so it stays the newest message even
+      when per-torrent updates scroll the chat.
 
 App logging goes to local files only (no Telegram forwarding).
 """
@@ -367,6 +370,9 @@ class TelegramBot:
         self._last_active_text: str = ""
         self._last_active_cache: tuple[int, int, str] | None = None
         self._last_callback_time: float = 0.0
+        # Last monotonic timestamp of an active-message (re)post, for the
+        # keep-at-bottom repost interval.
+        self._last_repost_monotonic: float = 0.0
         # Serializes periodic active-message refresh vs callback-triggered
         # refresh so they can't interleave edits / race the dedup cache.
         self._active_lock = asyncio.Lock()
@@ -773,9 +779,12 @@ class TelegramBot:
         self._current_page = cur_page
         keyboard = self._build_keyboard(cur_page, total_pages)
 
-        # Skip the API call if page, total_pages, and text are identical
+        # Skip the API call if page, total_pages, and text are identical —
+        # unless a keep-at-bottom repost is due (position refreshes even
+        # when the content is unchanged).
         cache_key = (cur_page, total_pages, text)
-        if cache_key == self._last_active_cache and self._active_msg_id is not None:
+        repost_due = self._repost_due()
+        if cache_key == self._last_active_cache and self._active_msg_id is not None and not repost_due:
             return
         self._last_active_text = text
 
@@ -800,6 +809,7 @@ class TelegramBot:
                 self._active_msg_id = sent.message_id
                 self._prev_active_msg_id = sent.message_id
                 self._last_active_cache = cache_key
+                self._last_repost_monotonic = time.monotonic()
                 await asyncio.to_thread(
                     self._store.set_meta, "telegram_active_msg_id", str(sent.message_id)
                 )
@@ -816,6 +826,7 @@ class TelegramBot:
                         self._active_msg_id = sent.message_id
                         self._prev_active_msg_id = sent.message_id
                         self._last_active_cache = cache_key
+                        self._last_repost_monotonic = time.monotonic()
                         await asyncio.to_thread(
                             self._store.set_meta, "telegram_active_msg_id", str(sent.message_id)
                         )
@@ -824,6 +835,9 @@ class TelegramBot:
                 else:
                     log.warning("active-tasks send failed: %s", e)
         else:
+            if repost_due:
+                await self._repost_active_message(text, keyboard, cache_key)
+                return
             try:
                 await self._bot.edit_message_text(
                     text,
@@ -893,6 +907,90 @@ class TelegramBot:
 
                 # Other errors — keep message_id for next retry
                 log.warning("active-tasks edit failed (%s); keeping message_id for next retry", e)
+
+    def _repost_interval(self) -> float:
+        """Keep-at-bottom cadence in seconds; 0.0 means disabled."""
+        try:
+            raw = float(getattr(self._cfg, "active_repost_interval_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        if raw <= 0:
+            return 0.0
+        return max(5.0, raw)
+
+    def _repost_due(self) -> bool:
+        """True when a silent delete+resend is due to keep the message last."""
+        interval = self._repost_interval()
+        if interval <= 0:
+            return False
+        if not self._active_msg_id or self._active_msg_id == -1:
+            return False
+        try:
+            last = float(getattr(self, "_last_repost_monotonic", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            last = 0.0
+        return (time.monotonic() - last) >= interval
+
+    async def _repost_active_message(
+        self, text: str, keyboard: InlineKeyboardMarkup | None,
+        cache_key: tuple[int, int, str],
+    ) -> None:
+        """Delete the old active message and resend it silently as newest.
+
+        Sends with notifications disabled so the periodic bump never buzzes
+        the chat. Any failure degrades to "resend fresh next tick" — the id
+        is cleared so the next refresh takes the normal send path.
+        """
+        assert self._bot is not None
+        old_id = self._active_msg_id
+        try:
+            await self._bot.delete_message(
+                chat_id=self._cfg.chat_id,
+                message_id=old_id,
+            )
+        except Exception:
+            pass
+        try:
+            try:
+                sent = await self._bot.send_message(
+                    self._cfg.chat_id, text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=keyboard,
+                    disable_notification=True,
+                )
+            except TelegramError as e:
+                msg = str(e).lower()
+                if "can't parse" in msg or "entity" in msg:
+                    sent = await self._bot.send_message(
+                        self._cfg.chat_id, text,
+                        reply_markup=keyboard,
+                        disable_notification=True,
+                    )
+                else:
+                    raise
+        except (RetryAfter, TimedOut, NetworkError) as e:
+            log.warning("active-tasks repost skipped due to temporary network/rate-limit (%s); will retry next interval", e)
+            self._active_msg_id = None
+            self._last_active_cache = None
+            await asyncio.to_thread(
+                self._store.set_meta, "telegram_active_msg_id", ""
+            )
+            return
+        except TelegramError as e:
+            log.warning("active-tasks repost failed (%s); will resend next interval", e)
+            self._active_msg_id = None
+            self._last_active_cache = None
+            await asyncio.to_thread(
+                self._store.set_meta, "telegram_active_msg_id", ""
+            )
+            return
+        self._active_msg_id = sent.message_id
+        self._prev_active_msg_id = sent.message_id
+        self._last_active_cache = cache_key
+        self._last_repost_monotonic = time.monotonic()
+        await asyncio.to_thread(
+            self._store.set_meta, "telegram_active_msg_id", str(sent.message_id)
+        )
 
     async def _reconcile_pinned(self) -> None:
         """Telegram allows at most one pinned message per chat; pin ours."""
