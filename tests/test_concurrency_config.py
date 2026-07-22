@@ -492,7 +492,16 @@ async def test_pick_ssd_source_public_and_private_paths():
 
     hit = MagicMock(title="Priv.Movie", size_bytes=1000, download_url="http://indexer/1", guid="0123456789012345678901234567890123456789")
     prowlarr.best_match.return_value = hit
-    prowlarr.download_torrent.return_value = b"prowlarr_blob"
+    from racing_sync.watchdir import _bencode
+    prowlarr.download_torrent.return_value = _bencode({
+        b"announce": b"http://indexer/announce",
+        b"info": {
+            b"name": b"Priv.Movie",
+            b"length": 1000,
+            b"piece length": 16384,
+            b"pieces": b"12345678901234567890",
+        },
+    })
 
     dec_priv = await pick_ssd_source_for_racing(
         cfg=cfg_priv,
@@ -504,8 +513,8 @@ async def test_pick_ssd_source_public_and_private_paths():
     )
     assert dec_priv is not None
     assert dec_priv.source_label == "indexer-cross-seed"
-    assert dec_priv.torrent_bytes == b"prowlarr_blob"
-    assert dec_priv.infohash == ""
+    assert dec_priv.torrent_bytes == prowlarr.download_torrent.return_value
+    assert len(dec_priv.infohash) == 40
 
 
 @pytest.mark.anyio
