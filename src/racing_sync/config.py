@@ -299,9 +299,9 @@ class TelegramConfig(BaseModel):
     outbound_rate: int = Field(default=5, ge=1)
     # Number of active tasks displayed per page in the status message (default: 5)
     page_size: int = Field(default=5, ge=1)
-    # Re-post (delete + resend, silent) the active-tasks message every N
-    # seconds so it stays the newest message at the bottom of the chat
-    # instead of scrolling away under per-torrent updates.
+    # Re-post (delete + resend, silent) the active-tasks message when our
+    # own newer traffic has buried it, at most every N seconds, so it
+    # returns to newest-message position. Never fires while already last.
     # 0 = disabled (edit in place, today's behavior). Values 1-4 are
     # clamped to 5 to respect Telegram rate limits.
     active_repost_interval_seconds: int = Field(default=0, ge=0)
