@@ -12,9 +12,10 @@ stays clean:
    2. **Active-tasks message** — one message at the bottom of the chat that
       lists every torrent currently in flight (anything != DONE / FAILED).
       Edited every status_update_interval. Pinned if pin_status_message=true.
-      Optionally re-posted (deleted + silently resent) every
-      active_repost_interval_seconds so it stays the newest message even
-      when per-torrent updates scroll the chat.
+      Optionally re-posted (deleted + silently resent) when our own newer
+      messages have buried it AND active_repost_interval_seconds has elapsed,
+      so it returns to newest-message position without churning while it is
+      already last.
 
 App logging goes to local files only (no Telegram forwarding).
 """
@@ -373,6 +374,11 @@ class TelegramBot:
         # Last monotonic timestamp of an active-message (re)post, for the
         # keep-at-bottom repost interval.
         self._last_repost_monotonic: float = 0.0
+        # Newest outbound message id this bot knows it sent. The Bot API
+        # cannot report chat history, so burial is detected from our own
+        # traffic (per-torrent cards are what floods this chat): a repost
+        # is only due when something newer than the active message exists.
+        self._newest_outbound_id: int | None = None
         # Serializes periodic active-message refresh vs callback-triggered
         # refresh so they can't interleave edits / race the dedup cache.
         self._active_lock = asyncio.Lock()
@@ -402,12 +408,16 @@ class TelegramBot:
                 self._prev_active_msg_id = self._active_msg_id
             except ValueError:
                 pass
+        # Assume the restored message is still last until our own traffic
+        # proves otherwise — avoids an instant delete+resend on restart.
+        self._newest_outbound_id = self._active_msg_id
         self._detail_worker = asyncio.create_task(
             self._detail_worker_loop(), name="rs-telegram-detail",
         )
         try:
             # Send initial "online" message (separate from active-tasks)
-            await self._bot.send_message(self._cfg.chat_id, "racing-sync online")
+            sent_online = await self._bot.send_message(self._cfg.chat_id, "racing-sync online")
+            self._note_outbound(getattr(sent_online, "message_id", None))
         except TelegramError as e:
             log.warning("telegram probe failed: %s", e)
         self._task = asyncio.create_task(self._loop(), name="rs-telegram")
@@ -585,6 +595,7 @@ class TelegramBot:
                         )
                     else:
                         raise
+                self._note_outbound(getattr(sent, "message_id", None))
                 self._detail_cache[infohash] = sent.message_id
                 await asyncio.to_thread(
                     self._store.set_telegram_message_id,
@@ -617,6 +628,7 @@ class TelegramBot:
                                 )
                             else:
                                 raise
+                        self._note_outbound(getattr(sent, "message_id", None))
                         self._detail_cache[infohash] = sent.message_id
                         await asyncio.to_thread(
                             self._store.set_telegram_message_id,
@@ -810,6 +822,7 @@ class TelegramBot:
                 self._prev_active_msg_id = sent.message_id
                 self._last_active_cache = cache_key
                 self._last_repost_monotonic = time.monotonic()
+                self._note_outbound(sent.message_id)
                 await asyncio.to_thread(
                     self._store.set_meta, "telegram_active_msg_id", str(sent.message_id)
                 )
@@ -827,6 +840,7 @@ class TelegramBot:
                         self._prev_active_msg_id = sent.message_id
                         self._last_active_cache = cache_key
                         self._last_repost_monotonic = time.monotonic()
+                        self._note_outbound(sent.message_id)
                         await asyncio.to_thread(
                             self._store.set_meta, "telegram_active_msg_id", str(sent.message_id)
                         )
@@ -919,17 +933,39 @@ class TelegramBot:
         return max(5.0, raw)
 
     def _repost_due(self) -> bool:
-        """True when a silent delete+resend is due to keep the message last."""
+        """True when the active message is buried AND a resend is due.
+
+        Burial is proven by our own newer outbound traffic (per-torrent
+        detail cards, notifications) carrying a higher message id — the Bot
+        API exposes no chat history. No newer traffic means the message is
+        still last and a delete+resend would be pure churn.
+        """
         interval = self._repost_interval()
         if interval <= 0:
             return False
         if not self._active_msg_id or self._active_msg_id == -1:
+            return False
+        newest = getattr(self, "_newest_outbound_id", None)
+        if not isinstance(newest, int) or newest <= self._active_msg_id:
             return False
         try:
             last = float(getattr(self, "_last_repost_monotonic", 0.0) or 0.0)
         except (TypeError, ValueError):
             last = 0.0
         return (time.monotonic() - last) >= interval
+
+    def _note_outbound(self, message_id: object) -> None:
+        """Record an outbound message id for burial detection (best-effort)."""
+        try:
+            mid = int(message_id)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return
+        try:
+            cur = getattr(self, "_newest_outbound_id", None)
+            if not isinstance(cur, int) or mid > cur:
+                self._newest_outbound_id = mid
+        except Exception:
+            pass
 
     async def _repost_active_message(
         self, text: str, keyboard: InlineKeyboardMarkup | None,
@@ -988,6 +1024,7 @@ class TelegramBot:
         self._prev_active_msg_id = sent.message_id
         self._last_active_cache = cache_key
         self._last_repost_monotonic = time.monotonic()
+        self._note_outbound(sent.message_id)
         await asyncio.to_thread(
             self._store.set_meta, "telegram_active_msg_id", str(sent.message_id)
         )
@@ -1015,14 +1052,16 @@ class TelegramBot:
             return
         truncated = _safe_truncate_markdown(message)
         try:
-            await self._bot.send_message(
+            sent = await self._bot.send_message(
                 self._cfg.chat_id, truncated, parse_mode=ParseMode.MARKDOWN,
             )
+            self._note_outbound(getattr(sent, "message_id", None))
         except TelegramError as e:
             # Fallback without parse_mode if Markdown parsing or entity error occurs
             log.warning("telegram notify markdown failed (%s); retrying as plain text", e)
             try:
                 plain_text = message[:4093] + "..." if len(message) > 4096 else message
-                await self._bot.send_message(self._cfg.chat_id, plain_text)
+                sent = await self._bot.send_message(self._cfg.chat_id, plain_text)
+                self._note_outbound(getattr(sent, "message_id", None))
             except TelegramError as e2:
                 log.warning("telegram notify failed: %s", e2)
