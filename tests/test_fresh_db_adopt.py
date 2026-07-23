@@ -485,3 +485,77 @@ async def test_false_done_with_no_new_arrivals_still_demotes(tmp_path: Path):
     await coord._check_and_inject_late_cross_seeds(store.get(pub_hash), list(src.torrents))
     row = store.get(pub_hash)
     assert row.state == State.MOVING
+
+
+@pytest.mark.anyio
+async def test_done_stale_save_path_repairs_forward_when_fuse_healthy(tmp_path: Path):
+    """A healthy DONE row with a stale SSD save_path must NOT demote.
+
+    Regression for the demote loop: the pipeline finished (bytes moved,
+    entries seeding from fuse) but save_path was never updated. The guard
+    repairs save_path forward and late cross-seeds inject normally.
+    """
+    ssd = tmp_path / "ssd"
+    fuse = tmp_path / "fuse"
+    ssd.mkdir()
+    fuse.mkdir()
+    (fuse / FNAME).write_bytes(b"D" * FSIZE)
+
+    pub_blob = _mk_blob(PUB_ANNOUNCE)
+    priv_blob = _mk_blob(PRIV_ANNOUNCES[0])
+    pub_hash = _bencoded_info_hash(pub_blob)[0].lower()
+    priv_hash = _bencoded_info_hash(priv_blob)[0].lower()
+    assert priv_hash != pub_hash
+
+    src = _FakeSource([pub_blob, priv_blob], [PUB_ANNOUNCE, PRIV_ANNOUNCES[0]])
+    dest = _FakeDest()
+    dest.seed(pub_blob, str(fuse), "racing", progress=1.0)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = _make_coord(ssd, fuse, store, src, dest)
+
+    ts = TorrentState(
+        source_infohash=pub_hash, source_name=FNAME, dest_infohash=pub_hash,
+        save_path=str(ssd), total_bytes=FSIZE, state=State.DONE,
+        cross_seed_blob=pub_blob, injected_private_hashes=pub_hash,
+    )
+    store.upsert(ts)
+
+    await coord._check_and_inject_late_cross_seeds(store.get(pub_hash), list(src.torrents))
+    row = store.get(pub_hash)
+    assert row.state == State.DONE, "healthy DONE must not demote"
+    assert row.save_path == str(fuse), "stale SSD save_path must repair forward to fuse"
+    fuse_adds = [e for e in dest.events if e[0] == "add" and e[2] == str(fuse)]
+    assert priv_hash in {e[1] for e in fuse_adds}
+    assert not [e for e in dest.events if e[0] == "rclone"]
+
+
+@pytest.mark.anyio
+async def test_re_add_success_points_save_path_at_fuse(tmp_path: Path):
+    """RE_ADDING -> DONE records the fuse mount, not the SSD dir."""
+    ssd = tmp_path / "ssd"
+    fuse = tmp_path / "fuse"
+    ssd.mkdir()
+    fuse.mkdir()
+    (fuse / FNAME).write_bytes(b"D" * FSIZE)
+
+    pub_blob = _mk_blob(PUB_ANNOUNCE)
+    pub_hash = _bencoded_info_hash(pub_blob)[0].lower()
+
+    src = _FakeSource([pub_blob], [PUB_ANNOUNCE])
+    dest = _FakeDest()
+
+    store = StateStore(tmp_path / "state.db")
+    coord = _make_coord(ssd, fuse, store, src, dest)
+
+    ts = TorrentState(
+        source_infohash=pub_hash, source_name=FNAME, dest_infohash=pub_hash,
+        cross_seed_infohash=pub_hash, cross_seed_blob=pub_blob,
+        save_path=str(ssd), total_bytes=FSIZE, state=State.RE_ADDING,
+    )
+    store.upsert(ts)
+
+    await coord._process_torrent_inner(store.get(pub_hash))
+    row = store.get(pub_hash)
+    assert row.state == State.DONE
+    assert row.save_path == str(fuse)

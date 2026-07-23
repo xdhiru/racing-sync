@@ -1514,10 +1514,12 @@ class Coordinator:
             return False
 
     async def _cleanup_fuse_healthy(self, ts: TorrentState) -> bool:
-        """Re-verify every injected fuse entry still exists on the dest client.
+        """Re-verify the row really seeds from fuse (entries AND bytes).
 
-        Single batched lookup by hashes. Any missing entry (user pruned it,
-        client restarted it away, mount trouble) fails closed: keep VPS1.
+        Single batched entry lookup by hashes, plus a file-presence check at
+        the fuse target whenever the torrent bytes are available. Entries
+        alone are not proof (a skip_check entry reports complete with zero
+        bytes). Any doubt fails closed: keep VPS1.
         """
         hashes = {
             h.lower() for h in (
@@ -1542,6 +1544,29 @@ class Coordinator:
             log.warning("cleanup: %d fuse entr%s missing for %s (%s…); keeping VPS1",
                         len(missing), "y" if len(missing) == 1 else "ies",
                         ts.source_name[:60], missing[0][:10])
+            return False
+        blob = ts._blob or ts.cross_seed_blob
+        if not blob and getattr(self, "store", None) is not None:
+            try:
+                blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
+            except Exception:
+                blob = None
+        expected = self._expected_fuse_files(blob)
+        if not expected:
+            # No bytes to verify against (e.g. adopted rows predate blob
+            # persistence): entries existing is the best available signal.
+            return True
+        try:
+            target = self._target_mount_for_blob(blob, self._target_mount_for(ts))
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            file_missing = await self._missing_fuse_files(target, expected)
+        except Exception:  # noqa: BLE001
+            return False
+        if file_missing:
+            log.warning("cleanup: %d fuse file(s) missing for %s at %s; keeping VPS1",
+                        len(file_missing), ts.source_name[:60], target)
             return False
         return True
 
@@ -2951,6 +2976,14 @@ class Coordinator:
 
                 if ts.state != State.FAILED:
                     ts.readd_next_retry_at = None
+                    # The content now seeds from fuse: record the fuse mount
+                    # as the save location. Late-seed/cleanup guards read a
+                    # non-fuse save_path on DONE rows as "never moved" — a
+                    # stale SSD path here would demote healthy rows forever.
+                    try:
+                        ts.save_path = str(self._target_mount_for(ts))
+                    except Exception:  # noqa: BLE001
+                        pass
                     self.transition(ts, State.DONE)
                 return
 
@@ -3172,17 +3205,32 @@ class Coordinator:
     ) -> None:
         """Check if new cross-seeds arrived on VPS1 for a completed release and inject them to FUSE."""
         # Ordering guard FIRST (before the no-new-torrents early return): a
-        # DONE row whose save_path is not on fuse never completed its rclone
-        # move. Nothing may inject until the SSD bytes move — demote so the
-        # MOVING worker runs first, even when this tick has no new arrivals.
+        # DONE row whose save_path is not on fuse *may* never have completed
+        # its rclone move — but it may also be a healthy row whose save_path
+        # was never updated after the move (pre-fix rows). Distinguish by
+        # proving fuse health: verified rows repair save_path forward and
+        # processing continues; only unverified rows demote to MOVING.
         if ts.save_path and not self._save_path_is_on_fuse(ts.save_path):
-            log.warning(
-                "late cross-seed: %s is DONE but save_path %s is not on fuse; "
-                "demoting to MOVING so the SSD move runs before any injection",
-                ts.source_name[:50], ts.save_path,
-            )
-            await self._demote_false_done_to_moving(ts)
-            return
+            verified_mount = await self._verified_fuse_mount_for_done_row(ts)
+            if verified_mount is not None:
+                log.info(
+                    "late cross-seed: %s seeds from fuse but save_path %s is stale; "
+                    "repairing to %s instead of demoting",
+                    ts.source_name[:50], ts.save_path, verified_mount,
+                )
+                ts.save_path = str(verified_mount)
+                try:
+                    self.store.upsert(ts)
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                log.warning(
+                    "late cross-seed: %s is DONE but save_path %s is not on fuse; "
+                    "demoting to MOVING so the SSD move runs before any injection",
+                    ts.source_name[:50], ts.save_path,
+                )
+                await self._demote_false_done_to_moving(ts)
+                return
 
         known_hashes = {
             h.lower() for h in (
@@ -3310,6 +3358,50 @@ class Coordinator:
         if changed:
             ts.injected_private_hashes = ",".join(dict.fromkeys(current_injected))
             self.store.upsert(ts)
+
+    async def _verified_fuse_mount_for_done_row(self, ts: TorrentState) -> Path | None:
+        """Prove a DONE row really seeds from fuse; return the mount or None.
+
+        Checks both halves of "seeding from fuse": every recorded hash has a
+        live dest entry AND the torrent bytes are present under the fuse
+        target. Entries alone are not proof (a skip_check entry reports
+        complete with zero bytes). None means unverifiable — callers must
+        take the fail-closed path (demote/defer), never assume health.
+        """
+        hashes = {
+            h.lower() for h in (
+                ts.dest_infohash,
+                ts.cross_seed_infohash,
+                *ts.injected_private_hashes.split(","),
+            ) if h
+        }
+        if not hashes:
+            return None
+        try:
+            present = await self.dest_client.list_torrents(hashes=list(hashes))
+        except Exception:  # noqa: BLE001
+            return None
+        have = {t.hash.lower() for t in (present or [])}
+        if hashes - have:
+            return None
+        blob = ts._blob or ts.cross_seed_blob
+        if not blob and getattr(self, "store", None) is not None:
+            try:
+                blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
+            except Exception:
+                blob = None
+        expected = self._expected_fuse_files(blob)
+        if not expected:
+            return None
+        try:
+            target = self._target_mount_for_blob(blob, self._target_mount_for(ts))
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            missing = await self._missing_fuse_files(target, expected)
+        except Exception:  # noqa: BLE001
+            return None
+        return target if not missing else None
 
     async def _demote_false_done_to_moving(self, ts: TorrentState) -> None:
         """Self-heal a DONE row whose save_path never left SSD.
