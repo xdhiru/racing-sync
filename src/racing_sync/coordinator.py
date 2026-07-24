@@ -2195,7 +2195,18 @@ class Coordinator:
             )
             ts.dest_infohash = ext.hash.lower()
             ts.save_path = ext.save_path
-            await self.dest_client.resume(ext.hash)
+            try:
+                await self.dest_client.resume(ext.hash)
+            except Exception as e:  # noqa: BLE001
+                # Transient qB hiccup (registration lag, timeout): stay
+                # QUEUED so the next tick retries via this same check.
+                log.warning("resume %s hit transient dest error: %s; staying queued",
+                            ext.hash[:10], e)
+                try:
+                    self.store.upsert(ts)
+                except Exception:
+                    pass
+                return
             self.transition(ts, State.DOWNLOADING)
             return
 
@@ -2228,8 +2239,40 @@ class Coordinator:
         if new_hash:
             ts.dest_infohash = new_hash.lower()
 
-        # Classify
-        files = await self.dest_client.get_torrent_files(ts.dest_infohash or ts.source_infohash)
+        # Everything below runs against a just-added entry: a loaded client
+        # (10k torrents) can 404/time out individual calls while it registers
+        # the torrent. Any unexpected failure here parks the row back in
+        # QUEUED (dest_infohash persisted) instead of FAILED — the next tick
+        # re-enters through the existing-torrent check above and continues.
+        # Deliberate terminal transitions (WAITING_DISK park, oversize-movie
+        # FAILED) return normally inside the block and are unaffected.
+        try:
+            await self._setup_queued_download(ts, blob)
+        except Exception as e:  # noqa: BLE001
+            log.warning("queued setup hit transient dest error for %s: %s; staying queued",
+                        ts.source_infohash[:10], e)
+            try:
+                self.store.upsert(ts)
+            except Exception:
+                pass
+            return
+
+    async def _setup_queued_download(self, ts: TorrentState, blob: bytes) -> None:
+        """Classify, prioritize, and resume a just-added SSD torrent."""
+        # Classify (with a short retry: the files endpoint can 404 for a few
+        # seconds right after add while qB registers the torrent).
+        files: list[TorrentFile] = []
+        last_err: Exception | None = None
+        for _ in range(4):
+            try:
+                files = await self.dest_client.get_torrent_files(ts.dest_infohash or ts.source_infohash)
+                last_err = None
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                await asyncio.sleep(2)
+        if last_err is not None:
+            raise last_err
         cls = classify(files, self.cfg)
         ts.classification_kind = cls.kind
 

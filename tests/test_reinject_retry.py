@@ -769,6 +769,114 @@ async def test_do_queued_fuse_fast_track_persists_classification(tmp_path: Path)
 
 
 @pytest.mark.anyio
+async def test_do_queued_retries_files_listing_after_add(tmp_path: Path):
+    """A 404 right after add (loaded client registration lag) must not FAILED."""
+    from unittest.mock import patch
+    from racing_sync.clients.abstract import AddResult, TorrentFile
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.fuse.mount = str(tmp_path / "fuse")
+    coord.cfg.rclone.fuse.mount_unsorted = str(tmp_path / "fuse-unsorted")
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash="ab" * 20, accepted=True, detail="Ok.")
+    )
+    movie = [TorrentFile(name="Queued.Movie.2026.mkv", size_bytes=100, progress=0.0)]
+    coord.dest_client.get_torrent_files = AsyncMock(
+        side_effect=[RuntimeError("404 Not Found"), RuntimeError("404 Not Found"), movie]
+    )
+    coord.dest_client.resume = AsyncMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(
+        source_infohash="c" * 40, source_name="Queued.Movie.2026",
+        cross_seed_blob=b"blob", save_path=str(tmp_path), state=State.QUEUED,
+    )
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        await coord._do_queued(ts)
+
+    assert coord.dest_client.get_torrent_files.call_count == 3
+    assert ts.state == State.DOWNLOADING
+    assert ts.dest_infohash == "ab" * 20
+
+
+@pytest.mark.anyio
+async def test_do_queued_persistent_files_failure_stays_queued(tmp_path: Path):
+    """If the files endpoint never recovers, park in QUEUED (not FAILED).
+
+    dest_infohash must be persisted so the next tick re-enters through the
+    existing-torrent check instead of re-adding a duplicate.
+    """
+    from unittest.mock import patch
+    from racing_sync.clients.abstract import AddResult
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash="ab" * 20, accepted=True, detail="Ok.")
+    )
+    coord.dest_client.get_torrent_files = AsyncMock(side_effect=RuntimeError("boom"))
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(
+        source_infohash="c" * 40, source_name="Queued.Movie.2026",
+        cross_seed_blob=b"blob", save_path=str(tmp_path), state=State.QUEUED,
+    )
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        await coord._do_queued(ts)
+
+    assert ts.state == State.QUEUED
+    assert ts.dest_infohash == "ab" * 20
+    coord.store.upsert.assert_called()
+    failed = [c for c in coord.transition.call_args_list if c[0][1] == State.FAILED]
+    assert failed == []
+
+
+@pytest.mark.anyio
+async def test_do_queued_existing_resume_failure_stays_queued(tmp_path: Path):
+    from racing_sync.clients.abstract import Torrent
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.rclone.fuse.mount = str(tmp_path / "fuse")
+    coord.cfg.rclone.fuse.mount_unsorted = str(tmp_path / "fuse-unsorted")
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    ext = Torrent(
+        hash="d" * 40, name="Existing.Show", category="racing",
+        save_path=str(tmp_path), size_bytes=100, state="downloading",
+        progress=0.5,
+    )
+    coord.dest_client.list_torrents = AsyncMock(return_value=[ext])
+    coord.dest_client.resume = AsyncMock(side_effect=RuntimeError("qB busy"))
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(
+        source_infohash="d" * 40, source_name="Existing.Show",
+        cross_seed_blob=b"blob", save_path=str(tmp_path), state=State.QUEUED,
+    )
+
+    await coord._do_queued(ts)
+
+    assert ts.state == State.QUEUED
+    assert ts.dest_infohash == "d" * 40
+    coord.store.upsert.assert_called()
+
+
+@pytest.mark.anyio
 async def test_do_queued_parks_to_readding_when_fuse_files_missing(tmp_path: Path):
     """A fuse-complete entry with missing bytes must NOT mark DONE — nor FAILED.
 
