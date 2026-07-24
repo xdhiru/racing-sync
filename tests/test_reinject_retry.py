@@ -1127,3 +1127,123 @@ async def test_re_inject_racing_torrents_skips_missing_fuse_content(tmp_path: Pa
     coord.dest_client.add_torrent.assert_not_called()
     assert ts.injected_private_hashes == ""
 
+
+@pytest.mark.anyio
+async def test_ensure_fuse_entry_retries_delayed_visibility_after_replace(tmp_path: Path):
+    """A re-add accepted by qB but invisible to immediate lookups (10k-torrent
+    registration lag) must be confirmed via retry, not reported as rejected."""
+    from unittest.mock import patch
+    from racing_sync.watchdir import _bencoded_info_hash
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    ssd_dir = tmp_path / "ssd"
+    ssd_dir.mkdir()
+
+    blob = _single_file_torrent_bytes("Lag.Movie.2026.mkv", 80)
+    real_hash = _bencoded_info_hash(blob)[0].lower()
+
+    coord = object.__new__(Coordinator)
+    coord.dest_client = AsyncMock()
+    coord.dest_client.add_torrent = AsyncMock(side_effect=[
+        AddResult(hash=None, accepted=False, detail="Fails."),
+        AddResult(hash=None, accepted=True, detail="Ok."),
+    ])
+    ssd_entry = Torrent(
+        hash=real_hash, name="Lag.Movie.2026", category="racing",
+        save_path=str(ssd_dir), size_bytes=80, state="seeding", progress=1.0,
+    )
+    fuse_entry = Torrent(
+        hash=real_hash, name="Lag.Movie.2026", category="racing",
+        save_path=str(fuse_dir), size_bytes=80, state="seeding", progress=1.0,
+    )
+    # First lookup: stale SSD entry. Post-replace lookups: invisible twice
+    # (registration lag), then the fuse entry.
+    coord.dest_client.get_torrent = AsyncMock(
+        side_effect=[ssd_entry, None, None, fuse_entry]
+    )
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        ok, _ = await coord._ensure_fuse_entry(
+            blob=blob, infohash=real_hash, target_mount=fuse_dir,
+            label="cross-seed torrent",
+        )
+
+    assert ok is True
+    coord.dest_client.delete.assert_awaited_once_with(real_hash, delete_files=False)
+
+
+@pytest.mark.anyio
+async def test_ensure_fuse_entry_unconfirmed_replace_is_retryable(tmp_path: Path):
+    """A replace accepted but never visible must NOT read as a rejection.
+
+    Returns the sentinel detail so callers park/retry instead of FAILED —
+    the pre-fix code returned (False, "Ok."), which failed the row with the
+    absurd message "fuse re-add rejected: Ok."
+    """
+    from unittest.mock import patch
+    from racing_sync.coordinator import _NOT_VISIBLE_DETAIL
+    from racing_sync.watchdir import _bencoded_info_hash
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    ssd_dir = tmp_path / "ssd"
+    ssd_dir.mkdir()
+
+    blob = _single_file_torrent_bytes("Ghost.Movie.2026.mkv", 80)
+    real_hash = _bencoded_info_hash(blob)[0].lower()
+
+    coord = object.__new__(Coordinator)
+    coord.dest_client = AsyncMock()
+    coord.dest_client.add_torrent = AsyncMock(side_effect=[
+        AddResult(hash=None, accepted=False, detail="Fails."),
+        AddResult(hash=None, accepted=True, detail="Ok."),
+    ])
+    ssd_entry = Torrent(
+        hash=real_hash, name="Ghost.Movie.2026", category="racing",
+        save_path=str(ssd_dir), size_bytes=80, state="seeding", progress=1.0,
+    )
+    coord.dest_client.get_torrent = AsyncMock(
+        side_effect=[ssd_entry, None, None, None, None]
+    )
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        ok, detail = await coord._ensure_fuse_entry(
+            blob=blob, infohash=real_hash, target_mount=fuse_dir,
+            label="cross-seed torrent",
+        )
+
+    assert ok is False
+    assert detail == _NOT_VISIBLE_DETAIL
+
+
+@pytest.mark.anyio
+async def test_re_add_cross_seed_unconfirmed_replace_retries_not_fails(tmp_path: Path):
+    """The S36E174 incident: accepted-but-invisible re-add must raise the
+    retryable error (RE_ADDING parks) instead of FAILED."""
+    from racing_sync.coordinator import WebUIUnresponsiveError
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.rclone.fuse.mount = tmp_path / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-unsorted"
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    blob = _single_file_torrent_bytes("Retry.Movie.2026.mkv", 80)
+    from racing_sync.watchdir import _bencoded_info_hash
+    real_hash = _bencoded_info_hash(blob)[0].lower()
+
+    ts = TorrentState(
+        source_infohash="src_retry_1", source_name="Retry.Movie.2026",
+        dest_infohash=real_hash, cross_seed_infohash=real_hash,
+        cross_seed_blob=blob, state=State.RE_ADDING,
+    )
+    coord._ensure_fuse_entry = AsyncMock(return_value=(False, "added but entry not yet visible on dest client"))
+
+    with pytest.raises(WebUIUnresponsiveError):
+        await coord._re_add_cross_seed_torrent(ts)
+    assert ts.state == State.RE_ADDING
+    coord.transition.assert_not_called()
+

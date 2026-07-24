@@ -65,6 +65,11 @@ _WEBUI_RETRY_ERRORS = (
     WebUIUnresponsiveError,
 )
 
+# Indeterminate fuse-entry outcome from _ensure_fuse_entry: the re-add was
+# accepted but the entry is not yet visible to lookups (client registration
+# lag). Callers must park/retry, never fail the row over it.
+_NOT_VISIBLE_DETAIL = "added but entry not yet visible on dest client"
+
 
 def normalize_content_name(name: str) -> str:
     """Normalize release/torrent names for deduplication and grouping.
@@ -3115,7 +3120,7 @@ class Coordinator:
         if not ok:
             err_msg = f"fuse re-add rejected: {detail or 'client rejected torrent'}"
             log.error("re-add cross-seed torrent failed for %s: %s", ts.source_name, err_msg)
-            if detail == "Fails." or not detail:
+            if detail == "Fails." or not detail or detail == _NOT_VISIBLE_DETAIL:
                 raise WebUIUnresponsiveError(err_msg)
             self.transition(ts, State.FAILED, error=err_msg)
             return
@@ -3742,6 +3747,11 @@ class Coordinator:
         Returns (ok, detail). Never raises for client rejections; callers
         apply their own retry/fail policy. Exact add kwargs are kept stable
         for the seeding contract (category/tags/skip_check).
+
+        Registration lag: a loaded client can accept the re-add while the
+        entry is not yet visible to lookups. The post-add check is retried;
+        a still-unconfirmed entry returns _NOT_VISIBLE_DETAIL so callers
+        park/retry instead of failing the row over a transient.
         """
         h_low = infohash.lower()
         add_kwargs: dict[str, object] = {
@@ -3782,15 +3792,21 @@ class Coordinator:
             res2 = await self.dest_client.add_torrent(**add_kwargs)  # type: ignore[arg-type]
             detail2 = res2.detail if isinstance(res2.detail, str) else ""
             if res2.accepted or detail2 == "Fails." or "already" in detail2.lower():
-                try:
-                    dest_st2 = await self.dest_client.get_torrent(h_low)
-                except Exception:
-                    dest_st2 = None
+                dest_st2 = None
+                for _ in range(4):
+                    try:
+                        dest_st2 = await self.dest_client.get_torrent(h_low)
+                    except Exception:
+                        dest_st2 = None
+                    if dest_st2 is not None:
+                        break
+                    await asyncio.sleep(2)
                 if dest_st2 is not None and self._save_path_points_at_target(
                     getattr(dest_st2, "save_path", ""), target_mount
                 ):
                     log.info("re-injected %s %s on fuse (%s)", label, h_low[:10], target_mount)
                     return True, detail2
+                return False, _NOT_VISIBLE_DETAIL
             return False, detail2
         return False, detail
 
