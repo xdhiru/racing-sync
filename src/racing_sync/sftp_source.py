@@ -22,6 +22,11 @@ log = logging.getLogger(__name__)
 
 MAX_TORRENT_BYTES: int = 20 * 1024 * 1024  # 20 MiB safety cap, matching Prowlarr
 
+# Max wait for the shared-connection lock before failing fast (seconds).
+# Must stay comfortably below the coordinator's 15s asyncio.wait_for budget
+# around SFTP calls so contention surfaces as a catchable timeout there.
+_SFTP_LOCK_TIMEOUT: float = 10.0
+
 _HEX40_RE = None  # lazy compiled in list_state_dir to avoid import cost
 
 import re as _re
@@ -201,19 +206,52 @@ class SFTPExporter:
         )
 
     def close(self) -> None:
-        with self._lock:
-            if self._sftp is not None:
-                try:
-                    self._sftp.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                self._sftp = None
-            if self._client is not None:
-                try:
-                    self._client.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                self._client = None
+        # Best-effort: never block shutdown on a wedged holder. Re-entrant
+        # same-thread acquisition succeeds immediately, so nested callers
+        # (connect() under fetch_torrent's guard) are unaffected.
+        try:
+            acquired = self._lock.acquire(timeout=5)
+        except Exception:
+            return
+        if not acquired:
+            return
+        try:
+            with self._lock:
+                if self._sftp is not None:
+                    try:
+                        self._sftp.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._sftp = None
+                if self._client is not None:
+                    try:
+                        self._client.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._client = None
+        finally:
+            try:
+                self._lock.release()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _acquire_or_busy(lock: threading.RLock, what: str) -> bool:
+        """Fail-fast lock acquisition for SFTP entry points.
+
+        Callers invoke fetches via asyncio.to_thread with their own timeout
+        and abandon the thread on expiry — but an abandoned thread stuck in
+        a wedged transport keeps holding this lock, so unbounded waiters
+        pile up behind it (and behind the bounded to_thread pool). Waiting
+        briefly then failing lets every caller hit its existing retry path
+        instead of wedging the whole runtime.
+        """
+        try:
+            if lock.acquire(timeout=_SFTP_LOCK_TIMEOUT):
+                return True
+        except Exception:
+            pass
+        raise TimeoutError(f"sftp busy: {what} gave up waiting for the connection lock")
 
     # ---- torrent file ----
 
@@ -224,6 +262,17 @@ class SFTPExporter:
         # State dirs live on case-sensitive filesystems with lowercase names.
         infohash = infohash.lower()
 
+        if not self._acquire_or_busy(self._lock, f"fetch {infohash[:10]}"):
+            return None  # unreachable: helper raises; kept for clarity
+        try:
+            return self._fetch_torrent_locked(infohash)
+        finally:
+            try:
+                self._lock.release()
+            except Exception:
+                pass
+
+    def _fetch_torrent_locked(self, infohash: str) -> bytes | None:
         with self._lock:
             # Reconnect if connection dropped
             if (self._client is None
@@ -288,25 +337,33 @@ class SFTPExporter:
         Returns None when unknown (disconnected, unsupported, any error) —
         callers degrade to time-only grace, never to zero.
         """
-        with self._lock:
-            if (self._client is None
-                    or self._sftp is None
-                    or self._client.get_transport() is None
-                    or not self._client.get_transport().is_active()):
-                try:
-                    self.connect()
-                except Exception as e:
-                    log.warning("sftp disk-free reconnect failed: %s", e)
-                    return None
-            statvfs = getattr(self._sftp, "statvfs", None)
-            if callable(statvfs):
-                try:
-                    st = statvfs(path)
-                except Exception as e:
-                    log.warning("sftp statvfs %s failed: %s", path, e)
-                    return self._disk_free_via_df(path)
-                return self._free_from_statvfs(st)
-            return self._disk_free_via_df(path)
+        if not self._acquire_or_busy(self._lock, f"disk-free {path}"):
+            return None  # unreachable: helper raises; kept for clarity
+        try:
+            with self._lock:
+                if (self._client is None
+                        or self._sftp is None
+                        or self._client.get_transport() is None
+                        or not self._client.get_transport().is_active()):
+                    try:
+                        self.connect()
+                    except Exception as e:
+                        log.warning("sftp disk-free reconnect failed: %s", e)
+                        return None
+                statvfs = getattr(self._sftp, "statvfs", None)
+                if callable(statvfs):
+                    try:
+                        st = statvfs(path)
+                    except Exception as e:
+                        log.warning("sftp statvfs %s failed: %s", path, e)
+                        return self._disk_free_via_df(path)
+                    return self._free_from_statvfs(st)
+                return self._disk_free_via_df(path)
+        finally:
+            try:
+                self._lock.release()
+            except Exception:
+                pass
 
     @staticmethod
     def _free_from_statvfs(st: object) -> int | None:
@@ -345,6 +402,18 @@ class SFTPExporter:
             return None
 
     def list_state_dir(self) -> list[str]:
+        if not self._acquire_or_busy(self._lock, "list state dir"):
+            raise SFTPError("sftp busy")  # unreachable: helper raises
+        try:
+            with self._lock:
+                return self._list_state_dir_locked()
+        finally:
+            try:
+                self._lock.release()
+            except Exception:
+                pass
+
+    def _list_state_dir_locked(self) -> list[str]:
         with self._lock:
             # Mirror fetch_torrent: reconnect if the connection dropped.
             if (self._client is None

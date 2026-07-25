@@ -303,7 +303,13 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 return sftp.fetch_torrent(torrent_hash)
 
         try:
-            blob = await asyncio.to_thread(_fetch)
+            # Bounded: a stalled connection must not wedge the calling worker
+            # forever (the shared exporter paths use 15s; a fresh connect
+            # costs a handshake first, hence the larger budget here).
+            blob = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=45.0)
+        except (asyncio.TimeoutError, TimeoutError):
+            log.warning("deluge: SFTP .torrent fetch for %s timed out", torrent_hash[:10])
+            return []
         except Exception as e:
             log.warning("deluge: failed to fetch .torrent via SFTP for %s: %s", torrent_hash, e)
             return []
