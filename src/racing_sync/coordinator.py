@@ -20,32 +20,29 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
-import os
 import re
 import shutil
 import time
-import aiohttp
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+
+import aiohttp
 
 from .batcher import Batch, escape_rclone_glob, make_batches
-from .classifier import Classification, classify, should_skip_movie
+from .classifier import classify, should_skip_movie
 from .clients.abstract import Torrent, TorrentClient, TorrentFile
 from .clients.deluge import DelugeClient
 from .clients.http_base import AuthError
-from .clients.qbittorrent import QBittorrentClient, build_qbtorrent_from_dest
+from .clients.qbittorrent import QBittorrentClient
 from .config import AppConfig
-from .logging_setup import get_ring_buffer
 from .prowlarr import ProwlarrClient, TorrentHit
-from .recovery import find_content_on_ssd, reconcile
 from .rclone_ops import (
     move_local_to_remote,
-    ssd_free_bytes,
     ssd_has_room,
     ssd_max_inflight_bytes,
     wipe_local_tree,
 )
+from .recovery import find_content_on_ssd, reconcile
 from .sftp_source import SFTPExporter
 from .state import State, StateStore, TorrentState
 from .watchdir import WatchDirScanner, WatchItem
@@ -658,10 +655,12 @@ class Coordinator:
             fuse = [str(self.cfg.rclone.fuse.mount), str(self.cfg.rclone.fuse.mount_unsorted)]
         except Exception:
             return
-        norm = lambda p: p.rstrip("/\\").replace("\\", "/")
+        def _norm(p: str) -> str:
+            return p.rstrip("/\\").replace("\\", "/")
+
         for s in ssd_dirs:
             for fm in fuse:
-                sn, fn = norm(s or ""), norm(fm or "")
+                sn, fn = _norm(s or ""), _norm(fm or "")
                 if sn and fn and (sn == fn or sn.startswith(fn + "/") or fn.startswith(sn + "/")):
                     log.warning(
                         "storage overlap: SSD path %s overlaps fuse mount %s — "
@@ -983,9 +982,13 @@ class Coordinator:
         by_name: dict[str, list[Torrent]] = {}
         for st in src_torrents:
             norm_key = normalize_content_name(st.name)
+            if not norm_key:
+                # Nameless entries must not collapse into a single "" group
+                # (would elect one primary and drop the rest). Track solo.
+                norm_key = f"__infohash__:{st.infohash.lower()}"
             by_name.setdefault(norm_key, []).append(st)
 
-        for norm_name, group in by_name.items():
+        for _norm_name, group in by_name.items():
             # Check if any torrent in this release group is already tracked in state store
             existing_ts: TorrentState | None = None
             for t in group:
@@ -1160,16 +1163,6 @@ class Coordinator:
             if t.progress > 0.001:
                 eta_s = (1.0 - t.progress) * 60  # crude placeholder
                 item.eta = f"{eta_s:.0f}m"
-
-    def live_progress_map(self) -> dict[str, float]:
-        """Snapshot of in-flight download progress keyed by infohash.
-
-        Used by the Telegram bot for the active-tasks message.
-        """
-        return {
-            h.lower(): item.progress
-            for h, item in self._live.items()
-        }
 
     def live_progress_map(self) -> dict[str, float]:
         """Snapshot of in-flight download progress keyed by infohash.
@@ -2715,7 +2708,6 @@ class Coordinator:
         folder = self._season_folder_for(
             cls_files, ts.source_name, base_path=src_dir
         )
-        content_dir = folder if folder and folder.exists() else src_dir
 
         completed_files: list[TorrentFile] = []
         incomplete_files: list[TorrentFile] = []
