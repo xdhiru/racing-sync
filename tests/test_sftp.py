@@ -367,3 +367,87 @@ def test_disk_free_bytes_none_on_unparsable_df():
 
     assert exporter.disk_free_bytes("/data") is None
 
+
+def test_fetch_fails_fast_when_lock_wedged(monkeypatch):
+    """A wedged holder must not wedge every later caller behind it.
+
+    Regression for the ~2min silent stall: abandoned to_thread workers kept
+    the shared lock while callers queued with no bound. Now the waiter fails
+    fast (TimeoutError) so coordinator retry/backoff paths engage.
+    """
+    import threading
+    import time
+    from unittest.mock import MagicMock
+    import racing_sync.sftp_source as sftp_mod
+    from racing_sync.sftp_source import SFTPExporter
+
+    monkeypatch.setattr(sftp_mod, "_SFTP_LOCK_TIMEOUT", 0.2)
+
+    exporter = object.__new__(SFTPExporter)
+    exporter._lock = threading.RLock()
+    exporter._client = MagicMock()
+    exporter._sftp = MagicMock()
+
+    # Wedge the lock from ANOTHER thread (same-thread re-acquire is legal
+    # for RLock and must keep working).
+    holder_ready = threading.Event()
+    release_holder = threading.Event()
+
+    def _hold():
+        exporter._lock.acquire()
+        holder_ready.set()
+        try:
+            assert release_holder.wait(timeout=30)
+        finally:
+            exporter._lock.release()
+
+    holder = threading.Thread(target=_hold, daemon=True)
+    holder.start()
+    assert holder_ready.wait(timeout=10)
+    try:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError, match="sftp busy"):
+            exporter.fetch_torrent("a" * 40)
+        assert time.monotonic() - start < 5.0
+    finally:
+        release_holder.set()
+        holder.join(timeout=10)
+    # Lock usable again afterwards.
+    assert exporter._lock.acquire(blocking=False)
+    exporter._lock.release()
+
+
+def test_close_does_not_hang_on_wedged_lock():
+    import threading
+    import time
+    from unittest.mock import MagicMock
+    from racing_sync.sftp_source import SFTPExporter
+
+    exporter = object.__new__(SFTPExporter)
+    exporter._lock = threading.RLock()
+    exporter._client = MagicMock()
+    exporter._sftp = MagicMock()
+
+    holder_ready = threading.Event()
+    release_holder = threading.Event()
+
+    def _hold():
+        exporter._lock.acquire()
+        holder_ready.set()
+        try:
+            assert release_holder.wait(timeout=30)
+        finally:
+            exporter._lock.release()
+
+    holder = threading.Thread(target=_hold, daemon=True)
+    holder.start()
+    assert holder_ready.wait(timeout=10)
+    try:
+        start = time.monotonic()
+        exporter.close()  # must return (~5s), not hang forever
+        elapsed = time.monotonic() - start
+    finally:
+        release_holder.set()
+        holder.join(timeout=10)
+    assert elapsed < 30.0
+
