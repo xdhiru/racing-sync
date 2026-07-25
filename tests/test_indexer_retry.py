@@ -342,3 +342,83 @@ async def test_wait_disk_then_queue_transitions_to_queued_under_download_sem():
 
     assert coord.transition.call_args_list[0][0][1] == State.QUEUED
     coord._do_queued.assert_awaited_once_with(ts)
+
+
+@pytest.mark.anyio
+async def test_public_sftp_timeout_retried_once_then_succeeds(caplog):
+    """A single SFTP stall must not fail a public SSD pick (cf. prod 15s gap)."""
+    import logging
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.coordinator import pick_ssd_source_for_racing
+
+    cfg = MagicMock()
+    cfg.cross_seed.allow_ssh_export = True
+    cfg.cross_seed.refetch_public_via_prowlarr = False
+
+    blob = b"d8:announce5:helloe"
+    sftp = MagicMock()
+    sftp.fetch_torrent = MagicMock(side_effect=[TimeoutError(), blob])
+
+    torrent = Torrent(
+        hash="p" * 40, name="Public.Show.S01E01.mkv", category="",
+        save_path="", size_bytes=500, state="seeding", progress=1.0,
+        trackers=["http://tracker.opentrackr.org/announce"],
+    )
+    with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
+        dec = await pick_ssd_source_for_racing(
+            cfg=cfg, source_torrent=torrent, other_source_torrents=[],
+            prowlarr=None, sftp=sftp, source_client=AsyncMock(),
+            attempt_prowlarr=True,
+        )
+    assert dec is not None
+    assert dec.source_label == "public-racing"
+    assert dec.torrent_bytes == blob
+    assert sftp.fetch_torrent.call_count == 2
+    assert any("timed out after 15s (attempt 1/2)" in r.message for r in caplog.records)
+
+
+@pytest.mark.anyio
+async def test_public_export_failure_parks_as_source_export_miss(caplog):
+    """A public group whose .torrent export keeps failing must park with an
+    honest reason — never a 'indexer miss' (Indexer was never involved)."""
+    import logging
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.coordinator import Coordinator
+
+    cfg = MagicMock()
+    cfg.cross_seed.allow_ssh_export = True
+    cfg.cross_seed.refetch_public_via_prowlarr = False
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+    cfg.cross_seed.indexer_retry_interval_seconds = 1800
+    cfg.cross_seed.prowlarr_max_age_seconds = 86400
+    cfg.dest.save_path = "/ssd"
+
+    torrent = Torrent(
+        hash="p" * 40, name="Public.Show.S01E01.mkv", category="",
+        save_path="", size_bytes=500, state="seeding", progress=1.0,
+        trackers=["http://tracker.opentrackr.org/announce"],
+    )
+    sftp = MagicMock()
+    sftp.fetch_torrent = MagicMock(return_value=None)
+    source_client = AsyncMock()
+    source_client.get_torrent = AsyncMock(return_value=torrent)
+    source_client.export_torrent = AsyncMock(side_effect=RuntimeError("nope"))
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = cfg
+    coord.store = MagicMock()
+    coord.source_client = source_client
+    coord.sftp = sftp
+    coord.prowlarr = None
+    coord._list_source_torrents = AsyncMock(return_value=[torrent])
+    coord.transition = MagicMock(side_effect=lambda t, s, **k: setattr(t, "state", s))
+
+    ts = TorrentState(source_infohash="p" * 40, state=State.NEW)
+    with caplog.at_level(logging.INFO, logger="racing_sync.coordinator"):
+        await coord._do_new(ts)
+
+    assert ts.state == State.WAITING_INDEXER
+    assert any("source export miss #1" in r.message for r in caplog.records)
+    assert not any("indexer miss" in r.message for r in caplog.records)
