@@ -74,6 +74,20 @@ def test_single_file_episode_is_classified_as_episode():
     assert cls.episodes[0].episode == 8
 
 
+def test_three_digit_episode_is_classified_as_episode():
+    """Long-running dailies (S36E171, S62E010): 3-digit episode numbers are
+    still individual episodes and route to unsorted/, not the movie path."""
+    files = [TorrentFile(
+        "Daily.Cookoff.S36E171.2026.06.10.1080p.AMZN.WEB-DL.DDP2.0.H.264-Raccoon.mkv",
+        2_600_000_000,
+    )]
+    cls = classify(files, _cfg())
+    assert cls.kind == "episode"
+    assert len(cls.episodes) == 1
+    assert cls.episodes[0].season == 36
+    assert cls.episodes[0].episode == 171
+
+
 def test_single_episode_with_nfo_is_classified_as_episode():
     files = [
         TorrentFile("Show.S02E05.1080p.mkv", 2_000_000_000),

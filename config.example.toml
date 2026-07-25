@@ -240,8 +240,10 @@ batch_move_extra_flags = [
 [classifier]
 # Regex applied to a FILE NAME (not folder). If it matches, the file
 # is treated as an individual TV episode and routed to unsorted/.
-# Default: S01E03, s10e22, S1E1, etc. Tweak per your release naming.
-episode_regex = "(?i)\\bS\\d{1,2}E\\d{1,2}\\b"
+# Default: S01E03, s10e22, S1E1, S36E171, etc. The episode number allows
+# up to 3 digits for long-running daily shows (S36E171, S62E010, ...).
+# Tweak per your release naming.
+episode_regex = "(?i)\\bS\\d{1,2}E\\d{1,3}\\b"
 
 # ============================================================
 # Telegram notifications
