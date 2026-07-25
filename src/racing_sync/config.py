@@ -257,7 +257,7 @@ class RcloneConfig(BaseModel):
 
 
 class ClassifierConfig(BaseModel):
-    episode_regex: str = r"(?i)\bS\d{1,2}E\d{1,2}\b"
+    episode_regex: str = r"(?i)\bS\d{1,2}E\d{1,3}\b"
 
     @field_validator("episode_regex")
     @classmethod
