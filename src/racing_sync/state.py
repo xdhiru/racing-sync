@@ -263,6 +263,7 @@ class StateStore:
         self._lock = threading.RLock()
         self._log_append_counter = 0
         self._db_path = db_path
+        self._closed = False
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(
             str(db_path), isolation_level=None, timeout=30.0, check_same_thread=False
@@ -277,7 +278,18 @@ class StateStore:
 
     def close(self) -> None:
         with self._lock:
-            self._conn.close()
+            if self._closed:
+                return
+            try:
+                self._conn.close()
+            finally:
+                self._closed = True
+
+    def __enter__(self) -> StateStore:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     # ---- migrations ----
 
@@ -537,6 +549,13 @@ class StateStore:
                 )
 
     def prune_logs(self, max_records: int = 5000) -> None:
+        # SQLite LIMIT -1 means "no limit" and would invert the prune.
+        try:
+            max_records = int(max_records)
+        except (TypeError, ValueError):
+            return
+        if max_records < 1:
+            return
         with self._lock:
             self._conn.execute(
                 "DELETE FROM run_log WHERE id NOT IN (SELECT id FROM run_log ORDER BY id DESC LIMIT ?)",
@@ -578,6 +597,27 @@ def _safe_state(value: object) -> State:
         return State.FAILED
 
 
+def _safe_int(value: object, default: int = 0) -> int:
+    """Float-tolerant int parse; one corrupt cell must not kill a listing."""
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_dt(value: object) -> dt.datetime | None:
+    """Parse ISO datetime or return None on corrupt/legacy values."""
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        log.warning("state DB has corrupt datetime %r; treating as None", value)
+        return None
+
+
 def _row_to_state(row: sqlite3.Row) -> TorrentState:
     keys = row.keys()
     sp_first = row["indexer_first_queried_at"] if "indexer_first_queried_at" in keys else ""
@@ -594,7 +634,10 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
     elif isinstance(blob_raw, str):
         blob_bytes = blob_raw.encode("utf-8")
     else:
-        blob_bytes = bytes(blob_raw)
+        try:
+            blob_bytes = bytes(blob_raw)
+        except Exception:
+            blob_bytes = b""
 
     return TorrentState(
         source_infohash=row["source_infohash"] if "source_infohash" in keys else "",
@@ -603,50 +646,40 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         source_tracker=row["source_tracker"] if "source_tracker" in keys else "",
         source_announce_url=row["source_announce_url"] if "source_announce_url" in keys else "",
         classification_kind=row["classification_kind"] if "classification_kind" in keys else "unknown",
-        total_bytes=int(row["total_bytes"] or 0) if "total_bytes" in keys else 0,
+        total_bytes=_safe_int(row["total_bytes"]) if "total_bytes" in keys else 0,
         save_path=row["save_path"] if "save_path" in keys else "",
         cross_seed_infohash=row["cross_seed_infohash"] if "cross_seed_infohash" in keys else "",
         cross_seed_source=row["cross_seed_source"] if "cross_seed_source" in keys else "",
         cross_seed_blob=blob_bytes,
         injected_private_hashes=row["injected_private_hashes"] if "injected_private_hashes" in keys else "",
-        indexer_first_queried_at=(
-            dt.datetime.fromisoformat(sp_first) if sp_first else None
-        ),
-        indexer_next_retry_at=(
-            dt.datetime.fromisoformat(sp_next) if sp_next else None
-        ),
-        indexer_attempts=int(row["indexer_attempts"] or 0) if "indexer_attempts" in keys else 0,
-        readd_first_attempted_at=(
-            dt.datetime.fromisoformat(ra_first) if ra_first else None
-        ),
-        readd_next_retry_at=(
-            dt.datetime.fromisoformat(ra_next) if ra_next else None
-        ),
-        readd_attempts=int(ra_attempts or 0),
-        failed_retries=int(row["failed_retries"] or 0) if "failed_retries" in keys else 0,
+        indexer_first_queried_at=_safe_dt(sp_first),
+        indexer_next_retry_at=_safe_dt(sp_next),
+        indexer_attempts=_safe_int(row["indexer_attempts"]) if "indexer_attempts" in keys else 0,
+        readd_first_attempted_at=_safe_dt(ra_first),
+        readd_next_retry_at=_safe_dt(ra_next),
+        readd_attempts=_safe_int(ra_attempts),
+        failed_retries=_safe_int(row["failed_retries"]) if "failed_retries" in keys else 0,
         completed_at=(
-            dt.datetime.fromisoformat(row["completed_at"])
+            _safe_dt(row["completed_at"])
             if ("completed_at" in keys and row["completed_at"])
             else None
         ),
         vps1_last_activity_at=(
-            dt.datetime.fromisoformat(row["vps1_last_activity_at"])
+            _safe_dt(row["vps1_last_activity_at"])
             if ("vps1_last_activity_at" in keys and row["vps1_last_activity_at"])
             else None
         ),
         state=_safe_state(row["state"]) if "state" in keys else State.NEW,
-        batch_index=int(row["batch_index"] or 0) if "batch_index" in keys else 0,
-        batches_total=int(row["batches_total"] or 0) if "batches_total" in keys else 0,
+        batch_index=_safe_int(row["batch_index"]) if "batch_index" in keys else 0,
+        batches_total=_safe_int(row["batches_total"]) if "batches_total" in keys else 0,
         last_error=row["last_error"] if "last_error" in keys else "",
         created_at=(
-            dt.datetime.fromisoformat(row["created_at"])
-            if ("created_at" in keys and row["created_at"])
-            else dt.datetime.now(dt.timezone.utc)
-        ),
+            _safe_dt(row["created_at"])
+            or dt.datetime.now(dt.timezone.utc)
+        ) if "created_at" in keys else dt.datetime.now(dt.timezone.utc),
         updated_at=(
-            dt.datetime.fromisoformat(row["updated_at"])
-            if ("updated_at" in keys and row["updated_at"])
-            else dt.datetime.now(dt.timezone.utc)
-        ),
-        telegram_message_id=int(row["telegram_message_id"] or 0) if "telegram_message_id" in keys else 0,
+            _safe_dt(row["updated_at"])
+            or dt.datetime.now(dt.timezone.utc)
+        ) if "updated_at" in keys else dt.datetime.now(dt.timezone.utc),
+        telegram_message_id=_safe_int(row["telegram_message_id"]) if "telegram_message_id" in keys else 0,
     )
