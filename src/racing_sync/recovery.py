@@ -42,6 +42,37 @@ class RecoveryReport:
         )
 
 
+def _safe_top(name: str) -> str | None:
+    """First path segment or None when the torrent name is unsafe.
+
+    Rejects absolute paths, drive letters, and any ``..`` segment so a
+    crafted name can never escape the SSD/fuse root via ``(root / top)``.
+    """
+    norm = name.replace("\\", "/").strip()
+    if not norm or norm.startswith("/") or ".." in norm.split("/"):
+        return None
+    # Windows drive (C:/...) or UNC would escape the root join.
+    if len(norm) >= 2 and norm[1] == ":":
+        return None
+    norm = norm.strip("/")
+    if not norm:
+        return None
+    top = norm.split("/")[0]
+    if top in ("", ".", ".."):
+        return None
+    return top
+
+
+def _safe_join(root: Path, name: str) -> Path | None:
+    """Join torrent-relative `name` under `root`, or None when unsafe."""
+    norm = name.replace("\\", "/").strip()
+    if not norm or norm.startswith("/") or ".." in norm.split("/"):
+        return None
+    if len(norm) >= 2 and norm[1] == ":":
+        return None
+    return root / norm
+
+
 def find_content_on_ssd(cfg: AppConfig, expected: list[tuple[str, int]]) -> Path | None:
     """Locate single-top content under the SSD roots.
 
@@ -52,10 +83,10 @@ def find_content_on_ssd(cfg: AppConfig, expected: list[tuple[str, int]]) -> Path
     """
     tops: set[str] = set()
     for name, _ in expected:
-        norm = name.replace("\\", "/").strip("/")
-        if not norm:
-            continue
-        tops.add(norm.split("/")[0])
+        top = _safe_top(name)
+        if top is None:
+            return None
+        tops.add(top)
     if len(tops) != 1:
         return None
     top = next(iter(tops))
@@ -120,8 +151,12 @@ async def _missing_under(mount: Path, expected: list[tuple[str, int]]) -> list[s
     def _check() -> list[str]:
         missing: list[str] = []
         for name, want in expected:
+            target = _safe_join(mount, name)
+            if target is None:
+                missing.append(name)
+                continue
             try:
-                actual = (mount / name.replace("\\", "/")).stat().st_size
+                actual = target.stat().st_size
             except OSError:
                 missing.append(name)
                 continue
@@ -209,7 +244,11 @@ async def reconcile(
     # 1. Snapshot reality — restrict to the racing category so we
     #    don't churn through 7000+ long-term seeds on every startup.
     actual = await dest.list_torrents(category="racing")
-    actual_by_hash: dict[str, object] = {t.hash.lower(): t for t in actual}
+    actual_by_hash: dict[str, object] = {}
+    for t in actual:
+        h = (getattr(t, "hash", "") or "").strip().lower()
+        if h:
+            actual_by_hash[h] = t
 
     # 2. Snapshot DB
     all_rows = store.all()
@@ -305,7 +344,7 @@ async def reconcile(
     ]
     for h, t in actual_by_hash.items():
         if h.lower() not in db_hashes:
-            save_path = getattr(t, "save_path", "").rstrip("/\\").replace("\\", "/")
+            save_path = (getattr(t, "save_path", "") or "").rstrip("/\\").replace("\\", "/")
             on_fuse = any(save_path == fm or save_path.startswith(fm + "/") for fm in fuse_mounts if fm)
             comp = getattr(t, "is_complete", False)
             is_done = comp() if callable(comp) else bool(comp)
@@ -347,12 +386,16 @@ async def reconcile(
                     adopt_state.value, name, h[:10],
                     use_save_path, on_fuse, is_done, kind,
                 )
+                try:
+                    size_bytes = int(float(getattr(t, "size_bytes", 0) or 0))
+                except (TypeError, ValueError):
+                    size_bytes = 0
                 ts = TorrentState(
                     source_infohash=h,
                     source_name=name,
                     dest_infohash=h,
                     save_path=use_save_path,
-                    total_bytes=getattr(t, "size_bytes", 0),
+                    total_bytes=size_bytes,
                     classification_kind=kind,
                     state=adopt_state,
                 )
@@ -457,11 +500,20 @@ async def fix_orphan(
 
         def _content_exists() -> bool:
             if expected_names:
-                return any((src_path / name).exists() for name in expected_names)
+                for name in expected_names:
+                    target = _safe_join(src_path, name)
+                    if target is not None and target.exists():
+                        return True
+                return False
+            # Fall back to the display name; never let ".." escape src_path.
+            safe_display = _safe_join(src_path, ts.source_name)
+            if safe_display is not None and safe_display.exists():
+                return True
             escaped_name = glob.escape(ts.source_name)
-            return (src_path / ts.source_name).exists() or any(
-                src_path.glob(f"{escaped_name}*")
-            )
+            try:
+                return any(src_path.glob(f"{escaped_name}*"))
+            except (OSError, ValueError):
+                return False
 
         try:
             content_exists = await asyncio.to_thread(_content_exists)
