@@ -75,13 +75,33 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             params["filter"] = "all"
         hash_list = list(hashes) if hashes is not None else None
         if hash_list:
-            params["hashes"] = "|".join(hash_list)
+            # Chunk large hash filters to avoid 414 URL-too-long on
+            # 10k-torrent instances (qB takes pipe-separated hashes).
+            out: list[Torrent] = []
+            for i in range(0, len(hash_list), 200):
+                chunk = hash_list[i : i + 200]
+                chunk_params = dict(params)
+                chunk_params["hashes"] = "|".join(chunk)
+                async with await self.request("GET", "/api/v2/torrents/info", params=chunk_params) as r:
+                    data = await r.json()
+                for row in data:
+                    try:
+                        out.append(_torrent_from_qb(row))
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("qB list_torrents skipping bad row: %s", e)
+            return out
         elif hashes is not None:
             # Explicit empty filter: return nothing instead of everything.
             return []
         async with await self.request("GET", "/api/v2/torrents/info", params=params) as r:
             data = await r.json()
-        return [_torrent_from_qb(t) for t in data]
+        torrents: list[Torrent] = []
+        for row in data:
+            try:
+                torrents.append(_torrent_from_qb(row))
+            except Exception as e:  # noqa: BLE001
+                log.warning("qB list_torrents skipping bad row: %s", e)
+        return torrents
 
     async def get_torrent(self, torrent_hash: str) -> Torrent | None:
         rows = await self.list_torrents(hashes=[torrent_hash])
@@ -106,7 +126,10 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         for row in data:
             try:
                 name = row.get("name", "")
-                size = int(row.get("size", 0) or 0)
+                try:
+                    size = int(float(row.get("size", 0) or 0))
+                except (TypeError, ValueError):
+                    size = 0
                 try:
                     prog = float(row.get("progress", 0.0) or 0.0)
                 except (TypeError, ValueError):
@@ -423,18 +446,24 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
         except (TypeError, ValueError):
             return default
 
+    def _fnum(value: object, default: float = 0.0) -> float:
+        try:
+            return float(value or 0.0)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default
+
     return Torrent(
         hash=infohash,
         name=torrent_name or infohash,
         category=d.get("category", "") or "",
         save_path=sp,
-        size_bytes=int(d.get("size", d.get("total_size", 0)) or 0),
+        size_bytes=_num(d.get("size", d.get("total_size", 0))),
         state=str(state),
-        progress=float(d.get("progress", 0.0) or 0.0),
-        ratio=float(d.get("ratio", 0.0) or 0.0),
+        progress=_fnum(d.get("progress", 0.0)),
+        ratio=_fnum(d.get("ratio", 0.0)),
         trackers=[],
         files=[],
-        added_on=int(d.get("added_on") or 0),
+        added_on=_num(d.get("added_on")),
         upspeed_bps=_num(d.get("upspeed")),
         num_leechers=_num(d.get("num_leechs")),
         total_uploaded_bytes=_num(d.get("uploaded")),
