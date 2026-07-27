@@ -38,6 +38,9 @@ racing-sync.log
 state.db
 state.db-*
 
+# Torrent files (user-supplied samples for debugging; never commit)
+*.torrent
+
 # Editor / OS
 .vscode/
 .idea/
