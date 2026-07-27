@@ -4,7 +4,9 @@ req #6:
   - Movie or full season folders go to rclone remote default.
   - Individual episodes (matching S00E00 regex) go to remote unsorted.
 
-We also reject single-file torrents (movies) larger than `skip_movie_larger_than_bytes`.
+Feasibility is enforced per individual file (see oversize_single_file):
+anything — movie, season pack, game, disc image — flows through download
+(batched as needed); only a single file bigger than the SSD cap is refused.
 """
 
 from __future__ import annotations
@@ -203,10 +205,34 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
     return Classification(kind="mixed", episodes=deduped_eps, single_file=None, total_bytes=total)
 
 
-def should_skip_movie(classification: Classification, cfg: AppConfig) -> bool:
-    if classification.kind != "movie":
-        return False
-    return classification.total_bytes > cfg.ssd.skip_movie_larger_than_bytes
+def oversize_single_file(files: Iterable[TorrentFile], cfg: AppConfig) -> str | None:
+    """Name of a single file that can never fit the SSD cap, else None.
+
+    Batched/type-agnostic flows stream multi-file torrents of any total size
+    through the SSD in chunks, so total size never disqualifies content —
+    only an individual file bigger than `skip_movie_larger_than_bytes`
+    (games, disc images, giant episodes alike) is refused upfront.
+    """
+    try:
+        ssd_cfg = cfg.ssd
+    except AttributeError:
+        return None
+    cap_raw = getattr(ssd_cfg, "skip_movie_larger_than_bytes", 0)
+    # Strictly numeric only: a MagicMock (unit tests) int()s to 1, which
+    # would refuse every file. Real configs always carry an int here.
+    if isinstance(cap_raw, bool) or not isinstance(cap_raw, (int, float)):
+        return None
+    cap = int(cap_raw)
+    if cap <= 0:
+        return None
+    for f in files:
+        try:
+            size = int(f.size_bytes or 0)
+        except (TypeError, ValueError):
+            continue
+        if size > cap and getattr(f, "name", ""):
+            return f.name
+    return None
 
 
 def file_total_size(files: Iterable[TorrentFile]) -> int:
