@@ -10,6 +10,7 @@ req #8: each batch is moved independently with rclone include patterns.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .classifier import Episode
@@ -29,6 +30,31 @@ def escape_rclone_glob(s: str) -> str:
         else:
             res.append(ch)
     return "".join(res)
+
+
+def include_patterns_for_names(names: Iterable[str]) -> list[str]:
+    """Rclone --include patterns for exact torrent-relative file names.
+
+    Shared by batch moves and the end-of-download leftover sweep so both
+    preserve torrent-relative paths identically. Only the listed files can
+    transfer — piece-boundary partials of deselected files never match and
+    therefore can neither reach the remote nor overwrite an older batch's
+    moved file.
+    """
+    patterns: list[str] = []
+    for raw in names:
+        # Normalize path separators to POSIX forward slashes
+        normalized = (raw or "").replace("\\", "/").strip("/")
+        parts = normalized.split("/")
+        escaped_path = "/".join(escape_rclone_glob(p) for p in parts if p)
+        if not escaped_path or escaped_path == "**/":
+            # Empty/blank file name would match everything — never emit it.
+            log.warning("batcher: skipping empty file name for include patterns")
+            continue
+        if not escaped_path.startswith("**/"):
+            escaped_path = f"**/{escaped_path}"
+        patterns.append(f"--include={escaped_path}")
+    return patterns
 
 
 @dataclass(slots=True)
@@ -55,20 +81,7 @@ class Batch:
 
     def include_patterns(self) -> list[str]:
         """Rclone --include patterns for this batch's episodes with subfolder and glob escaping."""
-        patterns: list[str] = []
-        for e in self.episodes:
-            # Normalize path separators to POSIX forward slashes
-            normalized = e.file_name.replace("\\", "/").strip("/")
-            parts = normalized.split("/")
-            escaped_path = "/".join(escape_rclone_glob(p) for p in parts if p)
-            if not escaped_path or escaped_path == "**/":
-                # Empty/blank file name would match everything — never emit it.
-                log.warning("batcher: skipping empty episode file name for include patterns")
-                continue
-            if not escaped_path.startswith("**/"):
-                escaped_path = f"**/{escaped_path}"
-            patterns.append(f"--include={escaped_path}")
-        return patterns
+        return include_patterns_for_names([e.file_name for e in self.episodes])
 
 
 def make_batches(

@@ -28,7 +28,7 @@ from pathlib import Path
 
 import aiohttp
 
-from .batcher import Batch, escape_rclone_glob, make_batches
+from .batcher import Batch, escape_rclone_glob, include_patterns_for_names, make_batches
 from .classifier import classify, should_skip_movie
 from .clients.abstract import Torrent, TorrentClient, TorrentFile
 from .clients.deluge import DelugeClient
@@ -2711,16 +2711,37 @@ class Coordinator:
 
         completed_files: list[TorrentFile] = []
         incomplete_files: list[TorrentFile] = []
+        uncertain_files: list[TorrentFile] = []
 
         for f in cls_files:
             file_path = src_dir / f.name
             if not file_path.exists():
                 continue
-            # A file is complete if progress >= 0.999 or its size on disk matches expected size
-            if f.progress >= 0.999 or file_path.stat().st_size >= f.size_bytes:
+            # Client-verified complete: the ONLY set ever moved to remote.
+            # NOTE: on-disk size alone must NOT mark completeness — qBittorrent
+            # pre-allocates deselected files at full size, so a piece-boundary
+            # partial of a deselected episode looks "full" while its progress
+            # is < 1. Moving it would upload corrupt data (and could overwrite
+            # an older batch's moved file). Progress is authoritative.
+            if (f.progress or 0.0) >= 0.999:
                 completed_files.append(f)
-            else:
+                continue
+            try:
+                on_disk = file_path.stat().st_size
+            except OSError:
+                continue
+            if on_disk < (f.size_bytes or 0):
                 incomplete_files.append(f)
+            else:
+                # Preallocated-but-incomplete (or laggy progress): move nothing
+                # and delete nothing individually — left for the folder wipe.
+                uncertain_files.append(f)
+        if uncertain_files:
+            log.info(
+                "leaving %d unverified file(s) for folder wipe (not individually "
+                "deleted, never moved): e.g. %s",
+                len(uncertain_files), uncertain_files[0].name,
+            )
 
         # 3. Clean up incomplete piece-boundary files so they are NOT moved to remote
         for f in incomplete_files:
@@ -2779,20 +2800,41 @@ class Coordinator:
 
             if ts.batch_index < ts.batches_total or remaining_payload:
                 if local_folder and local_folder.exists():
-                    log.warning(
-                        "multi-batch torrent %s: incomplete batch move (batch %d/%d, %d remaining files); moving to remote before cleanup",
-                        ts.source_name, ts.batch_index, ts.batches_total, len(remaining_payload),
-                    )
-                    # Never bare-move the folder (`rclone move <dir>
-                    # <remote>` strips the top dir). Move from the parent
-                    # with `<top>/**` so the remote keeps the folder.
-                    move_base = local_folder.parent
-                    top_include = _top_include_for_folder(move_base, local_folder)
-                    if top_include is None:  # only if local_folder is a fs root
-                        raise RuntimeError(
-                            f"cannot preserve top dir moving {local_folder} to {remote}"
+                    # Move ONLY client-verified-complete leftovers via per-file
+                    # includes (same mechanism batch moves use, preserving
+                    # torrent-relative paths). Deselected files share pieces
+                    # with batch episodes and sit preallocated-but-incomplete:
+                    # a bare `<top>/**` move would upload that corrupt data
+                    # (and could overwrite an older batch's moved file).
+                    try:
+                        top_rel = local_folder.resolve().relative_to(src_dir.resolve())
+                        top = top_rel.parts[0] if top_rel.parts else ""
+                    except Exception:
+                        top = ""
+                    leftover_names: list[str] = []
+                    for f in completed_files:
+                        norm = (f.name or "").replace("\\", "/").strip("/")
+                        if not norm:
+                            continue
+                        if top and not (norm == top or norm.startswith(top + "/")):
+                            continue
+                        if (src_dir / norm).is_file():
+                            leftover_names.append(norm)
+                    leftover_includes = include_patterns_for_names(leftover_names)
+                    if not leftover_includes:
+                        log.info(
+                            "multi-batch torrent %s: no verified-complete leftovers to move "
+                            "(%d remaining file(s) are incomplete boundary data); skipping remote move",
+                            ts.source_name, len(remaining_payload),
                         )
-                    await self._rclone_move(move_base, remote, ts, include=top_include)
+                    else:
+                        log.info(
+                            "multi-batch torrent %s: moving %d verified-complete leftover file(s) "
+                            "(batch %d/%d, %d remaining file(s) total)",
+                            ts.source_name, len(leftover_includes),
+                            ts.batch_index, ts.batches_total, len(remaining_payload),
+                        )
+                        await self._rclone_move(src_dir, remote, ts, include=leftover_includes)
                 else:
                     log.info(
                         "multi-batch torrent %s: batches already moved (no remaining local content)",
