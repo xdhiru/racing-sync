@@ -407,3 +407,33 @@ def test_classifier_episode_delimiter_support():
     assert parse_episode("Show Name - [01x08] - Title.mkv") == (1, 8)
     assert parse_episode("S01E01 - Pilot.mkv") == (1, 1)
 
+
+def test_oversize_single_file_flags_only_the_big_member():
+    from unittest.mock import MagicMock
+    from racing_sync.classifier import oversize_single_file
+    from racing_sync.clients.abstract import TorrentFile
+
+    cfg = MagicMock()
+    cfg.ssd.skip_movie_larger_than_bytes = 10_000
+
+    files = [
+        TorrentFile(name="Pack/part01.bin", size_bytes=1000),
+        TorrentFile(name="Pack/huge.bin", size_bytes=50_000),
+        TorrentFile(name="Pack/part02.bin", size_bytes=1000),
+    ]
+    assert oversize_single_file(files, cfg) == "Pack/huge.bin"
+    assert oversize_single_file(files[:1] + files[2:], cfg) is None
+
+
+def test_oversize_single_file_ignores_non_numeric_cap():
+    from unittest.mock import MagicMock
+    from racing_sync.classifier import oversize_single_file
+    from racing_sync.clients.abstract import TorrentFile
+
+    cfg = MagicMock()  # skip threshold unset: must not refuse everything
+    files = [TorrentFile(name="a.bin", size_bytes=10**12)]
+    assert oversize_single_file(files, cfg) is None
+
+    cfg.ssd.skip_movie_larger_than_bytes = 0
+    assert oversize_single_file(files, cfg) is None
+
