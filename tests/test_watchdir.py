@@ -136,7 +136,7 @@ async def test_do_new_watch_dir_already_download_tracker(tmp_path: Path):
     coord.cfg.prowlarr.should_skip_title.return_value = False
     coord.prowlarr = MagicMock()
     coord.store = store
-    coord.transition = lambda t, s: setattr(t, "state", s)
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
 
     ts = TorrentState(
         source_infohash=infohash,
@@ -176,7 +176,7 @@ async def test_do_new_watch_dir_already_download_tracker_still_searches_other_cr
     coord.cfg.prowlarr.should_skip_title.return_value = False
     coord.cfg.prowlarr.tracker_map.entries = {"beta": "Beta"}
     coord.store = store
-    coord.transition = lambda t, s: setattr(t, "state", s)
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
 
     bhd_idx = Indexer(2, "Beta", "torrent", True, [])
     coord.prowlarr = MagicMock()
@@ -249,7 +249,7 @@ async def test_do_new_watch_dir_public_torrent_skips_sacrificial_copy(tmp_path: 
     coord.cfg.prowlarr.should_skip_title.return_value = False
     coord.cfg.prowlarr.tracker_map.entries = {"beta": "Beta"}
     coord.store = store
-    coord.transition = lambda t, s: setattr(t, "state", s)
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
 
     bhd_idx = Indexer(2, "Beta", "torrent", True, [])
     coord.prowlarr = MagicMock()
@@ -322,7 +322,7 @@ async def test_do_new_watch_dir_with_prowlarr_search_and_cross_seeds(tmp_path: P
     coord.cfg.prowlarr.should_skip_title.return_value = False
     coord.cfg.prowlarr.tracker_map.entries = {"beta": "Beta"}
     coord.store = store
-    coord.transition = lambda t, s: setattr(t, "state", s)
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
 
     dl_idx = Indexer(1, "Indexer (API)", "torrent", True, [])
     bhd_idx = Indexer(2, "Beta", "torrent", True, [])
@@ -840,10 +840,11 @@ async def test_do_new_watch_dir_classifies_and_skips_oversize_movie(tmp_path: Pa
 
     await coord._do_new_watch_dir(ts)
 
-    # Oversize movie must be classified as "movie" and rejected upfront
+    # Oversize single file must be rejected upfront
     assert ts.classification_kind == "movie"
     assert ts.state == State.FAILED
-    assert "movie larger than skip threshold" in ts.last_error
+    assert "single file larger than skip threshold" in ts.last_error
+    assert "Massive.Movie.2024.1080p" in ts.last_error
 
 
 @pytest.mark.anyio
