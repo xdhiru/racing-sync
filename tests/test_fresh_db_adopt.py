@@ -186,13 +186,20 @@ class _FakeDest:
 
 
 def _rclone_fake(ssd: Path, fuse: Path, calls: list):
-    """Faithful rclone move stand-in: honors --include, preserves rel paths."""
+    """Faithful rclone move stand-in: honors files_from/--include, preserves rel paths."""
 
-    async def _move(local, remote, ts, *, include=None, extra=None):
-        calls.append(("rclone", str(local), include))
+    async def _move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        calls.append(("rclone", str(local), include, files_from))
         local = Path(local)
         if local.is_file():
             targets = [(local, Path(local.name))]
+        elif files_from is not None:
+            # Exact --files-from-raw semantics: literal rel paths only.
+            targets = []
+            for name in files_from:
+                src_file = local / name
+                if src_file.is_file():
+                    targets.append((src_file, Path(name)))
         else:
             pats = []
             for inc in include or []:

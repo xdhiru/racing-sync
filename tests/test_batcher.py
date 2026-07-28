@@ -48,30 +48,29 @@ def test_batches_in_order():
     assert seq == [1, 2, 3, 4, 5]
 
 
-def test_include_patterns_are_per_file():
+def test_file_names_are_per_file():
     eps = [Episode("S01E01.mkv", 1, 1, 1), Episode("S01E02.mkv", 1, 2, 1)]
     b = make_batches(eps, cap_bytes=10)[0]
-    pats = b.include_patterns()
-    assert pats == ["--include=**/S01E01.mkv", "--include=**/S01E02.mkv"]
+    assert b.file_names() == ["S01E01.mkv", "S01E02.mkv"]
 
 
-def test_include_patterns_escapes_glob_metacharacters():
+def test_file_names_need_no_glob_escaping():
+    """--files-from-raw matches literally, so brackets need no escaping."""
     eps = [
         Episode("[DummySub] Show [1080p].mkv", 1, 1, 1),
         Episode("Show?Part{1}*test.mkv", 1, 2, 1),
     ]
     b = make_batches(eps, cap_bytes=10)[0]
-    pats = b.include_patterns()
-    assert pats == [
-        r"--include=**/\[DummySub\] Show \[1080p\].mkv",
-        r"--include=**/Show\?Part\{1\}\*test.mkv",
+    assert b.file_names() == [
+        "[DummySub] Show [1080p].mkv",
+        "Show?Part{1}*test.mkv",
     ]
 
 
-def test_include_patterns_subfolders_and_backslashes():
+def test_file_names_normalize_subfolders_and_backslashes():
     from racing_sync.batcher import escape_rclone_glob
 
-    # Direct escape_rclone_glob escapes backslashes
+    # escape_rclone_glob is still used by whole-folder <top>/** moves
     assert escape_rclone_glob(r"dir\file*") == r"dir\\file\*"
 
     eps = [
@@ -79,36 +78,25 @@ def test_include_patterns_subfolders_and_backslashes():
         Episode(r"Season 1\S01E02 [1080p].mkv", 1, 2, 100),
     ]
     b = make_batches(eps, cap_bytes=1000)[0]
-    pats = b.include_patterns()
-    assert pats == [
-        "--include=**/Season 1/",
-        "--include=**/Season 1/S01E01.mkv",
-        r"--include=**/Season 1/S01E02 \[1080p\].mkv",
+    assert b.file_names() == [
+        "Season 1/S01E01.mkv",
+        "Season 1/S01E02 [1080p].mkv",
     ]
 
 
-def test_include_patterns_emit_ancestor_dirs_once():
-    """Nested batch files must carry dir rules so rclone descends.
+def test_files_from_names_dedupes_and_skips_empties():
+    from racing_sync.batcher import files_from_names
 
-    Regression: `**/`-prefixed file patterns imply no directory-traversal
-    rules, so every directory hit the implied `- **` and batch moves
-    transferred zero files with exit 0.
-    """
-    from racing_sync.batcher import include_patterns_for_names
-
-    pats = include_patterns_for_names([
+    assert files_from_names([
         "Top/Sub/a.mkv",
-        "Top/Sub/b.mkv",
+        "Top\\Sub\\a.mkv",
+        "Top/c.mkv",
+        "",
+        "root.mkv",
+    ]) == [
+        "Top/Sub/a.mkv",
         "Top/c.mkv",
         "root.mkv",
-    ])
-    assert pats == [
-        "--include=**/Top/",
-        "--include=**/Top/Sub/",
-        "--include=**/Top/Sub/a.mkv",
-        "--include=**/Top/Sub/b.mkv",
-        "--include=**/Top/c.mkv",
-        "--include=**/root.mkv",
     ]
 
 
@@ -220,12 +208,9 @@ async def test_batch_interleaved_download_move_and_clean(tmp_path):
     coord._wait_for_completion = AsyncMock()
     coord._prepare_next_batch = AsyncMock()
 
-    async def _fake_move(local, remote, ts, *, include=None, extra=None):
-        # Simulate a real rclone move: matched files leave local disk.
-        for pat in include or []:
-            name = pat.split("=", 1)[1].removeprefix("**/")
-            if name.endswith("/"):
-                continue
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        # Simulate a real rclone move: listed files leave local disk.
+        for name in files_from or []:
             p = save_dir / name
             if p.is_file():
                 p.unlink()
@@ -403,12 +388,9 @@ async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
     coord.dest_client.delete = AsyncMock()
     coord.dest_client.export_torrent = AsyncMock(return_value=b"blob")
 
-    async def _fake_move(local, remote, ts, *, include=None, extra=None):
-        # Simulate a real rclone move: matched files leave local disk.
-        for pat in include or []:
-            name = pat.split("=", 1)[1].removeprefix("**/").replace("\\[", "[").replace("\\]", "]")
-            if name.endswith("/"):
-                continue
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        # Simulate a real rclone move: listed files leave local disk.
+        for name in files_from or []:
             p = ssd / name
             if p.is_file():
                 p.unlink()
@@ -432,14 +414,10 @@ async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
         await coord._do_moving(row)
 
     assert row.state == State.RE_ADDING
-    # Exactly one sweep move, covering ONLY the verified-complete leftover
-    # (plus the dir rule rclone needs to descend into the top folder).
+    # Exactly one sweep move, covering ONLY the verified-complete leftover.
     coord._rclone_move.assert_awaited_once()
-    includes = coord._rclone_move.call_args.kwargs.get("include")
-    assert includes == [
-        "--include=**/Big.Show.S01/",
-        "--include=**/Big.Show.S01/cover.jpg",
-    ]
+    files_from = coord._rclone_move.call_args.kwargs.get("files_from")
+    assert files_from == ["Big.Show.S01/cover.jpg"]
     # The preallocated partial was neither moved nor individually deleted.
     assert partial.exists()
     assert not cover.exists()
@@ -504,11 +482,8 @@ async def test_move_and_clean_batch_passes_when_rclone_moved_files(tmp_path):
     coord.cfg.rclone.remote.unsorted = "remote:unsorted"
     coord.cfg.rclone.batch_move_extra_flags = []
 
-    async def _fake_move(local, remote, ts, *, include=None, extra=None):
-        for pat in include or []:
-            name = pat.split("=", 1)[1].removeprefix("**/")
-            if name.endswith("/"):
-                continue
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        for name in files_from or []:
             p = ssd / name
             if p.is_file():
                 p.unlink()
@@ -646,7 +621,7 @@ def test_make_batches_huge_season_many_small_nested_episodes():
     """900 GB pack of ~1 GB nested episodes under a 37 GiB cap.
 
     Every batch fits the cap, every episode lands in exactly one batch, and
-    include patterns keep full nested paths (remote layout == torrent layout).
+    file lists keep full nested paths (remote layout == torrent layout).
     """
     from racing_sync.classifier import Episode
 
@@ -661,8 +636,8 @@ def test_make_batches_huge_season_many_small_nested_episodes():
     for b in batches:
         assert b.size_bytes <= 37 * 1024**3
         assert len(b.episodes) <= 100
-        for pat in b.include_patterns():
-            assert pat.startswith("--include=**/Giant.S01/")
+        for name in b.file_names():
+            assert name.startswith("Giant.S01/")
         seen.extend(e.file_name for e in b.episodes)
     assert sorted(seen) == sorted(e.file_name for e in eps)
 
@@ -742,7 +717,13 @@ async def test_do_moving_purges_only_own_temp_files_when_no_season_folder(tmp_pa
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[cls_file])
     coord.dest_client.pause = AsyncMock()
     coord.dest_client.delete = AsyncMock()
-    coord._rclone_move = AsyncMock()
+
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        # Simulate a real rclone move: the single file leaves local disk.
+        if local.is_file():
+            local.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
 
     ts = TorrentState(
         source_infohash="hash2",
@@ -865,12 +846,9 @@ async def test_do_moving_moves_remaining_files_when_batches_incomplete(tmp_path)
     coord.dest_client.pause = AsyncMock()
     coord.dest_client.delete = AsyncMock()
 
-    async def _fake_move(local, remote, ts, *, include=None, extra=None):
-        # Simulate a real rclone move: matched files leave local disk.
-        for pat in include or []:
-            name = pat.split("=", 1)[1].removeprefix("**/")
-            if name.endswith("/"):
-                continue
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        # Simulate a real rclone move: listed files leave local disk.
+        for name in files_from or []:
             p = tmp_path / name
             if p.is_file():
                 p.unlink()
@@ -934,7 +912,20 @@ async def test_do_moving_preserves_top_folder_on_remote(tmp_path):
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[cls_file])
     coord.dest_client.pause = AsyncMock()
     coord.dest_client.delete = AsyncMock()
-    coord._rclone_move = AsyncMock()
+
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        # Simulate a real rclone move: honor the <top>/** include.
+        from pathlib import PurePath
+
+        pats = [(p.split("=", 1)[1] if "=" in p else p) for p in include or []]
+        for src_file in sorted(local.rglob("*")):
+            if not src_file.is_file():
+                continue
+            rel = src_file.relative_to(local).as_posix()
+            if not pats or any(PurePath(rel).match(p) for p in pats):
+                src_file.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
 
     ts = TorrentState(
         source_infohash="hash1",
@@ -1001,7 +992,20 @@ async def test_do_moving_fallback_never_bare_moves_folder(tmp_path):
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[cls_file])
     coord.dest_client.pause = AsyncMock()
     coord.dest_client.delete = AsyncMock()
-    coord._rclone_move = AsyncMock()
+
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        # Simulate a real rclone move: honor the <top>/** include.
+        from pathlib import PurePath
+
+        pats = [(p.split("=", 1)[1] if "=" in p else p) for p in include or []]
+        for src_file in sorted(local.rglob("*")):
+            if not src_file.is_file():
+                continue
+            rel = src_file.relative_to(local).as_posix()
+            if not pats or any(PurePath(rel).match(p) for p in pats):
+                src_file.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
     # Simulate folder detection finding nothing (e.g. odd file order).
     coord._season_folder_for = MagicMock(return_value=None)
 

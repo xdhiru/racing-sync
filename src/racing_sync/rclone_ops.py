@@ -11,8 +11,13 @@ end-of-flags marker; only the two positionals follow it. Anything after
 (`Command move needs 2 arguments maximum`) — and positionals before `--`
 risk flag-injection from `-`-leading paths.
 
-Batch moves (per-episode) additionally carry `--include=...` patterns so
-only the targeted episodes of the season folder are uploaded.
+Per-file moves (batches, leftover sweeps) use `--files-from-raw` with an
+exact torrent-relative name list instead of `--include` globs: `--include`
+patterns cannot express directory traversal for `**/`-prefixed entries
+(rclone implies no dir rules from them, so every directory hits the
+implied `- **` and the move transfers zero files with exit 0), while a
+raw list matches literally — no glob escaping, no ARG_MAX blowup — and
+preserves torrent-relative paths on the remote identically.
 """
 
 from __future__ import annotations
@@ -86,11 +91,18 @@ def _env(cfg: AppConfig) -> dict[str, str]:
 
 def build_move_cmd(cfg: AppConfig, source: Path, dest_remote: str,
                    *, include: list[str] | None = None,
+                   files_from: str | None = None,
                    extra: list[str] | None = None) -> list[str]:
     if dest_remote.startswith("-"):
         raise RcloneError(f"refusing rclone dest_remote starting with '-': {dest_remote!r}")
     if include and not all(i.startswith("--include=") for i in include):
         raise RcloneError(f"include patterns must be '--include=...' form, got: {include!r}")
+    if include and files_from:
+        # --files-from-raw overrides/ignores every filter flag: passing both
+        # would silently drop the includes. Fail loudly instead.
+        raise RcloneError("rclone move takes either include= or files_from=, not both")
+    if files_from and files_from.startswith("-"):
+        raise RcloneError(f"refusing rclone files-from list starting with '-': {files_from!r}")
     # Flags first, `--` + positionals last: rclone parses everything after
     # `--` as positionals, so --config/extra flags placed there become
     # spurious "arguments" (rc=2). `--` still shields a `-`-leading source.
@@ -100,6 +112,8 @@ def build_move_cmd(cfg: AppConfig, source: Path, dest_remote: str,
     cmd.extend(cfg.rclone.extra_move_flags)
     if include:
         cmd.extend(include)
+    if files_from:
+        cmd.extend(["--files-from-raw", files_from])
     if extra:
         cmd.extend(extra)
     cmd.extend(["--", str(source), dest_remote])
@@ -210,12 +224,36 @@ async def move_local_to_remote(
     dest_remote: str,
     *,
     include: list[str] | None = None,
+    files_from: list[str] | None = None,
     extra: list[str] | None = None,
 ) -> RcloneResult:
     if not local.exists():
         raise FileNotFoundError(f"rclone source missing: {local}")
-    cmd = build_move_cmd(cfg, local, dest_remote, include=include, extra=extra)
-    return await run_rclone(cfg, cmd)
+    if files_from is not None and not files_from:
+        raise ValueError("rclone files_from list must not be empty (refusing silent no-op move)")
+    list_path: str | None = None
+    try:
+        if files_from is not None:
+            import tempfile
+
+            # --files-from-raw reads literal paths (no glob processing), one
+            # per line, relative to `local`. delete=False + explicit unlink:
+            # Windows cannot reopen delete=True temp files from the child.
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", suffix=".lst",
+                prefix="racing-sync-files-", delete=False,
+            ) as fh:
+                fh.write("\n".join(files_from) + "\n")
+                list_path = fh.name
+        cmd = build_move_cmd(cfg, local, dest_remote, include=include,
+                             files_from=list_path, extra=extra)
+        return await run_rclone(cfg, cmd)
+    finally:
+        if list_path:
+            try:
+                os.unlink(list_path)
+            except OSError as e:
+                log.warning("could not delete rclone file list %s: %s", list_path, e)
 
 
 def validate_safe_delete_path(

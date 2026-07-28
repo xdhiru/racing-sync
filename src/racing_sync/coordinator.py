@@ -28,7 +28,7 @@ from pathlib import Path
 
 import aiohttp
 
-from .batcher import Batch, escape_rclone_glob, include_patterns_for_names, make_batches, make_file_batches
+from .batcher import Batch, escape_rclone_glob, files_from_names, make_batches, make_file_batches
 from .classifier import classify, oversize_single_file
 from .clients.abstract import Torrent, TorrentClient, TorrentFile
 from .clients.deluge import DelugeClient
@@ -574,11 +574,11 @@ def _top_include_for_folder(src_dir: Path, folder: Path) -> list[str] | None:
     """`--include` patterns moving `folder` while preserving its top dir.
 
     `rclone move <folder> <remote>` transfers the folder's CONTENTS (top
-    dir stripped), but batch moves (`rclone move <src_dir> <remote>
-    --include=**/<top>/<file>`) preserve torrent-relative paths. A stripped
-    layout never matches `save_path/mount + torrent file names`, so fuse
-    re-adds with `skip_check=True` would point at missing data. Moving from
-    `src_dir` with `<top>/**` keeps both paths identical.
+    dir stripped), but per-file moves (`rclone move <src_dir> <remote>
+    --files-from-raw`, one exact name per line) preserve torrent-relative
+    paths. A stripped layout never matches `save_path/mount + torrent file
+    names`, so fuse re-adds with `skip_check=True` would point at missing
+    data. Moving from `src_dir` with `<top>/**` keeps both paths identical.
     Returns None when `folder` is not a direct child layout of `src_dir`
     (caller falls back to the exact-path move).
     """
@@ -2461,22 +2461,19 @@ class Coordinator:
             if hasattr(self, "cfg") and hasattr(self.cfg.rclone, "batch_move_extra_flags")
             else None
         )
+        names = batch.file_names()
         await self._rclone_move(
             src_dir,
             remote,
             ts,
-            include=batch.include_patterns(),
+            files_from=names,
             extra=extra_flags,
         )
-        # rclone exits 0 even when its filters matched nothing: batch files
-        # moved by rclone are already gone, so anything still present never
-        # reached the remote. Raising (instead of deleting) keeps the batch
-        # retryable and the data intact.
-        stragglers = [
-            ep.file_name
-            for ep in batch.episodes
-            if (src_dir / ep.file_name.replace("\\", "/")).exists()
-        ]
+        # rclone exits 0 even when it transferred nothing: batch files moved
+        # by rclone are already gone, so anything still present never reached
+        # the remote. Raising (instead of deleting) keeps the batch retryable
+        # and the data intact.
+        stragglers = [n for n in names if (src_dir / n).exists()]
         if stragglers:
             raise BatchMoveIncompleteError(
                 f"rclone move reported ok but {len(stragglers)} batch file(s) "
@@ -2877,12 +2874,12 @@ class Coordinator:
 
             if ts.batch_index < ts.batches_total or remaining_payload:
                 if local_folder and local_folder.exists():
-                    # Move ONLY client-verified-complete leftovers via per-file
-                    # includes (same mechanism batch moves use, preserving
-                    # torrent-relative paths). Deselected files share pieces
-                    # with batch episodes and sit preallocated-but-incomplete:
-                    # a bare `<top>/**` move would upload that corrupt data
-                    # (and could overwrite an older batch's moved file).
+                    # Move ONLY client-verified-complete leftovers via an exact
+                    # --files-from-raw list (same mechanism batch moves use,
+                    # preserving torrent-relative paths). Deselected files share
+                    # pieces with batch episodes and sit preallocated-but-
+                    # incomplete: a bare `<top>/**` move would upload that corrupt
+                    # data (and could overwrite an older batch's moved file).
                     try:
                         top_rel = local_folder.resolve().relative_to(src_dir.resolve())
                         top = top_rel.parts[0] if top_rel.parts else ""
@@ -2897,8 +2894,8 @@ class Coordinator:
                             continue
                         if (src_dir / norm).is_file():
                             leftover_names.append(norm)
-                    leftover_includes = include_patterns_for_names(leftover_names)
-                    if not leftover_includes:
+                    leftover_files = files_from_names(leftover_names)
+                    if not leftover_files:
                         log.info(
                             "multi-batch torrent %s: no verified-complete leftovers to move "
                             "(%d remaining file(s) are incomplete boundary data); skipping remote move",
@@ -2908,14 +2905,14 @@ class Coordinator:
                         log.info(
                             "multi-batch torrent %s: moving %d verified-complete leftover file(s) "
                             "(batch %d/%d, %d remaining file(s) total)",
-                            ts.source_name, len(leftover_includes),
+                            ts.source_name, len(leftover_files),
                             ts.batch_index, ts.batches_total, len(remaining_payload),
                         )
-                        await self._rclone_move(src_dir, remote, ts, include=leftover_includes)
+                        await self._rclone_move(src_dir, remote, ts, files_from=leftover_files)
                         # Same 0-transfer hazard as batch moves (rclone exits 0
-                        # when filters match nothing): proceeding to the folder
-                        # wipe below would destroy unmoved data. Stay MOVING.
-                        stuck = [n for n in leftover_names if (src_dir / n).exists()]
+                        # even when it transferred nothing): proceeding to the
+                        # folder wipe below would destroy unmoved data. Stay MOVING.
+                        stuck = [n for n in leftover_files if (src_dir / n).exists()]
                         if stuck:
                             log.warning(
                                 "leftover sweep for %s moved nothing "
@@ -2977,8 +2974,29 @@ class Coordinator:
                     raise FileNotFoundError(f"completed content not found on SSD: {cand}")
             if local_include is not None:
                 await self._rclone_move(move_base, remote, ts, include=local_include)
+                # A 0-transfer folder move must not proceed to the wipe below.
+                try:
+                    has_files = local.exists() and any(p.is_file() for p in local.rglob("*"))
+                except OSError:
+                    has_files = True
+                if has_files:
+                    log.warning(
+                        "folder move for %s left files on disk; "
+                        "staying in MOVING without wiping",
+                        ts.source_name,
+                    )
+                    self.store.upsert(ts)
+                    return
             else:
                 await self._rclone_move(local, remote, ts)
+                if local.exists():
+                    log.warning(
+                        "single-file move for %s left %s on disk; "
+                        "staying in MOVING without wiping",
+                        ts.source_name, local,
+                    )
+                    self.store.upsert(ts)
+                    return
         else:
             # Mixed — per-episode moves with --include (single batch)
             cap = self._batch_cap_bytes()
@@ -2999,13 +3017,24 @@ class Coordinator:
                 ts.batch_index = i
                 ts.batches_total = len(batches)
                 self.store.upsert(ts)
+                names = batch.file_names()
                 await self._rclone_move(
                     src_dir,
                     remote,
                     ts,
-                    include=batch.include_patterns(),
+                    files_from=names,
                     extra=self.cfg.rclone.batch_move_extra_flags,
                 )
+                stuck = [n for n in names if (src_dir / n).exists()]
+                if stuck:
+                    log.warning(
+                        "mixed-torrent batch move for %s moved nothing "
+                        "(%d file(s) still on disk, e.g. %s); "
+                        "staying in MOVING without wiping",
+                        ts.source_name, len(stuck), stuck[0],
+                    )
+                    self.store.upsert(ts)
+                    return
 
         # 6. Persist the SSD torrent's bytes for RE_ADDING before the client
         # entry is deleted below. Rows adopted by recovery (fresh state.db)
@@ -3062,11 +3091,18 @@ class Coordinator:
         ts: TorrentState,
         *,
         include: list[str] | None = None,
+        files_from: list[str] | None = None,
         extra: list[str] | None = None,
     ) -> None:
         async with self.move_sem:
-            log.info("rclone move %s -> %s (include=%s, extra=%s)", local, remote, include, extra)
-            res = await move_local_to_remote(self.cfg, local, remote, include=include, extra=extra)
+            if files_from is not None:
+                preview = ", ".join(files_from[:3]) + ("…" if len(files_from) > 3 else "")
+                log.info("rclone move %s -> %s (files=%d, e.g. %s)",
+                         local, remote, len(files_from), preview)
+            else:
+                log.info("rclone move %s -> %s (include=%s, extra=%s)", local, remote, include, extra)
+            res = await move_local_to_remote(self.cfg, local, remote, include=include,
+                                             files_from=files_from, extra=extra)
             if not res.ok:
                 err = res.stderr.strip()
                 last_err = [ln.strip() for ln in err.splitlines() if ln.strip()][-1] if err else f"rc={res.returncode}"
