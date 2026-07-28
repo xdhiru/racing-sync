@@ -68,6 +68,15 @@ _WEBUI_RETRY_ERRORS = (
 _NOT_VISIBLE_DETAIL = "added but entry not yet visible on dest client"
 
 
+class BatchMoveIncompleteError(RuntimeError):
+    """A batch rclone move exited 0 but left batch files on local disk.
+
+    rclone reports success when its filters match nothing, so a 0-transfer
+    must never advance the batch (the old unconditional local cleanup would
+    then destroy not-yet-uploaded data). Callers retry the same batch.
+    """
+
+
 def normalize_content_name(name: str) -> str:
     """Normalize release/torrent names for deduplication and grouping.
 
@@ -2459,16 +2468,20 @@ class Coordinator:
             include=batch.include_patterns(),
             extra=extra_flags,
         )
-        for ep in batch.episodes:
-            file_path = src_dir / ep.file_name
-            if file_path.exists():
-                try:
-                    if file_path.is_file():
-                        file_path.unlink()
-                    elif file_path.is_dir():
-                        shutil.rmtree(file_path, ignore_errors=True)
-                except OSError as e:
-                    log.warning("failed removing batch file %s: %s", ep.file_name, e)
+        # rclone exits 0 even when its filters matched nothing: batch files
+        # moved by rclone are already gone, so anything still present never
+        # reached the remote. Raising (instead of deleting) keeps the batch
+        # retryable and the data intact.
+        stragglers = [
+            ep.file_name
+            for ep in batch.episodes
+            if (src_dir / ep.file_name.replace("\\", "/")).exists()
+        ]
+        if stragglers:
+            raise BatchMoveIncompleteError(
+                f"rclone move reported ok but {len(stragglers)} batch file(s) "
+                f"never reached {remote} (e.g. {stragglers[0]}); not advancing batch"
+            )
 
     async def _do_downloading(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
@@ -2530,7 +2543,17 @@ class Coordinator:
                             )
                             await asyncio.sleep(5)
                             continue
-                    await self._move_and_clean_batch(ts, cur_batch)
+                    try:
+                        await self._move_and_clean_batch(ts, cur_batch)
+                    except BatchMoveIncompleteError as e:
+                        # Same-tick retry like the pause failure above: the
+                        # batch is still fully on local disk, nothing advanced.
+                        log.warning(
+                            "batch move %d/%d for %s incomplete (%s); retrying shortly",
+                            ts.batch_index + 1, ts.batches_total, ts.source_name, e,
+                        )
+                        await asyncio.sleep(5)
+                        continue
                     ts.batch_index += 1
                     self.store.upsert(ts)
                 elif hasattr(self, "_move_and_clean_batch") and hasattr(getattr(self, "_move_and_clean_batch"), "mock_calls"):
@@ -2889,6 +2912,19 @@ class Coordinator:
                             ts.batch_index, ts.batches_total, len(remaining_payload),
                         )
                         await self._rclone_move(src_dir, remote, ts, include=leftover_includes)
+                        # Same 0-transfer hazard as batch moves (rclone exits 0
+                        # when filters match nothing): proceeding to the folder
+                        # wipe below would destroy unmoved data. Stay MOVING.
+                        stuck = [n for n in leftover_names if (src_dir / n).exists()]
+                        if stuck:
+                            log.warning(
+                                "leftover sweep for %s moved nothing "
+                                "(%d file(s) still on disk, e.g. %s); "
+                                "staying in MOVING without wiping",
+                                ts.source_name, len(stuck), stuck[0],
+                            )
+                            self.store.upsert(ts)
+                            return
                 else:
                     log.info(
                         "multi-batch torrent %s: batches already moved (no remaining local content)",

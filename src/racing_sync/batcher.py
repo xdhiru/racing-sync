@@ -40,20 +40,35 @@ def include_patterns_for_names(names: Iterable[str]) -> list[str]:
     transfer — piece-boundary partials of deselected files never match and
     therefore can neither reach the remote nor overwrite an older batch's
     moved file.
+
+    Ancestor directories are emitted as well (trailing-slash dir rules,
+    before the file rules): any --include implies a bottom `- **` rule,
+    and rclone cannot imply directory-traversal rules from `**/`-prefixed
+    file patterns — without explicit dir rules every directory is excluded
+    and the move transfers zero files with exit 0.
     """
     patterns: list[str] = []
+    seen: set[str] = set()
+    file_patterns: list[str] = []
     for raw in names:
         # Normalize path separators to POSIX forward slashes
         normalized = (raw or "").replace("\\", "/").strip("/")
-        parts = normalized.split("/")
-        escaped_path = "/".join(escape_rclone_glob(p) for p in parts if p)
-        if not escaped_path or escaped_path == "**/":
+        parts = [p for p in normalized.split("/") if p]
+        if not parts:
             # Empty/blank file name would match everything — never emit it.
             log.warning("batcher: skipping empty file name for include patterns")
             continue
-        if not escaped_path.startswith("**/"):
-            escaped_path = f"**/{escaped_path}"
-        patterns.append(f"--include={escaped_path}")
+        for i in range(1, len(parts)):
+            dir_pat = f"--include=**/{'/'.join(escape_rclone_glob(p) for p in parts[:i])}/"
+            if dir_pat not in seen:
+                seen.add(dir_pat)
+                patterns.append(dir_pat)
+        escaped_path = f"**/{'/'.join(escape_rclone_glob(p) for p in parts)}"
+        file_pat = f"--include={escaped_path}"
+        if file_pat not in seen:
+            seen.add(file_pat)
+            file_patterns.append(file_pat)
+    patterns.extend(file_patterns)
     return patterns
 
 
