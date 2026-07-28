@@ -4,11 +4,14 @@ Usage:
     python3 run.py run --config config.toml
     python3 run.py run --config config.toml --reset
     python3 run.py check-config --config config.toml
+    python3 run.py forget --config config.toml <infohash|name> [--apply] [--keep-files]
     python3 run.py --help
     python3 run.py run --help
 
 --reset gives a fresh start: it deletes state.db (+WAL/SHM) and clears the
-log directory from the loaded config, then starts normally.
+log directory from the loaded config, then starts normally. Bookkeeping
+only — torrents on the clients/SSD are re-adopted by recovery and resume;
+use 'forget' to abandon one entirely (dry-run by default, --apply deletes).
 
 Ctrl+C stops gracefully. Third-party dependencies (aiohttp, pydantic, ...)
 must exist in the active Python environment; only racing-sync itself runs
