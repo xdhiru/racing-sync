@@ -94,6 +94,57 @@ def _do_reset(cfg: AppConfig) -> list[str]:
     return removed
 
 
+def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
+    """Run the forget off-switch (dry-run plan by default, --apply to delete)."""
+    from .clients.qbittorrent import QBittorrentClient
+    from .forget import forget_torrent
+    from .state import StateStore
+
+    async def _run() -> dict:
+        store = StateStore(cfg.general.state_db)
+        dest = QBittorrentClient(cfg.dest, label="dest-forget")
+        try:
+            await dest.start()
+            return await forget_torrent(
+                cfg, dest=dest, store=store,
+                target=args.target, apply=args.apply,
+                delete_files=not args.keep_files,
+            )
+        finally:
+            try:
+                await dest.close()
+            except Exception:
+                pass
+            try:
+                store.close()
+            except Exception:
+                pass
+
+    try:
+        result = asyncio.run(_run())
+    except LookupError as e:
+        print(f"forget: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"forget failed: {e}", file=sys.stderr)
+        return 1
+    if not result["applied"]:
+        print("dry-run plan (pass --apply to execute):")
+    else:
+        print("forget applied:")
+    print(f"  torrent: {result['source_name']} ({result['source_infohash'][:10]}) [{result['state']}]")
+    for h in result["dest_entries"]:
+        print(f"  dest entry: {h[:10]}")
+    for p in result["local_paths"]:
+        verb = "removed" if result["applied"] and result["delete_files"] else "planned"
+        print(f"  local path ({verb}): {p}")
+    for s in result["skipped_paths"]:
+        print(f"  skipped: {s}")
+    for e in result["errors"]:
+        print(f"  error: {e}")
+    return 1 if result["errors"] else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     prog = Path(sys.argv[0]).name if argv is None and sys.argv else "racing-sync"
     parser = argparse.ArgumentParser(prog=prog)
@@ -105,7 +156,30 @@ def main(argv: list[str] | None = None) -> int:
         "--reset",
         action="store_true",
         help="Fresh start: delete state.db (+WAL/SHM) and clear the log "
-             "directory before starting. The coordinator then starts normally.",
+             "directory before starting. Bookkeeping only — torrents on the "
+             "clients/SSD are re-adopted by recovery and resume; use "
+             "'forget' to abandon a torrent entirely.",
+    )
+
+    p_forget = sub.add_parser(
+        "forget",
+        help="Abandon a torrent: drop its DB row, delete dest client "
+             "entries and (by default) its local SSD data.",
+    )
+    p_forget.add_argument("--config", type=Path, required=True)
+    p_forget.add_argument(
+        "target",
+        help="40-char infohash (any known hash) or a unique name substring.",
+    )
+    p_forget.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually delete. Without it, only prints the dry-run plan.",
+    )
+    p_forget.add_argument(
+        "--keep-files",
+        action="store_true",
+        help="Remove client entries + DB row but keep local data files.",
     )
 
     p_check = sub.add_parser("check-config", help="Validate config and exit")
@@ -125,6 +199,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "check-config":
         print(f"OK: {args.config}")
         return 0
+
+    if args.cmd == "forget":
+        return _cmd_forget(cfg, args)
 
     if getattr(args, "reset", False):
         for line in _do_reset(cfg):

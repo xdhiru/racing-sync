@@ -6,6 +6,7 @@ Endpoints:
   GET  /api/logs?limit=N     -> recent run_log rows
   POST /api/recover          -> trigger reconciler now
   POST /api/retry/{hash}     -> FAILED -> QUEUED
+  POST /api/forget/{hash}    -> abandon a torrent (row + dest entries + SSD data)
   GET  /api/ssd              -> free bytes on the configured SSD path
   POST /api/scan-watch       -> force a watch-dir scan
 """
@@ -31,6 +32,7 @@ except ImportError:
     FastAPI = Any  # type: ignore[assignment,misc]
 
 from .coordinator import Coordinator
+from .forget import forget_torrent
 from .rclone_ops import ssd_free_bytes
 from .recovery import reconcile
 from .state import State
@@ -80,6 +82,16 @@ async def _hold_ops_lock(coord: Coordinator) -> AsyncIterator[None]:
 class RetryResult(BaseModel):
     source_infohash: str
     new_state: str
+
+
+class ForgetResult(BaseModel):
+    source_infohash: str
+    source_name: str
+    applied: bool
+    dest_entries: list[str]
+    local_paths: list[str]
+    skipped_paths: list[str]
+    errors: list[str]
 
 
 def build_app(coord: Coordinator) -> FastAPI:
@@ -149,6 +161,7 @@ def build_app(coord: Coordinator) -> FastAPI:
             "re_added": rpt.re_added,
             "orphans": rpt.orphans,
             "unknowns": rpt.unknowns,
+            "adopted": rpt.adopted,
         }
 
     @app.post("/api/scan-watch", dependencies=[Depends(auth)])
@@ -182,6 +195,32 @@ def build_app(coord: Coordinator) -> FastAPI:
         async with _hold_ops_lock(coord):
             new_state = await asyncio.to_thread(_do_retry)
         return RetryResult(source_infohash=normalized, new_state=new_state)
+
+    @app.post("/api/forget/{source_infohash}", dependencies=[Depends(auth)])
+    async def forget(
+        source_infohash: str,
+        delete_files: bool = Query(default=True),
+    ) -> ForgetResult:
+        normalized = (source_infohash or "").strip().lower()
+        if not _INFOHASH_RE.fullmatch(normalized):
+            raise HTTPException(422, "must be 40-char hex infohash")
+        async with _hold_ops_lock(coord):
+            try:
+                result = await forget_torrent(
+                    cfg, dest=coord.dest_client, store=coord.store,
+                    target=normalized, apply=True, delete_files=delete_files,
+                )
+            except LookupError as e:
+                raise HTTPException(404, str(e)) from e
+        return ForgetResult(
+            source_infohash=result["source_infohash"],
+            source_name=result["source_name"],
+            applied=result["applied"],
+            dest_entries=result["dest_entries"],
+            local_paths=result["local_paths"],
+            skipped_paths=result["skipped_paths"],
+            errors=result["errors"],
+        )
 
     return app
 

@@ -40,6 +40,7 @@ def test_api_recover_returns_dictionary():
         assert data["re_added"] == []
         assert data["orphans"] == []
         assert data["unknowns"] == []
+        assert data["adopted"] == []
 
 
 def test_auth_rejects_nginx_header_from_untrusted_remote_ip():
@@ -241,6 +242,55 @@ def test_api_retry_and_ssd_endpoints():
     resp_200 = client.post("/api/retry/" + "c" * 40, headers=headers)
     assert resp_200.status_code == 200
     coord.store.transition.assert_called_once_with(ts_failed, State.QUEUED, error="")
+
+
+def test_api_forget_endpoint():
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(enabled=True, api_token="secret", trust_nginx_header=False)
+
+    coord = MagicMock()
+    coord.cfg = cfg
+
+    app = build_app(coord)
+    client = TestClient(app)
+    headers = {"X-Api-Token": "secret"}
+
+    # 422 (not a 40-char hex infohash)
+    resp_422 = client.post("/api/forget/not-a-hash", headers=headers)
+    assert resp_422.status_code == 422
+
+    # 404 (unknown hash)
+    with patch("racing_sync.api.forget_torrent", new_callable=AsyncMock) as mock_forget:
+        mock_forget.side_effect = LookupError("no torrent matching 'aaaa'")
+        resp_404 = client.post("/api/forget/" + "a" * 40, headers=headers)
+        assert resp_404.status_code == 404
+
+    # 200 (applied, delete_files default True)
+    planned = {
+        "applied": True,
+        "delete_files": True,
+        "source_infohash": "b" * 40,
+        "source_name": "Pack",
+        "state": "moving",
+        "dest_entries": ["b" * 40],
+        "local_paths": ["/ssd/Pack"],
+        "skipped_paths": [],
+        "errors": [],
+    }
+    with patch("racing_sync.api.forget_torrent", new_callable=AsyncMock) as mock_forget:
+        mock_forget.return_value = planned
+        resp_200 = client.post(
+            "/api/forget/" + "B" * 40 + "?delete_files=false", headers=headers
+        )
+        assert resp_200.status_code == 200
+        body = resp_200.json()
+        assert body["source_infohash"] == "b" * 40
+        assert body["applied"] is True
+        assert body["local_paths"] == ["/ssd/Pack"]
+        _, kwargs = mock_forget.call_args
+        assert kwargs["target"] == "b" * 40
+        assert kwargs["apply"] is True
+        assert kwargs["delete_files"] is False
 
 
 def test_build_app_without_fastapi_raises_error():
