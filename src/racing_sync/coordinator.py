@@ -28,8 +28,8 @@ from pathlib import Path
 
 import aiohttp
 
-from .batcher import Batch, escape_rclone_glob, include_patterns_for_names, make_batches
-from .classifier import classify, should_skip_movie
+from .batcher import Batch, escape_rclone_glob, include_patterns_for_names, make_batches, make_file_batches
+from .classifier import classify, oversize_single_file
 from .clients.abstract import Torrent, TorrentClient, TorrentFile
 from .clients.deluge import DelugeClient
 from .clients.http_base import AuthError
@@ -1970,19 +1970,25 @@ class Coordinator:
                         except Exception as e:  # noqa: BLE001
                             log.warning("could not download cross-seed from %s: %s", hit.indexer, e)
 
-        # Classify the chosen torrent metadata and apply movie skip upfront
+        # Classify the chosen torrent metadata for downstream routing.
+        parsed_files: list = []
         try:
             from .watchdir import extract_torrent_files_from_bencoded
             parsed_files = extract_torrent_files_from_bencoded(chosen_blob)
             if parsed_files:
                 cls = classify(parsed_files, self.cfg)
                 ts.classification_kind = cls.kind
-                if should_skip_movie(cls, self.cfg):
-                    log.warning("watch-dir: skipping oversize movie: %s (%d B)", ts.source_name, ts.total_bytes)
-                    self.transition(ts, State.FAILED, error="movie larger than skip threshold")
-                    return
         except Exception as e:
             log.warning("watch-dir: failed to classify %s: %s", ts.source_name, e)
+
+        # Feasibility is per individual file: anything may flow (batched as
+        # needed) unless one file alone exceeds the SSD cap.
+        too_big = oversize_single_file(parsed_files, self.cfg)
+        if too_big is not None:
+            log.warning("watch-dir: single file %s exceeds skip threshold; failing %s",
+                        too_big, ts.source_name)
+            self.transition(ts, State.FAILED, error=f"single file larger than skip threshold: {too_big}")
+            return
 
         ts.cross_seed_infohash = chosen_infohash.lower()
         ts.cross_seed_source = chosen_label
@@ -2292,6 +2298,25 @@ class Coordinator:
         cls = classify(files, self.cfg)
         ts.classification_kind = cls.kind
 
+        # Feasibility is per individual file: anything may flow (batched as
+        # needed) unless one file alone exceeds the SSD cap. Total size never
+        # disqualifies content anymore.
+        too_big = oversize_single_file(files, self.cfg)
+        if too_big is not None:
+            log.warning("single file %s exceeds skip threshold; failing %s",
+                        too_big, ts.source_name)
+            # Remove the paused torrent from VPS2 so it does not leak as an orphan
+            h = ts.dest_infohash or ts.source_infohash
+            if h:
+                try:
+                    await self.dest_client.delete(h, delete_files=True)
+                except Exception as e:
+                    log.warning("failed to delete skipped oversize content %s: %s", h[:10], e)
+            self.transition(
+                ts, State.FAILED, error=f"single file larger than skip threshold: {too_big}",
+            )
+            return
+
         # Apply batch file priorities for seasons
         if cls.kind in ("season", "mixed") and cls.episodes:
             episodes = [e for e in cls.episodes]
@@ -2317,22 +2342,30 @@ class Coordinator:
                 await self.dest_client.set_file_priorities(
                     ts.dest_infohash or ts.source_infohash, prio_map,
                 )
-
-        # Skip movies that are too big (req #7)
-        if should_skip_movie(cls, self.cfg):
-            log.warning("skipping oversize movie: %s (%d B)",
-                        ts.source_name, ts.total_bytes)
-            # Remove the paused torrent from VPS2 so it does not leak as an orphan
-            h = ts.dest_infohash or ts.source_infohash
-            if h:
-                try:
-                    await self.dest_client.delete(h, delete_files=True)
-                except Exception as e:
-                    log.warning("failed to delete skipped oversize movie %s: %s", h[:10], e)
-            self.transition(
-                ts, State.FAILED, error="movie larger than skip threshold",
-            )
-            return
+        elif cls.kind in ("movie", "unknown") and len(files) > 1:
+            # Type-agnostic file-group batching for multi-file content that
+            # is not episodic (games, disc images, complete packs with plain
+            # numbering): stream name-sorted groups through the SSD instead
+            # of needing the whole torrent on disk at once. Single episodes
+            # stay on the full-torrent path even when extras are present.
+            cap = self._batch_cap_bytes()
+            if cap <= 0:
+                total_files = sum(f.size_bytes for f in files)
+                if not ssd_has_room(self.cfg, min(total_files, ts.total_bytes or total_files)):
+                    log.info("ssd cap in use; parking %s", ts.source_name)
+                    self.transition(ts, State.WAITING_DISK)
+                    return
+                cap = total_files or ts.total_bytes or 1
+            batches = make_file_batches(files, cap_bytes=cap)
+            ts.batches_total = len(batches)
+            ts.batch_index = 0
+            if batches:
+                first = batches[0]
+                wanted = {ep.file_name for ep in first.episodes}
+                prio_map = {f.name: (1 if f.name in wanted else 0) for f in files}
+                await self.dest_client.set_file_priorities(
+                    ts.dest_infohash or ts.source_infohash, prio_map,
+                )
 
         # Resume
         await self.dest_client.resume(ts.dest_infohash or ts.source_infohash)
@@ -2350,6 +2383,27 @@ class Coordinator:
 
     # ---- state: DOWNLOADING ----
 
+    def _resolve_batches(self, files: list[TorrentFile], kind: str, cap_bytes: int) -> list[Batch]:
+        """Episode batches for seasons, file-group batches otherwise.
+
+        Single shared rule used at QUEUED time and re-resolved during the
+        download loop, so batch counts stay consistent: seasons split by
+        episode, movie/unknown multi-file content splits name-sorted file
+        groups. Single files, single episodes and empty lists yield no
+        batches (full-torrent flow).
+        """
+        if kind in ("season", "mixed"):
+            try:
+                eps = list(classify(files, self.cfg).episodes)
+            except Exception:
+                return []
+            if not eps:
+                return []
+            return make_batches(eps, cap_bytes=cap_bytes)
+        if kind in ("movie", "unknown") and len(files) > 1:
+            return make_file_batches(files, cap_bytes=cap_bytes)
+        return []
+
     async def _get_batches_for_torrent(self, ts: TorrentState) -> list[Batch]:
         h = ts.dest_infohash or ts.source_infohash
         try:
@@ -2357,20 +2411,20 @@ class Coordinator:
         except Exception as e:
             log.warning("could not get torrent files for batches: %s", e)
             return []
-        # Use classify() — the same filtering/dedup/regex as _do_queued —
-        # so batch counts stay consistent across the download loop.
-        try:
-            eps = list(classify(files, self.cfg).episodes)
-        except Exception as e:
-            log.warning("could not classify files for batches: %s", e)
-            return []
-        if not eps:
-            return []
+        # Same rule as _do_queued so batch counts stay consistent across
+        # the download loop.
+        kind = ts.classification_kind
+        if not kind or kind == "unknown":
+            try:
+                kind = classify(files, self.cfg).kind
+            except Exception as e:
+                log.warning("could not classify files for batches: %s", e)
+                return []
         cap = self._batch_cap_bytes()
         if cap <= 0:
-            cap = sum(e.size_bytes for e in eps) or 1
+            cap = sum(f.size_bytes for f in files) or 1
         try:
-            return make_batches(eps, cap_bytes=cap)
+            return self._resolve_batches(files, kind, cap)
         except Exception as e:
             log.warning("could not make batches for %s: %s", ts.source_name, e)
             return []
@@ -2418,12 +2472,12 @@ class Coordinator:
 
     async def _do_downloading(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
-        if ts.batches_total <= 0 and ts.classification_kind in ("season", "mixed") and hasattr(self, "dest_client"):
+        if ts.batches_total <= 0 and hasattr(self, "dest_client"):
             batches = await self._get_batches_for_torrent(ts)
             ts.batches_total = len(batches)
             self.store.upsert(ts)
 
-        is_batched = ts.classification_kind in ("season", "mixed") and ts.batches_total > 1
+        is_batched = ts.batches_total > 1
 
         while not self._stop:
             # Live tracking
@@ -2601,19 +2655,19 @@ class Coordinator:
             log.warning("could not get torrent files for next batch: %s", e)
             return
         try:
-            eps = list(classify(files, self.cfg).episodes)
+            kind = classify(files, self.cfg).kind
         except Exception as e:
             log.warning("could not classify files for next batch: %s", e)
             return
-        if not eps:
-            return
         cap = self._batch_cap_bytes()
         if cap <= 0:
-            cap = sum(e.size_bytes for e in eps) or 1
+            cap = sum(f.size_bytes for f in files) or 1
         try:
-            batches = make_batches(eps, cap_bytes=cap)
+            batches = self._resolve_batches(files, kind, cap)
         except Exception as e:
             log.warning("could not make batches for next batch: %s", e)
+            return
+        if not batches:
             return
         if ts.batch_index >= len(batches):
             return

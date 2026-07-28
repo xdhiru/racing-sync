@@ -1129,6 +1129,93 @@ async def test_re_inject_racing_torrents_skips_missing_fuse_content(tmp_path: Pa
 
 
 @pytest.mark.anyio
+async def test_do_queued_batches_non_episodic_bundle_in_file_groups(tmp_path: Path):
+    """Multi-file movie bundles (games, complete packs) stream in file groups.
+
+    Total size must NOT disqualify content: only an individual file bigger
+    than the cap refuses the torrent.
+    """
+    from racing_sync.clients.abstract import AddResult, TorrentFile
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 10_000
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.fuse.mount = str(tmp_path / "fuse")
+    coord.cfg.rclone.fuse.mount_unsorted = str(tmp_path / "fuse-unsorted")
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash="dd" * 20, accepted=True, detail="Ok.")
+    )
+    files = [
+        TorrentFile(name="Pack/A.Level1.bin", size_bytes=4000, progress=0.0),
+        TorrentFile(name="Pack/B.Level2.bin", size_bytes=4000, progress=0.0),
+        TorrentFile(name="Pack/C.Level3.bin", size_bytes=4000, progress=0.0),
+    ]
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=files)
+    coord.dest_client.set_file_priorities = AsyncMock()
+    coord.dest_client.resume = AsyncMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(
+        source_infohash="e" * 40, source_name="Pack", total_bytes=12000,
+        cross_seed_blob=b"blob", save_path=str(tmp_path), state=State.QUEUED,
+    )
+
+    await coord._do_queued(ts)
+
+    assert ts.state == State.DOWNLOADING
+    assert ts.classification_kind == "movie"
+    assert ts.batches_total == 2
+    prio_map = coord.dest_client.set_file_priorities.call_args[0][1]
+    assert prio_map["Pack/A.Level1.bin"] == 1
+    assert prio_map["Pack/B.Level2.bin"] == 1
+    assert prio_map["Pack/C.Level3.bin"] == 0
+
+
+@pytest.mark.anyio
+async def test_do_queued_fails_single_oversize_member_not_total(tmp_path: Path):
+    """One member bigger than the cap fails the torrent, however small the rest."""
+    from racing_sync.clients.abstract import AddResult, TorrentFile
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 100_000_000_000
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 10_000
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash="dd" * 20, accepted=True, detail="Ok.")
+    )
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Pack/ok.bin", size_bytes=1000, progress=0.0),
+        TorrentFile(name="Pack/huge.bin", size_bytes=50_000, progress=0.0),
+    ])
+    coord.dest_client.delete = AsyncMock()
+    def _set_state(t, s, error="", **kwargs):
+        t.state = s
+        t.last_error = error
+    coord.transition = MagicMock(side_effect=_set_state)
+
+    ts = TorrentState(
+        source_infohash="e" * 40, source_name="Pack", total_bytes=51000,
+        cross_seed_blob=b"blob", save_path=str(tmp_path), state=State.QUEUED,
+    )
+
+    await coord._do_queued(ts)
+
+    assert ts.state == State.FAILED
+    assert "skip threshold" in ts.last_error
+    assert "Pack/huge.bin" in ts.last_error
+    coord.dest_client.delete.assert_awaited_once_with("dd" * 20, delete_files=True)
+
+
+@pytest.mark.anyio
 async def test_ensure_fuse_entry_retries_delayed_visibility_after_replace(tmp_path: Path):
     """A re-add accepted by qB but invisible to immediate lookups (10k-torrent
     registration lag) must be confirmed via retry, not reported as rejected."""

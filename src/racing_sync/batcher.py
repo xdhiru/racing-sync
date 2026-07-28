@@ -132,3 +132,31 @@ def make_batches(
             i, b.first_season_ep, b.last_season_ep, len(b.episodes), b.size_bytes,
         )
     return batches
+
+
+def make_file_batches(
+    files: list, *, cap_bytes: int, max_files: int = DEFAULT_MAX_BATCH_FILES
+) -> list[Batch]:
+    """Greedy size-capped groups over arbitrary torrent files.
+
+    Type-agnostic counterpart to make_batches for multi-file content that is
+    not episodic (games, disc images, complete packs with plain numbering):
+    files stream through the SSD in name-sorted groups instead of needing
+    the whole torrent on disk at once. Members are synthesized Episode
+    entries (season 0) so every downstream consumer (priorities, wait
+    lists, include patterns, cleanup) works unchanged.
+    """
+    ordered = sorted(
+        [f for f in files if getattr(f, "name", "")],
+        key=lambda f: f.name.replace("\\", "/"),
+    )
+    episodes: list[Episode] = []
+    for idx, f in enumerate(ordered, start=1):
+        try:
+            size = int(float(getattr(f, "size_bytes", 0) or 0))
+        except (TypeError, ValueError):
+            size = 0
+        if size < 0:
+            raise ValueError(f"file {f.name!r} has negative size {size}")
+        episodes.append(Episode(f.name, 0, idx, size))
+    return make_batches(episodes, cap_bytes=cap_bytes, max_files=max_files)
