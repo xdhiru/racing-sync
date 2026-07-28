@@ -128,6 +128,90 @@ def test_build_move_cmd(tmp_path: Path):
     assert "--dry-run" in cmd[:dash_idx]
 
 
+def test_build_move_cmd_files_from_raw(tmp_path: Path):
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+    cfg.rclone.binary = Path("/usr/bin/rclone")
+    cfg.rclone.config_path = None
+    cfg.rclone.extra_move_flags = []
+
+    cmd = build_move_cmd(
+        cfg, tmp_path / "src", "remote:dest",
+        files_from="/tmp/list.lst",
+    )
+    dash_idx = cmd.index("--")
+    assert "--files-from-raw" in cmd[:dash_idx]
+    assert "/tmp/list.lst" in cmd[:dash_idx]
+    assert cmd[-3:] == ["--", str(tmp_path / "src"), "remote:dest"]
+
+
+def test_build_move_cmd_rejects_include_plus_files_from(tmp_path: Path):
+    import pytest as _pytest
+
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+    cfg.rclone.binary = Path("/usr/bin/rclone")
+    cfg.rclone.config_path = None
+    cfg.rclone.extra_move_flags = []
+
+    with _pytest.raises(Exception):
+        build_move_cmd(
+            cfg, tmp_path / "src", "remote:dest",
+            include=["--include=*.mkv"], files_from="/tmp/list.lst",
+        )
+
+
+@pytest.mark.anyio
+async def test_move_local_to_remote_files_from_writes_and_cleans_list(tmp_path: Path):
+    from unittest.mock import AsyncMock, patch
+    from racing_sync import rclone_ops
+    from racing_sync.rclone_ops import move_local_to_remote
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "Top").mkdir()
+
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+    cfg.rclone.binary = Path("/usr/bin/rclone")
+    cfg.rclone.config_path = None
+    cfg.rclone.extra_move_flags = []
+
+    seen: dict = {}
+
+    async def _fake_run(cfg_, cmd, **kwargs):
+        idx = cmd.index("--files-from-raw")
+        with open(cmd[idx + 1], encoding="utf-8") as fh:
+            seen["content"] = fh.read()
+        seen["list_path"] = cmd[idx + 1]
+        from racing_sync.rclone_ops import RcloneResult
+        return RcloneResult(returncode=0, stdout="", stderr="", duration=0.1)
+
+    with patch.object(rclone_ops, "run_rclone", AsyncMock(side_effect=_fake_run)):
+        await move_local_to_remote(
+            cfg, src, "remote:dest",
+            files_from=["Top/a.mkv", "Top/Sub/b.mkv"],
+        )
+
+    assert seen["content"] == "Top/a.mkv\nTop/Sub/b.mkv\n"
+    assert not Path(seen["list_path"]).exists()
+
+
+@pytest.mark.anyio
+async def test_move_local_to_remote_rejects_empty_files_from(tmp_path: Path):
+    import pytest as _pytest
+    from racing_sync.rclone_ops import move_local_to_remote
+
+    src = tmp_path / "src"
+    src.mkdir()
+
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+
+    with _pytest.raises(ValueError):
+        await move_local_to_remote(cfg, src, "remote:dest", files_from=[])
+
+
 @pytest.mark.anyio
 async def test_run_rclone_timeout_redacts_command(monkeypatch):
     from unittest.mock import AsyncMock

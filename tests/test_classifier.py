@@ -199,7 +199,15 @@ async def test_do_moving_moves_mixed_content_in_batches(tmp_path: Path):
     coord.cfg = cfg
     coord.store = MagicMock()
     coord.dest_client = AsyncMock()
-    coord._rclone_move = AsyncMock()
+
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        # Simulate a real rclone move: listed files leave local disk.
+        for name in files_from or []:
+            p = tmp_path / name
+            if p.is_file():
+                p.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
     coord.transition = MagicMock()
     coord._season_folder_for = MagicMock(return_value=None)
 
