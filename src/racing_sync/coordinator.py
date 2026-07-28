@@ -2486,6 +2486,18 @@ class Coordinator:
             batches = await self._get_batches_for_torrent(ts)
             ts.batches_total = len(batches)
             self.store.upsert(ts)
+            # Freshly adopted rows (e.g. recovery after --reset wiped the batch
+            # cursors) skip QUEUED setup, so no batch was ever prioritized and
+            # the client may still select a stale batch. Restart at batch 0.
+            try:
+                await self._prepare_next_batch(ts)
+            except Exception as e:  # noqa: BLE001
+                log.warning("could not prioritize first batch for %s: %s",
+                            ts.source_infohash[:10], e)
+            try:
+                await self.dest_client.resume(h)
+            except Exception as e:  # noqa: BLE001
+                log.warning("could not resume adopted torrent %s: %s", h[:10], e)
 
         is_batched = ts.batches_total > 1
 

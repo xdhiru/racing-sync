@@ -21,9 +21,13 @@ async def test_reconcile_adopts_fuse_and_completed_torrents(tmp_path: Path):
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
     cfg = MagicMock()
     cfg.rclone.fuse.mount = Path("/mnt/fuse/torrents")
     cfg.rclone.fuse.mount_unsorted = Path("/mnt/fuse/unsorted")
+    cfg.dest.save_path = ssd
+    cfg.ssd.path = ssd
 
     # Mock dest client returning torrents already on VPS2
     dest = AsyncMock()
@@ -48,12 +52,22 @@ async def test_reconcile_adopts_fuse_and_completed_torrents(tmp_path: Path):
             progress=1.0,
             state="uploading",
         ),
-        # Torrent 3: incomplete on SSD (unknown)
+        # Torrent 3: incomplete on SSD -> adopted as DOWNLOADING, not abandoned
         Torrent(
             hash="3333333333333333333333333333333333333333",
             name="Incomplete.Download.mkv",
             size_bytes=3000,
-            save_path="/home/user/torrents/qbittorrent",
+            save_path=str(ssd),
+            category="racing",
+            progress=0.3,
+            state="downloading",
+        ),
+        # Torrent 4: incomplete outside any SSD root -> still unknown
+        Torrent(
+            hash="4444444444444444444444444444444444444444",
+            name="Stray.Download.mkv",
+            size_bytes=4000,
+            save_path="/mnt/other/place",
             category="racing",
             progress=0.3,
             state="downloading",
@@ -64,6 +78,8 @@ async def test_reconcile_adopts_fuse_and_completed_torrents(tmp_path: Path):
 
     assert len(report.kept) == 2
     assert len(report.unknowns) == 1
+    assert report.unknowns == ["4444444444444444444444444444444444444444"]
+    assert len(report.adopted) == 3
 
     # Check store has adopted the 2 fuse/completed torrents as DONE
     t1 = store.get("1111111111111111111111111111111111111111")
@@ -74,8 +90,16 @@ async def test_reconcile_adopts_fuse_and_completed_torrents(tmp_path: Path):
     assert t2 is not None
     assert t2.state == State.DONE
 
+    # Partial SSD torrent resumes instead of being abandoned
     t3 = store.get("3333333333333333333333333333333333333333")
-    assert t3 is None
+    assert t3 is not None
+    assert t3.state == State.DOWNLOADING
+    assert t3.dest_infohash == "3333333333333333333333333333333333333333"
+    assert t3.save_path == str(ssd).replace("\\", "/")
+    assert "3333333333333333333333333333333333333333" in report.resumed
+
+    t4 = store.get("4444444444444444444444444444444444444444")
+    assert t4 is None
 
 
 @pytest.mark.anyio
@@ -766,8 +790,116 @@ async def test_queued_existing_torrent_resumes(tmp_path: Path):
     assert ts.state == State.DOWNLOADING
 
 
+@pytest.mark.anyio
+async def test_save_path_on_ssd_membership(tmp_path: Path):
+    from racing_sync.recovery import _save_path_on_ssd
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    cfg = MagicMock()
+    cfg.dest.save_path = ssd
+    cfg.ssd.path = ssd
+
+    assert _save_path_on_ssd(cfg, str(ssd)) is True
+    assert _save_path_on_ssd(cfg, str(ssd / "Pack")) is True
+    assert _save_path_on_ssd(cfg, "/mnt/fuse/torrents") is False
+    assert _save_path_on_ssd(cfg, "") is False
+    assert _save_path_on_ssd(cfg, "/etc") is False
+    # Unresolvable roots (test doubles) never claim membership.
+    assert _save_path_on_ssd(MagicMock(), str(ssd)) is False
 
 
+@pytest.mark.anyio
+async def test_reconcile_warns_when_adopting_rows(tmp_path: Path, caplog):
+    import logging
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+
+    cfg = MagicMock()
+    cfg.rclone.fuse.mount = Path("/mnt/fuse/torrents")
+    cfg.rclone.fuse.mount_unsorted = Path("/mnt/fuse/unsorted")
+    cfg.dest.save_path = ssd
+    cfg.ssd.path = ssd
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [
+        Torrent(
+            hash="p" * 40,
+            name="Partial.Pack.S01",
+            size_bytes=999,
+            save_path=str(ssd),
+            category="racing",
+            progress=0.2,
+            state="downloading",
+        ),
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="racing_sync.recovery"):
+        report = await reconcile(cfg, dest=dest, store=store)
+
+    assert report.adopted == ["p" * 40]
+    assert any("forget" in r.message for r in caplog.records)
+
+
+@pytest.mark.anyio
+async def test_do_downloading_fresh_row_prioritizes_batch_zero(tmp_path: Path):
+    """Adopted DOWNLOADING rows (batches_total=0) restart priorities at batch 0.
+
+    Recovery adoptions skip QUEUED setup, so without this the client keeps
+    downloading a stale batch selection while the loop waits on batch 0.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord._live = {}
+    coord._tg = None
+    coord.store = MagicMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, **kw: setattr(t, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.max_inflight_bytes = 10_000
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.dest_client = AsyncMock()
+    files = [
+        TorrentFile(name="Pack/a.bin", size_bytes=4000, progress=0.0),
+        TorrentFile(name="Pack/b.bin", size_bytes=4000, progress=0.0),
+        TorrentFile(name="Pack/c.bin", size_bytes=4000, progress=0.0),
+    ]
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=files)
+    coord._wait_for_completion = AsyncMock()
+    coord._move_and_clean_batch = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="a" * 40,
+        source_name="Pack",
+        dest_infohash="a" * 40,
+        save_path=str(ssd),
+        total_bytes=12000,
+        classification_kind="movie",
+        batches_total=0,
+        batch_index=0,
+        state=State.DOWNLOADING,
+    )
+
+    await coord._do_downloading(ts)
+
+    # Batches resolved on entry; the first priority map must select batch 0
+    # only (a+b under a 10k cap) and the torrent must be resumed.
+    assert ts.batches_total == 2
+    first_map = coord.dest_client.set_file_priorities.call_args_list[0][0][1]
+    assert first_map["Pack/a.bin"] == 1
+    assert first_map["Pack/b.bin"] == 1
+    assert first_map["Pack/c.bin"] == 0
+    coord.dest_client.resume.assert_called()
+    assert ts.state == State.MOVING
 
 
 
