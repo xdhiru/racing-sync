@@ -81,8 +81,34 @@ def test_include_patterns_subfolders_and_backslashes():
     b = make_batches(eps, cap_bytes=1000)[0]
     pats = b.include_patterns()
     assert pats == [
+        "--include=**/Season 1/",
         "--include=**/Season 1/S01E01.mkv",
         r"--include=**/Season 1/S01E02 \[1080p\].mkv",
+    ]
+
+
+def test_include_patterns_emit_ancestor_dirs_once():
+    """Nested batch files must carry dir rules so rclone descends.
+
+    Regression: `**/`-prefixed file patterns imply no directory-traversal
+    rules, so every directory hit the implied `- **` and batch moves
+    transferred zero files with exit 0.
+    """
+    from racing_sync.batcher import include_patterns_for_names
+
+    pats = include_patterns_for_names([
+        "Top/Sub/a.mkv",
+        "Top/Sub/b.mkv",
+        "Top/c.mkv",
+        "root.mkv",
+    ])
+    assert pats == [
+        "--include=**/Top/",
+        "--include=**/Top/Sub/",
+        "--include=**/Top/Sub/a.mkv",
+        "--include=**/Top/Sub/b.mkv",
+        "--include=**/Top/c.mkv",
+        "--include=**/root.mkv",
     ]
 
 
@@ -193,7 +219,18 @@ async def test_batch_interleaved_download_move_and_clean(tmp_path):
     coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
     coord._wait_for_completion = AsyncMock()
     coord._prepare_next_batch = AsyncMock()
-    coord._rclone_move = AsyncMock()
+
+    async def _fake_move(local, remote, ts, *, include=None, extra=None):
+        # Simulate a real rclone move: matched files leave local disk.
+        for pat in include or []:
+            name = pat.split("=", 1)[1].removeprefix("**/")
+            if name.endswith("/"):
+                continue
+            p = save_dir / name
+            if p.is_file():
+                p.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
     coord.dest_client = MagicMock()
     coord.dest_client.pause = AsyncMock()
     coord.dest_client.resume = AsyncMock()
@@ -234,7 +271,7 @@ async def test_batch_interleaved_download_move_and_clean(tmp_path):
     # Client paused before move and resumed for next batch
     assert coord.dest_client.pause.await_count == 2
     assert coord.dest_client.resume.await_count == 1
-    # Local files wiped after batch move
+    # Batch files left local disk via the (simulated) rclone move
     assert not ep1_path.exists()
     assert not ep2_path.exists()
     assert ts.batch_index == 2
@@ -365,7 +402,18 @@ async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
     coord.dest_client.pause = AsyncMock()
     coord.dest_client.delete = AsyncMock()
     coord.dest_client.export_torrent = AsyncMock(return_value=b"blob")
-    coord._rclone_move = AsyncMock()
+
+    async def _fake_move(local, remote, ts, *, include=None, extra=None):
+        # Simulate a real rclone move: matched files leave local disk.
+        for pat in include or []:
+            name = pat.split("=", 1)[1].removeprefix("**/").replace("\\[", "[").replace("\\]", "]")
+            if name.endswith("/"):
+                continue
+            p = ssd / name
+            if p.is_file():
+                p.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
 
     ts = TorrentState(
         source_infohash="b" * 40,
@@ -384,12 +432,156 @@ async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
         await coord._do_moving(row)
 
     assert row.state == State.RE_ADDING
-    # Exactly one sweep move, covering ONLY the verified-complete leftover.
+    # Exactly one sweep move, covering ONLY the verified-complete leftover
+    # (plus the dir rule rclone needs to descend into the top folder).
     coord._rclone_move.assert_awaited_once()
     includes = coord._rclone_move.call_args.kwargs.get("include")
-    assert includes == ["--include=**/Big.Show.S01/cover.jpg"]
+    assert includes == [
+        "--include=**/Big.Show.S01/",
+        "--include=**/Big.Show.S01/cover.jpg",
+    ]
     # The preallocated partial was neither moved nor individually deleted.
     assert partial.exists()
+    assert not cover.exists()
+
+
+@pytest.mark.anyio
+async def test_move_and_clean_batch_raises_when_files_remain(tmp_path):
+    """A 0-transfer rclone move (exit 0, filters matched nothing) must not advance.
+
+    Regression: the old unconditional local cleanup deleted batch files that
+    never reached the remote, silently losing data while the batch was
+    marked complete.
+    """
+    from racing_sync.coordinator import BatchMoveIncompleteError, Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.batcher import Batch
+    from racing_sync.classifier import Episode
+
+    ssd = tmp_path / "ssd"
+    top = ssd / "Pack"
+    top.mkdir(parents=True)
+    (top / "a.mkv").write_bytes(b"data")
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.batch_move_extra_flags = []
+    coord._rclone_move = AsyncMock()  # exit 0 but moves nothing
+
+    ts = TorrentState(
+        source_infohash="d" * 40,
+        source_name="Pack",
+        save_path=str(ssd),
+        classification_kind="movie",
+        state=State.DOWNLOADING,
+    )
+    batch = Batch(episodes=[Episode("Pack/a.mkv", 0, 1, 4)])
+
+    with pytest.raises(BatchMoveIncompleteError):
+        await coord._move_and_clean_batch(ts, batch)
+    # Evidence preserved for retry — nothing deleted, nothing advanced.
+    assert (top / "a.mkv").exists()
+
+
+@pytest.mark.anyio
+async def test_move_and_clean_batch_passes_when_rclone_moved_files(tmp_path):
+    """When rclone really moved the files (gone locally), no error."""
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.batcher import Batch
+    from racing_sync.classifier import Episode
+
+    ssd = tmp_path / "ssd"
+    (ssd / "Pack").mkdir(parents=True)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.batch_move_extra_flags = []
+
+    async def _fake_move(local, remote, ts, *, include=None, extra=None):
+        for pat in include or []:
+            name = pat.split("=", 1)[1].removeprefix("**/")
+            if name.endswith("/"):
+                continue
+            p = ssd / name
+            if p.is_file():
+                p.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
+
+    ts = TorrentState(
+        source_infohash="e" * 40,
+        source_name="Pack",
+        save_path=str(ssd),
+        classification_kind="movie",
+        state=State.DOWNLOADING,
+    )
+    batch = Batch(episodes=[Episode("Pack/a.mkv", 0, 1, 4)])
+    await coord._move_and_clean_batch(ts, batch)
+
+
+@pytest.mark.anyio
+async def test_do_moving_sweep_stays_moving_when_leftovers_stuck(tmp_path):
+    """Sweep 0-transfer must not proceed to the folder wipe (data loss)."""
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    top = ssd / "Big.Show.S01"
+    top.mkdir(parents=True)
+    cover = top / "cover.jpg"
+    cover.write_bytes(b"cover!")
+
+    cls_files = [
+        TorrentFile(name="Big.Show.S01/cover.jpg", size_bytes=6, progress=1.0),
+    ]
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = ssd / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+    coord.cfg.rclone.batch_move_extra_flags = []
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=cls_files)
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.delete = AsyncMock()
+    coord.dest_client.export_torrent = AsyncMock(return_value=b"blob")
+    coord._rclone_move = AsyncMock()  # exit 0 but moves nothing
+
+    ts = TorrentState(
+        source_infohash="f" * 40,
+        source_name="Big.Show.S01",
+        dest_infohash="f" * 40,
+        save_path=str(ssd),
+        classification_kind="season",
+        batches_total=3,
+        batch_index=3,
+        state=State.MOVING,
+    )
+    coord.store.upsert(ts)
+
+    row = coord.store.get("f" * 40)
+    with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock) as wipe:
+        await coord._do_moving(row)
+
+    assert row.state == State.MOVING
+    wipe.assert_not_called()
+    assert cover.exists()
 
 
 @pytest.mark.anyio
@@ -672,7 +864,18 @@ async def test_do_moving_moves_remaining_files_when_batches_incomplete(tmp_path)
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[cls_file])
     coord.dest_client.pause = AsyncMock()
     coord.dest_client.delete = AsyncMock()
-    coord._rclone_move = AsyncMock()
+
+    async def _fake_move(local, remote, ts, *, include=None, extra=None):
+        # Simulate a real rclone move: matched files leave local disk.
+        for pat in include or []:
+            name = pat.split("=", 1)[1].removeprefix("**/")
+            if name.endswith("/"):
+                continue
+            p = tmp_path / name
+            if p.is_file():
+                p.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
 
     ts = TorrentState(
         source_infohash="hash1",
