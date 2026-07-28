@@ -33,12 +33,13 @@ class RecoveryReport:
         self.re_added: list[str] = []
         self.orphans: list[str] = []   # in DB but not on VPS2
         self.unknowns: list[str] = []  # on VPS2 but not in DB
+        self.adopted: list[str] = []   # fresh DB rows rebuilt from VPS2 state
 
     def summary(self) -> str:
         return (
             f"kept={len(self.kept)} resumed={len(self.resumed)} "
             f"re_added={len(self.re_added)} orphans={len(self.orphans)} "
-            f"unknowns={len(self.unknowns)}"
+            f"unknowns={len(self.unknowns)} adopted={len(self.adopted)}"
         )
 
 
@@ -71,6 +72,30 @@ def _safe_join(root: Path, name: str) -> Path | None:
     if len(norm) >= 2 and norm[1] == ":":
         return None
     return root / norm
+
+
+def _save_path_on_ssd(cfg: AppConfig, save_path: str) -> bool:
+    """True iff a client entry's save_path lives under a configured SSD root.
+
+    Gates DOWNLOADING adoption of partial torrents: entries pointing anywhere
+    else (stale paths, other mounts) stay unknowns. Defensive against test
+    doubles — unresolvable roots simply yield False.
+    """
+    sp = (save_path or "").rstrip("/\\").replace("\\", "/")
+    if not sp:
+        return False
+    roots: list[str] = []
+    for raw in (getattr(cfg.dest, "save_path", None), getattr(cfg.ssd, "path", None)):
+        # Real configs always carry str/Path here; anything else (e.g. a
+        # MagicMock in unit tests) means membership is unknowable -> False.
+        if not isinstance(raw, (str, Path)):
+            continue
+        r = str(raw).rstrip("/\\").replace("\\", "/")
+        if r:
+            roots.append(r)
+    if not roots:
+        return False
+    return any(sp == r or sp.startswith(r + "/") for r in roots)
 
 
 def find_content_on_ssd(cfg: AppConfig, expected: list[tuple[str, int]]) -> Path | None:
@@ -348,8 +373,12 @@ async def reconcile(
             on_fuse = any(save_path == fm or save_path.startswith(fm + "/") for fm in fuse_mounts if fm)
             comp = getattr(t, "is_complete", False)
             is_done = comp() if callable(comp) else bool(comp)
+            name = getattr(t, "name", h) or h
+            try:
+                size_bytes = int(float(getattr(t, "size_bytes", 0) or 0))
+            except (TypeError, ValueError):
+                size_bytes = 0
             if on_fuse or is_done:
-                name = getattr(t, "name", h)
                 matches = store.find_by_name(name)
                 if matches:
                     existing = matches[0]
@@ -386,10 +415,6 @@ async def reconcile(
                     adopt_state.value, name, h[:10],
                     use_save_path, on_fuse, is_done, kind,
                 )
-                try:
-                    size_bytes = int(float(getattr(t, "size_bytes", 0) or 0))
-                except (TypeError, ValueError):
-                    size_bytes = 0
                 ts = TorrentState(
                     source_infohash=h,
                     source_name=name,
@@ -401,10 +426,42 @@ async def reconcile(
                 )
                 store.upsert(ts)
                 rpt.kept.append(h)
+                rpt.adopted.append(h)
+            elif _save_path_on_ssd(cfg, save_path):
+                # Partial SSD download with no DB row (e.g. --reset wiped the
+                # batch cursors mid-download): resume it as DOWNLOADING instead
+                # of abandoning it as unknown. Batches re-resolve from the live
+                # file list and priorities restart at batch 0 downstream.
+                kind = await _classify_adopted(cfg, dest, h)
+                log.info(
+                    "reconcile: adopting partial SSD torrent on VPS2 as downloading: %s (%s) "
+                    "save_path=%s complete=%s kind=%s",
+                    name, h[:10], save_path, is_done, kind,
+                )
+                ts = TorrentState(
+                    source_infohash=h,
+                    source_name=name,
+                    dest_infohash=h,
+                    save_path=save_path,
+                    total_bytes=size_bytes,
+                    classification_kind=kind,
+                    state=State.DOWNLOADING,
+                )
+                store.upsert(ts)
+                rpt.resumed.append(h)
+                rpt.adopted.append(h)
             else:
                 rpt.unknowns.append(h)
 
     log.info("recovery: %s", rpt.summary())
+    if rpt.adopted:
+        preview = ", ".join(h[:10] for h in rpt.adopted[:5])
+        log.warning(
+            "recovery adopted %d torrent(s) from VPS2 client state with no DB row "
+            "(e.g. %s); --reset clears bookkeeping only — in-flight work resumes; "
+            "use 'forget' to abandon a torrent entirely",
+            len(rpt.adopted), preview,
+        )
     return rpt
 
 
