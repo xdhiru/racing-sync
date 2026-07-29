@@ -884,7 +884,7 @@ async def test_do_moving_preserves_top_folder_on_remote(tmp_path):
 
     `rclone move <folder> <remote>` strips the top dir, so fuse re-adds
     (save_path/mount + torrent-relative names) would point at missing data.
-    Moving from src_dir with `<top>/**` preserves it.
+    Moving verified per-file names from src_dir preserves it.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
     from racing_sync.coordinator import Coordinator
@@ -914,16 +914,11 @@ async def test_do_moving_preserves_top_folder_on_remote(tmp_path):
     coord.dest_client.delete = AsyncMock()
 
     async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
-        # Simulate a real rclone move: honor the <top>/** include.
-        from pathlib import PurePath
-
-        pats = [(p.split("=", 1)[1] if "=" in p else p) for p in include or []]
-        for src_file in sorted(local.rglob("*")):
-            if not src_file.is_file():
-                continue
-            rel = src_file.relative_to(local).as_posix()
-            if not pats or any(PurePath(rel).match(p) for p in pats):
-                src_file.unlink()
+        # Simulate a real rclone move: listed files leave local disk.
+        for name in files_from or []:
+            p = local / name
+            if p.is_file():
+                p.unlink()
 
     coord._rclone_move = AsyncMock(side_effect=_fake_move)
 
@@ -949,10 +944,11 @@ async def test_do_moving_preserves_top_folder_on_remote(tmp_path):
 
     coord._rclone_move.assert_called_once()
     call = coord._rclone_move.call_args
-    # Moved from src_dir (not the folder itself) with a top-preserving include.
+    # Moved from src_dir (not the folder itself) with verified per-file names
+    # (top dir preserved in the relative paths, never bare-moved).
     assert call.args[0] == tmp_path
     assert call.args[1] == "remote:media"
-    assert call.kwargs.get("include") == ["--include=Show.S01/**"]
+    assert call.kwargs.get("files_from") == ["Show.S01/Show.S01E01.mkv"]
     assert ts.state == State.RE_ADDING
 
 
@@ -963,8 +959,8 @@ async def test_do_moving_fallback_never_bare_moves_folder(tmp_path):
     Regression (Harbor.Lights.S03 pack): when `_season_folder_for` finds nothing
     but `src_dir/<torrent>` exists on disk, a bare
     `rclone move <folder> <remote>` would upload the CONTENTS and land the
-    episodes flat in the remote root. Must move from the parent with
-    `<top>/**` instead.
+    episodes flat in the remote root. Must move verified per-file names
+    from src_dir instead.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
     from racing_sync.coordinator import Coordinator
@@ -994,16 +990,11 @@ async def test_do_moving_fallback_never_bare_moves_folder(tmp_path):
     coord.dest_client.delete = AsyncMock()
 
     async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
-        # Simulate a real rclone move: honor the <top>/** include.
-        from pathlib import PurePath
-
-        pats = [(p.split("=", 1)[1] if "=" in p else p) for p in include or []]
-        for src_file in sorted(local.rglob("*")):
-            if not src_file.is_file():
-                continue
-            rel = src_file.relative_to(local).as_posix()
-            if not pats or any(PurePath(rel).match(p) for p in pats):
-                src_file.unlink()
+        # Simulate a real rclone move: listed files leave local disk.
+        for name in files_from or []:
+            p = local / name
+            if p.is_file():
+                p.unlink()
 
     coord._rclone_move = AsyncMock(side_effect=_fake_move)
     # Simulate folder detection finding nothing (e.g. odd file order).
@@ -1034,8 +1025,8 @@ async def test_do_moving_fallback_never_bare_moves_folder(tmp_path):
     # Moved from the PARENT (not the folder itself) with top-preserving include.
     assert call.args[0] == tmp_path
     assert call.args[1] == "remote:media"
-    assert call.kwargs.get("include") == [
-        "--include=Harbor.Lights.S03.1080p.iP.WEB-DL.AAC2.0.H.264-Raccoon/**"
+    assert call.kwargs.get("files_from") == [
+        "Harbor.Lights.S03.1080p.iP.WEB-DL.AAC2.0.H.264-Raccoon/Harbor.Lights.S03E01.mkv"
     ]
     assert ts.state == State.RE_ADDING
 
@@ -1077,3 +1068,272 @@ async def test_get_batches_respects_custom_episode_regex():
     assert len(batches) == 1
     assert len(batches[0].episodes) == 2
     assert batches[0].episodes[0].file_name == "Show - 01.mkv"
+
+
+@pytest.mark.anyio
+async def test_fuse_skipped_matches_size_only(tmp_path):
+    """Only size-verified fuse files are skipped; missing/short ones download."""
+    from racing_sync.coordinator import Coordinator
+
+    fuse = tmp_path / "fuse"
+    (fuse / "Pack").mkdir(parents=True)
+    (fuse / "Pack" / "a.mkv").write_bytes(b"x" * 100)
+    (fuse / "Pack" / "b.mkv").write_bytes(b"short")
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.rclone.fuse.mount = fuse
+    coord.cfg.rclone.fuse.mount_unsorted = fuse / "unsorted"
+    coord.cfg.dest.save_path = tmp_path / "ssd"
+
+    skipped = await coord._fuse_skipped(
+        [("Pack/a.mkv", 100), ("Pack/b.mkv", 100), ("Pack/missing.mkv", 50)],
+        "movie",
+    )
+    assert skipped == {"Pack/a.mkv"}
+    # Episodes route at the unsorted mount, which is empty here.
+    assert await coord._fuse_skipped([("Pack/a.mkv", 100)], "episode") == set()
+
+
+@pytest.mark.anyio
+async def test_wait_for_completion_empty_expected_returns_immediately():
+    """A fully-skipped batch waits on nothing (and fetches nothing)."""
+    from unittest.mock import AsyncMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord._live = {}
+    coord.cfg = MagicMock()
+    coord.dest_client = AsyncMock()
+
+    ts = TorrentState(source_infohash="e" * 40, state=State.DOWNLOADING)
+    await coord._wait_for_completion(ts, expected_files=[])
+
+    coord.dest_client.get_torrent.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_move_and_clean_batch_honors_skip(tmp_path):
+    """Already-remote batch members are neither moved nor verified."""
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.batcher import Batch
+    from racing_sync.classifier import Episode
+
+    ssd = tmp_path / "ssd"
+    (ssd / "Pack").mkdir(parents=True)
+    (ssd / "Pack" / "b.mkv").write_bytes(b"data")
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.batch_move_extra_flags = []
+
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        for name in files_from or []:
+            p = local / name
+            if p.is_file():
+                p.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
+
+    ts = TorrentState(
+        source_infohash="f" * 40,
+        source_name="Pack",
+        save_path=str(ssd),
+        classification_kind="movie",
+        state=State.DOWNLOADING,
+    )
+    batch = Batch(episodes=[
+        Episode("Pack/a.mkv", 0, 1, 4),
+        Episode("Pack/b.mkv", 0, 2, 4),
+    ])
+    await coord._move_and_clean_batch(ts, batch, skip={"Pack/a.mkv"})
+
+    files_from = coord._rclone_move.call_args.kwargs.get("files_from")
+    assert files_from == ["Pack/b.mkv"]
+    assert not (ssd / "Pack" / "b.mkv").exists()
+
+
+@pytest.mark.anyio
+async def test_setup_queued_download_skips_remote_batch0(tmp_path):
+    """Batch-0 members already on the remote stay deselected from the start."""
+    from racing_sync.clients.abstract import AddResult, TorrentFile
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+
+    fuse = tmp_path / "fuse"
+    (fuse / "Pack").mkdir(parents=True)
+    (fuse / "Pack" / "a.bin").write_bytes(b"x" * 4000)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 10_000
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.fuse.mount = fuse
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-unsorted"
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash="dd" * 20, accepted=True, detail="Ok.")
+    )
+    files = [
+        TorrentFile(name="Pack/a.bin", size_bytes=4000, progress=0.0),
+        TorrentFile(name="Pack/b.bin", size_bytes=4000, progress=0.0),
+        TorrentFile(name="Pack/c.bin", size_bytes=4000, progress=0.0),
+    ]
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=files)
+    coord.dest_client.set_file_priorities = AsyncMock()
+    coord.dest_client.resume = AsyncMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(
+        source_infohash="e" * 40, source_name="Pack", total_bytes=12000,
+        cross_seed_blob=b"blob", save_path=str(tmp_path), state=State.QUEUED,
+    )
+
+    await coord._do_queued(ts)
+
+    assert ts.state == State.DOWNLOADING
+    assert ts.batches_total == 2
+    prio_map = coord.dest_client.set_file_priorities.call_args[0][1]
+    assert prio_map["Pack/a.bin"] == 0
+    assert prio_map["Pack/b.bin"] == 1
+    assert prio_map["Pack/c.bin"] == 0
+    coord.dest_client.resume.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_setup_queued_download_single_on_fuse_goes_moving(tmp_path):
+    """A single file already archived needs no SSD download at all."""
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+    (fuse / "Movie.mkv").write_bytes(b"x" * 100)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 50
+    coord.cfg.rclone.fuse.mount = fuse
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-unsorted"
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[TorrentFile(name="Movie.mkv", size_bytes=100, progress=0.0)]
+    )
+    coord.dest_client.resume = AsyncMock()
+    coord.dest_client.delete = AsyncMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(
+        source_infohash="f" * 40, source_name="Movie", total_bytes=100,
+        dest_infohash="f" * 40, save_path=str(tmp_path), state=State.QUEUED,
+    )
+
+    await coord._setup_queued_download(ts, b"blob")
+
+    # On fuse despite exceeding the skip cap: no SSD needed, no failure.
+    assert ts.state == State.MOVING
+    coord.dest_client.resume.assert_not_called()
+    coord.dest_client.delete.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_do_moving_mixed_skips_remote_episode(tmp_path):
+    """Mixed redo: the already-archived episode is not moved again."""
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    fuse_unsorted = tmp_path / "fuse-unsorted"
+    fuse_unsorted.mkdir()
+    (fuse_unsorted / "Show.S01E01.mkv").write_bytes(b"x" * 1000)
+    for name in ("Show.S01E01.mkv", "Show.S01E02.mkv", "Extra1.mp4", "Extra2.mp4"):
+        (tmp_path / name).write_bytes(b"x" * 1000)
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 1500
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = tmp_path / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = fuse_unsorted
+    coord.cfg.rclone.batch_move_extra_flags = []
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile("Show.S01E01.mkv", 1000, progress=1.0),
+        TorrentFile("Show.S01E02.mkv", 1000, progress=1.0),
+        TorrentFile("Extra1.mp4", 1000, progress=1.0),
+        TorrentFile("Extra2.mp4", 1000, progress=1.0),
+    ])
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.delete = AsyncMock()
+    coord.dest_client.export_torrent = AsyncMock(return_value=b"blob")
+
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        for name in files_from or []:
+            p = local / name
+            if p.is_file():
+                p.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
+
+    ts = TorrentState(
+        source_infohash="m" * 40, source_name="Show.Mixed", save_path=str(tmp_path),
+        classification_kind="mixed", state=State.MOVING,
+    )
+
+    await coord._do_moving(ts)
+
+    # E01 already archived: only E02 moves; E01 stays untouched locally.
+    assert coord._rclone_move.await_count == 1
+    moved = coord._rclone_move.call_args.kwargs.get("files_from")
+    assert moved == ["Show.S01E02.mkv"]
+    assert (tmp_path / "Show.S01E01.mkv").exists()
+    assert not (tmp_path / "Show.S01E02.mkv").exists()
+    assert ts.state == State.RE_ADDING
+
+
+@pytest.mark.anyio
+async def test_move_and_clean_batch_all_skipped_skips_rclone(tmp_path):
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.batcher import Batch
+    from racing_sync.classifier import Episode
+
+    coord = object.__new__(Coordinator)
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.batch_move_extra_flags = []
+    coord._rclone_move = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="g" * 40,
+        source_name="Pack",
+        save_path=str(ssd),
+        classification_kind="movie",
+        state=State.DOWNLOADING,
+    )
+    batch = Batch(episodes=[Episode("Pack/a.mkv", 0, 1, 4)])
+    await coord._move_and_clean_batch(ts, batch, skip={"Pack/a.mkv"})
+
+    coord._rclone_move.assert_not_called()
