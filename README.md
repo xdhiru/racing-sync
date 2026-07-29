@@ -33,6 +33,29 @@ loaded config, then starts normally. Use it instead of hand-deleting files:
 python3 run.py run --config config.toml --reset
 ```
 
+Note this clears **bookkeeping only**. Torrents sitting on the clients/SSD
+are re-adopted by recovery on startup and resume (complete ones continue to
+the rclone move, partial SSD ones resume downloading) — a startup warning
+names how many rows were rebuilt. `--reset` never deletes torrent data.
+
+### Abandon a torrent (`forget`)
+
+Recovery gives the pipeline no way to *stop* wanting a torrent, so `forget`
+is the off-switch: it drops the DB row, deletes the matching destination
+client entries, and removes the torrent's local SSD data (fuse/remote
+copies are never touched). Dry-run by default; `--apply` deletes:
+
+```bash
+python3 run.py forget --config config.toml <infohash|name>
+python3 run.py forget --config config.toml <infohash|name> --apply
+python3 run.py forget --config config.toml <infohash|name> --apply --keep-files
+```
+
+`<infohash|name>` is a 40-char infohash (any known hash) or a unique name
+substring — ambiguous names abort with the candidate list instead of
+guessing. Same operation is available at `POST /api/forget/{hash}` when the
+control API is enabled.
+
 Validate a config without starting anything:
 
 ```bash
@@ -69,6 +92,7 @@ src/racing_sync/
   state.py            # SQLite-backed state machine
   coordinator.py      # Main async loop
   recovery.py         # Reconciler (req #4)
+  forget.py           # Abandon a torrent (row + client entries + SSD data)
   watchdir.py         # Manual torrent drop scanner
   api.py              # Optional FastAPI control plane
   clients/
