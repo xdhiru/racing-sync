@@ -73,6 +73,13 @@ def test_queued_to_done_is_allowed():
     check_transition(State.QUEUED, State.DONE)
 
 
+def test_queued_to_moving_and_waiting_disk_is_allowed():
+    # Single file already on remote skips SSD download (QUEUED->MOVING);
+    # SSD-full park after add goes back to WAITING_DISK (bug 1).
+    check_transition(State.QUEUED, State.MOVING)
+    check_transition(State.QUEUED, State.WAITING_DISK)
+
+
 def test_find_by_name_extension_matching(tmp_path):
     from racing_sync.state import StateStore, TorrentState
 
