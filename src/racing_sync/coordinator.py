@@ -28,7 +28,7 @@ from pathlib import Path
 
 import aiohttp
 
-from .batcher import Batch, escape_rclone_glob, files_from_names, make_batches, make_file_batches
+from .batcher import Batch, files_from_names, make_batches, make_file_batches
 from .classifier import classify, oversize_single_file
 from .clients.abstract import Torrent, TorrentClient, TorrentFile
 from .clients.deluge import DelugeClient
@@ -568,27 +568,6 @@ async def pick_ssd_source_for_racing(
         source_torrent.name,
     )
     return None
-
-
-def _top_include_for_folder(src_dir: Path, folder: Path) -> list[str] | None:
-    """`--include` patterns moving `folder` while preserving its top dir.
-
-    `rclone move <folder> <remote>` transfers the folder's CONTENTS (top
-    dir stripped), but per-file moves (`rclone move <src_dir> <remote>
-    --files-from-raw`, one exact name per line) preserve torrent-relative
-    paths. A stripped layout never matches `save_path/mount + torrent file
-    names`, so fuse re-adds with `skip_check=True` would point at missing
-    data. Moving from `src_dir` with `<top>/**` keeps both paths identical.
-    Returns None when `folder` is not a direct child layout of `src_dir`
-    (caller falls back to the exact-path move).
-    """
-    try:
-        rel = folder.resolve().relative_to(src_dir.resolve())
-    except Exception:
-        return None
-    if len(rel.parts) != 1 or rel.parts[0] in (".", "..", ""):
-        return None
-    return [f"--include={escape_rclone_glob(rel.parts[0])}/**"]
 
 
 # --------------------------------------------------------------------------- #
@@ -2288,6 +2267,43 @@ class Coordinator:
                 pass
             return
 
+    async def _fuse_skipped(self, items: list[tuple[str, int]], kind: str) -> set[str]:
+        """Subset of torrent-relative names already complete on the fuse target.
+
+        Lets reprocessing skip re-downloading batches a previous run already
+        moved: only size-verified files are skipped, stats run off the event
+        loop, and anything unstatable is downloaded (safe direction — the
+        final fuse gate re-verifies everything before injection).
+        Returns the input names (exact strings) to skip.
+        """
+        if not items:
+            return set()
+        try:
+            mount = self._target_mount_for_kind(kind, Path(self.cfg.dest.save_path))
+        except Exception:
+            return set()
+
+        def _check() -> set[str]:
+            skipped: set[str] = set()
+            for name, size in items:
+                norm = (name or "").replace("\\", "/").strip("/")
+                if not norm:
+                    continue
+                try:
+                    actual = (mount / norm).stat().st_size
+                except OSError:
+                    continue
+                want = size or 0
+                if actual == want:
+                    skipped.add(name)
+            return skipped
+
+        try:
+            return await asyncio.to_thread(_check)
+        except Exception as e:  # noqa: BLE001
+            log.warning("fuse skip check failed, downloading everything: %s", e)
+            return set()
+
     async def _setup_queued_download(self, ts: TorrentState, blob: bytes) -> None:
         """Classify, prioritize, and resume a just-added SSD torrent."""
         # Classify (with a short retry: the files endpoint can 404 for a few
@@ -2306,6 +2322,17 @@ class Coordinator:
             raise last_err
         cls = classify(files, self.cfg)
         ts.classification_kind = cls.kind
+
+        if len(files) == 1:
+            # A previous run may already have moved this exact file: no SSD
+            # need, no oversize failure — straight to MOVING (its branch
+            # tolerates already-remote singles) for the fuse-gated finish.
+            only = files[0]
+            if await self._fuse_skipped([(only.name, only.size_bytes)], cls.kind):
+                log.info("single file %s already on remote; skipping SSD download",
+                         only.name)
+                self.transition(ts, State.MOVING)
+                return
 
         # Feasibility is per individual file: anything may flow (batched as
         # needed) unless one file alone exceeds the SSD cap. Total size never
@@ -2327,6 +2354,7 @@ class Coordinator:
             return
 
         # Apply batch file priorities for seasons
+        first_need: set[str] | None = None
         if cls.kind in ("season", "mixed") and cls.episodes:
             episodes = [e for e in cls.episodes]
             cap = self._batch_cap_bytes()
@@ -2343,11 +2371,16 @@ class Coordinator:
             ts.batches_total = len(batches)
             ts.batch_index = 0
             if batches:
-                # First batch only: priority 1; rest: 0
+                # First batch only: priority 1; rest: 0. Files a previous run
+                # already moved stay deselected (re-downloaded never).
                 first = batches[0]
+                skip0 = await self._fuse_skipped(
+                    [(e.file_name, e.size_bytes) for e in first.episodes], cls.kind,
+                )
                 prio_map = {f.name: 0 for f in files}
-                for ep in first.episodes:
-                    prio_map[ep.file_name] = 1
+                first_need = {e.file_name for e in first.episodes} - skip0
+                for name in first_need:
+                    prio_map[name] = 1
                 await self.dest_client.set_file_priorities(
                     ts.dest_infohash or ts.source_infohash, prio_map,
                 )
@@ -2371,13 +2404,20 @@ class Coordinator:
             if batches:
                 first = batches[0]
                 wanted = {ep.file_name for ep in first.episodes}
-                prio_map = {f.name: (1 if f.name in wanted else 0) for f in files}
+                skip0 = await self._fuse_skipped(
+                    [(e.file_name, e.size_bytes) for e in first.episodes], cls.kind,
+                )
+                first_need = wanted - skip0
+                prio_map = {f.name: (1 if f.name in first_need else 0) for f in files}
                 await self.dest_client.set_file_priorities(
                     ts.dest_infohash or ts.source_infohash, prio_map,
                 )
 
-        # Resume
-        await self.dest_client.resume(ts.dest_infohash or ts.source_infohash)
+        # Resume (skipped when the first batch needs nothing locally yet:
+        # a client with zero selected files may refuse; the download loop
+        # resumes on reaching the first batch with work).
+        if first_need is None or first_need:
+            await self.dest_client.resume(ts.dest_infohash or ts.source_infohash)
         self.transition(ts, State.DOWNLOADING)
 
     async def _await_hash_for_name(self, name: str, *, timeout: float = 60) -> str | None:
@@ -2439,7 +2479,7 @@ class Coordinator:
             return []
 
     async def _move_and_clean_batch(
-        self, ts: TorrentState, batch: Batch
+        self, ts: TorrentState, batch: Batch, skip: set[str] | None = None
     ) -> None:
         if batch is None:
             return
@@ -2461,7 +2501,16 @@ class Coordinator:
             if hasattr(self, "cfg") and hasattr(self.cfg.rclone, "batch_move_extra_flags")
             else None
         )
-        names = batch.file_names()
+        skip_norm = {
+            (n or "").replace("\\", "/").strip("/") for n in (skip or set())
+        }
+        names = [n for n in batch.file_names() if n not in skip_norm]
+        if not names:
+            log.info(
+                "batch %d/%d for %s already on remote; skipping move",
+                ts.batch_index + 1, ts.batches_total, ts.source_name,
+            )
+            return
         await self._rclone_move(
             src_dir,
             remote,
@@ -2512,6 +2561,7 @@ class Coordinator:
             )
 
             cur_batch: Batch | None = None
+            cur_skip: set[str] = set()
             expected_files: list[str] | None = None
 
             if is_batched and hasattr(self, "dest_client"):
@@ -2519,7 +2569,16 @@ class Coordinator:
                     batches = await self._get_batches_for_torrent(ts)
                     if batches and ts.batch_index < len(batches):
                         cur_batch = batches[ts.batch_index]
-                        expected_files = [ep.file_name for ep in cur_batch.episodes]
+                        # Already on the remote from a previous run: neither
+                        # waited on, downloaded, nor moved again.
+                        cur_skip = await self._fuse_skipped(
+                            [(e.file_name, e.size_bytes) for e in cur_batch.episodes],
+                            ts.classification_kind or "unknown",
+                        )
+                        expected_files = [
+                            ep.file_name for ep in cur_batch.episodes
+                            if ep.file_name not in cur_skip
+                        ]
                 except Exception as e:
                     log.warning("could not resolve batches for %s: %s", ts.source_name, e)
 
@@ -2553,7 +2612,7 @@ class Coordinator:
                             await asyncio.sleep(5)
                             continue
                     try:
-                        await self._move_and_clean_batch(ts, cur_batch)
+                        await self._move_and_clean_batch(ts, cur_batch, skip=cur_skip)
                     except BatchMoveIncompleteError as e:
                         # Same-tick retry like the pause failure above: the
                         # batch is still fully on local disk, nothing advanced.
@@ -2619,12 +2678,16 @@ class Coordinator:
             else 2
         )
 
+        if expected_files is not None and not expected_files:
+            # Whole batch already on the remote: nothing to wait for.
+            return
+
         while not self._stop:
             t = await self.dest_client.get_torrent(h)
             if t is None:
                 raise RuntimeError(f"torrent vanished mid-download: {h}")
 
-            if expected_files:
+            if expected_files is not None:
                 files = await self.dest_client.get_torrent_files(h)
                 f_map = {f.name: f for f in files}
                 missing_files = [fn for fn in expected_files if fn not in f_map]
@@ -2704,9 +2767,13 @@ class Coordinator:
         if ts.batch_index >= len(batches):
             return
         cur = batches[ts.batch_index]
+        skip = await self._fuse_skipped(
+            [(e.file_name, e.size_bytes) for e in cur.episodes], kind,
+        )
         prio_map = {f.name: 0 for f in files}
         for ep in cur.episodes:
-            prio_map[ep.file_name] = 1
+            if ep.file_name not in skip:
+                prio_map[ep.file_name] = 1
         await self.dest_client.set_file_priorities(h, prio_map)
 
     def _season_folder_for(
@@ -2746,6 +2813,31 @@ class Coordinator:
         return None
 
     # ---- state: MOVING ----
+
+    def _single_on_fuse(self, files: list, single_file: str, ts) -> bool:
+        """True iff an already-remote single file needs no SSD download/move.
+
+        Size-verified against the kind-appropriate fuse mount; anything
+        unstatable answers False (safe direction: download it).
+        """
+        norm = (single_file or "").replace("\\", "/").strip("/")
+        if not norm:
+            return False
+        match = next(
+            (f for f in files
+             if (getattr(f, "name", "") or "").replace("\\", "/").strip("/") == norm),
+            None,
+        )
+        if match is None:
+            return False
+        try:
+            mount = self._target_mount_for(ts)
+        except Exception:
+            return False
+        try:
+            return (mount / norm).stat().st_size == (match.size_bytes or 0)
+        except OSError:
+            return False
 
     async def _do_moving(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
@@ -2871,10 +2963,8 @@ class Coordinator:
             remote = self.cfg.rclone.remote.unsorted
 
         # 5. Move completed files via rclone
-        # (local_include preserves the top dir for whole-folder moves so the
-        # remote layout matches torrent-relative names; see helper above.)
-        local_include: list[str] | None = None
-        move_base: Path = src_dir
+        # (per-file --files-from-raw lists preserve the top dir so the
+        # remote layout matches torrent-relative names.)
         if ts.batches_total > 1:
             local_folder = folder if (folder and folder.exists()) else (src_dir / ts.source_name if (src_dir / ts.source_name).exists() else None)
             remaining_payload: list[Path] = []
@@ -2945,11 +3035,16 @@ class Coordinator:
                     ts.source_name,
                 )
         elif cls.kind in ("movie", "episode", "season", "unknown"):
+            local: Path | None
             if cls.kind in ("movie", "episode") and cls.single_file:
                 local = src_dir / cls.single_file
                 if not local.exists():
                     if folder and (folder / cls.single_file).exists():
                         local = folder / cls.single_file
+                    elif self._single_on_fuse(cls_files, cls.single_file, ts):
+                        log.info("single file %s already on remote; skipping move",
+                                 cls.single_file)
+                        local = None
                     else:
                         raise FileNotFoundError(f"completed {cls.kind} file not found on SSD: {local}")
             elif cls.kind in ("season", "unknown") or (cls.kind == "movie" and not cls.single_file):
@@ -2962,43 +3057,56 @@ class Coordinator:
                         f"completed {cls.kind} content not found on SSD: "
                         f"neither {folder} nor {src_dir / ts.source_name} exists"
                     )
-                # Never bare-move a folder: `rclone move <dir> <remote>`
-                # uploads the dir's CONTENTS (top dir stripped) while batch
-                # moves preserve torrent-relative paths — the remote/fuse
-                # layouts would diverge and re-adds would point at missing
-                # data (season packs landing flat in the remote root).
-                # Move from the parent with `<top>/**` instead. This also
-                # covers the folder-detection fallback above: even when
-                # `folder` is None (e.g. a root-level extra broke the
-                # all-share check), `src_dir/<torrent>` still moves with
-                # its top dir intact.
-                move_base = local.parent
-                local_include = _top_include_for_folder(move_base, local)
-                if local_include is None:  # only if local is a fs root
-                    raise RuntimeError(
-                        f"cannot preserve top dir moving {local} to {remote}"
+                # Verified-complete per-file move (same guarantee as the sweep
+                # above): a bare `<top>/**` move would also upload
+                # preallocated-but-incomplete boundary files of content that
+                # never needed downloading because it is already remote.
+                # Torrent-relative names keep the remote/fuse layout identical.
+                try:
+                    top_rel = local.resolve().relative_to(src_dir.resolve())
+                    top = top_rel.parts[0] if top_rel.parts else ""
+                except Exception:
+                    top = ""
+                folder_names: list[str] = []
+                for f in completed_files:
+                    norm = (f.name or "").replace("\\", "/").strip("/")
+                    if not norm:
+                        continue
+                    if top and not (norm == top or norm.startswith(top + "/")):
+                        continue
+                    if (src_dir / norm).is_file():
+                        folder_names.append(norm)
+                folder_names = files_from_names(folder_names)
+                if folder_names:
+                    await self._rclone_move(src_dir, remote, ts, files_from=folder_names)
+                    # A 0-transfer folder move must not proceed to the wipe below.
+                    stuck = [n for n in folder_names if (src_dir / n).exists()]
+                    if stuck:
+                        log.warning(
+                            "folder move for %s left files on disk; "
+                            "staying in MOVING without wiping",
+                            ts.source_name,
+                        )
+                        self.store.upsert(ts)
+                        return
+                else:
+                    log.info(
+                        "folder %s for %s has no verified-complete files to move "
+                        "(already remote or incomplete boundary data)",
+                        local, ts.source_name,
                     )
+                local = None
             else:
                 cand = src_dir / ts.source_name
                 if cand.exists():
                     local = cand
                 else:
                     raise FileNotFoundError(f"completed content not found on SSD: {cand}")
-            if local_include is not None:
-                await self._rclone_move(move_base, remote, ts, include=local_include)
-                # A 0-transfer folder move must not proceed to the wipe below.
-                try:
-                    has_files = local.exists() and any(p.is_file() for p in local.rglob("*"))
-                except OSError:
-                    has_files = True
-                if has_files:
-                    log.warning(
-                        "folder move for %s left files on disk; "
-                        "staying in MOVING without wiping",
-                        ts.source_name,
-                    )
-                    self.store.upsert(ts)
-                    return
+            if local is None:
+                pass
+            elif isinstance(local, Path) and local.is_dir():
+                # Unreachable: folder layouts move per-file above by design.
+                raise RuntimeError(f"refusing bare folder move of {local}")
             else:
                 await self._rclone_move(local, remote, ts)
                 if local.exists():
@@ -3029,7 +3137,17 @@ class Coordinator:
                 ts.batch_index = i
                 ts.batches_total = len(batches)
                 self.store.upsert(ts)
-                names = batch.file_names()
+                skip = await self._fuse_skipped(
+                    [(e.file_name, e.size_bytes) for e in batch.episodes], cls.kind,
+                )
+                skip_norm = {(s or "").replace("\\", "/").strip("/") for s in skip}
+                names = [n for n in batch.file_names() if n not in skip_norm]
+                if not names:
+                    log.info(
+                        "mixed batch %d/%d for %s already on remote; skipping move",
+                        i + 1, len(batches), ts.source_name,
+                    )
+                    continue
                 await self._rclone_move(
                     src_dir,
                     remote,
