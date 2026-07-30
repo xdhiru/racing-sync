@@ -403,6 +403,13 @@ async def reconcile(
                     # a fuse-pointing entry must go through MOVING instead).
                     ok, use_save_path, kind = await _verify_fuse_adopted(cfg, dest, t, save_path)
                     adopt_state = State.DONE if ok else State.MOVING
+                elif on_fuse and not is_done:
+                    # Fuse-pointing but incomplete: the client itself says
+                    # bytes are missing. Never DONE (would strand an
+                    # unseedable entry as terminal). Park in RE_ADDING for
+                    # the gated fuse retry instead.
+                    kind = await _classify_adopted(cfg, dest, h)
+                    adopt_state = State.RE_ADDING
                 else:
                     # SSD-complete (or fuse-incomplete) adoption: classify now
                     # so _target_mount_for() routes movies/seasons to the
