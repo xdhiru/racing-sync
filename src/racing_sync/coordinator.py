@@ -731,10 +731,11 @@ class Coordinator:
                     self.store.upsert(ts)
                     self.transition(ts, State.NEW)
 
-            # Optional Telegram bot
-            from .telegram_bot import TelegramBot
-            self._tg: TelegramBot | None = None
+            # Optional Telegram bot (lazy import: python-telegram-bot is
+            # only required when enabled).
+            self._tg = None
             if self.cfg.telegram.enabled:
+                from .telegram_bot import TelegramBot
                 self._tg = TelegramBot(self.cfg.telegram, self, self.store)
                 await self._tg.start()
 
