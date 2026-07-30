@@ -613,6 +613,11 @@ class Coordinator:
     # Serializes the periodic tick against API-triggered ops (recover /
     # scan-watch / retry) so they can't double-schedule or clobber rows.
     _ops_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    # Frozen per-torrent batch cap (bug 5): batch boundaries must not shift
+    # when free space changes mid-download, or batch_index points at
+    # different episodes (skip/repeat). Frozen at first use, reused for the
+    # row's lifetime; cleared on terminal states to bound memory.
+    _batch_cap_cache: dict[str, int] = field(default_factory=dict, init=False)
 
     @property
     def download_sem(self) -> asyncio.Semaphore:
@@ -1690,6 +1695,8 @@ class Coordinator:
         """
         prev = ts.state
         self.store.transition(ts, dst, error=error, batch_index=batch_index)
+        if dst in (State.DONE, State.FAILED):
+            self._drop_frozen_batch_cap(ts)
         log.info(
             "%s %s -> %s (batch %s/%s)",
             ts.source_name[:60],
@@ -1760,6 +1767,42 @@ class Coordinator:
         except Exception:
             pass
         return 0
+
+    def _frozen_batch_cap(self, ts: TorrentState) -> int:
+        """Stable batch cap for one row (see _batch_cap_cache)."""
+        try:
+            cache = getattr(self, "_batch_cap_cache", None)
+            if cache is None:
+                cache = {}
+                self._batch_cap_cache = cache
+            key = (ts.source_infohash or "").lower()
+            if key and key in cache and cache[key] > 0:
+                return cache[key]
+        except Exception:
+            cache = None
+            key = ""
+        cap = self._batch_cap_bytes()
+        if cap <= 0:
+            return 0
+        try:
+            if key and cache is not None:
+                cache[key] = cap
+                if len(cache) > 5000:
+                    # Bound memory: drop an arbitrary chunk (oldest unknown
+                    # order, but caps re-freeze on next use).
+                    for k in list(cache)[:2500]:
+                        cache.pop(k, None)
+        except Exception:
+            pass
+        return cap
+
+    def _drop_frozen_batch_cap(self, ts: TorrentState) -> None:
+        try:
+            cache = getattr(self, "_batch_cap_cache", None)
+            if cache:
+                cache.pop((ts.source_infohash or "").lower(), None)
+        except Exception:
+            pass
 
     async def _do_new(self, ts: TorrentState) -> None:
         if ts.cross_seed_source == "watch-dir":
@@ -2357,7 +2400,7 @@ class Coordinator:
         first_need: set[str] | None = None
         if cls.kind in ("season", "mixed") and cls.episodes:
             episodes = [e for e in cls.episodes]
-            cap = self._batch_cap_bytes()
+            cap = self._frozen_batch_cap(ts)
             if cap <= 0:
                 # No usable batch cap: re-check SSD room (disk may have
                 # filled since scheduling). Park if full, else one batch.
@@ -2390,7 +2433,7 @@ class Coordinator:
             # numbering): stream name-sorted groups through the SSD instead
             # of needing the whole torrent on disk at once. Single episodes
             # stay on the full-torrent path even when extras are present.
-            cap = self._batch_cap_bytes()
+            cap = self._frozen_batch_cap(ts)
             if cap <= 0:
                 total_files = sum(f.size_bytes for f in files)
                 if not ssd_has_room(self.cfg, min(total_files, ts.total_bytes or total_files)):
@@ -2469,7 +2512,7 @@ class Coordinator:
             except Exception as e:
                 log.warning("could not classify files for batches: %s", e)
                 return []
-        cap = self._batch_cap_bytes()
+        cap = self._frozen_batch_cap(ts)
         if cap <= 0:
             cap = sum(f.size_bytes for f in files) or 1
         try:
@@ -2754,7 +2797,7 @@ class Coordinator:
         except Exception as e:
             log.warning("could not classify files for next batch: %s", e)
             return
-        cap = self._batch_cap_bytes()
+        cap = self._frozen_batch_cap(ts)
         if cap <= 0:
             cap = sum(f.size_bytes for f in files) or 1
         try:
@@ -3119,7 +3162,7 @@ class Coordinator:
                     return
         else:
             # Mixed — per-episode moves with --include (single batch)
-            cap = self._batch_cap_bytes()
+            cap = self._frozen_batch_cap(ts)
             episodes = cls.episodes
             if not episodes:
                 raise RuntimeError(
