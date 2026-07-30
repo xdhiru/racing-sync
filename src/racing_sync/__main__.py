@@ -50,6 +50,60 @@ async def _runner(coord: Coordinator) -> int:
         await coord.shutdown()
 
 
+def _is_safe_log_dir_to_clear(log_dir: Path) -> str | None:
+    """Return None when `log_dir` is safe to clear, else a refusal reason.
+
+    `--reset` deletes every child of the configured log dir. A misconfigured
+    path (filesystem root, /var/log, home dir, symlink to elsewhere) would
+    wipe data outside racing-sync. Fail closed: refuse with a reason.
+    """
+    try:
+        # Never follow a symlink to an unexpected target.
+        if log_dir.is_symlink():
+            return f"refusing to clear log dir (is a symlink): {log_dir}"
+        resolved = log_dir.resolve()
+    except OSError as e:
+        return f"refusing to clear log dir (cannot resolve {log_dir}): {e}"
+    anchor = Path(resolved.anchor)
+    if resolved == anchor or str(resolved) in ("/", "\\"):
+        return f"refusing to clear filesystem root: {log_dir}"
+    # Well-known system/profile roots: clearing them would destroy data
+    # far beyond racing-sync logs. Compare both Path and posix forms so
+    # POSIX-style config values are caught on Windows test hosts too.
+    denied = {
+        Path("/var"), Path("/var/log"), Path("/etc"), Path("/usr"),
+        Path("/bin"), Path("/sbin"), Path("/home"), Path("/root"),
+        Path("/tmp"), Path("/var/tmp"),
+    }
+    denied_posix = {p.as_posix() for p in denied} | {
+        "/var", "/var/log", "/etc", "/usr", "/bin", "/sbin",
+        "/home", "/root", "/tmp", "/var/tmp", "/",
+    }
+    try:
+        home = Path.home().resolve()
+        denied.add(home)
+        denied_posix.add(home.as_posix())
+    except Exception:
+        pass
+    if resolved in denied or resolved.as_posix() in denied_posix:
+        return f"refusing to clear system directory: {log_dir}"
+    # Also match the raw configured value: on Windows Path("/var/log")
+    # resolves to C:/var/log, hiding the POSIX system path.
+    try:
+        raw_posix = log_dir.as_posix()
+    except Exception:
+        raw_posix = str(log_dir)
+    if raw_posix in denied_posix or raw_posix.rstrip("/") in denied_posix:
+        return f"refusing to clear system directory: {log_dir}"
+    # Shallow paths (e.g. /data, C:\\logs) are one typo away from a system
+    # dir; require at least 3 parts (anchor + 2 levels) to clear.
+    if len(resolved.parts) < 3 and resolved.parent in (anchor, resolved):
+        # e.g. "/x" or "C:\\x" — allow only when it already looks like an
+        # app dir? Fail closed: refuse bare top-level dirs.
+        return f"refusing to clear top-level directory: {log_dir}"
+    return None
+
+
 def _do_reset(cfg: AppConfig) -> list[str]:
     """Fresh start: delete state.db (+WAL/SHM) and clear the log directory.
 
@@ -75,7 +129,10 @@ def _do_reset(cfg: AppConfig) -> list[str]:
     except Exception:
         log_dir = None
     if log_dir is not None:
-        if log_dir.is_dir():
+        refusal = _is_safe_log_dir_to_clear(log_dir)
+        if refusal is not None:
+            removed.append(refusal)
+        elif log_dir.is_dir():
             for child in sorted(log_dir.iterdir()):
                 try:
                     if child.is_dir() and not child.is_symlink():
