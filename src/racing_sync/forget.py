@@ -95,11 +95,16 @@ async def _candidate_local_paths(cfg, dest, row, entry_hashes: list[str]) -> tup
     if base_dir is None:
         return [], ["torrent save path unknown; skipping local cleanup"]
     tops: list[str] = []
+    seen_tops: set[str] = set()
     for f in files:
         norm = (getattr(f, "name", "") or "").replace("\\", "/").strip("/")
-        if not norm or norm in tops:
+        if not norm:
             continue
-        tops.append(norm.split("/")[0] if "/" in norm else norm)
+        top = norm.split("/")[0] if "/" in norm else norm
+        if not top or top in seen_tops:
+            continue
+        seen_tops.add(top)
+        tops.append(top)
     if not tops:
         return [], ["no file list available; skipping local cleanup"]
     ok: list[Path] = []

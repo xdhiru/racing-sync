@@ -15,6 +15,30 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.mark.anyio
+async def test_candidate_local_paths_dedups_top_dir(tmp_path: Path):
+    """Two files under the same top dir must yield one local path."""
+    from racing_sync.forget import _candidate_local_paths
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    dest = FakeDest()
+    dest.seed(
+        "a" * 40, str(ssd),
+        [TorrentFile(name="Show/ep1.mkv", size_bytes=10),
+         TorrentFile(name="Show/ep2.mkv", size_bytes=10)],
+    )
+    cfg = MagicMock()
+    cfg.ssd.path = ssd
+    cfg.dest.save_path = ssd
+    row = MagicMock()
+    row.save_path = str(ssd)
+
+    paths, skipped = await _candidate_local_paths(cfg, dest, row, ["a" * 40])
+    assert [str(p) for p in paths] == [str(ssd / "Show")]
+    assert skipped == []
+
+
 class FakeDest:
     """Minimal dest client double backed by real tmp-dir files."""
 
