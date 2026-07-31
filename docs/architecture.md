@@ -16,6 +16,7 @@ src/racing_sync/
   watchdir.py         Watch-dir scanner with bencoded torrent parser
   recovery.py         Startup reconciler
   coordinator.py      Main async loop + per-torrent workers
+  coordinator_content.py  Stateless helpers (normalize, grace, notify filter)
   telegram_bot.py     Live status + log forwarding
   api.py              Optional FastAPI control plane
   clients/
