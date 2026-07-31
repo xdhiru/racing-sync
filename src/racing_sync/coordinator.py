@@ -697,6 +697,14 @@ class Coordinator:
                     and self.cfg.source.deluge_sftp.enabled):
                 self.sftp = SFTPExporter(self.cfg.source.deluge_sftp)
                 self.sftp.connect()
+                # Reuse the shared connection for Deluge .torrent fallback
+                # instead of a fresh handshake per get_torrent_files call.
+                wire = getattr(self.source_client, "set_sftp_exporter", None)
+                if callable(wire):
+                    try:
+                        wire(self.sftp)
+                    except Exception:
+                        pass
             # NOTE: qBittorrent sources have no SFTP config (SourceConfig only
             # defines deluge_sftp) — SFTP fallback for qB goes through the
             # source client's export_torrent() endpoint instead. self.sftp

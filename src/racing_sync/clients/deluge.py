@@ -59,6 +59,14 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             cfg.deluge_sftp if cfg.deluge_sftp and cfg.deluge_sftp.enabled
             else None
         )
+        # Shared exporter wired by the coordinator (reuses one SSH
+        # connection). Falls back to a fresh per-call connection when unset
+        # (e.g. standalone use in tests).
+        self._shared_sftp = None
+
+    def set_sftp_exporter(self, exporter) -> None:
+        """Reuse the coordinator's shared SFTP connection for .torrent fallback."""
+        self._shared_sftp = exporter
 
     async def _do_client_auth(self) -> None:
         # Deluge's WebUI uses the same login endpoint as the daemon. We
@@ -319,23 +327,42 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         than the daemon's RPC since the .torrent file is immutable and
         the daemon version is irrelevant.
 
-        NOTE: opens a fresh SFTP connection per call — callers fetching
-        many torrents should reuse/pool the exporter where possible.
+        Prefers the coordinator's shared exporter (one SSH connection);
+        only opens a fresh per-call connection when none was wired via
+        set_sftp_exporter() (standalone/test use).
         """
         from ..sftp_source import SFTPExporter
-        if not self._sftp_cfg:
+        if not self._sftp_cfg and self._shared_sftp is None:
             return []
-        sftp_cfg = self._sftp_cfg
+        shared = self._shared_sftp
 
-        def _fetch() -> bytes | None:
-            with SFTPExporter(sftp_cfg) as sftp:
+        async def _fetch_shared() -> bytes | None:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(shared.fetch_torrent, torrent_hash),
+                    timeout=15.0,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                log.warning("deluge: shared SFTP .torrent fetch for %s timed out",
+                            torrent_hash[:10])
+                return None
+            except Exception as e:
+                log.warning("deluge: shared SFTP fetch failed for %s: %s",
+                            torrent_hash, e)
+                return None
+
+        def _fetch_fresh() -> bytes | None:
+            with SFTPExporter(self._sftp_cfg) as sftp:  # type: ignore[arg-type]
                 return sftp.fetch_torrent(torrent_hash)
 
         try:
-            # Bounded: a stalled connection must not wedge the calling worker
-            # forever (the shared exporter paths use 15s; a fresh connect
-            # costs a handshake first, hence the larger budget here).
-            blob = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=45.0)
+            if shared is not None:
+                blob = await _fetch_shared()
+            else:
+                # Bounded: a stalled connection must not wedge the calling worker
+                # forever (the shared exporter paths use 15s; a fresh connect
+                # costs a handshake first, hence the larger budget here).
+                blob = await asyncio.wait_for(asyncio.to_thread(_fetch_fresh), timeout=45.0)
         except (asyncio.TimeoutError, TimeoutError):
             log.warning("deluge: SFTP .torrent fetch for %s timed out", torrent_hash[:10])
             return []

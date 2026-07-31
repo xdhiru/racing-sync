@@ -543,6 +543,31 @@ async def test_deluge_files_from_torrent_file_catches_sftp_error():
 
 
 @pytest.mark.anyio
+async def test_deluge_files_prefers_shared_sftp_exporter():
+    """Shared exporter must be reused; no fresh handshake per call."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.clients.deluge import DelugeClient
+    from racing_sync.config import SourceConfig
+
+    cfg = SourceConfig(
+        type="deluge",
+        host="http://localhost:8112",
+        password="secret",
+        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+    )
+    client = DelugeClient(cfg)
+    shared = MagicMock()
+    shared.fetch_torrent.return_value = None
+    client.set_sftp_exporter(shared)
+
+    with patch("racing_sync.sftp_source.SFTPExporter") as mock_cls:
+        files = await client._files_from_torrent_file("a" * 40)
+        assert files == []
+        mock_cls.assert_not_called()
+    shared.fetch_torrent.assert_called_once()
+
+
+@pytest.mark.anyio
 async def test_http_client_authed_reset_on_close_and_origin_rfc6454():
     from racing_sync.clients.http_base import HTTPClientBase
     from racing_sync.config import HTTPClientConfig
