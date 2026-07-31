@@ -35,9 +35,13 @@ from .clients.http_base import AuthError
 from .clients.qbittorrent import QBittorrentClient
 from .config import AppConfig
 from .coordinator_content import (
-    PUBLIC_TRACKER_HOSTS as PUBLIC_TRACKER_HOSTS,  # noqa: F401  (re-exported API)
-    SourceDecision,
     _TELEGRAM_NOTIFY_STATES as _TELEGRAM_NOTIFY_STATES,  # noqa: F401  (re-exported API)
+)
+from .coordinator_content import (
+    PUBLIC_TRACKER_HOSTS as PUBLIC_TRACKER_HOSTS,  # noqa: F401  (re-exported API)
+)
+from .coordinator_content import (
+    SourceDecision,
     _looks_public,
     _matches_release,
     _should_notify_telegram,
@@ -197,7 +201,7 @@ async def pick_ssd_source_for_racing(
                         timeout=15.0,
                     )
                     break
-                except (asyncio.TimeoutError, TimeoutError):
+                except TimeoutError:
                     log.warning("sftp fetch %s timed out after 15s (attempt %d/2)",
                                 chosen.infohash[:10], attempt)
                 except Exception as e:  # noqa: BLE001
@@ -374,7 +378,7 @@ async def pick_ssd_source_for_racing(
                     asyncio.to_thread(sftp.fetch_torrent, source_torrent.infohash),
                     timeout=15.0,
                 )
-            except (asyncio.TimeoutError, TimeoutError):
+            except TimeoutError:
                 log.warning("sftp fallback fetch %s timed out after 15s",
                             source_torrent.infohash[:10])
             except Exception as e:  # noqa: BLE001
@@ -1014,9 +1018,8 @@ class Coordinator:
                 continue
             item.progress = t.progress
             item.size_mb = t.size_bytes / (1024 * 1024)
-            if t.progress > 0.001:
-                eta_s = (1.0 - t.progress) * 60  # crude placeholder
-                item.eta = f"{eta_s:.0f}m"
+            # No ETA: we don't track downspeed, and the old
+            # (1-progress)*60 placeholder misled operators.
 
     def live_progress_map(self) -> dict[str, float]:
         """Snapshot of in-flight download progress keyed by infohash.
@@ -2324,10 +2327,12 @@ class Coordinator:
             await self.dest_client.resume(ts.dest_infohash or ts.source_infohash)
         self.transition(ts, State.DOWNLOADING)
 
-    async def _await_hash_for_name(self, name: str, *, timeout: float = 60) -> str | None:
-        deadline = time.monotonic() + timeout
+    async def _await_hash_for_name(self, name: str, *, timeout_s: float = 60) -> str | None:
+        deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            rows = await self.dest_client.list_torrents()
+            # Dest entries are always added with category="racing": filter
+            # server-side instead of pulling 10k long-term seeds per poll.
+            rows = await self.dest_client.list_torrents(category="racing")
             for t in rows:
                 if t.name == name:
                     return t.hash.lower()
@@ -3794,7 +3799,7 @@ class Coordinator:
                     if blob:
                         return blob
                     break
-                except (asyncio.TimeoutError, TimeoutError):
+                except TimeoutError:
                     log.warning("sftp fetch %s timed out after 15s (attempt %d/2)",
                                 infohash[:10], attempt)
                 except Exception as e:  # noqa: BLE001
