@@ -126,6 +126,11 @@ class DelugeSFTPConfig(BaseModel):
     known_hosts_path: Path | None = None
     auto_add_host_key: bool = False
     state_dir: Path
+    # Independent SSH/SFTP connections in the exporter pool. Re-inject
+    # bursts from concurrent workers used to serialize on one transport
+    # (15s-timeout clusters); 3 lets a few fetches fly in parallel while
+    # a wedged member fails over instead of wedging everyone.
+    pool_size: int = Field(default=3, ge=1, le=8)
 
     @field_validator("ssh_key_path", "known_hosts_path", mode="before")
     @classmethod

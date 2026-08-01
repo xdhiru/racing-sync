@@ -111,6 +111,10 @@ known_hosts_path = ""
 auto_add_host_key = false
 # Path inside VPS1 to deluge state dir; typically ~/.config/deluge/state
 state_dir = "/home/deluge/.config/deluge/state"
+# Independent SSH/SFTP connections in the exporter pool (1-8, default 3).
+# Concurrent re-inject fetches share the pool instead of serializing on
+# one transport; a wedged member fails over instead of wedging everyone.
+pool_size = 3
 
 # ============================================================
 # Destination (VPS2) — long-term seed client (qbittorrent)

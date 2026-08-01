@@ -327,7 +327,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         than the daemon's RPC since the .torrent file is immutable and
         the daemon version is irrelevant.
 
-        Prefers the coordinator's shared exporter (one SSH connection);
+        Prefers the coordinator's shared exporter (pooled SSH connections);
         only opens a fresh per-call connection when none was wired via
         set_sftp_exporter() (standalone/test use).
         """
@@ -342,7 +342,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     asyncio.to_thread(shared.fetch_torrent, torrent_hash),
                     timeout=15.0,
                 )
-            except (asyncio.TimeoutError, TimeoutError):
+            except TimeoutError:
                 log.warning("deluge: shared SFTP .torrent fetch for %s timed out",
                             torrent_hash[:10])
                 return None
@@ -352,7 +352,9 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 return None
 
         def _fetch_fresh() -> bytes | None:
-            with SFTPExporter(self._sftp_cfg) as sftp:  # type: ignore[arg-type]
+            # Single-member pool: a fresh handshake per call is already
+            # expensive; don't triple it.
+            with SFTPExporter(self._sftp_cfg, pool_size=1) as sftp:  # type: ignore[arg-type]
                 return sftp.fetch_torrent(torrent_hash)
 
         try:
@@ -363,7 +365,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 # forever (the shared exporter paths use 15s; a fresh connect
                 # costs a handshake first, hence the larger budget here).
                 blob = await asyncio.wait_for(asyncio.to_thread(_fetch_fresh), timeout=45.0)
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             log.warning("deluge: SFTP .torrent fetch for %s timed out", torrent_hash[:10])
             return []
         except Exception as e:
