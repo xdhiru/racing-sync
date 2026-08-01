@@ -256,17 +256,12 @@ async def test_check_and_inject_late_cross_seeds(tmp_path: Path):
 
     await coord._check_and_inject_late_cross_seeds(ts, group)
 
-    coord.dest_client.add_torrent.assert_awaited_once_with(
-        torrent_files=[blob],
-        save_path=str(fuse_dir),
-        category="racing",
-        paused=False,
-        skip_check=True,
-        tags=["racing", "fuse"],
-    )
-
+    # The not-yet-injected source torrent is repaired first, then the late
+    # arrival: two fuse adds total.
+    assert coord.dest_client.add_torrent.await_count == 2
+    assert "sourcehash" in ts.injected_private_hashes
     assert "newhash" in ts.injected_private_hashes
-    coord.store.upsert.assert_called_once_with(ts)
+    assert coord.store.upsert.call_count == 2
 
 
 @pytest.mark.anyio
@@ -320,8 +315,10 @@ async def test_check_and_inject_late_cross_seeds_recognizes_existing_torrent(tmp
     await coord._check_and_inject_late_cross_seeds(ts, group)
 
     # Must be marked as injected despite add_torrent returning "Fails."
+    # (source repair upserts first, then the late arrival: two upserts).
     assert "existinghash" in ts.injected_private_hashes
-    coord.store.upsert.assert_called_once_with(ts)
+    assert "sourcehash" in ts.injected_private_hashes
+    assert coord.store.upsert.call_count == 2
 
 
 @pytest.mark.anyio
