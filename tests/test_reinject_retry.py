@@ -1339,3 +1339,155 @@ async def test_re_add_cross_seed_unconfirmed_replace_retries_not_fails(tmp_path:
     assert ts.state == State.RE_ADDING
     coord.transition.assert_not_called()
 
+
+@pytest.mark.anyio
+async def test_late_cross_seed_repairs_skipped_racing_injection(tmp_path: Path):
+    """Regression: SFTP timeouts during RE_ADDING left DONE rows seeding the
+    cross-seed only (Dark.Matter S02E04 / Bold S40E002 shape).
+
+    The source hash is in known_hashes by construction, so the late-arrival
+    loop never retried it. The repair must inject it while VPS1 still lists
+    it — even with no *new* arrivals in the group.
+    """
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    fname = "Dark.Matter.2024.S02E04.mkv"
+    (fuse_dir / fname).write_bytes(b"d" * 100)
+    blob = _single_file_torrent_bytes(fname, 100)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
+    # Real mount paths: with a bare MagicMock, episode kinds resolve to a
+    # mock path and the fuse gate can never pass.
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.fuse.mount = fuse_dir
+    coord.cfg.rclone.fuse.mount_unsorted = fuse_dir
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
+    coord.dest_client = AsyncMock()
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash=None, accepted=True, detail="Ok.")
+    )
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
+    coord.store = MagicMock()
+    coord._failed_late_cross_seeds = {}
+
+    racing_hash = "b" * 40   # VPS1 private torrent (SFTP timed out in RE_ADDING)
+    indexer_hash = "c" * 40  # cross-seed actually injected
+    ts = TorrentState(
+        source_infohash=racing_hash,
+        source_name="Dark.Matter.2024.S02E04",
+        dest_infohash=indexer_hash,
+        cross_seed_infohash=indexer_hash,
+        injected_private_hashes="",
+        state=State.DONE,
+    )
+    group = [
+        Torrent(hash=racing_hash, name="Dark.Matter.2024.S02E04", category="",
+                save_path="", size_bytes=100, state="seeding", progress=1.0),
+    ]
+
+    await coord._check_and_inject_late_cross_seeds(ts, group)
+
+    coord.dest_client.add_torrent.assert_awaited_once()
+    assert racing_hash in ts.injected_private_hashes
+    coord.store.upsert.assert_called_once_with(ts)
+
+
+@pytest.mark.anyio
+async def test_late_cross_seed_repair_skipped_when_source_recorded(tmp_path: Path):
+    """Healthy rows (source already injected) must not re-fetch or re-add."""
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
+    coord._target_mount_for = MagicMock(return_value=tmp_path)
+    coord.dest_client = AsyncMock()
+    coord._fetch_racing_torrent_bytes = AsyncMock()
+    coord.store = MagicMock()
+    coord._failed_late_cross_seeds = {}
+
+    racing_hash = "b" * 40
+    ts = TorrentState(
+        source_infohash=racing_hash,
+        source_name="Dark.Matter.2024.S02E04",
+        dest_infohash="c" * 40,
+        cross_seed_infohash="c" * 40,
+        injected_private_hashes=racing_hash,
+        state=State.DONE,
+    )
+    group = [
+        Torrent(hash=racing_hash, name="Dark.Matter.2024.S02E04", category="",
+                save_path="", size_bytes=100, state="seeding", progress=1.0),
+    ]
+
+    await coord._check_and_inject_late_cross_seeds(ts, group)
+
+    coord._fetch_racing_torrent_bytes.assert_not_called()
+    coord.dest_client.add_torrent.assert_not_called()
+    coord.store.upsert.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_late_cross_seed_repair_backs_off_on_fetch_miss():
+    """Unfetchable racing bytes defer with backoff instead of SFTP storms."""
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
+    coord.dest_client = AsyncMock()
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=None)
+    coord.store = MagicMock()
+    coord._failed_late_cross_seeds = {}
+
+    racing_hash = "b" * 40
+    ts = TorrentState(
+        source_infohash=racing_hash,
+        source_name="Dark.Matter.2024.S02E04",
+        dest_infohash="c" * 40,
+        cross_seed_infohash="c" * 40,
+        injected_private_hashes="",
+        state=State.DONE,
+    )
+    group = [
+        Torrent(hash=racing_hash, name="Dark.Matter.2024.S02E04", category="",
+                save_path="", size_bytes=100, state="seeding", progress=1.0),
+    ]
+
+    await coord._check_and_inject_late_cross_seeds(ts, group)
+
+    assert racing_hash in coord._failed_late_cross_seeds
+    coord.dest_client.add_torrent.assert_not_called()
+    coord.store.upsert.assert_not_called()
+
+    # Second tick within backoff: fetch must not even be attempted.
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=None)
+    await coord._check_and_inject_late_cross_seeds(ts, group)
+    coord._fetch_racing_torrent_bytes.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_re_inject_zero_injection_warns(caplog):
+    """A racing fetch miss during RE_ADDING must be loud, not silent."""
+    import logging
+
+    coord = object.__new__(Coordinator)
+    coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse/unsorted"))
+    coord.dest_client = AsyncMock()
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=None)
+    coord._list_source_torrents = AsyncMock(return_value=[
+        Torrent(hash="b" * 40, name="Dark.Matter.2024.S02E04", category="",
+                save_path="", size_bytes=100, state="seeding", progress=1.0),
+    ])
+
+    ts = TorrentState(
+        source_infohash="b" * 40,
+        source_name="Dark.Matter.2024.S02E04",
+        injected_private_hashes="",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
+        await coord._re_inject_racing_torrents(ts)
+
+    assert ts.injected_private_hashes == ""
+    assert any("no .torrent bytes" in r.message for r in caplog.records)
+    assert any("0/1 racing torrent" in r.message for r in caplog.records)
+
