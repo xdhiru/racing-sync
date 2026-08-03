@@ -218,6 +218,27 @@ async def run_rclone(
     return res
 
 
+def _validate_files_from_entries(files_from: list[str]) -> None:
+    """Reject traversal/absolute/control-char entries before writing --files-from-raw list.
+
+    Entries come from .torrent metadata / client file lists (untrusted).
+    ``["a.mkv\\n/etc/passwd", "../outside"]`` must never reach rclone where
+    they would escape `local`.
+    """
+    for entry in files_from:
+        if not isinstance(entry, str) or not entry:
+            raise ValueError(f"refusing empty rclone files-from entry: {entry!r}")
+        if "\n" in entry or "\r" in entry or "\0" in entry:
+            raise ValueError(f"refusing rclone files-from entry with control chars: {entry!r}")
+        norm = entry.replace("\\", "/")
+        # Absolute (POSIX or Windows drive) — never relativize silently.
+        if norm.startswith("/") or (len(norm) >= 2 and norm[1] == ":" and norm[0].isalpha()):
+            raise ValueError(f"refusing absolute rclone files-from entry: {entry!r}")
+        parts = [p for p in norm.strip("/").split("/") if p]
+        if not parts or any(p in (".", "..") for p in parts):
+            raise ValueError(f"refusing traversal rclone files-from entry: {entry!r}")
+
+
 async def move_local_to_remote(
     cfg: AppConfig,
     local: Path,
@@ -231,6 +252,8 @@ async def move_local_to_remote(
         raise FileNotFoundError(f"rclone source missing: {local}")
     if files_from is not None and not files_from:
         raise ValueError("rclone files_from list must not be empty (refusing silent no-op move)")
+    if files_from is not None:
+        _validate_files_from_entries(files_from)
     list_path: str | None = None
     try:
         if files_from is not None:
@@ -278,6 +301,8 @@ async def wipe_local_tree(
     path: Path, *, base_dir: Path | Iterable[Path] | None = None
 ) -> None:
     """Remove a directory tree safely, ensuring it is within base_dir and not a filesystem root."""
+    if base_dir is None:
+        raise ValueError(f"refusing to delete without base_dir guard: {path}")
     if not path.exists() and not path.is_symlink():
         return
     validate_safe_delete_path(path, base_dir=base_dir)
@@ -295,6 +320,8 @@ async def wipe_local_tree(
 async def wipe_local_files(
     paths: list[Path], *, base_dir: Path | Iterable[Path] | None = None
 ) -> None:
+    if base_dir is None:
+        raise ValueError("refusing to delete without base_dir guard")
     if not paths:
         return
 

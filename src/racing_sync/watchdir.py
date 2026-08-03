@@ -231,7 +231,22 @@ def extract_torrent_files_from_bencoded(data: bytes) -> list[Any]:
 
     files_list: list[TorrentFile] = []
     pieces = info.get(b"files")
+    def _safe_part(p: str) -> str | None:
+        # Path parts come from untrusted .torrent metadata: reject
+        # traversal, absolute, and control-char segments.
+        if not p or p in (".", ".."):
+            return None
+        if "/" in p or "\\" in p or "\n" in p or "\r" in p or "\0" in p:
+            return None
+        if len(p) >= 2 and p[1] == ":" and p[0].isalpha():
+            return None
+        return p
+
     if isinstance(pieces, list):
+        top_safe = _safe_part(str(top_name)) if top_name else None
+        # Fall back to a neutral top when the torrent's name itself is
+        # unsafe — never propagate traversal into downstream joins.
+        top_prefix = top_safe if top_safe else "torrent"
         for f in pieces:
             if isinstance(f, dict):
                 length_raw = f.get(b"length", 0)
@@ -241,16 +256,23 @@ def extract_torrent_files_from_bencoded(data: bytes) -> list[Any]:
                 if isinstance(path_parts, list):
                     for p in path_parts:
                         if isinstance(p, bytes):
-                            parts_str.append(p.decode("utf-8", errors="replace"))
+                            s = p.decode("utf-8", errors="replace")
                         elif isinstance(p, str):
-                            parts_str.append(p)
+                            s = p
+                        else:
+                            continue
+                        safe = _safe_part(s)
+                        if safe is None:
+                            continue
+                        parts_str.append(safe)
                 rel_path = "/".join(parts_str) if parts_str else "file"
-                full_name = f"{top_name}/{rel_path}" if top_name else rel_path
+                full_name = f"{top_prefix}/{rel_path}"
                 files_list.append(TorrentFile(name=full_name, size_bytes=length, progress=1.0))
     else:
         length_raw = info.get(b"length", 0)
         length = length_raw if isinstance(length_raw, int) and length_raw >= 0 else 0
-        files_list.append(TorrentFile(name=str(top_name), size_bytes=length, progress=1.0))
+        safe_top = _safe_part(str(top_name)) if top_name else None
+        files_list.append(TorrentFile(name=str(safe_top or "file"), size_bytes=length, progress=1.0))
 
     return files_list
 
@@ -277,6 +299,14 @@ def parse_torrent_file(path: Path) -> tuple[str, str, int, str, bytes]:
     # Reject symlinks — watch-dir must not follow links to /etc/passwd etc.
     if path.is_symlink():
         raise ValueError(f"refusing symlink torrent: {path}")
+    try:
+        st = path.stat()
+        if st.st_size > MAX_TORRENT_BYTES:
+            raise ValueError(f"torrent file exceeds maximum allowed size ({st.st_size} > {MAX_TORRENT_BYTES})")
+        if st.st_size == 0:
+            raise ValueError("empty torrent file")
+    except OSError as e:
+        raise ValueError(f"cannot stat torrent file {path}: {e}") from e
     data = path.read_bytes()
     # Re-check after read (TOCTOU): file may have grown between stat and read.
     if len(data) > MAX_TORRENT_BYTES:

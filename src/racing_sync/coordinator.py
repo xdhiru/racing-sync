@@ -124,6 +124,28 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 
 
+def _safe_ssd_join(base: Path, name: str) -> Path | None:
+    """Join untrusted client/torrent file `name` under `base`, or None if unsafe.
+
+    Rejects absolute paths, ``..`` segments, and control chars instead of
+    silently relativizing them. Callers must skip (never delete/move) None.
+    """
+    if not name or not isinstance(name, str):
+        return None
+    if "\n" in name or "\r" in name or "\0" in name:
+        log.warning("refusing file name with control chars: %r", name[:100])
+        return None
+    norm = name.replace("\\", "/")
+    if norm.startswith("/") or (len(norm) >= 2 and norm[1] == ":" and norm[0].isalpha()):
+        log.warning("refusing absolute file name: %r", name[:100])
+        return None
+    parts = [p for p in norm.strip("/").split("/") if p]
+    if not parts or any(p in (".", "..") for p in parts):
+        log.warning("refusing traversal file name: %r", name[:100])
+        return None
+    return base / "/".join(parts)
+
+
 # (SourceDecision / telegram notify filter / public detection moved to
 # coordinator_content.py; re-exported above)
 
@@ -1457,7 +1479,9 @@ class Coordinator:
         base = Path(ts.save_path) if ts.save_path else Path(self.cfg.dest.save_path)
         for name, want in expected:
             try:
-                p = base / name.replace("\\", "/")
+                p = _safe_ssd_join(base, name)
+                if p is None:
+                    return False
                 if not p.exists():
                     return False
                 if want and p.stat().st_size < want:
@@ -2729,12 +2753,15 @@ class Coordinator:
         Size-verified against the kind-appropriate fuse mount; anything
         unstatable answers False (safe direction: download it).
         """
-        norm = (single_file or "").replace("\\", "/").strip("/")
-        if not norm:
+        safe = _safe_ssd_join(Path("."), single_file)
+        if safe is None:
+            return False
+        norm = str(safe)
+        if not norm or norm == ".":
             return False
         match = next(
             (f for f in files
-             if (getattr(f, "name", "") or "").replace("\\", "/").strip("/") == norm),
+             if str(_safe_ssd_join(Path("."), getattr(f, "name", "") or "") or "") == norm),
             None,
         )
         if match is None:
@@ -2744,7 +2771,10 @@ class Coordinator:
         except Exception:
             return False
         try:
-            return (mount / norm).stat().st_size == (match.size_bytes or 0)
+            target = _safe_ssd_join(mount, norm)
+            if target is None:
+                return False
+            return target.stat().st_size == (match.size_bytes or 0)
         except OSError:
             return False
 
@@ -2801,7 +2831,9 @@ class Coordinator:
         uncertain_files: list[TorrentFile] = []
 
         for f in cls_files:
-            file_path = src_dir / f.name
+            file_path = _safe_ssd_join(src_dir, f.name)
+            if file_path is None:
+                continue
             if not file_path.exists():
                 continue
             # Client-verified complete: the ONLY set ever moved to remote.
@@ -2832,7 +2864,21 @@ class Coordinator:
 
         # 3. Clean up incomplete piece-boundary files so they are NOT moved to remote
         for f in incomplete_files:
-            file_path = src_dir / f.name
+            file_path = _safe_ssd_join(src_dir, f.name)
+            if file_path is None:
+                continue
+            # Never delete outside src_dir (traversal guard above) and never
+            # follow symlinks out of the SSD tree.
+            try:
+                if file_path.is_symlink():
+                    log.warning("refusing to delete symlink outside SSD tree: %s", f.name)
+                    continue
+                resolved = file_path.resolve()
+                if resolved != src_dir.resolve() and not resolved.is_relative_to(src_dir.resolve()):
+                    log.warning("refusing to delete outside SSD tree: %s", f.name)
+                    continue
+            except OSError:
+                continue
             if file_path.exists():
                 log.info(
                     "removing incomplete piece-boundary file: %s (%d/%d B)",
@@ -2856,9 +2902,17 @@ class Coordinator:
         else:
             # Scoped to torrent-owned files only to avoid deleting concurrent downloads in shared save_path
             for f in cls_files:
-                base_file = src_dir / f.name
+                base_file = _safe_ssd_join(src_dir, f.name)
+                if base_file is None:
+                    continue
                 for ext in (".!qB", ".parts"):
                     temp_file = base_file.parent / f"{base_file.name}{ext}"
+                    try:
+                        resolved_tmp = temp_file.resolve()
+                        if resolved_tmp != src_dir.resolve() and not resolved_tmp.is_relative_to(src_dir.resolve()):
+                            continue
+                    except OSError:
+                        continue
                     if temp_file.exists():
                         try:
                             temp_file.unlink()
@@ -2875,7 +2929,9 @@ class Coordinator:
         # (per-file --files-from-raw lists preserve the top dir so the
         # remote layout matches torrent-relative names.)
         if ts.batches_total > 1:
-            local_folder = folder if (folder and folder.exists()) else (src_dir / ts.source_name if (src_dir / ts.source_name).exists() else None)
+            _top_join = _safe_ssd_join(src_dir, ts.source_name)
+            _top_exists = _top_join is not None and _top_join.exists()
+            local_folder = folder if (folder and folder.exists()) else (_top_join if _top_exists else None)
             remaining_payload: list[Path] = []
             if local_folder and local_folder.exists() and local_folder.resolve() != src_dir.resolve():
                 remaining_payload = [
@@ -2898,12 +2954,18 @@ class Coordinator:
                         top = ""
                     leftover_names: list[str] = []
                     for f in completed_files:
-                        norm = (f.name or "").replace("\\", "/").strip("/")
+                        joined = _safe_ssd_join(src_dir, f.name or "")
+                        if joined is None:
+                            continue
+                        try:
+                            norm = str(joined.relative_to(src_dir)).replace("\\", "/")
+                        except ValueError:
+                            continue
                         if not norm:
                             continue
                         if top and not (norm == top or norm.startswith(top + "/")):
                             continue
-                        if (src_dir / norm).is_file():
+                        if joined.is_file():
                             leftover_names.append(norm)
                     leftover_files = files_from_names(leftover_names)
                     if not leftover_files:
@@ -2923,7 +2985,10 @@ class Coordinator:
                         # Same 0-transfer hazard as batch moves (rclone exits 0
                         # even when it transferred nothing): proceeding to the
                         # folder wipe below would destroy unmoved data. Stay MOVING.
-                        stuck = [n for n in leftover_files if (src_dir / n).exists()]
+                        def _still_on_disk(n: str) -> bool:
+                            p = _safe_ssd_join(src_dir, n)
+                            return p is not None and p.exists()
+                        stuck = [n for n in leftover_files if _still_on_disk(n)]
                         if stuck:
                             log.warning(
                                 "leftover sweep for %s moved nothing "
@@ -2946,25 +3011,34 @@ class Coordinator:
         elif cls.kind in ("movie", "episode", "season", "unknown"):
             local: Path | None
             if cls.kind in ("movie", "episode") and cls.single_file:
-                local = src_dir / cls.single_file
-                if not local.exists():
-                    if folder and (folder / cls.single_file).exists():
-                        local = folder / cls.single_file
+                local = _safe_ssd_join(src_dir, cls.single_file)
+                if local is None or not local.exists():
+                    if folder is not None:
+                        _alt = _safe_ssd_join(folder, cls.single_file)
+                        if _alt is not None and _alt.exists():
+                            local = _alt
+                        elif self._single_on_fuse(cls_files, cls.single_file, ts):
+                            log.info("single file %s already on remote; skipping move",
+                                     cls.single_file)
+                            local = None
+                        else:
+                            raise FileNotFoundError(f"completed {cls.kind} file not found on SSD: {src_dir}/{cls.single_file}")
                     elif self._single_on_fuse(cls_files, cls.single_file, ts):
                         log.info("single file %s already on remote; skipping move",
                                  cls.single_file)
                         local = None
                     else:
-                        raise FileNotFoundError(f"completed {cls.kind} file not found on SSD: {local}")
+                        raise FileNotFoundError(f"completed {cls.kind} file not found on SSD: {src_dir}/{cls.single_file}")
             elif cls.kind in ("season", "unknown") or (cls.kind == "movie" and not cls.single_file):
+                _src_top = _safe_ssd_join(src_dir, ts.source_name)
                 if folder and folder.exists():
                     local = folder
-                elif (src_dir / ts.source_name).exists():
-                    local = src_dir / ts.source_name
+                elif _src_top is not None and _src_top.exists():
+                    local = _src_top
                 else:
                     raise FileNotFoundError(
                         f"completed {cls.kind} content not found on SSD: "
-                        f"neither {folder} nor {src_dir / ts.source_name} exists"
+                        f"neither {folder} nor {src_dir}/{ts.source_name} exists"
                     )
                 # Verified-complete per-file move (same guarantee as the sweep
                 # above): a bare `<top>/**` move would also upload
@@ -2978,18 +3052,24 @@ class Coordinator:
                     top = ""
                 folder_names: list[str] = []
                 for f in completed_files:
-                    norm = (f.name or "").replace("\\", "/").strip("/")
+                    joined = _safe_ssd_join(src_dir, f.name or "")
+                    if joined is None:
+                        continue
+                    try:
+                        norm = str(joined.relative_to(src_dir)).replace("\\", "/")
+                    except ValueError:
+                        continue
                     if not norm:
                         continue
                     if top and not (norm == top or norm.startswith(top + "/")):
                         continue
-                    if (src_dir / norm).is_file():
+                    if joined.is_file():
                         folder_names.append(norm)
                 folder_names = files_from_names(folder_names)
                 if folder_names:
                     await self._rclone_move(src_dir, remote, ts, files_from=folder_names)
                     # A 0-transfer folder move must not proceed to the wipe below.
-                    stuck = [n for n in folder_names if (src_dir / n).exists()]
+                    stuck = [n for n in folder_names if (_p := _safe_ssd_join(src_dir, n)) is not None and _p.exists()]
                     if stuck:
                         log.warning(
                             "folder move for %s left files on disk; "
@@ -3006,11 +3086,11 @@ class Coordinator:
                     )
                 local = None
             else:
-                cand = src_dir / ts.source_name
-                if cand.exists():
+                cand = _safe_ssd_join(src_dir, ts.source_name)
+                if cand is not None and cand.exists():
                     local = cand
                 else:
-                    raise FileNotFoundError(f"completed content not found on SSD: {cand}")
+                    raise FileNotFoundError(f"completed content not found on SSD: {src_dir}/{ts.source_name}")
             if local is None:
                 pass
             elif isinstance(local, Path) and local.is_dir():

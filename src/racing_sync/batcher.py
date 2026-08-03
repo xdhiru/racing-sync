@@ -41,15 +41,38 @@ def files_from_names(names: Iterable[str]) -> list[str]:
     and therefore can neither reach the remote nor overwrite an older
     batch's moved file. Raw mode needs no glob escaping and preserves the
     relative tree on the remote exactly.
+
+    Untrusted torrent file names are filtered: absolute paths, ``..``
+    segments, empty names, and embedded newlines are skipped (never
+    converted to a relative path) so a crafted torrent cannot escape the
+    local source dir via ``--files-from-raw``.
     """
     out: list[str] = []
     seen: set[str] = set()
     for raw in names:
+        if not raw or not isinstance(raw, str):
+            continue
+        # Reject absolute paths before stripping: "/etc/passwd" must not
+        # silently become "etc/passwd".
+        stripped = raw.strip()
+        if stripped.startswith("/") or stripped.startswith("\\"):
+            log.warning("batcher: skipping absolute file name for file list: %r", raw[:100])
+            continue
+        # Windows drive-absolute ("C:/x", "C:\\x") — reject, don't relativize.
+        if len(stripped) >= 2 and stripped[1] == ":" and stripped[0].isalpha():
+            log.warning("batcher: skipping drive-absolute file name for file list: %r", raw[:100])
+            continue
+        if "\n" in raw or "\r" in raw or "\0" in raw:
+            log.warning("batcher: skipping file name with control chars for file list: %r", raw[:100])
+            continue
         # Normalize path separators to POSIX forward slashes
-        normalized = (raw or "").replace("\\", "/").strip("/")
+        normalized = raw.replace("\\", "/").strip("/")
         parts = [p for p in normalized.split("/") if p]
         if not parts:
             log.warning("batcher: skipping empty file name for file list")
+            continue
+        if any(p in (".", "..") for p in parts):
+            log.warning("batcher: skipping traversal file name for file list: %r", raw[:100])
             continue
         name = "/".join(parts)
         if name not in seen:
