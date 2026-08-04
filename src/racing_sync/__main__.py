@@ -37,7 +37,14 @@ async def _runner(coord: Coordinator) -> int:
 
     try:
         res = await main_task
-        return int(res or 0)
+        # Coordinator.run() returns None on success; be explicit so a
+        # truthy non-int (e.g. True) never becomes exit 1.
+        if res is None or res is False or res is True:
+            return 0
+        try:
+            return int(res)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0
     except asyncio.CancelledError:
         return 130
     finally:
@@ -67,6 +74,21 @@ def _is_safe_log_dir_to_clear(log_dir: Path) -> str | None:
     anchor = Path(resolved.anchor)
     if resolved == anchor or str(resolved) in ("/", "\\"):
         return f"refusing to clear filesystem root: {log_dir}"
+    # Never wipe the current working directory (e.g. log_dir="." on a repo
+    # checkout would delete every child of the project).
+    try:
+        if resolved == Path.cwd().resolve():
+            return f"refusing to clear current working directory: {log_dir}"
+    except OSError:
+        pass
+    # Never wipe a directory that looks like a source checkout: wiping it
+    # would delete code, .git history, and the DB alongside logs.
+    try:
+        markers = ("pyproject.toml", ".git", "src", "run.py")
+        if any((resolved / m).exists() for m in markers):
+            return f"refusing to clear directory containing project files: {log_dir}"
+    except OSError:
+        pass
     # Well-known system/profile roots: clearing them would destroy data
     # far beyond racing-sync logs. Compare both Path and posix forms so
     # POSIX-style config values are caught on Windows test hosts too.
@@ -104,6 +126,15 @@ def _is_safe_log_dir_to_clear(log_dir: Path) -> str | None:
     return None
 
 
+def _db_sidecar_paths(db: Path) -> list[Path]:
+    """Return state.db plus its WAL/SHM sidecars without with_suffix crashes.
+
+    `Path.with_suffix("-wal")` raises on suffix-less names (e.g. "state"),
+    so build sidecars by string suffix instead.
+    """
+    return [db, Path(str(db) + "-wal"), Path(str(db) + "-shm")]
+
+
 def _do_reset(cfg: AppConfig) -> list[str]:
     """Fresh start: delete state.db (+WAL/SHM) and clear the log directory.
 
@@ -117,7 +148,7 @@ def _do_reset(cfg: AppConfig) -> list[str]:
     except Exception:
         db = None
     if db is not None:
-        for candidate in (db, db.with_suffix(db.suffix + "-wal"), db.with_suffix(db.suffix + "-shm")):
+        for candidate in _db_sidecar_paths(db):
             try:
                 if candidate.is_file():
                     candidate.unlink()
@@ -140,7 +171,13 @@ def _do_reset(cfg: AppConfig) -> list[str]:
                     elif child.is_file() or child.is_symlink():
                         child.unlink()
                     else:
-                        continue
+                        # FIFOs, sockets, and other special files: unlink
+                        # explicitly instead of silently skipping them.
+                        try:
+                            child.unlink()
+                        except OSError as e:
+                            removed.append(f"could not delete {child}: {e}")
+                            continue
                     removed.append(f"deleted log entry: {child}")
                 except OSError as e:
                     removed.append(f"could not delete {child}: {e}")
@@ -189,7 +226,10 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
         print("dry-run plan (pass --apply to execute):")
     else:
         print("forget applied:")
-    print(f"  torrent: {result['source_name']} ({result['source_infohash'][:10]}) [{result['state']}]")
+    src_name = result.get("source_name") or "?"
+    src_hash = result.get("source_infohash") or ""
+    src_state = result.get("state") or "?"
+    print(f"  torrent: {src_name} ({src_hash[:10]}) [{src_state}]")
     for h in result["dest_entries"]:
         print(f"  dest entry: {h[:10]}")
     for p in result["local_paths"]:
@@ -294,7 +334,8 @@ def main(argv: list[str] | None = None) -> int:
 def _startup_hint(exc: BaseException) -> str:
     """Actionable hint for common startup failures (SFTP/host-key)."""
     text = f"{type(exc).__name__}: {exc}"
-    if "known_hosts" in text or "host key" in text.lower():
+    lowered = text.lower()
+    if "known_hosts" in lowered or "host key" in lowered:
         return (
             "Hint: the SSH host key is not trusted. Either pin it:\n"
             "  ssh-keyscan -p <ssh_port> <ssh_host>"
@@ -303,7 +344,7 @@ def _startup_hint(exc: BaseException) -> str:
             "  [source.deluge_sftp].auto_add_host_key = true "
             "(weaker: vulnerable to first-connection MITM)."
         )
-    if "Authentication" in text or "auth" in text.lower():
+    if "authentication" in lowered or "auth" in lowered:
         return (
             "Hint: SSH auth failed. Check [source.deluge_sftp].ssh_user plus "
             "ssh_key_path/ssh_key_passphrase or ssh_password."
