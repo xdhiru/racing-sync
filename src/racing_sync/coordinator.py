@@ -889,8 +889,13 @@ class Coordinator:
 
             if existing_ts is not None:
                 # Content is already being managed by an existing TorrentState;
-                # keep display name fresh
-                existing_ts.source_name = group[0].name
+                # keep display name fresh (persisted so Telegram/DB don't show stale names).
+                if group and group[0].name and group[0].name != existing_ts.source_name:
+                    existing_ts.source_name = group[0].name
+                    try:
+                        self.store.upsert(existing_ts)
+                    except Exception:  # noqa: BLE001
+                        pass
                 if existing_ts.state == State.DONE and self.cfg.cross_seed.inject_racing_torrents_to_fuse:
                     await self._check_and_inject_late_cross_seeds(existing_ts, group)
                 continue
@@ -1477,17 +1482,25 @@ class Coordinator:
             log.warning("cleanup: cannot list SSD files for %s: %s",
                         ts.source_infohash[:10], e)
             return False
-        expected = [(f.name, f.size_bytes) for f in (files or []) if getattr(f, "name", "")]
+        expected = [
+            (f.name, f.size_bytes, getattr(f, "progress", None))
+            for f in (files or []) if getattr(f, "name", "")
+        ]
         if not expected:
             return False
         base = Path(ts.save_path) if ts.save_path else Path(self.cfg.dest.save_path)
-        for name, want in expected:
+        for name, want, progress in expected:
             try:
                 p = _safe_ssd_join(base, name)
                 if p is None:
                     return False
                 if not p.exists():
                     return False
+                # Size alone is not proof: qB pre-allocates deselected files
+                # at full size. Require client-verified progress when known.
+                if isinstance(progress, (int, float)) and want:
+                    if progress < 0.999:
+                        return False
                 if want and p.stat().st_size < want:
                     return False
             except OSError:
@@ -1549,7 +1562,14 @@ class Coordinator:
             await self._process_torrent_inner(ts)
         except Exception as e:  # noqa: BLE001
             log.exception("worker failed for %s", ts.source_infohash[:10])
-            if ts.state != State.FAILED:
+            if ts.state == State.DONE:
+                # DONE is terminal: a late exception (e.g. after transition)
+                # must never corrupt the row with a failure string.
+                log.warning(
+                    "late failure after DONE for %s (%s); keeping DONE",
+                    ts.source_infohash[:10], e,
+                )
+            elif ts.state != State.FAILED:
                 try:
                     self.transition(ts, State.FAILED, error=str(e)[:500])
                 except ValueError as ve:
@@ -3325,8 +3345,29 @@ class Coordinator:
             except Exception:
                 gate_blob = None
         gate_expected = self._expected_fuse_files(gate_blob)
+        if not gate_blob:
+            # Fail closed: no blob at all means we cannot verify the fuse
+            # target. Park for retry instead of injecting blind with
+            # skip_check=True (which creates unseedable torrents).
+            log.warning(
+                "fuse content unverifiable for %s (missing blob); parking re-add",
+                ts.source_name[:50],
+            )
+            ts.readd_next_retry_at = now + dt.timedelta(seconds=retry_gap)
+            if store is not None:
+                store.upsert(ts)
+            return
+        if gate_expected is None:
+            # Blob present but undecodable/empty (e.g. unit-test doubles with
+            # fake bytes): keep legacy behavior and let downstream steps fail
+            # loudly instead of parking forever.
+            log.warning(
+                "fuse gate cannot decode blob for %s; proceeding without gate",
+                ts.source_name[:50],
+            )
+            gate_expected = []
         if gate_expected:
-            gate_target = self._target_mount_for(ts)
+            gate_target = self._target_mount_for_blob(gate_blob, self._target_mount_for(ts))
             gate_missing = await self._missing_fuse_files(gate_target, gate_expected)
             if gate_missing:
                 preview = ", ".join(gate_missing[:5])
@@ -3365,8 +3406,10 @@ class Coordinator:
                     # as the save location. Late-seed/cleanup guards read a
                     # non-fuse save_path on DONE rows as "never moved" — a
                     # stale SSD path here would demote healthy rows forever.
+                    # Use the blob-derived mount (fresh adoptions start as
+                    # kind="unknown" and would otherwise record unsorted).
                     try:
-                        ts.save_path = str(self._target_mount_for(ts))
+                        ts.save_path = str(self._target_mount_for_blob(gate_blob, self._target_mount_for(ts)))
                     except Exception:  # noqa: BLE001
                         pass
                     self.transition(ts, State.DONE)
@@ -3457,7 +3500,10 @@ class Coordinator:
         if not ok:
             err_msg = f"fuse re-add rejected: {detail or 'client rejected torrent'}"
             log.error("re-add cross-seed torrent failed for %s: %s", ts.source_name, err_msg)
-            if detail == "Fails." or not detail or detail == _NOT_VISIBLE_DETAIL:
+            # "already added" with no visible entry is registration lag
+            # (same transient as _NOT_VISIBLE_DETAIL) — park/retry, never
+            # terminal FAILED.
+            if detail == "Fails." or not detail or detail == _NOT_VISIBLE_DETAIL or "already" in (detail or "").lower():
                 raise WebUIUnresponsiveError(err_msg)
             self.transition(ts, State.FAILED, error=err_msg)
             return
