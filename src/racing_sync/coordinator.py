@@ -721,6 +721,10 @@ class Coordinator:
             t.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+        for t in list(getattr(self, "_tg_tasks", set())):
+            t.cancel()
+        if getattr(self, "_tg_tasks", None):
+            await asyncio.gather(*list(self._tg_tasks), return_exceptions=True)
         tg = getattr(self, "_tg", None)
         if tg is not None:
             await tg.stop()
@@ -1601,7 +1605,15 @@ class Coordinator:
             return
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._notify_telegram(ts))
+            task = loop.create_task(self._notify_telegram(ts))
+            # Track fire-and-forget notifies so shutdown can await them
+            # instead of leaking "Task was destroyed" warnings.
+            pending = getattr(self, "_tg_tasks", None)
+            if pending is None:
+                pending = set()
+                self._tg_tasks = pending  # type: ignore[attr-defined]
+            pending.add(task)
+            task.add_done_callback(pending.discard)
         except RuntimeError:
             # No running loop (e.g. during shutdown). Skip.
             pass
@@ -1615,6 +1627,9 @@ class Coordinator:
         if ts.state == State.WAITING_DISK:
             await self._wait_disk_then_queue(ts)
         if ts.state == State.QUEUED:
+            # download_sem guards QUEUED admission only (_do_queued is
+            # short: add + prioritize). The multi-hour _do_downloading
+            # below runs outside the semaphore so slots are not pinned.
             async with self.download_sem:
                 await self._do_queued(ts)
             if ts.state == State.DOWNLOADING:
@@ -2482,6 +2497,8 @@ class Coordinator:
                 log.warning("could not resume adopted torrent %s: %s", h[:10], e)
 
         is_batched = ts.batches_total > 1
+        consecutive_batch_failures = 0
+        max_batch_failures_per_tick = 5
 
         while not self._stop:
             # Live tracking
@@ -2538,10 +2555,22 @@ class Coordinator:
                         if not paused_ok:
                             # Never move while qB is still writing — retry
                             # shortly instead of corrupting the remote.
+                            # Bound per-tick retries so one wedged torrent
+                            # cannot pin this worker (and its tick) forever;
+                            # state stays DOWNLOADING for retry next tick.
+                            consecutive_batch_failures += 1
                             log.warning(
-                                "could not pause torrent %s before batch move (%s); retrying shortly",
+                                "could not pause torrent %s before batch move (%s); retrying shortly (%d/%d)",
                                 h[:10], pause_err,
+                                consecutive_batch_failures, max_batch_failures_per_tick,
                             )
+                            if consecutive_batch_failures >= max_batch_failures_per_tick:
+                                log.warning(
+                                    "parking %s in DOWNLOADING after %d batch-pause failures",
+                                    ts.source_name, consecutive_batch_failures,
+                                )
+                                self.store.upsert(ts)
+                                return
                             await asyncio.sleep(5)
                             continue
                     try:
@@ -2549,12 +2578,23 @@ class Coordinator:
                     except BatchMoveIncompleteError as e:
                         # Same-tick retry like the pause failure above: the
                         # batch is still fully on local disk, nothing advanced.
+                        # Bound it for the same reason — never wedge the worker.
+                        consecutive_batch_failures += 1
                         log.warning(
-                            "batch move %d/%d for %s incomplete (%s); retrying shortly",
+                            "batch move %d/%d for %s incomplete (%s); retrying shortly (%d/%d)",
                             ts.batch_index + 1, ts.batches_total, ts.source_name, e,
+                            consecutive_batch_failures, max_batch_failures_per_tick,
                         )
+                        if consecutive_batch_failures >= max_batch_failures_per_tick:
+                            log.warning(
+                                "parking %s in DOWNLOADING after %d incomplete batch moves",
+                                ts.source_name, consecutive_batch_failures,
+                            )
+                            self.store.upsert(ts)
+                            return
                         await asyncio.sleep(5)
                         continue
+                    consecutive_batch_failures = 0
                     ts.batch_index += 1
                     self.store.upsert(ts)
                 elif hasattr(self, "_move_and_clean_batch") and hasattr(getattr(self, "_move_and_clean_batch"), "mock_calls"):
