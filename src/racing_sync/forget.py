@@ -50,7 +50,7 @@ def resolve_row(store, target: str):
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
-        preview = ", ".join(f"{t.source_name} ({t.source_infohash[:10]})" for t in matches[:5])
+        preview = ", ".join(f"{t.source_name} ({(t.source_infohash or '')[:10]})" for t in matches[:5])
         raise LookupError(
             f"forget target {target!r} matches {len(matches)} torrents: {preview}; "
             "use a 40-char infohash to pick one"
@@ -97,10 +97,15 @@ async def _candidate_local_paths(cfg, dest, row, entry_hashes: list[str]) -> tup
     tops: list[str] = []
     seen_tops: set[str] = set()
     for f in files:
-        norm = (getattr(f, "name", "") or "").replace("\\", "/").strip("/")
-        if not norm:
+        raw = (getattr(f, "name", "") or "").replace("\\", "/").strip("/")
+        if not raw or "\n" in raw or "\r" in raw or "\0" in raw:
             continue
-        top = norm.split("/")[0] if "/" in norm else norm
+        parts = [p for p in raw.split("/") if p]
+        if not parts or any(p in (".", "..") for p in parts):
+            continue
+        top = parts[0]
+        if top.startswith("/") or (len(top) >= 2 and top[1] == ":" and top[0].isalpha()):
+            continue
         if not top or top in seen_tops:
             continue
         seen_tops.add(top)

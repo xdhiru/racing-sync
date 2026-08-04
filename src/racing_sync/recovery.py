@@ -268,7 +268,21 @@ async def reconcile(
 
     # 1. Snapshot reality — restrict to the racing category so we
     #    don't churn through 7000+ long-term seeds on every startup.
-    actual = await dest.list_torrents(category="racing")
+    # Retry transient WebUI hiccups so one timeout doesn't kill startup.
+    actual: list = []
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            actual = await dest.list_torrents(category="racing")
+            last_err = None
+            break
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            log.warning("reconcile: list_torrents attempt %d/3 failed: %s", attempt, e)
+            if attempt < 3:
+                await asyncio.sleep(2 * attempt)
+    if last_err is not None:
+        raise RuntimeError(f"reconcile: cannot list dest torrents after 3 attempts: {last_err}") from last_err
     actual_by_hash: dict[str, object] = {}
     for t in actual:
         h = (getattr(t, "hash", "") or "").strip().lower()
@@ -276,7 +290,10 @@ async def reconcile(
             actual_by_hash[h] = t
 
     # 2. Snapshot DB
-    all_rows = store.all()
+    try:
+        all_rows = store.all()
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"reconcile: cannot read state DB: {e}") from e
 
     for ts in all_rows:
         h = ts.source_infohash.lower()
@@ -285,6 +302,12 @@ async def reconcile(
             for k in (ts.source_infohash, ts.dest_infohash, ts.cross_seed_infohash)
             if k
         }
+        # An injected private hash still seeding covers presence too —
+        # otherwise DONE rows with vanished source/dest falsely re-add.
+        if ts.injected_private_hashes:
+            for iph in ts.injected_private_hashes.split(","):
+                if iph.strip():
+                    known_hashes.add(iph.strip().lower())
         present = any(k in actual_by_hash for k in known_hashes)
         if ts.state == State.DONE:
             if present:
@@ -382,7 +405,7 @@ async def reconcile(
                 matches = store.find_by_name(name)
                 if matches:
                     existing = matches[0]
-                    curr = [x for x in existing.injected_private_hashes.split(",") if x]
+                    curr = [x.strip() for x in existing.injected_private_hashes.split(",") if x.strip()]
                     curr_lower = {x.lower() for x in curr}
                     if h.lower() not in curr_lower and h.lower() != existing.source_infohash.lower():
                         curr.append(h)

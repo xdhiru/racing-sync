@@ -112,10 +112,10 @@ def build_app(coord: Coordinator) -> FastAPI:
             raise HTTPException(403, "api disabled")
         client_host = request.client.host if request.client else ""
         trusted_proxies = set(getattr(cfg.api, "trusted_proxies", ["127.0.0.1", "::1", "localhost"]))
-        if cfg.api.trust_nginx_header and x_authenticated_user:
+        if cfg.api.trust_nginx_header and x_authenticated_user and x_authenticated_user.strip():
             if not _host_is_trusted(client_host, trusted_proxies):
                 raise HTTPException(403, "untrusted proxy for nginx auth header")
-            return x_authenticated_user
+            return x_authenticated_user.strip()
         token_str = (
             cfg.api.api_token.get_secret_value()
             if hasattr(cfg.api.api_token, "get_secret_value")
@@ -126,9 +126,14 @@ def build_app(coord: Coordinator) -> FastAPI:
         raise HTTPException(401, "auth required")
 
     @app.get("/api/state", dependencies=[Depends(auth)])
-    async def state(limit: int = Query(default=5000, ge=1, le=50000)) -> list[dict[str, Any]]:
-        rows = await asyncio.to_thread(coord.store.all)
-        return [_ts_to_dict(t) for t in rows[:limit]]
+    async def state(
+        limit: int = Query(default=500, ge=1, le=5000),
+        offset: int = Query(default=0, ge=0),
+    ) -> list[dict[str, Any]]:
+        # SQL-level pagination: never materialize the whole table for a
+        # 50k-row request.
+        rows = await asyncio.to_thread(coord.store.all, False, limit, offset)
+        return [_ts_to_dict(t) for t in rows]
 
     @app.get("/api/active", dependencies=[Depends(auth)])
     async def active() -> list[dict[str, Any]]:
@@ -146,7 +151,9 @@ def build_app(coord: Coordinator) -> FastAPI:
     async def ssd() -> dict[str, Any]:
         try:
             free_bytes = await asyncio.to_thread(ssd_free_bytes, cfg)
-        except OSError as e:
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
             raise HTTPException(503, f"ssd path unavailable: {e}") from e
         return {"free_bytes": free_bytes, "path": str(cfg.ssd.path)}
 
@@ -226,18 +233,35 @@ def build_app(coord: Coordinator) -> FastAPI:
 
 
 def _ts_to_dict(t) -> dict[str, Any]:
+    try:
+        from .logging_setup import sanitize_log_text
+        safe_error = sanitize_log_text(str(t.last_error or ""))[:500]
+    except Exception:
+        safe_error = str(t.last_error or "")[:500]
+    try:
+        created = t.created_at.isoformat() if t.created_at is not None else ""
+    except Exception:
+        created = ""
+    try:
+        updated = t.updated_at.isoformat() if t.updated_at is not None else ""
+    except Exception:
+        updated = ""
+    try:
+        state_val = t.state.value
+    except Exception:
+        state_val = str(getattr(t, "state", "unknown"))
     return {
         "source_infohash": t.source_infohash,
         "dest_infohash": t.dest_infohash,
         "source_name": t.source_name,
         "classification_kind": t.classification_kind,
-        "state": t.state.value,
+        "state": state_val,
         "total_bytes": t.total_bytes,
         "batch_index": t.batch_index,
         "batches_total": t.batches_total,
-        "last_error": t.last_error,
-        "created_at": t.created_at.isoformat(),
-        "updated_at": t.updated_at.isoformat(),
+        "last_error": safe_error,
+        "created_at": created,
+        "updated_at": updated,
     }
 
 
