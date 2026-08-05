@@ -345,11 +345,13 @@ async def test_process_torrent_handles_illegal_transition_to_failed():
 
     coord._process_torrent_inner = raise_boom
 
-    # Must catch ValueError from check_transition(DONE -> FAILED) and not crash
+    # DONE is terminal: late failures must keep DONE clean (no last_error
+    # corruption via upsert). Only ERROR log + telegram notify run.
     await coord._process_torrent(ts)
 
-    coord.store.upsert.assert_called_once_with(ts)
-    assert ts.last_error == "boom!"
+    coord.store.upsert.assert_not_called()
+    assert ts.last_error == ""
+    assert ts.state == State.DONE
     coord.store.append_log.assert_called_once_with("ERROR", "boom!", "h1")
     coord._notify_telegram.assert_awaited_once_with(ts)
 
