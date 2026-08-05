@@ -23,13 +23,18 @@ def normalize_content_name(name: str) -> str:
 
     Strips trailing indexer tags (e.g. '[Indexer]', '[FL]'), trailing
     file extensions ('.torrent', '.mkv', etc.), and case-folds/strips.
+    Loops until stable so 'Show [A] [B]' and 'Movie.mkv.torrent' fully collapse.
     """
-    s = name.strip()
-    s = re.sub(r"\.torrent$", "", s, flags=re.IGNORECASE).strip()
-    s = re.sub(r"\s*\[[^\]]+\]\s*$", "", s).strip()
-    for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v"):
-        if s.lower().endswith(ext):
-            s = s[:-len(ext)].strip()
+    s = (name or "").strip()
+    for _ in range(5):
+        prev = s
+        s = re.sub(r"\.torrent$", "", s, flags=re.IGNORECASE).strip()
+        s = re.sub(r"\s*\[[^\]]+\]\s*$", "", s).strip()
+        for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v"):
+            if s.lower().endswith(ext):
+                s = s[:-len(ext)].strip()
+                break
+        if s == prev:
             break
     return s.lower()
 
@@ -124,8 +129,12 @@ def cleanup_grace_seconds(cfg: object, free_bytes: int | None, arrivals_per_hour
         rate = max(0.0, float(arrivals_per_hour or 0.0))
     except (TypeError, ValueError):
         rate = 0.0
+    try:
+        free_f = float(free_bytes) if free_bytes is not None else None
+    except (TypeError, ValueError):
+        free_f = None
 
-    space_curve = _lerp(free_bytes, low, high, min_g, max_g) if free_bytes is not None else max_g
+    space_curve = _lerp(free_f, low, high, min_g, max_g) if free_f is not None else max_g
     velocity_curve = _lerp(rate, calm, burst, max_g, min_g)
     return max(min_g, min(space_curve, velocity_curve, max_g))
 
