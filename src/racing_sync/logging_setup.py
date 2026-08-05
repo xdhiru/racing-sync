@@ -50,6 +50,45 @@ _SENSITIVE_HEADER_KEYS = frozenset(
 )
 
 
+class ENOSPCSafeTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    """Timed file handler that disables itself on ENOSPC instead of traceback-storming.
+
+    Once the log disk is full, every emit() would raise OSError(28) and the
+    logging module prints a full traceback to stderr per message — which
+    fills the disk faster and buries the real error. Fail silent after the
+    first ENOSPC: drop file output, keep console/ring, and print one line.
+    """
+
+    _disabled_due_to_enospc: bool = False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._disabled_due_to_enospc:
+            return
+        try:
+            super().emit(record)
+        except OSError as e:
+            import errno as _errno
+
+            if e.errno == _errno.ENOSPC:
+                self._disabled_due_to_enospc = True
+                try:
+                    sys.stderr.write(
+                        f"[log] disabling file handler {self.baseFilename}: "
+                        "no space left on device (logging to console/ring only)\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                try:
+                    self.close()
+                except Exception:
+                    pass
+                return
+            self.handleError(record)
+        except Exception:
+            self.handleError(record)
+
+
 def sanitize_log_text(text: str) -> str:
     """Scrub sensitive credentials, tokens, and passkeys from log messages."""
     text = _SENSITIVE_PARAM_RE.sub(r"\1***", text)
@@ -275,8 +314,9 @@ def setup_logging(cfg: AppConfig) -> None:
     console.setFormatter(SanitizingFormatter(LOG_FORMAT, DATE_FORMAT))
     root.addHandler(console)
 
-    # Rotating human-readable log
-    fh = logging.handlers.TimedRotatingFileHandler(
+    # Rotating human-readable log (ENOSPC-safe: a full log disk disables
+    # file output instead of traceback-storming per message).
+    fh = ENOSPCSafeTimedRotatingFileHandler(
         log_dir / "racing-sync.log",
         when="midnight",
         backupCount=cfg.general.log_retention_days,
@@ -287,7 +327,7 @@ def setup_logging(cfg: AppConfig) -> None:
     root.addHandler(fh)
 
     # Structured JSONL
-    jh = logging.handlers.TimedRotatingFileHandler(
+    jh = ENOSPCSafeTimedRotatingFileHandler(
         log_dir / "racing-sync.jsonl",
         when="midnight",
         backupCount=cfg.general.log_retention_days,
@@ -316,6 +356,30 @@ def setup_logging(cfg: AppConfig) -> None:
     for noisy in ("aiohttp.access", "asyncio", "urllib3", "paramiko", "uvicorn",
                   "httpx", "httpcore", "telegram", "telegram.ext"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # Fail-fast hint for the ENOSPC feedback loop: logs + SSD/state on one
+    # mount means a full SSD kills logging and state.db together.
+    try:
+        log_dev = log_dir.stat().st_dev
+        for _label, _raw in (
+            ("state_db", cfg.general.state_db),
+            ("ssd.path", cfg.ssd.path),
+            ("dest.save_path", cfg.dest.save_path),
+        ):
+            try:
+                _p = Path(str(_raw)).parent if str(_raw).endswith(".db") else Path(str(_raw))
+                if _p.exists() and _p.stat().st_dev == log_dev:
+                    logging.getLogger("racing_sync").warning(
+                        "log dir %s shares a filesystem with %s (%s) — "
+                        "move logs to a separate mount so a full SSD does not "
+                        "take down logging/state.db",
+                        log_dir, _label, _p,
+                    )
+                    break
+            except OSError:
+                continue
+    except OSError:
+        pass
 
     logging.getLogger("racing_sync").info(
         "logging initialised: dir=%s retention=%dd",
