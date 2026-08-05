@@ -111,7 +111,7 @@ class Batch:
 def make_batches(
     episodes: list[Episode], *, cap_bytes: int, max_files: int = DEFAULT_MAX_BATCH_FILES
 ) -> list[Batch]:
-    """Greedy first-fit-decreasing on already-sorted episodes.
+    """Greedy sequential batches over already-sorted episodes.
 
     Episodes are already (season, episode) sorted by the classifier.
     Since (season, episode) order is roughly monotonic, a greedy linear pass

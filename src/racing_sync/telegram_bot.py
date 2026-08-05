@@ -173,6 +173,19 @@ def _tracker_domain(url: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _retry_at_in_future(value: object) -> bool:
+    """True iff value is a datetime in the future (naive treated as UTC)."""
+    if not isinstance(value, dt.datetime):
+        return False
+    try:
+        now = dt.datetime.now(dt.timezone.utc)
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=dt.timezone.utc)
+        return value > now
+    except Exception:
+        return False
+
+
 def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     """Per-torrent detail message (edited in place as state advances)."""
     icon = _STATE_ICON.get(ts.state, ts.state.value.upper())
@@ -212,7 +225,7 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     elif ts.state == State.MOVING:
         lines.append("rclone moving to remote…")
     elif ts.state == State.RE_ADDING:
-        if ts.readd_next_retry_at and ts.readd_next_retry_at > dt.datetime.now(dt.timezone.utc):
+        if _retry_at_in_future(ts.readd_next_retry_at):
             mins = max(1, round((ts.readd_next_retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds() / 60))
             lines.append(f"Re-adding on fuse mount (WebUI busy, retrying in {mins}m)")
         else:
@@ -251,6 +264,11 @@ def render_active(
     page_size: int = 5,
 ) -> tuple[str, int, int]:
     """Render paginated list of active tasks with numbered items."""
+    try:
+        page_size = int(page_size)
+    except (TypeError, ValueError):
+        page_size = 5
+    page_size = max(1, min(page_size, 50))
     total_items = len(active)
     total_pages = max(1, (total_items + page_size - 1) // page_size)
     cur_page = max(0, min(page, total_pages - 1))
@@ -273,7 +291,7 @@ def render_active(
 
     for i, (ts, progress) in enumerate(page_items):
         item_num = start_idx + i + 1
-        name = ts.source_name.replace("`", "'").rstrip("\\")
+        name = (ts.source_name or "").replace("`", "'").replace("\n", " ").replace("\r", " ").rstrip("\\")
         size = _bytes_human(ts.total_bytes)
         full_hash = (ts.source_infohash or "").lower()
 
@@ -294,7 +312,7 @@ def render_active(
         elif ts.state == State.MOVING:
             state_text = "📦 Moving"
         elif ts.state == State.RE_ADDING:
-            if ts.readd_next_retry_at and ts.readd_next_retry_at > dt.datetime.now(dt.timezone.utc):
+            if _retry_at_in_future(ts.readd_next_retry_at):
                 mins = max(1, round((ts.readd_next_retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds() / 60))
                 state_text = f"🔄 Re-adding (retry in {mins}m)"
             else:
