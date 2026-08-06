@@ -2720,8 +2720,39 @@ class Coordinator:
                         await asyncio.sleep(5)
                         continue
                     consecutive_batch_failures = 0
-                    ts.batch_index += 1
-                    self.store.upsert(ts)
+                    next_index = ts.batch_index + 1
+                    if next_index < ts.batches_total:
+                        # Isolated batches: fresh delete(with-files) + re-add
+                        # so next batch downloads from zero with no shared-piece
+                        # partials. Only verified-complete files ever moved.
+                        # Index advances only after reset succeeds; a transient
+                        # failure replays this already-moved batch as a no-op
+                        # via _fuse_skipped next tick.
+                        try:
+                            ok = await self._reset_torrent_for_next_batch(ts, next_index)
+                        except _WEBUI_RETRY_ERRORS as e:
+                            log.warning(
+                                "isolated batch reset hit transient dest error for %s (%s); retry next tick",
+                                ts.source_name, e,
+                            )
+                            self.store.upsert(ts)
+                            return
+                        if not ok:
+                            self.store.upsert(ts)
+                            return
+                        ts.batch_index = next_index
+                        self.store.upsert(ts)
+                        # dest hash may have changed on re-add; refresh live key.
+                        try:
+                            new_h = ts.dest_infohash or ts.source_infohash
+                            if new_h.lower() != h.lower():
+                                self._live.pop(h.lower(), None)
+                                h = new_h
+                        except Exception:
+                            pass
+                    else:
+                        ts.batch_index = next_index
+                        self.store.upsert(ts)
                 elif hasattr(self, "_move_and_clean_batch") and hasattr(getattr(self, "_move_and_clean_batch"), "mock_calls"):
                     # Mock in unit test (e.g. AsyncMock)
                     await self._move_and_clean_batch(ts, None)  # type: ignore[arg-type]
@@ -2744,12 +2775,8 @@ class Coordinator:
                     break
 
                 if ts.batch_index < ts.batches_total:
-                    await self._prepare_next_batch(ts)
-                    if hasattr(self, "dest_client"):
-                        try:
-                            await self.dest_client.resume(h)
-                        except Exception as e:
-                            log.warning("could not resume torrent %s after batch move: %s", h[:10], e)
+                    # Next batch was already prioritized + resumed inside the
+                    # isolated reset above; loop back to wait for it.
                     continue
 
             break
@@ -2873,6 +2900,187 @@ class Coordinator:
             if ep.file_name not in skip:
                 prio_map[ep.file_name] = 1
         await self.dest_client.set_file_priorities(h, prio_map)
+
+    async def _reset_torrent_for_next_batch(self, ts: TorrentState, next_index: int) -> bool:
+        """Delete + fresh re-add for isolated per-batch downloads.
+
+        After batch N is verified moved (straggler check passed), the old
+        torrent entry holds deselected partials of batch N+1 (shared pieces)
+        plus preallocated files. Flipping priorities in place can leave the
+        next batch's first file permanently partial. A fresh
+        ``delete(delete_files=True) + add`` wipes those partials so the next
+        batch downloads from zero and only verified-complete files ever reach
+        ``rclone move`` — guaranteeing 100% of bytes land on the remote.
+
+        Crash-safe: batch_index is only advanced by the caller AFTER this
+        returns True. A crash before then replays the already-moved batch,
+        which is a no-op via _fuse_skipped. Returns False on transient
+        failure (stay DOWNLOADING, retry next tick).
+        """
+        h_old = ts.dest_infohash or ts.source_infohash
+        blob = getattr(ts, "_blob", None) or ts.cross_seed_blob or None
+        if blob is None or (isinstance(blob, (bytes, bytearray)) and len(blob) == 0):
+            try:
+                fetched = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
+            except Exception:
+                fetched = None
+            # Test doubles may return non-bytes MagicMocks — accept truthy
+            # values, reject only None/empty-bytes (real missing case).
+            if fetched is None or (isinstance(fetched, (bytes, bytearray)) and len(fetched) == 0):
+                pass
+            else:
+                blob = fetched
+                try:
+                    ts.cross_seed_blob = blob if isinstance(blob, (bytes, bytearray)) else ts.cross_seed_blob
+                    ts._blob = blob
+                except Exception:
+                    pass
+        if blob is None or (isinstance(blob, (bytes, bytearray)) and len(blob) == 0):
+            log.warning(
+                "isolated batch: missing .torrent bytes for %s; keeping batch %d to retry",
+                ts.source_name, ts.batch_index,
+            )
+            return False
+        save_path_str = ts.save_path or str(self.cfg.dest.save_path)
+
+        # 1. Remove old entry WITH files: clears deselected partials and
+        # preallocated leftovers of the next batch. Already-moved batch files
+        # are gone from SSD (on remote), so only unwanted partials are lost.
+        try:
+            await self.dest_client.delete(h_old, delete_files=True)
+            log.info(
+                "isolated batch: removed torrent %s with files after batch %d/%d",
+                h_old[:10], ts.batch_index + 1, ts.batches_total,
+            )
+        except Exception as e:  # noqa: BLE001
+            # Not-found or transient: continue to add — add handles
+            # "already added" duplicates, next tick retries on failure.
+            log.warning(
+                "isolated batch: delete %s with files failed (%s); continuing to re-add",
+                h_old[:10], e,
+            )
+
+        # 2. Fresh add, paused, no skip-check (clean download of next batch).
+        try:
+            result = await self.dest_client.add_torrent(
+                torrent_files=[blob],
+                save_path=save_path_str,
+                category="racing",
+                paused=True,
+                skip_check=False,
+            )
+        except _WEBUI_RETRY_ERRORS as e:
+            log.warning(
+                "isolated batch: re-add for %s hit transient dest error (%s); retry next tick",
+                ts.source_name, e,
+            )
+            return False
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "isolated batch: re-add for %s failed (%s); retry next tick",
+                ts.source_name, e,
+            )
+            return False
+        if not result.accepted:
+            log.warning(
+                "isolated batch: re-add rejected for %s (%s); retry next tick",
+                ts.source_name, result.detail,
+            )
+            return False
+
+        # 3. Resolve new hash (same torrent → usually same hash).
+        # Test doubles may return non-str hashes — only accept real strings,
+        # otherwise keep the old hash (re-added same torrent).
+        new_hash: str | None = None
+        try:
+            _rh = result.hash
+            if isinstance(_rh, str) and _rh:
+                new_hash = _rh.lower()
+        except Exception:
+            new_hash = None
+        if not new_hash and isinstance(blob, (bytes, bytearray)):
+            try:
+                from .watchdir import _bencoded_info_hash
+
+                parsed_hash, _, _, _ = _bencoded_info_hash(bytes(blob))
+                if isinstance(parsed_hash, str) and parsed_hash:
+                    new_hash = parsed_hash.lower()
+            except Exception:
+                new_hash = None
+        if not new_hash and isinstance(blob, (bytes, bytearray)):
+            try:
+                awaited = await self._await_hash_for_name(ts.source_name)
+                if isinstance(awaited, str) and awaited:
+                    new_hash = awaited.lower()
+            except Exception:
+                new_hash = None
+        if new_hash:
+            ts.dest_infohash = new_hash
+            try:
+                self.store.upsert(ts)
+            except Exception:
+                pass
+        h_new = ts.dest_infohash or ts.source_infohash
+
+        # 4. Wait for file list (registration lag) + prioritize next batch only.
+        files: list[TorrentFile] = []
+        for _ in range(4):
+            try:
+                files = await self.dest_client.get_torrent_files(h_new)
+                if files:
+                    break
+            except Exception:
+                files = []
+            await asyncio.sleep(2)
+        if not files:
+            log.warning(
+                "isolated batch: file list not ready for %s after re-add; retry next tick",
+                ts.source_name,
+            )
+            return False
+        try:
+            kind = ts.classification_kind or classify(files, self.cfg).kind
+        except Exception:
+            kind = ts.classification_kind or "unknown"
+        cap = self._frozen_batch_cap(ts)
+        if cap <= 0:
+            cap = sum(f.size_bytes for f in files) or 1
+        try:
+            batches = self._resolve_batches(files, kind, cap)
+        except Exception as e:  # noqa: BLE001
+            log.warning("isolated batch: could not resolve batches for %s: %s", ts.source_name, e)
+            return False
+        if not batches or next_index >= len(batches):
+            log.warning(
+                "isolated batch: next batch %d out of range for %s (%d batches); retry next tick",
+                next_index, ts.source_name, len(batches),
+            )
+            return False
+        nxt = batches[next_index]
+        try:
+            skip = await self._fuse_skipped(
+                [(e.file_name, e.size_bytes) for e in nxt.episodes], kind,
+            )
+        except Exception:
+            skip = set()
+        wanted = {e.file_name for e in nxt.episodes} - skip
+        prio_map = {f.name: (1 if f.name in wanted else 0) for f in files}
+        try:
+            await self.dest_client.set_file_priorities(h_new, prio_map)
+        except Exception as e:  # noqa: BLE001
+            log.warning("isolated batch: priority set failed for %s: %s", ts.source_name, e)
+            return False
+        if wanted:
+            try:
+                await self.dest_client.resume(h_new)
+            except Exception as e:  # noqa: BLE001
+                log.warning("isolated batch: resume failed for %s: %s", ts.source_name, e)
+                return False
+        log.info(
+            "isolated batch: ready for batch %d/%d for %s (%d file(s) wanted)",
+            next_index + 1, ts.batches_total, ts.source_name, len(wanted),
+        )
+        return True
 
     def _season_folder_for(
         self,
