@@ -184,8 +184,9 @@ async def test_do_downloading_iterates_batches():
 
     # _wait_for_completion called 3 times (once per batch)
     assert coord._wait_for_completion.await_count == 3
-    # _prepare_next_batch called 2 times (for batch 1 and 2)
-    assert coord._prepare_next_batch.await_count == 2
+    # Dummy path (no dest_client): no isolated reset, no priority flips —
+    # batch_index still advances to MOVING.
+    assert coord._prepare_next_batch.await_count == 0
     assert ts.batch_index == 3
     assert ts.state == State.MOVING
     assert coord.transition.called
@@ -207,6 +208,9 @@ async def test_batch_interleaved_download_move_and_clean(tmp_path):
     coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
     coord._wait_for_completion = AsyncMock()
     coord._prepare_next_batch = AsyncMock()
+    # Isolated batches: fresh delete+re-add between batches (mocked here;
+    # covered end-to-end in test_isolated_reset_*).
+    coord._reset_torrent_for_next_batch = AsyncMock(return_value=True)
 
     async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
         # Simulate a real rclone move: listed files leave local disk.
@@ -253,9 +257,10 @@ async def test_batch_interleaved_download_move_and_clean(tmp_path):
 
     # Both batches moved via rclone
     assert coord._rclone_move.await_count == 2
-    # Client paused before move and resumed for next batch
+    # Client paused before each move; isolated reset (not in-place priority
+    # flip) prepares the next batch — resume happens inside the reset.
     assert coord.dest_client.pause.await_count == 2
-    assert coord.dest_client.resume.await_count == 1
+    assert coord._reset_torrent_for_next_batch.await_count == 1
     # Batch files left local disk via the (simulated) rclone move
     assert not ep1_path.exists()
     assert not ep2_path.exists()
@@ -1354,3 +1359,93 @@ async def test_move_and_clean_batch_all_skipped_skips_rclone(tmp_path):
     await coord._move_and_clean_batch(ts, batch, skip={"Pack/a.mkv"})
 
     coord._rclone_move.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_isolated_reset_deletes_with_files_and_reads_next_batch(tmp_path):
+    """Fresh delete+re-add isolates batches so only complete files move."""
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import AddResult, TorrentFile
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.store = MagicMock()
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.rclone.fuse.mount = tmp_path / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "unsorted"
+    coord.dest_client = AsyncMock()
+    coord.dest_client.delete = AsyncMock()
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash="b" * 40, accepted=True, detail="Ok.")
+    )
+    files = [
+        TorrentFile(name="Show.S01E01.mkv", size_bytes=8, progress=0.0),
+        TorrentFile(name="Show.S01E02.mkv", size_bytes=8, progress=0.0),
+    ]
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=files)
+    coord.dest_client.set_file_priorities = AsyncMock()
+    coord.dest_client.resume = AsyncMock()
+    coord._fuse_skipped = AsyncMock(return_value=set())
+    coord._frozen_batch_cap = MagicMock(return_value=8)
+    coord._await_hash_for_name = AsyncMock(return_value=None)
+
+    ts = TorrentState(
+        source_infohash="a" * 40,
+        source_name="Show",
+        dest_infohash="a" * 40,
+        save_path=str(ssd),
+        classification_kind="season",
+        batches_total=2,
+        batch_index=0,
+        state=State.DOWNLOADING,
+    )
+    ts._blob = b"fake-torrent-bytes"
+    ts.cross_seed_blob = b"fake-torrent-bytes"
+
+    ok = await coord._reset_torrent_for_next_batch(ts, 1)
+
+    assert ok is True
+    # Old entry removed WITH files to clear shared-piece partials.
+    coord.dest_client.delete.assert_awaited_once()
+    assert coord.dest_client.delete.call_args.kwargs.get("delete_files") is True
+    # Fresh paused re-add, then only next batch selected.
+    coord.dest_client.add_torrent.assert_awaited_once()
+    assert coord.dest_client.add_torrent.call_args.kwargs.get("paused") is True
+    prio = coord.dest_client.set_file_priorities.call_args[0][1]
+    assert prio["Show.S01E02.mkv"] == 1
+    assert prio["Show.S01E01.mkv"] == 0
+    coord.dest_client.resume.assert_awaited_once()
+    assert ts.dest_infohash == "b" * 40
+
+
+@pytest.mark.anyio
+async def test_isolated_reset_missing_blob_parks_without_delete():
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+
+    coord = object.__new__(Coordinator)
+    coord.store = MagicMock()
+    coord.store.get_blob = MagicMock(return_value=b"")
+    coord.cfg = MagicMock()
+    coord.dest_client = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="c" * 40,
+        source_name="Show",
+        classification_kind="season",
+        batches_total=2,
+        batch_index=0,
+        state=State.DOWNLOADING,
+    )
+    ts._blob = b""
+    ts.cross_seed_blob = b""
+
+    ok = await coord._reset_torrent_for_next_batch(ts, 1)
+
+    assert ok is False
+    coord.dest_client.delete.assert_not_called()
+    coord.dest_client.add_torrent.assert_not_called()
