@@ -59,7 +59,12 @@ class SSDLedgerMixin:
         return 0
 
     def _frozen_batch_cap(self, ts: TorrentState) -> int:
-        """Stable batch cap for one row (see _batch_cap_cache)."""
+        """Stable batch cap for one row (see _batch_cap_cache).
+
+        Priority: in-memory cache, then the persisted ``batch_cap_bytes``
+        column (survives restarts so batch boundaries never shift under a
+        persisted ``batch_index``), then a fresh freeze from the live cap.
+        """
         try:
             cache = getattr(self, "_batch_cap_cache", None)
             if cache is None:
@@ -68,6 +73,14 @@ class SSDLedgerMixin:
             key = (ts.source_infohash or "").lower()
             if key and key in cache and cache[key] > 0:
                 return cache[key]
+            try:
+                persisted = int(getattr(ts, "batch_cap_bytes", 0) or 0)
+            except (TypeError, ValueError):
+                persisted = 0
+            if persisted > 0:
+                if key and cache is not None:
+                    cache[key] = persisted
+                return persisted
         except Exception:
             cache = None
             key = ""
@@ -82,6 +95,10 @@ class SSDLedgerMixin:
                     # order, but caps re-freeze on next use).
                     for k in list(cache)[:2500]:
                         cache.pop(k, None)
+            try:
+                ts.batch_cap_bytes = cap
+            except Exception:
+                pass
         except Exception:
             pass
         return cap

@@ -306,7 +306,7 @@ async def test_coordinator_gate_uses_min_total_and_batch_cap():
 
 
 @pytest.mark.anyio
-async def test_wait_for_completion_resolves_when_expected_files_complete():
+async def test_wait_for_completion_resolves_when_expected_files_complete(tmp_path):
     from unittest.mock import AsyncMock, MagicMock
     from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState
@@ -318,6 +318,7 @@ async def test_wait_for_completion_resolves_when_expected_files_complete():
     coord.cfg = MagicMock()
     coord.cfg.general.dest_poll_interval = 0.01
     coord.cfg.general.download_stall_timeout_seconds = 0
+    coord.cfg.dest.save_path = tmp_path
 
     t_item = Torrent(
         hash="hash1",
@@ -331,14 +332,56 @@ async def test_wait_for_completion_resolves_when_expected_files_complete():
     coord.dest_client = MagicMock()
     coord.dest_client.get_torrent = AsyncMock(return_value=t_item)
 
-    # Batch only includes S01E01, which is at 100%
+    # Batch only includes S01E01, which is at 100% AND present on SSD at
+    # full size (completion requires both client progress and disk bytes).
+    (tmp_path / "S01E01.mkv").write_bytes(b"x" * 1000)
     f1 = TorrentFile(name="S01E01.mkv", size_bytes=1000, progress=1.0)
     f2 = TorrentFile(name="S01E02.mkv", size_bytes=1000, progress=0.0)
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[f1, f2])
 
-    ts = TorrentState(source_infohash="hash1", source_name="Show.S01")
+    ts = TorrentState(source_infohash="hash1", source_name="Show.S01",
+                      save_path=str(tmp_path))
     # Waiting for only S01E01 should return immediately because S01E01 is complete
     await coord._wait_for_completion(ts, expected_files=["S01E01.mkv"])
+
+
+@pytest.mark.anyio
+async def test_wait_for_completion_waits_when_bytes_missing_on_disk(tmp_path):
+    """Client-complete but short on SSD keeps polling (desynced piece map)."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState
+    from racing_sync.clients.abstract import TorrentFile, Torrent
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord._live = {}
+    coord.cfg = MagicMock()
+    coord.cfg.general.dest_poll_interval = 0.01
+    coord.cfg.general.download_stall_timeout_seconds = 0
+    coord.cfg.dest.save_path = tmp_path
+
+    calls = {"n": 0}
+
+    async def _stop_after_second(_h):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            coord._stop = True
+        return Torrent(hash="hash1", name="Show.S01", size_bytes=2000,
+                       progress=1.0, state="downloading", category="racing",
+                       save_path="/tmp")
+
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(side_effect=_stop_after_second)
+    f1 = TorrentFile(name="S01E01.mkv", size_bytes=1000, progress=1.0)
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[f1])
+
+    ts = TorrentState(source_infohash="hash1", source_name="Show.S01",
+                      save_path=str(tmp_path))
+    # No S01E01.mkv on disk: must NOT return as complete on the first poll
+    # (progress-only logic would); it keeps polling until stopped.
+    await coord._wait_for_completion(ts, expected_files=["S01E01.mkv"])
+    assert calls["n"] == 2
 
 
 @pytest.mark.anyio
@@ -1407,7 +1450,7 @@ async def test_isolated_reset_deletes_with_files_and_reads_next_batch(tmp_path):
 
     ok = await coord._reset_torrent_for_next_batch(ts, 1)
 
-    assert ok is True
+    assert ok == 1
     # Old entry removed WITH files to clear shared-piece partials.
     coord.dest_client.delete.assert_awaited_once()
     assert coord.dest_client.delete.call_args.kwargs.get("delete_files") is True
