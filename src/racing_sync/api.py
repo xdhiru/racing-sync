@@ -219,6 +219,11 @@ def build_app(coord: Coordinator) -> FastAPI:
                 )
             except LookupError as e:
                 raise HTTPException(404, str(e)) from e
+            # Free the SSD budget immediately (forget bypasses transition hooks).
+            try:
+                await coord._ssd_release(result.get("source_infohash") or normalized)
+            except Exception:
+                pass
         return ForgetResult(
             source_infohash=result["source_infohash"],
             source_name=result["source_name"],
