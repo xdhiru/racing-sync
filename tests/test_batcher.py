@@ -278,32 +278,31 @@ async def test_coordinator_gate_uses_min_total_and_batch_cap():
     coord._stop = False
     coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
     coord.cfg = MagicMock()
-
-    # Total season is 100 GB, batch cap is 20 GB
-    total_season_bytes = 100 * 1024 * 1024 * 1024
+    # Global ledger budget uses the STABLE configured cap (not free-shrunk live cap).
     batch_cap = 20 * 1024 * 1024 * 1024
+    coord.cfg.ssd.max_inflight_bytes = batch_cap
 
-    with patch("racing_sync.coordinator.ssd_max_inflight_bytes", return_value=batch_cap):
-        effective = coord._effective_inflight_cap(total_season_bytes)
-        assert effective == batch_cap
+    # Total season is 100 GB, configured cap is 20 GB → estimate is one batch.
+    total_season_bytes = 100 * 1024 * 1024 * 1024
+    assert coord._ssd_estimate_for_new(total_season_bytes) == batch_cap
 
-        # ssd_has_room is called with the batch cap (20GB), NOT the full 100GB
-        ts = TorrentState(
-            source_infohash="seasonhash",
-            source_name="Big.Show.S01",
-            total_bytes=total_season_bytes,
-            state=State.WAITING_DISK,
-        )
+    # ssd_has_room is called with the estimate (20GB), NOT the full 100GB
+    ts = TorrentState(
+        source_infohash="seasonhash",
+        source_name="Big.Show.S01",
+        total_bytes=total_season_bytes,
+        state=State.WAITING_DISK,
+    )
 
-        with patch("racing_sync.coordinator.ssd_has_room") as mock_has_room:
-            # Mock room only for 25 GB (enough for 20 GB batch cap, but NOT 100 GB)
-            mock_has_room.side_effect = lambda cfg, needed: needed <= 25 * 1024 * 1024 * 1024
+    with patch("racing_sync.coordinator.ssd_has_room") as mock_has_room:
+        # Mock room only for 25 GB (enough for 20 GB estimate, but NOT 100 GB)
+        mock_has_room.side_effect = lambda cfg, needed: needed <= 25 * 1024 * 1024 * 1024
 
-            await coord._wait_disk_then_queue(ts)
+        await coord._wait_disk_then_queue(ts)
 
-            # Should have transitioned to QUEUED because 20 GB <= 25 GB
-            assert ts.state == State.QUEUED
-            mock_has_room.assert_called_once_with(coord.cfg, batch_cap)
+        # Should have transitioned to QUEUED because 20 GB <= 25 GB
+        assert ts.state == State.QUEUED
+        mock_has_room.assert_called_once_with(coord.cfg, batch_cap)
 
 
 @pytest.mark.anyio
