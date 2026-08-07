@@ -18,6 +18,7 @@ calls, rclone invocations, and prowlarr lookups. The flow per torrent:
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as dt
 import logging
 import shutil
@@ -661,14 +662,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         # 3. Wake up WAITING_INDEXER rows whose retry timer has elapsed.
         ready_indexer = self.store.list_indexer_ready()
         for ts in ready_indexer:
-            if ts.source_infohash in self._running_infohashes:
+            _key = (ts.source_infohash or "").lower()
+            if _key in self._running_infohashes:
                 continue
+            # Re-read: a worker may have moved this row (e.g. QUEUED via the
+            # SSD path) after the snapshot above — never demote it back.
+            try:
+                fresh = self.store.get(ts.source_infohash)
+            except Exception:
+                fresh = None
+            if fresh is None or fresh.state != State.WAITING_INDEXER:
+                continue
+            ts = fresh
             log.info(
                 "indexer retry timer fired for %s (attempt #%d)",
                 ts.source_name[:40], ts.indexer_attempts,
             )
             self.transition(ts, State.QUERYING)
-            h = ts.source_infohash
+            h = (ts.source_infohash or "").lower()
             self._running_infohashes.add(h)
             task = asyncio.create_task(self._process_torrent(ts))
             self._tasks.add(task)
@@ -677,8 +688,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 self._running_infohashes.discard(infohash)
             task.add_done_callback(_done_cb_indexer)
 
-        # 4. Schedule workers for active states that have no live task
-        active = self.store.all_active()
+        # 4. Schedule workers for active states that have no live task.
+        # WAITING_DISK rows sort last so real QUEUED/DOWNLOADING/MOVING work
+        # is never starved of worker slots by parked rows.
+        active = sorted(
+            self.store.all_active(),
+            key=lambda t: t.state == State.WAITING_DISK,
+        )
         scheduled = 0
         scheduled_waiting_disk = 0
         max_concurrent_workers = max(
@@ -689,19 +705,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
         active_downloads = sum(
             1 for t in active
-            if t.source_infohash in self._running_infohashes
+            if (t.source_infohash or "").lower() in self._running_infohashes
             and t.state in (State.QUEUED, State.DOWNLOADING)
         )
         active_moves = sum(
             1 for t in active
-            if t.source_infohash in self._running_infohashes
+            if (t.source_infohash or "").lower() in self._running_infohashes
             and t.state == State.MOVING
         )
 
         for ts in active:
             if available_slots <= 0:
                 break
-            if ts.source_infohash in self._running_infohashes:
+            _tkey = (ts.source_infohash or "").lower()
+            if _tkey in self._running_infohashes:
                 continue
 
             # Skip WAITING_INDEXER rows: they are parked and woken up exclusively
@@ -715,7 +732,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if ts.state == State.WAITING_DISK:
                 try:
                     _wd = getattr(self, "_waiting_disk_next_check", None)
-                    nxt = _wd.get(ts.source_infohash) if isinstance(_wd, dict) else None
+                    nxt = _wd.get(_tkey) if isinstance(_wd, dict) else None
                 except Exception:
                     nxt = None
                 if nxt is not None and time.monotonic() < nxt:
@@ -735,7 +752,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if ts.state == State.MOVING and active_moves >= self.cfg.max_concurrent_moves:
                 continue
 
-            h = ts.source_infohash
+            h = (ts.source_infohash or "").lower()
             self._running_infohashes.add(h)
             task = asyncio.create_task(self._process_torrent(ts))
             self._tasks.add(task)
@@ -796,12 +813,21 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     def live_progress_map(self) -> dict[str, float]:
         """Snapshot of in-flight download progress keyed by infohash.
 
-        Used by the Telegram bot for the active-tasks message.
+        Used by the Telegram bot for the active-tasks message. Entries are
+        keyed by dest hash for client polling, so alias each to its source
+        hash too — cross-seed rows (dest != source) would otherwise always
+        report no progress.
         """
-        return {
-            h.lower(): item.progress
-            for h, item in self._live.items()
-        }
+        out: dict[str, float] = {}
+        for h, item in self._live.items():
+            try:
+                out[h.lower()] = item.progress
+                _src = (getattr(item, "source_infohash", "") or "").lower()
+                if _src and _src not in out:
+                    out[_src] = item.progress
+            except Exception:
+                continue
+        return out
 
     # ---- VPS1 cleanup janitor ([cleanup]) ----
 
@@ -811,6 +837,22 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
     async def _process_torrent(self, ts: TorrentState) -> None:
         try:
+            # Fresh-state guard: API retry / forget / recovery may have moved
+            # this row after the tick snapshot. Never let a stale worker
+            # object overwrite the new state via a later upsert.
+            try:
+                _fresh = None
+                if getattr(self, "store", None) is not None and hasattr(self.store, "get"):
+                    _fresh = self.store.get(ts.source_infohash)
+            except Exception:
+                _fresh = None
+            if isinstance(_fresh, TorrentState):
+                if _fresh.state != ts.state:
+                    log.info(
+                        "worker: %s moved %s -> %s by another actor; skipping stale worker",
+                        ts.source_infohash[:10], ts.state.value, _fresh.state.value,
+                    )
+                    return
             await self._process_torrent_inner(ts)
         except Exception as e:  # noqa: BLE001
             log.exception("worker failed for %s", ts.source_infohash[:10])
@@ -834,13 +876,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             self.store.append_log("ERROR", str(e), ts.source_infohash)
             await self._notify_telegram(ts)
 
-    async def _notify_telegram(self, ts: TorrentState) -> None:
+    async def _notify_telegram(self, ts: TorrentState, progress: float | None = None) -> None:
         """Push a state-update to the per-torrent Telegram message."""
         tg = getattr(self, "_tg", None)
         if tg is None:
             return
         try:
-            progress = self.live_progress_map().get(ts.source_infohash.lower())
+            if progress is None:
+                progress = self.live_progress_map().get((ts.source_infohash or "").lower())
             await tg.ensure_detail_message(ts, progress=progress)
         except Exception as e:  # noqa: BLE001
             log.warning("telegram notify failed for %s: %s",
@@ -865,7 +908,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             try:
                 _wd = getattr(self, "_waiting_disk_next_check", None)
                 if isinstance(_wd, dict):
-                    _wd.pop(ts.source_infohash, None)
+                    _wd.pop((ts.source_infohash or "").lower(), None)
+            except Exception:
+                pass
+        else:
+            # Fresh parks start their quiet-wait window immediately so the
+            # next tick doesn't thundering-herd every parked row at once.
+            try:
+                _wd = getattr(self, "_waiting_disk_next_check", None)
+                if _wd is None:
+                    _wd = {}
+                    self._waiting_disk_next_check = _wd  # type: ignore[attr-defined]
+                if isinstance(_wd, dict):
+                    _interval = getattr(self, "WAITING_DISK_RECHECK_SECONDS", 60.0)
+                    try:
+                        _interval = float(_interval)
+                    except (TypeError, ValueError):
+                        _interval = 60.0
+                    _wd[(ts.source_infohash or "").lower()] = time.monotonic() + _interval
             except Exception:
                 pass
         # SSD ledger: reservation held only while the row can occupy SSD
@@ -894,8 +954,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if tg is None or self._stop:
             return
         try:
+            # Snapshot state + progress now: the queued task may run after
+            # later transitions mutated this object (chain NEW→…→DONE in one
+            # worker), which would duplicate final-state edits and drop
+            # intermediates.
+            snap = copy.copy(ts)
+            progress = self.live_progress_map().get((ts.source_infohash or "").lower())
             loop = asyncio.get_running_loop()
-            task = loop.create_task(self._notify_telegram(ts))
+            task = loop.create_task(self._notify_telegram(snap, progress))
             # Track fire-and-forget notifies so shutdown can await them
             # instead of leaking "Task was destroyed" warnings.
             pending = getattr(self, "_tg_tasks", None)
@@ -1011,7 +1077,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             )
             self.transition(ts, State.WAITING_DISK)
         else:
-            self.transition(ts, State.QUEUED)
+            try:
+                self.transition(ts, State.QUEUED)
+            except Exception:
+                # Reservation without a QUEUED row would leak budget (the
+                # prune only drops non-SSD states on later admissions).
+                await self._ssd_release(ts.source_infohash)
+                raise
 
     async def _do_new_watch_dir(self, ts: TorrentState) -> None:
         """Process a manual torrent drop from the watch directory."""
@@ -1176,7 +1248,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             )
             self.transition(ts, State.WAITING_DISK)
         else:
-            self.transition(ts, State.QUEUED)
+            try:
+                self.transition(ts, State.QUEUED)
+            except Exception:
+                await self._ssd_release(ts.source_infohash)
+                raise
 
     def _park_for_indexer_retry(self, ts: TorrentState, *, reason: str = "indexer miss") -> None:
         """Park into WAITING_INDEXER with an escalating retry timer.
@@ -1277,7 +1353,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if not await self._ssd_try_reserve(ts.source_infohash, needed):
             self.transition(ts, State.WAITING_DISK)
         else:
-            self.transition(ts, State.QUEUED)
+            try:
+                self.transition(ts, State.QUEUED)
+            except Exception:
+                await self._ssd_release(ts.source_infohash)
+                raise
 
     # How long a still-full WAITING_DISK row stays quiet before its next
     # SSD re-check. Batches drain via MOVING in the meantime.
@@ -1294,9 +1374,41 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             try:
                 _wd = getattr(self, "_waiting_disk_next_check", None)
                 if isinstance(_wd, dict):
-                    _wd.pop(ts.source_infohash, None)
+                    _wd.pop((ts.source_infohash or "").lower(), None)
             except Exception:
                 pass
+            # A WAITING_DISK promotion inside a worker bypasses the tick's
+            # max_active_downloads gate (checked at schedule time) — re-check
+            # here so parked bursts can't overshoot concurrent downloads.
+            # The SSD reservation is already held; release it if we stay parked.
+            try:
+                _max_dl = int(getattr(self.cfg, "max_active_downloads", 0) or 0)
+            except (TypeError, ValueError):
+                _max_dl = 0
+            if _max_dl > 0:
+                try:
+                    _active_dl = len(self.store.list_by_state(State.QUEUED, State.DOWNLOADING))
+                except Exception:
+                    _active_dl = 0
+                if _active_dl >= _max_dl:
+                    # Downloads full: release the just-made reservation and
+                    # stay parked (never FAILED — space, not an error).
+                    await self._ssd_release(ts.source_infohash)
+                    try:
+                        _wd2 = getattr(self, "_waiting_disk_next_check", None)
+                        if _wd2 is None:
+                            _wd2 = {}
+                            self._waiting_disk_next_check = _wd2  # type: ignore[attr-defined]
+                        _wd2[(ts.source_infohash or "").lower()] = (
+                            time.monotonic() + self.WAITING_DISK_RECHECK_SECONDS
+                        )
+                    except Exception:
+                        pass
+                    log.debug(
+                        "downloads full (%d/%d); %s stays waiting_disk",
+                        _active_dl, _max_dl, ts.source_name[:60],
+                    )
+                    return
             self.transition(ts, State.QUEUED)
             return
         # Still full: stay parked quietly until the next interval instead of
@@ -1306,7 +1418,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if _wd is None:
                 _wd = {}
                 self._waiting_disk_next_check = _wd  # type: ignore[attr-defined]
-            _wd[ts.source_infohash] = (
+            _wd[(ts.source_infohash or "").lower()] = (
                 time.monotonic() + self.WAITING_DISK_RECHECK_SECONDS
             )
         except Exception:
