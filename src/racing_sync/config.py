@@ -68,6 +68,9 @@ class HTTPClientConfig(BaseModel):
     nginx_user_field: str = "username"
     nginx_pass_field: str = "password"
     nginx_extra_fields: dict[str, str] = {}
+    # False (default) forces IPv4 for the WebUI session — intentional, see
+    # [source].use_ipv6. Plumb-through only; set it on [source]/[dest].
+    use_ipv6: bool = False
 
     def has_nginx(self) -> bool:
         return self.nginx_mode in ("basic", "form_post")
@@ -83,6 +86,7 @@ class HTTPClientConfig(BaseModel):
             nginx_user_field=src.nginx.user_field,
             nginx_pass_field=src.nginx.pass_field,
             nginx_extra_fields=dict(src.nginx.extra_fields),
+            use_ipv6=bool(getattr(src, "use_ipv6", False)),
         )
 
     @classmethod
@@ -96,6 +100,7 @@ class HTTPClientConfig(BaseModel):
             nginx_user_field=dst.nginx.user_field,
             nginx_pass_field=dst.nginx.pass_field,
             nginx_extra_fields=dict(dst.nginx.extra_fields),
+            use_ipv6=bool(getattr(dst, "use_ipv6", False)),
         )
 
 
@@ -190,6 +195,11 @@ class SourceConfig(BaseModel):
     # nginx is not used.
     nginx: NginxAuthConfig = NginxAuthConfig()
     deluge_sftp: DelugeSFTPConfig | None = None
+    # Network family for the WebUI session. False (default) forces IPv4:
+    # intentional — tracker allowlists, split-horizon DNS and jail/VPN
+    # egress on seedboxes are overwhelmingly v4, and dual-stack happy-eyeballs
+    # to link-local/ULA addresses has wedged handshakes. Set true for v6.
+    use_ipv6: bool = False
 
     @model_validator(mode="after")
     def _deluge_needs_sftp(self) -> "SourceConfig":
@@ -209,6 +219,9 @@ class DestConfig(BaseModel):
     nginx: NginxAuthConfig = NginxAuthConfig()
     # Maximum concurrent torrents actively downloading on VPS2 SSD (default: 3)
     max_active_downloads: int = Field(default=3, ge=1, le=100)
+    # Network family for the WebUI session. False (default) forces IPv4:
+    # intentional — see [source].use_ipv6.
+    use_ipv6: bool = False
 
 
 class SSDConfig(BaseModel):
@@ -276,6 +289,32 @@ class RcloneConfig(BaseModel):
         """Treat empty string in TOML as None so rclone uses user default config."""
         if isinstance(v, str) and not v.strip():
             return None
+        return v
+
+    @field_validator("extra_move_flags", "batch_move_extra_flags")
+    @classmethod
+    def _reject_config_hijack_flags(cls, v: list[str]) -> list[str]:
+        """Reject rclone flags that hijack config/credentials.
+
+        ``--config`` (any form) swaps the whole rclone config; anything
+        matching ``--password-command`` / ``--ask-password`` executes or
+        prompts. Both are footguns in a tuning list — everything else
+        (transfers, bwlimit, s3-chunk-size, ...) passes through.
+        """
+        bad: list[str] = []
+        for item in v or []:
+            try:
+                low = str(item).strip().lower()
+            except Exception:
+                continue
+            flag = low.split("=", 1)[0]
+            if flag in ("--config", "--password-command", "--ask-password"):
+                bad.append(str(item))
+        if bad:
+            raise ValueError(
+                "rclone move flags must not include config/credential hijack "
+                f"flags (--config, --password-command, --ask-password), got: {bad!r}"
+            )
         return v
 
 
@@ -661,6 +700,7 @@ class CleanupConfig(BaseModel):
     min_ratio: float = Field(default=0.0, ge=0)
     min_seed_hours: float = Field(default=0.0, ge=0)
     # Case-insensitive substrings; matching release names are never deleted.
+    # Blank entries are rejected ("" would match every release).
     protected_patterns: list[str] = Field(default_factory=list)
     # Remove data files as well as client entries (required to free disk).
     # False = remove entries only (frees no space; useful for testing).
@@ -678,6 +718,12 @@ class CleanupConfig(BaseModel):
             raise ValueError(
                 "cleanup: high_watermark_free_bytes must be > low_watermark_free_bytes"
             )
+        for pat in self.protected_patterns or []:
+            if not str(pat).strip():
+                raise ValueError(
+                    "cleanup: protected_patterns must not contain blank entries "
+                    "(an empty pattern matches every release)"
+                )
         if self.critical_watermark_free_bytes > self.low_watermark_free_bytes:
             raise ValueError(
                 "cleanup: critical_watermark_free_bytes must be <= low_watermark_free_bytes"
@@ -762,6 +808,7 @@ class AppConfig(BaseModel):
 
         with open(path, "rb") as f:
             data = tomllib.load(f)
+        _warn_unknown_keys(cls, data)
         return cls.model_validate(data)
 
     @property
@@ -796,3 +843,62 @@ class AppConfig(BaseModel):
 
     def is_episode(self, name: str) -> bool:
         return bool(self.classifier._episode_re.search(name))
+
+
+def _warn_unknown_keys(model: type[BaseModel], data: object, prefix: str = "") -> None:
+    """Log likely-typo config keys that pydantic would silently ignore.
+
+    Most models use the default ``extra="ignore"`` (strict ``forbid`` would
+    refuse to start on any typo'd historical key after an upgrade), so surf
+    ``[general].max_active_download``-style mistakes as warnings instead.
+    Models with ``extra="allow"`` (tracker maps) are skipped.
+    """
+    import logging as _logging
+
+    try:
+        if not isinstance(data, dict):
+            return
+        fields = getattr(model, "model_fields", {}) or {}
+        try:
+            extra = (getattr(model, "model_config", None) or {}).get("extra")
+        except Exception:
+            extra = None
+        if extra == "allow":
+            return
+        for key, val in data.items():
+            if key not in fields:
+                _logging.getLogger(__name__).warning(
+                    "config: unknown key %r%s — ignored (possible typo)",
+                    key, f" in [{prefix}]" if prefix else "",
+                )
+                continue
+            try:
+                sub = fields[key].annotation
+            except Exception:
+                continue
+            _descend_unknown(sub, val, f"{prefix}.{key}" if prefix else str(key))
+    except Exception:
+        pass
+
+
+def _descend_unknown(annotation: object, val: object, prefix: str) -> None:
+    """Recurse _warn_unknown_keys into nested BaseModel fields (best-effort)."""
+    try:
+        import types as _types
+        import typing as _typing
+
+        if not isinstance(val, dict):
+            return
+        origin = _typing.get_origin(annotation)
+        args = [a for a in (_typing.get_args(annotation) or ()) if isinstance(a, type)]
+        if origin in (_typing.Union, getattr(_types, "UnionType", _typing.Union)):
+            for a in args:
+                if isinstance(a, type) and issubclass(a, BaseModel):
+                    _warn_unknown_keys(a, val, prefix)
+                    return
+            return
+        ann = annotation
+        if isinstance(ann, type) and issubclass(ann, BaseModel):
+            _warn_unknown_keys(ann, val, prefix)
+    except Exception:
+        pass

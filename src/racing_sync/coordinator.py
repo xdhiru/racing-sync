@@ -68,6 +68,7 @@ from .rclone_ops import (
 from .recovery import find_content_on_ssd, reconcile
 from .sftp_source import SFTPExporter
 from .state import State, StateStore, TorrentState
+from .state import _MAX_READD_CYCLES
 from .watchdir import WatchDirScanner, WatchItem
 
 log = logging.getLogger(__name__)
@@ -3107,6 +3108,22 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     async def _do_re_add(self, ts: TorrentState) -> None:
         store = getattr(self, "store", None)
         now = dt.datetime.now(dt.timezone.utc)
+        try:
+            _cycles = int(getattr(ts, "readd_cycles", 0) or 0)
+        except (TypeError, ValueError):
+            _cycles = 0
+        if _cycles >= _MAX_READD_CYCLES:
+            # Rapid DONE -> re-add flapping (lost fuse entry re-added, lost
+            # again, ...) would otherwise reset its timer forever and never
+            # trip max-age. Page the operator instead of looping silently.
+            err = (
+                f"re-add flap limit reached ({_cycles} rapid DONE demotions); "
+                "fuse entries keep going missing — inspect the dest client"
+            )
+            log.error("giving up on %s: %s", ts.source_name, err)
+            ts.readd_next_retry_at = None
+            self.transition(ts, State.FAILED, error=err)
+            return
         if ts.readd_first_attempted_at is None:
             ts.readd_first_attempted_at = now
             if store is not None:
@@ -3475,7 +3492,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         self, ts: TorrentState, group: list[Torrent]
     ) -> None:
         """Check if new cross-seeds arrived on VPS1 for a completed release and inject them to FUSE."""
-        # Ordering guard FIRST (before the no-new-torrents early return): a
+        if not hasattr(self, "_failed_late_cross_seeds"):
+            self._failed_late_cross_seeds = {}
+        _row_key = (ts.source_infohash or "").lower()
+        try:
+            _ok_at = getattr(self, "_late_seed_ok_at", None)
+            if isinstance(_ok_at, dict) and _row_key:
+                _next_ok = _ok_at.get(_row_key)
+                if _next_ok is not None and time.monotonic() < float(_next_ok):
+                    return
+        except Exception:
+            pass
+        self._late_seed_sweep()
+        _injected_before = ts.injected_private_hashes
+        _save_before = ts.save_path
         # DONE row whose save_path is not on fuse *may* never have completed
         # its rclone move — but it may also be a healthy row whose save_path
         # was never updated after the move (pre-fix rows). Distinguish by
@@ -3512,6 +3542,32 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             ) if h
         }
 
+        def _late_pending() -> bool:
+            """Any unexpired deferral for this row's hashes or group members."""
+            try:
+                fm = getattr(self, "_failed_late_cross_seeds", None)
+                if not isinstance(fm, dict) or not fm:
+                    return False
+                rel: set[str] = set(known_hashes)
+                try:
+                    for t in group or []:
+                        _gh = (getattr(t, "infohash", "") or "").lower()
+                        if _gh:
+                            rel.add(_gh)
+                except Exception:
+                    pass
+                _now = dt.datetime.now(dt.timezone.utc)
+                for k, v in fm.items():
+                    if k in rel:
+                        try:
+                            if (_now - v).total_seconds() < 1800:
+                                return True
+                        except Exception:
+                            return True
+            except Exception:
+                pass
+            return False
+
         if not hasattr(self, "_failed_late_cross_seeds"):
             self._failed_late_cross_seeds = {}
         now_utc = dt.datetime.now(dt.timezone.utc)
@@ -3526,6 +3582,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
         new_torrents = [t for t in group if t.infohash.lower() not in known_hashes]
         if not new_torrents:
+            # Fully healthy and nothing new: back off success for 30m instead
+            # of export+stat per DONE row per tick. New VPS1 arrivals wait
+            # at most one window (late seeds are bonus, not pipeline).
+            # Never memoize while deferrals are pending — that would freeze
+            # retries for the full window.
+            if not _late_pending():
+                self._late_seed_memoize(_row_key, _injected_before, _save_before, ts, changed=False)
             return
 
         ts_fallback_mount = self._target_mount_for(ts)
@@ -3636,6 +3699,72 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if changed:
             ts.injected_private_hashes = ",".join(dict.fromkeys(current_injected))
             self.store.upsert(ts)
+        elif not _late_pending():
+            self._late_seed_memoize(_row_key, _injected_before, _save_before, ts, changed=False)
+
+    def _late_seed_defer(self, h_low: str) -> None:
+        """Record a late-seed deferral for the 30m backoff map (best-effort)."""
+        try:
+            d = getattr(self, "_failed_late_cross_seeds", None)
+            if isinstance(d, dict) and h_low:
+                d[h_low] = dt.datetime.now(dt.timezone.utc)
+        except Exception:
+            pass
+
+    def _late_seed_sweep(self) -> None:
+        """Bound the late-seed failure/success maps (30m TTL, 5000 cap).
+
+        Called at the top of every late-seed check; cheap fast path unless a
+        map grew large. Restart-wiped maps simply re-warm (thundering herd
+        bounded by one full scan per DONE row, then memoized).
+        """
+        try:
+            for attr in ("_failed_late_cross_seeds", "_late_seed_ok_at"):
+                d = getattr(self, attr, None)
+                if not isinstance(d, dict) or len(d) <= 2000:
+                    continue
+                if attr == "_late_seed_ok_at":
+                    now_m = time.monotonic()
+                    for k in list(d.keys()):
+                        try:
+                            if now_m >= float(d[k]):
+                                d.pop(k, None)
+                        except Exception:
+                            d.pop(k, None)
+                else:
+                    try:
+                        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=30)
+                    except Exception:
+                        continue
+                    for k in list(d.keys()):
+                        try:
+                            if d[k] < cutoff:
+                                d.pop(k, None)
+                        except Exception:
+                            d.pop(k, None)
+                if len(d) > 5000:
+                    for k in list(d.keys())[: len(d) - 5000]:
+                        d.pop(k, None)
+        except Exception:
+            pass
+
+    def _late_seed_memoize(
+        self, row_key: str, injected_before: str, save_before: str,
+        ts: TorrentState, *, changed: bool,
+    ) -> None:
+        """Record a quiet healthy check so the next tick skips this DONE row."""
+        try:
+            if changed or not row_key:
+                return
+            if ts.injected_private_hashes != injected_before or ts.save_path != save_before:
+                return
+            d = getattr(self, "_late_seed_ok_at", None)
+            if not isinstance(d, dict):
+                d = {}
+                self._late_seed_ok_at = d  # type: ignore[attr-defined]
+            d[row_key] = time.monotonic() + 1800.0
+        except Exception:
+            pass
 
     async def _ensure_source_fuse_entry(
         self, ts: TorrentState, group: list[Torrent], now_utc: dt.datetime
@@ -3858,6 +3987,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         h = (ts.dest_infohash or ts.source_infohash or "").lower()
         if not h:
             return
+        # Same 30m backoff as late cross-seeds: without it every tick pays a
+        # dest export + fuse stat per DONE row even when healthy or stably
+        # unrepairable.
+        try:
+            _failed = getattr(self, "_failed_late_cross_seeds", None)
+            _fa = _failed.get(h) if isinstance(_failed, dict) else None
+            if _fa is not None:
+                try:
+                    if (dt.datetime.now(dt.timezone.utc) - _fa).total_seconds() < 1800:
+                        return
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # Dest-export only (no source RPC): the original entry's own bytes
         # are the authoritative repair payload, and this keeps the late-tick
         # free of extra source calls. Unavailable => skip repair; new seeds
@@ -3870,18 +4013,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 if isinstance(candidate, (bytes, bytearray)) and candidate:
                     blob = bytes(candidate)
         except Exception:  # noqa: BLE001
+            # Transport flap (dest down): silent return, no deferral — the
+            # outage already backs everything else off, and a stable miss
+            # must not be confused with a down client.
             blob = None
         if not blob:
             return
         target = self._target_mount_for_blob(blob, fallback_mount)
         expected = self._expected_fuse_files(blob)
         if not expected:
+            self._late_seed_defer(h)
             return
         try:
             missing = await self._missing_fuse_files(target, expected)
         except Exception:  # noqa: BLE001
+            self._late_seed_defer(h)
             return
         if missing:
+            self._late_seed_defer(h)
             return
         try:
             ok, detail = await self._ensure_fuse_entry(
@@ -3893,8 +4042,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     "late cross-seed: original %s fuse repair rejected: %s",
                     h[:10], detail,
                 )
+                self._late_seed_defer(h)
+            else:
+                try:
+                    _failed6 = getattr(self, "_failed_late_cross_seeds", None)
+                    if isinstance(_failed6, dict):
+                        _failed6.pop(h, None)
+                except Exception:
+                    pass
         except Exception as e:  # noqa: BLE001
             log.warning("late cross-seed: original %s fuse repair failed: %s", h[:10], e)
+            self._late_seed_defer(h)
 
     async def _fetch_racing_torrent_bytes(self, infohash: str) -> bytes | None:
         """Fetch the raw .torrent bytes for a racing-client infohash.
@@ -3976,10 +4134,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
         Blocking fuse stats are offloaded to a thread. A failed check itself
         counts as missing — never inject blind when the mount can't be read.
+        A dead mount short-circuits on one mount stat instead of one failing
+        stat per file per row per tick.
         """
         mount = Path(target_mount)
 
         def _check() -> list[str]:
+            try:
+                mount.stat()
+            except OSError as e:
+                return [f"<mount unavailable: {mount} ({e})>"]
             missing: list[str] = []
             for name, want in files:
                 try:
