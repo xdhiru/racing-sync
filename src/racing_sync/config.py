@@ -509,6 +509,9 @@ class ProwlarrConfig(BaseModel):
     download_indexer_substrings: list[str] = Field(default_factory=list)
     # Substrings in torrent titles to skip querying Prowlarr for (case-insensitive)
     skip_query_substrings: list[str] = Field(default_factory=list)
+    # Network family for the Prowlarr session. False (default) forces IPv4:
+    # intentional — see [source].use_ipv6.
+    use_ipv6: bool = False
 
     def is_download_indexer(self, announce_url: str) -> bool:
         """Check if an announce URL matches the download indexer."""

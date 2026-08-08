@@ -205,6 +205,9 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                     content_type="application/x-bittorrent",
                 )
 
+        # _add_lock covers ONLY the POST: qB serializes adds server-side
+        # anyway, and the "Fails." duplicate check below (get_torrent) must
+        # stay outside so concurrent adds don't queue behind lookups.
         async with self._add_lock:
             async with await self.request(
                 "POST", "/api/v2/torrents/add", data=data
