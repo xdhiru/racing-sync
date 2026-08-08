@@ -176,7 +176,10 @@ class CleanupMixin:
 
         deleted = 0
         for _, _, ts, group in candidates:
-            if deleted >= cap:
+            # The cap bounds real deletions; dry-run logs every candidate
+            # so rehearsal output matches a live run instead of stopping
+            # at phantom counts.
+            if not dry_run and deleted >= cap:
                 break
             try:
                 ok = await self._delete_source_group(ts, group, cfg, dry_run)
@@ -218,7 +221,8 @@ class CleanupMixin:
         name = (ts.source_name or "").lower()
         for pat in patterns:
             try:
-                if pat and str(pat).lower() in name:
+                text = str(pat).strip().lower()
+                if text and text in name:
                     log.info("cleanup: %s matches protected pattern %r; keeping",
                              ts.source_name[:60], pat)
                     return True
@@ -360,10 +364,16 @@ class CleanupMixin:
         if not group:
             return False
         try:
+            # Cross-host clock skew guard: VPS1 added_on is compared against
+            # VPS2 now. Future timestamps (VPS1 ahead) and near-epoch values
+            # (bogus/unknown, e.g. 1) fail closed instead of fast-laning.
+            now_ts = now_utc.timestamp()
             youngest_added = 0
             for m in group:
                 added = int(m.added_on or 0)
-                if added <= 0:
+                if added <= 1_000_000_000:
+                    return False
+                if added > now_ts + 300:
                     return False
                 youngest_added = max(youngest_added, added)
             added_dt = dt.datetime.fromtimestamp(youngest_added, tz=dt.timezone.utc)
