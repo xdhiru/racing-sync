@@ -102,6 +102,8 @@ class _SFTPConnection:
         self._client: paramiko.SSHClient | None = None
         self._sftp: paramiko.SFTPClient | None = None
         self._lock = threading.RLock()
+        # Set by close(): the member is dead — _lease must skip it instead
+        # of queueing behind its (possibly wedged-holder) lock.
 
     def __enter__(self) -> _SFTPConnection:
         self.connect()
@@ -125,6 +127,8 @@ class _SFTPConnection:
             self.close()
             if not self._creds_present():
                 raise SFTPError("no SSH credentials: set ssh_key_path or ssh_password")
+            # close() marks _closed; a fresh dial revives the member.
+            self._closed = False
             sock: socket.socket | None = None
             try:
                 self._client = paramiko.SSHClient()
@@ -233,34 +237,36 @@ class _SFTPConnection:
         )
 
     def close(self) -> None:
-        # Best-effort: never block shutdown on a wedged holder. Re-entrant
-        # same-thread acquisition succeeds immediately, so nested callers
-        # (connect() under fetch_torrent's guard) are unaffected.
+        # Best-effort: never block shutdown on a wedged holder, and never
+        # leak the transport. Mark dead first so new leases skip this member;
+        # then close even if the lock stays held — the in-flight holder will
+        # error out of its op (callers already retry on exactly that).
+        # Re-entrant same-thread acquisition succeeds immediately, so nested
+        # callers (connect() under fetch_torrent's guard) are unaffected.
+        self._closed = True
         try:
             acquired = self._lock.acquire(timeout=5)
         except Exception:
-            return
-        if not acquired:
-            return
+            acquired = False
         try:
-            with self._lock:
-                if self._sftp is not None:
-                    try:
-                        self._sftp.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    self._sftp = None
-                if self._client is not None:
-                    try:
-                        self._client.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    self._client = None
+            if self._sftp is not None:
+                try:
+                    self._sftp.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._sftp = None
+            if self._client is not None:
+                try:
+                    self._client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._client = None
         finally:
-            try:
-                self._lock.release()
-            except Exception:
-                pass
+            if acquired:
+                try:
+                    self._lock.release()
+                except Exception:
+                    pass
 
     @staticmethod
     def _acquire_or_busy(lock: threading.RLock, what: str) -> bool:
@@ -524,8 +530,11 @@ class SFTPExporter:
     def _lease(self, what: str) -> _SFTPConnection:
         """Return a member with its lock held; caller must _release() it.
 
-        Rotating start spreads concurrent callers across members; a wedged
-        member is simply skipped while it stays busy.
+        Rotating start spreads concurrent callers across members. Each pass
+        sweeps non-blocking first (a wedged member never stalls failover to
+        a free one), then blocks in short slices so release wakes promptly
+        without sleep-spinning. Closed members are skipped outright, and a
+        fully-wedged pool still fails fast at the deadline.
         """
         members = self._members_snapshot()
         with self._pool_lock:
@@ -536,7 +545,15 @@ class SFTPExporter:
             for i in range(len(members)):
                 m = members[(start + i) % len(members)]
                 try:
+                    if getattr(m, "_closed", False):
+                        continue
                     if m._lock.acquire(blocking=False):
+                        if getattr(m, "_closed", False):
+                            try:
+                                m._lock.release()
+                            except Exception:
+                                pass
+                            continue
                         return m
                 except Exception:
                     continue
@@ -544,7 +561,24 @@ class SFTPExporter:
                 raise TimeoutError(
                     f"sftp busy: {what} gave up waiting for a free connection"
                 )
-            time.sleep(0.05)
+            for i in range(len(members)):
+                m = members[(start + i) % len(members)]
+                try:
+                    if getattr(m, "_closed", False):
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    if m._lock.acquire(timeout=min(0.05, remaining)):
+                        if getattr(m, "_closed", False):
+                            try:
+                                m._lock.release()
+                            except Exception:
+                                pass
+                            continue
+                        return m
+                except Exception:
+                    continue
 
     def _release(self, m: _SFTPConnection) -> None:
         try:

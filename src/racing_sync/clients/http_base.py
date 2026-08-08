@@ -16,9 +16,24 @@ log = logging.getLogger(__name__)
 
 
 # The racing client and destination qBittorrent instances may not have
-# IPv6 reachable from VPS2. We force IPv4-only DNS resolution across the
-# whole app so we never try to connect to a v6 address and hang.
+# IPv6 reachable from VPS2, so IPv4-only DNS resolution is the default
+# (see HTTPClientConfig.use_ipv6). Dual-stack happy-eyeballs to
+# link-local/ULA addresses has wedged handshakes on seedboxes.
 _IPV4_ONLY = socket.AF_INET
+
+
+def _connector_for(cfg: HTTPClientConfig) -> aiohttp.TCPConnector:
+    """Shared connector shape: bounded pool, cached DNS, configured family."""
+    try:
+        use_v6 = bool(getattr(cfg, "use_ipv6", False))
+    except Exception:
+        use_v6 = False
+    return aiohttp.TCPConnector(
+        family=socket.AF_UNSPEC if use_v6 else _IPV4_ONLY,
+        limit=100,
+        limit_per_host=20,
+        ttl_dns_cache=300,
+    )
 
 
 class AuthError(RuntimeError):
@@ -227,7 +242,7 @@ class HTTPClientBase:
             cookie_jar=aiohttp.CookieJar(unsafe=True),
             timeout=aiohttp.ClientTimeout(total=60),
             headers=headers,
-            connector=aiohttp.TCPConnector(family=_IPV4_ONLY),
+            connector=_connector_for(self._cfg),
         )
 
     async def close(self) -> None:

@@ -91,10 +91,21 @@ class ProwlarrClient:
         if self._session is not None and not self._session.closed:
             return
         import socket
+        try:
+            use_v6 = bool(getattr(self._cfg, "use_ipv6", False))
+        except Exception:
+            use_v6 = False
+        # IPv4-only by default (intentional — tracker/DNS on seedboxes is
+        # overwhelmingly v4); bounded pool + cached DNS either way.
         self._session = aiohttp.ClientSession(
             base_url=self._cfg.base_url.rstrip("/") + "/",
             timeout=aiohttp.ClientTimeout(total=self._cfg.timeout_seconds),
-            connector=aiohttp.TCPConnector(family=socket.AF_INET),
+            connector=aiohttp.TCPConnector(
+                family=socket.AF_UNSPEC if use_v6 else socket.AF_INET,
+                limit=100,
+                limit_per_host=20,
+                ttl_dns_cache=300,
+            ),
         )
         try:
             await self._refresh_indexers()
