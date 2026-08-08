@@ -4,7 +4,6 @@ mount short-circuit, added_on skew, protected-pattern validation).
 from __future__ import annotations
 
 import datetime as dt
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,7 +15,7 @@ def anyio_backend():
 
 
 def _ts(state=None, **kw):
-    from racing_sync.state import TorrentState, State
+    from racing_sync.state import State, TorrentState
     base = dict(source_infohash="a" * 40, source_name="Show",
                 state=State.RE_ADDING if state is None else state)
     base.update(kw)
@@ -146,10 +145,11 @@ async def test_missing_fuse_files_short_circuits_dead_mount(tmp_path):
 
 
 def test_cleanup_idle_rejects_skewed_added_on():
+    import time
+
     from racing_sync.clients.abstract import Torrent
     from racing_sync.coordinator import Coordinator
-    from racing_sync.state import TorrentState, State
-    import time
+    from racing_sync.state import State, TorrentState
 
     coord = object.__new__(Coordinator)
     coord.cfg = MagicMock()
@@ -174,20 +174,24 @@ def test_cleanup_idle_rejects_skewed_added_on():
 
 
 def test_protected_patterns_reject_blank():
-    from racing_sync.config import CleanupConfig
     import pytest as _pt
+    from pydantic import ValidationError
 
-    with _pt.raises(Exception):
+    from racing_sync.config import CleanupConfig
+
+    with _pt.raises(ValidationError):
         CleanupConfig(protected_patterns=[""])
-    with _pt.raises(Exception):
+    with _pt.raises(ValidationError):
         CleanupConfig(protected_patterns=["   "])
     # Sane values still pass.
     assert CleanupConfig(protected_patterns=["My.Show"]).protected_patterns == ["My.Show"]
 
 
 def test_rclone_flags_reject_hijack():
-    from racing_sync.config import FuseConfig, RcloneConfig, RemoteConfig
     import pytest as _pt
+    from pydantic import ValidationError
+
+    from racing_sync.config import FuseConfig, RcloneConfig, RemoteConfig
 
     def _cfg(**kw):
         base = dict(
@@ -199,9 +203,9 @@ def test_rclone_flags_reject_hijack():
         base.update(kw)
         return RcloneConfig(**base)
 
-    with _pt.raises(Exception):
+    with _pt.raises(ValidationError):
         _cfg(extra_move_flags=["--config=/evil.conf"])
-    with _pt.raises(Exception):
+    with _pt.raises(ValidationError):
         _cfg(batch_move_extra_flags=["--password-command=echo x"])
     # Legit tuning still passes.
     assert _cfg(extra_move_flags=["--transfers=4", "--s3-chunk-size=64M"]).extra_move_flags
@@ -211,8 +215,9 @@ def test_rclone_flags_reject_hijack():
 async def test_deluge_scan_cached_across_hash_lookups():
     """Single-hash get_torrent bursts share one full scan (5s TTL)."""
     from unittest.mock import AsyncMock
-    from racing_sync.config import SourceConfig
+
     from racing_sync.clients.deluge import DelugeClient
+    from racing_sync.config import SourceConfig
 
     cfg = SourceConfig(
         type="deluge", host="http://localhost:8112", password="secret",
@@ -235,6 +240,7 @@ async def test_deluge_scan_cached_across_hash_lookups():
 def test_sftp_close_never_leaks_wedged_member():
     """close() marks dead + closes even when a holder wedges the lock."""
     import threading
+
     from racing_sync.sftp_source import _SFTPConnection
 
     cfg = MagicMock()
@@ -258,3 +264,87 @@ def test_sftp_close_never_leaks_wedged_member():
     assert m._sftp is None and m._client is None
     release.set()
     t.join(timeout=10)
+
+
+@pytest.mark.anyio
+async def test_watchdir_no_reemit_without_pickup(tmp_path):
+    """Kept files are never evicted from _seen (no duplicate WatchItems)."""
+    from racing_sync.config import WatchDirConfig
+    from racing_sync.watchdir import WatchDirScanner, _bencode
+
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    blob = _bencode({
+        b"announce": b"http://tracker.example/announce",
+        b"info": {b"name": b"a", b"length": 10, b"piece length": 16384,
+                  b"pieces": b"12345678901234567890"},
+    })
+    (watch / "a.torrent").write_bytes(blob)
+    cfg = WatchDirConfig(path=watch, glob="*.torrent", delete_after_pickup=False)
+    scanner = WatchDirScanner(cfg, None)
+    # Fill _seen with 6000 stale (non-resident) hashes + the resident one.
+    scanner._seen = {f"stale{i:05d}" for i in range(6000)}
+    first = await scanner.scan_once()
+    resident = {i.infohash for i in first}
+    assert len(resident) == 1
+    scanner._seen |= resident
+    second = await scanner.scan_once()
+    assert second == []
+    assert resident <= scanner._seen  # resident never evicted
+    assert len(scanner._seen) <= 5001  # only non-resident overflow bounded
+
+
+@pytest.mark.anyio
+async def test_telegram_debounce_is_per_chat():
+    """One chat's burst must not drop another chat's pagination."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from racing_sync.telegram_bot import TelegramBot
+
+    bot = object.__new__(TelegramBot)
+    bot._cfg = MagicMock()
+    bot._cfg.chat_id = "1"
+    bot._cfg.page_size = 5
+    bot._callback_times = {}
+    bot._last_callback_time = 0.0
+    bot._store = MagicMock()
+    bot._store.list_active_inflight = MagicMock(return_value=[])
+    bot._current_page = 0
+    bot._refresh_active_message = AsyncMock()
+
+    def _query(chat, user):
+        q = MagicMock()
+        q.message.chat.id = chat
+        q.from_user.id = user
+        q.data = "page:next"
+        q.answer = AsyncMock()
+        return q
+
+    await bot._handle_callback(_query("1", "9"))
+    # Same chat immediately again: debounced...
+    await bot._handle_callback(_query("1", "9"))
+    # ...but a different chat (same authorized user) goes through.
+    q_other = _query("9", "1")
+    await bot._handle_callback(q_other)
+    assert bot._refresh_active_message.await_count == 2
+
+
+def test_unknown_config_keys_warned(tmp_path, caplog):
+    """Typo'd keys log warnings instead of silently ignored."""
+    import logging
+
+    from racing_sync.config import AppConfig
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        "[general]\nmax_active_download = 3\n"
+        "[source]\ntype = \"qbittorrent\"\nhost = \"http://127.0.0.1:8080\"\n"
+        "[dest]\nhost = \"http://127.0.0.1:8081\"\nsave_path = \"/d\"\n"
+        "[ssd]\npath = \"/d\"\nmax_inflight_bytes = 10\n"
+        "skip_movie_larger_than_bytes = 10\n"
+        "[rclone.remote]\ndefault = \"rem:/a/\"\nunsorted = \"rem:/u/\"\n"
+        "[rclone.fuse]\nmount = \"/m\"\nmount_unsorted = \"/m/u\"\n"
+    )
+    with caplog.at_level(logging.WARNING):
+        AppConfig.from_toml(cfg_file)
+    assert any("max_active_download" in r.message for r in caplog.records)

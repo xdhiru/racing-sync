@@ -34,10 +34,56 @@ mount_unsorted = "/mnt/fuse/unsorted"
 
 
 def test_main_check_config(tmp_path: Path):
+    rclone_bin = tmp_path / "rclone"
+    rclone_bin.write_bytes(b"fake")
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    fuse = tmp_path / "fuse"
+    (fuse / "unsorted").mkdir(parents=True)
+    logs = tmp_path / "logs"
+    cfg_text = f"""
+[general]
+source_poll_interval = 30
+dest_poll_interval = 15
+state_db = "{(tmp_path / "state.db").as_posix()}"
+log_dir = "{logs.as_posix()}"
+
+[source]
+type = "qbittorrent"
+host = "http://127.0.0.1:8080"
+
+[dest]
+host = "http://127.0.0.1:8081"
+save_path = "{downloads.as_posix()}"
+
+[ssd]
+path = "{downloads.as_posix()}"
+max_inflight_bytes = 1000000000
+skip_movie_larger_than_bytes = 1000000000
+
+[rclone]
+binary = "{rclone_bin.as_posix()}"
+
+[rclone.remote]
+default = "remote:movies/"
+unsorted = "remote:unsorted/"
+
+[rclone.fuse]
+mount = "{fuse.as_posix()}"
+mount_unsorted = "{(fuse / "unsorted").as_posix()}"
+"""
     cfg_file = tmp_path / "config.toml"
-    cfg_file.write_text(MINIMAL_CONFIG)
+    cfg_file.write_text(cfg_text)
     rc = main(["check-config", "--config", str(cfg_file)])
     assert rc == 0
+
+
+def test_main_check_config_reports_missing_binary(tmp_path: Path, capsys):
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG + '\n[rclone]\nbinary = "/no/such/rclone"\n')
+    rc = main(["check-config", "--config", str(cfg_file)])
+    assert rc == 2
+    assert "rclone.binary" in capsys.readouterr().err
 
 
 def test_main_run_startup_failure_is_clean(tmp_path: Path, capsys):

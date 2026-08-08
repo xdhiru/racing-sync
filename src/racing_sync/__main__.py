@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import shutil
 import signal
 import sys
@@ -242,6 +243,77 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
     return 1 if result["errors"] else 0
 
 
+def _check_config_env(cfg: AppConfig) -> list[str]:
+    """Best-effort environment checks beyond schema validation.
+
+    Schema validation already ran (from_toml). Here: filesystem reachability
+    (log dir writable, state/db parents, SSD/fuse paths exist) and the rclone
+    binary being present + executable. Returns problem strings (empty = OK).
+    Never raises — every probe is guarded.
+    """
+    problems: list[str] = []
+
+    def _need_dir(label: str, raw: object, *, must_exist: bool, writable: bool = False) -> None:
+        try:
+            p = Path(str(raw))
+        except Exception:
+            problems.append(f"{label}: not a path: {raw!r}")
+            return
+        try:
+            target = p if must_exist else p.parent
+            if must_exist and not p.exists():
+                problems.append(f"{label} does not exist: {p}")
+                return
+            if writable:
+                try:
+                    target.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    problems.append(f"{label} not writable ({p}): {e}")
+                    return
+                if not os.access(str(target), os.W_OK):
+                    problems.append(f"{label} not writable: {target}")
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"{label} check failed ({raw!r}): {e}")
+
+    try:
+        _need_dir("general.log_dir", cfg.general.log_dir, must_exist=False, writable=True)
+    except Exception:
+        pass
+    for label, val in (
+        ("dest.save_path", getattr(cfg.dest, "save_path", "")),
+        ("ssd.path", getattr(cfg.ssd, "path", "")),
+        ("rclone.fuse.mount", getattr(cfg.rclone.fuse, "mount", "")),
+        ("rclone.fuse.mount_unsorted", getattr(cfg.rclone.fuse, "mount_unsorted", "")),
+    ):
+        try:
+            _need_dir(label, val, must_exist=True)
+        except Exception:
+            pass
+    # state.db itself is created on first run — its parent must exist.
+    try:
+        _need_dir("general.state_db parent", Path(str(getattr(cfg.general, "state_db", ""))).parent,
+                  must_exist=True)
+    except Exception:
+        pass
+    if getattr(cfg, "watch_dir", None) is not None:
+        try:
+            _need_dir("watch_dir.path", cfg.watch_dir.path, must_exist=True)
+        except Exception:
+            pass
+    # rclone binary: absolute + exists + executable (PATH hijack / typo guard).
+    try:
+        b = Path(str(cfg.rclone.binary))
+        if not b.is_absolute():
+            problems.append(f"rclone.binary must be absolute: {b}")
+        elif not b.exists():
+            problems.append(f"rclone.binary not found: {b}")
+        elif not os.access(str(b), os.X_OK):
+            problems.append(f"rclone.binary not executable: {b}")
+    except Exception as e:  # noqa: BLE001
+        problems.append(f"rclone.binary check failed: {e}")
+    return problems
+
+
 def main(argv: list[str] | None = None) -> int:
     prog = Path(sys.argv[0]).name if argv is None and sys.argv else "racing-sync"
     parser = argparse.ArgumentParser(prog=prog)
@@ -294,6 +366,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.cmd == "check-config":
+        problems = _check_config_env(cfg)
+        if problems:
+            for p in problems:
+                print(f"config problem: {p}", file=sys.stderr)
+            return 2
         print(f"OK: {args.config}")
         return 0
 
