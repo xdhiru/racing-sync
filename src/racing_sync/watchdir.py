@@ -408,11 +408,12 @@ class WatchDirScanner:
         # an arbitrary-but-bounded sample).
         if self._cfg.delete_after_pickup:
             self._seen &= current_infohashes
-        elif len(self._seen) > 5000:
-            # Deterministic: keep currently-present hashes, then fill up to
-            # 2500 with sorted overflow for reproducibility.
+        else:
+            # Resident hashes must never be evicted: with pickup files kept
+            # on disk, an evicted hash re-emits as a duplicate WatchItem on
+            # the next scan. Only non-resident overflow is bounded.
             keep = set(self._seen & current_infohashes)
-            overflow = sorted(self._seen - keep)[: max(0, 2500 - len(keep))]
+            overflow = sorted(self._seen - keep)[: max(0, 5000 - len(keep))]
             self._seen = keep | set(overflow)
 
         return out

@@ -389,6 +389,9 @@ class TelegramBot:
         self._last_active_text: str = ""
         self._last_active_cache: tuple[int, int, str] | None = None
         self._last_callback_time: float = 0.0
+        # Per-chat debounce (monotonic timestamps by chat/user key): one
+        # chat's burst must not starve pagination for everyone else.
+        self._callback_times: dict[str, float] = {}
         # Last monotonic timestamp of an active-message (re)post, for the
         # keep-at-bottom repost interval.
         self._last_repost_monotonic: float = 0.0
@@ -742,14 +745,34 @@ class TelegramBot:
                 pass
             return
 
-        # Throttle callback handling (0.5s debounce)
+        # Throttle callback handling (0.5s debounce per chat/user — a
+        # global throttle lets one spammer block pagination for all chats).
         now = time.monotonic()
-        if now - self._last_callback_time < 0.5:
+        try:
+            _debounce_key = str(chat_id) if chat_id is not None else str(user_id)
+        except Exception:
+            _debounce_key = ""
+        try:
+            _times = getattr(self, "_callback_times", None)
+            if not isinstance(_times, dict):
+                _times = {}
+                self._callback_times = _times
+            _last = float(_times.get(_debounce_key, 0.0) or 0.0)
+        except Exception:
+            _last = 0.0
+        if now - _last < 0.5:
             try:
                 await query.answer()
             except Exception:
                 pass
             return
+        try:
+            _times[_debounce_key] = now
+            if len(_times) > 1000:
+                for _k in list(_times.keys())[:500]:
+                    _times.pop(_k, None)
+        except Exception:
+            pass
         self._last_callback_time = now
 
         try:
