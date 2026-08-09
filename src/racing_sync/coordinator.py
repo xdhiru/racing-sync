@@ -67,8 +67,7 @@ from .rclone_ops import (
 )
 from .recovery import find_content_on_ssd, reconcile
 from .sftp_source import SFTPExporter
-from .state import State, StateStore, TorrentState
-from .state import _MAX_READD_CYCLES
+from .state import _MAX_READD_CYCLES, State, StateStore, TorrentState
 from .watchdir import WatchDirScanner, WatchItem
 
 log = logging.getLogger(__name__)
