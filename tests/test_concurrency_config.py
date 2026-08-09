@@ -324,6 +324,8 @@ async def test_late_cross_seeds_handles_none_detail_and_expires_failures(tmp_pat
 
     # Now add_torrent succeeds with detail=None
     coord.dest_client.add_torrent = AsyncMock(return_value=AddResult(hash="late1", accepted=True, detail=None))
+    coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path="x"))
+    coord._save_path_points_at_target = MagicMock(return_value=True)
     await coord._check_and_inject_late_cross_seeds(ts, group)
 
     assert "late1" in ts.injected_private_hashes

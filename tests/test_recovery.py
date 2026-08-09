@@ -237,6 +237,8 @@ async def test_check_and_inject_late_cross_seeds(tmp_path: Path):
     coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
+    coord._save_path_points_at_target = MagicMock(return_value=True)
+    coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path="x"))
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord.dest_client.add_torrent.return_value = AddResult(hash="newhash", accepted=True)
 

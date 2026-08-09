@@ -124,12 +124,17 @@ async def test_late_seed_healthy_check_memoized(tmp_path):
         dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=31))
     coord.dest_client.add_torrent = AsyncMock(
         return_value=AddResult(hash="late1", accepted=True, detail=None))
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=MagicMock(save_path=str(fuse)))
+    coord._save_path_points_at_target = MagicMock(return_value=True)
     await coord._check_and_inject_late_cross_seeds(ts, group)
     assert "late1" in ts.injected_private_hashes
 
     coord.dest_client.reset_mock()
     await coord._check_and_inject_late_cross_seeds(ts, group)
-    # Healthy + nothing new: memoized, zero dest traffic.
+    # Healthy + nothing new: memo engaged — the following tick is silent.
+    coord.dest_client.reset_mock()
+    await coord._check_and_inject_late_cross_seeds(ts, group)
     assert coord.dest_client.method_calls == []
 
 
@@ -209,6 +214,49 @@ def test_rclone_flags_reject_hijack():
         _cfg(batch_move_extra_flags=["--password-command=echo x"])
     # Legit tuning still passes.
     assert _cfg(extra_move_flags=["--transfers=4", "--s3-chunk-size=64M"]).extra_move_flags
+
+
+@pytest.mark.anyio
+async def test_fuse_first_add_verified_before_trust(tmp_path):
+    """Accepted-but-invisible fuse adds park (never DONE, never destructive).
+
+    The fuse index lags when rclone is busy with another move: verification
+    waits (4x2s, no deletes/replaces), then reports not-visible so callers
+    retry. A visible entry trusts immediately.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from racing_sync.clients.abstract import AddResult
+    from racing_sync.coordinator import Coordinator, _NOT_VISIBLE_DETAIL
+
+    def _coord_with_add(add_result, get_result):
+        coord = object.__new__(Coordinator)
+        coord.dest_client = AsyncMock()
+        coord.dest_client.add_torrent = AsyncMock(return_value=add_result)
+        coord.dest_client.get_torrent = AsyncMock(return_value=get_result)
+        coord.dest_client.delete = AsyncMock()
+        return coord
+
+    fuse = tmp_path / "fuse"
+    # Invisible: get_torrent stays None through all 4 polls.
+    coord = _coord_with_add(
+        AddResult(hash="ab" * 20, accepted=True, detail="Ok."), None)
+    ok, detail = await coord._ensure_fuse_entry(
+        blob=b"d8:announce1:a4:infod4:name1:x6:lengthi1ee",
+        infohash="ab" * 20, target_mount=fuse, label="t")
+    assert ok is False
+    assert detail == _NOT_VISIBLE_DETAIL
+    coord.dest_client.delete.assert_not_called()
+
+    # Visible at target: trusted on the first poll (no 8s wait).
+    entry = MagicMock(save_path=str(fuse))
+    coord = _coord_with_add(
+        AddResult(hash="ab" * 20, accepted=True, detail="Ok."), entry)
+    ok, _ = await coord._ensure_fuse_entry(
+        blob=b"d8:announce1:a4:infod4:name1:x6:lengthi1ee",
+        infohash="ab" * 20, target_mount=fuse, label="t")
+    assert ok is True
+    assert coord.dest_client.get_torrent.await_count == 1
 
 
 @pytest.mark.anyio
