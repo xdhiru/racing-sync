@@ -102,10 +102,14 @@ class _FakeDest:
 
     def _row(self, h: str) -> Torrent:
         e = self.entries[h.lower()]
+        if e["paused"]:
+            state = "pausedDL"
+        else:
+            state = "seeding" if e["progress"] >= 1.0 else "downloading"
         t = Torrent(
             hash=h.lower(), name=e["name"], category=e["category"],
             save_path=e["save_path"], size_bytes=e["size"],
-            state=("seeding" if e["progress"] >= 1.0 else "downloading"),
+            state=state,
             progress=e["progress"], trackers=[],
         )
         t.files = list(e["files"])
