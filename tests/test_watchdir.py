@@ -414,6 +414,7 @@ async def test_re_inject_watch_dir_torrents(tmp_path: Path):
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord.dest_client = AsyncMock()
     coord.dest_client.add_torrent.return_value = AddResult(hash="h1", accepted=True)
+    coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path=str(fuse_dir)))
 
     infohash = "1111222233334444555566667777888899990000"
     watch_cross_dir = tmp_path / "watch_cross_seeds" / infohash
