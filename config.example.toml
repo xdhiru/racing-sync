@@ -187,6 +187,28 @@ max_concurrent_moves = 3
 # Empty/unset = use [rclone.fuse].reinject_delay_seconds.
 # reinject_delay_seconds = 30
 
+# Extra rclone flags applied to every `rclone move`.
+# Defaults are sensible for slow remotes; tune as needed.
+extra_move_flags = [
+    "--transfers=4",
+    "--checkers=8",
+    "--bwlimit=0",          # 0 = no limit; set a number if you need to cap
+    "--size-only",          # faster than --checksum on huge media files
+    "--retries=10",
+    "--low-level-retries=20",
+    "--log-level=INFO",
+    "--stats=30s",
+    "--stats-one-line",
+]
+
+# rclone move used for the per-batch episode transfers adds
+# --include patterns dynamically. These extra flags are appended
+# AFTER the auto-generated --include flags so they can still win
+# if needed.
+batch_move_extra_flags = [
+    "--delete-after",       # not strictly needed; batch folder is wiped locally anyway
+]
+
 # Default remote + path for movies and full season-root folders.
 # These are rclone REMOTE paths (not fuse mount paths).
 # They get passed to:   rclone move <local> <remote_path>
@@ -220,28 +242,6 @@ reinject_backoff_seconds = 1800
 # Maximum duration (seconds) since re-injection began before marking the torrent as FAILED (default: 86400 / 24 hours).
 # Prevents dangling tasks while giving slow/overloaded servers ample time to recover.
 reinject_max_age_seconds = 86400
-
-# Extra rclone flags applied to every `rclone move`.
-# Defaults are sensible for slow remotes; tune as needed.
-extra_move_flags = [
-    "--transfers=4",
-    "--checkers=8",
-    "--bwlimit=0",          # 0 = no limit; set a number if you need to cap
-    "--size-only",          # faster than --checksum on huge media files
-    "--retries=10",
-    "--low-level-retries=20",
-    "--log-level=INFO",
-    "--stats=30s",
-    "--stats-one-line",
-]
-
-# rclone move used for the per-batch episode transfers adds
-# --include patterns dynamically. These extra flags are appended
-# AFTER the auto-generated --include flags so they can still win
-# if needed.
-batch_move_extra_flags = [
-    "--delete-after",       # not strictly needed; batch folder is wiped locally anyway
-]
 
 # ============================================================
 # Classifier (movie / episode / season)

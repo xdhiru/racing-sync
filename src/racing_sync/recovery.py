@@ -125,8 +125,18 @@ def find_content_on_ssd(cfg: AppConfig, expected: list[tuple[str, int]]) -> Path
             roots.append(p)
     for root in roots:
         try:
-            if (root / top).exists():
-                return root
+            cand = root / top
+            if not cand.exists():
+                continue
+            if cand.is_dir():
+                # An empty directory proves nothing (wiped leftovers);
+                # only adopt when real bytes remain.
+                try:
+                    if not any(cand.iterdir()):
+                        continue
+                except OSError:
+                    continue
+            return root
         except OSError:
             continue
     return None
@@ -333,6 +343,41 @@ async def reconcile(
                                 "reconcile: classified previously-unknown DONE %s as %s",
                                 ts.source_name[:60], _kind,
                             )
+                # Ghost check: a skip_check entry reports complete with zero
+                # bytes. Verify cheaply at startup; a warming mount keeps
+                # trust, SSD-resident bytes demote to MOVING for a real move.
+                try:
+                    _hit = next((k for k in known_hashes if k in actual_by_hash), None)
+                    if _hit is not None:
+                        _t = actual_by_hash[_hit]
+                        _sp = str(getattr(_t, "save_path", "") or "")
+                        _fl = await dest.get_torrent_files(_hit)
+                        _exp = [
+                            (str(f.name), int(f.size_bytes or 0))
+                            for f in (_fl or []) if getattr(f, "name", "")
+                        ]
+                        if _exp and _sp:
+                            _miss = await _missing_under(Path(_sp), _exp)
+                            if _miss:
+                                _root = find_content_on_ssd(cfg, _exp)
+                                if _root is not None:
+                                    log.warning(
+                                        "reconcile: DONE %s missing %d/%d files at %s; "
+                                        "bytes on SSD at %s — demoting to MOVING",
+                                        ts.source_name[:60], len(_miss), len(_exp),
+                                        _sp, _root,
+                                    )
+                                    ts.save_path = str(_root)
+                                    store.transition(ts, State.MOVING)
+                                    rpt.resumed.append(h)
+                                    continue
+                                log.warning(
+                                    "reconcile: DONE %s missing %d/%d files at %s; "
+                                    "keeping DONE (mount may be warming)",
+                                    ts.source_name[:60], len(_miss), len(_exp), _sp,
+                                )
+                except Exception as e:  # noqa: BLE001
+                    log.warning("reconcile: ghost check failed for %s: %s", h[:10], e)
                 rpt.kept.append(h)
             else:
                 # Lost — re-add pointing at fuse. The data is on remote.
@@ -394,6 +439,25 @@ async def reconcile(
         if h.lower() not in db_hashes:
             save_path = (getattr(t, "save_path", "") or "").rstrip("/\\").replace("\\", "/")
             on_fuse = any(save_path == fm or save_path.startswith(fm + "/") for fm in fuse_mounts if fm)
+            # Placement gate: only adopt entries under known SSD/fuse roots.
+            # With unresolvable roots (e.g. MagicMock cfg in unit tests)
+            # membership is unknowable — preserve legacy adopt behavior.
+            _roots_known = any(
+                isinstance(raw, (str, Path)) and str(raw).strip()
+                for raw in (getattr(cfg.dest, "save_path", None),
+                            getattr(cfg.ssd, "path", None))
+            )
+            on_ssd = _save_path_on_ssd(cfg, save_path)
+            if save_path and not on_fuse and not on_ssd and _roots_known:
+                # Foreign placement (stale path, other mount): adopting it
+                # would later move arbitrary directories to the remote.
+                log.warning(
+                    "reconcile: ignoring unplaced entry %s (%s) at %s; "
+                    "not SSD nor fuse — left as unknown",
+                    getattr(t, "name", h)[:60], h[:10], save_path,
+                )
+                rpt.unknowns.append(h)
+                continue
             comp = getattr(t, "is_complete", False)
             is_done = comp() if callable(comp) else bool(comp)
             name = getattr(t, "name", h) or h
@@ -404,19 +468,33 @@ async def reconcile(
             if on_fuse or is_done:
                 matches = store.find_by_name(name)
                 if matches:
-                    existing = matches[0]
-                    curr = [x.strip() for x in existing.injected_private_hashes.split(",") if x.strip()]
-                    curr_lower = {x.lower() for x in curr}
-                    if h.lower() not in curr_lower and h.lower() != existing.source_infohash.lower():
-                        curr.append(h)
-                        existing.injected_private_hashes = ",".join(curr)
-                        store.upsert(existing)
-                        rpt.kept.append(h)
-                        log.info(
-                            "reconcile: linked existing cross-seed %s to adopted release %s",
-                            h[:10], name,
+                    from .coordinator_content import normalize_content_name
+
+                    norm = normalize_content_name(name)
+                    same_release = [
+                        m for m in matches
+                        if normalize_content_name(m.source_name or "") == norm
+                    ]
+                    existing = same_release[0] if same_release else None
+                    if existing is None:
+                        log.warning(
+                            "reconcile: %s (%s) name-matches %d row(s) but none "
+                            "is the same release; adopting fresh instead of merging",
+                            name[:60], h[:10], len(matches),
                         )
-                        continue
+                    else:
+                        curr = [x.strip() for x in existing.injected_private_hashes.split(",") if x.strip()]
+                        curr_lower = {x.lower() for x in curr}
+                        if h.lower() not in curr_lower and h.lower() != existing.source_infohash.lower():
+                            curr.append(h)
+                            existing.injected_private_hashes = ",".join(curr)
+                            store.upsert(existing)
+                            rpt.kept.append(h)
+                            log.info(
+                                "reconcile: linked existing cross-seed %s to adopted release %s",
+                                h[:10], name,
+                            )
+                            continue
                 adopt_state = State.DONE if on_fuse else State.MOVING
                 use_save_path = save_path
                 kind = "unknown"
