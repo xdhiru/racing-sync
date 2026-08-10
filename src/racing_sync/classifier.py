@@ -84,6 +84,10 @@ def _compile_pattern(pattern_str: str) -> re.Pattern[str]:
 @functools.lru_cache(maxsize=2048)
 def parse_episode(name: str, regex: re.Pattern[str] | str | None = None) -> tuple[int, int] | None:
     """Return (season, episode) parsed from filename, or None."""
+    if not isinstance(name, str) or not name:
+        return None
+    if regex is not None and not isinstance(regex, (str, re.Pattern)):
+        return None
     if regex is None:
         pattern = EP_RE
     elif isinstance(regex, str):
@@ -118,6 +122,28 @@ def parse_episode(name: str, regex: re.Pattern[str] | str | None = None) -> tupl
     return None
 
 
+def _safe_file_name_size(f: object) -> tuple[str, int] | None:
+    """Coerce a client file entry to (name, size); None when unaddressable.
+
+    Client names must stay byte-identical for priority maps, so well-formed
+    str names pass through untouched; only hostile/None values coerce.
+    """
+    try:
+        raw_name = getattr(f, "name", "")
+        name = raw_name if isinstance(raw_name, str) else str(raw_name or "")
+    except Exception:
+        return None
+    if not name:
+        return None
+    try:
+        size = int(getattr(f, "size_bytes", 0) or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size < 0:
+        size = 0
+    return name, size
+
+
 def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
     """Classify a torrent given its files.
 
@@ -130,24 +156,34 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
         (routed to rclone remote default and fuse mount).
     """
     files = list(files)
-    total = sum(f.size_bytes for f in files)
+    normed: list[tuple[TorrentFile, str, int]] = []
+    for f in files:
+        coerced = _safe_file_name_size(f)
+        if coerced is None:
+            continue
+        normed.append((f, coerced[0], coerced[1]))
+    total = sum(size for _, _, size in normed)
 
-    if not files:
+    if not normed:
         return Classification(kind="unknown", episodes=[], single_file=None, total_bytes=0)
 
     ep_re_attr = getattr(cfg.classifier, "_episode_re", None)
     ep_regex = ep_re_attr if isinstance(ep_re_attr, (re.Pattern, str)) else EP_RE
 
-    # Filter out non-video files (.srt, .nfo, etc.) when evaluating episodes
-    video_files = [f for f in files if Path(f.name).suffix.lower() not in NON_VIDEO_EXTENSIONS]
-    eval_files = video_files if video_files else files
+    # Filter out non-video files (.srt, .nfo, etc.) when evaluating episodes.
+    # Operates on coerced (name, size) pairs so hostile entries can't crash
+    # the suffix/parse path; Episode file_names stay client-identical for
+    # well-formed inputs.
+    video = [(f, n, s) for f, n, s in normed
+             if Path(n).suffix.lower() not in NON_VIDEO_EXTENSIONS]
+    eval_trip = video if video else normed
 
     # Check for episode matches across evaluated files
     eps: list[Episode] = []
-    for f in eval_files:
-        parsed = parse_episode(f.name, ep_regex)
+    for _, name, size in eval_trip:
+        parsed = parse_episode(name, ep_regex)
         if parsed:
-            eps.append(Episode(f.name, parsed[0], parsed[1], f.size_bytes))
+            eps.append(Episode(name, parsed[0], parsed[1], size))
     eps.sort(key=lambda e: (e.season, e.episode))
 
     # Deduplicate eps per (season, episode), keeping the largest file
@@ -166,7 +202,7 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
     # mixed/season logic below.
     if len(distinct_eps) == 1:
         main_ep = deduped_eps[0]
-        if len(eval_files) == 1 or main_ep.size_bytes >= int(0.9 * total):
+        if len(eval_trip) == 1 or main_ep.size_bytes >= int(0.9 * total):
             return Classification(
                 kind="episode",
                 episodes=[main_ep],
@@ -178,15 +214,15 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
     # Case 2: No episodes found at all
     if not deduped_eps:
         # If single file -> movie
-        if len(files) == 1:
-            f = files[0]
-            if f.size_bytes > cfg.ssd.skip_movie_larger_than_bytes:
+        if len(normed) == 1:
+            _, name, size = normed[0]
+            if size > cfg.ssd.skip_movie_larger_than_bytes:
                 log.warning(
                     "movie '%s' (%d B) exceeds skip threshold (%d B)",
-                    f.name, f.size_bytes, cfg.ssd.skip_movie_larger_than_bytes,
+                    name, size, cfg.ssd.skip_movie_larger_than_bytes,
                 )
             return Classification(
-                kind="movie", episodes=[], single_file=f.name, total_bytes=total,
+                kind="movie", episodes=[], single_file=name, total_bytes=total,
             )
         # Multi-file but no episode tag -> treat as movie bundle (default remote)
         return Classification(
@@ -198,7 +234,7 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
     # Use ceiling: e.g. 4 files where 3 are episodes is still a season.
     # NOTE: use pre-dedup `eps` count — deduped count undercounts when 2 files
     # map to the same (season, episode) (e.g. mkv + mp4 per episode).
-    if len(eps) >= max(1, int(-(-len(eval_files) * 9 // 10))):
+    if len(eps) >= max(1, int(-(-len(eval_trip) * 9 // 10))):
         return Classification(kind="season", episodes=deduped_eps, single_file=None, total_bytes=total)
 
     # Mixed (rare): multiple episodes with lots of non-episode files

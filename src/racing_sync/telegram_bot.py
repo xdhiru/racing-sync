@@ -175,15 +175,31 @@ def _tracker_domain(url: str) -> str:
 
 def _retry_at_in_future(value: object) -> bool:
     """True iff value is a datetime in the future (naive treated as UTC)."""
+    return _retry_in_future_seconds(value) is not None
+
+
+def _as_aware_utc(value: object) -> dt.datetime | None:
+    """Coerce to aware UTC; naive legacy rows are treated as UTC, not local."""
     if not isinstance(value, dt.datetime):
-        return False
+        return None
     try:
-        now = dt.datetime.now(dt.timezone.utc)
         if value.tzinfo is None:
-            value = value.replace(tzinfo=dt.timezone.utc)
-        return value > now
+            return value.replace(tzinfo=dt.timezone.utc)
+        return value
     except Exception:
-        return False
+        return None
+
+
+def _retry_in_future_seconds(value: object) -> float | None:
+    """Seconds until `value`, or None when not a future datetime."""
+    aware = _as_aware_utc(value)
+    if aware is None:
+        return None
+    try:
+        delta = (aware - dt.datetime.now(dt.timezone.utc)).total_seconds()
+        return delta if delta > 0 else None
+    except Exception:
+        return None
 
 
 def render_detail(ts: TorrentState, progress: float | None = None) -> str:
@@ -205,7 +221,8 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
 
     # State-specific extras
     if ts.state == State.WAITING_INDEXER and ts.indexer_next_retry_at:
-        when = ts.indexer_next_retry_at.astimezone().strftime("%H:%M:%S")
+        _when = _as_aware_utc(ts.indexer_next_retry_at)
+        when = _when.astimezone().strftime("%H:%M:%S") if _when else "?"
         lines.append(
             f"Indexer miss #{ts.indexer_attempts}; next retry at {when}"
         )
@@ -225,8 +242,9 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     elif ts.state == State.MOVING:
         lines.append("rclone moving to remote…")
     elif ts.state == State.RE_ADDING:
-        if _retry_at_in_future(ts.readd_next_retry_at):
-            mins = max(1, round((ts.readd_next_retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds() / 60))
+        _retry_s = _retry_in_future_seconds(ts.readd_next_retry_at)
+        if _retry_s is not None:
+            mins = max(1, round(_retry_s / 60))
             lines.append(f"Re-adding on fuse mount (WebUI busy, retrying in {mins}m)")
         else:
             lines.append("Re-adding on fuse mount")
@@ -312,8 +330,9 @@ def render_active(
         elif ts.state == State.MOVING:
             state_text = "📦 Moving"
         elif ts.state == State.RE_ADDING:
-            if _retry_at_in_future(ts.readd_next_retry_at):
-                mins = max(1, round((ts.readd_next_retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds() / 60))
+            _retry_s = _retry_in_future_seconds(ts.readd_next_retry_at)
+            if _retry_s is not None:
+                mins = max(1, round(_retry_s / 60))
                 state_text = f"🔄 Re-adding (retry in {mins}m)"
             else:
                 state_text = "🔄 Re-adding"
@@ -786,7 +805,10 @@ class TelegramBot:
 
         action = data.split(":", 1)[1]
         rows = await asyncio.to_thread(self._store.list_active_inflight)
-        page_size = self._cfg.page_size
+        try:
+            page_size = max(1, min(int(self._cfg.page_size), 50))
+        except (TypeError, ValueError):
+            page_size = 5
         total_pages = max(1, (len(rows) + page_size - 1) // page_size)
 
         if action == "prev":
@@ -1082,7 +1104,15 @@ class TelegramBot:
             )
             self._pinned_message_id = self._active_msg_id
         except TelegramError as e:
-            # Permission errors etc. — log warning and disable further pin attempts
+            # Permanent failures (no rights, bad request) disable further
+            # pin attempts; transient rate-limit/network errors keep the
+            # setting — the next refresh retries.
+            msg = str(e).lower()
+            transient = isinstance(e, (RetryAfter, TimedOut, NetworkError))
+            transient = transient or "retry after" in msg or "flood" in msg or "timeout" in msg
+            if transient:
+                log.warning("pin deferred (transient %s); will retry", e)
+                return
             log.warning("pin failed (%s); disabling pin_status_message", e)
             self._cfg.pin_status_message = False
 

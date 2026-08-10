@@ -245,10 +245,17 @@ class RemoteConfig(BaseModel):
                 f"rclone remote path must be of form 'name:path', got: {v!r}"
             )
         name, path = m.group(1), m.group(2)
-        # Reject Windows drive letters (C:/, C:\) mistaken for remotes.
+        # Reject Windows drive letters (C:/, C:\) mistaken for remotes — and
+        # drive-relative paths (C:foo), which rclone would treat as local
+        # paths and misdirect moves.
         if len(name) == 1 and path.startswith(("/", "\\")):
             raise ValueError(
                 f"rclone remote path looks like a Windows drive, got: {v!r}"
+            )
+        if len(name) == 1 and not path.startswith("/"):
+            raise ValueError(
+                f"single-character rclone remote names are ambiguous with "
+                f"Windows drive letters; rename the remote (got: {v!r})"
             )
         if not path or path.strip() in ("", "/"):
             raise ValueError(
@@ -405,9 +412,22 @@ class WatchDirConfig(BaseModel):
     delete_after_pickup: bool = True
     # Prowlarr query policy for watch-dir drops
     query_prowlarr: bool = True
-    # If prowlarr returns a hit on the configured indexer, use that torrent
-    # for SSD download. Otherwise fall back to the dropped file itself.
+    # If prowlarr returns a hit on the configured indexer, prefer that
+    # torrent over the manually-dropped file.
     prefer_prowlarr_result: bool = True
+
+    @field_validator("glob")
+    @classmethod
+    def _glob_must_stay_inside(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("watch_dir.glob must not be empty")
+        norm = v.strip().replace("\\", "/")
+        if norm.startswith("/") or ".." in norm.split("/") or ":" in norm:
+            raise ValueError(
+                f"watch_dir.glob must be a plain filename pattern inside the "
+                f"watch dir (no paths/escapes), got: {v!r}"
+            )
+        return v
 
 
 class ProwlarrTrackerMap(BaseModel):
@@ -468,6 +488,11 @@ class ProwlarrTrackerMap(BaseModel):
                     raise ValueError(
                         "[prowlarr.tracker_map] has an empty substring key "
                         "which would match every announce URL"
+                    )
+                if len(str(k).strip()) < 2:
+                    raise ValueError(
+                        f"[prowlarr.tracker_map] substring key {k!r} is too short "
+                        "(single characters match nearly every announce URL)"
                     )
                 if not str(val).strip():
                     raise ValueError(

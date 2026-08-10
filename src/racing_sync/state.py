@@ -483,9 +483,21 @@ class StateStore:
                  source_infohash),
             )
 
-    def all_active(self, include_blob: bool = False) -> list[TorrentState]:
+    def all_active(self, include_blob: bool = False, limit: int | None = None) -> list[TorrentState]:
         cols = _TORRENT_STATE_COLUMNS_NO_BLOB if not include_blob else "*"
         with self._lock:
+            if limit is not None:
+                try:
+                    limit = int(limit)
+                except (TypeError, ValueError):
+                    limit = None
+            if limit is not None and limit > 0:
+                rows = self._conn.execute(
+                    f"SELECT {cols} FROM torrent_state WHERE state != 'done' AND state != 'failed' "
+                    "ORDER BY updated_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                return [_row_to_state(r) for r in rows]
             rows = self._conn.execute(
                 f"SELECT {cols} FROM torrent_state WHERE state != 'done' AND state != 'failed' "
                 "ORDER BY updated_at"

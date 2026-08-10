@@ -163,7 +163,12 @@ def _clone_formdata(fd: aiohttp.FormData) -> aiohttp.FormData:
                 value = bytes(value)
         except Exception:
             pass
-        ctype = headers.get("Content-Type") if isinstance(headers, dict) else None
+        # Headers may be CIMultiDict (not dict) — duck-type the lookup so
+        # retries keep the original Content-Type (e.g. application/x-bittorrent).
+        try:
+            ctype = headers.get("Content-Type") if hasattr(headers, "get") else None
+        except Exception:
+            ctype = None
         try:
             out.add_field(name, value, filename=filename, content_type=ctype)
         except Exception:

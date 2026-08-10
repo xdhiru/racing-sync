@@ -170,17 +170,27 @@ def make_file_batches(
     entries (season 0) so every downstream consumer (priorities, wait
     lists, include patterns, cleanup) works unchanged.
     """
+    def _sort_key(f: object) -> str:
+        try:
+            raw = getattr(f, "name", "")
+            name = raw if isinstance(raw, str) else str(raw or "")
+        except Exception:
+            name = ""
+        return name.replace("\\", "/")
+
     ordered = sorted(
         [f for f in files if getattr(f, "name", "")],
-        key=lambda f: f.name.replace("\\", "/"),
+        key=_sort_key,
     )
     episodes: list[Episode] = []
     for idx, f in enumerate(ordered, start=1):
         try:
-            size = int(float(getattr(f, "size_bytes", 0) or 0))
-        except (TypeError, ValueError):
+            raw_size = getattr(f, "size_bytes", 0) or 0
+            size = int(raw_size) if isinstance(raw_size, (int, float)) and raw_size == raw_size else int(float(raw_size))
+        except (TypeError, ValueError, OverflowError):
+            log.warning("batcher: unparsable size for %r; treating as 0", _sort_key(f)[:100])
             size = 0
         if size < 0:
-            raise ValueError(f"file {f.name!r} has negative size {size}")
-        episodes.append(Episode(f.name, 0, idx, size))
+            raise ValueError(f"file {_sort_key(f)!r} has negative size {size}")
+        episodes.append(Episode(_sort_key(f), 0, idx, size))
     return make_batches(episodes, cap_bytes=cap_bytes, max_files=max_files)

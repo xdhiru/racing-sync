@@ -144,23 +144,31 @@ def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
     pos = 1
     root: dict[bytes, object] = {}
     raw_info_bytes: bytes | None = None
+    # Share one item budget across the whole root dict: per-key _bdecode
+    # calls without it let a many-small-keys dict bypass MAX_BENCODE_ITEMS.
+    _budget: list[int] = [0]
 
     while True:
         if pos >= len(data):
             raise ValueError("unexpected EOF in root dict")
         if data[pos:pos + 1] == b"e":
             break
-        pos, k = _bdecode(data, pos, depth=1)
+        pos, k = _bdecode(data, pos, depth=1, _items=_budget)
         if not isinstance(k, (bytes, str)):
             raise ValueError("dict key must be string/bytes")
         k_bytes = k if isinstance(k, bytes) else k.encode("utf-8")
 
         val_start = pos
-        pos, v = _bdecode(data, pos, depth=1)
+        pos, v = _bdecode(data, pos, depth=1, _items=_budget)
         val_end = pos
         if k_bytes == b"info":
             raw_info_bytes = data[val_start:val_end]
         root[k_bytes] = v
+        # _bdecode only counts containers: count top-level pairs here so a
+        # flat many-small-keys dict cannot bypass MAX_BENCODE_ITEMS.
+        _budget[0] += 1
+        if _budget[0] > MAX_BENCODE_ITEMS:
+            raise ValueError(f"bencode item limit exceeded ({MAX_BENCODE_ITEMS})")
 
     info = root.get(b"info")
     if not isinstance(info, dict) or raw_info_bytes is None:
@@ -211,15 +219,19 @@ def extract_torrent_files_from_bencoded(data: bytes) -> list[Any]:
         return []
     pos = 1
     root: dict[bytes, object] = {}
+    _budget: list[int] = [0]
     while True:
         if pos >= len(data) or data[pos:pos + 1] == b"e":
             break
-        pos, k = _bdecode(data, pos, depth=1)
+        pos, k = _bdecode(data, pos, depth=1, _items=_budget)
         if not isinstance(k, (bytes, str)):
             break
         k_bytes = k if isinstance(k, bytes) else k.encode("utf-8")
-        pos, v = _bdecode(data, pos, depth=1)
+        pos, v = _bdecode(data, pos, depth=1, _items=_budget)
         root[k_bytes] = v
+        _budget[0] += 1
+        if _budget[0] > MAX_BENCODE_ITEMS:
+            raise ValueError(f"bencode item limit exceeded ({MAX_BENCODE_ITEMS})")
 
     info = root.get(b"info")
     if not isinstance(info, dict):
@@ -319,11 +331,16 @@ def parse_torrent_file(path: Path) -> tuple[str, str, int, str, bytes]:
 
 
 class WatchDirScanner:
+    # Metadata-only file cache: (mtime, size, infohash, name, size, announce).
+    # Torrent bytes are re-read on emission only, so the cache can never
+    # hold onto megabytes per file.
+    _FILE_CACHE_MAX = 512
+
     def __init__(self, cfg: WatchDirConfig, prowlarr: ProwlarrClient | None):
         self._cfg = cfg
         self._prowlarr = prowlarr
         self._seen: set[str] = set()  # infohashes already picked up
-        self._file_cache: dict[Path, tuple[float, int, str, str, int, str, bytes]] = {}
+        self._file_cache: dict[Path, tuple[float, int, str, str, int, str]] = {}
         self._bad_files: dict[Path, tuple[float, int]] = {}
 
     async def scan_once(self) -> list[WatchItem]:
@@ -355,13 +372,27 @@ class WatchDirScanner:
 
                 cached = self._file_cache.get(entry)
                 if cached and cached[0] == mtime and cached[1] == fsize:
-                    infohash, name, size, announce, data = (
-                        cached[2], cached[3], cached[4], cached[5], cached[6]
+                    infohash, name, size, announce = (
+                        cached[2], cached[3], cached[4], cached[5]
                     )
+                    # Bytes are never cached: re-read for emission (the file
+                    # is small — parse already size-checked it).
+                    try:
+                        data = entry.read_bytes()
+                    except OSError as e:
+                        log.warning("watch-dir: error accessing %s (%s)", entry.name, e)
+                        continue
+                    if len(data) != fsize:
+                        self._file_cache.pop(entry, None)
+                        continue
                 else:
                     try:
                         infohash, name, size, announce, data = parse_torrent_file(entry)
-                        self._file_cache[entry] = (mtime, fsize, infohash, name, size, announce, data)
+                        self._file_cache[entry] = (mtime, fsize, infohash, name, size, announce)
+                        if len(self._file_cache) > self._FILE_CACHE_MAX:
+                            # Evict oldest-inserted (dicts preserve order).
+                            for k in list(self._file_cache.keys())[: len(self._file_cache) - self._FILE_CACHE_MAX]:
+                                self._file_cache.pop(k, None)
                         self._bad_files.pop(entry, None)
                     except Exception as parse_err:
                         # Half-write guard: if modified recently (< 2s), wait for write to settle
