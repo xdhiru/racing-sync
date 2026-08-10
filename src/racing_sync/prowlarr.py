@@ -20,6 +20,35 @@ import aiohttp
 from .config import ProwlarrConfig
 
 
+def _is_fetchable_http_url(url: str) -> bool:
+    """True iff `url` is an http(s) URL that is not link-local/loopback.
+
+    Prowlarr enclosure URLs come from indexer feeds: never send requests to
+    cloud metadata endpoints or LAN hosts from a compromised/malicious feed.
+    Host-literal check only (no DNS resolution, so no rebinding protection —
+    indexers themselves remain trusted infrastructure).
+    """
+    try:
+        from ipaddress import ip_address as _ip
+
+        parts = urlsplit(url or "")
+        if parts.scheme not in ("http", "https"):
+            return False
+        host = (parts.hostname or "").strip().lower().strip("[]")
+        if not host:
+            return False
+        if host in ("localhost", "metadata.google.internal", "metadata.google",
+                    "instance-data", "instance-data-compute"):
+            return False
+        try:
+            ip = _ip(host)
+            return ip.is_global and not ip.is_multicast and not ip.is_reserved
+        except ValueError:
+            return True
+    except Exception:
+        return False
+
+
 def _scrub_url(url: str) -> str:
     """Scrub query parameters from URL to prevent leaking API keys or passkeys in logs."""
     try:
@@ -150,21 +179,29 @@ class ProwlarrClient:
                     raise ProwlarrError(f"prowlarr indexer refresh failed: {last_exc}") from last_exc
                 raise ProwlarrError("prowlarr indexer refresh returned no data")
             # Build temp dicts then swap atomically so readers never see empty.
+            # One malformed indexer entry must not abort the whole refresh.
             by_name: dict[str, Indexer] = {}
             by_id: dict[int, Indexer] = {}
             for raw in data:
                 try:
+                    if not isinstance(raw, dict):
+                        continue
                     idx_id = raw["id"]
                     idx_name = raw["name"]
+                    if not isinstance(idx_id, int) or not isinstance(idx_name, str):
+                        continue
+                    caps = raw.get("caps") or {}
+                    cats = (caps.get("categories") if isinstance(caps, dict) else None) or {}
+                    cats = cats.keys() if isinstance(cats, dict) else []
+                    idx = Indexer(
+                        id=idx_id,
+                        name=idx_name,
+                        protocol=raw.get("protocol", "torrent"),
+                        enable=raw.get("enable", True),
+                        capabilities=list(cats),
+                    )
                 except (KeyError, TypeError):
                     continue
-                idx = Indexer(
-                    id=idx_id,
-                    name=idx_name,
-                    protocol=raw.get("protocol", "torrent"),
-                    enable=raw.get("enable", True),
-                    capabilities=list(((raw.get("caps") or {}).get("categories") or {}).keys()),
-                )
                 by_name[idx.name.lower()] = idx
                 by_id[idx.id] = idx
             self._indexers_by_name = by_name
@@ -227,9 +264,15 @@ class ProwlarrClient:
                 break
             except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
                 last_exc = e
-                if attempt == 2:
-                    raise ProwlarrError(f"prowlarr search on {indexer.name!r} failed: {e}") from e
-                await asyncio.sleep(0.5 * (2 ** attempt))
+            except aiohttp.ClientResponseError as e:
+                # Rate-limit / gateway hiccups are retryable; anything else
+                # fails fast so bad queries don't burn 3 attempts.
+                if e.status not in (408, 425, 429, 502, 503, 504):
+                    raise ProwlarrError(f"prowlarr search on {indexer.name!r} failed: HTTP {e.status}") from e
+                last_exc = e
+            if attempt == 2:
+                raise ProwlarrError(f"prowlarr search on {indexer.name!r} failed: {last_exc}") from last_exc
+            await asyncio.sleep(0.5 * (2 ** attempt))
         return _parse_newznab(text, indexer)
 
     async def search_download_indexer(self, query: str) -> list[TorrentHit]:
@@ -244,6 +287,10 @@ class ProwlarrClient:
         parsed = urlsplit(hit.download_url)
         if parsed.scheme not in ("http", "https"):
             raise ProwlarrError(f"invalid or unsafe download_url scheme: {safe_url!r}")
+        # Never attach the Prowlarr X-Api-Key to third-party enclosure hosts
+        # (it would leak); instead refuse non-routable targets outright.
+        if not _is_fetchable_http_url(hit.download_url):
+            raise ProwlarrError(f"refusing non-routable download_url: {safe_url!r}")
 
         try:
             async with self._session.get(hit.download_url) as r:

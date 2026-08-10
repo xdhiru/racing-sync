@@ -108,13 +108,17 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         if not rows:
             return None
         t = rows[0]
-        # Concurrently fetch files and trackers to avoid serial RTT latency
+        # Concurrently fetch files and trackers to avoid serial RTT latency.
+        # Trackers are best-effort: a 404 there must not fail the lookup.
         files, trackers = await asyncio.gather(
             self.get_torrent_files(torrent_hash),
             self.get_trackers(torrent_hash),
+            return_exceptions=True,
         )
-        t.files = files
-        t.trackers = trackers
+        if isinstance(files, BaseException):
+            raise files
+        t.files = files if isinstance(files, list) else []
+        t.trackers = trackers if isinstance(trackers, list) else []
         return t
 
     async def get_torrent_files(self, torrent_hash: str) -> list[TorrentFile]:
@@ -216,6 +220,10 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         is_hex40 = len(text) == 40 and all(c in "0123456789abcdefABCDEF" for c in text)
         if is_hex40:
             return AddResult(hash=text.lower(), accepted=True, detail=text)
+        if len(text) == 64 and all(c in "0123456789abcdefABCDEF" for c in text):
+            # v2 (sha256) hash echo: accept, but leave hash empty — callers
+            # resolve the v1 lookup hash from the .torrent blob instead.
+            return AddResult(hash=None, accepted=True, detail=text)
         if text == "Ok." or text == "":
             return AddResult(hash=None, accepted=True, detail=text)
         if text == "Fails.":
