@@ -181,11 +181,49 @@ class JsonlFormatter(logging.Formatter):
                 payload[k] = "***"
                 continue
             try:
-                json.dumps(v)
-                payload[k] = sanitize_log_text(v) if isinstance(v, str) else v
-            except TypeError:
-                payload[k] = sanitize_log_text(repr(v))
+                payload[k] = _scrub_value(v)
+            except Exception:
+                try:
+                    payload[k] = sanitize_log_text(repr(v))
+                except Exception:
+                    payload[k] = "<unserializable>"
         return json.dumps(payload, ensure_ascii=False)
+
+
+def _scrub_value(v: object, depth: int = 0) -> object:
+    """Recursively scrub secrets from extras (dicts/lists/tuples/sets)."""
+    if depth > 5:
+        return "<max-depth>"
+    if isinstance(v, str):
+        return sanitize_log_text(v)
+    if isinstance(v, dict):
+        out: dict[object, object] = {}
+        for dk, dv in v.items():
+            try:
+                if isinstance(dk, str) and is_sensitive_key(dk):
+                    out[dk] = "***"
+                else:
+                    out[dk] = _scrub_value(dv, depth + 1)
+            except Exception:
+                out[dk] = "<unserializable>"
+        try:
+            json.dumps(out)
+            return out
+        except TypeError:
+            return sanitize_log_text(repr(v))
+    if isinstance(v, (list, tuple)):
+        cleaned = [_scrub_value(x, depth + 1) for x in v]
+        return cleaned if isinstance(v, list) else tuple(cleaned)
+    if isinstance(v, (set, frozenset)):
+        try:
+            return sorted((_scrub_value(x, depth + 1) for x in v), key=repr)
+        except Exception:
+            return sanitize_log_text(repr(v))
+    try:
+        json.dumps(v)
+        return v
+    except TypeError:
+        return sanitize_log_text(repr(v))
 
 
 # --------------------------------------------------------------------------- #
