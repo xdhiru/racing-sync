@@ -487,6 +487,8 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 content_layout, tags,
             )
 
+        if torrent_files and urls:
+            raise ValueError("add_torrent takes either torrent_files or urls, not both")
         results: list[Any] = []
         if torrent_files:
             # Deluge has add_torrent_file (string of base64 or .torrent path).
@@ -494,7 +496,16 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             import base64
             import uuid
             for blob in torrent_files:
-                encoded = base64.b64encode(blob).decode()
+                if not isinstance(blob, (bytes, bytearray)) or not blob:
+                    results.append(None)
+                    continue
+                # Bound the wire payload like the watchdir .torrent cap.
+                from ..watchdir import MAX_TORRENT_BYTES
+                if len(blob) > MAX_TORRENT_BYTES:
+                    raise ValueError(
+                        f"torrent payload exceeds {MAX_TORRENT_BYTES} bytes; refusing"
+                    )
+                encoded = base64.b64encode(bytes(blob)).decode()
                 res = await self._rpc(
                     "core.add_torrent_file", [f"{uuid.uuid4().hex}.torrent", encoded, opts]
                 )
@@ -506,7 +517,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         else:
             raise ValueError("add_torrent requires urls or torrent_files")
 
-        first_hash = str(results[0]) if (results and results[0]) else None
+        first_hash = next((str(r) for r in results if r), None)
         return AddResult(
             hash=first_hash,
             accepted=any(bool(r) for r in results),
@@ -577,7 +588,16 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         encoded = await self._rpc("core.get_torrent_file", [torrent_hash])
         if not encoded:
             raise FileNotFoundError(f"deluge has no .torrent for {torrent_hash}")
-        return base64.b64decode(encoded)
+        if not isinstance(encoded, str):
+            raise ValueError(f"deluge returned non-string .torrent for {torrent_hash}")
+        from ..watchdir import MAX_TORRENT_BYTES
+        # Base64 inflates ~4/3: reject before decoding unbounded input.
+        if len(encoded) > MAX_TORRENT_BYTES * 4 // 3 + 16:
+            raise ValueError(f"deluge .torrent for {torrent_hash} exceeds size cap")
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except Exception as e:
+            raise ValueError(f"deluge .torrent for {torrent_hash} is not valid base64: {e}") from e
 
 
 def build_deluge(cfg: SourceConfig) -> DelugeClient:
