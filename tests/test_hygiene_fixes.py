@@ -227,7 +227,7 @@ async def test_fuse_first_add_verified_before_trust(tmp_path):
     from unittest.mock import AsyncMock, MagicMock
 
     from racing_sync.clients.abstract import AddResult
-    from racing_sync.coordinator import Coordinator, _NOT_VISIBLE_DETAIL
+    from racing_sync.coordinator import _NOT_VISIBLE_DETAIL, Coordinator
 
     def _coord_with_add(add_result, get_result):
         coord = object.__new__(Coordinator)
