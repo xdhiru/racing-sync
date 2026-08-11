@@ -395,10 +395,33 @@ def disk_free_bytes_at(path: Path) -> int:
         return 0
 
 
+def _total_margin_bytes(cfg: AppConfig) -> int:
+    """Combined SSD safety margin: general + ssd-specific (both default 0)."""
+    def _as_int(raw: object) -> int:
+        # Non-numeric doubles (MagicMock cfg in unit tests) count as 0 —
+        # int(MagicMock) would otherwise invent a 1-byte margin.
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return 0
+        try:
+            return max(0, int(raw or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    try:
+        general = _as_int(getattr(cfg.general, "disk_safety_margin_bytes", 0))
+    except Exception:
+        general = 0
+    try:
+        specific = _as_int(getattr(cfg.ssd, "safety_margin_bytes", 0))
+    except Exception:
+        specific = 0
+    return general + specific
+
+
 def ssd_has_room(cfg: AppConfig, extra_bytes: int = 0) -> bool:
     """True iff `ssd.path` has at least `extra_bytes + safety_margin` free."""
     free = disk_free_bytes_at(cfg.ssd.path)
-    needed = extra_bytes + cfg.general.disk_safety_margin_bytes
+    needed = extra_bytes + _total_margin_bytes(cfg)
     return free >= needed
 
 
@@ -409,5 +432,5 @@ def ssd_free_bytes(cfg: AppConfig) -> int:
 def ssd_max_inflight_bytes(cfg: AppConfig) -> int:
     """Batcher cap is the configured max, capped by actual free space - safety margin."""
     free = disk_free_bytes_at(cfg.ssd.path)
-    usable = max(0, free - cfg.general.disk_safety_margin_bytes)
+    usable = max(0, free - _total_margin_bytes(cfg))
     return min(cfg.ssd.max_inflight_bytes, usable)

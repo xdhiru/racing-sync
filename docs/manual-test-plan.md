@@ -66,9 +66,12 @@ Add a 20 GB / 10-episode season torrent.
 Expected:
 
 1. Classifier returns `season`, 10 episodes.
-2. Batcher splits into 4 batches (each ≤ 500 GiB cap; trivial for this test).
-3. After each batch completion: rclone `--include` log, then `wiping local
-   tree` log. The season folder on SSD disappears between batches.
+2. Batcher splits into batches that each fit the frozen per-row cap (see
+   the `batched N episodes into M batches (cap=…)` log).
+3. After each verified batch move the torrent entry is deleted *with files*
+   and re-added fresh for the next batch (isolated batches — watch for
+   `isolated batch: ready for batch N/M`). The SSD holds at most one batch
+   at a time.
 4. After all batches: VPS2 has the full season on `fuse.mount`.
 
 ## 6. Recovery
@@ -100,9 +103,29 @@ Use a torrent that's only on a private tracker (Beta / Alpha). Expect:
 
 Force the SSD path to be 99% full. Expect:
 
-1. New torrents land in `state=waiting_disk`.
+1. New torrents land in `state=waiting_disk` (re-checked quietly, about
+   once a minute — no per-tick worker spam).
 2. Live status message shows them queued behind the cap.
 3. When space frees up, processing resumes automatically.
+
+## 9b. SSD budget over-commit
+
+With `max_inflight_bytes` well below free space (e.g. 5 GiB on an empty
+disk), start two torrents whose *combined* size exceeds the budget but
+each fit alone. Expect:
+
+1. The first goes `queued`; the second parks in `waiting_disk` even though
+   free space alone would fit it (check the `ssd budget in use` log).
+2. No `ENOSPC` mid-download; the second starts after the first releases
+   its reservation (`moving → re_adding`).
+
+## 9c. Fuse index lag
+
+While a move is running (remote busy), watch a re-add land. Expect:
+
+1. `accepted but not yet visible on fuse …; parking re-add` instead of a
+   failure — the row retries and reaches `done` once the index catches up.
+2. Moved files are never deleted or replaced by the retry.
 
 ## 10. Telegram
 
