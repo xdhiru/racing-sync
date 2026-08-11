@@ -2107,23 +2107,30 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
         while not self._stop:
             # Fresh-state re-guard: this loop runs for hours across batch
-            # resets — an operator forget / API retry mid-download must stop
-            # the worker instead of letting later upserts resurrect the row.
+            # resets — an operator forget (row gone) or API retry (row left
+            # DOWNLOADING) must stop the worker instead of letting later
+            # upserts resurrect or clobber the row. The worker keeps its own
+            # object (rebinding to a fresh row would strand the caller's
+            # state dispatch); all worker mutations are upserted immediately
+            # so the two stay in sync.
             try:
                 _fresh_dl = None
                 if getattr(self, "store", None) is not None and hasattr(self.store, "get"):
                     _fresh_dl = self.store.get(ts.source_infohash)
             except Exception:
                 _fresh_dl = None
+            if _fresh_dl is None:
+                log.info(
+                    "worker: row gone for %s (forgotten?); stopping download",
+                    ts.source_infohash[:10],
+                )
+                return
             if isinstance(_fresh_dl, TorrentState) and _fresh_dl.state != State.DOWNLOADING:
                 log.info(
                     "worker: %s left DOWNLOADING while downloading (%s); stopping",
                     ts.source_infohash[:10], _fresh_dl.state.value,
                 )
                 return
-            if isinstance(_fresh_dl, TorrentState):
-                ts = _fresh_dl
-                h = ts.dest_infohash or ts.source_infohash
             # Live tracking, keyed by dest hash for client polling; the
             # source hash is recorded inside for progress-map aliasing.
             self._live[h.lower()] = LiveItem(
