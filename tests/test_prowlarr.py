@@ -807,3 +807,36 @@ async def test_pick_rejects_hit_whose_payload_is_another_release():
 
 
 
+
+def test_fetchable_url_allows_own_prowlarr_refuses_metadata():
+    """Prowlarr on localhost/LAN must fetch; metadata/link-local must not.
+
+    Regression: the SSRF guard once refused 127.0.0.1 and failed every
+    Indexer enclosure download (6 worker tracebacks in one run).
+    """
+    from racing_sync.prowlarr import _is_fetchable_http_url
+
+    allowed = [
+        "http://127.0.0.1:9696/prowlarr/4/download",
+        "http://localhost:9696/dl/abc",
+        "http://192.168.1.10:9696/dl/abc",
+        "http://10.0.0.5/dl/abc",
+        "http://nas.local:9696/dl/abc",
+        "https://indexer.example.com/dl/abc.torrent",
+        "http://[::1]:9696/dl/abc",
+    ]
+    for url in allowed:
+        assert _is_fetchable_http_url(url), url
+
+    refused = [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://169.254.169.254/computeMetadata/v1/",
+        "http://metadata.google.internal/computeMetadata/v1/",
+        "http://instance-data/computeMetadata/v1/",
+        "http://224.0.0.1/announce",
+        "http://0.0.0.0/dl/abc",
+        "ftp://indexer.example.com/dl/abc",
+        "",
+    ]
+    for url in refused:
+        assert not _is_fetchable_http_url(url), url
