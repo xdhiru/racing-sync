@@ -24,7 +24,8 @@ disk_safety_margin_bytes = 10737418240
 # max_active_downloads = 3
 # max_concurrent_moves = 3
 # Stall timeout (seconds) for a VPS2 SSD download with zero progress.
-# 0 = disabled (default); set e.g. 3600 to fail visibly-stuck downloads.
+# 0 = disabled (default); set e.g. 3600 to park visibly-stuck downloads
+# back in DOWNLOADING for retry instead of failing them.
 # download_stall_timeout_seconds = 0
 
 # ============================================================
@@ -158,8 +159,10 @@ extra_fields = {}
 [ssd]
 # Path to check free space against (usually == dest.save_path)
 path = "/srv/qbittorrent/data"
-# Maximum bytes that may be occupied by an in-flight torrent at once.
-# Hard cap; batcher will not exceed this for season processing.
+# GLOBAL budget (bytes) shared by every concurrent download — not a
+# per-torrent cap. Each torrent reserves min(total, this) before admission
+# and parks in WAITING_DISK past it; batch footprints refine after
+# classification. Keep this below the filesystem size minus headroom.
 max_inflight_bytes = 536870912000   # 500 GiB
 # If a single-file torrent (movie) is larger than this, skip it entirely.
 # (Season torrents are still processed in batches even if larger.)

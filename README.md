@@ -56,11 +56,37 @@ substring — ambiguous names abort with the candidate list instead of
 guessing. Same operation is available at `POST /api/forget/{hash}` when the
 control API is enabled.
 
-Validate a config without starting anything:
+Validate a config (schema + environment: paths, rclone binary) without
+starting anything:
 
 ```bash
 python3 run.py check-config --config config.toml
 ```
+
+Unknown config keys are reported as warnings (they would otherwise be
+silently ignored) — useful for catching typos like `max_active_download`.
+
+## How it works (short version)
+
+- **SSD budget, not just a cap.** `ssd.max_inflight_bytes` is a *global*
+  budget shared by every concurrent download. Each torrent reserves its
+  footprint before admission (`WAITING_DISK` parks the rest); batch
+  footprints refine after classification; the ledger rebuilds from the DB
+  after an abrupt stop. Two 32 GB + 16 GB arrivals never jointly exceed a
+  40 GB budget, even if each fits free space alone.
+- **Isolated batches.** Multi-file torrents stream through the SSD one
+  batch at a time; after each verified move the torrent entry is deleted
+  *with files* and re-added fresh for the next batch. Shared piece-boundary
+  partials can never leak into the next batch, so only complete files reach
+  the remote (at the cost of re-downloading boundary pieces).
+- **Verified fuse injection.** Every fuse re-add is confirmed visible at
+  the target mount before the row advances. The fuse index can lag while
+  rclone is busy, so an accepted-but-invisible entry parks and retries —
+  never fails, never touches moved files.
+- **Quiet waits.** `WAITING_DISK` rows re-check at most once a minute, and
+  the log handlers survive a full disk instead of traceback-storming it.
+
+See `docs/architecture.md` for the full design.
 
 ### Installed alternative
 
@@ -96,6 +122,7 @@ src/racing_sync/
   coordinator_cleanup.py # VPS1 cleanup janitor
   coordinator_paths.py # Untrusted torrent-relative path guard
   coordinator_errors.py # Retryable WebUI / batch-move error contract
+  coordinator_content.py # Stateless helpers (normalize, grace, notify filter)
   recovery.py         # Reconciler (req #4)
   forget.py           # Abandon a torrent (row + client entries + SSD data)
   watchdir.py         # Manual torrent drop scanner
@@ -105,5 +132,5 @@ src/racing_sync/
     http_base.py      # HTTP client base with auth
     qbittorrent.py    # qBittorrent WebUI wrapper
     deluge.py         # Deluge JSON-RPC wrapper
-  telegram_bot.py     # Live status + log forwarder
+  telegram_bot.py     # Live status cards + active-tasks list
 ```
