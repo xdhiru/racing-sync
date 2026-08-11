@@ -21,12 +21,15 @@ from .config import ProwlarrConfig
 
 
 def _is_fetchable_http_url(url: str) -> bool:
-    """True iff `url` is an http(s) URL that is not link-local/loopback.
+    """True iff `url` is an http(s) URL safe to fetch an enclosure from.
 
-    Prowlarr enclosure URLs come from indexer feeds: never send requests to
-    cloud metadata endpoints or LAN hosts from a compromised/malicious feed.
-    Host-literal check only (no DNS resolution, so no rebinding protection —
-    indexers themselves remain trusted infrastructure).
+    Prowlarr itself commonly lives on localhost/LAN (enclosure downloads
+    are served by Prowlarr), so loopback and private hosts are explicitly
+    allowed. Refused: multicast/unspecified/link-local literals (cloud
+    metadata endpoints like 169.254.169.254 live there) and known metadata
+    hostnames. No DNS resolution, so no rebinding protection —
+    indexers themselves remain trusted infrastructure; this only narrows
+    what a compromised/malicious feed entry can make us fetch.
     """
     try:
         from ipaddress import ip_address as _ip
@@ -37,14 +40,16 @@ def _is_fetchable_http_url(url: str) -> bool:
         host = (parts.hostname or "").strip().lower().strip("[]")
         if not host:
             return False
-        if host in ("localhost", "metadata.google.internal", "metadata.google",
+        if host in ("metadata.google.internal", "metadata.google",
                     "instance-data", "instance-data-compute"):
             return False
         try:
             ip = _ip(host)
-            return ip.is_global and not ip.is_multicast and not ip.is_reserved
         except ValueError:
             return True
+        if ip.is_multicast or ip.is_unspecified or ip.is_link_local:
+            return False
+        return True
     except Exception:
         return False
 
