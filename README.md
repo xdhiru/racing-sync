@@ -38,23 +38,53 @@ are re-adopted by recovery on startup and resume (complete ones continue to
 the rclone move, partial SSD ones resume downloading) — a startup warning
 names how many rows were rebuilt. `--reset` never deletes torrent data.
 
+Mid-testing clean slate (`--reset --full`): also drops every `racing`
+client entry on dest **with files**, wipes SSD data (children only, never
+the SSD root itself) and the cached `.torrent` blobs in
+`watch_cross_seeds/`:
+
+```bash
+python3 run.py run --config config.toml --reset --full
+```
+
+Fuse/remote copies are never touched. Refuses unsafe SSD roots (symlink,
+fuse mount, filesystem root, project checkout) instead of wiping.
+
 ### Abandon a torrent (`forget`)
 
 Recovery gives the pipeline no way to *stop* wanting a torrent, so `forget`
 is the off-switch: it drops the DB row, deletes the matching destination
-client entries, and removes the torrent's local SSD data (fuse/remote
-copies are never touched). Dry-run by default; `--apply` deletes:
+client entries, removes the torrent's local SSD data **and** its cached
+`watch_cross_seeds/<hash>/` blobs (fuse/remote copies are never touched).
+Dry-run by default; `--apply` deletes:
 
 ```bash
 python3 run.py forget --config config.toml <infohash|name>
 python3 run.py forget --config config.toml <infohash|name> --apply
 python3 run.py forget --config config.toml <infohash|name> --apply --keep-files
+python3 run.py forget --config config.toml <infohash|name> --apply --ignore
 ```
 
 `<infohash|name>` is a 40-char infohash (any known hash) or a unique name
 substring — ambiguous names abort with the candidate list instead of
-guessing. Same operation is available at `POST /api/forget/{hash}` when the
-control API is enabled.
+guessing. `--ignore` also records the release as cancelled so discovery,
+recovery, re-injection and late-seed never pick it up again while it stays
+on VPS1; lift with:
+
+```bash
+python3 run.py unignore --config config.toml --list
+python3 run.py unignore --config config.toml <infohash|name>
+```
+
+Same operation is available at `POST /api/forget/{hash}?ignore=true` when
+the control API is enabled.
+
+From Telegram you don't need the CLI at all: the Active Tasks message
+shows one `Cancel: /cancel_<hash>` line per torrent (10-char short hash;
+full 40-char hashes also work). Copy-paste it into the chat and the bot
+forgets + ignores it immediately (row, dest entries, SSD data, blob
+cache) — no confirmation, the sent message is final. Unknown or
+ambiguous prefixes get a reply telling you what to send instead.
 
 Validate a config (schema + environment: paths, rclone binary) without
 starting anything:

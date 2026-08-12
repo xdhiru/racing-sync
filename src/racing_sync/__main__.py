@@ -58,20 +58,21 @@ async def _runner(coord: Coordinator) -> int:
         await coord.shutdown()
 
 
-def _is_safe_log_dir_to_clear(log_dir: Path) -> str | None:
-    """Return None when `log_dir` is safe to clear, else a refusal reason.
+def _is_safe_dir_to_clear(path: Path, label: str = "log dir") -> str | None:
+    """Return None when `path` is safe to clear children of, else a reason.
 
-    `--reset` deletes every child of the configured log dir. A misconfigured
-    path (filesystem root, /var/log, home dir, symlink to elsewhere) would
-    wipe data outside racing-sync. Fail closed: refuse with a reason.
+    `--reset` / `--full` delete every child of the configured dir. A
+    misconfigured path (filesystem root, /var/log, home dir, symlink to
+    elsewhere) would wipe data outside racing-sync. Fail closed.
     """
+    log_dir = path
     try:
         # Never follow a symlink to an unexpected target.
         if log_dir.is_symlink():
-            return f"refusing to clear log dir (is a symlink): {log_dir}"
+            return f"refusing to clear {label} (is a symlink): {log_dir}"
         resolved = log_dir.resolve()
     except OSError as e:
-        return f"refusing to clear log dir (cannot resolve {log_dir}): {e}"
+        return f"refusing to clear {label} (cannot resolve {log_dir}): {e}"
     anchor = Path(resolved.anchor)
     if resolved == anchor or str(resolved) in ("/", "\\"):
         return f"refusing to clear filesystem root: {log_dir}"
@@ -125,6 +126,41 @@ def _is_safe_log_dir_to_clear(log_dir: Path) -> str | None:
         # app dir? Fail closed: refuse bare top-level dirs.
         return f"refusing to clear top-level directory: {log_dir}"
     return None
+
+
+def _is_safe_log_dir_to_clear(log_dir: Path) -> str | None:
+    """Back-compat wrapper: log-dir safety check."""
+    return _is_safe_dir_to_clear(log_dir, "log dir")
+
+
+def _clear_dir_children(root: Path, *, base_desc: str) -> list[str]:
+    """Delete every child of `root` (never `root` itself). Returns log lines."""
+    from .rclone_ops import validate_safe_delete_path
+
+    lines: list[str] = []
+    try:
+        children = sorted(root.iterdir())
+    except OSError as e:
+        return [f"could not list {base_desc} {root}: {e}"]
+    for child in children:
+        try:
+            validate_safe_delete_path(child, base_dir=root)
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            elif child.is_file() or child.is_symlink():
+                child.unlink()
+            else:
+                try:
+                    child.unlink()
+                except OSError as e:
+                    lines.append(f"could not delete {base_desc} entry {child}: {e}")
+                    continue
+            lines.append(f"deleted {base_desc} entry: {child}")
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"could not delete {base_desc} entry {child}: {e}")
+    if not lines:
+        lines.append(f"{base_desc} already empty: {root}")
+    return lines
 
 
 def _db_sidecar_paths(db: Path) -> list[Path]:
@@ -189,6 +225,126 @@ def _do_reset(cfg: AppConfig) -> list[str]:
     return removed
 
 
+async def _do_full_reset(cfg: AppConfig) -> list[str]:
+    """True clean slate for testing: dest racing entries + SSD + blob cache.
+
+    Runs after `_do_reset` (state.db + logs already gone) and before the
+    coordinator starts, so nothing re-adopts mid-wipe. Removes every
+    `racing`-category entry on the dest client *with files*, wipes the
+    cached .torrent blob dir, and drops the ignore list with the DB.
+    Fuse/remote copies are never touched. Best-effort per step — failures
+    are reported, never raised (leftovers are re-adopted and resume).
+    """
+    from .clients.qbittorrent import QBittorrentClient
+    from .rclone_ops import validate_safe_delete_path
+
+    done: list[str] = []
+    dest = QBittorrentClient(cfg.dest, label="dest-reset")
+    try:
+        await dest.start()
+    except Exception as e:
+        done.append(f"full reset: dest client unreachable ({e}); client entries kept")
+        try:
+            await dest.close()
+        except Exception:
+            pass
+        dest = None  # type: ignore[assignment]
+    if dest is not None:
+        try:
+            try:
+                racing = await dest.list_torrents(category="racing") or []
+            except Exception as e:
+                racing = []
+                done.append(f"full reset: cannot list dest entries ({e})")
+            for t in racing:
+                h = (getattr(t, "hash", "") or "").lower()
+                if not h:
+                    continue
+                try:
+                    await dest.delete(h, delete_files=True)
+                    done.append(f"deleted dest entry with files: {h[:10]}")
+                except Exception as e:  # noqa: BLE001
+                    done.append(f"could not delete dest entry {h[:10]}: {e}")
+        finally:
+            try:
+                await dest.close()
+            except Exception:
+                pass
+    # Cached .torrent blobs (sibling of state.db): the whole directory.
+    try:
+        blob_root = Path(cfg.general.state_db).parent / "watch_cross_seeds"
+        if blob_root.is_dir() and not blob_root.is_symlink():
+            validate_safe_delete_path(
+                blob_root, base_dir=Path(cfg.general.state_db).parent)
+            shutil.rmtree(blob_root)
+            done.append(f"deleted blob cache: {blob_root}")
+        else:
+            done.append("blob cache absent, nothing to clear")
+    except Exception as e:  # noqa: BLE001
+        done.append(f"could not clear blob cache: {e}")
+    # SSD data (children only, never the SSD root itself). Dest entries
+    # were already deleted with files above; this catches orphans from
+    # crashed downloads or non-racing categories left mid-testing.
+    try:
+        raw_roots = [getattr(cfg.ssd, "path", None),
+                     getattr(cfg.dest, "save_path", None)]
+        seen: set[str] = set()
+        ssd_roots: list[Path] = []
+        for raw in raw_roots:
+            if not isinstance(raw, (str, Path)) or not str(raw).strip():
+                continue
+            try:
+                p = Path(str(raw))
+            except Exception:
+                continue
+            try:
+                key = str(p.resolve())
+            except OSError:
+                key = str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            ssd_roots.append(p)
+        # Fuse mounts are never touched: refuse an SSD root that *is* a
+        # fuse mount (misconfiguration would delete remote data).
+        fuse_roots: list[Path] = []
+        try:
+            for raw in (getattr(cfg.rclone.fuse, "mount", None),
+                        getattr(cfg.rclone.fuse, "mount_unsorted", None)):
+                if isinstance(raw, (str, Path)) and str(raw).strip():
+                    fuse_roots.append(Path(str(raw)))
+        except Exception:
+            fuse_roots = []
+        for root in ssd_roots:
+            try:
+                if root.is_symlink():
+                    done.append(f"full reset: refusing to wipe SSD dir (is a symlink): {root}")
+                    continue
+                resolved = root.resolve()
+            except OSError as e:
+                done.append(f"full reset: cannot resolve SSD dir {root}: {e}")
+                continue
+            try:
+                if any(resolved == f.resolve() for f in fuse_roots if f.exists()):
+                    done.append(f"full reset: refusing to wipe SSD dir (is a fuse mount): {root}")
+                    continue
+            except OSError:
+                pass
+            refusal = _is_safe_dir_to_clear(root, "SSD dir")
+            if refusal is not None:
+                done.append(f"full reset: {refusal}; SSD data kept")
+                continue
+            if not root.is_dir():
+                done.append(f"SSD dir absent, nothing to clear: {root}")
+                continue
+            done.extend(_clear_dir_children(root, base_desc="SSD data"))
+    except Exception as e:  # noqa: BLE001
+        done.append(f"could not clear SSD data: {e}")
+    if not done:
+        done.append("nothing to fully reset")
+    return done
+
+
 def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
     """Run the forget off-switch (dry-run plan by default, --apply to delete)."""
     from .clients.qbittorrent import QBittorrentClient
@@ -204,6 +360,7 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
                 cfg, dest=dest, store=store,
                 target=args.target, apply=args.apply,
                 delete_files=not args.keep_files,
+                ignore=bool(getattr(args, "ignore", False)),
             )
         finally:
             try:
@@ -240,7 +397,43 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
         print(f"  skipped: {s}")
     for e in result["errors"]:
         print(f"  error: {e}")
+    if result.get("ignored"):
+        print("  ignored: will not be picked up again while listed")
     return 1 if result["errors"] else 0
+
+
+def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
+    """List or remove cancelled-release ignore entries."""
+    from .state import StateStore
+
+    try:
+        store = StateStore(cfg.general.state_db)
+    except Exception as e:
+        print(f"forget failed: {e}", file=sys.stderr)
+        return 1
+    try:
+        if getattr(args, "list", False) or not getattr(args, "target", None):
+            rows = store.list_ignored()
+            if not rows:
+                print("ignore list is empty")
+            for r in rows:
+                print(f"  {(r['source_name'] or '?')[:60]} ({(r['source_infohash'] or '')[:10]})")
+            return 0
+        try:
+            found = store.find_ignored(args.target)
+        except LookupError as e:
+            print(f"unignore: {e}", file=sys.stderr)
+            return 1
+        if store.unignore_torrent(found["source_infohash"]):
+            print(f"unignored: {(found['source_name'] or '?')[:60]} ({found['source_infohash'][:10]})")
+        else:
+            print("unignore: entry already gone")
+        return 0
+    finally:
+        try:
+            store.close()
+        except Exception:
+            pass
 
 
 def _check_config_env(cfg: AppConfig) -> list[str]:
@@ -329,6 +522,13 @@ def main(argv: list[str] | None = None) -> int:
              "clients/SSD are re-adopted by recovery and resume; use "
              "'forget' to abandon a torrent entirely.",
     )
+    p_run.add_argument(
+        "--full",
+        action="store_true",
+        help="With --reset: also drop dest racing entries (with files), wipe "
+             "SSD data and the cached .torrent blobs — a true clean slate "
+             "for testing. Implies --reset. Fuse/remote copies are untouched.",
+    )
 
     p_forget = sub.add_parser(
         "forget",
@@ -349,6 +549,27 @@ def main(argv: list[str] | None = None) -> int:
         "--keep-files",
         action="store_true",
         help="Remove client entries + DB row but keep local data files.",
+    )
+    p_forget.add_argument(
+        "--ignore",
+        action="store_true",
+        help="With --apply: also record the release as cancelled so it is "
+             "never picked up again while listed on VPS1. Use 'unignore' to "
+             "lift it.",
+    )
+
+    p_unignore = sub.add_parser(
+        "unignore",
+        help="Lift a cancellation: list the ignore list (--list) or remove one entry.",
+    )
+    p_unignore.add_argument("--config", type=Path, required=True)
+    p_unignore.add_argument(
+        "target", nargs="?",
+        help="40-char infohash or unique name substring. Omit with --list.",
+    )
+    p_unignore.add_argument(
+        "--list", action="store_true",
+        help="List cancelled releases instead of removing one.",
     )
 
     p_check = sub.add_parser("check-config", help="Validate config and exit")
@@ -377,9 +598,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "forget":
         return _cmd_forget(cfg, args)
 
-    if getattr(args, "reset", False):
+    if args.cmd == "unignore":
+        return _cmd_unignore(cfg, args)
+
+    if getattr(args, "reset", False) or getattr(args, "full", False):
         for line in _do_reset(cfg):
             print(line)
+        if getattr(args, "full", False):
+            for line in asyncio.run(_do_full_reset(cfg)):
+                print(line)
 
     try:
         setup_logging(cfg)

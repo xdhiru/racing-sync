@@ -92,6 +92,7 @@ class ForgetResult(BaseModel):
     local_paths: list[str]
     skipped_paths: list[str]
     errors: list[str]
+    ignored: bool = False
 
 
 def build_app(coord: Coordinator) -> FastAPI:
@@ -209,6 +210,7 @@ def build_app(coord: Coordinator) -> FastAPI:
     async def forget(
         source_infohash: str,
         delete_files: bool = Query(default=True),
+        ignore: bool = Query(default=False),
     ) -> ForgetResult:
         normalized = (source_infohash or "").strip().lower()
         if not _INFOHASH_RE.fullmatch(normalized):
@@ -218,6 +220,7 @@ def build_app(coord: Coordinator) -> FastAPI:
                 result = await forget_torrent(
                     cfg, dest=coord.dest_client, store=coord.store,
                     target=normalized, apply=True, delete_files=delete_files,
+                    ignore=ignore,
                 )
             except LookupError as e:
                 raise HTTPException(404, str(e)) from e
@@ -234,6 +237,7 @@ def build_app(coord: Coordinator) -> FastAPI:
             local_paths=result["local_paths"],
             skipped_paths=result["skipped_paths"],
             errors=result["errors"],
+            ignored=bool(result.get("ignored", False)),
         )
 
     return app

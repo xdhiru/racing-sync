@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 from pathlib import Path
 
 from .rclone_ops import validate_safe_delete_path, wipe_local_tree
@@ -64,6 +65,22 @@ def _ssd_bases(cfg) -> list[Path]:
         if isinstance(raw, Path) and raw not in bases:
             bases.append(raw)
     return bases
+
+
+def _watch_cross_seeds_dir(cfg, source_infohash: str) -> Path | None:
+    """Cached .torrent dir for one row (sibling of state.db), if configured."""
+    norm = (source_infohash or "").strip().lower()
+    if not norm:
+        # Never return the blob root itself: forgetting a hash-less row
+        # must not wipe every cached .torrent.
+        return None
+    try:
+        db = Path(getattr(cfg.general, "state_db", ""))
+    except Exception:
+        return None
+    if not str(db):
+        return None
+    return db.parent / "watch_cross_seeds" / norm
 
 
 async def _candidate_local_paths(cfg, dest, row, entry_hashes: list[str]) -> tuple[list[Path], list[str]]:
@@ -142,6 +159,7 @@ async def forget_torrent(
     target: str,
     apply: bool,
     delete_files: bool = True,
+    ignore: bool = False,
 ) -> dict:
     """Plan (apply=False) or execute (apply=True) abandoning one torrent.
 
@@ -149,6 +167,10 @@ async def forget_torrent(
     entries and local paths, skipped paths, and per-step errors. Lookup
     failures raise LookupError; operational errors are collected, never
     raised mid-way (a half-finished forget must be visible, not silent).
+
+    `ignore=True` additionally records the release on the ignore list so
+    discovery/recovery/re-injection never pick it up again while it stays
+    on the VPS1 racing client (only meaningful with apply=True).
     """
     row = resolve_row(store, target)
     known = sorted(_row_hashes(row))
@@ -165,9 +187,19 @@ async def forget_torrent(
     local_paths, skipped = await _candidate_local_paths(
         cfg, dest, row, [h for h in known if h in entries] or known[:1],
     )
+    # Cached .torrent blobs for this row (sibling of state.db): planned in
+    # dry-run like any other local path, removed on apply.
+    blob_dir = _watch_cross_seeds_dir(cfg, row.source_infohash)
+    if blob_dir is not None:
+        try:
+            if blob_dir.exists() or blob_dir.is_symlink():
+                local_paths.append(blob_dir)
+        except OSError as e:
+            skipped.append(f"{blob_dir}: {e}")
     result: dict = {
         "applied": apply,
         "delete_files": delete_files,
+        "ignored": bool(apply and ignore),
         "source_infohash": row.source_infohash,
         "source_name": row.source_name,
         "state": row.state.value,
@@ -186,12 +218,33 @@ async def forget_torrent(
             result["errors"].append(f"dest entry {h[:10]}: {e}")
     if delete_files:
         bases = _ssd_bases(cfg)
+        try:
+            state_parent = Path(getattr(cfg.general, "state_db", "")).parent
+        except Exception:
+            state_parent = None
         for p in local_paths:
             try:
-                await _remove_path(p, bases)
+                if blob_dir is not None and Path(p) == blob_dir:
+                    # Blob cache: guarded by the state.db parent, not SSD bases.
+                    if state_parent is None:
+                        raise ValueError("state.db parent unknown; refusing blob cache delete")
+                    validate_safe_delete_path(Path(p), base_dir=state_parent)
+                    if Path(p).is_symlink():
+                        await asyncio.to_thread(Path(p).unlink)
+                    else:
+                        await asyncio.to_thread(shutil.rmtree, str(p), True)
+                else:
+                    await _remove_path(p, bases)
                 log.info("forget: removed local path %s", p)
             except Exception as e:  # noqa: BLE001
                 result["errors"].append(f"local path {p}: {e}")
+    if ignore:
+        try:
+            store.ignore_torrent(row.source_infohash, row.source_name)
+            log.info("forget: ignoring %s going forward", row.source_infohash[:10])
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append(f"ignore list: {e}")
+            result["ignored"] = False
     try:
         store.delete(row.source_infohash)
     except Exception as e:  # noqa: BLE001

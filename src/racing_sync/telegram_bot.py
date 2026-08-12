@@ -276,6 +276,20 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     return _safe_truncate_markdown("\n".join(lines))
 
 
+#: Hex chars of the infohash shown in the per-task `/cancel_` command.
+#: 10 chars (40 bits) is unambiguous for hundreds of rows and short enough
+#: to copy-paste; full 40-char hashes are also accepted by the watcher.
+CANCEL_SHORT_LEN = 10
+
+#: `/cancel_<hex>` (optional `@bot` suffix, extra trailing text ignored).
+CANCEL_CMD_RE = re.compile(r"^/cancel_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+
+def _cancel_command(infohash: str) -> str:
+    """Copy-pasteable cancel command for one task (short hash)."""
+    return f"/cancel_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
 def render_active(
     active: list[tuple[TorrentState, float | None]],
     page: int = 0,
@@ -357,6 +371,11 @@ def render_active(
             state_text += f" · {_esc(domain)}"
 
         lines.append(f"  {state_text}")
+        # Per-task copy-paste cancel command (no buttons, no confirm —
+        # the user's sent message is final). In backticks so the
+        # underscore in `/cancel_...` can't break Markdown parsing and
+        # mobile clients offer tap-to-copy.
+        lines.append(f"  Cancel: `{_cancel_command(full_hash)}`")
         lines.append("")
 
     rendered = _safe_truncate_markdown("\n".join(lines).strip())
@@ -702,7 +721,12 @@ class TelegramBot:
 
     # ---- active tasks pagination & callback handling ----
 
-    def _build_keyboard(self, current_page: int, total_pages: int) -> InlineKeyboardMarkup | None:
+    def _build_keyboard(
+        self,
+        current_page: int,
+        total_pages: int,
+    ) -> InlineKeyboardMarkup | None:
+        """Pagination nav buttons (cancel is via `/cancel_` chat commands)."""
         if total_pages <= 1:
             buttons = [
                 [InlineKeyboardButton("🔄 Refresh", callback_data="page:refresh")]
@@ -722,7 +746,7 @@ class TelegramBot:
         return InlineKeyboardMarkup(buttons)
 
     async def _callback_loop(self) -> None:
-        """Poll get_updates to handle pagination inline keyboard clicks."""
+        """Poll get_updates for pagination clicks and `/cancel_` commands."""
         assert self._bot is not None
         offset = 0
         while not self._stopped:
@@ -730,12 +754,16 @@ class TelegramBot:
                 updates = await self._bot.get_updates(
                     offset=offset,
                     timeout=10,
-                    allowed_updates=["callback_query"],
+                    allowed_updates=["callback_query", "message", "channel_post"],
                 )
                 for u in updates:
                     offset = max(offset, u.update_id + 1)
                     if u.callback_query:
                         await self._handle_callback(u.callback_query)
+                        continue
+                    msg = getattr(u, "message", None) or getattr(u, "channel_post", None)
+                    if msg is not None:
+                        await self._handle_chat_message(msg)
             except asyncio.CancelledError:
                 return
             except (TimedOut, NetworkError):
@@ -820,6 +848,154 @@ class TelegramBot:
 
         self._last_active_cache = None
         await self._refresh_active_message()
+
+    # ---- task cancellation via `/cancel_` chat commands ----
+
+    def _resolve_cancel_target(self, short: str):
+        """Map a `/cancel_<prefix|full-hash>` token to its tracked row.
+
+        Raises LookupError when unknown or ambiguous (prefix matches
+        several rows — resend with the full 40-char hash).
+        """
+        norm = (short or "").strip().lower()
+        if not norm or any(c not in "0123456789abcdef" for c in norm):
+            raise LookupError(f"not a torrent hash: {short!r}")
+        try:
+            if len(norm) == 40:
+                row = self._store.get(norm)
+                if row is not None:
+                    return row
+        except Exception:
+            pass
+        try:
+            candidates = [
+                ts for ts in self._store.all()
+                if (ts.source_infohash or "").lower().startswith(norm)
+            ]
+        except Exception as e:  # noqa: BLE001
+            raise LookupError(f"cannot look up {short!r}: {e}") from e
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            preview = ", ".join(
+                f"{(ts.source_name or '?')[:30]} ({(ts.source_infohash or '')[:10]})"
+                for ts in candidates[:5]
+            )
+            raise LookupError(
+                f"/cancel_{norm} matches {len(candidates)} torrents: {preview}; "
+                "send /cancel_<full 40-char hash>"
+            )
+        raise LookupError(
+            f"no tracked torrent starts with {norm!r} "
+            "(it may already be done/cancelled)"
+        )
+
+    async def _handle_chat_message(self, message: Any) -> None:
+        """Execute `/cancel_<hash>` commands sent in the chat (no confirm).
+
+        The user's sent message is final: resolve the short/full hash,
+        forget+ignore it, and reply with the outcome. Anything else is
+        ignored. Only the configured chat/user may cancel.
+        """
+        try:
+            chat = getattr(message, "chat", None)
+            chat_id = getattr(chat, "id", None)
+            from_user = getattr(message, "from_user", None)
+            user_id = getattr(from_user, "id", None)
+            cfg_chat = str(self._cfg.chat_id)
+            if str(chat_id) != cfg_chat and str(user_id) != cfg_chat:
+                return
+            text = (
+                getattr(message, "text", None)
+                or getattr(message, "caption", None)
+                or ""
+            )
+            text = str(text or "").strip()
+            m = CANCEL_CMD_RE.match(text)
+            if not m:
+                return
+            short = m.group(1)
+            try:
+                target = await asyncio.to_thread(
+                    self._resolve_cancel_target, short)
+                full_hash = target.source_infohash
+            except LookupError as e:
+                await self._reply(str(e)[:300], reply_to=message)
+                return
+            result = await self._cancel_torrent(full_hash)
+            await self._reply(result[:300], reply_to=message)
+            self._last_active_cache = None
+            await self._refresh_active_message()
+        except Exception as e:  # noqa: BLE001
+            log.debug("cancel command handling failed: %s", e)
+
+    async def _reply(self, text: str, reply_to: Any = None) -> None:
+        """Best-effort chat reply (plain text, no markdown to parse)."""
+        bot = getattr(self, "_bot", None)
+        if bot is None:
+            return
+        try:
+            kwargs: dict[str, Any] = {}
+            try:
+                msg_id = getattr(reply_to, "message_id", None)
+                if isinstance(msg_id, int) and msg_id > 0:
+                    kwargs["reply_to_message_id"] = msg_id
+            except Exception:
+                pass
+            sent = await bot.send_message(self._cfg.chat_id, text, **kwargs)
+            self._note_outbound(getattr(sent, "message_id", None))
+        except Exception as e:  # noqa: BLE001
+            log.debug("cancel reply failed: %s", e)
+
+    async def _cancel_torrent(self, infohash: str) -> str:
+        """Forget + ignore one release (row, dest entries, SSD data)."""
+        try:
+            from .api import _hold_ops_lock
+        except Exception:
+            _hold_ops_lock = None  # type: ignore[assignment]
+        try:
+            from .forget import forget_torrent
+        except Exception as e:  # noqa: BLE001
+            return f"Cancel failed: {e}"
+        coord = getattr(self, "_coord", None)
+        store = getattr(self, "_store", None)
+        if coord is None or store is None:
+            return "Cancel failed: bot not attached"
+        dest = getattr(coord, "dest_client", None)
+        cfg = getattr(coord, "cfg", None)
+        if dest is None or cfg is None:
+            return "Cancel failed: coordinator not ready"
+        try:
+            if _hold_ops_lock is not None:
+                async with _hold_ops_lock(coord):
+                    result = await forget_torrent(
+                        cfg, dest=dest, store=store, target=infohash,
+                        apply=True, delete_files=True, ignore=True,
+                    )
+                    try:
+                        await coord._ssd_release(
+                            result.get("source_infohash") or infohash)
+                    except Exception:
+                        pass
+            else:
+                result = await forget_torrent(
+                    cfg, dest=dest, store=store, target=infohash,
+                    apply=True, delete_files=True, ignore=True,
+                )
+                try:
+                    await coord._ssd_release(
+                        result.get("source_infohash") or infohash)
+                except Exception:
+                    pass
+        except LookupError:
+            return "Already gone from tracking"
+        except Exception as e:  # noqa: BLE001
+            return f"Cancel failed: {e}"
+        name = str(result.get("source_name") or infohash[:10])[:50]
+        errs = result.get("errors") or []
+        if errs:
+            return f"Cancelled {name} with {len(errs)} error(s); check logs"
+        return f"Cancelled {name} (removed + ignored)"
 
     # ---- active tasks list ----
 

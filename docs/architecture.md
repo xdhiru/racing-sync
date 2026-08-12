@@ -4,7 +4,7 @@
 
 ```
 src/racing_sync/
-  __main__.py         CLI (run / forget / check-config)
+  __main__.py         CLI (run [--reset/--full] / forget [--ignore] / unignore / check-config)
   config.py           Pydantic schema, cross-validates everything
   logging_setup.py    Rotating files + JSONL + ring buffer + optional HTTP sink
   state.py            SQLite state machine (State, ALLOWED, StateStore)
@@ -15,7 +15,7 @@ src/racing_sync/
   prowlarr.py         Prowlarr client (indexers, search, download)
   watchdir.py         Watch-dir scanner with bencoded torrent parser
   recovery.py         Startup reconciler
-  forget.py           Abandon-torrent off-switch (row + entries + SSD data)
+  forget.py           Abandon-torrent off-switch (row + entries + SSD data + blob cache + optional ignore)
   coordinator.py      Main async loop + per-torrent workers (tick, dispatch)
   coordinator_ssd.py  SSD batch caps + global reservation ledger
   coordinator_picker.py  Cross-seed SSD-source picker (req #1/#2)
@@ -198,15 +198,25 @@ memoized 30 minutes when healthy (new arrivals wait at most one window).
 
 One message per torrent (detail card, edited in place as the state
 advances) plus one active-tasks list message, refreshed every
-`status_update_interval` seconds with pagination buttons. Callback
-debounce is per chat/user; pinning disables itself only on permanent
-errors. `notify()` posts out-of-band errors as plain-text fallback.
+`status_update_interval` seconds with pagination buttons. Each active
+task renders a `Cancel: /cancel_<short-hash>` line (10-char prefix in
+backticks so mobile offers tap-to-copy; full hashes accepted too).
+The updates poller also watches chat messages: a `/cancel_<...>` line
+from the configured chat/user resolves the prefix against tracked rows
+and runs forget+ignore immediately (row, dest entries, SSD data, blob
+cache) with no confirmation, then replies with the outcome and frees
+the SSD reservation. Unknown/ambiguous prefixes get an explanatory
+reply. Callback debounce stays pagination-only. Cancelled releases live
+in `ignored_torrents` (in state.db, so `--reset` clears them) and are
+skipped at discovery, recovery adoption, re-injection and late-seed
+time.
 
 ## FastAPI control plane
 
 `GET /api/state` (paginated) · `GET /api/active` (bounded) ·
 `GET /api/logs` · `GET /api/ssd` · `POST /api/recover` ·
-`POST /api/retry/{hash}` · `POST /api/forget/{hash}` (always applies) ·
+`POST /api/retry/{hash}` · `POST /api/forget/{hash}?ignore=true`
+(always applies; `ignore` records the cancellation) ·
 `POST /api/scan-watch`. Useful when the Telegram bot isn't enough. Auth via
 nginx-injected `X-Authenticated-User` header or a static token.
 
