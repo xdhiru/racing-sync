@@ -1491,3 +1491,110 @@ async def test_isolated_reset_missing_blob_parks_without_delete():
     assert ok is False
     coord.dest_client.delete.assert_not_called()
     coord.dest_client.add_torrent.assert_not_called()
+@pytest.mark.anyio
+async def test_park_moving_records_reason_and_escalates(tmp_path, caplog):
+    """MOVING parks must name their gate instead of idling silently.
+
+    Regression (core stall): _do_moving early returns parked with only a
+    WARNING, so a gate that never passes (unverifiable pause, 0-transfer
+    rclone) idled forever as plain "MOVING". Parks now stamp last_error
+    and escalate to ERROR after consecutive parks.
+    """
+    import logging
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import StateStore, TorrentState, State
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.store = StateStore(tmp_path / "state.db")
+    ts = TorrentState(source_infohash="e" * 40, source_name="Stalled.Show",
+                      state=State.MOVING)
+    coord.store.upsert(ts)
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(4):
+            coord._park_moving(ts, "could not pause torrent eeee before move")
+    assert "(4x)" in (coord.store.get("e" * 40).last_error or "")
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    coord._park_moving(ts, "could not pause torrent eeee before move")
+    assert "(5x)" in (coord.store.get("e" * 40).last_error or "")
+    assert any(r.levelno >= logging.ERROR and "MOVING stalled" in r.message
+               for r in caplog.records)
+
+    # Leaving MOVING resets the counter (fresh re-entry starts at 1x).
+    coord.transition(ts, State.RE_ADDING)
+    assert ts.state == State.RE_ADDING
+    assert ts.last_error == ""
+    coord._park_moving(ts, "boom")
+    assert "(1x)" in (coord.store.get("e" * 40).last_error or "")
+
+
+@pytest.mark.anyio
+async def test_do_moving_branches_on_pinned_kind_despite_flip(tmp_path):
+    """A mid-flight classification flip must not reroute the move.
+
+    Regression: routing was pinned to the QUEUED-time kind but the move
+    branch still followed the fresh file list, so extras appearing
+    mid-flight (season -> mixed) rewrote batch cursors via the mixed
+    branch. The move now branches on the pinned kind with the fresh
+    layout: cursors untouched, leftovers swept, RE_ADDING reached.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from pathlib import Path
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    top = ssd / "Pack"
+    top.mkdir(parents=True)
+    # 9 episodes + 2 extras: 9/11 < 90% -> fresh classify is "mixed",
+    # while QUEUED saw the pack as a season.
+    names = [f"Pack.S01E{i:02d}.mkv" for i in range(1, 10)] + ["Extra1.mp4", "Extra2.mp4"]
+    for n in names:
+        (top / n).write_bytes(b"x" * 100)
+    cls_files = [TorrentFile(name=f"Pack/{n}", size_bytes=100, progress=1.0)
+                 for n in names]
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = ssd / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+    coord.cfg.rclone.batch_move_extra_flags = []
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=cls_files)
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.delete = AsyncMock()
+    coord.dest_client.export_torrent = AsyncMock(return_value=b"blob")
+
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        for name in files_from or []:
+            p = ssd / name
+            if p.is_file():
+                p.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
+
+    ts = TorrentState(source_infohash="f" * 40, source_name="Pack",
+                      dest_infohash="f" * 40, save_path=str(ssd),
+                      classification_kind="season", batches_total=0,
+                      batch_index=0, state=State.MOVING)
+    coord.store.upsert(ts)
+    row = coord.store.get("f" * 40)
+    with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock):
+        await coord._do_moving(row)
+
+    assert row.state == State.RE_ADDING
+    # Sweep branch (pinned season): cursors untouched, no batch extras.
+    assert row.batches_total == 0
+    coord._rclone_move.assert_awaited_once()
+    assert coord._rclone_move.call_args.kwargs.get("extra") is None

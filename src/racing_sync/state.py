@@ -251,6 +251,12 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ignored_torrents (
+    source_infohash TEXT PRIMARY KEY,
+    source_name     TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT ''
+);
 """
 
 SCHEMA_INDEXES = """
@@ -561,6 +567,97 @@ class StateStore:
             self._conn.execute(
                 "DELETE FROM torrent_state WHERE source_infohash = ?", (source_infohash,)
             )
+
+    # ---- ignore list (cancelled releases) ----
+
+    def ignore_torrent(self, source_infohash: str, source_name: str = "") -> None:
+        """Never pick up this release again (cancelled by the operator).
+
+        Checked at discovery, recovery adoption, re-injection and late-seed
+        time so a cancelled torrent stays cancelled while it remains on the
+        VPS1 racing client. Lives in state.db: `--reset` clears it (fresh
+        start means fresh intent).
+        """
+        self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
+        if not norm:
+            raise ValueError("ignore_torrent requires an infohash")
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO ignored_torrents "
+                "(source_infohash, source_name, created_at) VALUES (?,?,?)",
+                (norm, source_name or "",
+                 dt.datetime.now(dt.timezone.utc).isoformat()),
+            )
+
+    def unignore_torrent(self, source_infohash: str) -> bool:
+        """Drop an ignore entry; True when one existed."""
+        self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
+        if not norm:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM ignored_torrents WHERE source_infohash = ?",
+                (norm,),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def is_ignored(self, source_infohash: str) -> bool:
+        norm = (source_infohash or "").strip().lower()
+        if not norm:
+            return False
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT 1 FROM ignored_torrents WHERE source_infohash = ?",
+                    (norm,),
+                ).fetchone()
+                return row is not None
+        except Exception:
+            return False
+
+    def list_ignored(self) -> list[dict]:
+        """All ignore entries, newest first."""
+        self._ensure_open()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT source_infohash, source_name, created_at "
+                "FROM ignored_torrents ORDER BY created_at DESC"
+            ).fetchall()
+            return [
+                {"source_infohash": r["source_infohash"],
+                 "source_name": r["source_name"],
+                 "created_at": r["created_at"]}
+                for r in rows
+            ]
+
+    def find_ignored(self, target: str) -> dict:
+        """Single ignore entry by infohash or unique name substring.
+
+        Raises LookupError when nothing matches or several match.
+        """
+        norm = (target or "").strip()
+        if not norm:
+            raise LookupError("ignore target must not be empty")
+        rows = self.list_ignored()
+        low = norm.lower()
+        for r in rows:
+            if low == (r["source_infohash"] or "").lower():
+                return r
+        matches = [r for r in rows if low in (r["source_name"] or "").lower()]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            preview = ", ".join(
+                f"{r['source_name']} ({(r['source_infohash'] or '')[:10]})"
+                for r in matches[:5]
+            )
+            raise LookupError(
+                f"ignore target {target!r} matches {len(matches)} entries: {preview}; "
+                "use a 40-char infohash to pick one"
+            )
+        raise LookupError(f"no ignored torrent matching {target!r}")
 
     # ---- convenience ----
 

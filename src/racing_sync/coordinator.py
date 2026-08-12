@@ -137,6 +137,29 @@ def _left_on_disk(src_dir: Path, name: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+def _group_is_ignored(group: list[Torrent], store) -> bool:
+    """True when any member hash of a same-content group is cancelled.
+
+    Group members are duplicate client entries for one release, so one
+    cancelled hash vetoes the whole group (otherwise the next duplicate
+    would resurrect it on the following tick). Requires an actual `True`
+    so bare MagicMock stores never veto in unit tests.
+    """
+    try:
+        is_ignored = getattr(store, "is_ignored", None)
+        if not callable(is_ignored):
+            return False
+        for t in group or []:
+            try:
+                if t.infohash and is_ignored(t.infohash) is True:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
 @dataclass
 class LiveItem:
     source_infohash: str
@@ -193,6 +216,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     # FAILED/WAITING_DISK/forget. Rebuilt from DB on startup for crash recovery.
     _ssd_reserved: dict[str, int] = field(default_factory=dict, init=False)
     _ssd_lock: asyncio.Lock | None = field(default=None, init=False)
+    # Consecutive MOVING-park counter: infohash.lower() -> parks in a row.
+    # _do_moving parks (pause unverified, 0-transfer rclone, short bytes…)
+    # with only a warning, so a gate that never passes idles as plain
+    # "MOVING" forever. The counter (cleared on leaving MOVING) escalates to
+    # ERROR so the live log names the stuck gate instead of whispering it.
+    _moving_parks: dict[str, int] = field(default_factory=dict, init=False)
 
     @property
     def download_sem(self) -> asyncio.Semaphore:
@@ -642,6 +671,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             by_name.setdefault(norm_key, []).append(st)
 
         for _norm_name, group in by_name.items():
+            # Cancelled releases stay cancelled while listed on VPS1.
+            if _group_is_ignored(group, getattr(self, "store", None)):
+                log.info(
+                    "ignoring cancelled release: %s (%d duplicate(s))",
+                    group[0].name[:60], len(group),
+                )
+                continue
             # Check if any torrent in this release group is already tracked in state store
             existing_ts: TorrentState | None = None
             for t in group:
@@ -1007,6 +1043,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 _rsv = getattr(self, "_ssd_reserved", None)
                 if isinstance(_rsv, dict):
                     _rsv.pop((ts.source_infohash or "").lower(), None)
+            except Exception:
+                pass
+        # MOVING stall counter: leaving MOVING resets consecutive parks
+        # (a later re-entry starts fresh). transition() also clears the
+        # parked last_error via error="".
+        if prev == State.MOVING and dst != State.MOVING:
+            try:
+                _mp = getattr(self, "_moving_parks", None)
+                if isinstance(_mp, dict):
+                    _mp.pop((ts.source_infohash or "").lower(), None)
             except Exception:
                 pass
         log.info(
@@ -2681,6 +2727,45 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
     # ---- state: MOVING ----
 
+    def _park_moving(self, ts: TorrentState, reason: str) -> None:
+        """Stay in MOVING for retry next tick, recording WHY (stall diagnosis).
+
+        Every _do_moving early return funnels here instead of a bare
+        upsert: the park reason lands in last_error (cleared by transition()
+        on advance, visible via API/DB meanwhile) and consecutive parks for
+        the same row escalate from WARNING to ERROR so a gate that never
+        passes (unverifiable pause, 0-transfer rclone, short bytes) can't
+        idle silently as plain "MOVING" forever. Never raises.
+        """
+        key = (ts.source_infohash or "").lower()
+        try:
+            parks = getattr(self, "_moving_parks", None)
+            if not isinstance(parks, dict):
+                parks = {}
+                self._moving_parks = parks
+            n = int(parks.get(key, 0) or 0) + 1
+            parks[key] = n
+        except Exception:
+            n = 1
+        try:
+            ts.last_error = f"moving parked ({n}x): {reason}"[:500]
+        except Exception:
+            pass
+        try:
+            self.store.upsert(ts)
+        except Exception:  # noqa: BLE001
+            pass
+        if n >= 5:
+            log.error(
+                "MOVING stalled for %s: %s (parked %dx, still retrying)",
+                ts.source_name[:60], reason, n,
+            )
+        else:
+            log.warning(
+                "staying in MOVING for %s: %s",
+                ts.source_name[:60], reason,
+            )
+
     def _single_on_fuse(self, files: list, single_file: str, ts) -> bool:
         """True iff an already-remote single file needs no SSD download/move.
 
@@ -2734,6 +2819,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 "classification flipped %s -> %s for %s after queue; keeping pinned %s for routing",
                 pinned_kind, cls.kind, ts.source_name, pinned_kind,
             )
+        # Branch the move on the PINNED kind (falling back to the fresh one
+        # when nothing was ever pinned): batches were downloaded and routed
+        # under it, so a mid-flight flip (tracker sidecar added, metadata
+        # completed) must not reroute the move or rewrite batch cursors via
+        # the mixed branch. Fresh `cls` still supplies the file layout
+        # (episodes/single_file/sizes) below.
+        branch_kind = pinned_kind if pinned_kind not in ("", "unknown") else cls.kind
 
         # 1. Pause torrent on VPS2 client BEFORE move begins to stop active seeding from SSD
         log.info("pausing torrent %s on VPS2 client before move", h[:10])
@@ -2742,11 +2834,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # Never move while the client is still writing, but don't fail
             # terminally on a transient WebUI hiccup — stay in MOVING so the
             # next tick retries (preserves downloaded bytes on SSD).
-            log.warning(
-                "could not pause torrent %s before move (%s); will retry on next tick",
-                h[:10], pause_err,
+            self._park_moving(
+                ts,
+                f"could not pause torrent {h[:10]} before move "
+                f"({pause_err}); will retry on next tick",
             )
-            self.store.upsert(ts)
             return
 
         # 2. Separate completed files from incomplete piece-boundary files
@@ -2972,13 +3064,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         # folder wipe below would destroy unmoved data. Stay MOVING.
                         stuck = [n for n in leftover_files if _left_on_disk(src_dir, n)]
                         if stuck:
-                            log.warning(
-                                "leftover sweep for %s moved nothing "
-                                "(%d file(s) still on disk, e.g. %s); "
-                                "staying in MOVING without wiping",
-                                ts.source_name, len(stuck), stuck[0],
+                            self._park_moving(
+                                ts,
+                                f"leftover sweep moved nothing "
+                                f"({len(stuck)} file(s) still on disk, e.g. {stuck[0]}); "
+                                f"staying in MOVING without wiping",
                             )
-                            self.store.upsert(ts)
                             return
                 else:
                     log.info(
@@ -2990,9 +3081,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     "multi-batch torrent %s: batches were already moved during downloading stage",
                     ts.source_name,
                 )
-        elif cls.kind in ("movie", "episode", "season", "unknown"):
+        elif branch_kind in ("movie", "episode", "season", "unknown"):
             local: Path | None
-            if cls.kind in ("movie", "episode") and cls.single_file:
+            if branch_kind in ("movie", "episode") and cls.single_file:
                 local = _safe_ssd_join(src_dir, cls.single_file)
                 if local is None or not local.exists():
                     if folder is not None:
@@ -3011,7 +3102,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         local = None
                     else:
                         raise FileNotFoundError(f"completed {cls.kind} file not found on SSD: {src_dir}/{cls.single_file}")
-            elif cls.kind in ("season", "unknown") or (cls.kind == "movie" and not cls.single_file):
+            elif branch_kind in ("season", "unknown") or (branch_kind == "movie" and not cls.single_file):
                 _src_top = _safe_ssd_join(src_dir, ts.source_name)
                 if folder and folder.exists():
                     local = folder
@@ -3053,12 +3144,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     # A 0-transfer folder move must not proceed to the wipe below.
                     stuck = [n for n in folder_names if _left_on_disk(src_dir, n)]
                     if stuck:
-                        log.warning(
-                            "folder move for %s left files on disk; "
-                            "staying in MOVING without wiping",
-                            ts.source_name,
+                        self._park_moving(
+                            ts,
+                            f"folder move left {len(stuck)} file(s) on disk "
+                            f"(e.g. {stuck[0]}); staying in MOVING without wiping",
                         )
-                        self.store.upsert(ts)
                         return
                 else:
                     log.info(
@@ -3085,15 +3175,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 except OSError:
                     _left = True
                 if _left:
-                    log.warning(
-                        "single-file move for %s left %s on disk; "
-                        "staying in MOVING without wiping",
-                        ts.source_name, local,
+                    self._park_moving(
+                        ts,
+                        f"single-file move left {local} on disk; "
+                        f"staying in MOVING without wiping",
                     )
-                    self.store.upsert(ts)
                     return
         else:
-            # Mixed — per-episode moves with --include (single batch)
+            # Mixed — per-episode moves with --include (single batch).
+            # Only reachable when the pinned kind is mixed (see branch_kind
+            # above), so cursor rewrites here can't corrupt single-flow rows.
             cap = self._frozen_batch_cap(ts)
             episodes = cls.episodes
             if not episodes:
@@ -3113,7 +3204,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 ts.batches_total = len(batches)
                 self.store.upsert(ts)
                 skip = await self._fuse_skipped(
-                    [(e.file_name, e.size_bytes) for e in batch.episodes], cls.kind,
+                    [(e.file_name, e.size_bytes) for e in batch.episodes], branch_kind,
                 )
                 skip_norm = {(s or "").replace("\\", "/").strip("/") for s in skip}
                 names = [n for n in batch.file_names() if n not in skip_norm]
@@ -3132,13 +3223,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 )
                 stuck = [n for n in names if _left_on_disk(src_dir, n)]
                 if stuck:
-                    log.warning(
-                        "mixed-torrent batch move for %s moved nothing "
-                        "(%d file(s) still on disk, e.g. %s); "
-                        "staying in MOVING without wiping",
-                        ts.source_name, len(stuck), stuck[0],
+                    self._park_moving(
+                        ts,
+                        f"mixed-torrent batch move moved nothing "
+                        f"({len(stuck)} file(s) still on disk, e.g. {stuck[0]}); "
+                        f"staying in MOVING without wiping",
                     )
-                    self.store.upsert(ts)
                     return
 
         # 6. Persist the SSD torrent's bytes for RE_ADDING before the client
@@ -3543,6 +3633,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 h_low = t.infohash.lower()
                 if h_low in injected_set:
                     continue
+                if _group_is_ignored([t], getattr(self, "store", None)):
+                    log.info("re-inject: skipping cancelled torrent %s (%s)",
+                             t.infohash[:10], (t.name or "")[:40])
+                    continue
                 try:
                     blob = await self._fetch_racing_torrent_bytes(t.infohash)
                 except Exception as e:  # noqa: BLE001
@@ -3713,7 +3807,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         # with no *new* arrivals still heal.
         await self._ensure_source_fuse_entry(ts, group, now_utc)
 
-        new_torrents = [t for t in group if t.infohash.lower() not in known_hashes]
+        new_torrents = [
+            t for t in group
+            if t.infohash.lower() not in known_hashes
+            and not _group_is_ignored([t], getattr(self, "store", None))
+        ]
 
         # Repair the original entry even on quiet ticks (no new arrivals):
         # otherwise an original SSD leftover only heals when something else

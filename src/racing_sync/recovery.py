@@ -74,6 +74,21 @@ def _safe_join(root: Path, name: str) -> Path | None:
     return root / norm
 
 
+def _hash_is_ignored(store, infohash: str) -> bool:
+    """Strict bool check against the ignore list (cancelled releases).
+
+    Requires an actual `True` (not truthy): bare MagicMock stores answer
+    truthy to everything and must never veto adoption in unit tests.
+    """
+    try:
+        fn = getattr(store, "is_ignored", None)
+        if not callable(fn):
+            return False
+        return fn(infohash) is True
+    except Exception:
+        return False
+
+
 def _save_path_on_ssd(cfg: AppConfig, save_path: str) -> bool:
     """True iff a client entry's save_path lives under a configured SSD root.
 
@@ -437,6 +452,10 @@ async def reconcile(
     ]
     for h, t in actual_by_hash.items():
         if h.lower() not in db_hashes:
+            if _hash_is_ignored(store, h):
+                log.info("reconcile: skipping cancelled release %s (%s)",
+                         getattr(t, "name", h)[:60], h[:10])
+                continue
             save_path = (getattr(t, "save_path", "") or "").rstrip("/\\").replace("\\", "/")
             on_fuse = any(save_path == fm or save_path.startswith(fm + "/") for fm in fuse_mounts if fm)
             # Placement gate: only adopt entries under known SSD/fuse roots.
@@ -482,6 +501,10 @@ async def reconcile(
                             "is the same release; adopting fresh instead of merging",
                             name[:60], h[:10], len(matches),
                         )
+                    elif _hash_is_ignored(store, h):
+                        log.info("reconcile: skipping link of cancelled %s (%s)",
+                                 name[:60], h[:10])
+                        continue
                     else:
                         curr = [x.strip() for x in existing.injected_private_hashes.split(",") if x.strip()]
                         curr_lower = {x.lower() for x in curr}
