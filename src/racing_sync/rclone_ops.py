@@ -53,6 +53,15 @@ class RcloneError(RuntimeError):
     pass
 
 
+class RcloneTimeoutError(RcloneError):
+    """`rclone move` produced no result within the wall-clock ceiling.
+
+    The source tree is intact (rclone only removes source files after each
+    is verified on the remote), so callers must PARK the row for retry —
+    never fail it (failing would loop: re-download, stall again, fail…).
+    """
+
+
 def _validate_rclone_binary(cfg: AppConfig) -> Path | None:
     """Require an absolute, executable rclone binary to avoid PATH hijack.
 
@@ -182,12 +191,28 @@ def redact_rclone_cmd(cmd: list[str]) -> str:
     return " ".join(out)
 
 
+def _move_timeout_seconds(cfg: AppConfig) -> float:
+    """Wall-clock ceiling per move; MagicMock test doubles count as default."""
+    try:
+        raw = getattr(getattr(cfg, "rclone", None), "move_timeout_seconds", None)
+    except Exception:
+        raw = None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 6 * 3600
+    try:
+        return max(60.0, float(raw))
+    except (TypeError, ValueError):
+        return 6 * 3600
+
+
 async def run_rclone(
     cfg: AppConfig,
     cmd: list[str],
     *,
-    timeout: float = 6 * 3600,
+    timeout: float | None = None,
 ) -> RcloneResult:
+    if timeout is None:
+        timeout = _move_timeout_seconds(cfg)
     _validate_rclone_binary(cfg)
     log.info("rclone: %s", redact_rclone_cmd(cmd))
     t0 = time.monotonic()
@@ -202,6 +227,25 @@ async def run_rclone(
         stdout_b, stderr_b = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
         )
+    except asyncio.CancelledError:
+        # Shutdown while a move is in flight: terminate the child (bounded)
+        # so it can't keep uploading/deleting source files after we exit,
+        # then let the cancellation propagate.
+        try:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        raise
     except asyncio.TimeoutError:
         import inspect as _inspect
 
@@ -239,7 +283,10 @@ async def run_rclone(
                     pass
             except Exception:
                 pass
-        raise RcloneError(f"rclone timeout after {timeout}s: {redact_rclone_cmd(cmd)}")
+        raise RcloneTimeoutError(
+            f"rclone timeout after {timeout}s (source intact, retry later): "
+            f"{redact_rclone_cmd(cmd)}"
+        ) from None
     dt = time.monotonic() - t0
     stdout = stdout_b.decode("utf-8", errors="replace")
     stderr = stderr_b.decode("utf-8", errors="replace")
@@ -282,6 +329,7 @@ async def move_local_to_remote(
     include: list[str] | None = None,
     files_from: list[str] | None = None,
     extra: list[str] | None = None,
+    timeout: float | None = None,
 ) -> RcloneResult:
     if not local.exists():
         raise FileNotFoundError(f"rclone source missing: {local}")
@@ -305,7 +353,7 @@ async def move_local_to_remote(
                 list_path = fh.name
         cmd = build_move_cmd(cfg, local, dest_remote, include=include,
                              files_from=list_path, extra=extra)
-        return await run_rclone(cfg, cmd)
+        return await run_rclone(cfg, cmd, timeout=timeout)
     finally:
         if list_path:
             try:

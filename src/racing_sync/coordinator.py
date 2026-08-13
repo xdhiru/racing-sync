@@ -60,6 +60,7 @@ from .coordinator_picker import pick_ssd_source_for_racing
 from .coordinator_ssd import SSDLedgerMixin
 from .prowlarr import ProwlarrClient, TorrentHit
 from .rclone_ops import (
+    RcloneTimeoutError,
     move_local_to_remote,
     ssd_has_room,
     ssd_max_inflight_bytes,  # noqa: F401  (runtime use via coordinator_ssd lazy lookup + compat)
@@ -960,6 +961,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     )
                     return
             await self._process_torrent_inner(ts)
+        except RcloneTimeoutError as e:
+            # Last-resort net: a timed-out move from any path parks the row
+            # (source bytes intact) instead of failing it. The two expected
+            # sites handle this directly with better context; this only
+            # fires for future call paths.
+            log.error("rclone timed out for %s: %s (parking, not failing)",
+                      ts.source_infohash[:10], e)
+            try:
+                if ts.state == State.MOVING:
+                    self._park_moving(ts, f"rclone move timed out: {e}")
+                else:
+                    try:
+                        ts.last_error = f"rclone timed out: {e}"[:500]
+                    except Exception:
+                        pass
+                    self.store.upsert(ts)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as e:  # noqa: BLE001
             log.exception("worker failed for %s", ts.source_infohash[:10])
             if ts.state == State.DONE:
@@ -1114,7 +1133,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         elif ts.state == State.DOWNLOADING:
             await self._do_downloading(ts)
         if ts.state == State.MOVING:
-            await self._do_moving(ts)
+            try:
+                await self._do_moving(ts)
+            except RcloneTimeoutError as e:
+                # Hung remote (flood-wait pileup, stalled uplink): bytes are
+                # intact on SSD, slots freed — park for next tick, never fail.
+                self._park_moving(ts, f"rclone move timed out: {e}")
+                return
         if ts.state == State.RE_ADDING:
             await self._do_re_add(ts)
 
@@ -2269,6 +2294,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                             continue
                     try:
                         await self._move_and_clean_batch(ts, cur_batch, skip=cur_skip)
+                    except RcloneTimeoutError as e:
+                        # Hung remote mid-batch: child terminated, bytes
+                        # intact — park in DOWNLOADING for next tick at once.
+                        # (Must NOT funnel into the incomplete-move retry
+                        # below: each attempt would block for the full
+                        # timeout again.)
+                        log.error("rclone batch move timed out for %s: %s",
+                                  ts.source_name[:60], e)
+                        try:
+                            ts.last_error = f"batch move timed out: {e}"[:500]
+                        except Exception:
+                            pass
+                        self.store.upsert(ts)
+                        return
                     except BatchMoveIncompleteError as e:
                         # Same-tick retry like the pause failure above: the
                         # batch is still fully on local disk, nothing advanced.
@@ -3296,6 +3335,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                          local, remote, len(files_from), preview)
             else:
                 log.info("rclone move %s -> %s (include=%s, extra=%s)", local, remote, include, extra)
+            # RcloneTimeoutError propagates: the child is terminated and the
+            # source tree intact, so callers park the row for retry (never
+            # fail — failing would loop: re-download, stall again, fail…).
             res = await move_local_to_remote(self.cfg, local, remote, include=include,
                                              files_from=files_from, extra=extra)
             if not res.ok:

@@ -237,3 +237,61 @@ async def test_run_rclone_timeout_redacts_command(monkeypatch):
         assert "--password ******" in err_msg
 
 
+
+@pytest.mark.anyio
+async def test_run_rclone_timeout_raises_timeout_error(monkeypatch):
+    """A hung remote must raise RcloneTimeoutError (park), not plain RcloneError."""
+    from unittest.mock import AsyncMock
+    from racing_sync.rclone_ops import run_rclone, RcloneError, RcloneTimeoutError
+
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+    cfg.rclone.binary = Path("/usr/bin/rclone")
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate.side_effect = TimeoutError()
+    mock_proc.terminate = MagicMock()
+    mock_proc.wait = AsyncMock()
+
+    with monkeypatch.context() as m:
+        m.setattr("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc))
+        with pytest.raises(RcloneTimeoutError) as exc_info:
+            await run_rclone(cfg, ["rclone", "move", "/src", "remote:dst"], timeout=0.01)
+        assert isinstance(exc_info.value, RcloneError)  # still catchable as RcloneError
+        assert "source intact" in str(exc_info.value)
+        mock_proc.terminate.assert_called()
+
+
+@pytest.mark.anyio
+async def test_run_rclone_cancel_terminates_child(monkeypatch):
+    """Shutdown mid-move must kill the child, not orphan an uploader."""
+    import asyncio as _asyncio
+    from unittest.mock import AsyncMock
+    from racing_sync.rclone_ops import run_rclone
+
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+    cfg.rclone.binary = Path("/usr/bin/rclone")
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate.side_effect = _asyncio.CancelledError()
+    mock_proc.terminate = MagicMock()
+    mock_proc.wait = AsyncMock()
+
+    with monkeypatch.context() as m:
+        m.setattr("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc))
+        with pytest.raises(_asyncio.CancelledError):
+            await run_rclone(cfg, ["rclone", "move", "/src", "remote:dst"], timeout=60)
+        mock_proc.terminate.assert_called()
+
+
+def test_move_timeout_seconds_falls_back_for_test_doubles():
+    """MagicMock configs must not poison the wait_for timeout."""
+    from racing_sync.rclone_ops import _move_timeout_seconds
+
+    assert _move_timeout_seconds(MagicMock()) == 6 * 3600
+    cfg = MagicMock()
+    cfg.rclone.move_timeout_seconds = 1800
+    assert _move_timeout_seconds(cfg) == 1800
+    cfg.rclone.move_timeout_seconds = 5  # below the 60s floor
+    assert _move_timeout_seconds(cfg) == 60.0
