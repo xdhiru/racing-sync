@@ -1714,3 +1714,169 @@ async def test_process_torrent_timeout_safety_net_parks(tmp_path):
     row = coord.store.get("v" * 40)
     assert row.state == State.DOWNLOADING
     assert "timed out" in (row.last_error or "")
+
+@pytest.mark.anyio
+async def test_queued_burst_respects_download_cap(tmp_path):
+    """A fresh-start burst of NEW workers must not exceed max_active_downloads.
+
+    Live incident: 12 workers scheduled for state=new rows sailed past the
+    tick gate (snapshot-QUEUED-only) into 5 concurrent DOWNLOADING against
+    max 3. The QUEUED edge now parks extras; reservations stay intact and
+    parked rows proceed without re-adding once slots free.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile, AddResult
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord._running_infohashes = set()  # tick-managed live set, mirrored here
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.ssd.max_inflight_bytes = 100_000_000_000
+    coord.cfg.max_active_downloads = 3
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = fuse
+    coord.cfg.rclone.fuse.mount_unsorted = fuse
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])  # brand-new
+    added: list[str] = []
+
+    async def _fake_add(**kw):
+        h = f"{len(added) + 10:040d}"
+        added.append(h)
+        return AddResult(hash=h, accepted=True, detail="ok")
+
+    coord.dest_client.add_torrent = AsyncMock(side_effect=_fake_add)
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=0.0),
+    ])
+    coord.dest_client.set_file_priorities = AsyncMock()
+    coord.dest_client.resume = AsyncMock()
+
+    rows = []
+    for i in range(5):
+        ts = TorrentState(source_infohash=f"{i + 1:040d}", source_name=f"Show{i}",
+                          save_path=str(ssd), total_bytes=100,
+                          classification_kind="unknown",
+                          cross_seed_blob=b"blob",
+                          state=State.QUEUED)
+        coord.store.upsert(ts)
+        rows.append(ts)
+
+    async def _run_queued(key: str) -> None:
+        # Mirror the tick: schedule (live set) -> worker -> done (discard
+        # when the worker returns without continuing into downloading).
+        coord._running_infohashes.add(key)
+        try:
+            await coord._do_queued(coord.store.get(key))
+        finally:
+            row = coord.store.get(key)
+            if row is None or row.state != State.DOWNLOADING:
+                coord._running_infohashes.discard(key)
+
+    for ts in rows:
+        await _run_queued(ts.source_infohash)
+
+    states = [coord.store.get(ts.source_infohash).state for ts in rows]
+    assert states.count(State.DOWNLOADING) == 3
+    assert states.count(State.QUEUED) == 2
+    # Parked rows added nothing and hold no client entry.
+    assert len(added) == 3
+
+    # Two slots free up -> parked rows proceed exactly once each, no churn.
+    drained = 0
+    for ts in rows:
+        r = coord.store.get(ts.source_infohash)
+        if r.state == State.DOWNLOADING and drained < 2:
+            coord.transition(r, State.MOVING)
+            coord._running_infohashes.discard(r.source_infohash.lower())
+            drained += 1
+    for ts in rows:
+        r = coord.store.get(ts.source_infohash)
+        if r.state == State.QUEUED:
+            await _run_queued(r.source_infohash)
+    states = [coord.store.get(ts.source_infohash).state for ts in rows]
+    assert states.count(State.DOWNLOADING) == 3
+    assert len(added) == 5
+    assert len(set(added)) == 5
+
+
+@pytest.mark.anyio
+async def test_queued_existing_entry_parks_when_full(tmp_path):
+    """The resume path for already-added entries obeys the cap too."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import StateStore, TorrentState, State
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord._running_infohashes = set()
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.max_active_downloads = 1
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = fuse
+    coord.cfg.rclone.fuse.mount_unsorted = fuse
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[
+        Torrent(hash="e" * 40, name="Show", category="racing", save_path=str(ssd),
+                size_bytes=100, state="pausedDL", progress=0.5),
+    ])
+    coord.dest_client.resume = AsyncMock()
+
+    # One DOWNLOADING row already fills the single slot.
+    coord.store.upsert(TorrentState(source_infohash="d" * 40, source_name="Busy",
+                                    state=State.DOWNLOADING))
+    ts = TorrentState(source_infohash="e" * 40, source_name="Show",
+                      dest_infohash="e" * 40, save_path=str(ssd),
+                      cross_seed_blob=b"blob",
+                      state=State.QUEUED)
+    coord.store.upsert(ts)
+
+    coord._running_infohashes.add("e" * 40)
+    await coord._do_queued(coord.store.get("e" * 40))
+
+    row = coord.store.get("e" * 40)
+    assert row.state == State.QUEUED
+    coord.dest_client.resume.assert_not_called()
+
+    # Drain -> resume proceeds, exactly once.
+    busy = coord.store.get("d" * 40)
+    coord.transition(busy, State.MOVING)
+    await coord._do_queued(coord.store.get("e" * 40))
+    assert coord.store.get("e" * 40).state == State.DOWNLOADING
+    coord.dest_client.resume.assert_awaited_once()
+
+
+def test_queued_gate_ignores_non_int_configs():
+    """MagicMock test doubles must never report a full cap."""
+    from unittest.mock import MagicMock
+    from racing_sync.coordinator import Coordinator
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()  # max_active_downloads is a MagicMock
+    coord.store = MagicMock()
+    assert coord._try_admit_download(MagicMock()) is True
+    assert coord._park_queued_for_download_slot(MagicMock()) is False

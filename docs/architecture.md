@@ -77,9 +77,13 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
    - No luck anywhere → SFTP-export the racing torrent.
 
 3. **Add to VPS2**:
-   - `save_path = dest.save_path` (local SSD)
-   - `paused = True`, `skip_check = False` (req #3: we *want* the hash check on SSD)
-   - `category = "racing"`
+    - `save_path = dest.save_path` (local SSD)
+    - `paused = True`, `skip_check = False` (req #3: we *want* the hash check on SSD)
+    - `category = "racing"`
+    - The QUEUED→DOWNLOADING edge re-checks `max_active_downloads`
+      (atomic admit via `_download_admissions`, extras stay QUEUED) so
+      fresh-start bursts can't sail past the tick's snapshot-only gate;
+      already-DOWNLOADING rows are grandfathered and drain naturally.
 
 4. **Classify** (`classifier.classify`):
     - Individual episode matching episode regex -> `episode`
