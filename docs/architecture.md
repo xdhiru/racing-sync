@@ -106,7 +106,14 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
       batch N+1, so shared piece-boundary partials can't leak across
       batches. Only complete files ever reach the remote.
 
-6. **Move to remote** (`rclone_ops.move_local_to_remote`):
+6. **Move to remote** (`rclone_ops.move_local_to_remote`, ceiling
+    `[rclone].move_timeout_seconds`, 6h default):
+
+    A hung remote (flood-wait pileup, stalled uplink) raises
+    `RcloneTimeoutError` after the ceiling; the child is terminated and
+    the row PARKS (source bytes are intact — rclone only removes them
+    after verified transfer), never fails. Repeated MOVING parks escalate
+    to `ERROR "MOVING stalled …"` with the gate reason in `last_error`.
     - `rclone move <local> <remote> -- <extra_move_flags>` with per-file
       `--files-from-raw` lists (literal paths, no globs) preserving the
       torrent-relative tree. `extra_move_flags` / `batch_move_extra_flags`

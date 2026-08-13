@@ -288,6 +288,13 @@ class RcloneConfig(BaseModel):
     batch_move_extra_flags: list[str] = Field(default_factory=list)
     # Maximum concurrent rclone move commands running simultaneously (default: 3)
     max_concurrent_moves: int = Field(default=3, ge=1, le=100)
+    # Wall-clock ceiling per `rclone move` (seconds). A remote that stops
+    # responding (e.g. API flood-wait pileup on Telegram-backed remotes)
+    # must park the row for retry, never wedge a move slot forever. 6h
+    # preserves the historical default; lower it on fast remotes (e.g.
+    # 1800) so stalls surface sooner. Timeouts park (bytes stay on SSD),
+    # never fail the row.
+    move_timeout_seconds: float = Field(default=6 * 3600, ge=60)
     reinject_delay_seconds: int | None = Field(default=None, ge=0)
 
     @field_validator("config_path", mode="before")

@@ -186,6 +186,12 @@ binary = "/usr/local/bin/rclone"
 # Limits parallel moves from SSD to remote to prevent CPU/network saturation.
 # Can be overridden globally via [general].max_concurrent_moves.
 max_concurrent_moves = 3
+# Wall-clock ceiling per `rclone move` in seconds (default: 21600 / 6h).
+# A remote that stops responding (e.g. API flood-waits on Telegram-backed
+# remotes with high --transfers) parks the row for retry instead of wedging
+# a move slot forever. Timeouts never fail the row (bytes stay on SSD).
+# Lower it on fast remotes (e.g. 1800) so stalls surface sooner.
+# move_timeout_seconds = 21600
 # Optional override for the fuse re-inject delay below (seconds).
 # Empty/unset = use [rclone.fuse].reinject_delay_seconds.
 # reinject_delay_seconds = 30
