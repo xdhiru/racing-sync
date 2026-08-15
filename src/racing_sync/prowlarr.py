@@ -216,11 +216,6 @@ class ProwlarrClient:
     def get_indexer_by_name(self, name: str) -> Indexer | None:
         return self._indexers_by_name.get(name.lower())
 
-    def get_download_indexer(self) -> Indexer:
-        """First usable download-target indexer (highest priority)."""
-        usable = self.get_download_indexers()
-        return usable[0]
-
     def get_download_indexers(self) -> list[Indexer]:
         """All usable download-target indexers, in configured priority order.
 
@@ -310,10 +305,6 @@ class ProwlarrClient:
                 raise ProwlarrError(f"prowlarr search on {indexer.name!r} failed: {last_exc}") from last_exc
             await asyncio.sleep(0.5 * (2 ** attempt))
         return _parse_newznab(text, indexer)
-
-    async def search_download_indexer(self, query: str) -> list[TorrentHit]:
-        idx = self.get_download_indexer()
-        return await self.search_indexer(idx, query)
 
     async def download_torrent(self, hit: TorrentHit) -> bytes:
         """Fetch the .torrent bytes for a hit (qBittorrent can accept this directly)."""

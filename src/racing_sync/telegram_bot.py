@@ -27,7 +27,6 @@ import datetime as dt
 import logging
 import re
 import time
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -130,15 +129,6 @@ def _safe_truncate_markdown(text: str, max_len: int = 4096) -> str:
     return truncated + to_close + suffix
 
 
-def _short_name(name: str, limit: int = 56) -> str:
-    """Trim long release names with an ellipsis in the middle."""
-    if len(name) <= limit:
-        return name
-    head = (limit - 1) // 2
-    tail = limit - 1 - head
-    return name[:head] + "…" + name[-tail:]
-
-
 def _bytes_human(n: int) -> str:
     if n < 1024:
         return f"{n} B"
@@ -171,11 +161,6 @@ def _tracker_domain(url: str) -> str:
 # --------------------------------------------------------------------------- #
 # Message renderers
 # --------------------------------------------------------------------------- #
-
-
-def _retry_at_in_future(value: object) -> bool:
-    """True iff value is a datetime in the future (naive treated as UTC)."""
-    return _retry_in_future_seconds(value) is not None
 
 
 def _as_aware_utc(value: object) -> dt.datetime | None:
@@ -387,17 +372,6 @@ def render_active(
 # --------------------------------------------------------------------------- #
 
 
-@dataclass
-class _ActiveProgress:
-    """Per-torrent progress dict keyed by source_infohash (lowercase)."""
-
-    data: dict[str, float] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.data is None:
-            self.data = {}
-
-
 class TelegramBot:
     def __init__(self, cfg: TelegramConfig, coord: Coordinator,
                  store: StateStore):
@@ -412,11 +386,6 @@ class TelegramBot:
         self._active_msg_id: int | None = None
         self._prev_active_msg_id: int | None = None
         self._pinned_message_id: int | None = None
-        # Outbound rate limiter: Telegram's bot API allows ~30
-        # messages/sec across all chats per bot. We self-throttle to
-        # `outbound_rate` per second so a flood of state transitions
-        # doesn't trigger HTTP 429 / Retry-After.
-        self._rate_sem: asyncio.Semaphore | None = None
         # Pending detail-message work, drained by a background worker.
         self._detail_queue: asyncio.Queue[tuple[str, float | None]] | None = None
         self._detail_worker: asyncio.Task | None = None
@@ -424,9 +393,7 @@ class TelegramBot:
         # need to hit state.db for every send.
         self._detail_cache: dict[str, int] = {}
         # Cached "last active-tasks (page, total_pages, text)" so we skip identical edits.
-        self._last_active_text: str = ""
         self._last_active_cache: tuple[int, int, str] | None = None
-        self._last_callback_time: float = 0.0
         # Per-chat debounce (monotonic timestamps by chat/user key): one
         # chat's burst must not starve pagination for everyone else.
         self._callback_times: dict[str, float] = {}
@@ -820,7 +787,6 @@ class TelegramBot:
                     _times.pop(_k, None)
         except Exception:
             pass
-        self._last_callback_time = now
 
         try:
             await query.answer()
@@ -1037,7 +1003,6 @@ class TelegramBot:
         repost_due = self._repost_due()
         if cache_key == self._last_active_cache and self._active_msg_id is not None and not repost_due:
             return
-        self._last_active_text = text
 
         if self._active_msg_id is None:
             # Clean up previously known message if any to prevent duplicate message spam

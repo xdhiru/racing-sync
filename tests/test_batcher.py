@@ -241,7 +241,6 @@ async def test_batch_interleaved_download_move_and_clean(tmp_path):
     coord.cfg.dest.save_path = save_dir
     coord.cfg.rclone.remote.default = "remote:tv"
     coord.cfg.rclone.batch_move_extra_flags = []
-    coord._effective_inflight_cap = MagicMock(return_value=10)
 
     ts = TorrentState(
         source_infohash="testhash",

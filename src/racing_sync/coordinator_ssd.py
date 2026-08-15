@@ -26,17 +26,6 @@ log = logging.getLogger("racing_sync.coordinator")
 class SSDLedgerMixin:
     """Batch caps + global SSD reservation ledger (duck-typed ``self``)."""
 
-    def _effective_inflight_cap(self, total_bytes: int) -> int:
-        from . import coordinator as _c
-
-        try:
-            cap = _c.ssd_max_inflight_bytes(self.cfg)
-            if isinstance(cap, int) and cap > 0:
-                return min(total_bytes, cap)
-        except Exception:
-            pass
-        return total_bytes
-
     def _batch_cap_bytes(self) -> int:
         from . import coordinator as _c
 
