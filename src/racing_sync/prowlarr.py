@@ -217,15 +217,46 @@ class ProwlarrClient:
         return self._indexers_by_name.get(name.lower())
 
     def get_download_indexer(self) -> Indexer:
-        idx = self.get_indexer_by_name(self._cfg.download_indexer)
-        if idx is None:
+        """First usable download-target indexer (highest priority)."""
+        usable = self.get_download_indexers()
+        return usable[0]
+
+    def get_download_indexers(self) -> list[Indexer]:
+        """All usable download-target indexers, in configured priority order.
+
+        Entries whose name is unknown to Prowlarr or disabled there are
+        skipped with a warning; raises only when NOTHING configured is
+        usable (fail fast instead of parking every row until max-age).
+        """
+        wanted = self._cfg.download_indexer_names
+        usable: list[Indexer] = []
+        missing: list[str] = []
+        disabled: list[str] = []
+        for name in wanted:
+            idx = self.get_indexer_by_name(name)
+            if idx is None:
+                missing.append(name)
+            elif not idx.enable:
+                disabled.append(name)
+            else:
+                usable.append(idx)
+        for name in missing:
+            log.warning(
+                "download-target indexer %r not found in prowlarr; skipping. "
+                "Known: %s", name, sorted(self._indexers_by_name),
+            )
+        for name in disabled:
+            log.warning(
+                "download-target indexer %r is disabled in prowlarr; skipping",
+                name,
+            )
+        if not usable:
             raise ProwlarrError(
-                f"download_indexer {self._cfg.download_indexer!r} not found. "
+                f"none of the configured download-target indexers {wanted!r} "
+                f"is usable (missing={missing}, disabled={disabled}). "
                 f"Known: {sorted(self._indexers_by_name)}"
             )
-        if not idx.enable:
-            raise ProwlarrError(f"download_indexer {idx.name!r} is disabled in prowlarr")
-        return idx
+        return usable
 
     def resolve_indexer_for_announce(
         self, announce_url: str, tracker_map
@@ -341,9 +372,14 @@ class ProwlarrClient:
         query: str,
         *,
         prefer_indexer: Indexer | None = None,
+        indexers: list[Indexer] | None = None,
         target_size: int = 0,
     ) -> TorrentHit | None:
-        """Search the configured download indexer for the EXACT release.
+        """Search the download-target indexers for the EXACT release.
+
+        Indexers are tried in priority order (an explicit `prefer_indexer`
+        first, else the given `indexers`, else all configured usable
+        indexers); the first indexer with an exact match wins.
 
         Cross-seed correctness demands byte-identical content: a same-episode
         different-group release (e.g. `...H.264-Raccoon` vs `...H.264-WebRip`)
@@ -359,26 +395,38 @@ class ProwlarrClient:
             same rule as `coordinator._matches_release` (kept in sync
             manually; the two modules cannot import each other).
 
-        Among exact matches the largest wins (deterministic). Returns None
-        when nothing matches exactly — callers treat that as "no cross-seed
-        yet" and park/retry instead of downloading the wrong release.
+        Among exact matches on one indexer the largest wins (deterministic).
+        Returns None when no indexer has the exact release — callers treat
+        that as "no cross-seed yet" and park/retry instead of downloading
+        the wrong release.
         """
         if self._cfg.should_skip_title(query):
             log.info("prowlarr: skipping best_match for %r (matches skip_query_substrings)", query)
             return None
-        idx = prefer_indexer or self.get_download_indexer()
-        hits = await self.search_indexer(idx, query)
-        if not hits:
-            return None
-        exact = [h for h in hits if _is_exact_release_match(h.title, h.size_bytes, query, target_size)]
-        if not exact:
-            log.info(
-                "prowlarr: %d hit(s) for %r but none is the exact release; ignoring",
-                len(hits), query,
-            )
-            return None
-        exact.sort(key=lambda h: -h.size_bytes)
-        return exact[0]
+        if prefer_indexer is not None:
+            ordered = [prefer_indexer]
+        elif indexers is not None:
+            ordered = list(indexers)
+        else:
+            ordered = self.get_download_indexers()
+        for idx in ordered:
+            hits = await self.search_indexer(idx, query)
+            if not hits:
+                continue
+            exact = [h for h in hits if _is_exact_release_match(h.title, h.size_bytes, query, target_size)]
+            if not exact:
+                log.info(
+                    "prowlarr: %d hit(s) on %r for %r but none is the exact release; ignoring",
+                    len(hits), idx.name, query,
+                )
+                continue
+            exact.sort(key=lambda h: -h.size_bytes)
+            return exact[0]
+        log.info(
+            "prowlarr: no exact release for %r on any of %d download-target indexer(s); ignoring",
+            query, len(ordered),
+        )
+        return None
 
     async def search_indexers_parallel(
         self,

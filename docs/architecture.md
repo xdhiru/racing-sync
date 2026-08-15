@@ -69,11 +69,13 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
 2. **Decide SSD source** (`pick_ssd_source_for_racing`):
    - Multiple racing-client torrents for the same content?
      Prefer public. Try:
-       - `cross_seed.refetch_public_via_prowlarr` → prowlarr → Indexer
+       - `cross_seed.refetch_public_via_prowlarr` → prowlarr → download-target indexers (priority order)
        - SFTP fallback (Deluge) or qB `export_torrent` (qB)
    - Only private? Map each racing torrent's announce URL to a prowlarr indexer
      via `[prowlarr.tracker_map]` (Beta, Alpha, Gamma, …). Search.
-     First hit → use it.
+     No tracker_map hit → query the `[[prowlarr.download_indexers]]`
+     download-target indexers in priority order; first exact release wins.
+     Park in `WAITING_INDEXER` + retry per `prowlarr_retry_*` if no hit yet.
    - No luck anywhere → SFTP-export the racing torrent.
 
 3. **Add to VPS2**:

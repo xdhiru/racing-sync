@@ -387,6 +387,7 @@ def test_config_strict_validations():
     from racing_sync.config import (
         NginxAuthConfig,
         DelugeSFTPConfig,
+        DownloadIndexerConfig,
         ProwlarrConfig,
         TelegramConfig,
         LoggingSinkConfig,
@@ -414,7 +415,7 @@ def test_config_strict_validations():
             enabled=True,
             base_url="http://localhost:9696",
             api_key="CHANGE_ME",
-            download_indexer="Index",
+            download_indexers=[DownloadIndexerConfig(name="Index")],
         )
 
     # 4. Telegram placeholder and missing check
@@ -446,6 +447,10 @@ async def test_pick_ssd_source_public_and_private_paths():
     source_client = AsyncMock()
     source_client.export_torrent.return_value = b"d8:announce...e"
     prowlarr = AsyncMock()
+    from racing_sync.prowlarr import Indexer
+    prowlarr.get_download_indexers = MagicMock(
+        return_value=[Indexer(1, "Test Indexer (API)", "torrent", True, [])]
+    )
 
     # Public path: public tracker present -> direct export from source_client, no Prowlarr
     t_public = Torrent(
@@ -489,16 +494,16 @@ async def test_pick_ssd_source_public_and_private_paths():
     cfg_priv = MagicMock()
     cfg_priv.prowlarr.enabled = True
     cfg_priv.prowlarr.should_skip_title.return_value = False
-    cfg_priv.prowlarr.download_indexer = "Indexer (API)"
+    cfg_priv.prowlarr.download_indexer_names = ["Test Indexer (API)"]
     cfg_priv.prowlarr.tracker_map = {"alpha.cc": "Alpha (API)"}
-    cfg_priv.prowlarr.get_download_indexer.return_value = MagicMock()
     cfg_priv.cross_seed.allow_prowlarr_cross_seed = True
 
-    hit = MagicMock(title="Priv.Movie", size_bytes=1000, download_url="http://indexer/1", guid="0123456789012345678901234567890123456789")
+    hit = MagicMock(title="Priv.Movie", size_bytes=1000, download_url="http://dl-indexer.example/1", guid="0123456789012345678901234567890123456789")
+    hit.indexer = "Test Indexer (API)"
     prowlarr.best_match.return_value = hit
     from racing_sync.watchdir import _bencode
     prowlarr.download_torrent.return_value = _bencode({
-        b"announce": b"http://indexer/announce",
+        b"announce": b"http://dl-indexer.example/announce",
         b"info": {
             b"name": b"Priv.Movie",
             b"length": 1000,
@@ -516,7 +521,7 @@ async def test_pick_ssd_source_public_and_private_paths():
         source_client=source_client,
     )
     assert dec_priv is not None
-    assert dec_priv.source_label == "indexer-cross-seed"
+    assert dec_priv.source_label == "test-indexer-api-cross-seed"
     assert dec_priv.torrent_bytes == prowlarr.download_torrent.return_value
     assert len(dec_priv.infohash) == 40
 

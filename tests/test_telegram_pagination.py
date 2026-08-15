@@ -112,7 +112,7 @@ def test_render_detail_formatting():
         total_bytes=1900000000,
         source_tracker="https://alpha.cc/announce/2xxxxxxxxxxxxxxsxxxxxxxxxxxxxxxxxx9b",
         classification_kind="movie",
-        cross_seed_source="indexer-cross-seed",
+        cross_seed_source="test-indexer-api-cross-seed",
     )
     detail = render_detail(ts)
 
@@ -129,7 +129,7 @@ def test_render_detail_formatting():
     assert "2xxxxxxxxxxxxxxs" not in detail
 
     # 4. Other fields not in backticks
-    assert "SSD source: indexer-cross-seed" in detail
+    assert "SSD source: test-indexer-api-cross-seed" in detail
     assert "Classifier: movie" in detail
 
 

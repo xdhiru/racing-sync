@@ -1,4 +1,4 @@
-"""Tests for the indexer retry policy math.
+"""Tests for the download-target indexer retry policy math.
 
 We don't run the full coordinator here (it needs live qBittorrent +
 Prowlarr). Instead we verify the timing rules that _park_for_indexer_retry
@@ -32,7 +32,7 @@ def test_first_attempt_sets_first_queried_at():
     assert ts.indexer_attempts == 0
 
     now = dt.datetime.now(dt.timezone.utc)
-    interval = cfg.cross_seed.indexer_retry_interval_seconds
+    interval = cfg.cross_seed.prowlarr_retry_interval_seconds
     ts.indexer_first_queried_at = now
     ts.indexer_attempts = 1
     ts.indexer_next_retry_at = now + dt.timedelta(seconds=interval)
@@ -45,8 +45,8 @@ def test_first_attempt_sets_first_queried_at():
 
 def test_retry_window_is_24_hours():
     cfg = _cfg()
-    assert cfg.cross_seed.indexer_max_age_seconds == 86400
-    assert cfg.cross_seed.indexer_retry_interval_seconds == 1800
+    assert cfg.cross_seed.prowlarr_max_age_seconds == 86400
+    assert cfg.cross_seed.prowlarr_retry_interval_seconds == 1800
 
 
 def test_expired_max_age_marks_failed():
@@ -57,13 +57,13 @@ def test_expired_max_age_marks_failed():
         source_infohash="a" * 40,
         state=State.WAITING_INDEXER,
         indexer_first_queried_at=dt.datetime.now(dt.timezone.utc)
-        - dt.timedelta(seconds=cfg.cross_seed.indexer_max_age_seconds + 1),
+        - dt.timedelta(seconds=cfg.cross_seed.prowlarr_max_age_seconds + 1),
         indexer_next_retry_at=dt.datetime.now(dt.timezone.utc),
         indexer_attempts=10,
     )
     now = dt.datetime.now(dt.timezone.utc)
     elapsed = now - ts.indexer_first_queried_at
-    assert elapsed > dt.timedelta(seconds=cfg.cross_seed.indexer_max_age_seconds)
+    assert elapsed > dt.timedelta(seconds=cfg.cross_seed.prowlarr_max_age_seconds)
 
 
 @pytest.mark.anyio
@@ -381,7 +381,7 @@ async def test_public_sftp_timeout_retried_once_then_succeeds(caplog):
 @pytest.mark.anyio
 async def test_public_export_failure_parks_as_source_export_miss(caplog):
     """A public group whose .torrent export keeps failing must park with an
-    honest reason — never a 'indexer miss' (Indexer was never involved)."""
+    honest reason — never an 'indexer miss' (no indexer was ever queried)."""
     import logging
     from unittest.mock import AsyncMock, MagicMock
     from racing_sync.clients.abstract import Torrent
@@ -391,7 +391,7 @@ async def test_public_export_failure_parks_as_source_export_miss(caplog):
     cfg.cross_seed.allow_ssh_export = True
     cfg.cross_seed.refetch_public_via_prowlarr = False
     cfg.cross_seed.allow_prowlarr_cross_seed = True
-    cfg.cross_seed.indexer_retry_interval_seconds = 1800
+    cfg.cross_seed.prowlarr_retry_interval_seconds = 1800
     cfg.cross_seed.prowlarr_max_age_seconds = 86400
     cfg.dest.save_path = "/ssd"
 

@@ -341,13 +341,21 @@ prefer_prowlarr_result = true
 enabled = false
 base_url = "http://127.0.0.1:9696"
 api_key = "CHANGE_ME"
-# Indexer used for SSD downloads and cross-seed searches. Must match
-# the EXACT name of the indexer in your Prowlarr instance (case-sensitive).
-# No default — you must set this when [prowlarr].enabled = true.
-download_indexer = "Indexer (API)"
-# Announce URL substrings that identify this download indexer (e.g. if announce contains "indexer").
-# Used to detect if a watch-dir dropped torrent already comes from the download indexer.
-download_indexer_substrings = ["indexer"]
+# SSD download-target indexers used for SSD downloads and cross-seed
+# searches, in priority order (first table = tried first; each is queried
+# in turn until one returns the exact release). `name` must match the
+# EXACT indexer name in your Prowlarr instance (case-sensitive).
+# `announce_substrings` identifies torrents that already come from that
+# indexer (announce URL substring match), so they are used directly
+# instead of being re-searched. Add one table per indexer; a single
+# indexer is fine.
+[[prowlarr.download_indexers]]
+name = "My Indexer (API)"
+announce_substrings = ["my-indexer"]
+# Example second indexer (commented out):
+# [[prowlarr.download_indexers]]
+# name = "Another Indexer (API)"
+# announce_substrings = ["another"]
 # Substrings in release titles to skip querying Prowlarr for (case-insensitive).
 # Useful for groups (like DummySub) whose complex titles/symbols never match Prowlarr indexers.
 skip_query_substrings = ["dummysub"]
@@ -384,9 +392,9 @@ max_results = 20
 #     Re-injection   = every racing-client torrent (public + private) for
 #                     this content gets re-added on VPS2 fuse, skip_check.
 #   Only private racing torrents exist:
-#     SSD download   = query Prowlarr (download_indexer = "Indexer (API)"
-#                     by default). Park + retry per prowlarr_retry_*
-#                     if no hit.
+#     SSD download   = query Prowlarr download-target indexers (in
+#                     priority order, first exact release wins). Park + retry
+#                     per prowlarr_retry_* if no hit.
 #     Re-injection   = every racing-client torrent for this content gets
 #                     re-added on VPS2 fuse, skip_check.
 #
@@ -406,7 +414,7 @@ allow_prowlarr_cross_seed = true
 # state. Required for Deluge (no WebUI export). For qBittorrent this is
 # a last-resort fallback when no public torrent and no Prowlarr hit.
 allow_ssh_export = true
-# req #2 follow-up: when the configured download_indexer returns no
+# req #2 follow-up: when no configured download-target indexer returns a
 # cross-seed for a brand-new release, re-query every
 # prowlarr_retry_interval_seconds. After prowlarr_max_age_seconds
 # (counted from the FIRST attempt), give up and mark the torrent FAILED

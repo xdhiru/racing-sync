@@ -4,7 +4,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-from racing_sync.config import AppConfig, ProwlarrConfig, WatchDirConfig, GeneralConfig, DestConfig, SSDConfig, RcloneConfig
+from racing_sync.config import AppConfig, DownloadIndexerConfig, ProwlarrConfig, WatchDirConfig, GeneralConfig, DestConfig, SSDConfig, RcloneConfig
 from racing_sync.watchdir import WatchDirScanner, WatchItem, _bencode, _bencoded_info_hash, parse_torrent_file
 from racing_sync.coordinator import Coordinator
 from racing_sync.state import State, StateStore, TorrentState
@@ -12,7 +12,7 @@ from racing_sync.prowlarr import TorrentHit, Indexer
 from racing_sync.clients.abstract import AddResult
 
 
-def _create_sample_torrent_data(name: str = "Test.Movie.1080p", length: int = 1000, announce: str = "http://indexer.net/announce", piece_length: int = 16384) -> bytes:
+def _create_sample_torrent_data(name: str = "Test.Movie.1080p", length: int = 1000, announce: str = "http://dl-indexer.example.net/announce", piece_length: int = 16384) -> bytes:
     torrent_dict = {
         b"announce": announce.encode("utf-8"),
         b"info": {
@@ -39,11 +39,21 @@ def test_prowlarr_config_is_download_indexer():
         enabled=True,
         base_url="http://localhost:9696",
         api_key="secret",
-        download_indexer="Indexer (API)",
-        download_indexer_substrings=["indexer", "publicbt"],
+        download_indexers=[
+            DownloadIndexerConfig(
+                name="Test Indexer (API)",
+                announce_substrings=["test-indexer", "publicbt"],
+            ),
+            DownloadIndexerConfig(
+                name="Second Indexer",
+                announce_substrings=["second"],
+            ),
+        ],
     )
-    assert cfg.is_download_indexer("https://tracker.indexer.org/announce/1234") is True
+    assert cfg.download_indexer_names == ["Test Indexer (API)", "Second Indexer"]
+    assert cfg.is_download_indexer("https://tracker.test-indexer.example/announce/1234") is True
     assert cfg.is_download_indexer("http://publicbt.com/announce") is True
+    assert cfg.is_download_indexer("https://second.example/announce") is True
     assert cfg.is_download_indexer("https://alpha.cc/announce/1234") is False
     assert cfg.is_download_indexer("") is False
 
@@ -77,7 +87,7 @@ async def test_watchdir_pickup_in_tick(tmp_path: Path):
     watch_dir = tmp_path / "watch"
     watch_dir.mkdir()
     tfile = watch_dir / "sample.torrent"
-    raw_data = _create_sample_torrent_data("My.Release", 10000, "http://indexer.org/announce")
+    raw_data = _create_sample_torrent_data("My.Release", 10000, "http://dl-indexer.example.org/announce")
     tfile.write_bytes(raw_data)
 
     db_path = tmp_path / "state.db"
@@ -110,7 +120,7 @@ async def test_watchdir_pickup_in_tick(tmp_path: Path):
     assert ts.source_name == "My.Release"
     assert ts.cross_seed_source == "watch-dir"
     assert ts.cross_seed_blob == raw_data
-    assert ts.source_announce_url == "http://indexer.org/announce"
+    assert ts.source_announce_url == "http://dl-indexer.example.org/announce"
 
     # File should have been deleted after pickup
     assert not tfile.exists()
@@ -118,7 +128,7 @@ async def test_watchdir_pickup_in_tick(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_do_new_watch_dir_already_download_tracker(tmp_path: Path):
-    raw_data = _create_sample_torrent_data("Indexer.Content", 5000, "http://indexer.net/announce")
+    raw_data = _create_sample_torrent_data("DLIndexer.Content", 5000, "http://dl-indexer.example.net/announce")
     infohash, name, total, announce = _bencoded_info_hash(raw_data)
 
     db_path = tmp_path / "state.db"
@@ -132,7 +142,7 @@ async def test_do_new_watch_dir_already_download_tracker(tmp_path: Path):
     coord.cfg.general.state_db = db_path
     coord.cfg.general.disk_safety_margin_bytes = 1000
     coord.cfg.prowlarr.enabled = True
-    coord.cfg.prowlarr.is_download_indexer = lambda url: "indexer" in url
+    coord.cfg.prowlarr.is_download_indexer = lambda url: "dl-indexer" in url
     coord.cfg.prowlarr.should_skip_title.return_value = False
     coord.prowlarr = MagicMock()
     coord.store = store
@@ -150,15 +160,15 @@ async def test_do_new_watch_dir_already_download_tracker(tmp_path: Path):
 
     await coord._do_new_watch_dir(ts)
 
-    # Should NOT search for a download indexer because it already comes from indexer
-    coord.prowlarr.get_download_indexer.assert_not_called()
+    # Should NOT search the download-target indexers because the drop already comes from one
+    coord.prowlarr.get_download_indexers.assert_not_called()
     assert ts.cross_seed_source == "watch-dir"
     assert ts.state == State.QUEUED
 
 
 @pytest.mark.anyio
 async def test_do_new_watch_dir_already_download_tracker_still_searches_other_cross_seeds(tmp_path: Path):
-    raw_data = _create_sample_torrent_data("Indexer.Movie.1080p", 5000, "http://indexer.net/announce")
+    raw_data = _create_sample_torrent_data("DLIndexer.Movie.1080p", 5000, "http://dl-indexer.example.net/announce")
     infohash, name, total, announce = _bencoded_info_hash(raw_data)
 
     db_path = tmp_path / "state.db"
@@ -172,7 +182,7 @@ async def test_do_new_watch_dir_already_download_tracker_still_searches_other_cr
     coord.cfg.general.state_db = db_path
     coord.cfg.general.disk_safety_margin_bytes = 1000
     coord.cfg.prowlarr.enabled = True
-    coord.cfg.prowlarr.is_download_indexer = lambda url: "indexer" in url
+    coord.cfg.prowlarr.is_download_indexer = lambda url: "dl-indexer" in url
     coord.cfg.prowlarr.should_skip_title.return_value = False
     coord.cfg.prowlarr.tracker_map.entries = {"beta": "Beta"}
     coord.store = store
@@ -180,13 +190,13 @@ async def test_do_new_watch_dir_already_download_tracker_still_searches_other_cr
 
     bhd_idx = Indexer(2, "Beta", "torrent", True, [])
     coord.prowlarr = MagicMock()
-    coord.prowlarr.get_download_indexer = MagicMock()
+    coord.prowlarr.get_download_indexers = MagicMock(return_value=[])
     coord.prowlarr.get_indexer_by_name = MagicMock(side_effect=lambda n: bhd_idx if n == "Beta" else None)
     coord.prowlarr.search_indexers_parallel = AsyncMock()
     coord.prowlarr.download_torrent = AsyncMock()
 
     bhd_hit = TorrentHit(
-        title="Indexer.Movie.1080p",
+        title="DLIndexer.Movie.1080p",
         guid="2",
         indexer="Beta",
         indexer_id=2,
@@ -200,7 +210,7 @@ async def test_do_new_watch_dir_already_download_tracker_still_searches_other_cr
         "beta": [bhd_hit],
     }
 
-    bhd_torrent_bytes = _create_sample_torrent_data("Indexer.Movie.1080p", 5000, "http://beta.me/announce", piece_length=32768)
+    bhd_torrent_bytes = _create_sample_torrent_data("DLIndexer.Movie.1080p", 5000, "http://beta.me/announce", piece_length=32768)
     coord.prowlarr.download_torrent.return_value = bhd_torrent_bytes
 
     ts = TorrentState(
@@ -215,8 +225,8 @@ async def test_do_new_watch_dir_already_download_tracker_still_searches_other_cr
 
     await coord._do_new_watch_dir(ts)
 
-    # download_indexer should NOT be queried
-    coord.prowlarr.get_download_indexer.assert_not_called()
+    # download-target indexers should NOT be queried
+    coord.prowlarr.get_download_indexers.assert_not_called()
     # But Beta was searched!
     coord.prowlarr.search_indexers_parallel.assert_called_once()
     # Dropped torrent used for SSD
@@ -226,7 +236,7 @@ async def test_do_new_watch_dir_already_download_tracker_still_searches_other_cr
     # Beta was saved as a cross-seed for FUSE
     watch_cross_dir = tmp_path / "watch_cross_seeds" / infohash
     saved_files = list(watch_cross_dir.glob("*.torrent"))
-    assert len(saved_files) == 2  # dropped indexer torrent + Beta cross-seed
+    assert len(saved_files) == 2  # dropped download-indexer torrent + Beta cross-seed
 
 
 @pytest.mark.anyio
@@ -245,7 +255,7 @@ async def test_do_new_watch_dir_public_torrent_skips_sacrificial_copy(tmp_path: 
     coord.cfg.general.state_db = db_path
     coord.cfg.general.disk_safety_margin_bytes = 1000
     coord.cfg.prowlarr.enabled = True
-    coord.cfg.prowlarr.is_download_indexer = lambda url: "indexer" in url
+    coord.cfg.prowlarr.is_download_indexer = lambda url: "dl-indexer" in url
     coord.cfg.prowlarr.should_skip_title.return_value = False
     coord.cfg.prowlarr.tracker_map.entries = {"beta": "Beta"}
     coord.store = store
@@ -253,7 +263,7 @@ async def test_do_new_watch_dir_public_torrent_skips_sacrificial_copy(tmp_path: 
 
     bhd_idx = Indexer(2, "Beta", "torrent", True, [])
     coord.prowlarr = MagicMock()
-    coord.prowlarr.get_download_indexer = MagicMock()
+    coord.prowlarr.get_download_indexers = MagicMock(return_value=[])
     coord.prowlarr.get_indexer_by_name = MagicMock(side_effect=lambda n: bhd_idx if n == "Beta" else None)
     coord.prowlarr.search_indexers_parallel = AsyncMock()
     coord.prowlarr.download_torrent = AsyncMock()
@@ -288,8 +298,8 @@ async def test_do_new_watch_dir_public_torrent_skips_sacrificial_copy(tmp_path: 
 
     await coord._do_new_watch_dir(ts)
 
-    # download_indexer should NOT be queried for a sacrificial copy
-    coord.prowlarr.get_download_indexer.assert_not_called()
+    # download-target indexers should NOT be queried for a sacrificial copy
+    coord.prowlarr.get_download_indexers.assert_not_called()
     # But Beta was searched for cross-seeds!
     coord.prowlarr.search_indexers_parallel.assert_called_once()
     # Dropped public torrent used directly for SSD
@@ -318,17 +328,17 @@ async def test_do_new_watch_dir_with_prowlarr_search_and_cross_seeds(tmp_path: P
     coord.cfg.general.state_db = db_path
     coord.cfg.general.disk_safety_margin_bytes = 1000
     coord.cfg.prowlarr.enabled = True
-    coord.cfg.prowlarr.is_download_indexer = lambda url: "indexer" in url
+    coord.cfg.prowlarr.is_download_indexer = lambda url: "dl-indexer" in url
     coord.cfg.prowlarr.should_skip_title.return_value = False
     coord.cfg.prowlarr.tracker_map.entries = {"beta": "Beta"}
     coord.store = store
     coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
 
-    dl_idx = Indexer(1, "Indexer (API)", "torrent", True, [])
+    dl_idx = Indexer(1, "Test Indexer (API)", "torrent", True, [])
     bhd_idx = Indexer(2, "Beta", "torrent", True, [])
 
     coord.prowlarr = MagicMock()
-    coord.prowlarr.get_download_indexer = MagicMock(return_value=dl_idx)
+    coord.prowlarr.get_download_indexers = MagicMock(return_value=[dl_idx])
     coord.prowlarr.get_indexer_by_name = MagicMock(side_effect=lambda n: bhd_idx if n == "Beta" else None)
     coord.prowlarr.search_indexers_parallel = AsyncMock()
     coord.prowlarr.download_torrent = AsyncMock()
@@ -337,7 +347,7 @@ async def test_do_new_watch_dir_with_prowlarr_search_and_cross_seeds(tmp_path: P
     dl_hit = TorrentHit(
         title="Private.Movie.1080p",
         guid="1",
-        indexer="Indexer (API)",
+        indexer="Test Indexer (API)",
         indexer_id=1,
         size_bytes=5000,
         download_url="http://prowlarr/dl/1",
@@ -358,12 +368,12 @@ async def test_do_new_watch_dir_with_prowlarr_search_and_cross_seeds(tmp_path: P
     )
 
     coord.prowlarr.search_indexers_parallel.return_value = {
-        "indexer (api)": [dl_hit],
+        "test indexer (api)": [dl_hit],
         "beta": [bhd_hit],
     }
 
     # Mock downloads from Prowlarr
-    dl_torrent_bytes = _create_sample_torrent_data("Private.Movie.1080p", 5000, "http://indexer.net/announce")
+    dl_torrent_bytes = _create_sample_torrent_data("Private.Movie.1080p", 5000, "http://dl-indexer.example.net/announce")
     bhd_torrent_bytes = _create_sample_torrent_data("Private.Movie.1080p", 5000, "http://beta.me/announce", piece_length=32768)
 
     async def mock_dl(hit):
@@ -385,7 +395,7 @@ async def test_do_new_watch_dir_with_prowlarr_search_and_cross_seeds(tmp_path: P
 
     await coord._do_new_watch_dir(ts)
 
-    # Chosen download torrent should be Indexer
+    # Chosen download torrent should be the download-target indexer hit
     assert ts.cross_seed_source == "public-prowlarr"
     assert ts.cross_seed_blob == dl_torrent_bytes
     assert ts.state == State.QUEUED
@@ -610,7 +620,7 @@ def test_matches_release_helper():
     # Matching titles
     assert _matches_release("Show.Name.S01E01.1080p", 1000, "Show.Name.S01E01.1080p", 1000)
     assert _matches_release("Show.Name.S01E01.1080p.mkv", 1000, "Show.Name.S01E01.1080p", 1000)
-    assert _matches_release("Show.Name.S01E01.1080p [Indexer]", 1000, "Show.Name.S01E01.1080p", 1000)
+    assert _matches_release("Show.Name.S01E01.1080p [A1B2C3D4]", 1000, "Show.Name.S01E01.1080p", 1000)
 
     # Size tolerance: within 2% or 50MB
     assert _matches_release("Show.Name", 100000000, "Show.Name", 100500000)
@@ -673,9 +683,9 @@ async def test_do_new_watch_dir_rejects_wrong_title_matching_size(tmp_path: Path
     coord.store = store
     coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
 
-    dl_idx = Indexer(1, "Indexer (API)", "torrent", True, [])
+    dl_idx = Indexer(1, "Test Indexer (API)", "torrent", True, [])
     coord.prowlarr = MagicMock()
-    coord.prowlarr.get_download_indexer = MagicMock(return_value=dl_idx)
+    coord.prowlarr.get_download_indexers = MagicMock(return_value=[dl_idx])
     coord.prowlarr.get_indexer_by_name = MagicMock(return_value=None)
     coord.prowlarr.search_indexers_parallel = AsyncMock()
     coord.prowlarr.download_torrent = AsyncMock()
@@ -684,7 +694,7 @@ async def test_do_new_watch_dir_rejects_wrong_title_matching_size(tmp_path: Path
     wrong_hit = TorrentHit(
         title="Completely.Unrelated.Release",
         guid="1",
-        indexer="Indexer (API)",
+        indexer="Test Indexer (API)",
         indexer_id=1,
         size_bytes=5000,
         download_url="http://prowlarr/dl/1",
@@ -693,7 +703,7 @@ async def test_do_new_watch_dir_rejects_wrong_title_matching_size(tmp_path: Path
         publish_date="",
     )
     coord.prowlarr.search_indexers_parallel.return_value = {
-        "indexer (api)": [wrong_hit],
+        "test indexer (api)": [wrong_hit],
     }
 
     ts = TorrentState(
@@ -780,9 +790,9 @@ async def test_do_new_watch_dir_prefer_prowlarr_result_disabled(tmp_path: Path):
     coord.store = store
     coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
 
-    dl_idx = Indexer(1, "Indexer (API)", "torrent", True, [])
+    dl_idx = Indexer(1, "Test Indexer (API)", "torrent", True, [])
     coord.prowlarr = MagicMock()
-    coord.prowlarr.get_download_indexer = MagicMock(return_value=dl_idx)
+    coord.prowlarr.get_download_indexers = MagicMock(return_value=[dl_idx])
     coord.prowlarr.search_indexers_parallel = AsyncMock()
 
     ts = TorrentState(
@@ -797,8 +807,8 @@ async def test_do_new_watch_dir_prefer_prowlarr_result_disabled(tmp_path: Path):
 
     await coord._do_new_watch_dir(ts)
 
-    # When prefer_prowlarr_result is False, download indexer should not even be queried for sacrificial copy
-    coord.prowlarr.get_download_indexer.assert_not_called()
+    # When prefer_prowlarr_result is False, download-target indexers are not even queried for a sacrificial copy
+    coord.prowlarr.get_download_indexers.assert_not_called()
     assert ts.cross_seed_source == "watch-dir"
     assert ts.cross_seed_blob == raw_data
 
@@ -852,7 +862,7 @@ async def test_do_new_watch_dir_classifies_and_skips_oversize_movie(tmp_path: Pa
 async def test_do_new_watch_dir_classifies_season(tmp_path: Path):
     from racing_sync.config import ClassifierConfig
     torrent_dict = {
-        b"announce": b"http://indexer.net/announce",
+        b"announce": b"http://dl-indexer.example.net/announce",
         b"info": {
             b"name": b"Show.S01",
             b"piece length": 16384,
@@ -900,3 +910,76 @@ async def test_do_new_watch_dir_classifies_season(tmp_path: Path):
 
 
 
+
+
+@pytest.mark.anyio
+async def test_do_new_watch_dir_sacrificial_prefers_first_download_indexer(tmp_path: Path):
+    """With two download-target indexers both holding the exact release,
+    the sacrificial SSD copy comes from the highest-priority one."""
+    raw_data = _create_sample_torrent_data("Private.Movie.1080p", 5000, "http://alpha.cc/announce")
+    infohash, name, total, announce = _bencoded_info_hash(raw_data)
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 100000000
+    coord.cfg.general.state_db = db_path
+    coord.cfg.general.disk_safety_margin_bytes = 1000
+    coord.cfg.prowlarr.enabled = True
+    coord.cfg.prowlarr.is_download_indexer = lambda url: False
+    coord.cfg.prowlarr.should_skip_title.return_value = False
+    coord.cfg.prowlarr.tracker_map.entries = {}
+    coord.store = store
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+
+    first_idx = Indexer(1, "First (API)", "torrent", True, [])
+    second_idx = Indexer(2, "Second (API)", "torrent", True, [])
+    coord.prowlarr = MagicMock()
+    coord.prowlarr.get_download_indexers = MagicMock(return_value=[first_idx, second_idx])
+    coord.prowlarr.get_indexer_by_name = MagicMock(return_value=None)
+    coord.prowlarr.search_indexers_parallel = AsyncMock()
+    coord.prowlarr.download_torrent = AsyncMock()
+
+    first_hit = TorrentHit(
+        title="Private.Movie.1080p", guid="1", indexer="First (API)",
+        indexer_id=1, size_bytes=5000, download_url="http://prowlarr/dl/1",
+        magnet_url="", info_url="", publish_date="",
+    )
+    second_hit = TorrentHit(
+        title="Private.Movie.1080p", guid="2", indexer="Second (API)",
+        indexer_id=2, size_bytes=5000, download_url="http://prowlarr/dl/2",
+        magnet_url="", info_url="", publish_date="",
+    )
+    coord.prowlarr.search_indexers_parallel.return_value = {
+        "first (api)": [first_hit],
+        "second (api)": [second_hit],
+    }
+    first_bytes = _create_sample_torrent_data(
+        "Private.Movie.1080p", 5000, "http://first.example/announce")
+    second_bytes = _create_sample_torrent_data(
+        "Private.Movie.1080p", 5000, "http://second.example/announce")
+
+    async def mock_dl(hit):
+        return first_bytes if hit.indexer_id == 1 else second_bytes
+
+    coord.prowlarr.download_torrent.side_effect = mock_dl
+
+    ts = TorrentState(
+        source_infohash=infohash,
+        source_name=name,
+        total_bytes=total,
+        source_announce_url=announce,
+        cross_seed_blob=raw_data,
+        cross_seed_source="watch-dir",
+        state=State.NEW,
+    )
+
+    await coord._do_new_watch_dir(ts)
+
+    assert ts.cross_seed_source == "public-prowlarr"
+    assert ts.cross_seed_blob == first_bytes
+    assert ts.state == State.QUEUED

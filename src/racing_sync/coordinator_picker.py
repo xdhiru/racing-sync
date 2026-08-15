@@ -17,6 +17,7 @@ from .coordinator_content import (
     SourceDecision,
     _looks_public,
     _verified_cross_seed_blob,
+    indexer_slug,
 )
 from .prowlarr import ProwlarrClient
 from .sftp_source import SFTPExporter
@@ -40,9 +41,9 @@ async def pick_ssd_source_for_racing(
     Returns:
       - SourceDecision if we have a candidate right now, OR
       - None if we should park the row in WAITING_INDEXER and retry later
-        (only when `attempt_prowlarr=True` and we had a real Indexer
-        miss; otherwise we fall through to the SFTP fallback even if
-        Indexer returned no hit).
+        (only when `attempt_prowlarr=True` and we had a real miss on the
+        download-target indexers; otherwise we fall through to the SFTP
+        fallback even when the indexers returned no hit).
 
     Logic per req #1 / #2:
       (a) one or more *public* torrents for the file on VPS1   → use the
@@ -52,19 +53,19 @@ async def pick_ssd_source_for_racing(
                                                                Prowlarr is
                                                                NEVER queried
                                                                in this case.
-      (b) only *private* torrents from Alpha / Beta /
-          Gamma (per tracker_map)                         → query the
+      (b) only *private* torrents (per tracker_map)            → query the
                                                                configured
-                                                               download_indexer
-                                                               ("Indexer (API)"
-                                                               by default) for a
-                                                               cross-seed copy
+                                                               download-target
+                                                               indexers in
+                                                               priority order
+                                                               for a cross-seed
+                                                               copy
     """
 
     # If the source torrent is itself a "public" tracker, we use IT for
     # the SSD download directly. We do NOT consult Prowlarr — the racing
-    # public torrent already works, fetching a Indexer copy would be
-    # redundant. The only exception is the rare case where the racing
+    # public torrent already works, fetching a download-indexer copy would
+    # be redundant. The only exception is the rare case where the racing
     # client's .torrent is unreachable on VPS1 (then refetch_public_via_prowlarr
     # can fall back to Prowlarr as a last resort).
     publics = [t for t in [source_torrent] + other_source_torrents
@@ -74,8 +75,8 @@ async def pick_ssd_source_for_racing(
         chosen = publics[0]
         # req #1: when a public torrent exists on VPS1, use IT for the
         # SSD download directly. We do NOT consult Prowlarr by default
-        # — the racing public torrent already works, fetching a Indexer
-        # copy would be redundant.
+        # — the racing public torrent already works, fetching a
+        # download-indexer copy would be redundant.
         #
         # The racing-client torrent's .torrent bytes are obtained either
         # via qBittorrent's `/api/v2/torrents/export` endpoint (handled
@@ -163,9 +164,12 @@ async def pick_ssd_source_for_racing(
                 chosen.name,
             )
             try:
-                hit = await prowlarr.best_match(chosen.name, target_size=chosen.size_bytes)
+                hit = await prowlarr.best_match(
+                    chosen.name, target_size=chosen.size_bytes,
+                    indexers=prowlarr.get_download_indexers(),
+                )
             except Exception as e:  # noqa: BLE001
-                log.warning("indexer search failed for %s: %s",
+                log.warning("download-indexer search failed for %s: %s",
                             chosen.name, e)
                 hit = None
             verified = None
@@ -181,7 +185,7 @@ async def pick_ssd_source_for_racing(
                 blob, real_hash, announce = verified
                 return SourceDecision(
                     torrent_bytes=blob,
-                    source_label="public-indexer-fallback",
+                    source_label=f"public-{indexer_slug(hit.indexer)}-fallback",
                     name=chosen.name,
                     size_bytes=hit_size,
                     infohash=real_hash,
@@ -197,10 +201,10 @@ async def pick_ssd_source_for_racing(
         return None
 
     # All torrents are private. Preferred SSD source is a cross-seed from the
-    # configured download_indexer ("Indexer (API)" by default) — unless the
-    # title matches skip_query_substrings (a query can never match, so don't
-    # park for one) or Prowlarr is unavailable/disabled. Those cases fall
-    # straight through to the direct-export fallback below instead of
+    # configured download-target indexers (tried in priority order) — unless
+    # the title matches skip_query_substrings (a query can never match, so
+    # don't park for one) or Prowlarr is unavailable/disabled. Those cases
+    # fall straight through to the direct-export fallback below instead of
     # entering the WAITING_INDEXER retry loop for a query that will never
     # run. Private torrents are never downloaded directly on SSD unless
     # allow_ssh_export (or the source export endpoint) is used.
@@ -218,14 +222,17 @@ async def pick_ssd_source_for_racing(
         )
     elif can_query_prowlarr:
         log.info(
-            "private release; querying Prowlarr (%s) for cross-seed of %s",
-            cfg.prowlarr.download_indexer,
+            "private release; querying Prowlarr download-target indexer(s) %s for cross-seed of %s",
+            cfg.prowlarr.download_indexer_names,
             source_torrent.name,
         )
         try:
-            hit = await prowlarr.best_match(source_torrent.name, target_size=source_torrent.size_bytes)
+            hit = await prowlarr.best_match(
+                source_torrent.name, target_size=source_torrent.size_bytes,
+                indexers=prowlarr.get_download_indexers(),
+            )
         except Exception as e:  # noqa: BLE001
-            log.warning("indexer search failed for %s: %s",
+            log.warning("download-indexer search failed for %s: %s",
                         source_torrent.name, e)
             hit = None
         verified = None
@@ -245,7 +252,7 @@ async def pick_ssd_source_for_racing(
             blob, real_hash, announce = verified
             return SourceDecision(
                 torrent_bytes=blob,
-                source_label="indexer-cross-seed",
+                source_label=f"{indexer_slug(hit.indexer)}-cross-seed",
                 name=source_torrent.name,
                 size_bytes=hit_size,
                 infohash=real_hash,
@@ -317,7 +324,7 @@ async def pick_ssd_source_for_racing(
             )
 
     log.warning(
-        "no public torrent and no Indexer cross-seed available for %s",
+        "no public torrent and no download-target indexer cross-seed available for %s",
         source_torrent.name,
     )
     return None

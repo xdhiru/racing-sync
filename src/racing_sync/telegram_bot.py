@@ -50,7 +50,7 @@ log = logging.getLogger(__name__)
 _STATE_ICON = {
     State.NEW: "🆕 NEW",
     State.QUERYING: "🔍 QUERY",
-    State.WAITING_INDEXER: "⏳ WAIT-SP",
+    State.WAITING_INDEXER: "⏳ WAIT-IDX",
     State.WAITING_DISK: "💾 WAIT-SSD",
     State.QUEUED: "📋 QUEUED",
     State.DOWNLOADING: "⬇️ DOWNLOADING",
@@ -353,7 +353,7 @@ def render_active(
         elif ts.state == State.QUERYING:
             state_text = "🔍 Querying"
         elif ts.state == State.WAITING_INDEXER:
-            state_text = f"⏳ Waiting for Indexer (#{ts.indexer_attempts})"
+            state_text = f"⏳ Waiting for download indexer (#{ts.indexer_attempts})"
         elif ts.state == State.WAITING_DISK:
             state_text = "💾 Waiting for SSD space"
         elif ts.state == State.DONE:

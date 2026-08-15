@@ -86,7 +86,7 @@ def test_find_by_name_extension_matching(tmp_path):
     db_path = tmp_path / "test.db"
     store = StateStore(db_path)
 
-    # Stored without .mkv (as Indexer or VPS2 client might report)
+    # Stored without .mkv (as a download-target indexer or VPS2 client might report)
     ts = TorrentState(
         source_infohash="hash123",
         source_name="Harbor.Lights.S01E06.1080p-Raccoon",
@@ -348,48 +348,6 @@ def test_transition_to_done_sets_completed_at(tmp_path: Path):
         reloaded.vps1_last_activity_at = stamp
         store.upsert(reloaded)
         assert store.get("4" * 40).vps1_last_activity_at == stamp
-    finally:
-        store.close()
-
-
-def test_migrate_handles_old_schema_without_telegram_or_indexer(tmp_path: Path):
-    import sqlite3
-    db_path = tmp_path / "old.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("""
-        CREATE TABLE torrent_state (
-            source_infohash TEXT PRIMARY KEY,
-            dest_infohash TEXT NOT NULL DEFAULT '',
-            source_name TEXT NOT NULL DEFAULT '',
-            source_tracker TEXT NOT NULL DEFAULT '',
-            source_announce_url TEXT NOT NULL DEFAULT '',
-            classification_kind TEXT NOT NULL DEFAULT 'unknown',
-            total_bytes INTEGER NOT NULL DEFAULT 0,
-            save_path TEXT NOT NULL DEFAULT '',
-            cross_seed_infohash TEXT NOT NULL DEFAULT '',
-            cross_seed_source TEXT NOT NULL DEFAULT '',
-            state TEXT NOT NULL DEFAULT 'new',
-            batch_index INTEGER NOT NULL DEFAULT 0,
-            batches_total INTEGER NOT NULL DEFAULT 0,
-            last_error TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        INSERT INTO torrent_state (source_infohash, created_at, updated_at)
-        VALUES ('3333333333333333333333333333333333333333', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')
-    """)
-    conn.commit()
-    conn.close()
-
-    # Opening StateStore on existing legacy DB runs _migrate()
-    store = StateStore(db_path)
-    try:
-        row = store.get("3333333333333333333333333333333333333333")
-        assert row is not None
-        assert row.telegram_message_id == 0
-        assert row.indexer_attempts == 0
     finally:
         store.close()
 

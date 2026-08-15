@@ -129,48 +129,23 @@ def test_state_store_readd_fields_roundtrip(tmp_path: Path):
     assert abs((loaded.readd_next_retry_at - next_retry).total_seconds()) < 1
 
 
-def test_state_store_migration_adds_readd_columns(tmp_path: Path):
+def test_state_store_readd_fields_round_trip(tmp_path: Path):
     import sqlite3
-    db_path = tmp_path / "legacy.db"
-    # Create legacy table without readd columns
+    from racing_sync.state import SCHEMA_TABLES
+    db_path = tmp_path / "state.db"
     conn = sqlite3.connect(str(db_path))
-    conn.execute("""
-        CREATE TABLE torrent_state (
-            source_infohash TEXT PRIMARY KEY,
-            dest_infohash TEXT NOT NULL DEFAULT '',
-            source_name TEXT NOT NULL DEFAULT '',
-            source_tracker TEXT NOT NULL DEFAULT '',
-            source_announce_url TEXT NOT NULL DEFAULT '',
-            classification_kind TEXT NOT NULL DEFAULT 'unknown',
-            total_bytes INTEGER NOT NULL DEFAULT 0,
-            save_path TEXT NOT NULL DEFAULT '',
-            cross_seed_infohash TEXT NOT NULL DEFAULT '',
-            cross_seed_source TEXT NOT NULL DEFAULT '',
-            injected_private_hashes TEXT NOT NULL DEFAULT '',
-            indexer_first_queried_at TEXT NOT NULL DEFAULT '',
-            indexer_next_retry_at TEXT NOT NULL DEFAULT '',
-            indexer_attempts INTEGER NOT NULL DEFAULT 0,
-            state TEXT NOT NULL,
-            batch_index INTEGER NOT NULL DEFAULT 0,
-            batches_total INTEGER NOT NULL DEFAULT 0,
-            last_error TEXT NOT NULL DEFAULT '',
-            telegram_message_id INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
+    conn.executescript(SCHEMA_TABLES)
     conn.close()
 
-    # Opening with StateStore should run _migrate() and add the columns
     store = StateStore(db_path)
     ts = TorrentState(
-        source_infohash="legacy_hash",
-        source_name="Legacy.Release",
+        source_infohash="readd_hash",
+        source_name="Readd.Release",
         state=State.RE_ADDING,
         readd_attempts=1,
     )
     store.upsert(ts)
-    loaded = store.get("legacy_hash")
+    loaded = store.get("readd_hash")
     assert loaded is not None
     assert loaded.readd_attempts == 1
     store.close()
@@ -1383,12 +1358,12 @@ async def test_late_cross_seed_repairs_skipped_racing_injection(tmp_path: Path):
     coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path="x"))
 
     racing_hash = "b" * 40   # VPS1 private torrent (SFTP timed out in RE_ADDING)
-    indexer_hash = "c" * 40  # cross-seed actually injected
+    xseed_hash = "c" * 40  # cross-seed actually injected
     ts = TorrentState(
         source_infohash=racing_hash,
         source_name="Dark.Matter.2024.S02E04",
-        dest_infohash=indexer_hash,
-        cross_seed_infohash=indexer_hash,
+        dest_infohash=xseed_hash,
+        cross_seed_infohash=xseed_hash,
         injected_private_hashes="",
         state=State.DONE,
     )

@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 def normalize_content_name(name: str) -> str:
     """Normalize release/torrent names for deduplication and grouping.
 
-    Strips trailing indexer tags (e.g. '[Indexer]', '[FL]'), trailing
+    Strips trailing indexer tags (e.g. '[A1B2C3D4]', '[FL]'), trailing
     file extensions ('.torrent', '.mkv', etc.), and case-folds/strips.
     Loops until stable so 'Show [A] [B]' and 'Movie.mkv.torrent' fully collapse.
     """
@@ -144,11 +144,26 @@ class SourceDecision:
     """Where the SSD-source torrent comes from."""
 
     torrent_bytes: bytes
-    source_label: str     # "public-prowlarr" | "public-sftp" | "private-prowlarr" | "watch-dir"
+    # "<indexer-slug>-cross-seed" for a download-target indexer hit
+    # (e.g. "my-indexer-api-cross-seed"), "public-racing",
+    # "public-<slug>-fallback", "private-sftp-fallback",
+    # "private-export-fallback", "public-prowlarr", "watch-dir", ...
+    source_label: str
     name: str
     size_bytes: int
     infohash: str
     announce_url: str = ""
+
+
+def indexer_slug(name: str) -> str:
+    """Slugify a Prowlarr indexer name for source labels.
+
+    "My Indexer (API)" -> "my-indexer-api". Used to build per-indexer
+    `source_label` values ("<slug>-cross-seed") so operators can see
+    which download-target indexer supplied the SSD bytes.
+    """
+    s = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+    return s or "indexer"
 
 
 # Telegram notification filter: only certain state transitions deserve

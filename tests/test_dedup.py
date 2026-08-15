@@ -80,10 +80,10 @@ def test_normalize_content_name():
     from racing_sync.coordinator import normalize_content_name
 
     assert normalize_content_name("Movie.2024.1080p-GROUP") == "movie.2024.1080p-group"
-    assert normalize_content_name("Movie.2024.1080p-GROUP [Indexer]") == "movie.2024.1080p-group"
+    assert normalize_content_name("Movie.2024.1080p-GROUP [A1B2C3D4]") == "movie.2024.1080p-group"
     assert normalize_content_name("Movie.2024.1080p-GROUP [FL].torrent") == "movie.2024.1080p-group"
     assert normalize_content_name("Movie.2024.1080p-GROUP.mkv") == "movie.2024.1080p-group"
-    assert normalize_content_name("  Movie.2024.1080p-GROUP [Indexer]  ") == "movie.2024.1080p-group"
+    assert normalize_content_name("  Movie.2024.1080p-GROUP [A1B2C3D4]  ") == "movie.2024.1080p-group"
 
 
 def test_find_by_name_with_bracketed_tags():
@@ -98,8 +98,8 @@ def test_find_by_name_with_bracketed_tags():
             )
             store.upsert(ts1)
 
-            # Query with [Indexer] variant matches the stored entry
-            results = store.find_by_name("Movie.2024.1080p-GROUP [Indexer]")
+            # Query with [A1B2C3D4] variant matches the stored entry
+            results = store.find_by_name("Movie.2024.1080p-GROUP [A1B2C3D4]")
             assert len(results) == 1
             assert results[0].source_infohash == "1" * 40
         finally:
