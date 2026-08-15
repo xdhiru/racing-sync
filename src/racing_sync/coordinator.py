@@ -1519,6 +1519,50 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     # SSD re-check. Batches drain via MOVING in the meantime.
     WAITING_DISK_RECHECK_SECONDS = 60.0
 
+    async def _estimate_remaining_bytes(self, ts: TorrentState) -> int | None:
+        """Remaining SSD bytes for a cursor-having row; None when unknowable.
+
+        A partially-moved season retries WAITING_DISK against its remaining
+        batches, not its full total (a 32 GB pack with 20 GB already remote
+        must not block a 16 GB waiter on phantom bytes). Best-effort: any
+        failure returns None and the caller stays parked.
+        """
+        try:
+            if not hasattr(self, "dest_client"):
+                return None
+            try:
+                total_batches = int(getattr(ts, "batches_total", 0) or 0)
+            except (TypeError, ValueError):
+                total_batches = 0
+            if total_batches <= 0:
+                return None
+            h = ts.dest_infohash or ts.source_infohash
+            try:
+                files = await self.dest_client.get_torrent_files(h)
+            except Exception:
+                return None
+            if not files:
+                return None
+            cls = classify(files, self.cfg)
+            kind = cls.kind or ts.classification_kind or "unknown"
+            cap = self._frozen_batch_cap(ts)
+            if cap <= 0:
+                return None
+            batches = self._resolve_batches(files, kind, cap)
+            if not batches:
+                return None
+            try:
+                idx = int(getattr(ts, "batch_index", 0) or 0)
+            except (TypeError, ValueError):
+                idx = 0
+            idx = max(0, min(idx, len(batches)))
+            if idx >= len(batches):
+                return 0
+            rem = await self._remaining_batch_footprint(batches[idx:], kind)
+            return int(rem) if rem is not None else None
+        except Exception:
+            return None
+
     async def _wait_disk_then_queue(self, ts: TorrentState) -> None:
         # Global ledger re-check (quiet 60s cadence): reserves before QUEUED
         # so a new arrival mid-batch can't over-commit the budget that batch
@@ -1526,7 +1570,22 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if self._stop:
             return
         needed = self._ssd_estimate_for_new(ts.total_bytes)
-        if await self._ssd_try_reserve(ts.source_infohash, needed):
+        admitted = await self._ssd_try_reserve(ts.source_infohash, needed)
+        if not admitted:
+            # Full total didn't fit, but a partially-moved row may need far
+            # less than its total — retry against remaining batches before
+            # parking another 60s.
+            try:
+                rem = await self._estimate_remaining_bytes(ts)
+            except Exception:
+                rem = None
+            if rem is not None and rem < needed:
+                log.info("retrying %s against remaining ~%d MB (full ~%d MB did not fit)",
+                         ts.source_name[:60], rem // (1024 * 1024), needed // (1024 * 1024))
+                admitted = await self._ssd_try_reserve(ts.source_infohash, rem)
+                if admitted:
+                    needed = rem
+        if admitted:
             try:
                 _wd = getattr(self, "_waiting_disk_next_check", None)
                 if isinstance(_wd, dict):
@@ -1823,6 +1882,44 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 pass
             return
 
+    async def _remaining_batch_footprint(self, batches, kind: str) -> int | None:
+        """Max SSD bytes still needed across `batches` (remote-skipped excluded).
+
+        Only bytes NOT already on the fuse remote can occupy SSD: batches a
+        previous run moved were wiped locally, and never-selected files never
+        hit disk on boxes without qB preallocation. One `_fuse_skipped` round
+        covers every batch at once. Returns None when unknowable (caller
+        keeps today's full-batch figure); 0 when everything is already
+        remote (the row will fast-path through downloading holding nothing).
+        The physical free-space check in `_ssd_try_reserve` stays the
+        backstop, so a preallocating box can at worst admit slightly early,
+        never overfill.
+        """
+        try:
+            blist = list(batches or [])
+            if not blist:
+                return None
+            all_eps = [
+                (e.file_name, e.size_bytes)
+                for b in blist for e in (getattr(b, "episodes", None) or [])
+                if getattr(e, "file_name", "")
+            ]
+            if not all_eps:
+                return 0
+            skipped = await self._fuse_skipped(all_eps, kind or "unknown")
+            skipped = skipped or set()
+            best = 0
+            for b in blist:
+                rem = sum(
+                    int(getattr(e, "size_bytes", 0) or 0)
+                    for e in (getattr(b, "episodes", None) or [])
+                    if getattr(e, "file_name", "") not in skipped
+                )
+                best = max(best, rem)
+            return best
+        except Exception:
+            return None
+
     async def _fuse_skipped(self, items: list[tuple[str, int]], kind: str) -> set[str]:
         """Subset of torrent-relative names already complete on the fuse target.
 
@@ -1938,12 +2035,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             batches = make_batches(episodes, cap_bytes=cap)
             ts.batches_total = len(batches)
             ts.batch_index = 0
-            # Refine global reservation to the real footprint (max batch —
-            # covers varying episode sizes, isolated batches hold one at a time).
-            try:
-                _real_footprint = max((b.size_bytes for b in batches), default=0) or cap
-            except Exception:
-                _real_footprint = cap
+            # Refine global reservation to the real footprint (max REMAINING
+            # batch — covers varying episode sizes, isolated batches hold one
+            # at a time; bytes already on the remote hold no SSD).
+            _rem = await self._remaining_batch_footprint(batches, cls.kind)
+            if _rem is None:
+                try:
+                    _real_footprint = max((b.size_bytes for b in batches), default=0) or cap
+                except Exception:
+                    _real_footprint = cap
+            else:
+                _real_footprint = _rem
             if batches:
                 # First batch only: priority 1; rest: 0. Files a previous run
                 # already moved stay deselected (re-downloaded never).
@@ -1981,10 +2083,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             batches = make_file_batches(files, cap_bytes=cap)
             ts.batches_total = len(batches)
             ts.batch_index = 0
-            try:
-                _real_footprint = max((b.size_bytes for b in batches), default=0) or cap
-            except Exception:
-                _real_footprint = cap
+            _rem = await self._remaining_batch_footprint(batches, cls.kind)
+            if _rem is None:
+                try:
+                    _real_footprint = max((b.size_bytes for b in batches), default=0) or cap
+                except Exception:
+                    _real_footprint = cap
+            else:
+                _real_footprint = _rem
             if batches:
                 first = batches[0]
                 wanted = {ep.file_name for ep in first.episodes}
@@ -1998,20 +2104,19 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 )
 
         # Refine the admission estimate to the real SSD footprint now that
-        # classification/batches are known (varying episode/game sizes → max
-        # batch; singles/full-torrent → total). Shrinking always succeeds and
-        # frees budget for waiters; growing (single bigger than estimate) can
-        # fail globally — roll back the just-added torrent and park.
+        # classification/batches are known (remaining batch bytes for
+        # seasons/games; singles/full-torrent → total). Zero is a valid
+        # refinement (everything already remote — hold nothing). Shrinking
+        # always succeeds and frees budget for waiters; growing (single
+        # bigger than estimate) can fail globally — roll back the just-added
+        # torrent and park.
         try:
             if _real_footprint is None:
                 try:
                     _real_footprint = sum(f.size_bytes for f in files) or ts.total_bytes or 0
                 except Exception:
                     _real_footprint = ts.total_bytes or 0
-            if _real_footprint and _real_footprint > 0:
-                _ok = await self._ssd_adjust(ts.source_infohash, int(_real_footprint))
-            else:
-                _ok = True
+            _ok = await self._ssd_adjust(ts.source_infohash, int(_real_footprint or 0))
         except Exception:
             _ok = True
         if not _ok:
@@ -2451,6 +2556,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     else:
                         ts.batch_index = next_index
                         self.store.upsert(ts)
+                    # Tighten the SSD reservation as batches land on the
+                    # remote: only remaining work should block waiters (a
+                    # 32 GB season with 20 GB already moved must not pin
+                    # 32 GB). Skipped here on the final batch: its bytes
+                    # are still on SSD until the MOVING wipe releases them.
+                    if ts.batch_index < ts.batches_total:
+                        try:
+                            _rem = await self._remaining_batch_footprint(
+                                batches, ts.classification_kind or "unknown")
+                            if _rem is not None:
+                                await self._ssd_adjust(
+                                    ts.source_infohash, int(_rem))
+                        except Exception:
+                            pass
                 elif hasattr(self, "_move_and_clean_batch") and hasattr(self._move_and_clean_batch, "mock_calls"):
                     # Mock in unit test (e.g. AsyncMock)
                     await self._move_and_clean_batch(ts, None)  # type: ignore[arg-type]
