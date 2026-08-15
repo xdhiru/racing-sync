@@ -634,6 +634,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 await self.watch.delete_picked_up(item)
         return items
 
+    def _spawn_worker(self, ts: TorrentState) -> None:
+        """Launch a _process_torrent worker with in-flight bookkeeping.
+
+        No-op if the row already has a live worker (both call sites
+        pre-check too; the re-check here closes the gap after awaits).
+        """
+        h = (ts.source_infohash or "").lower()
+        if h in self._running_infohashes:
+            return
+        self._running_infohashes.add(h)
+        task = asyncio.create_task(self._process_torrent(ts))
+        self._tasks.add(task)
+        def _done_cb(t: asyncio.Task, infohash: str = h) -> None:
+            self._tasks.discard(t)
+            self._running_infohashes.discard(infohash)
+        task.add_done_callback(_done_cb)
+
     async def _tick(self) -> None:
         """One iteration: poll sources, schedule work (serialized vs API ops)."""
         lock = getattr(self, "_ops_lock", None)
@@ -791,14 +808,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 ts.source_name[:40], ts.indexer_attempts,
             )
             self.transition(ts, State.QUERYING)
-            h = (ts.source_infohash or "").lower()
-            self._running_infohashes.add(h)
-            task = asyncio.create_task(self._process_torrent(ts))
-            self._tasks.add(task)
-            def _done_cb_indexer(t: asyncio.Task, infohash: str = h) -> None:
-                self._tasks.discard(t)
-                self._running_infohashes.discard(infohash)
-            task.add_done_callback(_done_cb_indexer)
+            self._spawn_worker(ts)
 
         # 4. Schedule workers for active states that have no live task.
         # WAITING_DISK rows sort last so real QUEUED/DOWNLOADING/MOVING work
@@ -864,14 +874,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if ts.state == State.MOVING and active_moves >= self.cfg.max_concurrent_moves:
                 continue
 
-            h = (ts.source_infohash or "").lower()
-            self._running_infohashes.add(h)
-            task = asyncio.create_task(self._process_torrent(ts))
-            self._tasks.add(task)
-            def _done_cb(t: asyncio.Task, infohash: str = h) -> None:
-                self._tasks.discard(t)
-                self._running_infohashes.discard(infohash)
-            task.add_done_callback(_done_cb)
+            self._spawn_worker(ts)
 
             if ts.state in (State.QUEUED, State.DOWNLOADING):
                 active_downloads += 1
