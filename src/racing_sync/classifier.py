@@ -269,7 +269,3 @@ def oversize_single_file(files: Iterable[TorrentFile], cfg: AppConfig) -> str | 
         if size > cap and getattr(f, "name", ""):
             return f.name
     return None
-
-
-def file_total_size(files: Iterable[TorrentFile]) -> int:
-    return sum(f.size_bytes for f in files)

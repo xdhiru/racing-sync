@@ -349,7 +349,6 @@ async def test_callback_authentication_and_throttling():
     from unittest.mock import AsyncMock, MagicMock
     bot = object.__new__(TelegramBot)
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
-    bot._last_callback_time = 0.0
     bot._store = MagicMock()
     bot._store.list_active_inflight.return_value = []
     bot._refresh_active_message = AsyncMock()

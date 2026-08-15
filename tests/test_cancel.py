@@ -422,7 +422,6 @@ def _bot(**kw):
     bot._cfg.chat_id = "1"
     bot._cfg.page_size = 5
     bot._callback_times = {}
-    bot._last_callback_time = 0.0
     bot._store = MagicMock()
     bot._current_page = 0
     bot._refresh_active_message = AsyncMock()
