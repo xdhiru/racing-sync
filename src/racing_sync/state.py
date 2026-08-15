@@ -31,8 +31,8 @@ class State(str, enum.Enum):
     SSD download + rclone move + fuse re-add has these stages:
 
       NEW                 we noticed the torrent on VPS1, need to make decisions
-      QUERYING            asking Indexer for a cross-seed torrent (req #1,#2,#3)
-      WAITING_INDEXER    Indexer returned no hit; we park and retry later
+      QUERYING            asking the download-target indexers for a cross-seed torrent (req #1,#2,#3)
+      WAITING_INDEXER     no download-target indexer returned a hit yet; we park and retry later
       WAITING_DISK        waiting for SSD to have room (cap in use)
       QUEUED              ready to add to qBittorrent on VPS2
       DOWNLOADING         qBittorrent is downloading on VPS2 SSD
@@ -121,7 +121,7 @@ class TorrentState:
     # when only the racing torrents survived.
     cross_seed_blob: bytes = b""
     injected_private_hashes: str = ""  # CSV of private hashes re-added to fuse
-    # Indexer retry policy
+    # Download-target indexer retry policy
     indexer_first_queried_at: dt.datetime | None = None
     indexer_next_retry_at: dt.datetime | None = None
     indexer_attempts: int = 0
@@ -313,7 +313,6 @@ class StateStore:
         except Exception:
             pass
         self._conn.executescript(SCHEMA_TABLES)
-        self._migrate()
         self._conn.executescript(SCHEMA_INDEXES)
 
     def _ensure_open(self) -> None:
@@ -334,54 +333,6 @@ class StateStore:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
-
-    # ---- migrations ----
-
-    def _migrate(self) -> None:
-        """Idempotent column additions for older state DBs.
-
-        SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so we
-        inspect `PRAGMA table_info` and add missing columns manually.
-        """
-        cols = {row["name"] for row in self._conn.execute(
-            "PRAGMA table_info(torrent_state)"
-        ).fetchall()}
-        EXPECTED_COLUMNS = {
-            "dest_infohash": "TEXT NOT NULL DEFAULT ''",
-            "source_name": "TEXT NOT NULL DEFAULT ''",
-            "source_tracker": "TEXT NOT NULL DEFAULT ''",
-            "source_announce_url": "TEXT NOT NULL DEFAULT ''",
-            "classification_kind": "TEXT NOT NULL DEFAULT 'unknown'",
-            "total_bytes": "INTEGER NOT NULL DEFAULT 0",
-            "save_path": "TEXT NOT NULL DEFAULT ''",
-            "cross_seed_infohash": "TEXT NOT NULL DEFAULT ''",
-            "cross_seed_source": "TEXT NOT NULL DEFAULT ''",
-            "cross_seed_blob": "BLOB NOT NULL DEFAULT ''",
-            "injected_private_hashes": "TEXT NOT NULL DEFAULT ''",
-            "indexer_first_queried_at": "TEXT NOT NULL DEFAULT ''",
-            "indexer_next_retry_at": "TEXT NOT NULL DEFAULT ''",
-            "indexer_attempts": "INTEGER NOT NULL DEFAULT 0",
-            "readd_first_attempted_at": "TEXT NOT NULL DEFAULT ''",
-            "readd_next_retry_at": "TEXT NOT NULL DEFAULT ''",
-            "readd_attempts": "INTEGER NOT NULL DEFAULT 0",
-            "failed_retries": "INTEGER NOT NULL DEFAULT 0",
-            "completed_at": "TEXT NOT NULL DEFAULT ''",
-            "vps1_last_activity_at": "TEXT NOT NULL DEFAULT ''",
-            "state": "TEXT NOT NULL DEFAULT 'new'",
-            "batch_index": "INTEGER NOT NULL DEFAULT 0",
-            "batches_total": "INTEGER NOT NULL DEFAULT 0",
-            "batch_cap_bytes": "INTEGER NOT NULL DEFAULT 0",
-            "readd_cycles": "INTEGER NOT NULL DEFAULT 0",
-            "last_error": "TEXT NOT NULL DEFAULT ''",
-            "telegram_message_id": "INTEGER NOT NULL DEFAULT 0",
-            "created_at": "TEXT NOT NULL DEFAULT ''",
-            "updated_at": "TEXT NOT NULL DEFAULT ''",
-        }
-        for col, col_def in EXPECTED_COLUMNS.items():
-            if col not in cols:
-                self._conn.execute(
-                    f"ALTER TABLE torrent_state ADD COLUMN {col} {col_def}"
-                )
 
     # ---- CRUD ----
 
@@ -445,7 +396,7 @@ class StateStore:
         """Rows in WAITING_INDEXER whose retry timer has elapsed.
 
         Used by the coordinator tick to decide which rows to wake up and
-        re-query Indexer.
+        re-query the download-target indexers.
         """
         now = now or dt.datetime.now(dt.timezone.utc)
         with self._lock:
@@ -846,8 +797,9 @@ def _safe_dt(value: object) -> dt.datetime | None:
 
 def _row_to_state(row: sqlite3.Row) -> TorrentState:
     keys = row.keys()
-    sp_first = row["indexer_first_queried_at"] if "indexer_first_queried_at" in keys else ""
-    sp_next = row["indexer_next_retry_at"] if "indexer_next_retry_at" in keys else ""
+    idx_first = row["indexer_first_queried_at"] if "indexer_first_queried_at" in keys else ""
+    idx_next = row["indexer_next_retry_at"] if "indexer_next_retry_at" in keys else ""
+    idx_attempts = row["indexer_attempts"] if "indexer_attempts" in keys else 0
     ra_first = row["readd_first_attempted_at"] if "readd_first_attempted_at" in keys else ""
     ra_next = row["readd_next_retry_at"] if "readd_next_retry_at" in keys else ""
     ra_attempts = row["readd_attempts"] if "readd_attempts" in keys else 0
@@ -878,9 +830,9 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         cross_seed_source=row["cross_seed_source"] if "cross_seed_source" in keys else "",
         cross_seed_blob=blob_bytes,
         injected_private_hashes=row["injected_private_hashes"] if "injected_private_hashes" in keys else "",
-        indexer_first_queried_at=_safe_dt(sp_first),
-        indexer_next_retry_at=_safe_dt(sp_next),
-        indexer_attempts=_safe_int(row["indexer_attempts"]) if "indexer_attempts" in keys else 0,
+        indexer_first_queried_at=_safe_dt(idx_first),
+        indexer_next_retry_at=_safe_dt(idx_next),
+        indexer_attempts=_safe_int(idx_attempts),
         readd_first_attempted_at=_safe_dt(ra_first),
         readd_next_retry_at=_safe_dt(ra_next),
         readd_attempts=_safe_int(ra_attempts),

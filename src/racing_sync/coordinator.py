@@ -7,7 +7,7 @@ calls, rclone invocations, and prowlarr lookups. The flow per torrent:
   2. Pick the SSD-source torrent:
        - if VPS1 has multiple, prefer public (req #1) via prowlarr or SFTP
        - if VPS1 has only private, query prowlarr by tracker map (req #2)
-       - if from watch_dir, prefer prowlarr hit on Indexer (req #3)
+       - if from watch_dir, prefer prowlarr hit on a download-target indexer (req #3)
   3. Add to VPS2 qBittorrent at SSD save_path, paused, skip_check=False
   4. Resume; poll until complete (with batched file priorities for seasons)
   5. rclone move SSD -> remote (with --include for seasons)
@@ -726,7 +726,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
             # Elect ONE primary torrent for SSD download:
             # 1. Prefer public torrent if available (req #1)
-            # 2. Otherwise pick first private torrent to query Indexer (req #2)
+            # 2. Otherwise pick first private torrent to query the download-target indexers (req #2)
             primary = next((t for t in group if _looks_public(t.trackers)), group[0])
             is_pub = _looks_public(primary.trackers)
 
@@ -787,7 +787,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 continue
             ts = fresh
             log.info(
-                "indexer retry timer fired for %s (attempt #%d)",
+                "download-indexer retry timer fired for %s (attempt #%d)",
                 ts.source_name[:40], ts.indexer_attempts,
             )
             self.transition(ts, State.QUERYING)
@@ -1200,9 +1200,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         )
         if decision is None:
             # No SSD source right now → park and retry. Label honestly: a
-            # public group never touched Indexer (its .torrent export
-            # failed), so "indexer miss" would send operators hunting the
-            # wrong subsystem.
+            # public group never touched the download-target indexers (its
+            # .torrent export failed), so "indexer miss" would send
+            # operators hunting the wrong subsystem.
             reason = (
                 "source export miss"
                 if any(_looks_public(t.trackers) for t in [st, *others])
@@ -1295,16 +1295,19 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             )
         elif self.cfg.prowlarr.enabled and self.prowlarr is not None:
             indexers_to_query = []
-            download_idx = None
+            # Download-target indexer names (lowercase), in priority order —
+            # the sacrificial pick below tries them in this order.
+            download_idx_names: list[str] = []
             if needs_sacrificial_copy and prefer_prowlarr:
                 try:
-                    download_idx = self.prowlarr.get_download_indexer()
-                    indexers_to_query.append(download_idx)
+                    for dl_idx in self.prowlarr.get_download_indexers():
+                        download_idx_names.append(dl_idx.name.lower())
+                        indexers_to_query.append(dl_idx)
                 except Exception as e:  # noqa: BLE001
-                    log.warning("could not get download indexer: %s", e)
+                    log.warning("could not get download-target indexers: %s", e)
 
             # Add all private indexers from tracker_map
-            seen_names = {download_idx.name.lower()} if download_idx else set()
+            seen_names = set(download_idx_names)
             for name in self.cfg.prowlarr.tracker_map.entries.values():
                 idx = self.prowlarr.get_indexer_by_name(name)
                 if idx and idx.name.lower() not in seen_names and idx.enable:
@@ -1321,20 +1324,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     log.warning("watch-dir: prowlarr search failed for %s: %s", ts.source_name, e)
                     hits_by_indexer = {}
 
-            # 1. Check for sacrificial download torrent on download_indexer
-            if prefer_prowlarr and download_idx and download_idx.name.lower() in hits_by_indexer:
-                dl_hits = hits_by_indexer[download_idx.name.lower()]
-                matching_dl = [
-                    h for h in dl_hits
-                    if _matches_release(h.title, h.size_bytes, ts.source_name, ts.total_bytes)
-                ]
-                matching_dl.sort(
-                    key=lambda h: (
-                        normalize_content_name(h.title) != normalize_content_name(ts.source_name),
-                        abs(h.size_bytes - ts.total_bytes),
+            # 1. Sacrificial download torrent from the download-target
+            # indexers, in priority order — first exact match wins.
+            if prefer_prowlarr and download_idx_names:
+                for dl_name in download_idx_names:
+                    dl_hits = hits_by_indexer.get(dl_name, [])
+                    matching_dl = [
+                        h for h in dl_hits
+                        if _matches_release(h.title, h.size_bytes, ts.source_name, ts.total_bytes)
+                    ]
+                    matching_dl.sort(
+                        key=lambda h: (
+                            normalize_content_name(h.title) != normalize_content_name(ts.source_name),
+                            abs(h.size_bytes - ts.total_bytes),
+                        )
                     )
-                )
-                if matching_dl:
+                    if not matching_dl:
+                        continue
                     best_dl = matching_dl[0]
                     try:
                         dl_blob = await self.prowlarr.download_torrent(best_dl)
@@ -1352,10 +1358,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         log.warning(
                             "failed to fetch download indexer torrent: %s; using dropped file", e
                         )
+                    break
 
             # 2. Collect other private tracker cross-seeds to inject onto FUSE
             for idx_name, hits in hits_by_indexer.items():
-                if download_idx and idx_name == download_idx.name.lower():
+                if idx_name in download_idx_names:
                     continue
                 for hit in hits:
                     if _matches_release(hit.title, hit.size_bytes, ts.source_name, ts.total_bytes):
@@ -1413,10 +1420,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     def _park_for_indexer_retry(self, ts: TorrentState, *, reason: str = "indexer miss") -> None:
         """Park into WAITING_INDEXER with an escalating retry timer.
 
-        The first attempt: retry after indexer_retry_interval_seconds.
+        The first attempt: retry after prowlarr_retry_interval_seconds.
         Subsequent attempts: same interval (fixed, not exponential — we
-        expect Indexer to catch up shortly for racing releases).
-        Hard cap: indexer_max_age_seconds since the FIRST attempt. If
+        expect the download-target indexers to catch up shortly for racing
+        releases).
+        Hard cap: prowlarr_max_age_seconds since the FIRST attempt. If
         that ceiling is reached, mark FAILED for manual handling.
         """
         now = dt.datetime.now(dt.timezone.utc)
@@ -1424,7 +1432,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             ts.indexer_first_queried_at = now
         ts.indexer_attempts += 1
         next_retry = now + dt.timedelta(
-            seconds=self.cfg.cross_seed.indexer_retry_interval_seconds
+            seconds=self.cfg.cross_seed.prowlarr_retry_interval_seconds
         )
         ts.indexer_next_retry_at = next_retry
         max_age = dt.timedelta(seconds=self.cfg.cross_seed.prowlarr_max_age_seconds)
@@ -1439,7 +1447,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
         if elapsed >= max_age:
             log.error(
-                "indexer giving up on %s after %d attempts (%ds > %ds max)",
+                "download-target indexers giving up on %s after %d attempts (%ds > %ds max)",
                 ts.source_name, ts.indexer_attempts,
                 int(elapsed.total_seconds()), int(max_age.total_seconds()),
             )
