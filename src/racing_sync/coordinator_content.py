@@ -39,6 +39,19 @@ def normalize_content_name(name: str) -> str:
     return s.lower()
 
 
+def size_within_tolerance(hit_size: int, target_size: int) -> bool:
+    """True iff two byte sizes agree within min(50 MiB, 2%).
+
+    A zero on either side means "unknown" and passes — callers only gate
+    when both sides are known. Shared by the coordinator and Prowlarr
+    matchers so the rule can't drift between selection and verification.
+    """
+    if hit_size > 0 and target_size > 0:
+        tolerance = min(1024 * 1024 * 50, int(target_size * 0.02))
+        return abs(hit_size - target_size) <= tolerance
+    return True
+
+
 def _matches_release(hit_title: str, hit_size: int, target_name: str, target_size: int) -> bool:
     """Check if a Prowlarr hit matches the target release by title and size."""
     ht_norm = normalize_content_name(hit_title)
@@ -49,10 +62,7 @@ def _matches_release(hit_title: str, hit_size: int, target_name: str, target_siz
     )
     if not title_matches:
         return False
-    if hit_size > 0 and target_size > 0:
-        tolerance = min(1024 * 1024 * 50, int(target_size * 0.02))
-        return abs(hit_size - target_size) <= tolerance
-    return True
+    return size_within_tolerance(hit_size, target_size)
 
 
 def _verified_cross_seed_blob(

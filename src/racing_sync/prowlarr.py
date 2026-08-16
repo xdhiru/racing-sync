@@ -486,10 +486,8 @@ def release_title_matches(hit_title: str, hit_size: int, target_name: str, targe
     """
     if _norm_title_for_match(hit_title) != _norm_title_for_match(target_name):
         return False
-    if hit_size > 0 and target_size > 0:
-        tolerance = min(1024 * 1024 * 50, int(target_size * 0.02))
-        return abs(hit_size - target_size) <= tolerance
-    return True
+    from .coordinator_content import size_within_tolerance
+    return size_within_tolerance(hit_size, target_size)
 
 
 def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
