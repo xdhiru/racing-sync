@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import pytest
+from conftest import make_coordinator
 
 from racing_sync.config import AppConfig
 from racing_sync.state import State, TorrentState
@@ -64,9 +65,8 @@ def test_expired_max_age_marks_failed():
 @pytest.mark.anyio
 async def test_process_torrent_inner_dispatches_querying_state():
     from unittest.mock import AsyncMock
-    from racing_sync.coordinator import Coordinator
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._do_waiting_indexer = AsyncMock()
 
     ts = TorrentState("hash1", state=State.QUERYING)
@@ -78,12 +78,10 @@ async def test_process_torrent_inner_dispatches_querying_state():
 
 @pytest.mark.anyio
 async def test_list_source_torrents_caches_within_ttl():
-    from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
+    from unittest.mock import AsyncMock
     from racing_sync.clients.abstract import Torrent
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.source.category = "racing"
     coord.cfg.source.min_age_seconds = 0
     coord._source_torrents_cache = []
@@ -112,9 +110,8 @@ async def test_list_source_torrents_caches_within_ttl():
 @pytest.mark.anyio
 async def test_do_new_transitions_failed_when_source_vanished():
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.source_client = AsyncMock()
     coord.source_client.get_torrent.return_value = None
     coord.transition = MagicMock()
@@ -130,9 +127,8 @@ async def test_do_new_transitions_failed_when_source_vanished():
 @pytest.mark.anyio
 async def test_do_waiting_indexer_transitions_failed_when_source_vanished():
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.source_client = AsyncMock()
     coord.source_client.get_torrent.return_value = None
     coord.transition = MagicMock()
@@ -148,10 +144,8 @@ async def test_do_waiting_indexer_transitions_failed_when_source_vanished():
 @pytest.mark.anyio
 async def test_do_re_add_skips_when_already_injected_in_step_1():
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.fuse_reinject_delay_seconds = 0
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
     coord.dest_client = AsyncMock()
@@ -172,11 +166,9 @@ async def test_do_re_add_skips_when_already_injected_in_step_1():
 @pytest.mark.anyio
 async def test_do_re_add_accepts_when_dest_client_returns_fails_but_already_exists():
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.clients.abstract import AddResult, Torrent
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.fuse_reinject_delay_seconds = 0
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
     coord.dest_client = AsyncMock()
@@ -222,9 +214,8 @@ def test_should_notify_telegram_policy():
 @pytest.mark.anyio
 async def test_process_torrent_inner_does_not_fallthrough_to_waiting_indexer_from_new():
     from unittest.mock import AsyncMock
-    from racing_sync.coordinator import Coordinator
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._do_waiting_indexer = AsyncMock()
 
     async def fake_do_new(ts: TorrentState) -> None:
@@ -242,19 +233,13 @@ async def test_process_torrent_inner_does_not_fallthrough_to_waiting_indexer_fro
 @pytest.mark.anyio
 async def test_tick_skips_waiting_indexer_in_step_4():
     import asyncio
-    from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
+    from unittest.mock import AsyncMock
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.max_active_downloads = 3
     coord.cfg.max_concurrent_moves = 3
-    coord._tasks = set()
-    coord._running_infohashes = set()
-    coord._live = {}
     coord._check_and_inject_late_cross_seeds = AsyncMock()
     coord.watch = None
-    coord.store = MagicMock()
     coord.store.list_indexer_ready.return_value = []
     coord._list_source_torrents = AsyncMock(return_value=[])
 
@@ -287,9 +272,8 @@ async def test_tick_skips_waiting_indexer_in_step_4():
 @pytest.mark.anyio
 async def test_coordinator_run_stops_immediately_when_stop_requested():
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.start = AsyncMock()
     coord.shutdown = AsyncMock()
@@ -315,10 +299,8 @@ async def test_coordinator_run_stops_immediately_when_stop_requested():
 async def test_wait_disk_then_queue_transitions_to_queued_under_download_sem():
     import asyncio
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.coordinator import Coordinator
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.transition = MagicMock()
     coord._download_sem = asyncio.Semaphore(1)
     coord._do_queued = AsyncMock()
@@ -380,7 +362,6 @@ async def test_public_export_failure_parks_as_source_export_miss(caplog):
     import logging
     from unittest.mock import AsyncMock, MagicMock
     from racing_sync.clients.abstract import Torrent
-    from racing_sync.coordinator import Coordinator
 
     cfg = MagicMock()
     cfg.cross_seed.allow_ssh_export = True
@@ -401,9 +382,8 @@ async def test_public_export_failure_parks_as_source_export_miss(caplog):
     source_client.get_torrent = AsyncMock(return_value=torrent)
     source_client.export_torrent = AsyncMock(side_effect=RuntimeError("nope"))
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.cfg = cfg
-    coord.store = MagicMock()
     coord.source_client = source_client
     coord.sftp = sftp
     coord.prowlarr = None

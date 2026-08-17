@@ -3,11 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from conftest import make_coordinator
 
 from racing_sync.config import AppConfig
 from racing_sync.classifier import classify
 from racing_sync.clients.abstract import TorrentFile
-from racing_sync.coordinator import Coordinator
 
 
 def _cfg() -> AppConfig:
@@ -102,12 +102,11 @@ def test_single_episode_with_nfo_is_classified_as_episode():
 
 
 def test_coordinator_target_mount_routing():
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState
 
     cfg = _cfg()
     # Mock Coordinator with minimal fields to test _target_mount_for
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.cfg = cfg
 
     ts_movie = TorrentState("hash1", classification_kind="movie")
@@ -127,11 +126,10 @@ def test_coordinator_target_mount_routing():
 @pytest.mark.anyio
 async def test_do_moving_raises_if_season_folder_missing(tmp_path: Path):
     from unittest.mock import AsyncMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState
 
     cfg = _cfg()
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.cfg = cfg
     coord.dest_client = AsyncMock()
     coord.dest_client.get_torrent_files.return_value = [
@@ -154,13 +152,12 @@ async def test_do_moving_raises_if_season_folder_missing(tmp_path: Path):
 @pytest.mark.anyio
 async def test_do_queued_deletes_torrent_when_oversize_movie_skipped(tmp_path: Path):
     from unittest.mock import AsyncMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import AddResult
 
     cfg = _cfg()
     cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.cfg = cfg
     coord.dest_client = AsyncMock()
     coord.dest_client.list_torrents.return_value = []
@@ -189,15 +186,13 @@ async def test_do_queued_deletes_torrent_when_oversize_movie_skipped(tmp_path: P
 @pytest.mark.anyio
 async def test_do_moving_moves_mixed_content_in_batches(tmp_path: Path):
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
 
     cfg = _cfg()
     cfg.dest.save_path = str(tmp_path)
     cfg.ssd.path = tmp_path
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.cfg = cfg
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
 
     async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
@@ -274,9 +269,10 @@ def test_classify_with_custom_episode_regex():
 
 
 def test_season_folder_for_security(tmp_path):
+
     cfg = _cfg()
     cfg.dest.save_path = str(tmp_path / "downloads")
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.cfg = cfg
 
     # Valid season folder
@@ -311,7 +307,7 @@ def test_season_folder_for_ignores_file_order(tmp_path):
 
     cfg = _cfg()
     cfg.dest.save_path = str(tmp_path / "downloads")
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.cfg = cfg
 
     files = [

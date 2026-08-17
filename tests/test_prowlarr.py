@@ -6,7 +6,8 @@ from pathlib import Path
 
 from racing_sync.config import AppConfig, DownloadIndexerConfig, ProwlarrConfig
 from racing_sync.prowlarr import ProwlarrClient, Indexer, TorrentHit
-from racing_sync.coordinator import pick_ssd_source_for_racing, Coordinator
+from racing_sync.coordinator import pick_ssd_source_for_racing
+from conftest import make_coordinator
 from racing_sync.state import StateStore, TorrentState, State
 from racing_sync.clients.abstract import Torrent
 from racing_sync.watchdir import _bencode, _bencoded_info_hash
@@ -184,8 +185,7 @@ async def test_do_new_watch_dir_skips_prowlarr(tmp_path: Path):
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path / "downloads"
     coord.cfg.ssd.path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 100000000

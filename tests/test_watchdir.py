@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from racing_sync.config import AppConfig, DownloadIndexerConfig, ProwlarrConfig, WatchDirConfig, GeneralConfig, DestConfig, SSDConfig, RcloneConfig
 from racing_sync.watchdir import WatchDirScanner, WatchItem, _bencode, _bencoded_info_hash, parse_torrent_file
-from racing_sync.coordinator import Coordinator
+from conftest import make_coordinator
 from racing_sync.state import State, StateStore, TorrentState
 from racing_sync.prowlarr import TorrentHit, Indexer
 from racing_sync.clients.abstract import AddResult
@@ -93,8 +93,7 @@ async def test_watchdir_pickup_in_tick(tmp_path: Path):
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.max_active_downloads = 3
     coord.cfg.max_concurrent_moves = 3
     coord.cfg.general.source_poll_interval = 30
@@ -102,9 +101,6 @@ async def test_watchdir_pickup_in_tick(tmp_path: Path):
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
     coord.cfg.watch_dir = WatchDirConfig(path=watch_dir, delete_after_pickup=True)
     coord.store = store
-    coord._running_infohashes = set()
-    coord._tasks = set()
-    coord._live = {}
     coord.watch = WatchDirScanner(coord.cfg.watch_dir, prowlarr=None)
     coord._list_source_torrents = AsyncMock(return_value=[])
     coord.store.list_indexer_ready = MagicMock(return_value=[])
@@ -134,8 +130,7 @@ async def test_do_new_watch_dir_already_download_tracker(tmp_path: Path):
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path / "downloads"
     coord.cfg.ssd.path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 100000000
@@ -174,8 +169,7 @@ async def test_do_new_watch_dir_already_download_tracker_still_searches_other_cr
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path / "downloads"
     coord.cfg.ssd.path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 100000000
@@ -247,8 +241,7 @@ async def test_do_new_watch_dir_public_torrent_skips_sacrificial_copy(tmp_path: 
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path / "downloads"
     coord.cfg.ssd.path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 100000000
@@ -320,8 +313,7 @@ async def test_do_new_watch_dir_with_prowlarr_search_and_cross_seeds(tmp_path: P
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path / "downloads"
     coord.cfg.ssd.path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 100000000
@@ -412,8 +404,7 @@ async def test_re_inject_watch_dir_torrents(tmp_path: Path):
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.general.state_db = db_path
     coord.store = store
     # Fuse target holds the moved content (single-file torrents land by name).
@@ -456,8 +447,7 @@ async def test_re_inject_watch_dir_torrents_skips_missing_fuse_content(tmp_path:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.general.state_db = db_path
     coord.store = store
     # Fuse target is empty: content was never moved -> no blind injection.
@@ -668,8 +658,7 @@ async def test_do_new_watch_dir_rejects_wrong_title_matching_size(tmp_path: Path
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path / "downloads"
     coord.cfg.ssd.path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 100000000
@@ -732,8 +721,7 @@ async def test_do_new_watch_dir_query_prowlarr_disabled(tmp_path: Path):
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path / "downloads"
     coord.cfg.ssd.path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 100000000
@@ -775,8 +763,7 @@ async def test_do_new_watch_dir_prefer_prowlarr_result_disabled(tmp_path: Path):
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path / "downloads"
     coord.cfg.ssd.path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 100000000
@@ -822,8 +809,7 @@ async def test_do_new_watch_dir_classifies_and_skips_oversize_movie(tmp_path: Pa
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path / "downloads"
     coord.cfg.ssd.path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 10000000000
@@ -879,8 +865,7 @@ async def test_do_new_watch_dir_classifies_season(tmp_path: Path):
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path / "downloads"
     coord.cfg.ssd.path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 10000000000
@@ -909,9 +894,6 @@ async def test_do_new_watch_dir_classifies_season(tmp_path: Path):
     assert ts.state == State.QUEUED
 
 
-
-
-
 @pytest.mark.anyio
 async def test_do_new_watch_dir_sacrificial_prefers_first_download_indexer(tmp_path: Path):
     """With two download-target indexers both holding the exact release,
@@ -922,8 +904,7 @@ async def test_do_new_watch_dir_sacrificial_prefers_first_download_indexer(tmp_p
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path / "downloads"
     coord.cfg.ssd.path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 100000000

@@ -7,6 +7,7 @@ import datetime as dt
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from conftest import make_coordinator
 
 
 def _ts(state=None, **kw):
@@ -49,13 +50,10 @@ def test_done_rapid_demotions_count_flaps(tmp_path):
 
 @pytest.mark.anyio
 async def test_do_re_add_trips_on_flap_limit():
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import State
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.fuse_reinject_delay_seconds = 0
-    coord.store = MagicMock()
     transitioned = {}
 
     def _transition(ts, dst, error=""):
@@ -73,7 +71,6 @@ async def test_do_re_add_trips_on_flap_limit():
 async def test_late_seed_healthy_check_memoized(tmp_path):
     """A quiet healthy check backs off; the next tick is a client-traffic no-op."""
     from racing_sync.clients.abstract import AddResult, Torrent
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import State
     from racing_sync.watchdir import _bencode
 
@@ -92,14 +89,12 @@ async def test_late_seed_healthy_check_memoized(tmp_path):
         },
     })
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
     coord.cfg.rclone.fuse.mount = str(fuse)
     coord.cfg.rclone.fuse.mount_unsorted = str(fuse)
     coord._target_mount_for = MagicMock(return_value=fuse)
     coord.dest_client = MagicMock()
-    coord.store = MagicMock()
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord._failed_late_cross_seeds = {}
     # First attempt rejected -> deferred; retry succeeds -> injected.
@@ -135,9 +130,8 @@ async def test_late_seed_healthy_check_memoized(tmp_path):
 
 @pytest.mark.anyio
 async def test_missing_fuse_files_short_circuits_dead_mount(tmp_path):
-    from racing_sync.coordinator import Coordinator
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     missing = await coord._missing_fuse_files(
         tmp_path / "no-such-mount", [("a.mkv", 1), ("b.mkv", 2)])
     assert len(missing) == 1
@@ -148,11 +142,9 @@ def test_cleanup_idle_rejects_skewed_added_on():
     import time
 
     from racing_sync.clients.abstract import Torrent
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import State, TorrentState
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     cfg = MagicMock()
     cfg.idle_confirm_minutes = 45.0
     now = dt.datetime.now(dt.timezone.utc)
@@ -222,10 +214,10 @@ async def test_fuse_first_add_verified_before_trust(tmp_path):
     from unittest.mock import AsyncMock, MagicMock
 
     from racing_sync.clients.abstract import AddResult
-    from racing_sync.coordinator import _NOT_VISIBLE_DETAIL, Coordinator
+    from racing_sync.coordinator import _NOT_VISIBLE_DETAIL
 
     def _coord_with_add(add_result, get_result):
-        coord = object.__new__(Coordinator)
+        coord = make_coordinator()
         coord.dest_client = AsyncMock()
         coord.dest_client.add_torrent = AsyncMock(return_value=add_result)
         coord.dest_client.get_torrent = AsyncMock(return_value=get_result)

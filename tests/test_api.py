@@ -1,4 +1,5 @@
 import pytest
+from conftest import make_coordinator
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 
@@ -14,7 +15,6 @@ def test_api_recover_returns_dictionary():
     coord = MagicMock()
     coord.cfg = cfg
     coord.dest_client = MagicMock()
-    coord.store = MagicMock()
 
     rpt = RecoveryReport()
     rpt.kept.append("hash1")
@@ -44,7 +44,6 @@ def test_auth_rejects_nginx_header_from_untrusted_remote_ip():
 
     coord = MagicMock()
     coord.cfg = cfg
-    coord.store = MagicMock()
     coord.store.all.return_value = []
 
     app = build_app(coord)
@@ -62,7 +61,6 @@ def test_auth_accepts_nginx_header_from_trusted_client():
 
     coord = MagicMock()
     coord.cfg = cfg
-    coord.store = MagicMock()
     coord.store.all.return_value = []
 
     app = build_app(coord)
@@ -85,7 +83,6 @@ def test_auth_rejects_loopback_when_not_in_custom_trusted_proxies():
 
     coord = MagicMock()
     coord.cfg = cfg
-    coord.store = MagicMock()
     coord.store.all.return_value = []
 
     app = build_app(coord)
@@ -102,7 +99,6 @@ def test_auth_token_validation():
 
     coord = MagicMock()
     coord.cfg = cfg
-    coord.store = MagicMock()
     coord.store.all.return_value = []
 
     app = build_app(coord)
@@ -122,7 +118,6 @@ def test_logs_query_limit_bounds():
 
     coord = MagicMock()
     coord.cfg = cfg
-    coord.store = MagicMock()
     coord.store.iter_logs.return_value = []
 
     app = build_app(coord)
@@ -165,13 +160,11 @@ def test_scan_watch_endpoint():
 @pytest.mark.anyio
 async def test_coordinator_scan_watch_ingests_and_returns_items(anyio_backend):
     from unittest.mock import AsyncMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.watchdir import WatchItem
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.cfg = MagicMock(spec=AppConfig)
     coord.cfg.watch_dir = MagicMock(delete_after_pickup=True)
-    coord.store = MagicMock()
     coord.store.get.return_value = None
 
     mock_watch = MagicMock()
@@ -202,7 +195,6 @@ def test_api_retry_and_ssd_endpoints():
 
     coord = MagicMock()
     coord.cfg = cfg
-    coord.store = MagicMock()
 
     app = build_app(coord)
     client = TestClient(app)
