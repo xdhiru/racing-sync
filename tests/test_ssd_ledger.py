@@ -14,11 +14,6 @@ from racing_sync.coordinator import Coordinator
 from racing_sync.state import State, StateStore, TorrentState
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 def _coord_with_cap(tmp_path, cap: int):
     coord = object.__new__(Coordinator)
     coord._stop = False

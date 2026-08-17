@@ -9,11 +9,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 def _ts(state=None, **kw):
     from racing_sync.state import State, TorrentState
     base = dict(source_infohash="a" * 40, source_name="Show",

@@ -14,11 +14,6 @@ from racing_sync.config import AppConfig
 from racing_sync.state import State, TorrentState
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 def _cfg() -> AppConfig:
     return AppConfig.from_toml(
         __file__.replace("\\", "/").rsplit("/", 1)[0] + "/../config.example.toml"

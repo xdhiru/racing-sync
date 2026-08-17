@@ -6,11 +6,6 @@ import pytest
 from racing_sync.state import State, StateStore, TorrentState, check_transition
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 def test_done_can_only_transition_to_re_adding():
     check_transition(State.DONE, State.RE_ADDING)
     # Fresh-DB self-heal: falsely adopted DONE (SSD bytes never moved) demotes

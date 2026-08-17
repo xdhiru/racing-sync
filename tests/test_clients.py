@@ -85,12 +85,6 @@ async def test_qbittorrent_set_save_path_uses_hashes_field():
     await client.set_save_path("abc12345", "/new/path")
 
 
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 @pytest.mark.anyio
 async def test_http_client_base_nginx_modes():
     from racing_sync.clients.http_base import HTTPClientBase, AuthError
@@ -320,7 +314,6 @@ async def test_http_client_files_param_handling():
     assert isinstance(recorded_kwargs.get("data"), aiohttp.FormData)
 
 
-
 @pytest.mark.anyio
 async def test_deluge_list_torrents_progress_and_hash_filtering():
     cfg = SourceConfig(
@@ -389,7 +382,6 @@ async def test_deluge_list_torrents_progress_and_hash_filtering():
     from_gen = await client.list_torrents(hashes=gen)
     assert len(from_gen) == 1
     assert from_gen[0].hash == "hash_1"
-
 
 
 @pytest.mark.anyio
@@ -824,6 +816,5 @@ async def test_qbittorrent_add_torrent_handles_duplicates_and_hex_validation():
     res_hex = await client.add_torrent(urls=["http://example.com/test.torrent"], save_path="/downloads")
     assert res_hex.hash == hex_40
     assert res_hex.accepted is True
-
 
 

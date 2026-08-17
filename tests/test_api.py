@@ -7,11 +7,6 @@ from racing_sync.config import APIConfig, AppConfig
 from racing_sync.recovery import RecoveryReport
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 def test_api_recover_returns_dictionary():
     cfg = MagicMock(spec=AppConfig)
     cfg.api = APIConfig(enabled=True, api_token="secret", trust_nginx_header=False)
