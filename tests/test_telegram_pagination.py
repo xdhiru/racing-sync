@@ -7,11 +7,6 @@ from racing_sync.telegram_bot import render_active, TelegramBot
 from racing_sync.config import TelegramConfig
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 def test_render_active_empty():
     text, cur_page, total_pages = render_active([], page=0, page_size=5)
     assert cur_page == 0
@@ -469,7 +464,5 @@ async def test_notify_falls_back_to_plain_text_on_parse_error():
     second_call = bot._bot.send_message.call_args_list[1]
     assert "parse_mode" in first_call[1]
     assert "parse_mode" not in second_call[1]
-
-
 
 

@@ -5,11 +5,6 @@ import pytest
 from racing_sync.config import AppConfig
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 def test_concurrency_defaults():
     # Minimal config to validate defaults
     data = """
@@ -209,7 +204,6 @@ def test_secret_str_masking_in_repr_and_string_equality():
     assert cfg.password.get_secret_value() == "mypassword"
 
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 from racing_sync.coordinator import Coordinator
 from racing_sync.state import TorrentState, State
@@ -435,7 +429,6 @@ def test_config_strict_validations():
         APIConfig(enabled=True, api_token="CHANGE_ME")
     with pytest.raises(ValidationError, match="api.api_token is required"):
         APIConfig(enabled=True, api_token="")
-
 
 
 @pytest.mark.anyio

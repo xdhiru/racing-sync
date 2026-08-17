@@ -20,11 +20,6 @@ from racing_sync.state import State, StateStore, TorrentState
 GiB = 1024 ** 3
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 def _cleanup_cfg(**over) -> CleanupConfig:
     base = dict(enabled=True, dry_run=False)
     base.update(over)
