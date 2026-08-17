@@ -3403,6 +3403,44 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     local = cand
                 else:
                     raise FileNotFoundError(f"completed content not found on SSD: {src_dir}/{ts.source_name}")
+            if (
+                branch_kind in ("movie", "episode")
+                and cls.single_file
+                and isinstance(local, Path)
+                and local.is_file()
+            ):
+                # Single files move below via a bare `rclone move`, which —
+                # unlike the folder/season branches — never consults the
+                # verified-complete set above. Refuse to move
+                # client-unverified bytes: a partial file on the remote is
+                # worse than waiting. Park in MOVING for retry next tick
+                # (the torrent stays paused; nothing is wiped).
+                verified_paths: set[Path] = set()
+                for f in completed_files:
+                    joined = _safe_ssd_join(src_dir, f.name or "")
+                    if joined is None:
+                        continue
+                    try:
+                        verified_paths.add(joined.resolve())
+                    except OSError:
+                        continue
+                try:
+                    local_real = local.resolve()
+                except OSError:
+                    local_real = None
+                if local_real is None or local_real not in verified_paths:
+                    log.warning(
+                        "single file %s for %s is not client-verified complete "
+                        "(progress < 100%% or size mismatch); staying in MOVING "
+                        "without moving",
+                        cls.single_file, ts.source_name,
+                    )
+                    self._park_moving(
+                        ts,
+                        f"single file {cls.single_file} not verified complete; "
+                        f"staying in MOVING without moving",
+                    )
+                    return
             if local is None:
                 pass
             elif isinstance(local, Path) and local.is_dir():
