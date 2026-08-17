@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import pytest
+from conftest import make_coordinator
 
 from racing_sync.state import State, StateStore, TorrentState, check_transition
 
@@ -234,7 +235,6 @@ def test_state_store_blob_lazy_load_and_preservation(tmp_path: Path):
 @pytest.mark.anyio
 async def test_coordinator_lazy_loads_blob_on_queued_and_re_adding(tmp_path: Path):
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.config import AppConfig
 
     cfg = AppConfig.from_toml(Path(__file__).parent.parent / "config.example.toml")
@@ -249,7 +249,7 @@ async def test_coordinator_lazy_loads_blob_on_queued_and_re_adding(tmp_path: Pat
     )
     store.upsert(ts)
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.cfg = cfg
     coord.store = store
     coord.dest_client = AsyncMock()

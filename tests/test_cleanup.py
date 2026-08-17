@@ -14,6 +14,7 @@ import pytest
 
 from racing_sync.clients.abstract import Torrent, TorrentFile
 from racing_sync.config import CleanupConfig
+from conftest import make_coordinator
 from racing_sync.coordinator import Coordinator, cleanup_grace_seconds
 from racing_sync.state import State, StateStore, TorrentState
 
@@ -27,7 +28,7 @@ def _cleanup_cfg(**over) -> CleanupConfig:
 
 
 def _make_coord(ssd: Path, store: StateStore, src, dest, cfg) -> Coordinator:
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.cfg = cfg
     coord.store = store
     coord.source_client = src

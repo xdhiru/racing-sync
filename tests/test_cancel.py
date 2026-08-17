@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from conftest import make_coordinator
 
 from racing_sync.clients.abstract import Torrent, TorrentFile
 from racing_sync.state import State, StateStore, TorrentState
@@ -183,12 +184,11 @@ async def test_recovery_skips_ignored_unadopted(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_reinject_and_late_seed_skip_ignored(tmp_path: Path):
-    from racing_sync.coordinator import Coordinator
 
     store = StateStore(tmp_path / "state.db")
     try:
         store.ignore_torrent("c" * 40, "Ignored.Show")
-        coord = object.__new__(Coordinator)
+        coord = make_coordinator()
         coord.store = store
         coord.dest_client = AsyncMock()
         coord.cfg = MagicMock()
@@ -207,12 +207,11 @@ async def test_reinject_and_late_seed_skip_ignored(tmp_path: Path):
 @pytest.mark.anyio
 async def test_discovery_skips_ignored_group(tmp_path: Path):
     """An ignored hash on VPS1 produces no NEW row (no zombie pipeline)."""
-    from racing_sync.coordinator import Coordinator
 
     store = StateStore(tmp_path / "state.db")
     try:
         store.ignore_torrent("e" * 40, "Ignored.Show")
-        coord = object.__new__(Coordinator)
+        coord = make_coordinator()
         coord.cfg = MagicMock()
         coord.cfg.source.category = ""
         coord.cfg.source.min_age_seconds = 0

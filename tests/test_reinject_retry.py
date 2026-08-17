@@ -10,7 +10,8 @@ import pytest
 
 from racing_sync.clients.abstract import AddResult, Torrent
 from racing_sync.clients.http_base import HTTPClientBase, HTTPClientConfig
-from racing_sync.coordinator import Coordinator, WebUIUnresponsiveError
+from racing_sync.coordinator import WebUIUnresponsiveError
+from conftest import make_coordinator
 from racing_sync.state import State, StateStore, TorrentState
 from racing_sync.telegram_bot import render_active, render_detail
 
@@ -18,7 +19,7 @@ from racing_sync.telegram_bot import render_active, render_detail
 @pytest.mark.anyio
 async def test_fetch_retries_sftp_timeout_once():
     """A single SFTP stall is retried; a clean miss is not."""
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     blob = _single_file_torrent_bytes("Retry.Show.mkv", 50)
     coord.sftp = MagicMock()
     coord.sftp.fetch_torrent = MagicMock(side_effect=[TimeoutError(), blob])
@@ -42,7 +43,7 @@ async def test_fetch_deluge_export_failure_stays_debug(caplog):
     import logging
     from racing_sync.clients.deluge import DelugeClient
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.sftp = MagicMock()
     coord.sftp.fetch_torrent = MagicMock(return_value=None)
     coord.source_client = MagicMock(spec=DelugeClient)
@@ -60,8 +61,7 @@ async def test_fetch_deluge_export_failure_stays_debug(caplog):
 @pytest.mark.anyio
 async def test_late_fetch_failure_uses_backoff(tmp_path: Path):
     """Unfetchable late seeds back off instead of hammering SFTP every tick."""
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord._target_mount_for = MagicMock(return_value=tmp_path)
     coord.dest_client = AsyncMock()
     coord.dest_client.add_torrent = AsyncMock(
@@ -69,7 +69,6 @@ async def test_late_fetch_failure_uses_backoff(tmp_path: Path):
     )
     coord.dest_client.export_torrent = AsyncMock(return_value=None)
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=None)
-    coord.store = MagicMock()
     coord._failed_late_cross_seeds = {}
 
     ts = TorrentState(
@@ -148,8 +147,7 @@ def test_state_store_readd_fields_round_trip(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_reinject_immediate_retry_succeeds():
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.fuse_reinject_delay_seconds = 0
     coord.cfg.fuse_reinject_retry_gap_seconds = 0.001
     coord.cfg.fuse_reinject_backoff_seconds = 1800
@@ -157,7 +155,6 @@ async def test_reinject_immediate_retry_succeeds():
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
     coord._stop = False
     coord.dest_client = AsyncMock()
-    coord.store = MagicMock()
     coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse"))
 
     # Attempt 1: TimeoutError; Attempt 2: Success
@@ -187,8 +184,7 @@ async def test_reinject_immediate_retry_succeeds():
 
 @pytest.mark.anyio
 async def test_reinject_cycle_fails_triggers_30m_backoff():
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.fuse_reinject_delay_seconds = 0
     coord.cfg.fuse_reinject_retry_gap_seconds = 0.001
     coord.cfg.fuse_reinject_backoff_seconds = 1800
@@ -196,7 +192,6 @@ async def test_reinject_cycle_fails_triggers_30m_backoff():
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
     coord._stop = False
     coord.dest_client = AsyncMock()
-    coord.store = MagicMock()
     coord._schedule_telegram_update = MagicMock()
     coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse"))
 
@@ -235,12 +230,10 @@ async def test_reinject_cycle_fails_triggers_30m_backoff():
 
 @pytest.mark.anyio
 async def test_reinject_24h_hard_deadline_fails():
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.fuse_reinject_delay_seconds = 0
     coord.cfg.fuse_reinject_max_age_seconds = 86400
     coord.dest_client = AsyncMock()
-    coord.store = MagicMock()
 
     now = dt.datetime.now(dt.timezone.utc)
     ts = TorrentState(
@@ -267,17 +260,12 @@ async def test_reinject_24h_hard_deadline_fails():
 
 @pytest.mark.anyio
 async def test_reinject_tick_skips_backed_off_torrent():
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.max_active_downloads = 3
     coord.cfg.max_concurrent_moves = 3
-    coord._tasks = set()
-    coord._running_infohashes = set()
     coord.watch = None
-    coord.store = MagicMock()
     coord.store.list_indexer_ready.return_value = []
     coord._check_and_inject_late_cross_seeds = AsyncMock()
-    coord._live = {}
 
     now = dt.datetime.now(dt.timezone.utc)
 
@@ -373,7 +361,7 @@ async def test_http_base_request_retries_on_timeout_and_connector_error():
 
 @pytest.mark.anyio
 async def test_await_hash_for_name_normalizes_to_lower():
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.dest_client = MagicMock()
     t = Torrent(
         hash="ABCD1234EF",
@@ -391,7 +379,7 @@ async def test_await_hash_for_name_normalizes_to_lower():
 
 @pytest.mark.anyio
 async def test_re_inject_racing_torrents_case_insensitive():
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse/Test.Movie.2026"))
     coord.dest_client = MagicMock()
     coord.dest_client.add_torrent = AsyncMock()
@@ -431,12 +419,11 @@ async def test_check_and_inject_late_cross_seeds_normalizes_hash(tmp_path: Path)
     fsize = 1000
     (fuse_dir / fname).write_bytes(b"m" * fsize)
     blob = _single_file_torrent_bytes(fname, fsize)
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord.dest_client = MagicMock()
     coord.dest_client.add_torrent = AsyncMock(return_value=AddResult(hash="new_h", accepted=True))
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
-    coord.store = MagicMock()
     # Registration visible (verified first-add path is covered separately).
     coord._save_path_points_at_target = MagicMock(return_value=True)
     coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path="x"))
@@ -467,11 +454,9 @@ async def test_check_and_inject_late_cross_seeds_normalizes_hash(tmp_path: Path)
 @pytest.mark.anyio
 async def test_do_moving_parks_when_pause_fails(tmp_path: Path):
     from racing_sync.clients.abstract import TorrentFile
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path
     coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     coord.dest_client.get_torrent_files.return_value = [
         TorrentFile(name="Movie.mkv", size_bytes=1000, progress=1.0)
@@ -497,10 +482,8 @@ async def test_do_moving_parks_when_pause_fails(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_do_re_add_timer_delay_parks_without_sleeping():
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.fuse_reinject_delay_seconds = 30  # > 5s -> timer pattern
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
 
     ts = TorrentState(
@@ -521,8 +504,7 @@ async def test_do_re_add_timer_delay_parks_without_sleeping():
 
 @pytest.mark.anyio
 async def test_re_add_cross_seed_missing_blob_fails():
-    coord = object.__new__(Coordinator)
-    coord.store = MagicMock()
+    coord = make_coordinator()
     coord.store.get_blob.return_value = None  # No blob
     coord.dest_client = AsyncMock()
     coord.transition = MagicMock(side_effect=lambda ts, s, error="": setattr(ts, "state", s))
@@ -558,8 +540,7 @@ def _single_file_torrent_bytes(name: str, length: int) -> bytes:
 @pytest.mark.anyio
 async def test_do_re_add_parks_when_fuse_content_missing(tmp_path: Path):
     """SSD-complete data that never reached the fuse mount must NOT be injected."""
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.fuse_reinject_delay_seconds = 0
     coord.cfg.fuse_reinject_retry_gap_seconds = 120
     coord.cfg.fuse_reinject_backoff_seconds = 1800
@@ -567,7 +548,6 @@ async def test_do_re_add_parks_when_fuse_content_missing(tmp_path: Path):
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
     coord._stop = False
     coord.dest_client = AsyncMock()
-    coord.store = MagicMock()
     fuse_dir = tmp_path / "fuse-empty"
     fuse_dir.mkdir()
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
@@ -591,8 +571,7 @@ async def test_do_re_add_parks_when_fuse_content_missing(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_do_re_add_proceeds_when_fuse_content_present(tmp_path: Path):
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.fuse_reinject_delay_seconds = 0
     coord.cfg.fuse_reinject_retry_gap_seconds = 120
     coord.cfg.fuse_reinject_backoff_seconds = 1800
@@ -603,7 +582,6 @@ async def test_do_re_add_proceeds_when_fuse_content_present(tmp_path: Path):
     coord.dest_client.add_torrent.return_value = AddResult(hash=None, accepted=True, detail="Ok.")
     coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path="x"))
     coord._save_path_points_at_target = MagicMock(return_value=True)
-    coord.store = MagicMock()
     fuse_dir = tmp_path / "fuse"
     fuse_dir.mkdir()
     (fuse_dir / "Gated.Movie.2026.mkv").write_bytes(b"x" * 100)
@@ -650,8 +628,7 @@ async def test_do_moving_persists_blob_for_adopted_rows_without_one(tmp_path: Pa
         },
     })
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = ssd_dir
     coord.cfg.ssd.path = ssd_dir
     coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
@@ -713,14 +690,12 @@ async def test_do_queued_fuse_fast_track_persists_classification(tmp_path: Path)
         TorrentFile(name="Pack.S01/Pack.S01E02.mkv", size_bytes=100, progress=1.0),
     ]
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = ssd_dir
     coord.cfg.ssd.path = ssd_dir
     coord.cfg.rclone.fuse.mount = fuse_dir
     coord.cfg.rclone.fuse.mount_unsorted = fuse_dir / "unsorted"
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     ext = Torrent(
         hash="b" * 40,
@@ -757,14 +732,12 @@ async def test_do_queued_retries_files_listing_after_add(tmp_path: Path):
     from unittest.mock import patch
     from racing_sync.clients.abstract import AddResult, TorrentFile
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path
     coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
     coord.cfg.rclone.fuse.mount = str(tmp_path / "fuse")
     coord.cfg.rclone.fuse.mount_unsorted = str(tmp_path / "fuse-unsorted")
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     coord.dest_client.list_torrents = AsyncMock(return_value=[])
     coord.dest_client.add_torrent = AsyncMock(
@@ -800,10 +773,8 @@ async def test_do_queued_persistent_files_failure_stays_queued(tmp_path: Path):
     from unittest.mock import patch
     from racing_sync.clients.abstract import AddResult
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     coord.dest_client.list_torrents = AsyncMock(return_value=[])
     coord.dest_client.add_torrent = AsyncMock(
@@ -831,12 +802,10 @@ async def test_do_queued_persistent_files_failure_stays_queued(tmp_path: Path):
 async def test_do_queued_existing_resume_failure_stays_queued(tmp_path: Path):
     from racing_sync.clients.abstract import Torrent
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path
     coord.cfg.rclone.fuse.mount = str(tmp_path / "fuse")
     coord.cfg.rclone.fuse.mount_unsorted = str(tmp_path / "fuse-unsorted")
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     ext = Torrent(
         hash="d" * 40, name="Existing.Show", category="racing",
@@ -873,14 +842,12 @@ async def test_do_queued_parks_to_readding_when_fuse_files_missing(tmp_path: Pat
     ssd_dir = tmp_path / "ssd"
     ssd_dir.mkdir()
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = ssd_dir
     coord.cfg.ssd.path = ssd_dir
     coord.cfg.rclone.fuse.mount = str(fuse_dir)
     coord.cfg.rclone.fuse.mount_unsorted = str(fuse_dir / "unsorted")
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     ext = Torrent(
         hash="e" * 40,
@@ -925,14 +892,12 @@ async def test_do_queued_resumes_ssd_flow_when_fuse_entry_missing_but_ssd_has_fi
     ssd_dir.mkdir()
     (ssd_dir / "Ghost.Movie.2026.mkv").write_bytes(b"g" * 100)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = ssd_dir
     coord.cfg.ssd.path = ssd_dir
     coord.cfg.rclone.fuse.mount = str(fuse_dir)
     coord.cfg.rclone.fuse.mount_unsorted = str(fuse_dir / "unsorted")
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     ext = Torrent(
         hash="e" * 40,
@@ -976,14 +941,12 @@ async def test_late_cross_seeds_defer_when_fuse_content_missing(tmp_path: Path):
     fuse_dir = tmp_path / "fuse"
     fuse_dir.mkdir()
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord.dest_client = AsyncMock()
     coord.dest_client.add_torrent = AsyncMock(
         return_value=AddResult(hash=None, accepted=True, detail="Ok.")
     )
-    coord.store = MagicMock()
     coord._failed_late_cross_seeds = {}
 
     priv_blobs = [
@@ -1037,7 +1000,7 @@ async def test_re_inject_racing_torrents_replaces_stale_ssd_entry(tmp_path: Path
     from racing_sync.watchdir import _bencoded_info_hash
     real_hash = _bencoded_info_hash(blob)[0].lower()
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord.dest_client = AsyncMock()
     # First add fails (duplicate); second add after replace succeeds.
@@ -1077,7 +1040,7 @@ async def test_re_inject_racing_torrents_replaces_stale_ssd_entry(tmp_path: Path
 
 @pytest.mark.anyio
 async def test_re_inject_racing_torrents_skips_missing_fuse_content(tmp_path: Path):
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     fuse_dir = tmp_path / "fuse-empty"
     fuse_dir.mkdir()
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
@@ -1120,14 +1083,12 @@ async def test_do_queued_batches_non_episodic_bundle_in_file_groups(tmp_path: Pa
     """
     from racing_sync.clients.abstract import AddResult, TorrentFile
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 10_000
     coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
     coord.cfg.rclone.fuse.mount = str(tmp_path / "fuse")
     coord.cfg.rclone.fuse.mount_unsorted = str(tmp_path / "fuse-unsorted")
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     coord.dest_client.list_torrents = AsyncMock(return_value=[])
     coord.dest_client.add_torrent = AsyncMock(
@@ -1164,12 +1125,10 @@ async def test_do_queued_fails_single_oversize_member_not_total(tmp_path: Path):
     """One member bigger than the cap fails the torrent, however small the rest."""
     from racing_sync.clients.abstract import AddResult, TorrentFile
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 100_000_000_000
     coord.cfg.ssd.skip_movie_larger_than_bytes = 10_000
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     coord.dest_client.list_torrents = AsyncMock(return_value=[])
     coord.dest_client.add_torrent = AsyncMock(
@@ -1213,7 +1172,7 @@ async def test_ensure_fuse_entry_retries_delayed_visibility_after_replace(tmp_pa
     blob = _single_file_torrent_bytes("Lag.Movie.2026.mkv", 80)
     real_hash = _bencoded_info_hash(blob)[0].lower()
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.dest_client = AsyncMock()
     coord.dest_client.add_torrent = AsyncMock(side_effect=[
         AddResult(hash=None, accepted=False, detail="Fails."),
@@ -1263,7 +1222,7 @@ async def test_ensure_fuse_entry_unconfirmed_replace_is_retryable(tmp_path: Path
     blob = _single_file_torrent_bytes("Ghost.Movie.2026.mkv", 80)
     real_hash = _bencoded_info_hash(blob)[0].lower()
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.dest_client = AsyncMock()
     coord.dest_client.add_torrent = AsyncMock(side_effect=[
         AddResult(hash=None, accepted=False, detail="Fails."),
@@ -1293,11 +1252,9 @@ async def test_re_add_cross_seed_unconfirmed_replace_retries_not_fails(tmp_path:
     retryable error (RE_ADDING parks) instead of FAILED."""
     from racing_sync.coordinator import WebUIUnresponsiveError
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.rclone.fuse.mount = tmp_path / "fuse"
     coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-unsorted"
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
 
@@ -1333,8 +1290,7 @@ async def test_late_cross_seed_repairs_skipped_racing_injection(tmp_path: Path):
     (fuse_dir / fname).write_bytes(b"d" * 100)
     blob = _single_file_torrent_bytes(fname, 100)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
     # Real mount paths: with a bare MagicMock, episode kinds resolve to a
     # mock path and the fuse gate can never pass.
@@ -1347,7 +1303,6 @@ async def test_late_cross_seed_repairs_skipped_racing_injection(tmp_path: Path):
         return_value=AddResult(hash=None, accepted=True, detail="Ok.")
     )
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
-    coord.store = MagicMock()
     coord._failed_late_cross_seeds = {}
     coord._save_path_points_at_target = MagicMock(return_value=True)
     coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path="x"))
@@ -1377,13 +1332,11 @@ async def test_late_cross_seed_repairs_skipped_racing_injection(tmp_path: Path):
 @pytest.mark.anyio
 async def test_late_cross_seed_repair_skipped_when_source_recorded(tmp_path: Path):
     """Healthy rows (source already injected) must not re-fetch or re-add."""
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
     coord._target_mount_for = MagicMock(return_value=tmp_path)
     coord.dest_client = AsyncMock()
     coord._fetch_racing_torrent_bytes = AsyncMock()
-    coord.store = MagicMock()
     coord._failed_late_cross_seeds = {}
 
     racing_hash = "b" * 40
@@ -1410,12 +1363,10 @@ async def test_late_cross_seed_repair_skipped_when_source_recorded(tmp_path: Pat
 @pytest.mark.anyio
 async def test_late_cross_seed_repair_backs_off_on_fetch_miss():
     """Unfetchable racing bytes defer with backoff instead of SFTP storms."""
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
     coord.dest_client = AsyncMock()
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=None)
-    coord.store = MagicMock()
     coord._failed_late_cross_seeds = {}
 
     racing_hash = "b" * 40
@@ -1449,7 +1400,7 @@ async def test_re_inject_zero_injection_warns(caplog):
     """A racing fetch miss during RE_ADDING must be loud, not silent."""
     import logging
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse/unsorted"))
     coord.dest_client = AsyncMock()
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=None)

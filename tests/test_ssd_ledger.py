@@ -10,15 +10,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from racing_sync.coordinator import Coordinator
+from conftest import make_coordinator
 from racing_sync.state import State, StateStore, TorrentState
 
 
 def _coord_with_cap(tmp_path, cap: int):
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord._live = {}
-    coord.store = MagicMock()
     # Unknown test-double rows must not prune real reservations (see _ssd_prune_stale).
     coord.store.get = MagicMock(side_effect=lambda h: TorrentState(
         source_infohash=h, source_name="x", state=State.DOWNLOADING))
@@ -134,7 +132,7 @@ async def test_rebuild_after_abrupt_stop(tmp_path):
         for r in rows:
             store.upsert(r)
 
-        coord = object.__new__(Coordinator)
+        coord = make_coordinator()
         coord.store = store
         coord.cfg = MagicMock()
         coord.cfg.ssd.max_inflight_bytes = 40_000
@@ -152,7 +150,7 @@ async def test_rebuild_after_abrupt_stop(tmp_path):
 
         # Abrupt-stop replay: second coordinator on the SAME db file (no
         # shutdown cleanup) rebuilds identically — no leak, no double-spend.
-        coord2 = object.__new__(Coordinator)
+        coord2 = make_coordinator()
         coord2.store = StateStore(Path(db))
         try:
             coord2.cfg = MagicMock()

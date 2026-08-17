@@ -18,6 +18,7 @@ import pytest
 
 from racing_sync.clients.abstract import AddResult, Torrent
 from racing_sync.config import AppConfig  # noqa: F401  (spec reference)
+from conftest import make_coordinator
 from racing_sync.coordinator import Coordinator
 from racing_sync.recovery import reconcile
 from racing_sync.state import State, StateStore, TorrentState
@@ -226,7 +227,7 @@ def _rclone_fake(ssd: Path, fuse: Path, calls: list):
 
 
 def _make_coord(ssd: Path, fuse: Path, store: StateStore, src, dest) -> Coordinator:
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     cfg = MagicMock()
     cfg.source.category = ""
     cfg.source.min_age_seconds = 0
@@ -261,9 +262,6 @@ def _make_coord(ssd: Path, fuse: Path, store: StateStore, src, dest) -> Coordina
     coord.prowlarr = None
     coord.watch = None
     coord._stop = False
-    coord._live = {}
-    coord._tasks = set()
-    coord._running_infohashes = set()
     coord._source_torrents_cache = []
     coord._source_torrents_cached_at = 0.0
     coord._failed_late_cross_seeds = {}

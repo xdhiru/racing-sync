@@ -205,15 +205,14 @@ def test_secret_str_masking_in_repr_and_string_equality():
 
 
 from unittest.mock import AsyncMock, MagicMock
-from racing_sync.coordinator import Coordinator
+from conftest import make_coordinator
 from racing_sync.state import TorrentState, State
 from racing_sync.clients.abstract import AddResult, TorrentFile
 
 
 @pytest.mark.anyio
 async def test_coordinator_wait_disk_stops_on_stop():
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord._stop = True
     ts = TorrentState(source_infohash="abc", source_name="test", total_bytes=9999999999)
     # Should exit immediately without hanging
@@ -225,8 +224,7 @@ async def test_coordinator_wait_disk_stops_on_stop():
 async def test_coordinator_do_queued_extracts_infohash_from_blob():
     from racing_sync.watchdir import _bencode
     from racing_sync.config import ClassifierConfig
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = "/downloads"
     coord.cfg.classifier = ClassifierConfig()
     coord.cfg.ssd.skip_movie_larger_than_bytes = 0
@@ -287,13 +285,11 @@ async def test_late_cross_seeds_handles_none_detail_and_expires_failures(tmp_pat
         },
     })
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.rclone.fuse.mount = str(fuse_dir)
     coord.cfg.rclone.fuse.mount_unsorted = str(fuse_dir)
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord.dest_client = MagicMock()
-    coord.store = MagicMock()
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord._failed_late_cross_seeds = {}
 
@@ -328,8 +324,7 @@ async def test_late_cross_seeds_handles_none_detail_and_expires_failures(tmp_pat
 
 @pytest.mark.anyio
 async def test_process_torrent_handles_illegal_transition_to_failed():
-    coord = object.__new__(Coordinator)
-    coord.store = MagicMock()
+    coord = make_coordinator()
     coord.store.transition.side_effect = ValueError("illegal transition: done -> failed")
     coord._notify_telegram = AsyncMock()
 
@@ -356,8 +351,7 @@ async def test_process_torrent_handles_illegal_transition_to_failed():
 async def test_wait_for_completion_stall_timeout():
     from racing_sync.clients.abstract import Torrent
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.general.download_stall_timeout_seconds = 0.05
     coord.cfg.general.dest_poll_interval = 0.01
     coord._stop = False
@@ -523,8 +517,7 @@ async def test_pick_ssd_source_public_and_private_paths():
 async def test_wait_disk_then_queue_false_branch():
     from unittest.mock import patch
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord._stop = False
     coord.transition = MagicMock()
 
@@ -612,8 +605,7 @@ async def test_pick_ssd_source_private_primary_with_public_dupe():
 async def test_wait_disk_then_queue_does_not_block_worker():
     from unittest.mock import patch
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord._stop = False
     coord.transition = MagicMock()
 
@@ -627,8 +619,7 @@ async def test_wait_disk_then_queue_does_not_block_worker():
 
 @pytest.mark.anyio
 async def test_do_queued_happy_path():
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.rclone.fuse.mount = "/mnt/fuse"
     coord.cfg.rclone.fuse.mount_unsorted = "/mnt/fuse/unsorted"
     coord.cfg.classifier._episode_re = None

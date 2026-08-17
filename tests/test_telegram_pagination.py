@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from conftest import make_coordinator
 
 from racing_sync.state import State, TorrentState
 from racing_sync.telegram_bot import render_active, TelegramBot
@@ -131,12 +132,11 @@ def test_render_detail_formatting():
 @pytest.mark.anyio
 async def test_refresh_live_status_filters_by_hashes():
     from unittest.mock import AsyncMock
-    from racing_sync.coordinator import Coordinator, LiveItem
+    from racing_sync.coordinator import LiveItem
     from racing_sync.clients.abstract import Torrent
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.dest_client = AsyncMock()
-    coord._live = {}
 
     # Case 1: when _live is empty, list_torrents should not even be called
     await coord._refresh_live_status()
