@@ -1948,3 +1948,68 @@ async def test_download_loop_tightens_reservation_per_batch(tmp_path):
 
     assert ts.state == State.MOVING
     assert coord._ssd_reserved["k" * 40] == 100
+
+
+@pytest.mark.anyio
+async def test_do_moving_single_file_parks_when_client_progress_incomplete(tmp_path):
+    """Single-file branch must not bare-move client-unverified bytes.
+
+    Regression: the movie/episode single-file branch used to `rclone move`
+    whatever was on SSD without consulting the verified-complete set, so a
+    premature DOWNLOADING->MOVING (or a stale progress read) uploaded
+    partial files to the remote. Now it parks in MOVING instead.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    # Preallocated-but-incomplete: full size on disk, client progress < 1.
+    (ssd / "Partial.Movie.1080p.mkv").write_bytes(b"p" * 1000)
+
+    cls_files = [
+        TorrentFile(name="Partial.Movie.1080p.mkv", size_bytes=1000, progress=0.5),
+    ]
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = ssd / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+    coord.cfg.rclone.batch_move_extra_flags = []
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=cls_files)
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.delete = AsyncMock()
+    coord.dest_client.export_torrent = AsyncMock(return_value=b"blob")
+    coord._rclone_move = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="d" * 40,
+        source_name="Partial.Movie.1080p.mkv",
+        dest_infohash="d" * 40,
+        save_path=str(ssd),
+        classification_kind="movie",
+        batches_total=1,
+        batch_index=0,
+        state=State.MOVING,
+    )
+    coord.store.upsert(ts)
+
+    row = coord.store.get("d" * 40)
+    with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock) as wipe:
+        await coord._do_moving(row)
+
+    assert row.state == State.MOVING
+    assert "not verified complete" in (row.last_error or "")
+    coord._rclone_move.assert_not_called()
+    wipe.assert_not_called()
+    assert (ssd / "Partial.Movie.1080p.mkv").exists()
