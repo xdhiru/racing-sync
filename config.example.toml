@@ -4,19 +4,19 @@
 
 [general]
 # Polling interval (seconds) for source client (VPS1)
-source_poll_interval = 30
+source_poll_interval = 60
 # Polling interval (seconds) for destination client (VPS2)
-dest_poll_interval = 15
+dest_poll_interval = 30
 # SQLite state DB path
 state_db = "/var/lib/racing-sync/state.db"
 # Log directory (rotating files)
 log_dir = "/var/log/racing-sync"
 # Log retention days
-log_retention_days = 14
+log_retention_days = 2
 
 # Safety margin added on top of every SSD free-space check (bytes).
-# Example: 10 GiB. Prevents races between disk_usage() check and torrent fill.
-disk_safety_margin_bytes = 10737418240
+# Example: 1 GiB. Prevents races between disk_usage() check and torrent fill.
+disk_safety_margin_bytes = 1073741824
 
 # Optional global overrides (all commented = use per-section values):
 #   max_active_downloads       overrides [dest].max_active_downloads
@@ -163,10 +163,10 @@ path = "/srv/qbittorrent/data"
 # per-torrent cap. Each torrent reserves min(total, this) before admission
 # and parks in WAITING_DISK past it; batch footprints refine after
 # classification. Keep this below the filesystem size minus headroom.
-max_inflight_bytes = 536870912000   # 500 GiB
+max_inflight_bytes = 42949672960   # 40 GiB
 # If a single-file torrent (movie) is larger than this, skip it entirely.
 # (Season torrents are still processed in batches even if larger.)
-skip_movie_larger_than_bytes = 536870912000  # 500 GiB
+skip_movie_larger_than_bytes = 42949672960  # 40 GiB
 # Extra per-check safety margin for SSD operations (bytes, default 0).
 # Adds to [general].disk_safety_margin_bytes for SSD-space decisions.
 safety_margin_bytes = 0
@@ -238,7 +238,7 @@ mount = "/mnt/remote/qbittorrent"
 mount_unsorted = "/mnt/remote/qbittorrent/unsorted"
 # Delay (seconds) before re-injecting torrents to fuse after rclone move (default: 30).
 # Allows cloud fuse mounts time to refresh directory caches and index the new files.
-reinject_delay_seconds = 30
+reinject_delay_seconds = 135
 
 # Gap (seconds) between immediate re-injection retries when destination WebUI is unresponsive (default: 120 / 2 minutes).
 # Allows transient disk I/O and network transfer spikes time to subside before re-attempting.
@@ -281,7 +281,7 @@ enabled = false
 bot_token = ""
 chat_id = ""
 # How often to edit the active-tasks list (seconds).
-status_update_interval = 45
+status_update_interval = 15
 # Number of active tasks displayed per page in the status message (default: 5).
 # Users can paginate through tasks with inline arrow buttons on the message.
 page_size = 5
@@ -293,7 +293,7 @@ pin_status_message = false
 # while the message is already last — no churn. 0 = disabled (edit in
 # place). Minimum effective value is 5 (lower values are clamped) to respect
 # Telegram rate limits. Start with 10.
-active_repost_interval_seconds = 0
+active_repost_interval_seconds = 15
 # Pinning the active-tasks message in the chat requires the bot to
 # have admin rights with "can_pin_messages". If you don't have those,
 # the bot will log a warning and continue without pinning. Most users
