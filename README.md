@@ -113,6 +113,12 @@ silently ignored) — useful for catching typos like `max_active_download`.
   the target mount before the row advances. The fuse index can lag while
   rclone is busy, so an accepted-but-invisible entry parks and retries —
   never fails, never touches moved files.
+- **Manual fuse adoption.** Same infohash already seeding from fuse on VPS2
+  (any category) with verified bytes fast-tracks `NEW/QUERYING/
+  WAITING_INDEXER/WAITING_DISK` straight to `DONE` — no Prowlarr query, no
+  SSD download. Workers check before querying; each tick also runs one
+  batched hash lookup so parked rows are picked up within one poll interval.
+  Ghosts (complete but bytes missing) never adopt.
 - **Quiet waits.** `WAITING_DISK` rows re-check at most once a minute, and
   the log handlers survive a full disk instead of traceback-storming it.
 
