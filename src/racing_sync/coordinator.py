@@ -777,6 +777,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             except Exception:
                 pass
 
+        # 2b. Manual fuse sweep: same infohash already seeding from fuse on
+        # VPS2 (any category) with verified bytes needs no prowlarr/SSD work.
+        # Batch-adopted here so WAITING_INDEXER rows parked on their 30m retry
+        # timer are picked up within one poll interval, not one retry window.
+        # Never breaks the tick: all failures are caught inside.
+        try:
+            await self._sweep_manual_fuse_adoptions()
+        except Exception as e:  # noqa: BLE001
+            log.warning("manual fuse sweep failed: %s", e)
+
         # 3. Wake up WAITING_INDEXER rows whose retry timer has elapsed.
         # Indexer wakeups still respect worker capacity: an unbounded timer
         # burst must not spawn unbounded workers.
@@ -1245,6 +1255,242 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 await self._ssd_release(ts.source_infohash)
                 raise
 
+    async def _verify_and_adopt_manual_fuse(self, ts: TorrentState, ext) -> bool:
+        """Verify a dest entry as a manual fuse seed and adopt to DONE.
+
+        `ext` is a dest `Torrent` for the same infohash found via a
+        category-agnostic hash lookup (manual adds usually carry no
+        category/tags). Adoption requires on-fuse save_path + client-complete
+        + bytes stat-able at the fuse target (skip_check ghosts must never
+        mark DONE). Best-effort: any unverifiable outcome returns False and
+        the caller continues the normal SSD/prowlarr flow.
+
+        Returns True when the row was transitioned to DONE (or was already
+        DONE by a concurrent actor).
+        """
+        try:
+            if ts.state == State.DONE:
+                return True
+            if ts.state not in (State.NEW, State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK):
+                return False
+            try:
+                if getattr(self, "store", None) is not None and hasattr(self.store, "is_ignored"):
+                    if self.store.is_ignored(ts.source_infohash) is True:
+                        return False
+            except Exception:
+                pass
+            if ext is None:
+                return False
+            if not self._save_path_is_on_fuse(getattr(ext, "save_path", "")):
+                return False
+            try:
+                complete = ext.is_complete() if hasattr(ext, "is_complete") else False
+                if callable(complete):
+                    complete = complete()
+            except Exception:
+                return False
+            if not complete:
+                return False
+            try:
+                fuse_files = await self.dest_client.get_torrent_files(ext.hash)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "manual fuse check: could not list files for %s: %s",
+                    ts.source_infohash[:10], e,
+                )
+                return False
+            fuse_expected = [
+                (f.name, f.size_bytes) for f in (fuse_files or [])
+                if getattr(f, "name", "")
+            ]
+            # Empty file list: nothing to verify against — do not adopt blind.
+            # Recovery keeps the same fail-closed stance; a warming mount also
+            # shows nothing and must park, not DONE.
+            if not fuse_expected:
+                return False
+            try:
+                fuse_missing = await self._missing_fuse_files(
+                    Path(getattr(ext, "save_path", "")), fuse_expected
+                )
+            except Exception:
+                return False
+            if fuse_missing:
+                log.warning(
+                    "manual fuse check: %s reports complete on fuse %s but %d/%d files missing "
+                    "(e.g. %s); keeping normal flow instead of DONE",
+                    ts.source_infohash[:10], getattr(ext, "save_path", "?"),
+                    len(fuse_missing), len(fuse_expected), fuse_missing[0],
+                )
+                return False
+            log.info(
+                "torrent %s is already completed on VPS2 fuse mount (manual add, category-agnostic); marking DONE",
+                ts.source_infohash[:10],
+            )
+            ts.dest_infohash = ext.hash.lower()
+            ts.save_path = getattr(ext, "save_path", "")
+            try:
+                fast_kind = classify(fuse_files, self.cfg).kind
+            except Exception:  # noqa: BLE001
+                fast_kind = "unknown"
+            if fast_kind and fast_kind != ts.classification_kind:
+                ts.classification_kind = fast_kind
+                try:
+                    self.store.upsert(ts)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                if getattr(self.cfg.cross_seed, "inject_racing_torrents_to_fuse", False):
+                    await self._re_inject_racing_torrents(ts)
+            except Exception as e:  # noqa: BLE001
+                # Manual entry already seeds; a failed re-inject must not block
+                # DONE — the late-seed job repairs the racing injection.
+                log.warning(
+                    "manual fuse check: re-inject for %s failed (keeping DONE): %s",
+                    ts.source_infohash[:10], e,
+                )
+            try:
+                self.transition(ts, State.DONE)
+            except ValueError:
+                # Concurrent actor already moved the row (e.g. tick sweep beat
+                # this worker to DONE). Treat as adopted, never overwrite.
+                try:
+                    fresh = self.store.get(ts.source_infohash)
+                except Exception:
+                    fresh = None
+                if fresh is not None and fresh.state == State.DONE:
+                    try:
+                        ts.state = fresh.state
+                        ts.dest_infohash = fresh.dest_infohash or ts.dest_infohash
+                        ts.save_path = fresh.save_path or ts.save_path
+                    except Exception:
+                        pass
+                    return True
+                log.warning(
+                    "manual fuse check: could not transition %s to DONE from %s",
+                    ts.source_infohash[:10], ts.state.value,
+                )
+                return False
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "manual fuse check failed for %s: %s",
+                getattr(ts, "source_infohash", "?")[:10], e,
+            )
+            return False
+
+    async def _adopt_manual_fuse_if_present(self, ts: TorrentState) -> bool:
+        """Category-agnostic check for a manually added fuse seed (same infohash).
+
+        Used before any prowlarr query in _do_new/_do_waiting_indexer so an
+        operator-added torrent (no category/tags) fast-tracks to DONE instead
+        of parking in WAITING_INDEXER. Single-hash dest lookup — cheap and
+        independent of the racing-category filter recovery relies on.
+        """
+        try:
+            dest_client = getattr(self, "dest_client", None)
+            if dest_client is None:
+                return False
+            if ts.state not in (State.NEW, State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK):
+                return False
+            h = (ts.source_infohash or "").lower()
+            if not h:
+                return False
+            try:
+                existing = await dest_client.list_torrents(hashes=[h])
+            except Exception as e:  # noqa: BLE001
+                log.warning("manual fuse check: dest lookup failed for %s: %s", h[:10], e)
+                return False
+            if not existing:
+                return False
+            ext = next((t for t in existing if (t.hash or "").lower() == h), existing[0])
+            return await self._verify_and_adopt_manual_fuse(ts, ext)
+        except Exception as e:  # noqa: BLE001
+            log.warning("manual fuse check failed for %s: %s", ts.source_infohash[:10], e)
+            return False
+
+    async def _sweep_manual_fuse_adoptions(self) -> None:
+        """Batch-adopt pre-SSD rows whose infohash already seeds from fuse.
+
+        Tick-level responsiveness net: WAITING_INDEXER rows only wake on their
+        30m retry timer, so a manual add between retries would otherwise sit
+        parked. One batched hash lookup per tick covers all pre-SSD rows at
+        once (qB accepts pipe-separated hashes); rows with live workers are
+        skipped — their own _do_* check adopts without racing the worker.
+        """
+        try:
+            dest_client = getattr(self, "dest_client", None)
+            store = getattr(self, "store", None)
+            if dest_client is None or store is None:
+                return
+            try:
+                pre_ssd = store.list_by_state(
+                    State.NEW, State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK
+                )
+            except Exception:
+                return
+            if not pre_ssd:
+                return
+            running = getattr(self, "_running_infohashes", None)
+            candidates: list[TorrentState] = []
+            hashes: list[str] = []
+            seen: set[str] = set()
+            for ts in pre_ssd:
+                try:
+                    h = (ts.source_infohash or "").lower()
+                except Exception:
+                    continue
+                if not h or h in seen:
+                    continue
+                try:
+                    if isinstance(running, set) and h in running:
+                        continue
+                except Exception:
+                    pass
+                try:
+                    if hasattr(store, "is_ignored") and store.is_ignored(ts.source_infohash) is True:
+                        continue
+                except Exception:
+                    pass
+                seen.add(h)
+                hashes.append(h)
+                candidates.append(ts)
+            if not hashes:
+                return
+            try:
+                existing = await dest_client.list_torrents(hashes=hashes)
+            except Exception as e:  # noqa: BLE001
+                log.warning("manual fuse sweep: dest lookup failed: %s", e)
+                return
+            if not existing:
+                return
+            by_hash = {}
+            for t in existing or []:
+                try:
+                    by_hash[(t.hash or "").lower()] = t
+                except Exception:
+                    continue
+            for ts in candidates:
+                try:
+                    h = (ts.source_infohash or "").lower()
+                    ext = by_hash.get(h)
+                    if ext is None:
+                        continue
+                    # Re-read: a worker may have moved this row after the
+                    # snapshot above — never overwrite a fresh state.
+                    try:
+                        fresh = store.get(ts.source_infohash)
+                    except Exception:
+                        fresh = None
+                    if fresh is None or fresh.state != ts.state:
+                        continue
+                    if fresh.state not in (State.NEW, State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK):
+                        continue
+                    await self._verify_and_adopt_manual_fuse(fresh, ext)
+                except Exception:
+                    continue
+        except Exception as e:  # noqa: BLE001
+            log.warning("manual fuse sweep failed: %s", e)
+
     async def _do_new(self, ts: TorrentState) -> None:
         if ts.cross_seed_source == "watch-dir":
             await self._do_new_watch_dir(ts)
@@ -1258,6 +1504,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         ts.total_bytes = st.size_bytes
         ts.source_tracker = st.trackers[0] if st.trackers else ""
         ts.source_announce_url = ts.source_tracker or ts.source_announce_url
+
+        # Manual fuse fast-track: same infohash already seeding from fuse
+        # (any category) with verified bytes needs no prowlarr/SSD work.
+        try:
+            if await self._adopt_manual_fuse_if_present(ts):
+                return
+        except Exception:
+            pass
 
         all_source = await self._list_source_torrents()
         await self._pick_and_admit(ts, st, self._same_content_torrents(all_source, st))
@@ -1502,6 +1756,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             return
         ts.source_name = st.name
         ts.total_bytes = st.size_bytes
+
+        # Manual fuse fast-track before another prowlarr query: a torrent
+        # added by hand to VPS2 while parked must not wait out the retry.
+        try:
+            if await self._adopt_manual_fuse_if_present(ts):
+                return
+        except Exception:
+            pass
 
         all_source = await self._list_source_torrents()
         await self._pick_and_admit(
