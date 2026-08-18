@@ -17,7 +17,7 @@ racing-sync check-config --config config.toml
 pytest -q
 ```
 
-Expected: `test_batcher.py`, `test_classifier.py`, `test_state.py`, `test_sftp.py` pass.
+Expected: full suite passes (`pytest -q`).
 
 ## 2. qBittorrent auth probe (no race torrent yet)
 
@@ -126,6 +126,17 @@ While a move is running (remote busy), watch a re-add land. Expect:
 1. `accepted but not yet visible on fuse …; parking re-add` instead of a
    failure — the row retries and reaches `done` once the index catches up.
 2. Moved files are never deleted or replaced by the retry.
+
+## 9d. Manual fuse adoption
+
+Manually move a racing release's files to the remote and add the same
+torrent on VPS2 pointing at the fuse mount with no category/tags. Expect:
+
+1. The `NEW` / `WAITING_INDEXER` row goes straight to `done` within one
+   poll interval, with `already completed on VPS2 fuse mount (manual add,
+   category-agnostic)` in the log — no Prowlarr query.
+2. A `skip_check` ghost (complete but bytes missing at the fuse target)
+   never adopts; the row keeps its normal Prowlarr/SSD flow.
 
 ## 10. Telegram
 

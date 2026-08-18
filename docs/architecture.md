@@ -53,6 +53,14 @@ NEW ──┬─> QUERYING ──> WAITING_INDEXER ──> WAITING_DISK ──> 
 past 5 in 24h the row fails for operator attention instead of flapping
 forever. `FAILED → QUEUED/NEW` allows manual and auto retry.
 
+Pre-SSD states (`NEW`/`QUERYING`/`WAITING_INDEXER`/`WAITING_DISK`) may
+fast-track straight to `DONE` on manual fuse adoption: the operator moved
+the files to the remote and added the same infohash on VPS2 pointing at a
+fuse mount (any category) with verified bytes, so no SSD download or rclone
+move is needed. The check is category-agnostic (hash lookup, not the
+`racing`-category filter recovery relies on) and fail-closed on bytes
+(skip_check ghosts never mark `DONE`).
+
 The state lives in `state.db` (SQLite, WAL journal). Transitions are
 written through `StateStore.transition`, which restores the in-memory row
 if the `upsert` fails (e.g. full disk) so memory never disagrees with the
@@ -67,7 +75,16 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
    Insert/update row in `state.db` at `state=NEW`.
 
 2. **Decide SSD source** (`pick_ssd_source_for_racing`):
-   - Multiple racing-client torrents for the same content?
+
+   Manual fuse fast-track runs first: if the same infohash already seeds
+   from a fuse mount on VPS2 (any category) with verified bytes, the row
+   goes straight to `DONE` with no Prowlarr query or SSD work. Workers check
+   this at the top of `_do_new` / `_do_waiting_indexer`, and each tick runs
+   one batched hash lookup (`_sweep_manual_fuse_adoptions`) so parked
+   `WAITING_INDEXER` rows are picked up within one poll interval instead of
+   waiting out their 30-minute retry timer. Rows with live workers are
+   skipped by the sweep — their own worker check adopts without racing it.
+    - Multiple racing-client torrents for the same content?
      Prefer public. Try:
        - `cross_seed.refetch_public_via_prowlarr` → prowlarr → download-target indexers (priority order)
        - SFTP fallback (Deluge) or qB `export_torrent` (qB)
@@ -166,6 +183,9 @@ torrents and the local/remote filesystem:
   placements stay `unknowns`. Name matching requires the same normalized
   release, so repacks get their own rows instead of merging.
 - Torrents on destination client not tracked in `state.db` are audited and logged as orphans.
+- Startup recovery only lists `category="racing"`, so manual adds without a
+  category are invisible to it by design — the per-tick manual fuse sweep
+  (hash lookup, any category) covers those after startup.
 
 The state DB is the source of truth; VPS2 + filesystem are reality. The
 reconciler bridges them. After recovery the SSD ledger rebuilds from
