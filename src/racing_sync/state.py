@@ -55,15 +55,19 @@ class State(str, enum.Enum):
 
 
 # Allowed transitions (everything else raises ValueError).
+# Pre-SSD states (NEW/QUERYING/WAITING_INDEXER/WAITING_DISK) may fast-track
+# straight to DONE when a manual fuse seed is detected: the operator added
+# the same infohash on VPS2 pointing at the fuse mount (any category) with
+# verified bytes, so no SSD download / rclone move is needed.
 ALLOWED: dict[State, set[State]] = {
     State.NEW: {State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK,
                 State.QUEUED, State.DOWNLOADING, State.MOVING, State.RE_ADDING,
-                State.FAILED},
+                State.DONE, State.FAILED},
     State.QUERYING: {State.WAITING_INDEXER, State.WAITING_DISK, State.QUEUED,
-                State.DOWNLOADING, State.FAILED},
+                State.DOWNLOADING, State.DONE, State.FAILED},
     State.WAITING_INDEXER: {State.QUERYING, State.WAITING_DISK,
-                State.QUEUED, State.FAILED},
-    State.WAITING_DISK: {State.QUEUED, State.DOWNLOADING, State.FAILED},
+                State.QUEUED, State.DONE, State.FAILED},
+    State.WAITING_DISK: {State.QUEUED, State.DOWNLOADING, State.DONE, State.FAILED},
     State.QUEUED: {State.DOWNLOADING, State.MOVING, State.WAITING_DISK,
                    State.RE_ADDING, State.DONE, State.FAILED},
     State.DOWNLOADING: {State.MOVING, State.FAILED},

@@ -23,14 +23,18 @@ def test_failed_can_retry_to_queued_and_new():
     check_transition(State.FAILED, State.NEW)
 
 
-def test_new_cannot_go_directly_to_done():
-    with pytest.raises(ValueError):
-        check_transition(State.NEW, State.DONE)
+def test_new_can_fast_track_to_done_for_manual_fuse():
+    # Manual fuse adoption: same infohash already seeding from fuse with
+    # verified bytes needs no SSD work (NEW/WAITING_INDEXER -> DONE).
+    check_transition(State.NEW, State.DONE)
+    check_transition(State.WAITING_INDEXER, State.DONE)
+    check_transition(State.QUERYING, State.DONE)
+    check_transition(State.WAITING_DISK, State.DONE)
 
 
 def test_new_can_go_to_any_inflight():
     for s in [State.QUERYING, State.WAITING_DISK, State.QUEUED,
-              State.DOWNLOADING, State.MOVING, State.RE_ADDING]:
+              State.DOWNLOADING, State.MOVING, State.RE_ADDING, State.DONE]:
         check_transition(State.NEW, s)
 
 
