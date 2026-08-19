@@ -690,6 +690,15 @@ class CrossSeedConfig(BaseModel):
     #   neither a public racing torrent nor a Prowlarr cross-seed is
     #   available.
     #
+    # `pause_public_torrents_on_fuse` (default true):
+    #   When true, public torrents injected onto the fuse mount are added
+    #   paused (and an already-seeding fuse entry for one is paused), so
+    #   operators that don't want to seed publics from the remote still keep
+    #   the entry. Private torrents are never paused by this flag.
+    #   Detection is best-effort from the .torrent announce URL: undecodable
+    #   blobs fail open toward seeding (current behavior) so a private is
+    #   never paused by mistake.
+    #
     # Note: for Deluge sources, SFTP is the only way to obtain the .torrent
     # bytes for the racing client's own torrents. The coordinator will
     # automatically enable this and refuse to start if SFTP credentials
@@ -697,6 +706,7 @@ class CrossSeedConfig(BaseModel):
     inject_racing_torrents_to_fuse: bool = True
     allow_prowlarr_cross_seed: bool = True
     allow_ssh_export: bool = True
+    pause_public_torrents_on_fuse: bool = True
 
     @model_validator(mode="after")
     def _check_strategy(self) -> "CrossSeedConfig":

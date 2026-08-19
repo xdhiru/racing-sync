@@ -163,6 +163,12 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
       hard rejections skip just that torrent.
     - Duplicate entries pointing elsewhere are replaced; already-correct
       entries are kept as-is.
+    - Public torrents land paused when
+      `cross_seed.pause_public_torrents_on_fuse` is set (default true):
+      fresh adds go in paused and already-seeding fuse entries are paused
+      in place, so operators that don't seed publics still keep the entry.
+      Detection is best-effort from the blob announce URL and fails open
+      toward seeding, so privates always seed. Set false to seed publics.
 
 8. **Mark DONE** (recording the fuse mount as `save_path`).
 
