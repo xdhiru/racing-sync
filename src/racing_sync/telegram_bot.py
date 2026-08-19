@@ -947,6 +947,21 @@ class TelegramBot:
         cfg = getattr(coord, "cfg", None)
         if dest is None or cfg is None:
             return "Cancel failed: coordinator not ready"
+        # Snapshot the detail card before forget deletes the row (the
+        # telegram_message_id lives on the row): on success the card is
+        # edited to CANCELLED so it doesn't freeze at its last live state.
+        detail_msg_id: int | None = None
+        try:
+            cached = getattr(self, "_detail_cache", None)
+            if isinstance(cached, dict):
+                cached_id = cached.get(infohash)
+                if isinstance(cached_id, int) and cached_id > 0:
+                    detail_msg_id = cached_id
+            if detail_msg_id is None:
+                detail_msg_id = await asyncio.to_thread(
+                    store.get_telegram_message_id, infohash)
+        except Exception:
+            detail_msg_id = None
         try:
             if _hold_ops_lock is not None:
                 async with _hold_ops_lock(coord):
@@ -974,10 +989,59 @@ class TelegramBot:
         except Exception as e:  # noqa: BLE001
             return f"Cancel failed: {e}"
         name = str(result.get("source_name") or infohash[:10])[:50]
+        # The row (and its telegram_message_id) is gone: mark its detail
+        # card cancelled (best-effort) and drop the cached id so a future
+        # re-discovery of the same hash starts a fresh card instead of
+        # editing this one.
+        try:
+            cached = getattr(self, "_detail_cache", None)
+            if isinstance(cached, dict):
+                cached.pop(infohash, None)
+        except Exception:
+            pass
+        if detail_msg_id:
+            await self._mark_detail_cancelled(detail_msg_id, name, infohash)
         errs = result.get("errors") or []
         if errs:
             return f"Cancelled {name} with {len(errs)} error(s); check logs"
         return f"Cancelled {name} (removed + ignored)"
+
+    async def _mark_detail_cancelled(
+        self, message_id: int, name: str, infohash: str
+    ) -> None:
+        """Edit a forgotten row's detail card to CANCELLED (best-effort).
+
+        The DB row is already deleted, so this uses the snapshotted message
+        id. Never raises: a deleted card or a down Bot API must not fail
+        the cancel itself.
+        """
+        bot = getattr(self, "_bot", None)
+        if bot is None or not message_id:
+            return
+        shown = (name or infohash[:10])[:100]
+        text = (
+            f"🚫 CANCELLED `{_esc(shown)}`\n"
+            f"`{(infohash or '').lower()}`\n"
+            "✗ Cancelled by operator (removed + ignored)"
+        )
+        try:
+            await bot.edit_message_text(
+                text, chat_id=self._cfg.chat_id, message_id=message_id,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except TelegramError as e:
+            if _is_parse_error(e):
+                try:
+                    await bot.edit_message_text(
+                        text, chat_id=self._cfg.chat_id, message_id=message_id,
+                    )
+                except Exception:
+                    log.debug("cancel card plain edit failed: %s", e)
+            else:
+                # "not modified" / "not found" / transient — nothing to do.
+                log.debug("cancel card edit skipped: %s", e)
+        except Exception as e:  # noqa: BLE001
+            log.debug("cancel card edit failed: %s", e)
 
     # ---- active tasks list ----
 
