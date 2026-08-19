@@ -836,8 +836,11 @@ class TelegramBot:
     def _resolve_cancel_target(self, short: str):
         """Map a `/cancel_<prefix|full-hash>` token to its tracked row.
 
-        Raises LookupError when unknown or ambiguous (prefix matches
-        several rows — resend with the full 40-char hash).
+        Short prefixes search in-flight rows only, so `DONE`/`FAILED`
+        history can't force ambiguity on a live torrent. A full 40-char
+        hash addresses any tracked row (including `DONE`, e.g. to stop
+        seeding it). Raises LookupError when unknown or ambiguous
+        (prefix matches several live rows — resend with the full hash).
         """
         norm = (short or "").strip().lower()
         if not norm or any(c not in "0123456789abcdef" for c in norm):
@@ -850,8 +853,10 @@ class TelegramBot:
         except Exception:
             pass
         try:
+            all_active = getattr(self._store, "all_active", None)
+            rows = all_active() if callable(all_active) else self._store.all()
             candidates = [
-                ts for ts in self._store.all()
+                ts for ts in rows
                 if (ts.source_infohash or "").lower().startswith(norm)
             ]
         except Exception as e:  # noqa: BLE001

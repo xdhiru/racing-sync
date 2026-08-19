@@ -508,6 +508,28 @@ def test_resolve_cancel_target(tmp_path: Path):
         store.close()
 
 
+def test_resolve_cancel_target_ignores_done_history(tmp_path: Path):
+    # A DONE row sharing the live prefix must not force ambiguity, and a
+    # full hash still addresses the DONE row (e.g. to stop seeding it).
+    bot = _bot()
+    store = StateStore(tmp_path / "state.db")
+    bot._store = store
+    try:
+        store.upsert(TorrentState(source_infohash="a" * 10 + "0" * 30,
+                                  source_name="Old.Done", state=State.DONE))
+        store.upsert(TorrentState(source_infohash="a" * 10 + "1" * 30,
+                                  source_name="Live.One", state=State.QUEUED))
+        assert bot._resolve_cancel_target("a" * 10).source_name == "Live.One"
+        assert bot._resolve_cancel_target("a" * 10 + "0" * 30).source_name == "Old.Done"
+        # Two live rows on one prefix still refuse.
+        store.upsert(TorrentState(source_infohash="a" * 10 + "2" * 30,
+                                  source_name="Live.Two", state=State.QUEUED))
+        with pytest.raises(LookupError, match="matches 2"):
+            bot._resolve_cancel_target("a" * 10)
+    finally:
+        store.close()
+
+
 @pytest.mark.anyio
 async def test_chat_message_cancel_executes_without_confirm(tmp_path: Path):
     """Sending `/cancel_<short>` forgets+ignores immediately and replies."""
