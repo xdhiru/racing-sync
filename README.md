@@ -112,7 +112,8 @@ silently ignored) — useful for catching typos like `max_active_download`.
 - **Verified fuse injection.** Every fuse re-add is confirmed visible at
   the target mount before the row advances. The fuse index can lag while
   rclone is busy, so an accepted-but-invisible entry parks and retries —
-  never fails, never touches moved files.
+  never fails, never touches moved files. Public torrents land paused by
+  default (`cross_seed.pause_public_torrents_on_fuse`, set false to seed).
 - **Manual fuse adoption.** Same infohash already seeding from fuse on VPS2
   (any category) with verified bytes fast-tracks `NEW/QUERYING/
   WAITING_INDEXER/WAITING_DISK` straight to `DONE` — no Prowlarr query, no

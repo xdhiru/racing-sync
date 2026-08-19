@@ -414,6 +414,11 @@ allow_prowlarr_cross_seed = true
 # state. Required for Deluge (no WebUI export). For qBittorrent this is
 # a last-resort fallback when no public torrent and no Prowlarr hit.
 allow_ssh_export = true
+# Pause public torrents after fuse injection instead of seeding them.
+# true (default) = public entries are added paused on the fuse mount
+# (already-seeding ones are paused in place). Private torrents never pause.
+# Set false to keep seeding publics from fuse.
+pause_public_torrents_on_fuse = true
 # req #2 follow-up: when no configured download-target indexer returns a
 # cross-seed for a brand-new release, re-query every
 # prowlarr_retry_interval_seconds. After prowlarr_max_age_seconds

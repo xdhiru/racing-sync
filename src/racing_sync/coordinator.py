@@ -5018,6 +5018,53 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         tm = str(target_mount).rstrip("/\\").replace("\\", "/")
         return bool(tm) and (sp == tm or sp.startswith(tm + "/"))
 
+    def _should_pause_public_on_fuse(self, blob: bytes | None) -> bool:
+        """True when a fuse-injected blob must land paused, not seeding.
+
+        Gated on `cross_seed.pause_public_torrents_on_fuse` AND a positively
+        identified public announce URL in the blob. Fail-open toward seeding
+        (current behavior) on any doubt — undecodable blobs, missing config,
+        unknown trackers — so a private torrent is never paused by mistake
+        and break a seeding obligation.
+        """
+        try:
+            flag = getattr(getattr(self, "cfg", None), "cross_seed", None)
+            if not bool(getattr(flag, "pause_public_torrents_on_fuse", False)):
+                return False
+        except Exception:
+            return False
+        try:
+            if not blob or not isinstance(blob, (bytes, bytearray)):
+                return False
+            from .watchdir import _bencoded_info_hash
+
+            _, _, _, announce = _bencoded_info_hash(bytes(blob))
+        except Exception:
+            return False
+        try:
+            if not announce:
+                return False
+            return bool(_looks_public([announce]))
+        except Exception:
+            return False
+
+    async def _pause_fuse_entry_best_effort(self, h_low: str, *, label: str) -> None:
+        """Pause a fuse entry without ever failing the row.
+
+        The entry is already correctly placed; a failed pause only means it
+        keeps seeding until the operator pauses it by hand. Never raises.
+        """
+        try:
+            pause_fn = getattr(self.dest_client, "pause", None)
+            if not callable(pause_fn):
+                return
+            await pause_fn(h_low)
+            log.info("pausing public %s %s on fuse (pause_public_torrents_on_fuse=true)",
+                     label, h_low[:10])
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not pause public %s %s on fuse (keeps seeding): %s",
+                        label, h_low[:10], e)
+
     async def _ensure_fuse_entry(
         self, *, blob: bytes, infohash: str, target_mount: Path, label: str
     ) -> tuple[bool, str]:
@@ -5029,9 +5076,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         deleted (files kept) and re-added at the fuse target — the bytes
         were verified at the target before this call.
 
+        Public torrents land paused when
+        `cross_seed.pause_public_torrents_on_fuse` is set (fresh adds go in
+        paused; already-seeding fuse entries are paused in place). Private
+        torrents always seed as before.
+
         Returns (ok, detail). Never raises for client rejections; callers
         apply their own retry/fail policy. Exact add kwargs are kept stable
-        for the seeding contract (category/tags/skip_check).
+        for the seeding contract (category/tags/skip_check) apart from the
+        paused flag above.
 
         Registration lag: a loaded client can accept the re-add while the
         entry is not yet visible to lookups. The post-add check is retried;
@@ -5039,11 +5092,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         park/retry instead of failing the row over a transient.
         """
         h_low = infohash.lower()
+        pause_public = self._should_pause_public_on_fuse(blob)
         add_kwargs: dict[str, object] = {
             "torrent_files": [blob],
             "save_path": str(target_mount),
             "category": "racing",
-            "paused": False,
+            "paused": True if pause_public else False,
             "skip_check": True,
             "tags": ["racing", "fuse"],
         }
@@ -5063,6 +5117,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     getattr(_st, "save_path", ""), target_mount
                 ):
                     log.info("re-injected %s %s on fuse (%s)", label, h_low[:10], target_mount)
+                    if pause_public:
+                        await self._pause_fuse_entry_best_effort(h_low, label=label)
                     return True, detail
                 await asyncio.sleep(2)
             log.warning(
@@ -5082,6 +5138,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             getattr(dest_st, "save_path", ""), target_mount
         ):
             log.info("%s %s already on fuse; marking as injected", label, h_low[:10])
+            if pause_public:
+                await self._pause_fuse_entry_best_effort(h_low, label=label)
             return True, "already added"
         if dest_st is not None:
             log.warning(
@@ -5108,6 +5166,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     getattr(dest_st2, "save_path", ""), target_mount
                 ):
                     log.info("re-injected %s %s on fuse (%s)", label, h_low[:10], target_mount)
+                    if pause_public:
+                        await self._pause_fuse_entry_best_effort(h_low, label=label)
                     return True, detail2
                 return False, _NOT_VISIBLE_DETAIL
             return False, detail2
