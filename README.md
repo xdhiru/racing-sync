@@ -5,6 +5,41 @@ Two-VPS torrent synchroniser for racing workflows.
 - **VPS1** (source) — fast racing client (qBittorrent or Deluge) with autobrr.
 - **VPS2** (destination) — long-term seed client (qBittorrent) with SSD cap + rclone offload to remote storage.
 
+If you race torrents on a fast seedbox but don't want to pay for huge disks
+there, this is for you: keep racing on VPS1, let racing-sync copy what
+matters to VPS2, offload it to remote storage with rclone, and keep seeding
+from there long-term — automatically.
+
+## What problem does it solve?
+
+Racing needs speed; long-term seeding needs cheap space. One box rarely
+gives you both:
+
+- VPS1 is fast with a small disk — great for winning the race, terrible for
+  keeping 100s of torrents around.
+- VPS2 has a small local SSD plus effectively unlimited remote storage
+  (via an rclone mount) — great for seeding forever, terrible for racing.
+
+Manually copying `.torrent` files between clients, watching SSD free space,
+moving finished files, and re-adding everything to seed is tedious and
+error-prone. racing-sync runs that loop for you, 24/7, with crash recovery.
+
+## How it works — in plain English
+
+1. **Spot it:** a new torrent appears on VPS1.
+2. **Find the best copy:** prefer a public copy when one exists, otherwise
+   look the release up on your private indexers via Prowlarr, otherwise
+   export it directly from VPS1.
+3. **Stage it on SSD:** download it to the VPS2 SSD (movies in one go, big
+   season packs in small batches so a 40 GB SSD can handle a 100 GB season).
+4. **Offload it:** `rclone move` verified files to your remote
+   (`remote:qbittorrent/`, single episodes go to `.../unsorted/`).
+5. **Keep seeding:** re-add the torrent on VPS2 pointing at the fuse mount
+   with instant-check, so you seed long-term without using SSD space.
+
+Everything is tracked in a local SQLite database, so a restart, crash, or
+power cut just resumes where it left off.
+
 ## Quickstart
 
 Run straight from source — no install step, so `git pull` + restart is the
