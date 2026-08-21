@@ -45,12 +45,13 @@ def test_render_active_pagination_and_numbering():
     # 2. No ↳ symbol anywhere
     assert "↳" not in text0
 
-    # 3. Size in plain text, followed by dot and full hash in backticks
-    assert "  1.0 GB · `hash00abcdef1234567890abcdef1234567890`" in text0
+    # 3. Size in plain text, followed by dot and SHORT hash in backticks
+    # (full hash lives in the per-torrent detail card).
+    assert "  1.0 GB · `hash00abcd`" in text0
 
-    # 4. Next line shows state, batch, and tracker domain at the end without backticks
-    assert "  ⬇️ Downloading · 45.0% · Batch 0/2 · nyaa.tracker.wf" in text0
-    assert "  📋 Queued · Batch 0/2 · nyaa.tracker.wf" in text0
+    # 4. Next line shows state, batch (1-based), and tracker domain at the end without backticks
+    assert "  ⬇️ Downloading · 45.0% · Batch 1/2 · nyaa.tracker.wf" in text0
+    assert "  📋 Queued · Batch 1/2 · nyaa.tracker.wf" in text0
 
     # Page 1 (items 6..10)
     text1, p1, total1 = render_active(tasks, page=1, page_size=5)
