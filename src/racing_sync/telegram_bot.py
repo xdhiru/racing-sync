@@ -203,6 +203,24 @@ def _row_text_bits(ts: TorrentState) -> tuple[str, str, str]:
     return name, _bytes_human(ts.total_bytes), (ts.source_infohash or "").lower()
 
 
+def _batch_display(ts: TorrentState) -> str:
+    """1-based 'Batch i/n' label, or '' when not a multi-batch row.
+
+    `batch_index` is 0-based while work is in flight and clamps to
+    `batches_total` once the last batch is done — display
+    min(index+1, total) so the first batch reads 'Batch 1/3' and a
+    finished row reads 'Batch 3/3', never 'Batch 0/3' or 'Batch 4/3'.
+    """
+    try:
+        total = int(ts.batches_total or 0)
+        idx = int(ts.batch_index or 0)
+    except (TypeError, ValueError):
+        return ""
+    if total <= 1:
+        return ""
+    return f"Batch {min(max(idx + 1, 1), total)}/{total}"
+
+
 def _retry_minutes(ts: TorrentState) -> int | None:
     """Whole minutes until the re-add retry, or None when no timer is set."""
     _retry_s = _retry_in_future_seconds(ts.readd_next_retry_at)
@@ -221,9 +239,11 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     lines.append(f"{icon} `{name}`")
 
     # 2. Hash & size line: full hash copiable by click + size in plain text
+    # (detail card keeps the FULL hash; the Active Tasks list shows short).
     meta_parts = [f"`{full_hash}`", size]
-    if ts.batches_total > 1:
-        meta_parts.append(f"batch {ts.batch_index}/{ts.batches_total}")
+    _bd = _batch_display(ts)
+    if _bd:
+        meta_parts.append(_bd.lower())
     lines.append(" · ".join(meta_parts))
 
     # State-specific extras
@@ -248,6 +268,14 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
             lines.append("Downloading…")
     elif ts.state == State.MOVING:
         lines.append("rclone moving to remote…")
+        if (ts.last_error or "").strip():
+            from .logging_setup import sanitize_log_text as _san
+            _reason = (ts.last_error or "").replace("\n", " ").replace("\r", " ")
+            _reason = _san(_reason).strip()
+            if len(_reason) > 160:
+                _reason = _reason[:157] + "..."
+            if _reason:
+                lines.append(f"retrying: {_esc(_reason)}")
     elif ts.state == State.RE_ADDING:
         _mins = _retry_minutes(ts)
         if _mins is not None:
@@ -330,14 +358,17 @@ def render_active(
     for i, (ts, progress) in enumerate(page_items):
         item_num = start_idx + i + 1
         name, size, full_hash = _row_text_bits(ts)
+        short_hash = (full_hash or "")[:CANCEL_SHORT_LEN]
 
         # 1. Full name of the torrent, copiable by click (in backticks, no escape chars)
         lines.append(f"*{item_num}.* `{name}`")
 
-        # 2. Size below the name, separator dot with space, and full hash copiable by click
-        lines.append(f"  {size} · `{full_hash}`")
+        # 2. Size below the name, separator dot with space, and SHORT hash
+        # copiable by click (detail card keeps the full 40-char hash).
+        lines.append(f"  {size} · `{short_hash}`")
 
         # 3. Next line shows state, batch (if applicable), and tracker domain at the last
+        _bd = _batch_display(ts)
         if ts.state == State.DOWNLOADING:
             if progress is not None:
                 state_text = f"⬇️ Downloading · {progress * 100:.1f}%"
@@ -346,7 +377,12 @@ def render_active(
         elif ts.state == State.QUEUED:
             state_text = "📋 Queued"
         elif ts.state == State.MOVING:
-            state_text = "📦 Moving"
+            if _bd:
+                state_text = f"📦 Moving leftovers · {_bd}"
+            else:
+                state_text = "📦 Moving"
+            if (ts.last_error or "").strip():
+                state_text += " · retrying"
         elif ts.state == State.RE_ADDING:
             _mins = _retry_minutes(ts)
             if _mins is not None:
@@ -366,8 +402,8 @@ def render_active(
         else:
             state_text = f"🆕 {ts.state.value.capitalize()}"
 
-        if ts.batches_total > 1:
-            state_text += f" · Batch {ts.batch_index}/{ts.batches_total}"
+        if _bd and ts.state != State.MOVING:
+            state_text += f" · {_bd}"
 
         domain = _tracker_domain(ts.source_announce_url) or _tracker_domain(ts.source_tracker)
         if domain:
