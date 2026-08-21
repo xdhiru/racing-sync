@@ -3653,6 +3653,38 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         )
                         return
                 else:
+                    # Single-flow with nothing verified: either already remote
+                    # (safe to finish) or an incomplete download that advanced
+                    # prematurely on torrent-level progress. The latter must
+                    # NOT proceed to the folder wipe below — resume so the
+                    # remaining bytes can finish, same self-heal as singles.
+                    if not completed_files and (incomplete_files or uncertain_files):
+                        resumed = False
+                        try:
+                            await self.dest_client.resume(h)
+                            resumed = True
+                        except Exception as e:  # noqa: BLE001
+                            log.warning(
+                                "could not resume incomplete folder %s for %s: %s",
+                                local, ts.source_name, e,
+                            )
+                        log.warning(
+                            "folder %s for %s has no verified-complete files "
+                            "(%d incomplete, %d unverified); %s staying in "
+                            "MOVING without moving",
+                            local, ts.source_name,
+                            len(incomplete_files), len(uncertain_files),
+                            "resumed to finish downloading," if resumed else "resume failed,",
+                        )
+                        self._park_moving(
+                            ts,
+                            f"folder {ts.source_name} not verified complete "
+                            f"({len(incomplete_files)} incomplete, "
+                            f"{len(uncertain_files)} unverified); "
+                            f"{'resumed to finish, ' if resumed else ''}"
+                            f"staying in MOVING without moving",
+                        )
+                        return
                     log.info(
                         "folder %s for %s has no verified-complete files to move "
                         "(already remote or incomplete boundary data)",
@@ -3676,7 +3708,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 # verified-complete set above. Refuse to move
                 # client-unverified bytes: a partial file on the remote is
                 # worse than waiting. Park in MOVING for retry next tick
-                # (the torrent stays paused; nothing is wiped).
+                # (nothing is wiped).
+                #
+                # Self-heal: DOWNLOADING gates on torrent-level progress
+                # (>=0.999), so a 99.9% torrent can advance while its single
+                # file is still at 99.x% or short on disk. _do_moving pauses
+                # at the top, which would freeze those last pieces forever.
+                # Resume here so they can finish; next tick re-pauses and
+                # moves when verified.
                 verified_paths: set[Path] = set()
                 for f in completed_files:
                     joined = _safe_ssd_join(src_dir, f.name or "")
@@ -3691,15 +3730,46 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 except OSError:
                     local_real = None
                 if local_real is None or local_real not in verified_paths:
+                    detail = ""
+                    try:
+                        for f in cls_files:
+                            joined = _safe_ssd_join(src_dir, f.name or "")
+                            if joined is None:
+                                continue
+                            try:
+                                if joined.resolve() == local_real:
+                                    try:
+                                        on_disk = local.stat().st_size if local.is_file() else -1
+                                    except OSError:
+                                        on_disk = -1
+                                    detail = (
+                                        f" (file progress={(f.progress or 0.0) * 100:.1f}%, "
+                                        f"on-disk {max(on_disk, 0)}/{f.size_bytes or 0} B)"
+                                    )
+                                    break
+                            except OSError:
+                                continue
+                    except Exception:
+                        detail = ""
+                    resumed = False
+                    try:
+                        await self.dest_client.resume(h)
+                        resumed = True
+                    except Exception as e:  # noqa: BLE001
+                        log.warning(
+                            "could not resume incomplete single file %s for %s: %s",
+                            cls.single_file, ts.source_name, e,
+                        )
                     log.warning(
-                        "single file %s for %s is not client-verified complete "
-                        "(progress < 100%% or size mismatch); staying in MOVING "
-                        "without moving",
-                        cls.single_file, ts.source_name,
+                        "single file %s for %s is not client-verified complete%s; "
+                        "%s staying in MOVING without moving",
+                        cls.single_file, ts.source_name, detail,
+                        "resumed to finish downloading," if resumed else "resume failed,",
                     )
                     self._park_moving(
                         ts,
-                        f"single file {cls.single_file} not verified complete; "
+                        f"single file {cls.single_file} not verified complete{detail}; "
+                        f"{'resumed to finish, ' if resumed else ''}"
                         f"staying in MOVING without moving",
                     )
                     return
