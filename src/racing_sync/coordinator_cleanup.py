@@ -333,7 +333,16 @@ class CleanupMixin:
         else:
             return None
         sort_key = completed.timestamp() if completed else now_utc.timestamp()
-        size = float(ts.total_bytes or sum(m.size_bytes for m in group) or 0)
+        if ts.total_bytes:
+            size = float(ts.total_bytes)
+        else:
+            # Fresh adoptions carry no total: dedupe by save_path so
+            # cross-seeds sharing the same on-disk files don't multiply.
+            by_path: dict[str, int] = {}
+            for m in group:
+                key = m.save_path or ""
+                by_path[key] = max(by_path.get(key, 0), int(m.size_bytes or 0))
+            size = float(sum(by_path.values()) or 0)
         return (sort_key, size, ts, group)
 
     def _cleanup_idle_confirmed(
@@ -499,7 +508,10 @@ class CleanupMixin:
         ok = True
         for save_path, members in parts.items():
             hashes = [m.infohash for m in members]
-            total_mb = sum(m.size_bytes for m in members) // (1024 * 1024)
+            # Members sharing a save_path hold the same on-disk files
+            # (deleted exactly once via the first member), so the freed
+            # size is one copy, not the sum over cross-seeds.
+            total_mb = (max((m.size_bytes or 0) for m in members) if members else 0) // (1024 * 1024)
             if dry_run:
                 log.info(
                     "cleanup dry-run: would delete %d VPS1 torrent(s) for %s "
