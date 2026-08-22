@@ -641,6 +641,143 @@ async def test_cancel_torrent_releases_ssd_budget(tmp_path: Path):
         store.close()
 
 
+def test_render_active_shows_fetch_only_for_waiting_indexer():
+    from racing_sync.telegram_bot import render_active
+
+    waiting = TorrentState(source_infohash="a" * 40, source_name="Show",
+                           state=State.WAITING_INDEXER, total_bytes=1000,
+                           indexer_attempts=9)
+    downloading = TorrentState(source_infohash="b" * 40, source_name="Show2",
+                               state=State.DOWNLOADING, total_bytes=2000)
+    text, _, _ = render_active([(waiting, None), (downloading, 0.5)],
+                               page=0, page_size=5)
+    assert "`/fetch_aaaaaaaaaa`" in text
+    assert text.count("Fetch original:") == 1
+    assert "`/cancel_aaaaaaaaaa`" in text
+    assert "`/cancel_bbbbbbbbbb`" in text
+
+
+def test_render_detail_shows_fetch_hint_for_waiting_indexer():
+    from racing_sync.telegram_bot import render_detail
+
+    waiting = TorrentState(source_infohash="a" * 40, source_name="Show",
+                           state=State.WAITING_INDEXER, total_bytes=1000,
+                           indexer_attempts=9)
+    detail = render_detail(waiting)
+    # Full hash untouched in the detail card; fetch hint added.
+    assert "`" + "a" * 40 + "`" in detail
+    assert "`/fetch_aaaaaaaaaa`" in detail
+
+    downloading = TorrentState(source_infohash="b" * 40, source_name="Show2",
+                               state=State.DOWNLOADING, total_bytes=2000)
+    assert "/fetch_" not in render_detail(downloading)
+
+
+def test_resolve_fetch_target_requires_waiting(tmp_path: Path):
+    bot = _bot()
+    store = StateStore(tmp_path / "state.db")
+    bot._store = store
+    try:
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="Waiting.One",
+                                  state=State.WAITING_INDEXER))
+        store.upsert(TorrentState(source_infohash="b" * 40, source_name="Busy.One",
+                                  state=State.DOWNLOADING))
+        assert bot._resolve_fetch_target("a" * 10).source_name == "Waiting.One"
+        assert bot._resolve_fetch_target("a" * 40).source_name == "Waiting.One"
+        # Full hash of a non-waiting row explains itself.
+        with pytest.raises(LookupError, match="not waiting"):
+            bot._resolve_fetch_target("b" * 40)
+        # Unknown prefix raises.
+        with pytest.raises(LookupError, match="no tracked torrent"):
+            bot._resolve_fetch_target("d" * 10)
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_chat_message_fetch_flags_and_wakes_row(tmp_path: Path):
+    """Sending `/fetch_<short>` sets force_direct and wakes to QUERYING."""
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show",
+                              state=State.WAITING_INDEXER, indexer_attempts=9))
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/fetch_aaaaaaaaaa"))
+        row = store.get("a" * 40)
+        assert row.force_direct == 1
+        assert row.state == State.QUERYING
+        bot._bot.send_message.assert_awaited_once()
+        sent_text = bot._bot.send_message.call_args[0][1]
+        assert sent_text.startswith("Fetching VPS1 original")
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_chat_message_fetch_opens_fresh_direct_window(tmp_path: Path):
+    """Manual fetch restarts the retry clock, not just the flag."""
+    import datetime as dt
+
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(
+        source_infohash="e" * 40, source_name="Old",
+        state=State.WAITING_INDEXER, indexer_attempts=40,
+        indexer_first_queried_at=dt.datetime.now(dt.timezone.utc)
+        - dt.timedelta(hours=23),
+    ))
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/fetch_eeeeeeeeee"))
+        row = store.get("e" * 40)
+        assert row.force_direct == 1
+        assert row.state == State.QUERYING
+        assert row.indexer_attempts == 0
+        fresh = (dt.datetime.now(dt.timezone.utc)
+                 - row.indexer_first_queried_at).total_seconds()
+        assert fresh < 60
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_chat_message_fetch_rejects_non_waiting(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Busy",
+                              state=State.DOWNLOADING))
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/fetch_bbbbbbbbbb"))
+        row = store.get("b" * 40)
+        assert row.force_direct == 0
+        assert row.state == State.DOWNLOADING
+        bot._bot.send_message.assert_awaited_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_fetch_torrent_marks_stale_row(tmp_path: Path):
+    """Direct executor call on a row that already moved on explains itself."""
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="c" * 40, source_name="Moved",
+                              state=State.QUEUED))
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        msg = await bot._fetch_torrent("c" * 40)
+        assert "nothing to fetch" in msg
+        assert store.get("c" * 40).force_direct == 0
+    finally:
+        store.close()
+
+
 def test_full_reset_refuses_symlink_ssd(tmp_path: Path, monkeypatch):
     from racing_sync.__main__ import _do_full_reset
 

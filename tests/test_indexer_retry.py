@@ -397,3 +397,310 @@ async def test_public_export_failure_parks_as_source_export_miss(caplog):
     assert ts.state == State.WAITING_INDEXER
     assert any("source export miss #1" in r.message for r in caplog.records)
     assert not any("indexer miss" in r.message for r in caplog.records)
+
+
+# ---- racing-torrent fallback (force_direct) ----
+
+def _pick_coord(**cross_seed_over):
+    from unittest.mock import AsyncMock, MagicMock
+
+    cfg = MagicMock()
+    coord = make_coordinator()
+    coord.source_client = AsyncMock()
+    coord.sftp = None
+    coord.prowlarr = MagicMock()
+    cfg.cross_seed.allow_ssh_export = True
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+    cfg.cross_seed.refetch_public_via_prowlarr = False
+    cfg.cross_seed.prowlarr_retry_interval_seconds = 1800
+    cfg.cross_seed.prowlarr_max_age_seconds = 86400
+    cfg.cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout = False
+    cfg.dest.save_path = "/ssd"
+    for k, v in cross_seed_over.items():
+        setattr(cfg.cross_seed, k, v)
+    coord.cfg = cfg
+    coord._ssd_estimate_for_new = MagicMock(return_value=100)
+    coord._ssd_try_reserve = AsyncMock(return_value=True)
+    coord._park_for_indexer_retry = MagicMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, **k: setattr(t, "state", s))
+    return coord
+
+
+def _priv_st():
+    from racing_sync.clients.abstract import Torrent
+
+    return Torrent(
+        hash="d" * 40, name="Private.Show.S01E01.mkv", category="",
+        save_path="", size_bytes=1000, state="seeding", progress=1.0,
+        trackers=["https://alpha.cc/announce/xyz"],
+    )
+
+
+def _decision():
+    from racing_sync.coordinator_content import SourceDecision
+
+    return SourceDecision(
+        torrent_bytes=b"blob", source_label="private-export-fallback",
+        name="Private.Show.S01E01.mkv", size_bytes=1000,
+        infohash="d" * 40, announce_url="https://alpha.cc/announce/xyz",
+    )
+
+
+def _past_max_age(cfg):
+    return dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+        seconds=cfg.cross_seed.prowlarr_max_age_seconds + 10)
+
+
+@pytest.mark.anyio
+async def test_pick_and_admit_force_direct_bypasses_prowlarr():
+    from unittest.mock import AsyncMock, patch
+
+    coord = _pick_coord()
+    ts = TorrentState(source_infohash="d" * 40, state=State.QUERYING, force_direct=1)
+    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
+               new_callable=AsyncMock) as pick:
+        pick.return_value = _decision()
+        await coord._pick_and_admit(ts, _priv_st(), [])
+    pick.assert_awaited_once()
+    assert pick.call_args.kwargs["attempt_prowlarr"] is False
+    coord.transition.assert_called_once()
+    assert coord.transition.call_args[0][1] == State.QUEUED
+    coord._park_for_indexer_retry.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_pick_and_admit_first_miss_parks_despite_fallback_flag():
+    """The fallback fires only after the retry window is exhausted."""
+    from unittest.mock import AsyncMock, patch
+
+    coord = _pick_coord(fallback_to_racing_torrent_on_prowlarr_timeout=True)
+    ts = TorrentState(source_infohash="d" * 40, state=State.QUERYING)
+    assert ts.indexer_first_queried_at is None
+    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
+               new_callable=AsyncMock) as pick:
+        pick.return_value = None
+        await coord._pick_and_admit(ts, _priv_st(), [])
+    pick.assert_awaited_once()
+    assert pick.call_args.kwargs["attempt_prowlarr"] is True
+    coord._park_for_indexer_retry.assert_called_once()
+    assert ts.force_direct == 0
+
+
+@pytest.mark.anyio
+async def test_pick_and_admit_timeout_falls_back_to_racing():
+    from unittest.mock import AsyncMock, patch
+
+    coord = _pick_coord(fallback_to_racing_torrent_on_prowlarr_timeout=True)
+    ts = TorrentState(
+        source_infohash="d" * 40, state=State.QUERYING,
+        indexer_first_queried_at=_past_max_age(coord.cfg),
+        indexer_attempts=40,
+    )
+    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
+               new_callable=AsyncMock) as pick:
+        pick.side_effect = [None, _decision()]
+        await coord._pick_and_admit(ts, _priv_st(), [])
+    assert pick.await_count == 2
+    assert pick.call_args_list[0].kwargs["attempt_prowlarr"] is True
+    assert pick.call_args_list[1].kwargs["attempt_prowlarr"] is False
+    assert ts.force_direct == 1
+    coord.transition.assert_called_once()
+    assert coord.transition.call_args[0][1] == State.QUEUED
+    coord._park_for_indexer_retry.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_pick_and_admit_timeout_without_flag_parks():
+    from unittest.mock import AsyncMock, patch
+
+    coord = _pick_coord()
+    ts = TorrentState(
+        source_infohash="d" * 40, state=State.QUERYING,
+        indexer_first_queried_at=_past_max_age(coord.cfg),
+        indexer_attempts=40,
+    )
+    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
+               new_callable=AsyncMock) as pick:
+        pick.return_value = None
+        await coord._pick_and_admit(ts, _priv_st(), [])
+    pick.assert_awaited_once()
+    coord._park_for_indexer_retry.assert_called_once()
+    assert ts.force_direct == 0
+
+
+@pytest.mark.anyio
+async def test_pick_and_admit_timeout_skips_public_groups():
+    """Public misses never queried Prowlarr — no racing fallback applies."""
+    from unittest.mock import AsyncMock, patch
+    from racing_sync.clients.abstract import Torrent
+
+    coord = _pick_coord(fallback_to_racing_torrent_on_prowlarr_timeout=True)
+    pub = Torrent(
+        hash="e" * 40, name="Public.Show.mkv", category="",
+        save_path="", size_bytes=500, state="seeding", progress=1.0,
+        trackers=["http://tracker.opentrackr.org/announce"],
+    )
+    ts = TorrentState(
+        source_infohash="e" * 40, state=State.QUERYING,
+        indexer_first_queried_at=_past_max_age(coord.cfg),
+    )
+    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
+               new_callable=AsyncMock) as pick:
+        pick.return_value = None
+        await coord._pick_and_admit(ts, pub, [])
+    pick.assert_awaited_once()
+    assert coord._park_for_indexer_retry.call_args.kwargs["reason"] == "source export miss"
+    assert ts.force_direct == 0
+
+
+@pytest.mark.anyio
+async def test_private_fallback_retries_sftp_timeout_once():
+    """A single stalled SFTP read costs one retry, not the whole fallback."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.coordinator import pick_ssd_source_for_racing
+
+    cfg = MagicMock()
+    cfg.prowlarr.should_skip_title.return_value = False
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+    cfg.cross_seed.allow_ssh_export = True
+    sftp = MagicMock()
+    sftp.fetch_torrent = MagicMock(side_effect=[TimeoutError(), b"direct-blob"])
+    t_priv = Torrent(
+        hash="f" * 40, name="Priv.Retry", category="",
+        save_path="", size_bytes=500, state="seeding", progress=1.0,
+        trackers=["https://alpha.cc/announce"],
+    )
+    dec = await pick_ssd_source_for_racing(
+        cfg=cfg, source_torrent=t_priv, other_source_torrents=[],
+        prowlarr=None, sftp=sftp, source_client=AsyncMock(),
+        attempt_prowlarr=False,
+    )
+    assert dec is not None
+    assert dec.source_label == "private-sftp-fallback"
+    assert sftp.fetch_torrent.call_count == 2
+
+
+@pytest.mark.anyio
+async def test_private_fallback_double_timeout_falls_to_export():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.coordinator import pick_ssd_source_for_racing
+
+    cfg = MagicMock()
+    cfg.prowlarr.should_skip_title.return_value = False
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+    cfg.cross_seed.allow_ssh_export = True
+    sftp = MagicMock()
+    sftp.fetch_torrent = MagicMock(side_effect=TimeoutError("wedged"))
+    source_client = AsyncMock()
+    source_client.export_torrent = AsyncMock(return_value=b"export-blob")
+    t_priv = Torrent(
+        hash="f" * 40, name="Priv.Retry", category="",
+        save_path="", size_bytes=500, state="seeding", progress=1.0,
+        trackers=["https://alpha.cc/announce"],
+    )
+    dec = await pick_ssd_source_for_racing(
+        cfg=cfg, source_torrent=t_priv, other_source_torrents=[],
+        prowlarr=None, sftp=sftp, source_client=source_client,
+        attempt_prowlarr=False,
+    )
+    assert dec is not None
+    assert dec.source_label == "private-export-fallback"
+    assert sftp.fetch_torrent.call_count == 2
+    source_client.export_torrent.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_fallback_trip_opens_fresh_direct_window():
+    """After the trip, one failed direct fetch parks — it must not FAIL."""
+    from unittest.mock import AsyncMock, patch
+
+    coord = _pick_coord(fallback_to_racing_torrent_on_prowlarr_timeout=True)
+    # Real park (not mocked) so the max-age give-up logic actually runs.
+    del coord._park_for_indexer_retry
+    ts = TorrentState(
+        source_infohash="d" * 40, state=State.QUERYING,
+        indexer_first_queried_at=_past_max_age(coord.cfg),
+        indexer_attempts=40,
+    )
+    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
+               new_callable=AsyncMock) as pick:
+        pick.return_value = None  # prowlarr miss AND direct fetch miss
+        await coord._pick_and_admit(ts, _priv_st(), [])
+    # Fallback tripped (flag set, clock restarted) and the row parked for
+    # another direct attempt instead of failing at the old deadline.
+    assert ts.force_direct == 1
+    assert ts.state == State.WAITING_INDEXER
+    assert ts.indexer_next_retry_at is not None
+    assert ts.indexer_next_retry_at > dt.datetime.now(dt.timezone.utc)
+    fresh_elapsed = (dt.datetime.now(dt.timezone.utc)
+                     - ts.indexer_first_queried_at).total_seconds()
+    assert fresh_elapsed < 60
+
+
+def test_prowlarr_timed_out_helper():
+    coord = _pick_coord()
+    ts = TorrentState(source_infohash="d" * 40)
+    assert coord._prowlarr_timed_out(ts) is False  # no first attempt yet
+    ts.indexer_first_queried_at = dt.datetime.now(dt.timezone.utc)
+    assert coord._prowlarr_timed_out(ts) is False  # flag off anyway
+    coord.cfg.cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout = True
+    assert coord._prowlarr_timed_out(ts) is False  # window fresh
+    ts.indexer_first_queried_at = _past_max_age(coord.cfg)
+    assert coord._prowlarr_timed_out(ts) is True
+
+
+@pytest.mark.anyio
+async def test_reset_empty_db_rediscovers_waiting_row_from_zero(tmp_path: Path):
+    """Simulates --reset: empty DB + torrent still on VPS1 → fresh NEW row.
+
+    A WAITING_INDEXER row holds no VPS2 footprint, so after state.db is
+    wiped the next tick's discovery recreates it with no flag and no
+    timers — prowlarr retries start over instead of failing or stalling.
+    """
+    import time
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    coord = make_coordinator()
+    coord.cfg.max_active_downloads = 3
+    coord.cfg.max_concurrent_moves = 3
+    coord.cfg.source.category = ""
+    coord.cfg.source.min_age_seconds = 0
+    coord.store = store
+    coord.watch = None
+    coord._spawn_worker = MagicMock()
+    coord._sweep_manual_fuse_adoptions = AsyncMock()
+    coord._last_source_log_ts = time.monotonic()
+    t = Torrent(
+        hash="f" * 40, name="Reset.Show.S01E01", category="",
+        save_path="", size_bytes=1000, state="seeding", progress=1.0,
+        trackers=["https://alpha.cc/announce/xyz"],
+    )
+    coord._list_source_torrents = AsyncMock(return_value=[t])
+    try:
+        await coord._tick_inner()
+    finally:
+        pass
+    row = store.get("f" * 40)
+    assert row is not None
+    assert row.state == State.NEW
+    assert row.force_direct == 0
+    assert row.indexer_attempts == 0
+    assert row.indexer_first_queried_at is None
+    assert coord._spawn_worker.called
+    store.close()
+
+
+def test_fallback_config_validation():
+    from racing_sync.config import CrossSeedConfig
+
+    assert CrossSeedConfig().fallback_to_racing_torrent_on_prowlarr_timeout is False
+    CrossSeedConfig(fallback_to_racing_torrent_on_prowlarr_timeout=True,
+                    allow_ssh_export=True)
+    with pytest.raises(ValueError, match="allow_ssh_export"):
+        CrossSeedConfig(fallback_to_racing_torrent_on_prowlarr_timeout=True,
+                        allow_ssh_export=False)

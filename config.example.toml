@@ -423,9 +423,19 @@ pause_public_torrents_on_fuse = true
 # cross-seed for a brand-new release, re-query every
 # prowlarr_retry_interval_seconds. After prowlarr_max_age_seconds
 # (counted from the FIRST attempt), give up and mark the torrent FAILED
-# for manual handling.
+# for manual handling — unless fallback_to_racing_torrent_on_prowlarr_timeout
+# below is true.
 prowlarr_retry_interval_seconds = 1800   # 30 minutes
 prowlarr_max_age_seconds        = 86400  # 24 hours
+# When true, a private torrent with no Prowlarr hit after prowlarr_max_age_seconds
+# uses the racing client's own .torrent for the SSD download instead of FAILED.
+# The fallback opens a fresh retry window for the direct attempts (a single
+# SFTP blip at the deadline must not fail the row), then FAILEDs if VPS1 stays
+# unreachable. VPS2 then leeches the private swarm, which counts toward ratio —
+# opt in deliberately. Default false. Requires allow_ssh_export = true.
+# Independent of this flag, Telegram /fetch_<hash> triggers the same fallback
+# on demand for a torrent still waiting for the download indexer.
+fallback_to_racing_torrent_on_prowlarr_timeout = false
 
 # ============================================================
 # Recovery / reconciliation

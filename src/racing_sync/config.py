@@ -707,6 +707,14 @@ class CrossSeedConfig(BaseModel):
     allow_prowlarr_cross_seed: bool = True
     allow_ssh_export: bool = True
     pause_public_torrents_on_fuse: bool = True
+    # When true, a private torrent that still has no Prowlarr cross-seed
+    # after prowlarr_max_age_seconds falls back to the racing client's own
+    # .torrent (SFTP / export endpoint) for the SSD download instead of
+    # FAILED. VPS2 then leeches the private swarm, which counts toward
+    # ratio — opt in deliberately. Default false (fail for manual handling).
+    # A Telegram /fetch_<hash> command triggers the same fallback on
+    # demand for a WAITING_INDEXER row without needing this flag.
+    fallback_to_racing_torrent_on_prowlarr_timeout: bool = False
 
     @model_validator(mode="after")
     def _check_strategy(self) -> "CrossSeedConfig":
@@ -716,6 +724,12 @@ class CrossSeedConfig(BaseModel):
                 "leaves no SSD-source strategy for private torrents "
                 "(every torrent would park in WAITING_INDEXER until FAILED). "
                 "Enable at least one unless this is a public-only deployment."
+            )
+        if self.fallback_to_racing_torrent_on_prowlarr_timeout and not self.allow_ssh_export:
+            raise ValueError(
+                "cross_seed: fallback_to_racing_torrent_on_prowlarr_timeout=true "
+                "requires allow_ssh_export=true (the fallback fetches the "
+                "racing torrent's own bytes via SFTP / export endpoint)."
             )
         return self
 

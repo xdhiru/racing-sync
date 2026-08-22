@@ -135,6 +135,10 @@ class TorrentState:
     readd_attempts: int = 0
     # Failure retry tracking
     failed_retries: int = 0
+    # Operator/auto fallback to the racing client's own .torrent for the
+    # SSD download (Telegram /fetch_ or prowlarr-timeout fallback). Sticky:
+    # once set, every SSD-source pick bypasses Prowlarr for this row.
+    force_direct: int = 0
     # VPS1 cleanup bookkeeping (see [cleanup]):
     # - completed_at: last time the row entered DONE (grace anchor).
     # - vps1_last_activity_at: last time the VPS1 swarm showed upload
@@ -181,6 +185,7 @@ class TorrentState:
                 self.indexer_next_retry_at.isoformat()
                 if self.indexer_next_retry_at else "",
             "indexer_attempts": self.indexer_attempts,
+            "force_direct": int(self.force_direct or 0),
             "readd_first_attempted_at": (
                 self.readd_first_attempted_at.isoformat()
                 if self.readd_first_attempted_at else ""
@@ -226,6 +231,7 @@ CREATE TABLE IF NOT EXISTS torrent_state (
     indexer_first_queried_at TEXT NOT NULL DEFAULT '',
     indexer_next_retry_at    TEXT NOT NULL DEFAULT '',
     indexer_attempts         INTEGER NOT NULL DEFAULT 0,
+    force_direct             INTEGER NOT NULL DEFAULT 0,
     readd_first_attempted_at  TEXT NOT NULL DEFAULT '',
     readd_next_retry_at       TEXT NOT NULL DEFAULT '',
     readd_attempts            INTEGER NOT NULL DEFAULT 0,
@@ -277,7 +283,7 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = (
     "source_infohash, dest_infohash, source_name, source_tracker, source_announce_url, "
     "classification_kind, total_bytes, save_path, cross_seed_infohash, cross_seed_source, "
     "'' AS cross_seed_blob, injected_private_hashes, indexer_first_queried_at, "
-    "indexer_next_retry_at, indexer_attempts, readd_first_attempted_at, "
+    "indexer_next_retry_at, indexer_attempts, force_direct, readd_first_attempted_at, "
     "readd_next_retry_at, readd_attempts, failed_retries, completed_at, "
     "vps1_last_activity_at, state, batch_index, batches_total, batch_cap_bytes, readd_cycles, "
     "last_error, created_at, updated_at, telegram_message_id"
@@ -318,6 +324,15 @@ class StateStore:
             pass
         self._conn.executescript(SCHEMA_TABLES)
         self._conn.executescript(SCHEMA_INDEXES)
+        # Column added after 1.0.0: existing DBs predate it. CREATE TABLE
+        # IF NOT EXISTS never backfills, so migrate idempotently here.
+        try:
+            self._conn.execute(
+                "ALTER TABLE torrent_state "
+                "ADD COLUMN force_direct INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -826,6 +841,7 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         indexer_first_queried_at=_safe_dt(idx_first),
         indexer_next_retry_at=_safe_dt(idx_next),
         indexer_attempts=_safe_int(idx_attempts),
+        force_direct=_safe_int(row["force_direct"]) if "force_direct" in keys else 0,
         readd_first_attempted_at=_safe_dt(ra_first),
         readd_next_retry_at=_safe_dt(ra_next),
         readd_attempts=_safe_int(ra_attempts),

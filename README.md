@@ -121,6 +121,14 @@ forgets + ignores it immediately (row, dest entries, SSD data, blob
 cache) — no confirmation, the sent message is final. Unknown or
 ambiguous prefixes get a reply telling you what to send instead.
 
+Rows still waiting for the download indexer (`WAITING_INDEXER`) also show
+`Fetch original: /fetch_<hash>`: the bot flags the torrent to use the
+VPS1 original for the SSD download right away instead of waiting out the
+Prowlarr retry window (VPS2 then leeches the private swarm, which counts
+toward ratio). The same fallback can happen automatically at the retry
+deadline via `cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout`
+(default false).
+
 Validate a config (schema + environment: paths, rclone binary) without
 starting anything:
 

@@ -60,6 +60,56 @@ def test_indexer_park_and_retry():
     check_transition(State.WAITING_INDEXER, State.FAILED)
 
 
+def test_force_direct_defaults_zero_and_roundtrips(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    try:
+        assert TorrentState(source_infohash="a" * 40).force_direct == 0
+        ts = TorrentState(source_infohash="b" * 40, state=State.WAITING_INDEXER,
+                          force_direct=1)
+        store.upsert(ts)
+        assert store.get("b" * 40).force_direct == 1
+        # list/get paths without blob carry it too.
+        assert store.list_by_state(State.WAITING_INDEXER)[0].force_direct == 1
+    finally:
+        store.close()
+
+
+def test_force_direct_migrates_1_0_database(tmp_path: Path):
+    """A 1.0.0 DB (full schema minus force_direct) gains it on open."""
+    import sqlite3
+
+    from racing_sync.state import SCHEMA_TABLES
+
+    old_schema = "\n".join(
+        ln for ln in SCHEMA_TABLES.splitlines()
+        if "force_direct" not in ln
+    )
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO torrent_state (source_infohash, state, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?)",
+        ("c" * 40, "waiting_indexer", "2026-01-01T00:00:00+00:00",
+         "2026-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = StateStore(db)
+    try:
+        cols = [r[1] for r in store._conn.execute(
+            "PRAGMA table_info(torrent_state)").fetchall()]
+        assert "force_direct" in cols
+        assert store.get("c" * 40).force_direct == 0
+        row = store.get("c" * 40)
+        row.force_direct = 1
+        store.upsert(row)
+        assert store.get("c" * 40).force_direct == 1
+    finally:
+        store.close()
+
+
 def test_indexer_no_self_transition():
     # Re-parking bumps fields but should not go through transition().
     # The state machine still treats WAITING_INDEXER -> WAITING_INDEXER
