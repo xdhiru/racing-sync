@@ -88,12 +88,22 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
      Prefer public. Try:
        - `cross_seed.refetch_public_via_prowlarr` → prowlarr → download-target indexers (priority order)
        - SFTP fallback (Deluge) or qB `export_torrent` (qB)
-   - Only private? Map each racing torrent's announce URL to a prowlarr indexer
-     via `[prowlarr.tracker_map]` (Beta, Alpha, Gamma, …). Search.
-     No tracker_map hit → query the `[[prowlarr.download_indexers]]`
-     download-target indexers in priority order; first exact release wins.
-     Park in `WAITING_INDEXER` + retry per `prowlarr_retry_*` if no hit yet.
-   - No luck anywhere → SFTP-export the racing torrent.
+    - Only private? Map each racing torrent's announce URL to a prowlarr indexer
+      via `[prowlarr.tracker_map]` (Beta, Alpha, Gamma, …). Search.
+      No tracker_map hit → query the `[[prowlarr.download_indexers]]`
+      download-target indexers in priority order; first exact release wins.
+      Park in `WAITING_INDEXER` + retry per `prowlarr_retry_*` if no hit yet.
+      Past `prowlarr_max_age_seconds` the row fails — unless
+      `cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout` is set,
+      in which case it uses the racing torrent's own bytes instead (with a
+      fresh retry window for the direct attempts, then FAILED if VPS1 stays
+      unreachable), or the operator sends Telegram `/fetch_<hash>` while it
+      is still waiting (sticky per-row `force_direct` bypasses Prowlarr on
+      every later pick, also with a fresh window). Transient SFTP drops
+      park for the next interval; only a persistently unreachable VPS1 fails
+      the row. `--reset` wipes the flag with the DB — the torrent is
+      re-discovered from VPS1 and retries from zero.
+    - No luck anywhere → SFTP-export the racing torrent.
 
 3. **Add to VPS2**:
     - `save_path = dest.save_path` (local SSD)
@@ -243,11 +253,16 @@ advances) plus one active-tasks list message, refreshed every
 `status_update_interval` seconds with pagination buttons. Each active
 task renders a `Cancel: /cancel_<short-hash>` line (10-char prefix in
 backticks so mobile offers tap-to-copy; full hashes accepted too).
-The updates poller also watches chat messages: a `/cancel_<...>` line
-from the configured chat/user resolves the prefix against tracked rows
-and runs forget+ignore immediately (row, dest entries, SSD data, blob
-cache) with no confirmation, then replies with the outcome and frees
-the SSD reservation. Unknown/ambiguous prefixes get an explanatory
+`WAITING_INDEXER` rows additionally render
+`Fetch original: /fetch_<short-hash>`. The updates poller also watches
+chat messages: a `/cancel_<...>` line from the configured chat/user
+resolves the prefix against tracked rows and runs forget+ignore
+immediately (row, dest entries, SSD data, blob cache) with no
+confirmation, then replies with the outcome and frees the SSD
+reservation. A `/fetch_<...>` line flags a waiting row (`force_direct`)
+and wakes it (WAITING_INDEXER → QUERYING) so the racing torrent's own
+bytes feed the SSD download at once; non-waiting targets get an
+explanatory reply. Unknown/ambiguous prefixes get an explanatory
 reply. Callback debounce stays pagination-only. Cancelled releases live
 in `ignored_torrents` (in state.db, so `--reset` clears them) and are
 skipped at discovery, recovery adoption, re-injection and late-seed

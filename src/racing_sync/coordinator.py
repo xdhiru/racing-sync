@@ -1198,13 +1198,18 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         ]
 
     async def _pick_and_admit(self, ts: TorrentState, st, others: list,
-                              *, park_reason: str | None = None) -> None:
+                              *, park_reason: str | None = None,
+                              attempt_prowlarr: bool = True) -> None:
         """Pick the SSD source, then park (miss) or admit (WAITING_DISK/QUEUED).
 
         `park_reason=None` derives source-export-miss vs indexer-miss from
         whether the group is public (a public group never queries the
         download-target indexers, so "indexer miss" would mislead).
+        A sticky per-row `force_direct` (Telegram /fetch_ or a previous
+        prowlarr-timeout fallback) bypasses Prowlarr for every pick.
         """
+        if getattr(ts, "force_direct", 0):
+            attempt_prowlarr = False
         decision = await pick_ssd_source_for_racing(
             cfg=self.cfg,
             source_torrent=st,
@@ -1212,7 +1217,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             prowlarr=self.prowlarr,
             sftp=self.sftp,
             source_client=self.source_client,
-            attempt_prowlarr=True,
+            attempt_prowlarr=attempt_prowlarr,
         )
         if decision is None:
             # No SSD source right now → park and retry.
@@ -1222,8 +1227,40 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     if any(_looks_public(t.trackers) for t in [st, *others])
                     else "indexer miss"
                 )
-            self._park_for_indexer_retry(ts, reason=park_reason)
-            return
+            if (park_reason == "indexer miss" and not getattr(ts, "force_direct", 0)
+                    and self._prowlarr_timed_out(ts)):
+                # Automatic fallback (opt-in): the download-target indexers
+                # never produced this release within prowlarr_max_age_seconds.
+                # Use the racing client's own bytes instead of FAILED — VPS2
+                # then leeches the private swarm (counts toward ratio).
+                log.info(
+                    "prowlarr timeout for %s with no cross-seed; falling back "
+                    "to VPS1 original for SSD download",
+                    ts.source_name[:60],
+                )
+                try:
+                    # Fresh retry window for the direct phase: the prowlarr
+                    # clock is spent, so a single SFTP blip at the deadline
+                    # must not fail the row outright. Direct attempts run
+                    # the normal interval until one full window passes.
+                    ts.force_direct = 1
+                    ts.indexer_first_queried_at = dt.datetime.now(dt.timezone.utc)
+                    ts.indexer_attempts = 0
+                    self.store.upsert(ts)
+                except Exception:
+                    pass
+                decision = await pick_ssd_source_for_racing(
+                    cfg=self.cfg,
+                    source_torrent=st,
+                    other_source_torrents=others,
+                    prowlarr=self.prowlarr,
+                    sftp=self.sftp,
+                    source_client=self.source_client,
+                    attempt_prowlarr=False,
+                )
+            if decision is None:
+                self._park_for_indexer_retry(ts, reason=park_reason)
+                return
 
         ts.cross_seed_infohash = decision.infohash.lower()
         ts.cross_seed_source = decision.source_label
@@ -1815,6 +1852,27 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             except Exception:
                 await self._ssd_release(ts.source_infohash)
                 raise
+
+    def _prowlarr_timed_out(self, ts: TorrentState) -> bool:
+        """True when the opt-in racing-torrent fallback may fire.
+
+        Requires the config flag plus an exhausted prowlarr retry window
+        (first attempt older than prowlarr_max_age_seconds). Fail-closed:
+        any doubt returns False and the row keeps retrying / fails as before.
+        """
+        try:
+            if not getattr(getattr(self, "cfg", None), "cross_seed", None):
+                return False
+            if not self.cfg.cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout:
+                return False
+            first = ts.indexer_first_queried_at
+            if first is None:
+                return False
+            max_age = dt.timedelta(
+                seconds=self.cfg.cross_seed.prowlarr_max_age_seconds)
+            return (dt.datetime.now(dt.timezone.utc) - first) >= max_age
+        except Exception:
+            return False
 
     def _park_for_indexer_retry(self, ts: TorrentState, *, reason: str = "indexer miss") -> None:
         """Park into WAITING_INDEXER with an escalating retry timer.

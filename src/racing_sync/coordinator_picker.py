@@ -220,7 +220,7 @@ async def pick_ssd_source_for_racing(
             "using the racing torrent's own bytes",
             source_torrent.name,
         )
-    elif can_query_prowlarr:
+    elif can_query_prowlarr and attempt_prowlarr:
         log.info(
             "private release; querying Prowlarr download-target indexer(s) %s for cross-seed of %s",
             cfg.prowlarr.download_indexer_names,
@@ -277,16 +277,22 @@ async def pick_ssd_source_for_racing(
                 "Prowlarr bypass/fallback: SFTP-exporting private torrent %s from VPS1",
                 source_torrent.infohash[:10],
             )
-            try:
-                blob = await asyncio.wait_for(
-                    asyncio.to_thread(sftp.fetch_torrent, source_torrent.infohash),
-                    timeout=15.0,
-                )
-            except TimeoutError:
-                log.warning("sftp fallback fetch %s timed out after 15s",
-                            source_torrent.infohash[:10])
-            except Exception as e:  # noqa: BLE001
-                log.warning("sftp fallback fetch %s failed: %s", source_torrent.infohash[:10], e)
+            # One retry on timeout (same rationale as the public branch:
+            # shared transports stall single calls past the budget; a
+            # clean miss returns None and is not retried).
+            for attempt in (1, 2):
+                try:
+                    blob = await asyncio.wait_for(
+                        asyncio.to_thread(sftp.fetch_torrent, source_torrent.infohash),
+                        timeout=15.0,
+                    )
+                    break
+                except TimeoutError:
+                    log.warning("sftp fallback fetch %s timed out after 15s (attempt %d/2)",
+                                source_torrent.infohash[:10], attempt)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("sftp fallback fetch %s failed: %s", source_torrent.infohash[:10], e)
+                    break
             if blob:
                 label = "private-sftp-fallback"
         if blob is None:

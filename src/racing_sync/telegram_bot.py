@@ -253,6 +253,8 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
         lines.append(
             f"Indexer miss #{ts.indexer_attempts}; next retry at {when}"
         )
+    if ts.state == State.WAITING_INDEXER:
+        lines.append(f"Fetch VPS1 original now: `{_fetch_command(full_hash)}`")
     elif ts.state == State.WAITING_DISK:
         lines.append("Waiting for SSD cap to free up")
     elif ts.state == State.QUEUED:
@@ -318,10 +320,19 @@ CANCEL_SHORT_LEN = 10
 #: `/cancel_<hex>` (optional `@bot` suffix, extra trailing text ignored).
 CANCEL_CMD_RE = re.compile(r"^/cancel_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
+#: `/fetch_<hex>` — same shape: use the VPS1 original for the SSD
+#: download of a WAITING_INDEXER row instead of waiting for Prowlarr.
+FETCH_CMD_RE = re.compile(r"^/fetch_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
 
 def _cancel_command(infohash: str) -> str:
     """Copy-pasteable cancel command for one task (short hash)."""
     return f"/cancel_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+def _fetch_command(infohash: str) -> str:
+    """Copy-pasteable fetch-original command for one task (short hash)."""
+    return f"/fetch_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 def render_active(
@@ -415,6 +426,8 @@ def render_active(
         # underscore in `/cancel_...` can't break Markdown parsing and
         # mobile clients offer tap-to-copy.
         lines.append(f"  Cancel: `{_cancel_command(full_hash)}`")
+        if ts.state == State.WAITING_INDEXER:
+            lines.append(f"  Fetch original: `{_fetch_command(full_hash)}`")
         lines.append("")
 
     rendered = _safe_truncate_markdown("\n".join(lines).strip())
@@ -869,7 +882,7 @@ class TelegramBot:
 
     # ---- task cancellation via `/cancel_` chat commands ----
 
-    def _resolve_cancel_target(self, short: str):
+    def _resolve_cancel_target(self, short: str, *, cmd: str = "cancel"):
         """Map a `/cancel_<prefix|full-hash>` token to its tracked row.
 
         Short prefixes search in-flight rows only, so `DONE`/`FAILED`
@@ -905,20 +918,38 @@ class TelegramBot:
                 for ts in candidates[:5]
             )
             raise LookupError(
-                f"/cancel_{norm} matches {len(candidates)} torrents: {preview}; "
-                "send /cancel_<full 40-char hash>"
+                f"/{cmd}_{norm} matches {len(candidates)} torrents: {preview}; "
+                f"send /{cmd}_<full 40-char hash>"
             )
         raise LookupError(
             f"no tracked torrent starts with {norm!r} "
             "(it may already be done/cancelled)"
         )
 
-    async def _handle_chat_message(self, message: Any) -> None:
-        """Execute `/cancel_<hash>` commands sent in the chat (no confirm).
+    def _resolve_fetch_target(self, short: str):
+        """Map a `/fetch_<prefix|full-hash>` token to a WAITING_INDEXER row.
 
-        The user's sent message is final: resolve the short/full hash,
-        forget+ignore it, and reply with the outcome. Anything else is
-        ignored. Only the configured chat/user may cancel.
+        Same prefix/full-hash semantics as cancel; the resolved row must
+        still be waiting for the download indexer, otherwise fetching the
+        VPS1 original is meaningless. Raises LookupError otherwise.
+        """
+        row = self._resolve_cancel_target(short, cmd="fetch")
+        if row.state != State.WAITING_INDEXER:
+            raise LookupError(
+                f"{(row.source_name or row.source_infohash[:10])[:50]} is "
+                f"{row.state.value}, not waiting for the download indexer — "
+                "nothing to fetch"
+            )
+        return row
+
+    async def _handle_chat_message(self, message: Any) -> None:
+        """Execute `/cancel_<hash>` / `/fetch_<hash>` commands in the chat.
+
+        Both are no-confirm: the user's sent message is final. Cancel
+        forgets+ignores the release; fetch flags a WAITING_INDEXER row to
+        use the VPS1 original for the SSD download instead of waiting for
+        Prowlarr. Anything else is ignored. Only the configured chat/user
+        may send commands.
         """
         try:
             chat = getattr(message, "chat", None)
@@ -934,10 +965,25 @@ class TelegramBot:
                 or ""
             )
             text = str(text or "").strip()
-            m = CANCEL_CMD_RE.match(text)
-            if not m:
+            m_fetch = FETCH_CMD_RE.match(text)
+            m_cancel = CANCEL_CMD_RE.match(text)
+            if not m_fetch and not m_cancel:
                 return
-            short = m.group(1)
+            if m_fetch:
+                short = m_fetch.group(1)
+                try:
+                    target = await asyncio.to_thread(
+                        self._resolve_fetch_target, short)
+                    full_hash = target.source_infohash
+                except LookupError as e:
+                    await self._reply(str(e)[:300], reply_to=message)
+                    return
+                result = await self._fetch_torrent(full_hash)
+                await self._reply(result[:300], reply_to=message)
+                self._last_active_cache = None
+                await self._refresh_active_message()
+                return
+            short = m_cancel.group(1)
             try:
                 target = await asyncio.to_thread(
                     self._resolve_cancel_target, short)
@@ -950,7 +996,7 @@ class TelegramBot:
             self._last_active_cache = None
             await self._refresh_active_message()
         except Exception as e:  # noqa: BLE001
-            log.debug("cancel command handling failed: %s", e)
+            log.debug("chat command handling failed: %s", e)
 
     async def _reply(self, text: str, reply_to: Any = None) -> None:
         """Best-effort chat reply (plain text, no markdown to parse)."""
@@ -1046,6 +1092,60 @@ class TelegramBot:
         if errs:
             return f"Cancelled {name} with {len(errs)} error(s); check logs"
         return f"Cancelled {name} (removed + ignored)"
+
+    async def _fetch_torrent(self, infohash: str) -> str:
+        """Flag a WAITING_INDEXER row to use the VPS1 original now.
+
+        Sets the sticky `force_direct` flag and wakes the row
+        (WAITING_INDEXER -> QUERYING) so the next tick picks the racing
+        torrent's own bytes for the SSD download instead of waiting out
+        the Prowlarr retry window. VPS2 then leeches the private swarm,
+        which counts toward ratio.
+        """
+        try:
+            from .api import _hold_ops_lock
+        except Exception:
+            _hold_ops_lock = None  # type: ignore[assignment]
+        coord = getattr(self, "_coord", None)
+        store = getattr(self, "_store", None)
+        if coord is None or store is None:
+            return "Fetch failed: bot not attached"
+
+        def _flag() -> str:
+            row = store.get(infohash)
+            if row is None:
+                raise LookupError("no longer tracked (done/cancelled?)")
+            if row.state != State.WAITING_INDEXER:
+                return (
+                    f"{(row.source_name or infohash[:10])[:50]} is "
+                    f"{row.state.value} — nothing to fetch"
+                )
+            # Fresh retry window for the direct phase, same as the automatic
+            # timeout fallback: an explicit fetch buys full direct retries,
+            # not just the remainder of the spent prowlarr window.
+            row.force_direct = 1
+            row.indexer_first_queried_at = dt.datetime.now(dt.timezone.utc)
+            row.indexer_attempts = 0
+            store.transition(row, State.QUERYING)
+            return (
+                f"Fetching VPS1 original for {(row.source_name or infohash[:10])[:50]} "
+                "(bypassing Prowlarr; leeches the private swarm)"
+            )
+
+        try:
+            if _hold_ops_lock is not None:
+                async with _hold_ops_lock(coord):
+                    outcome = await asyncio.to_thread(_flag)
+            else:
+                outcome = await asyncio.to_thread(_flag)
+        except LookupError as e:
+            return f"Fetch failed: {e}"
+        except ValueError as e:
+            # Illegal transition (row left WAITING_INDEXER concurrently).
+            return f"Fetch failed: {e}"
+        except Exception as e:  # noqa: BLE001
+            return f"Fetch failed: {e}"
+        return outcome
 
     async def _mark_detail_cancelled(
         self, message_id: int, name: str, infohash: str
