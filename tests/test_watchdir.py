@@ -964,3 +964,164 @@ async def test_do_new_watch_dir_sacrificial_prefers_first_download_indexer(tmp_p
     assert ts.cross_seed_source == "public-prowlarr"
     assert ts.cross_seed_blob == first_bytes
     assert ts.state == State.QUEUED
+
+
+# ---- same-content election across watch drops ----
+
+_PUB_ANNOUNCE = "http://tracker.opentrackr.org:1337/announce"
+_DL_ANNOUNCE = "http://dl-indexer.example.net/announce"
+_PRIV_ANNOUNCE = "https://alpha.cc/announce/xyz"
+
+
+def _election_coord(tmp_path: Path, store: StateStore):
+    coord = make_coordinator()
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 100000000
+    coord.cfg.general.state_db = tmp_path / "state.db"
+    coord.cfg.general.disk_safety_margin_bytes = 1000
+    coord.cfg.prowlarr.enabled = True
+    coord.cfg.prowlarr.is_download_indexer = lambda url: "dl-indexer" in (url or "")
+    coord.store = store
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+    return coord
+
+
+def _watch_drop(store: StateStore, name: str, size: int, announce: str,
+                piece_length: int, state: State = State.NEW) -> TorrentState:
+    """Same content (name+size), distinct infohash via piece_length."""
+    raw = _create_sample_torrent_data(name, size, announce, piece_length=piece_length)
+    infohash, nm, total, ann = _bencoded_info_hash(raw)
+    ts = TorrentState(
+        source_infohash=infohash,
+        source_name=nm,
+        total_bytes=total,
+        source_announce_url=ann,
+        source_tracker=ann,
+        cross_seed_blob=raw,
+        cross_seed_source="watch-dir",
+        state=state,
+    )
+    ts._blob = raw
+    store.upsert(ts)
+    return ts
+
+
+def test_watch_rank_public_first(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    coord = _election_coord(tmp_path, store)
+    pub = _watch_drop(store, "Shared.Release.1080p", 5000, _PUB_ANNOUNCE, 16384)
+    dl = _watch_drop(store, "Shared.Release.1080p", 5000, _DL_ANNOUNCE, 32768)
+    priv = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 65536)
+    assert coord._watch_rank(pub) == 0
+    assert coord._watch_rank(dl) == 1
+    assert coord._watch_rank(priv) == 2
+
+
+def test_watch_election_prefers_public(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    coord = _election_coord(tmp_path, store)
+    pub = _watch_drop(store, "Shared.Release.1080p", 5000, _PUB_ANNOUNCE, 16384)
+    priv = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 32768)
+    ok_pub, _ = coord._watch_election(pub)
+    ok_priv, owner = coord._watch_election(priv)
+    assert ok_pub is True
+    assert ok_priv is False
+    assert pub.source_infohash[:10] in owner
+
+
+def test_watch_election_prefers_download_tracker_over_sacrificial(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    coord = _election_coord(tmp_path, store)
+    dl = _watch_drop(store, "Shared.Release.1080p", 5000, _DL_ANNOUNCE, 16384)
+    priv = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 32768)
+    ok_dl, _ = coord._watch_election(dl)
+    ok_priv, owner = coord._watch_election(priv)
+    assert ok_dl is True
+    assert ok_priv is False
+    assert dl.source_infohash[:10] in owner
+
+
+def test_watch_election_defers_to_inflight_owner(tmp_path: Path):
+    """First-come lock: a public NEW debut defers to a private DOWNLOADING row."""
+    store = StateStore(tmp_path / "state.db")
+    coord = _election_coord(tmp_path, store)
+    owner = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 16384,
+                        state=State.DOWNLOADING)
+    pub = _watch_drop(store, "Shared.Release.1080p", 5000, _PUB_ANNOUNCE, 32768)
+    ok_pub, reason = coord._watch_election(pub)
+    assert ok_pub is False
+    assert owner.source_infohash[:10] in reason
+    # The owner itself is unblocked.
+    ok_owner, _ = coord._watch_election(owner)
+    assert ok_owner is True
+
+
+def test_watch_election_releases_on_done_and_failed(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    coord = _election_coord(tmp_path, store)
+    owner = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 16384,
+                        state=State.DOWNLOADING)
+    waiter = _watch_drop(store, "Shared.Release.1080p", 5000, _PUB_ANNOUNCE, 32768)
+    assert coord._watch_election(waiter)[0] is False
+    owner.state = State.DONE
+    store.upsert(owner)
+    assert coord._watch_election(waiter)[0] is True
+    owner.state = State.FAILED
+    store.upsert(owner)
+    assert coord._watch_election(waiter)[0] is True
+
+
+def test_watch_election_ignores_other_content_and_non_watch_rows(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    coord = _election_coord(tmp_path, store)
+    # Different size: different content, no election.
+    other = _watch_drop(store, "Shared.Release.1080p", 6000, _PRIV_ANNOUNCE, 16384,
+                        state=State.DOWNLOADING)
+    solo = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 32768)
+    assert coord._watch_election(solo)[0] is True
+    # VPS1-derived row with same content: watch election does not gate it.
+    racing = TorrentState(
+        source_infohash="r" * 40,
+        source_name="Shared.Release.1080p",
+        total_bytes=5000,
+        state=State.NEW,
+    )
+    store.upsert(racing)
+    assert coord._watch_election(racing)[0] is True
+    # ... and a racing row never blocks a watch row either.
+    racing.state = State.DOWNLOADING
+    store.upsert(racing)
+    assert coord._watch_election(solo)[0] is True
+    assert other.state == State.DOWNLOADING  # untouched
+
+
+@pytest.mark.anyio
+async def test_do_new_watch_dir_defers_when_peer_owns_content(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    coord = _election_coord(tmp_path, store)
+    coord.prowlarr = MagicMock()
+    _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 16384,
+                state=State.DOWNLOADING)
+    pub = _watch_drop(store, "Shared.Release.1080p", 5000, _PUB_ANNOUNCE, 32768)
+
+    await coord._do_new_watch_dir(pub)
+
+    assert pub.state == State.NEW
+    coord.prowlarr.get_download_indexers.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_wait_disk_then_queue_defers_for_watch_election(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    coord = _election_coord(tmp_path, store)
+    _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 16384,
+                state=State.DOWNLOADING)
+    waiter = _watch_drop(store, "Shared.Release.1080p", 5000, _PUB_ANNOUNCE, 32768,
+                         state=State.WAITING_DISK)
+    coord._ssd_try_reserve = AsyncMock(return_value=True)
+
+    await coord._wait_disk_then_queue(waiter)
+
+    assert waiter.state == State.WAITING_DISK
+    coord._ssd_try_reserve.assert_not_called()

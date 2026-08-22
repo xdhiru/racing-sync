@@ -1516,6 +1516,115 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         all_source = await self._list_source_torrents()
         await self._pick_and_admit(ts, st, self._same_content_torrents(all_source, st))
 
+    def _watch_rank(self, ts: TorrentState) -> int:
+        """SSD-download priority for a watch-dir row: public (0) first.
+
+        Mirrors the `_do_new_watch_dir` classification so election and
+        download agree: a public drop costs no ratio, a download-target
+        tracker drop costs ratio on that tracker, anything else needs a
+        Prowlarr sacrificial copy. Lower wins.
+        """
+        try:
+            tracker_list = [u for u in (ts.source_announce_url or "").split(",") if u] or (
+                [ts.source_tracker] if ts.source_tracker else []
+            )
+        except Exception:
+            tracker_list = []
+        try:
+            if _looks_public(tracker_list):
+                return 0
+        except Exception:
+            pass
+        try:
+            if self.cfg.prowlarr.enabled and any(
+                self.cfg.prowlarr.is_download_indexer(u) for u in tracker_list
+            ):
+                return 1
+        except Exception:
+            pass
+        return 2
+
+    def _watch_election(self, ts: TorrentState) -> tuple[bool, str]:
+        """True when this watch-dir row may proceed to SSD admission.
+
+        Drops sharing content (normalized name + size, same rule as VPS1
+        grouping) elect ONE downloader; the rest defer until it is
+        DONE/FAILED/gone and then ride the already-remote fast paths with
+        no re-download. Rows already holding SSD/client presence
+        (QUEUED/DOWNLOADING/MOVING/RE_ADDING) lock ownership first-come —
+        no preemption, since same filenames share one save_path. Never
+        raises: any doubt proceeds solo (today's behavior).
+        """
+        try:
+            if (ts.cross_seed_source or "") != "watch-dir":
+                return True, ""
+            if ts.state not in (State.NEW, State.WAITING_DISK):
+                return True, ""
+            want_norm = normalize_content_name(ts.source_name or "")
+            if not want_norm:
+                return True, ""
+            try:
+                rows = self.store.all()
+            except Exception as e:  # noqa: BLE001
+                log.warning("watch-dir election: cannot list rows (%s); proceeding solo", e)
+                return True, ""
+            peers: list[TorrentState] = []
+            for p in rows or []:
+                try:
+                    if (p.source_infohash or "").lower() == (ts.source_infohash or "").lower():
+                        continue
+                    if (p.cross_seed_source or "") != "watch-dir":
+                        continue
+                    if p.state not in (State.NEW, State.WAITING_DISK, State.QUEUED,
+                                       State.DOWNLOADING, State.MOVING, State.RE_ADDING):
+                        continue
+                    if normalize_content_name(p.source_name or "") != want_norm:
+                        continue
+                    if ts.total_bytes and p.total_bytes and p.total_bytes != ts.total_bytes:
+                        continue
+                    peers.append(p)
+                except Exception:
+                    continue
+            if not peers:
+                return True, ""
+            locked = sorted(
+                (p for p in peers if p.state in (State.QUEUED, State.DOWNLOADING,
+                                                 State.MOVING, State.RE_ADDING)),
+                key=lambda p: (p.source_infohash or "").lower(),
+            )
+            if locked:
+                first = locked[0]
+                return False, (
+                    f"owned by {(first.source_infohash or '')[:10]} ({first.state.value})"
+                )
+            labels = ("public", "download-tracker", "sacrificial")
+
+            def _wkey(p: TorrentState) -> tuple[int, str, str]:
+                try:
+                    rank = self._watch_rank(p)
+                except Exception:
+                    rank = 2
+                return (rank, str(getattr(p, "created_at", "") or ""),
+                        (p.source_infohash or "").lower())
+
+            ordered = sorted([ts, *[p for p in peers
+                                      if p.state in (State.NEW, State.WAITING_DISK)]],
+                             key=_wkey)
+            winner = ordered[0]
+            if (winner.source_infohash or "").lower() == (ts.source_infohash or "").lower():
+                return True, ""
+            try:
+                rank = self._watch_rank(winner)
+            except Exception:
+                rank = 2
+            return False, (
+                f"queued behind {(winner.source_infohash or '')[:10]} "
+                f"({labels[rank] if rank < len(labels) else 'sacrificial'})"
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("watch-dir election failed (%s); proceeding solo", e)
+            return True, ""
+
     async def _do_new_watch_dir(self, ts: TorrentState) -> None:
         """Process a manual torrent drop from the watch directory."""
         blob = ts._blob or ts.cross_seed_blob
@@ -1527,6 +1636,21 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if not blob:
             log.error("watch-dir torrent has no bytes: %s", ts.source_name)
             self.transition(ts, State.FAILED, error="missing .torrent bytes for watch-dir drop")
+            return
+
+        # Same-content election across watch drops: one SSD downloader
+        # (public > download-tracker > sacrificial); the rest stay NEW
+        # until it is DONE/FAILED/gone, then ride the already-remote
+        # fast paths with no re-download.
+        try:
+            _proceed, _owner = self._watch_election(ts)
+        except Exception as e:  # noqa: BLE001
+            log.warning("watch-dir election failed for %s (%s); proceeding solo",
+                        ts.source_name[:60], e)
+            _proceed, _owner = True, ""
+        if not _proceed:
+            log.info("watch-dir: deferring %s — same content %s",
+                     ts.source_name[:60], _owner)
             return
 
         ts.save_path = str(self.cfg.dest.save_path)
@@ -1825,6 +1949,29 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         # completion is about to need.
         if self._stop:
             return
+        if (ts.cross_seed_source or "") == "watch-dir":
+            # Same-content election also gates WAITING_DISK promotion: no
+            # client entry exists yet, so deferring here is as cheap as NEW.
+            try:
+                _proceed, _owner = self._watch_election(ts)
+            except Exception:
+                _proceed, _owner = True, ""
+            if not _proceed:
+                log.debug("watch-dir: %s stays waiting_disk — same content %s",
+                          ts.source_name[:60], _owner)
+                # Refresh the quiet-wait window like the SSD-full path so a
+                # deferred row re-checks election at most once per interval.
+                try:
+                    _wd = getattr(self, "_waiting_disk_next_check", None)
+                    if _wd is None:
+                        _wd = {}
+                        self._waiting_disk_next_check = _wd  # type: ignore[attr-defined]
+                    _wd[(ts.source_infohash or "").lower()] = (
+                        time.monotonic() + self.WAITING_DISK_RECHECK_SECONDS
+                    )
+                except Exception:
+                    pass
+                return
         needed = self._ssd_estimate_for_new(ts.total_bytes)
         admitted = await self._ssd_try_reserve(ts.source_infohash, needed)
         if not admitted:
