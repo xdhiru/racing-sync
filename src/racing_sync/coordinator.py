@@ -631,9 +631,25 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 )
             # Delete only what this scan ingested: an already-tracked drop
             # still belongs to the user — never destroy what we didn't
-            # consume on this run.
-            if ingested and self.cfg.watch_dir and self.cfg.watch_dir.delete_after_pickup:
-                await self.watch.delete_picked_up(item)
+            # consume on this run. Exception: a re-dropped duplicate whose
+            # row is DONE is fully handled (seeding from fuse), so with
+            # delete_after_pickup it is clutter — remove it like a fresh
+            # ingest. Any other state keeps the file (the first drop's
+            # pipeline may still need it, or the operator may inspect it).
+            if self.cfg.watch_dir and self.cfg.watch_dir.delete_after_pickup:
+                if ingested:
+                    await self.watch.delete_picked_up(item)
+                else:
+                    try:
+                        existing = self.store.get(item_hash)
+                    except Exception:
+                        existing = None
+                    if existing is not None and existing.state == State.DONE:
+                        log.info(
+                            "watch-dir: %s (%s) already done; removing duplicate drop",
+                            item.name[:60], item.infohash[:10],
+                        )
+                        await self.watch.delete_picked_up(item)
         return items
 
     def _spawn_worker(self, ts: TorrentState) -> None:
