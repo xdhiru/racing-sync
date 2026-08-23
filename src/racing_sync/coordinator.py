@@ -46,6 +46,7 @@ from .coordinator_content import (
     _matches_release,
     _should_notify_telegram,
     _verified_cross_seed_blob,
+    announce_domain,
     cleanup_grace_seconds,
     normalize_content_name,
 )
@@ -625,7 +626,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     item.name,
                     item.infohash[:10],
                     item.size_bytes,
-                    item.announce_url,
+                    # Domain only: announce URLs embed per-user passkeys.
+                    announce_domain(item.announce_url),
                 )
             # Delete only what this scan ingested: an already-tracked drop
             # still belongs to the user — never destroy what we didn't

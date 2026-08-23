@@ -17,6 +17,18 @@ def test_looks_public():
     assert _looks_public(["https://beta.me/announce/passkey"]) is False
 
 
+def test_announce_domain_never_returns_credential():
+    from racing_sync.coordinator_content import announce_domain
+
+    assert announce_domain("https://dl-indexer.example.net/announce/e4a7c2f19b83d05a6c7e1f349a8bd6e55") == "dl-indexer.example.net"
+    assert announce_domain("https://alpha.cc/announce/xyz") == "alpha.cc"
+    assert announce_domain("udp://tracker.opentrackr.org:1337/announce") == "tracker.opentrackr.org"
+    assert announce_domain("https://www.example.com/announce/k") == "example.com"
+    assert announce_domain("not a url with spaces") == ""
+    assert announce_domain("") == ""
+    assert announce_domain(None) == ""
+
+
 def test_state_store_find_by_name():
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "test.db"
