@@ -45,6 +45,15 @@ _SENSITIVE_KEY_RE = re.compile(
     r"passkey|passwd|pwd|pass[_-]?key|api[_-]?key|auth[_-]?key|secret[_-]?key|token|secret|password|^auth$|auth[_-]",
     re.IGNORECASE,
 )
+_ANNOUNCE_URL_RE = re.compile(
+    # Tracker announce URLs embed per-user passkeys as a path segment
+    # (https://tracker/announce/<passkey>) — a shape the key=value
+    # patterns above cannot see. Redact the credential, keep the host so
+    # the log line stays useful. Bare infohashes elsewhere never match:
+    # the `/announce/` prefix is required.
+    r"(https?://[^\s'\"},;]*?/announce/)[^\s'\"},;]+",
+    re.IGNORECASE,
+)
 _SENSITIVE_HEADER_KEYS = frozenset(
     {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "x-api-token"}
 )
@@ -93,6 +102,7 @@ def sanitize_log_text(text: str) -> str:
     """Scrub sensitive credentials, tokens, and passkeys from log messages."""
     text = _SENSITIVE_PARAM_RE.sub(r"\1***", text)
     text = _BEARER_TOKEN_RE.sub(r"\1***", text)
+    text = _ANNOUNCE_URL_RE.sub(r"\1...", text)
     return text
 
 

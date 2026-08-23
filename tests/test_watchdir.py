@@ -966,6 +966,30 @@ async def test_do_new_watch_dir_sacrificial_prefers_first_download_indexer(tmp_p
     assert ts.state == State.QUEUED
 
 
+def test_watchdir_pickup_log_shows_domain_not_passkey(tmp_path: Path, caplog):
+    """The scanner log must never contain the announce passkey."""
+    import logging
+
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    raw = _create_sample_torrent_data(
+        "Secret.Show.S01E01", 5000,
+        "https://dl-indexer.example.net/announce/08f3b6d5c2a7419e0b5d8f3a6c4e29715")
+    (watch_dir / "secret.torrent").write_bytes(raw)
+
+    cfg = WatchDirConfig(path=watch_dir, glob="*.torrent", delete_after_pickup=False)
+    scanner = WatchDirScanner(cfg, prowlarr=None)
+    import asyncio
+
+    with caplog.at_level(logging.INFO, logger="racing_sync.watchdir"):
+        items = asyncio.run(scanner.scan_once())
+
+    assert len(items) == 1
+    assert any("announce=dl-indexer.example.net" in r.message for r in caplog.records)
+    assert not any("08f3b6d5c2a7419e0b5d8f3a6c4e29715" in r.message
+                   for r in caplog.records)
+
+
 # ---- same-content election across watch drops ----
 
 _PUB_ANNOUNCE = "http://tracker.opentrackr.org:1337/announce"
@@ -1016,6 +1040,36 @@ def test_watch_rank_public_first(tmp_path: Path):
     assert coord._watch_rank(pub) == 0
     assert coord._watch_rank(dl) == 1
     assert coord._watch_rank(priv) == 2
+
+
+@pytest.mark.anyio
+async def test_scan_watch_ingest_log_shows_domain_not_passkey(tmp_path: Path, caplog):
+    """Coordinator ingest log must never contain the announce passkey."""
+    import logging
+
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    raw = _create_sample_torrent_data(
+        "Secret.Show.S01E02", 5000,
+        "https://dl-indexer.example.net/announce/aaaabbbbccccddddeeeeffff0000111122223333")
+    (watch_dir / "secret2.torrent").write_bytes(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = make_coordinator()
+    coord.store = store
+    coord.watch = WatchDirScanner(
+        WatchDirConfig(path=watch_dir, glob="*.torrent", delete_after_pickup=False),
+        prowlarr=None,
+    )
+    coord.cfg.watch_dir = coord.watch._cfg
+    try:
+        with caplog.at_level(logging.INFO, logger="racing_sync.coordinator"):
+            await coord.scan_watch()
+        assert any("announce=dl-indexer.example.net" in r.message for r in caplog.records)
+        assert not any("aaaabbbbccccddddeeeeffff0000111122223333" in r.message
+                       for r in caplog.records)
+    finally:
+        store.close()
 
 
 def test_watch_election_prefers_public(tmp_path: Path):

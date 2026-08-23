@@ -419,12 +419,13 @@ class WatchDirScanner:
                 prefer_dropped=False,
             )
             out.append(item)
+            from .coordinator_content import announce_domain
             from .logging_setup import sanitize_log_text
             safe_name = sanitize_log_text(name.replace("\n", " ").replace("\r", " "))[:200]
-            safe_announce = sanitize_log_text(announce.replace("\n", " ").replace("\r", " "))[:200]
+            # Domain only: announce URLs embed per-user passkeys.
             log.info(
                 "watch-dir picked up: %s (%s) announce=%s",
-                safe_name, infohash[:10], safe_announce,
+                safe_name, infohash[:10], announce_domain(announce),
             )
 
         # Prune deleted files from caches

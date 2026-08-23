@@ -216,6 +216,38 @@ PUBLIC_TRACKER_HOSTS = (
 )
 
 
+def announce_domain(url: str) -> str:
+    """Host/domain of an announce URL for logging and display.
+
+    Announce URLs routinely embed per-user passkeys
+    (`https://tracker/announce/<passkey>`), so the full URL must never
+    reach logs or chat messages — matching only ever needs the tracker
+    identity, never the credential. Returns "" when unparseable.
+    """
+    if not url or not isinstance(url, str):
+        return ""
+    try:
+        import urllib.parse as _up
+
+        raw = url.strip()
+        if not raw:
+            return ""
+        if "://" not in raw:
+            raw = f"http://{raw}"
+        host = (_up.urlsplit(raw).hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        # Garbage in must not come back out as a "domain": require a
+        # plausible host (no whitespace, dotted or localhost).
+        if not host or any(c.isspace() for c in host):
+            return ""
+        if "." not in host and host != "localhost":
+            return ""
+        return host
+    except Exception:
+        return ""
+
+
 def _looks_public(tracker_urls: list[str]) -> bool:
     import urllib.parse as _up
 

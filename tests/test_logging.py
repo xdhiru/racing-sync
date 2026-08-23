@@ -140,6 +140,24 @@ def test_setup_logging_silences_chatty_http_libraries(tmp_path):
             root.removeHandler(h)
 
 
+def test_sanitize_redacts_announce_path_passkey():
+    from racing_sync.logging_setup import sanitize_log_text
+
+    leaked = (
+        "watch-dir picked up: Show (ff3d13ab68) "
+        "announce=https://dl-indexer.example.net/announce/e4a7c2f19b83d05a6c7e1f349a8bd6e55"
+    )
+    clean = sanitize_log_text(leaked)
+    assert "e4a7c2f19b83d05a6c7e1f349a8bd6e55" not in clean
+    assert "https://dl-indexer.example.net/announce/..." in clean
+    # Bare infohashes (content IDs, not credentials) are untouched.
+    assert sanitize_log_text("torrent (ff3d13ab68) done") == "torrent (ff3d13ab68) done"
+    assert sanitize_log_text("hash " + "a" * 40 + " ok") == "hash " + "a" * 40 + " ok"
+    # Multiple announce URLs in one line each redact independently.
+    multi = "a=https://x.test/announce/111,b=https://y.test/announce/222"
+    assert sanitize_log_text(multi) == "a=https://x.test/announce/...,b=https://y.test/announce/..."
+
+
 def test_sanitizing_formatter_scrubs_secrets_in_text_logs():
     from racing_sync.logging_setup import SanitizingFormatter, LOG_FORMAT, DATE_FORMAT
 
