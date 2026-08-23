@@ -1072,6 +1072,93 @@ async def test_scan_watch_ingest_log_shows_domain_not_passkey(tmp_path: Path, ca
         store.close()
 
 
+@pytest.mark.anyio
+async def test_scan_watch_deletes_done_duplicate_drop(tmp_path: Path):
+    """Re-dropped file for a DONE row is clutter: removed like a fresh ingest."""
+    from racing_sync.state import StateStore
+
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    raw = _create_sample_torrent_data("Done.Show.S01E01", 5000,
+                                      "https://alpha.cc/announce/xyz")
+    tfile = watch_dir / "done.torrent"
+    tfile.write_bytes(raw)
+    infohash, _, _, _ = _bencoded_info_hash(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash=infohash, source_name="Done.Show.S01E01",
+                              total_bytes=5000, cross_seed_source="watch-dir",
+                              state=State.DONE))
+    coord = make_coordinator()
+    coord.store = store
+    wcfg = WatchDirConfig(path=watch_dir, glob="*.torrent", delete_after_pickup=True)
+    coord.watch = WatchDirScanner(wcfg, prowlarr=None)
+    coord.cfg.watch_dir = wcfg
+    try:
+        await coord.scan_watch()
+        assert not tfile.exists()
+        assert store.get(infohash).state == State.DONE
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_scan_watch_keeps_duplicate_drop_while_inflight(tmp_path: Path):
+    """Same setup but row still working: the file must survive."""
+    from racing_sync.state import StateStore
+
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    raw = _create_sample_torrent_data("Busy.Show.S01E01", 5000,
+                                      "https://alpha.cc/announce/xyz")
+    tfile = watch_dir / "busy.torrent"
+    tfile.write_bytes(raw)
+    infohash, _, _, _ = _bencoded_info_hash(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash=infohash, source_name="Busy.Show.S01E01",
+                              total_bytes=5000, cross_seed_source="watch-dir",
+                              state=State.DOWNLOADING))
+    coord = make_coordinator()
+    coord.store = store
+    wcfg = WatchDirConfig(path=watch_dir, glob="*.torrent", delete_after_pickup=True)
+    coord.watch = WatchDirScanner(wcfg, prowlarr=None)
+    coord.cfg.watch_dir = wcfg
+    try:
+        await coord.scan_watch()
+        assert tfile.exists()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_scan_watch_keeps_done_duplicate_when_pickup_disabled(tmp_path: Path):
+    from racing_sync.state import StateStore
+
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    raw = _create_sample_torrent_data("Kept.Show.S01E01", 5000,
+                                      "https://alpha.cc/announce/xyz")
+    tfile = watch_dir / "kept.torrent"
+    tfile.write_bytes(raw)
+    infohash, _, _, _ = _bencoded_info_hash(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash=infohash, source_name="Kept.Show.S01E01",
+                              total_bytes=5000, cross_seed_source="watch-dir",
+                              state=State.DONE))
+    coord = make_coordinator()
+    coord.store = store
+    wcfg = WatchDirConfig(path=watch_dir, glob="*.torrent", delete_after_pickup=False)
+    coord.watch = WatchDirScanner(wcfg, prowlarr=None)
+    coord.cfg.watch_dir = wcfg
+    try:
+        await coord.scan_watch()
+        assert tfile.exists()
+    finally:
+        store.close()
+
+
 def test_watch_election_prefers_public(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     coord = _election_coord(tmp_path, store)
