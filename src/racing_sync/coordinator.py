@@ -1547,7 +1547,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             log.warning("manual fuse sweep failed: %s", e)
 
     async def _do_new(self, ts: TorrentState) -> None:
-        if ts.cross_seed_source == "watch-dir":
+        # Label-set check only (no blob-dir probe): at NEW time every watch
+        # row still carries exactly one of the three labels _do_new_watch_dir
+        # assigns, and a stale blob dir must never reroute a VPS1 row into
+        # the watch flow (missing blob there would FAIL it).
+        if (ts.cross_seed_source or "") in (
+            "watch-dir", "public-watch-dir", "public-prowlarr",
+        ):
             await self._do_new_watch_dir(ts)
             return
 
@@ -1680,6 +1686,35 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             log.warning("watch-dir election failed (%s); proceeding solo", e)
             return True, ""
 
+    def _is_watch_row(self, ts: TorrentState) -> bool:
+        """True when this row originated from a watch-dir drop.
+
+        `cross_seed_source` is overwritten with the chosen SSD flavour
+        ("watch-dir" | "public-watch-dir" | "public-prowlarr"), so the
+        label alone cannot identify watch rows past NEW — a sacrificial
+        row would otherwise be mistaken for a VPS1 row and miss its
+        fuse injection. The persisted blob dir
+        (watch_cross_seeds/<infohash>/) is created for every watch row
+        that proceeds, and only for watch rows, so its presence is the
+        durable origin signal. Never raises.
+        """
+        try:
+            if (ts.cross_seed_source or "") in (
+                "watch-dir", "public-watch-dir", "public-prowlarr",
+            ):
+                return True
+        except Exception:
+            pass
+        try:
+            base = Path(self.cfg.general.state_db).parent
+        except Exception:
+            return False
+        try:
+            blob_dir = base / "watch_cross_seeds" / (ts.source_infohash or "")
+            return blob_dir.is_dir() and any(blob_dir.glob("*.torrent"))
+        except Exception:
+            return False
+
     async def _do_new_watch_dir(self, ts: TorrentState) -> None:
         """Process a manual torrent drop from the watch directory."""
         blob = ts._blob or ts.cross_seed_blob
@@ -1804,6 +1839,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         chosen_label = "public-prowlarr"
                         chosen_size = best_dl.size_bytes
                         chosen_infohash = dl_h
+                        # Persist alongside the dropped + discovered blobs:
+                        # the watch blob dir is the single source of truth
+                        # for fuse injection, so flows that skip RE_ADDING
+                        # (e.g. the QUEUED fuse-DONE fast path) still seed
+                        # every copy. Same-infohash variants (identical
+                        # files, different announce) share one filename —
+                        # the dropped blob already represents them.
+                        if dl_h.lower() != ts.source_infohash.lower():
+                            await asyncio.to_thread((watch_cross_dir / f"{dl_h}.torrent").write_bytes, dl_blob)
                         log.info(
                             "watch-dir: using sacrificial download torrent from %s (%s)",
                             best_dl.indexer, best_dl.title,
@@ -1824,7 +1868,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                             cross_blob = await self.prowlarr.download_torrent(hit)
                             from .watchdir import _bencoded_info_hash
                             cross_h, _, _, _ = _bencoded_info_hash(cross_blob)
-                            await asyncio.to_thread((watch_cross_dir / f"{cross_h}.torrent").write_bytes, cross_blob)
+                            # Same info, different announce (identical files)
+                            # shares one filename — first persisted wins
+                            # (dropped blob, then sacrificial), so one file
+                            # seeds it and variants can't clobber each other.
+                            if (watch_cross_dir / f"{cross_h}.torrent").exists():
+                                log.debug(
+                                    "watch-dir: cross-seed %s from %s shares infohash; keeping persisted copy",
+                                    cross_h[:10], hit.indexer,
+                                )
+                            else:
+                                await asyncio.to_thread((watch_cross_dir / f"{cross_h}.torrent").write_bytes, cross_blob)
                             log.info(
                                 "watch-dir: discovered cross-seed from %s: %s (%s)",
                                 hit.indexer, hit.title, cross_h[:10],
@@ -2282,7 +2336,30 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     except Exception:  # noqa: BLE001
                         pass
                 if self.cfg.cross_seed.inject_racing_torrents_to_fuse:
-                    await self._re_inject_racing_torrents(ts)
+                    if self._is_watch_row(ts):
+                        # Mirror RE_ADDING step 1: inject every persisted
+                        # watch blob (dropped + sacrificial + discovered),
+                        # each fuse-gated on its own — the fast path must
+                        # not mark DONE while a dropped copy is unseeded. A
+                        # transient WebUI hiccup stays QUEUED for retry
+                        # instead of failing the row (any escape FAILEDs it
+                        # in the worker wrapper). Origin (not the SSD
+                        # flavour label, which sacrificial/public rows
+                        # overwrite) decides the injection set.
+                        try:
+                            await self._re_inject_watch_dir_torrents(ts)
+                        except _WEBUI_RETRY_ERRORS as e:
+                            log.warning(
+                                "watch re-inject hit transient dest error for %s (%s); staying queued",
+                                ts.source_name[:60], e,
+                            )
+                            try:
+                                self.store.upsert(ts)
+                            except Exception:
+                                pass
+                            return
+                    else:
+                        await self._re_inject_racing_torrents(ts)
                 self.transition(ts, State.DONE)
                 return
 
@@ -4259,8 +4336,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             try:
                 # 1) Re-inject the racing-client torrents (private or otherwise)
                 # pointing at the fuse mount with skip_check=True (req #3).
+                # Watch rows (any SSD flavour label) re-inject their
+                # persisted blobs instead.
                 if self.cfg.cross_seed.inject_racing_torrents_to_fuse:
-                    if ts.cross_seed_source == "watch-dir":
+                    if self._is_watch_row(ts):
                         await self._re_inject_watch_dir_torrents(ts)
                     else:
                         await self._re_inject_racing_torrents(ts)
