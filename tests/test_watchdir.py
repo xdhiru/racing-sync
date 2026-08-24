@@ -364,9 +364,10 @@ async def test_do_new_watch_dir_with_prowlarr_search_and_cross_seeds(tmp_path: P
         "beta": [bhd_hit],
     }
 
-    # Mock downloads from Prowlarr
-    dl_torrent_bytes = _create_sample_torrent_data("Private.Movie.1080p", 5000, "http://dl-indexer.example.net/announce")
-    bhd_torrent_bytes = _create_sample_torrent_data("Private.Movie.1080p", 5000, "http://beta.me/announce", piece_length=32768)
+    # Mock downloads from Prowlarr (distinct piece lengths → distinct
+    # infohashes for the same files, like real cross-tracker variants)
+    dl_torrent_bytes = _create_sample_torrent_data("Private.Movie.1080p", 5000, "http://dl-indexer.example.net/announce", piece_length=32768)
+    bhd_torrent_bytes = _create_sample_torrent_data("Private.Movie.1080p", 5000, "http://beta.me/announce", piece_length=65536)
 
     async def mock_dl(hit):
         if hit.indexer_id == 1:
@@ -392,11 +393,12 @@ async def test_do_new_watch_dir_with_prowlarr_search_and_cross_seeds(tmp_path: P
     assert ts.cross_seed_blob == dl_torrent_bytes
     assert ts.state == State.QUEUED
 
-    # Cross seed directory should have original dropped torrent AND Beta torrent
+    # Cross seed directory should have original dropped torrent, the
+    # sacrificial download-torrent copy AND Beta torrent
     watch_cross_dir = tmp_path / "watch_cross_seeds" / infohash
     assert watch_cross_dir.exists()
     saved_files = list(watch_cross_dir.glob("*.torrent"))
-    assert len(saved_files) == 2  # Original dropped + Beta
+    assert len(saved_files) == 3  # Original dropped + sacrificial + Beta
 
 
 @pytest.mark.anyio
@@ -475,6 +477,150 @@ async def test_re_inject_watch_dir_torrents_skips_missing_fuse_content(tmp_path:
 
     coord.dest_client.add_torrent.assert_not_called()
     assert ts.injected_private_hashes == ""
+
+
+@pytest.mark.anyio
+async def test_do_queued_fuse_fast_path_injects_dropped_watch_blob(tmp_path: Path):
+    """QUEUED→DONE fast path must seed the dropped watch copy, not skip it.
+
+    Regression: the fast path only re-injected VPS1 racing torrents, so a
+    manually dropped torrent whose content already seeded from fuse was
+    marked DONE without ever being injected.
+    """
+    from racing_sync.clients.abstract import AddResult, Torrent, TorrentFile
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    (fuse_dir / "Fast.Movie.1080p.mkv").write_bytes(b"m" * 2000)
+
+    dropped = _create_sample_torrent_data(
+        "Fast.Movie.1080p.mkv", 2000, "https://alpha.cc/announce/xyz")
+    drop_hash, _, _, _ = _bencoded_info_hash(dropped)
+    cross = _create_sample_torrent_data(
+        "Fast.Movie.1080p.mkv", 2000, "http://dl-indexer.example.net/announce",
+        piece_length=32768)
+    cross_hash, _, _, _ = _bencoded_info_hash(cross)
+    assert cross_hash != drop_hash
+    watch_cross_dir = tmp_path / "watch_cross_seeds" / drop_hash
+    watch_cross_dir.mkdir(parents=True)
+    (watch_cross_dir / f"{drop_hash}.torrent").write_bytes(dropped)
+
+    from racing_sync.config import ClassifierConfig
+
+    coord = make_coordinator()
+    coord.cfg.general.state_db = db_path
+    coord.cfg.classifier = ClassifierConfig()
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.fuse.mount = fuse_dir
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-u"
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
+    coord.store = store
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+
+    existing = Torrent(
+        hash=cross_hash, name="Fast.Movie.1080p.mkv", category="racing",
+        save_path=str(fuse_dir), size_bytes=2000, state="seeding", progress=1.0,
+    )
+    injected_entry = Torrent(
+        hash=drop_hash, name="Fast.Movie.1080p.mkv", category="racing",
+        save_path=str(fuse_dir), size_bytes=2000, state="seeding", progress=1.0,
+    )
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[existing])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Fast.Movie.1080p.mkv", size_bytes=2000, progress=1.0),
+    ])
+    coord.dest_client.get_torrent = AsyncMock(return_value=injected_entry)
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash=drop_hash, accepted=True, detail=""))
+
+    ts = TorrentState(
+        source_infohash=drop_hash,
+        source_name="Fast.Movie.1080p.mkv",
+        total_bytes=2000,
+        cross_seed_infohash=cross_hash,
+        # Sacrificial flavour: the SSD leg used the Prowlarr copy, but the
+        # row is still watch-origin — the dropped copy must be injected.
+        cross_seed_source="public-prowlarr",
+        cross_seed_blob=cross,
+        classification_kind="movie",
+        state=State.QUEUED,
+    )
+    ts._blob = cross
+    try:
+        assert coord._is_watch_row(ts) is True
+        await coord._do_queued(ts)
+        assert ts.state == State.DONE
+        # The dropped copy was injected to fuse (skip_check seeding).
+        assert coord.dest_client.add_torrent.await_count == 1
+        sent = coord.dest_client.add_torrent.call_args.kwargs["torrent_files"]
+        assert sent == [dropped]
+        assert drop_hash in ts.injected_private_hashes.split(",")
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_do_queued_fuse_fast_path_stays_queued_on_transient_webui(tmp_path: Path):
+    """Transient dest errors during fast-path watch injection park QUEUED."""
+    from racing_sync.clients.abstract import Torrent, TorrentFile
+    from racing_sync.coordinator_errors import WebUIUnresponsiveError
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    (fuse_dir / "Slow.Movie.1080p.mkv").write_bytes(b"m" * 2000)
+
+    dropped = _create_sample_torrent_data(
+        "Slow.Movie.1080p.mkv", 2000, "https://alpha.cc/announce/xyz")
+    drop_hash, _, _, _ = _bencoded_info_hash(dropped)
+    watch_cross_dir = tmp_path / "watch_cross_seeds" / drop_hash
+    watch_cross_dir.mkdir(parents=True)
+    (watch_cross_dir / f"{drop_hash}.torrent").write_bytes(dropped)
+
+    from racing_sync.config import ClassifierConfig
+
+    coord = make_coordinator()
+    coord.cfg.general.state_db = db_path
+    coord.cfg.classifier = ClassifierConfig()
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.fuse.mount = fuse_dir
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-u"
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
+    coord.store = store
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+
+    ts = TorrentState(
+        source_infohash=drop_hash,
+        source_name="Slow.Movie.1080p.mkv",
+        total_bytes=2000,
+        cross_seed_source="watch-dir",
+        cross_seed_blob=dropped,
+        classification_kind="movie",
+        state=State.QUEUED,
+    )
+    ts._blob = dropped
+
+    existing = Torrent(
+        hash="e" * 40, name="Slow.Movie.1080p.mkv", category="racing",
+        save_path=str(fuse_dir), size_bytes=2000, state="seeding", progress=1.0,
+    )
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[existing])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Slow.Movie.1080p.mkv", size_bytes=2000, progress=1.0),
+    ])
+    coord.dest_client.add_torrent = AsyncMock(
+        side_effect=WebUIUnresponsiveError("busy"))
+
+    try:
+        await coord._do_queued(ts)
+        assert ts.state == State.QUEUED
+    finally:
+        store.close()
 
 
 @pytest.mark.anyio
@@ -1155,6 +1301,37 @@ async def test_scan_watch_keeps_done_duplicate_when_pickup_disabled(tmp_path: Pa
     try:
         await coord.scan_watch()
         assert tfile.exists()
+    finally:
+        store.close()
+
+
+def test_is_watch_row_labels_and_blob_dir(tmp_path: Path):
+    from racing_sync.state import StateStore
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    coord = make_coordinator()
+    coord.cfg.general.state_db = db_path
+    coord.store = store
+    try:
+        # All three watch SSD flavours identify by label alone.
+        for label in ("watch-dir", "public-watch-dir", "public-prowlarr"):
+            ts = TorrentState(source_infohash="a" * 40, cross_seed_source=label)
+            assert coord._is_watch_row(ts) is True
+        # VPS1 flavours and empty labels do not — without a blob dir.
+        for label in ("", "public-racing", "public-dl-indexer-fallback",
+                      "dl-indexer-cross-seed", "private-sftp-fallback",
+                      "private-export-fallback"):
+            ts = TorrentState(source_infohash="b" * 40, cross_seed_source=label)
+            assert coord._is_watch_row(ts) is False
+        # The persisted blob dir is the durable signal either way.
+        d = tmp_path / "watch_cross_seeds" / ("c" * 40)
+        d.mkdir(parents=True)
+        (d / "x.torrent").write_bytes(b"not-a-torrent")
+        assert coord._is_watch_row(
+            TorrentState(source_infohash="c" * 40, cross_seed_source="")) is True
+        assert coord._is_watch_row(
+            TorrentState(source_infohash="d" * 40, cross_seed_source="")) is False
     finally:
         store.close()
 
