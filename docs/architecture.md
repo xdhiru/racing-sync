@@ -134,6 +134,9 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
     - Set file priorities: priority 1 for batch N, 0 for everything else.
       Resume; poll until the batch's files are client-complete *and* present
       on SSD at full size (a desynced piece map alone never counts).
+      All batches already remote (remaining footprint zero) skips download
+      + move entirely: QUEUED goes straight to fuse-gated RE_ADDING instead
+      of waiting on a paused, fully-deselected entry that can never complete.
     - After a verified move (rclone exit 0 *plus* nothing left on disk),
       the torrent entry is deleted **with files** and re-added fresh for
       batch N+1, so shared piece-boundary partials can't leak across
