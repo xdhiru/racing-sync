@@ -229,8 +229,13 @@ def _retry_minutes(ts: TorrentState) -> int | None:
     return max(1, round(_retry_s / 60))
 
 
-def render_detail(ts: TorrentState, progress: float | None = None) -> str:
-    """Per-torrent detail message (edited in place as state advances)."""
+def render_detail(ts: TorrentState, progress: float | None = None,
+                  note: str = "") -> str:
+    """Per-torrent detail message (edited in place as state advances).
+
+    `note` is an optional one-line extra (e.g. why a NEW row is waiting)
+    rendered after the state-specific lines.
+    """
     icon = _STATE_ICON.get(ts.state, ts.state.value.upper())
     name, size, full_hash = _row_text_bits(ts)
 
@@ -291,6 +296,9 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
         raw_err = (ts.last_error or "")[:200].replace("\n", " ").replace("\r", " ")
         err = _esc(_san(raw_err)) if raw_err else "no detail"
         lines.append(f"✗ Failed: {err}")
+
+    if note:
+        lines.append(f"⏳ {_esc(note)}")
 
     # Cross-seed info
     if ts.cross_seed_source:
@@ -375,8 +383,13 @@ def render_active(
     active: list[tuple[TorrentState, float | None]],
     page: int = 0,
     page_size: int = 5,
+    notes: dict[str, str] | None = None,
 ) -> tuple[str, int, int]:
-    """Render paginated list of active tasks with numbered items."""
+    """Render paginated list of active tasks with numbered items.
+
+    `notes` maps source_infohash -> one-line extra (e.g. why a NEW row is
+    waiting); a present note replaces the state line with `⏳ <note>`.
+    """
     try:
         page_size = int(page_size)
     except (TypeError, ValueError):
@@ -406,6 +419,10 @@ def render_active(
         item_num = start_idx + i + 1
         name, size, full_hash = _row_text_bits(ts)
         short_hash = (full_hash or "")[:CANCEL_SHORT_LEN]
+        try:
+            note = (notes or {}).get(ts.source_infohash or "") or ""
+        except Exception:
+            note = ""
 
         # 1. Full name of the torrent, copiable by click (in backticks, no escape chars)
         lines.append(f"*{item_num}.* `{name}`")
@@ -414,9 +431,12 @@ def render_active(
         # copiable by click (detail card keeps the full 40-char hash).
         lines.append(f"  {size} · `{short_hash}`")
 
-        # 3. Next line shows state, batch (if applicable), and tracker domain at the last
+        # 3. State line — or the deferral note, which already names why
+        # the row is waiting (shares the Cancel/tracker tail below).
         _bd = _batch_display(ts)
-        if ts.state == State.DOWNLOADING:
+        if note and ts.state in (State.NEW, State.WAITING_DISK):
+            state_text = f"⏳ {note}"
+        elif ts.state == State.DOWNLOADING:
             if progress is not None:
                 state_text = f"⬇️ Downloading · {progress * 100:.1f}%"
             else:
@@ -735,7 +755,15 @@ class TelegramBot:
         ts = await asyncio.to_thread(self._store.get, infohash)
         if ts is None:
             return
-        text = render_detail(ts, progress)
+        note = ""
+        try:
+            if ts.state in (State.NEW, State.WAITING_DISK):
+                _wn = getattr(getattr(self, "_coord", None), "_watch_wait_note", None)
+                if callable(_wn):
+                    note = _wn(ts) or ""
+        except Exception:
+            note = ""
+        text = render_detail(ts, progress, note)
         try:
             state_value = ts.state.value
         except Exception:
@@ -1322,8 +1350,26 @@ class TelegramBot:
                     continue
         except Exception:
             pass
+        # Deferral notes for waiting watch rows (e.g. "Waiting turn ·
+        # dl-indexer copy first") so the list explains itself. Best-effort:
+        # never break the refresh over a note.
+        notes: dict[str, str] = {}
+        try:
+            _wait_note = getattr(getattr(self, "_coord", None), "_watch_wait_note", None)
+            if callable(_wait_note):
+                for _ts, _ in items:
+                    try:
+                        if _ts.state in (State.NEW, State.WAITING_DISK):
+                            _n = _wait_note(_ts) or ""
+                            if _n:
+                                notes[_ts.source_infohash or ""] = _n
+                    except Exception:
+                        continue
+        except Exception:
+            notes = {}
         text, cur_page, total_pages = render_active(
-            items, page=self._current_page, page_size=self._cfg.page_size
+            items, page=self._current_page, page_size=self._cfg.page_size,
+            notes=notes,
         )
         if len(text) > 4096:
             text = _safe_truncate_markdown(text)

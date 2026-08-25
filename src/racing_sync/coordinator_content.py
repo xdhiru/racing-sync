@@ -215,6 +215,13 @@ PUBLIC_TRACKER_HOSTS = (
     "coppersurfer", "leechers-paradise", "open.stealth.si",
 )
 
+#: Every `cross_seed_source` value a watch-dir row can carry. The label is
+#: overwritten with the chosen SSD flavour past NEW, so origin checks must
+#: accept the whole set (plus the persisted blob dir), never one label.
+WATCH_ORIGIN_LABELS = frozenset({
+    "watch-dir", "public-watch-dir", "public-prowlarr",
+})
+
 
 def announce_domain(url: str) -> str:
     """Host/domain of an announce URL for logging and display.
