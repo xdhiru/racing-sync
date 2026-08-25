@@ -1863,7 +1863,11 @@ async def test_setup_footprint_excludes_remote_skipped_bytes(tmp_path):
 
 @pytest.mark.anyio
 async def test_setup_footprint_zero_when_fully_remote(tmp_path):
-    """Everything already moved -> hold nothing, still finish to MOVING."""
+    """Everything already remote -> skip download, fuse-gated RE_ADDING.
+
+    Parking such a row in DOWNLOADING waited on torrent-level progress
+    for a paused, fully-deselected entry that can never complete.
+    """
     from unittest.mock import AsyncMock, MagicMock
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
@@ -1903,8 +1907,7 @@ async def test_setup_footprint_zero_when_fully_remote(tmp_path):
 
     await coord._setup_queued_download(ts, b"blob")
 
-    assert ts.state == State.DOWNLOADING
-    assert coord._ssd_reserved["z" * 40] == 0
+    assert ts.state == State.RE_ADDING
     coord.dest_client.resume.assert_not_called()  # nothing needs downloading
 
 @pytest.mark.anyio
@@ -2013,3 +2016,104 @@ async def test_do_moving_single_file_parks_when_client_progress_incomplete(tmp_p
     coord._rclone_move.assert_not_called()
     wipe.assert_not_called()
     assert (ssd / "Partial.Movie.1080p.mkv").exists()
+
+
+def _all_remote_season_coord(tmp_path, fuse_files: dict[str, int], cap_bytes: int):
+    """Coordinator + SSD/fuse layout for setup shortcut tests.
+
+    `fuse_files`: torrent-relative name -> bytes present on the fuse mount.
+    Returns (coord, ts, ssd).
+    """
+    from pathlib import Path
+    from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.config import ClassifierConfig
+    from racing_sync.state import StateStore, TorrentState, State
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir(exist_ok=True)
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir(exist_ok=True)
+    for name, size in fuse_files.items():
+        (fuse_dir / name).write_bytes(b"v" * size)
+
+    coord = make_coordinator()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.classifier = ClassifierConfig()
+    coord.cfg.rclone.fuse.mount = fuse_dir
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-u"
+    coord.cfg.general.state_db = tmp_path / "state.db"
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+    coord._frozen_batch_cap = MagicMock(return_value=cap_bytes)
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name=n, size_bytes=s, progress=0.0) for n, s in fuse_files.items()
+    ])
+    coord.dest_client.set_file_priorities = AsyncMock()
+    coord.dest_client.resume = AsyncMock()
+    names = sorted(fuse_files)
+    ts = TorrentState(
+        source_infohash="e" * 40,
+        source_name="Cape.Fear.S01.1080p.ATVP.WEB-DL",
+        total_bytes=sum(fuse_files.values()),
+        dest_infohash="e" * 40,
+        save_path=str(ssd),
+        state=State.QUEUED,
+    )
+    return coord, ts, ssd
+
+
+@pytest.mark.anyio
+async def test_setup_queued_all_remote_season_skips_to_readding(tmp_path):
+    """Every batch already on fuse: no SSD download, straight to RE_ADDING.
+
+    Regression: the row went DOWNLOADING and waited on torrent-level
+    progress for a paused, fully-deselected entry that can never complete.
+    """
+    from racing_sync.state import State
+
+    files = {f"Cape.Fear.S01E{i:02d}.mkv": 1000 for i in range(1, 4)}
+    coord, ts, _ssd = _all_remote_season_coord(tmp_path, files, 40 * 1024**3)
+    try:
+        await coord._setup_queued_download(ts, b"blob")
+        assert ts.state == State.RE_ADDING
+        assert ts.batches_total == 1
+        # Never resumed: nothing was ever selected for download.
+        coord.dest_client.resume.assert_not_called()
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_setup_queued_all_remote_multi_batch_skips_to_readding(tmp_path):
+    """Same shortcut when the season would have needed several batches."""
+    from racing_sync.state import State
+
+    files = {f"Cape.Fear.S01E{i:02d}.mkv": 1000 for i in range(1, 4)}
+    coord, ts, _ssd = _all_remote_season_coord(tmp_path, files, 1500)
+    try:
+        await coord._setup_queued_download(ts, b"blob")
+        assert ts.batches_total >= 2
+        assert ts.state == State.RE_ADDING
+        coord.dest_client.resume.assert_not_called()
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_setup_queued_partial_remote_still_downloads(tmp_path):
+    """One file missing on fuse: normal download path, first batch resumed."""
+    from pathlib import Path
+    from racing_sync.state import State
+
+    files = {f"Cape.Fear.S01E{i:02d}.mkv": 1000 for i in range(1, 4)}
+    coord, ts, ssd = _all_remote_season_coord(tmp_path, files, 40 * 1024**3)
+    try:
+        (Path(coord.cfg.rclone.fuse.mount) / "Cape.Fear.S01E03.mkv").unlink()
+        await coord._setup_queued_download(ts, b"blob")
+        assert ts.state == State.DOWNLOADING
+        coord.dest_client.resume.assert_awaited_once()
+    finally:
+        coord.store.close()

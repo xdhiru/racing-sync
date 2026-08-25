@@ -2680,6 +2680,22 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     ts.dest_infohash or ts.source_infohash, prio_map,
                 )
 
+        # All-remote fast path: every batch already sits verified on the
+        # remote (remaining footprint zero) — nothing will ever hit SSD, so
+        # skip the download + MOVING and go fuse-gated RE_ADDING, which
+        # verifies presence before injecting. Without this, a single-flow
+        # row waits on torrent-level progress for a paused, fully-deselected
+        # entry that can never complete (stuck DOWNLOADING), or wipes its
+        # way into a FileNotFoundError. QUEUED -> RE_ADDING is legal and
+        # frees the admission slot + SSD reservation via transition().
+        if ts.batches_total > 0 and _real_footprint == 0:
+            log.info(
+                "all %d batche(s) for %s already on remote; skipping SSD download",
+                ts.batches_total, ts.source_name,
+            )
+            self.transition(ts, State.RE_ADDING)
+            return
+
         # Refine the admission estimate to the real SSD footprint now that
         # classification/batches are known (remaining batch bytes for
         # seasons/games; singles/full-torrent → total). Zero is a valid
