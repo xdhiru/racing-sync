@@ -361,6 +361,79 @@ async def test_stale_net_requeues_drifted_cards_only():
     assert await _run({"d" * 40: "done"}) == []
 
 
+def test_render_active_shows_wait_note_for_deferred_rows():
+    waiter = TorrentState(
+        source_infohash="e" * 40, source_name="Twin.Show.S01E01",
+        state=State.NEW, total_bytes=1000,
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
+    fresh = TorrentState(
+        source_infohash="f" * 40, source_name="Fresh.Show.S01E01",
+        state=State.NEW, total_bytes=1000,
+    )
+    notes = {"e" * 40: "Waiting turn · dl-indexer copy first"}
+    text, _, _ = render_active([(waiter, None), (fresh, None)],
+                               page=0, page_size=5, notes=notes)
+    assert "  ⏳ Waiting turn · dl-indexer copy first · alpha.cc" in text
+    # Row without a note keeps the plain NEW badge.
+    assert "🆕 New" in text
+    # Notes never leak onto other states.
+    other = TorrentState(
+        source_infohash="e" * 40, source_name="Twin.Show.S01E01",
+        state=State.DOWNLOADING, total_bytes=1000,
+    )
+    text2, _, _ = render_active([(other, 0.5)], page=0, page_size=5,
+                                notes=notes)
+    assert "Waiting turn" not in text2
+    assert "⬇️ Downloading · 50.0%" in text2
+
+
+def test_render_detail_shows_wait_note():
+    from racing_sync.telegram_bot import render_detail
+
+    ts = TorrentState(source_infohash="e" * 40, source_name="Twin.Show",
+                      state=State.NEW, total_bytes=1000)
+    assert "Waiting turn" not in render_detail(ts)
+    assert "⏳ Waiting turn · dl-indexer copy first" in render_detail(
+        ts, None, "Waiting turn · dl-indexer copy first")
+
+
+@pytest.mark.anyio
+async def test_refresh_attaches_watch_wait_notes():
+    """Active refresh resolves deferral notes via the coordinator."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    bot = object.__new__(TelegramBot)
+    bot._bot = MagicMock()
+    bot._bot.edit_message_text = AsyncMock()
+    bot._bot.send_message = AsyncMock(
+        return_value=MagicMock(message_id=99))
+    bot._store = MagicMock()
+    bot._coord = MagicMock()
+    bot._coord.live_progress_map.return_value = {}
+    bot._coord._watch_wait_note = MagicMock(
+        return_value="Waiting turn · dl-indexer copy first")
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
+    bot._current_page = 0
+    bot._active_msg_id = None
+    bot._prev_active_msg_id = None
+    bot._last_active_cache = None
+    bot._detail_cache = {}
+    bot._detail_queue = asyncio.Queue()
+    bot._detail_sent_state = {}
+    h = "e" * 40
+    bot._store.list_active_inflight.return_value = [
+        TorrentState(source_infohash=h, source_name="Twin.Show",
+                     state=State.NEW, total_bytes=1000,
+                     source_announce_url="https://alpha.cc/announce/xyz"),
+    ]
+    await bot._refresh_active_message_inner()
+    sent_text = bot._bot.send_message.call_args[0][1]
+    assert "⏳ Waiting turn · dl-indexer copy first" in sent_text
+    bot._coord._watch_wait_note.assert_called_once()
+
+
 def test_render_active_deterministic_cache_key():
     import time
     ts = TorrentState(

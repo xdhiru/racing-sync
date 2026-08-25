@@ -50,6 +50,7 @@ from .coordinator_content import (
     cleanup_grace_seconds,
     normalize_content_name,
 )
+from .coordinator_content import WATCH_ORIGIN_LABELS
 from .coordinator_errors import (
     _NOT_VISIBLE_DETAIL,
     _WEBUI_RETRY_ERRORS,
@@ -1548,12 +1549,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
     async def _do_new(self, ts: TorrentState) -> None:
         # Label-set check only (no blob-dir probe): at NEW time every watch
-        # row still carries exactly one of the three labels _do_new_watch_dir
-        # assigns, and a stale blob dir must never reroute a VPS1 row into
-        # the watch flow (missing blob there would FAIL it).
-        if (ts.cross_seed_source or "") in (
-            "watch-dir", "public-watch-dir", "public-prowlarr",
-        ):
+        # row still carries exactly one origin label, and a stale blob dir
+        # must never reroute a VPS1 row into the watch flow (missing blob
+        # there would FAIL it).
+        if (ts.cross_seed_source or "") in WATCH_ORIGIN_LABELS:
             await self._do_new_watch_dir(ts)
             return
 
@@ -1605,36 +1604,37 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             pass
         return 2
 
-    def _watch_election(self, ts: TorrentState) -> tuple[bool, str]:
-        """True when this watch-dir row may proceed to SSD admission.
+    def _watch_election(self, ts: TorrentState) -> tuple[bool, TorrentState | None]:
+        """Whether this watch-dir row may proceed to SSD admission.
 
         Drops sharing content (normalized name + size, same rule as VPS1
         grouping) elect ONE downloader; the rest defer until it is
         DONE/FAILED/gone and then ride the already-remote fast paths with
         no re-download. Rows already holding SSD/client presence
         (QUEUED/DOWNLOADING/MOVING/RE_ADDING) lock ownership first-come —
-        no preemption, since same filenames share one save_path. Never
-        raises: any doubt proceeds solo (today's behavior).
+        no preemption, since same filenames share one save_path. Returns
+        (True, None) when the row may proceed, else (False, winner).
+        Origin is checked with `_is_watch_row` (labels change past NEW),
+        never one label. Never raises: any doubt proceeds solo (today's
+        behavior).
         """
         try:
-            if (ts.cross_seed_source or "") != "watch-dir":
-                return True, ""
+            if not self._is_watch_row(ts):
+                return True, None
             if ts.state not in (State.NEW, State.WAITING_DISK):
-                return True, ""
+                return True, None
             want_norm = normalize_content_name(ts.source_name or "")
             if not want_norm:
-                return True, ""
+                return True, None
             try:
                 rows = self.store.all()
             except Exception as e:  # noqa: BLE001
                 log.warning("watch-dir election: cannot list rows (%s); proceeding solo", e)
-                return True, ""
+                return True, None
             peers: list[TorrentState] = []
             for p in rows or []:
                 try:
                     if (p.source_infohash or "").lower() == (ts.source_infohash or "").lower():
-                        continue
-                    if (p.cross_seed_source or "") != "watch-dir":
                         continue
                     if p.state not in (State.NEW, State.WAITING_DISK, State.QUEUED,
                                        State.DOWNLOADING, State.MOVING, State.RE_ADDING):
@@ -1643,22 +1643,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         continue
                     if ts.total_bytes and p.total_bytes and p.total_bytes != ts.total_bytes:
                         continue
+                    if not self._is_watch_row(p):
+                        continue
                     peers.append(p)
                 except Exception:
                     continue
             if not peers:
-                return True, ""
+                return True, None
             locked = sorted(
                 (p for p in peers if p.state in (State.QUEUED, State.DOWNLOADING,
                                                  State.MOVING, State.RE_ADDING)),
                 key=lambda p: (p.source_infohash or "").lower(),
             )
             if locked:
-                first = locked[0]
-                return False, (
-                    f"owned by {(first.source_infohash or '')[:10]} ({first.state.value})"
-                )
-            labels = ("public", "download-tracker", "sacrificial")
+                return False, locked[0]
 
             def _wkey(p: TorrentState) -> tuple[int, str, str]:
                 try:
@@ -1673,18 +1671,35 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                              key=_wkey)
             winner = ordered[0]
             if (winner.source_infohash or "").lower() == (ts.source_infohash or "").lower():
-                return True, ""
-            try:
-                rank = self._watch_rank(winner)
-            except Exception:
-                rank = 2
-            return False, (
-                f"queued behind {(winner.source_infohash or '')[:10]} "
-                f"({labels[rank] if rank < len(labels) else 'sacrificial'})"
-            )
+                return True, None
+            return False, winner
         except Exception as e:  # noqa: BLE001
             log.warning("watch-dir election failed (%s); proceeding solo", e)
-            return True, ""
+            return True, None
+
+    def _watch_wait_note(self, ts: TorrentState) -> str:
+        """Short human reason a watch row is deferred, or "" when it may proceed.
+
+        Names the winning copy's tracker ("Waiting turn · dl-indexer copy
+        first") so the card explains itself instead of reading as stuck.
+        Never raises.
+        """
+        try:
+            proceed, owner = self._watch_election(ts)
+            if proceed or owner is None:
+                return ""
+            domain = announce_domain(owner.source_announce_url) or announce_domain(
+                owner.source_tracker)
+            if domain:
+                return f"Waiting turn · {domain} copy first"
+            try:
+                rank = self._watch_rank(owner)
+            except Exception:
+                rank = 2
+            fallback = ("public copy first", "tracker copy first", "sibling copy first")
+            return "Waiting turn · " + (fallback[rank] if rank < len(fallback) else fallback[2])
+        except Exception:
+            return ""
 
     def _is_watch_row(self, ts: TorrentState) -> bool:
         """True when this row originated from a watch-dir drop.
@@ -1699,9 +1714,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         durable origin signal. Never raises.
         """
         try:
-            if (ts.cross_seed_source or "") in (
-                "watch-dir", "public-watch-dir", "public-prowlarr",
-            ):
+            if (ts.cross_seed_source or "") in WATCH_ORIGIN_LABELS:
                 return True
         except Exception:
             pass
@@ -1737,10 +1750,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         except Exception as e:  # noqa: BLE001
             log.warning("watch-dir election failed for %s (%s); proceeding solo",
                         ts.source_name[:60], e)
-            _proceed, _owner = True, ""
+            _proceed, _owner = True, None
         if not _proceed:
-            log.info("watch-dir: deferring %s — same content %s",
-                     ts.source_name[:60], _owner)
+            _owner_desc = (
+                f"{(_owner.source_infohash or '')[:10]} ({_owner.state.value})"
+                if _owner is not None else "unknown owner"
+            )
+            log.info("watch-dir: deferring %s — same content owned by %s",
+                     ts.source_name[:60], _owner_desc)
             return
 
         ts.save_path = str(self.cfg.dest.save_path)
@@ -2079,16 +2096,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         # completion is about to need.
         if self._stop:
             return
-        if (ts.cross_seed_source or "") == "watch-dir":
+        if self._is_watch_row(ts):
             # Same-content election also gates WAITING_DISK promotion: no
             # client entry exists yet, so deferring here is as cheap as NEW.
             try:
                 _proceed, _owner = self._watch_election(ts)
             except Exception:
-                _proceed, _owner = True, ""
+                _proceed, _owner = True, None
             if not _proceed:
-                log.debug("watch-dir: %s stays waiting_disk — same content %s",
-                          ts.source_name[:60], _owner)
+                _owner_desc = (
+                    f"{(_owner.source_infohash or '')[:10]} ({_owner.state.value})"
+                    if _owner is not None else "unknown owner"
+                )
+                log.debug("watch-dir: %s stays waiting_disk — same content owned by %s",
+                          ts.source_name[:60], _owner_desc)
                 # Refresh the quiet-wait window like the SSD-full path so a
                 # deferred row re-checks election at most once per interval.
                 try:

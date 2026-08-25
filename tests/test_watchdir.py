@@ -1341,11 +1341,12 @@ def test_watch_election_prefers_public(tmp_path: Path):
     coord = _election_coord(tmp_path, store)
     pub = _watch_drop(store, "Shared.Release.1080p", 5000, _PUB_ANNOUNCE, 16384)
     priv = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 32768)
-    ok_pub, _ = coord._watch_election(pub)
+    ok_pub, owner_pub = coord._watch_election(pub)
     ok_priv, owner = coord._watch_election(priv)
     assert ok_pub is True
+    assert owner_pub is None
     assert ok_priv is False
-    assert pub.source_infohash[:10] in owner
+    assert owner is not None and owner.source_infohash == pub.source_infohash
 
 
 def test_watch_election_prefers_download_tracker_over_sacrificial(tmp_path: Path):
@@ -1353,11 +1354,12 @@ def test_watch_election_prefers_download_tracker_over_sacrificial(tmp_path: Path
     coord = _election_coord(tmp_path, store)
     dl = _watch_drop(store, "Shared.Release.1080p", 5000, _DL_ANNOUNCE, 16384)
     priv = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 32768)
-    ok_dl, _ = coord._watch_election(dl)
+    ok_dl, owner_dl = coord._watch_election(dl)
     ok_priv, owner = coord._watch_election(priv)
     assert ok_dl is True
+    assert owner_dl is None
     assert ok_priv is False
-    assert dl.source_infohash[:10] in owner
+    assert owner is not None and owner.source_infohash == dl.source_infohash
 
 
 def test_watch_election_defers_to_inflight_owner(tmp_path: Path):
@@ -1367,12 +1369,51 @@ def test_watch_election_defers_to_inflight_owner(tmp_path: Path):
     owner = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 16384,
                         state=State.DOWNLOADING)
     pub = _watch_drop(store, "Shared.Release.1080p", 5000, _PUB_ANNOUNCE, 32768)
-    ok_pub, reason = coord._watch_election(pub)
+    ok_pub, winner = coord._watch_election(pub)
     assert ok_pub is False
-    assert owner.source_infohash[:10] in reason
+    assert winner is not None and winner.source_infohash == owner.source_infohash
     # The owner itself is unblocked.
-    ok_owner, _ = coord._watch_election(owner)
+    ok_owner, owner_owner = coord._watch_election(owner)
     assert ok_owner is True
+    assert owner_owner is None
+
+
+def test_watch_election_sees_proceeded_flavours_as_peers(tmp_path: Path):
+    """A public row that already proceeded still serializes later arrivals.
+
+    Regression: the peer filter only matched the pristine "watch-dir"
+    label, so a private drop arriving after the public copy left NEW
+    downloaded the same bytes a second time.
+    """
+    store = StateStore(tmp_path / "state.db")
+    coord = _election_coord(tmp_path, store)
+    owner = _watch_drop(store, "Shared.Release.1080p", 5000, _PUB_ANNOUNCE, 16384,
+                        state=State.DOWNLOADING)
+    owner.cross_seed_source = "public-watch-dir"
+    store.upsert(owner)
+    late = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 32768)
+    ok_late, winner = coord._watch_election(late)
+    assert ok_late is False
+    assert winner is not None and winner.source_infohash == owner.source_infohash
+    # Same for a sacrificial row mid-flight.
+    owner.cross_seed_source = "public-prowlarr"
+    store.upsert(owner)
+    ok_late2, winner2 = coord._watch_election(late)
+    assert ok_late2 is False
+    assert winner2 is not None and winner2.source_infohash == owner.source_infohash
+
+
+def test_watch_wait_note_names_winning_tracker(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    coord = _election_coord(tmp_path, store)
+    _watch_drop(store, "Shared.Release.1080p", 5000,
+                "https://dl-indexer.example.net/announce/xyz", 16384,
+                state=State.DOWNLOADING)
+    waiter = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 32768)
+    assert coord._watch_wait_note(waiter) == "Waiting turn · dl-indexer.example.net copy first"
+    # Proceeding rows and non-watch rows get no note.
+    assert coord._watch_wait_note(
+        _watch_drop(store, "Other.Release.1080p", 5000, _PRIV_ANNOUNCE, 16384)) == ""
 
 
 def test_watch_election_releases_on_done_and_failed(tmp_path: Path):
