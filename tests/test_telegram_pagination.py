@@ -200,6 +200,167 @@ async def test_send_one_detail_handles_timedelta_retry_after():
     assert not bot._detail_queue.empty()
 
 
+def test_flood_wait_seconds_helper():
+    import datetime as dt
+    from unittest.mock import MagicMock
+    from telegram.error import RetryAfter, TelegramError
+    from racing_sync.telegram_bot import _flood_wait_seconds
+
+    assert _flood_wait_seconds(TelegramError(
+        "Flood control exceeded. Retry in 39 seconds")) == 40
+    assert _flood_wait_seconds(TelegramError("Too Many Requests")) == 5
+    assert _flood_wait_seconds(TelegramError("Bad Request: message is empty")) is None
+    assert _flood_wait_seconds(ValueError("nope")) is None
+
+    class _RA(RetryAfter):
+        def __init__(self, v):
+            self._v = v
+            super().__init__(1)
+        @property
+        def retry_after(self):
+            return self._v
+
+    assert _flood_wait_seconds(_RA(33)) == 34
+    assert _flood_wait_seconds(_RA(dt.timedelta(seconds=5))) == 6
+
+
+@pytest.mark.anyio
+async def test_send_one_detail_recovers_plain_flood_edit():
+    """The reported bug: a flood-shaped plain TelegramError dropped the edit.
+
+    First call hits flood on edit -> sleeps the requested window and
+    re-queues; second call succeeds and the card carries the DONE state.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from telegram.error import TelegramError
+
+    bot = object.__new__(TelegramBot)
+    bot._bot = MagicMock()
+    bot._store = MagicMock()
+    bot._detail_cache = {}
+    bot._detail_queue = asyncio.Queue()
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
+
+    h = "8af4598b" + "0" * 32
+    ts = TorrentState(source_infohash=h, source_name="Show.S04E03",
+                      state=State.DONE, total_bytes=1000)
+    bot._store.get.return_value = ts
+    bot._store.get_telegram_message_id.return_value = 111
+    bot._detail_cache[h] = 111
+    flood = TelegramError("Flood control exceeded. Retry in 39 seconds")
+    bot._bot.edit_message_text = AsyncMock(side_effect=flood)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        await bot._send_one_detail(h, None)
+        mock_sleep.assert_awaited_once_with(40)
+    assert not bot._detail_queue.empty()
+    # Nothing recorded as sent yet — the card still shows the old state.
+    assert bot._sent_state_map().get(h) != State.DONE.value
+
+    # Flood lifts: the re-queued update sends the fresh DONE text.
+    bot._bot.edit_message_text = AsyncMock()
+    h2, _ = bot._detail_queue.get_nowait()
+    assert h2 == h
+    await bot._send_one_detail(h2, None)
+    sent_text = bot._bot.edit_message_text.call_args[0][0]
+    assert "DONE" in sent_text
+    assert bot._sent_state_map().get(h) == State.DONE.value
+
+
+@pytest.mark.anyio
+async def test_send_one_detail_send_path_flood_requeues():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from telegram.error import TelegramError
+
+    bot = object.__new__(TelegramBot)
+    bot._bot = MagicMock()
+    bot._store = MagicMock()
+    bot._detail_cache = {}
+    bot._detail_queue = asyncio.Queue()
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
+
+    h = "b" * 40
+    bot._store.get.return_value = TorrentState(
+        source_infohash=h, source_name="New.Show", state=State.QUEUED)
+    bot._store.get_telegram_message_id.return_value = None
+    bot._bot.send_message = AsyncMock(
+        side_effect=TelegramError("Too Many Requests: retry after 12"))
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        await bot._send_one_detail(h, None)
+        mock_sleep.assert_awaited_once_with(13)
+    assert not bot._detail_queue.empty()
+
+
+@pytest.mark.anyio
+async def test_send_one_detail_non_flood_error_still_drops():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from telegram.error import TelegramError
+
+    bot = object.__new__(TelegramBot)
+    bot._bot = MagicMock()
+    bot._store = MagicMock()
+    bot._detail_cache = {}
+    bot._detail_queue = asyncio.Queue()
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
+
+    h = "c" * 40
+    bot._store.get.return_value = TorrentState(
+        source_infohash=h, source_name="Bad.Show", state=State.DOWNLOADING)
+    bot._store.get_telegram_message_id.return_value = 111
+    bot._detail_cache[h] = 111
+    bot._bot.edit_message_text = AsyncMock(
+        side_effect=TelegramError("Bad Request: message is too long"))
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        await bot._send_one_detail(h, None)
+        mock_sleep.assert_not_called()
+    assert bot._detail_queue.empty()
+
+
+@pytest.mark.anyio
+async def test_stale_net_requeues_drifted_cards_only():
+    """Active refresh heals cards whose sent state drifted from the row."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    async def _run(sent_map):
+        bot = object.__new__(TelegramBot)
+        bot._bot = MagicMock()
+        bot._bot.edit_message_text = AsyncMock()
+        bot._bot.send_message = AsyncMock(
+            return_value=MagicMock(message_id=99))
+        bot._store = MagicMock()
+        bot._coord = MagicMock()
+        bot._coord.live_progress_map.return_value = {}
+        bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
+        bot._current_page = 0
+        bot._active_msg_id = None
+        bot._prev_active_msg_id = None
+        bot._last_active_cache = None
+        bot._detail_cache = {}
+        bot._detail_queue = asyncio.Queue()
+        bot._detail_sent_state = dict(sent_map)
+        h = "d" * 40
+        bot._store.list_active_inflight.return_value = [
+            TorrentState(source_infohash=h, source_name="Drifted",
+                         state=State.DONE, total_bytes=1000),
+        ]
+        await bot._refresh_active_message_inner()
+        got = []
+        while not bot._detail_queue.empty():
+            got.append(bot._detail_queue.get_nowait()[0])
+        return got
+
+    # Stale card (sent QUEUED, row DONE) gets re-queued...
+    assert await _run({"d" * 40: "queued"}) == ["d" * 40]
+    # ...while a fresh card stays silent.
+    assert await _run({"d" * 40: "done"}) == []
+
+
 def test_render_active_deterministic_cache_key():
     import time
     ts = TorrentState(

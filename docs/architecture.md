@@ -266,7 +266,11 @@ explanatory reply. Unknown/ambiguous prefixes get an explanatory
 reply. Callback debounce stays pagination-only. Cancelled releases live
 in `ignored_torrents` (in state.db, so `--reset` clears them) and are
 skipped at discovery, recovery adoption, re-injection and late-seed
-time.
+time. Flood control (including plain-text "Flood control exceeded" errors,
+not just `RetryAfter`) sleeps out the requested window and re-queues the
+update instead of dropping it; every successful detail send records its
+state, and each active-tasks refresh re-queues cards that drifted, so no
+card freezes at a dead state forever.
 
 ## FastAPI control plane
 

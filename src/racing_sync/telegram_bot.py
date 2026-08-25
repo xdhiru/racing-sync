@@ -335,6 +335,42 @@ def _fetch_command(infohash: str) -> str:
     return f"/fetch_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
+def _flood_wait_seconds(e: BaseException, default: int = 5) -> int | None:
+    """Seconds Telegram asks us to wait, or None when not rate-limited.
+
+    Flood control does not always arrive as a `RetryAfter` instance — the
+    observed failure mode is a plain `TelegramError("Flood control
+    exceeded. Retry in N seconds")`, which the old code logged and
+    dropped, freezing the card at its last state forever. Any
+    rate-limit-shaped error sleeps out the requested window and retries
+    instead of dropping the update.
+    """
+    try:
+        if isinstance(e, RetryAfter):
+            raw = e.retry_after
+            if isinstance(raw, dt.timedelta):
+                return int(raw.total_seconds()) + 1
+            return int(raw) + 1
+    except Exception:
+        pass
+    try:
+        msg = str(e or "").lower()
+    except Exception:
+        return None
+    if not any(k in msg for k in (
+        "flood", "too many requests", "rate limit", "ratelimit",
+        "slow mode", "slowmode",
+    )) and re.search(r"retry (?:in|after) \d+", msg) is None:
+        return None
+    try:
+        m = re.search(r"retry (?:in|after) (\d+)", msg)
+        if m:
+            return int(m.group(1)) + 1
+    except Exception:
+        pass
+    return default
+
+
 def render_active(
     active: list[tuple[TorrentState, float | None]],
     page: int = 0,
@@ -459,6 +495,10 @@ class TelegramBot:
         # In-process cache: source_infohash -> message_id, so we don't
         # need to hit state.db for every send.
         self._detail_cache: dict[str, int] = {}
+        # Last successfully sent detail state per infohash — the stale-card
+        # net re-queues rows whose card drifted (e.g. an edit lost to a
+        # flood ban) so no card freezes at a dead state forever.
+        self._detail_sent_state: dict[str, str] = {}
         # Cached "last active-tasks (page, total_pages, text)" so we skip identical edits.
         self._last_active_cache: tuple[int, int, str] | None = None
         # Per-chat debounce (monotonic timestamps by chat/user key): one
@@ -488,11 +528,16 @@ class TelegramBot:
         # grow memory. 256 is well over what any operator needs.
         self._detail_queue = asyncio.Queue(maxsize=256)
         # Pre-fill cache from the store so we don't re-send every
-        # torrent on restart.
+        # torrent on restart. Sent states pre-fill too, so the stale-card
+        # net stays quiet until a card actually drifts.
         all_items = await asyncio.to_thread(self._store.all)
         for ts in all_items:
             if ts.telegram_message_id:
                 self._detail_cache[ts.source_infohash] = ts.telegram_message_id
+            try:
+                self._detail_sent_state[ts.source_infohash] = ts.state.value
+            except Exception:
+                pass
         # Restore active message ID across restarts to prevent duplicate messages
         raw_active_id = await asyncio.to_thread(self._store.get_meta, "telegram_active_msg_id")
         if raw_active_id:
@@ -661,8 +706,29 @@ class TelegramBot:
                 log.warning("telegram detail worker error: %s", e)
                 await asyncio.sleep(1.0)
 
+    def _sent_state_map(self) -> dict[str, str]:
+        """Last successfully sent detail state per infohash (creates on demand).
+
+        Unit-test doubles build the bot via object.__new__ (no __init__),
+        so every access goes through here instead of assuming attributes.
+        """
+        try:
+            m = getattr(self, "_detail_sent_state", None)
+            if not isinstance(m, dict):
+                m = {}
+                self._detail_sent_state = m
+            return m
+        except Exception:
+            return {}
+
+    def _mark_detail_sent(self, infohash: str, state_value: str) -> None:
+        try:
+            self._sent_state_map()[infohash] = state_value
+        except Exception:
+            pass
+
     async def _send_one_detail(self, infohash: str,
-                                progress: float | None) -> None:
+                               progress: float | None) -> None:
         """Send or edit the detail message for a single torrent."""
         if self._bot is None:
             return
@@ -670,9 +736,27 @@ class TelegramBot:
         if ts is None:
             return
         text = render_detail(ts, progress)
+        try:
+            state_value = ts.state.value
+        except Exception:
+            state_value = ""
         msg_id = self._detail_cache.get(infohash)
         if msg_id is None:
             msg_id = await asyncio.to_thread(self._store.get_telegram_message_id, infohash)
+
+        async def _retry_rate_limited(err: BaseException) -> bool:
+            """Sleep out a rate limit and requeue; False when not one."""
+            _wait = _flood_wait_seconds(err)
+            if _wait is None:
+                return False
+            log.warning(
+                "telegram detail rate-limited for %s; retrying in %ds",
+                infohash[:10], _wait,
+            )
+            await asyncio.sleep(_wait)
+            self._enqueue_detail(infohash, progress)
+            return True
+
         try:
             if msg_id is None:
                 try:
@@ -693,6 +777,7 @@ class TelegramBot:
                     self._store.set_telegram_message_id,
                     infohash, sent.message_id,
                 )
+                self._mark_detail_sent(infohash, state_value)
             else:
                 try:
                     await self._bot.edit_message_text(
@@ -701,9 +786,11 @@ class TelegramBot:
                         message_id=msg_id,
                         parse_mode=ParseMode.MARKDOWN,
                     )
+                    self._mark_detail_sent(infohash, state_value)
                 except TelegramError as e:
                     msg = str(e).lower()
                     if "not modified" in msg:
+                        self._mark_detail_sent(infohash, state_value)
                         return
                     if "not found" in msg or "invalid" in msg:
                         # Message was deleted; resend.
@@ -725,12 +812,16 @@ class TelegramBot:
                             self._store.set_telegram_message_id,
                             infohash, sent.message_id,
                         )
+                        self._mark_detail_sent(infohash, state_value)
                     elif _is_parse_error(e):
                         await self._bot.edit_message_text(
                             text,
                             chat_id=self._cfg.chat_id,
                             message_id=msg_id,
                         )
+                        self._mark_detail_sent(infohash, state_value)
+                    elif await _retry_rate_limited(e):
+                        return
                     else:
                         log.warning(
                             "telegram detail edit failed for %s: %s",
@@ -748,6 +839,8 @@ class TelegramBot:
             log.warning("telegram detail send timed out (%s); will retry next interval", e)
             self._enqueue_detail(infohash, progress)
         except TelegramError as e:
+            if await _retry_rate_limited(e):
+                return
             log.warning("telegram detail send failed for %s: %s",
                         infohash[:10], e)
 
@@ -1084,6 +1177,9 @@ class TelegramBot:
             cached = getattr(self, "_detail_cache", None)
             if isinstance(cached, dict):
                 cached.pop(infohash, None)
+            sent_map = getattr(self, "_detail_sent_state", None)
+            if isinstance(sent_map, dict):
+                sent_map.pop(infohash, None)
         except Exception:
             pass
         if detail_msg_id:
@@ -1209,6 +1305,23 @@ class TelegramBot:
             (ts, progress_map.get(ts.source_infohash.lower()))
             for ts in rows
         ]
+        # Stale-card net: re-queue detail updates whose card drifted from
+        # the row (edits lost to flood bans, restarts mid-edit). Steady
+        # state is silent — only drift enqueues, with live progress, and
+        # the worker batch coalesces duplicates.
+        try:
+            _sent = self._sent_state_map()
+            for _ts, _prog in items:
+                try:
+                    _h = _ts.source_infohash or ""
+                    if not _h:
+                        continue
+                    if _sent.get(_h) != _ts.state.value:
+                        self._enqueue_detail(_h, _prog)
+                except Exception:
+                    continue
+        except Exception:
+            pass
         text, cur_page, total_pages = render_active(
             items, page=self._current_page, page_size=self._cfg.page_size
         )
