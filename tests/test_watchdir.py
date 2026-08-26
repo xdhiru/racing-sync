@@ -1336,6 +1336,97 @@ def test_is_watch_row_labels_and_blob_dir(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_do_new_watch_dir_all_remote_skips_budget(tmp_path: Path):
+    """Already-remote drops never queue behind SSD budget they won't use."""
+    from unittest.mock import AsyncMock
+
+    from racing_sync.config import ClassifierConfig
+
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    (fuse_dir / "Budget.Movie.1080p.mkv").write_bytes(b"m" * 2000)
+    raw = _create_sample_torrent_data(
+        "Budget.Movie.1080p.mkv", 2000, "https://alpha.cc/announce/xyz")
+    infohash, name, total, announce = _bencoded_info_hash(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = make_coordinator()
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 1  # budget exhausted for everything
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.classifier = ClassifierConfig()
+    coord.cfg.rclone.fuse.mount = fuse_dir
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-u"
+    coord.cfg.general.state_db = tmp_path / "state.db"
+    coord.cfg.general.disk_safety_margin_bytes = 1000
+    coord.cfg.prowlarr.enabled = False
+    coord.prowlarr = None
+    coord.store = store
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+    coord._ssd_try_reserve = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash=infohash, source_name=name, total_bytes=total,
+        source_announce_url=announce, cross_seed_blob=raw,
+        cross_seed_source="watch-dir", state=State.NEW,
+    )
+    ts._blob = raw
+    try:
+        await coord._do_new_watch_dir(ts)
+        assert ts.state == State.QUEUED
+        coord._ssd_try_reserve.assert_not_called()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_do_new_watch_dir_partial_remote_still_parks(tmp_path: Path):
+    """One missing byte on fuse: normal budget queue, no over-skip."""
+    from unittest.mock import AsyncMock
+
+    from racing_sync.config import ClassifierConfig
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    raw = _create_sample_torrent_data(
+        "Missing.Movie.1080p.mkv", 2000, "https://alpha.cc/announce/xyz")
+    infohash, name, total, announce = _bencoded_info_hash(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = make_coordinator()
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 1
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.classifier = ClassifierConfig()
+    coord.cfg.rclone.fuse.mount = fuse_dir
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-u"
+    coord.cfg.general.state_db = tmp_path / "state.db"
+    coord.cfg.general.disk_safety_margin_bytes = 1000
+    coord.cfg.prowlarr.enabled = False
+    coord.prowlarr = None
+    coord.store = store
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+    coord._ssd_try_reserve = AsyncMock(return_value=False)
+
+    ts = TorrentState(
+        source_infohash=infohash, source_name=name, total_bytes=total,
+        source_announce_url=announce, cross_seed_blob=raw,
+        cross_seed_source="watch-dir", state=State.NEW,
+    )
+    ts._blob = raw
+    try:
+        await coord._do_new_watch_dir(ts)
+        assert ts.state == State.WAITING_DISK
+        coord._ssd_try_reserve.assert_awaited_once()
+    finally:
+        store.close()
+
+
 def test_watch_election_prefers_public(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     coord = _election_coord(tmp_path, store)

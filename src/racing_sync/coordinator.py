@@ -1292,6 +1292,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         ts.cross_seed_blob = decision.torrent_bytes
         ts._blob = decision.torrent_bytes
 
+        # Admit-time all-remote skip: the decision bytes already sit
+        # verified on fuse, so no SSD budget is reserved at all — the QUEUED
+        # setup shortcut carries the row fuse-gated to RE_ADDING. Fail-open:
+        # any doubt reserves normally.
+        try:
+            _fully_remote = await self._blob_fully_remote(decision.torrent_bytes)
+        except Exception:
+            _fully_remote = None
+        if _fully_remote is True:
+            log.info("content for %s already fully on remote; skipping SSD budget",
+                     st.name[:60])
+            try:
+                self.transition(ts, State.QUEUED)
+            except Exception:
+                await self._ssd_release(ts.source_infohash)
+                raise
+            return
+
         # Global SSD ledger: reserve before QUEUED so concurrent high-size
         # arrivals can't all pass a point-in-time free check and exceed the
         # budget as they grow. Estimate uses the stable configured cap.
@@ -1928,6 +1946,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         ts.cross_seed_blob = chosen_blob
         ts._blob = chosen_blob
 
+        # Admit-time all-remote skip: the bytes already sit verified on
+        # fuse, so no SSD budget is reserved at all (even reserve(0) can
+        # park on a full disk) — the QUEUED setup shortcut carries the row
+        # fuse-gated to RE_ADDING. Fail-open: any doubt reserves normally.
+        try:
+            _fully_remote = await self._blob_fully_remote(chosen_blob)
+        except Exception:
+            _fully_remote = None
+        if _fully_remote is True:
+            log.info("watch-dir: %s already fully on remote; skipping SSD budget",
+                     ts.source_name[:60])
+            try:
+                self.transition(ts, State.QUEUED)
+            except Exception:
+                await self._ssd_release(ts.source_infohash)
+                raise
+            return
+
         needed = self._ssd_estimate_for_new(chosen_size)
         if not await self._ssd_try_reserve(ts.source_infohash, needed):
             log.info(
@@ -2494,6 +2530,41 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 )
                 best = max(best, rem)
             return best
+        except Exception:
+            return None
+
+    async def _blob_fully_remote(self, blob: bytes | None) -> bool | None:
+        """True iff every file in the .torrent bytes already sits verified on fuse.
+
+        Admit-time shortcut so already-remote content never queues behind
+        SSD budget it will never use (a fully-remote season otherwise parks
+        in WAITING_DISK for hours, then stalls past QUEUED). Three-valued:
+        None = unknowable (no blob, undecodable, empty, stat failure) and
+        the caller keeps today's flow; False = real SSD work remains. Only
+        size-verified files count, and both downstream gates (QUEUED setup
+        shortcut, RE_ADDING fuse gate) re-verify, so a wrong True degrades
+        to a parked re-add, never a blind seed.
+        """
+        try:
+            if not blob or not isinstance(blob, (bytes, bytearray)):
+                return None
+            from .watchdir import extract_torrent_files_from_bencoded
+            try:
+                parsed = extract_torrent_files_from_bencoded(bytes(blob))
+            except Exception:
+                return None
+            names = [(f.name, f.size_bytes) for f in (parsed or [])
+                     if getattr(f, "name", "")]
+            if not names:
+                return None
+            try:
+                kind = classify(parsed, self.cfg).kind
+            except Exception:
+                kind = "unknown"
+            skipped = await self._fuse_skipped(names, kind or "unknown")
+            if not skipped:
+                return False
+            return all(n in skipped for n, _ in names)
         except Exception:
             return None
 
