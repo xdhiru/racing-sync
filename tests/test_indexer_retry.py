@@ -695,6 +695,83 @@ async def test_reset_empty_db_rediscovers_waiting_row_from_zero(tmp_path: Path):
     store.close()
 
 
+def _sample_blob(name: str, size: int, announce: str, piece_length: int = 16384) -> bytes:
+    from racing_sync.watchdir import _bencode
+
+    return _bencode({
+        b"announce": announce.encode(),
+        b"info": {
+            b"name": name.encode(),
+            b"length": size,
+            b"piece length": piece_length,
+            b"pieces": b"12345678901234567890",
+        },
+    })
+
+
+@pytest.mark.anyio
+async def test_pick_and_admit_all_remote_skips_budget(tmp_path: Path):
+    """Decision bytes already on fuse: QUEUED with no reservation."""
+    from unittest.mock import AsyncMock, patch
+
+    from racing_sync.config import ClassifierConfig
+    from racing_sync.coordinator_content import SourceDecision
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    (fuse_dir / "Admit.Movie.1080p.mkv").write_bytes(b"m" * 2000)
+    blob = _sample_blob("Admit.Movie.1080p.mkv", 2000, "https://alpha.cc/announce/xyz")
+
+    coord = _pick_coord()
+    coord.cfg.classifier = ClassifierConfig()
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.rclone.fuse.mount = fuse_dir
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-u"
+    coord._ssd_try_reserve = AsyncMock()
+    decision = SourceDecision(
+        torrent_bytes=blob, source_label="private-export-fallback",
+        name="Admit.Movie.1080p.mkv", size_bytes=2000,
+        infohash="d" * 40, announce_url="https://alpha.cc/announce/xyz",
+    )
+    ts = TorrentState(source_infohash="d" * 40, state=State.NEW)
+    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
+               new_callable=AsyncMock) as pick:
+        pick.return_value = decision
+        await coord._pick_and_admit(ts, _priv_st(), [])
+    assert ts.state == State.QUEUED
+    coord._ssd_try_reserve.assert_not_called()
+    assert ts.cross_seed_blob == blob
+
+
+def test_blob_fully_remote_three_valued(tmp_path: Path):
+    import asyncio
+
+    from racing_sync.config import ClassifierConfig
+
+    coord = make_coordinator()
+    coord.cfg.classifier = ClassifierConfig()
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.dest.save_path = tmp_path
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    coord.cfg.rclone.fuse.mount = fuse_dir
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-u"
+
+    async def _check(blob):
+        return await coord._blob_fully_remote(blob)
+
+    raw = _sample_blob("Remote.Movie.1080p.mkv", 2000, "https://alpha.cc/announce/xyz")
+    assert asyncio.run(_check(None)) is None
+    assert asyncio.run(_check(b"junk")) is None
+    # Present but short on fuse: real work remains.
+    (fuse_dir / "Remote.Movie.1080p.mkv").write_bytes(b"m" * 1999)
+    assert asyncio.run(_check(raw)) is False
+    # Full size: fully remote.
+    (fuse_dir / "Remote.Movie.1080p.mkv").write_bytes(b"m" * 2000)
+    assert asyncio.run(_check(raw)) is True
+
+
 def test_fallback_config_validation():
     from racing_sync.config import CrossSeedConfig
 
