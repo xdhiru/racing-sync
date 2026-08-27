@@ -12,8 +12,9 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
-from .state import State
+from .state import State, TorrentState
 
 log = logging.getLogger(__name__)
 
@@ -221,6 +222,128 @@ PUBLIC_TRACKER_HOSTS = (
 WATCH_ORIGIN_LABELS = frozenset({
     "watch-dir", "public-watch-dir", "public-prowlarr",
 })
+
+#: Watch rows holding SSD/client presence lock election ownership.
+WATCH_ELECTION_LOCKED_STATES = frozenset({
+    State.QUEUED, State.DOWNLOADING, State.MOVING, State.RE_ADDING,
+})
+
+#: Watch rows that can still be waiting on an owner.
+WATCH_ELECTION_WAITER_STATES = frozenset({State.NEW, State.WAITING_DISK})
+
+#: All in-flight watch states considered for election grouping.
+WATCH_ELECTION_ACTIVE_STATES = frozenset(
+    WATCH_ELECTION_WAITER_STATES | WATCH_ELECTION_LOCKED_STATES
+)
+
+
+def is_watch_row(row: TorrentState, cfg) -> bool:
+    """True when this row originated from a watch-dir drop.
+
+    Pure version of the coordinator check (labels change past NEW, so the
+    persisted blob dir is the durable signal). Never raises.
+    """
+    try:
+        if (row.cross_seed_source or "") in WATCH_ORIGIN_LABELS:
+            return True
+    except Exception:
+        pass
+    try:
+        base = Path(cfg.general.state_db).parent
+    except Exception:
+        return False
+    try:
+        blob_dir = base / "watch_cross_seeds" / (row.source_infohash or "")
+        return blob_dir.is_dir() and any(blob_dir.glob("*.torrent"))
+    except Exception:
+        return False
+
+
+def watch_rank(row: TorrentState, cfg) -> int:
+    """SSD-download priority for a watch-dir row: public (0) first.
+
+    Lower wins. Never raises (doubt ranks last).
+    """
+    try:
+        tracker_list = [u for u in (row.source_announce_url or "").split(",") if u] or (
+            [row.source_tracker] if row.source_tracker else []
+        )
+    except Exception:
+        tracker_list = []
+    try:
+        if _looks_public(tracker_list):
+            return 0
+    except Exception:
+        pass
+    try:
+        if cfg.prowlarr.enabled and any(
+            cfg.prowlarr.is_download_indexer(u) for u in tracker_list
+        ):
+            return 1
+    except Exception:
+        pass
+    return 2
+
+
+def watch_election_winner(rows, ts: TorrentState, cfg) -> TorrentState | None:
+    """Winner blocking `ts`, or None when it may proceed. Pure.
+
+    Same-content watch drops (normalized name + size) elect ONE
+    downloader; locked (QUEUED+) rows win first-come, else the best
+    rank (public > download-tracker > sacrificial, earliest first).
+    Never raises: any doubt returns None (proceed solo).
+    """
+    try:
+        if not is_watch_row(ts, cfg):
+            return None
+        if ts.state not in WATCH_ELECTION_WAITER_STATES:
+            return None
+        want_norm = normalize_content_name(ts.source_name or "")
+        if not want_norm:
+            return None
+        self_hash = (ts.source_infohash or "").lower()
+        peers: list[TorrentState] = []
+        for p in rows or []:
+            try:
+                if (p.source_infohash or "").lower() == self_hash:
+                    continue
+                if p.state not in WATCH_ELECTION_ACTIVE_STATES:
+                    continue
+                if normalize_content_name(p.source_name or "") != want_norm:
+                    continue
+                if ts.total_bytes and p.total_bytes and p.total_bytes != ts.total_bytes:
+                    continue
+                if not is_watch_row(p, cfg):
+                    continue
+                peers.append(p)
+            except Exception:
+                continue
+        if not peers:
+            return None
+        locked = sorted(
+            (p for p in peers if p.state in WATCH_ELECTION_LOCKED_STATES),
+            key=lambda p: (p.source_infohash or "").lower(),
+        )
+        if locked:
+            return locked[0]
+
+        def _wkey(p: TorrentState) -> tuple[int, str, str]:
+            try:
+                rank = watch_rank(p, cfg)
+            except Exception:
+                rank = 2
+            return (rank, str(getattr(p, "created_at", "") or ""),
+                    (p.source_infohash or "").lower())
+
+        ordered = sorted([ts, *[p for p in peers
+                                  if p.state in WATCH_ELECTION_WAITER_STATES]],
+                         key=_wkey)
+        winner = ordered[0]
+        if (winner.source_infohash or "").lower() == self_hash:
+            return None
+        return winner
+    except Exception:
+        return None
 
 
 def announce_domain(url: str) -> str:

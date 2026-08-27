@@ -242,3 +242,142 @@ async def test_forget_missing_client_entry_still_drops_row(tmp_path: Path):
 
     assert result["dest_entries"] == []
     assert store.get("a" * 40) is None
+
+
+def _watch_pair_store(tmp_path: Path):
+    """Owner DOWNLOADING + two NEW waiters (same content) + bystanders."""
+    from racing_sync.state import StateStore
+    store = StateStore(tmp_path / "state.db")
+
+    def _w(h, name="Shared.Show.S01E01", size=1000, state=State.NEW,
+           source="watch-dir"):
+        ts = TorrentState(source_infohash=h, source_name=name,
+                          total_bytes=size, cross_seed_source=source,
+                          source_announce_url="https://alpha.cc/announce/xyz",
+                          state=state)
+        store.upsert(ts)
+        return ts
+
+    owner = _w("a" * 40, state=State.DOWNLOADING)
+    w1 = _w("b" * 40)
+    w2 = _w("c" * 40)
+    other = _w("d" * 40, name="Other.Show.S01E01")
+    diff_size = _w("e" * 40, size=2000)
+    return store, owner, (w1, w2), (other, diff_size)
+
+
+@pytest.mark.anyio
+async def test_forget_cascades_to_waiting_pairs(tmp_path: Path):
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store, _owner, waiters, bystanders = _watch_pair_store(tmp_path)
+    dest = FakeDest()
+    dest.seed("a" * 40, str(ssd), [TorrentFile(name="Shared/a.mkv", size_bytes=10)])
+
+    result = await forget_torrent(
+        _cfg(ssd), dest=dest, store=store, target="a" * 40,
+        apply=True, delete_files=True, ignore=True,
+    )
+
+    assert store.get("a" * 40) is None
+    assert store.get("b" * 40) is None
+    assert store.get("c" * 40) is None
+    # Bystanders (other content / other size) survive untouched.
+    assert store.get("d" * 40) is not None
+    assert store.get("e" * 40) is not None
+    # ... but everything cancelled is ignored so nothing comes back.
+    for h in ("a" * 40, "b" * 40, "c" * 40):
+        assert store.is_ignored(h) is True
+    assert store.is_ignored("d" * 40) is False
+    paired = {p["source_infohash"] for p in result["paired_cancelled"]}
+    assert paired == {"b" * 40, "c" * 40}
+    assert result["errors"] == []
+
+
+@pytest.mark.anyio
+async def test_forget_dry_run_plans_pairs_without_deleting(tmp_path: Path):
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store, _owner, _waiters, _bystanders = _watch_pair_store(tmp_path)
+    dest = FakeDest()
+
+    result = await forget_torrent(
+        _cfg(ssd), dest=dest, store=store, target="a" * 40,
+        apply=False, delete_files=True, ignore=True,
+    )
+
+    assert result["applied"] is False
+    assert {p["source_infohash"] for p in result["paired_cancelled"]} == {"b" * 40, "c" * 40}
+    assert store.get("a" * 40) is not None
+    assert store.get("b" * 40) is not None
+    assert store.is_ignored("a" * 40) is False
+
+
+@pytest.mark.anyio
+async def test_forget_waiter_cancels_alone(tmp_path: Path):
+    """Cancelling a waiter leaves the owner and its siblings running."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store, _owner, _waiters, _bystanders = _watch_pair_store(tmp_path)
+    dest = FakeDest()
+
+    result = await forget_torrent(
+        _cfg(ssd), dest=dest, store=store, target="b" * 40,
+        apply=True, delete_files=True, ignore=True,
+    )
+
+    assert store.get("b" * 40) is None
+    assert store.get("a" * 40) is not None
+    assert store.get("c" * 40) is not None
+    assert result["paired_cancelled"] == []
+
+
+@pytest.mark.anyio
+async def test_forget_done_owner_cascades_nothing(tmp_path: Path):
+    """DONE releases election — a same-content NEW row is independent."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(
+        source_infohash="a" * 40, source_name="Shared.Show.S01E01",
+        total_bytes=1000, cross_seed_source="watch-dir",
+        source_announce_url="https://alpha.cc/announce/xyz",
+        state=State.DONE))
+    store.upsert(TorrentState(
+        source_infohash="b" * 40, source_name="Shared.Show.S01E01",
+        total_bytes=1000, cross_seed_source="watch-dir",
+        source_announce_url="https://alpha.cc/announce/xyz",
+        state=State.NEW))
+    dest = FakeDest()
+
+    result = await forget_torrent(
+        _cfg(ssd), dest=dest, store=store, target="a" * 40,
+        apply=True, delete_files=True, ignore=True,
+    )
+
+    assert store.get("b" * 40) is not None
+    assert result["paired_cancelled"] == []
+
+
+@pytest.mark.anyio
+async def test_forget_verify_after_delete_reports_survivors(tmp_path: Path):
+    """An entry surviving delete is an error, not silent success."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(_row(save_path=str(ssd)))
+
+    class StubbornDest(FakeDest):
+        async def delete(self, h: str, *, delete_files: bool = False):
+            self.delete_calls.append((h.lower(), delete_files))
+            # Simulates a no-op delete: entry stays listed.
+
+    dest = StubbornDest()
+    dest.seed("a" * 40, str(ssd), [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
+
+    result = await forget_torrent(
+        _cfg(ssd), dest=dest, store=store, target="a" * 40,
+        apply=True, delete_files=True,
+    )
+
+    assert any("still present after delete" in e for e in result["errors"])

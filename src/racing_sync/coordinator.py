@@ -48,12 +48,16 @@ from .coordinator_content import (
     _verified_cross_seed_blob,
     announce_domain,
     cleanup_grace_seconds,
+    is_watch_row,
     normalize_content_name,
+    watch_election_winner,
+    watch_rank,
 )
 from .coordinator_content import WATCH_ORIGIN_LABELS
 from .coordinator_errors import (
     _NOT_VISIBLE_DETAIL,
     _WEBUI_RETRY_ERRORS,
+    AbandonedError,
     BatchMoveIncompleteError,
     WebUIUnresponsiveError,
 )
@@ -77,6 +81,7 @@ log = logging.getLogger(__name__)
 
 
 __all__ = [
+    "AbandonedError",
     "BatchMoveIncompleteError",
     "Coordinator",
     "LiveItem",
@@ -609,6 +614,18 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             item_hash = item.infohash.lower()
             ingested = False
             if self.store.get(item_hash) is None:
+                try:
+                    _ignored = self.store.is_ignored(item_hash) is True
+                except Exception:
+                    _ignored = False
+                if _ignored:
+                    # A cancelled drop re-appearing: respect the ignore list
+                    # instead of re-ingesting. The file is left in place
+                    # (never destroy what we didn't consume); unignore to
+                    # reprocess it.
+                    log.info("watch-dir: ignoring cancelled drop %s (%s)",
+                             item.name[:60], item.infohash[:10])
+                    continue
                 ts = TorrentState(
                     source_infohash=item_hash,
                     source_name=item.name,
@@ -998,6 +1015,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     )
                     return
             await self._process_torrent_inner(ts)
+        except AbandonedError as e:
+            # The DB row is gone (forget/cancel removed it mid-flight):
+            # unwind quietly. Failing here would upsert-resurrect the
+            # deliberately deleted row as a zombie FAILED row.
+            log.info("worker: %s abandoned (%s); stopping",
+                     ts.source_infohash[:10], e)
+            return
         except RcloneTimeoutError as e:
             # Last-resort net: a timed-out move from any path parks the row
             # (source bytes intact) instead of failing it. The two expected
@@ -1017,6 +1041,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             except Exception:  # noqa: BLE001
                 pass
         except Exception as e:  # noqa: BLE001
+            # Backstop for the same abandonment race on every other path:
+            # if the row is gone, any failure string would resurrect it.
+            try:
+                _row_gone = (
+                    getattr(self, "store", None) is not None
+                    and hasattr(self.store, "get")
+                    and self.store.get(ts.source_infohash) is None
+                )
+            except Exception:
+                _row_gone = False
+            if _row_gone:
+                log.info("worker: row gone for %s; dropping error (%s)",
+                         ts.source_infohash[:10], e)
+                return
             log.exception("worker failed for %s", ts.source_infohash[:10])
             if ts.state == State.DONE:
                 # DONE is terminal: a late exception (e.g. after transition)
@@ -1595,32 +1633,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         await self._pick_and_admit(ts, st, self._same_content_torrents(all_source, st))
 
     def _watch_rank(self, ts: TorrentState) -> int:
-        """SSD-download priority for a watch-dir row: public (0) first.
-
-        Mirrors the `_do_new_watch_dir` classification so election and
-        download agree: a public drop costs no ratio, a download-target
-        tracker drop costs ratio on that tracker, anything else needs a
-        Prowlarr sacrificial copy. Lower wins.
-        """
-        try:
-            tracker_list = [u for u in (ts.source_announce_url or "").split(",") if u] or (
-                [ts.source_tracker] if ts.source_tracker else []
-            )
-        except Exception:
-            tracker_list = []
-        try:
-            if _looks_public(tracker_list):
-                return 0
-        except Exception:
-            pass
-        try:
-            if self.cfg.prowlarr.enabled and any(
-                self.cfg.prowlarr.is_download_indexer(u) for u in tracker_list
-            ):
-                return 1
-        except Exception:
-            pass
-        return 2
+        """SSD-download priority for a watch-dir row: public (0) first."""
+        return watch_rank(ts, self.cfg)
 
     def _watch_election(self, ts: TorrentState) -> tuple[bool, TorrentState | None]:
         """Whether this watch-dir row may proceed to SSD admission.
@@ -1637,63 +1651,18 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         behavior).
         """
         try:
-            if not self._is_watch_row(ts):
-                return True, None
-            if ts.state not in (State.NEW, State.WAITING_DISK):
-                return True, None
-            want_norm = normalize_content_name(ts.source_name or "")
-            if not want_norm:
-                return True, None
-            try:
-                rows = self.store.all()
-            except Exception as e:  # noqa: BLE001
-                log.warning("watch-dir election: cannot list rows (%s); proceeding solo", e)
-                return True, None
-            peers: list[TorrentState] = []
-            for p in rows or []:
-                try:
-                    if (p.source_infohash or "").lower() == (ts.source_infohash or "").lower():
-                        continue
-                    if p.state not in (State.NEW, State.WAITING_DISK, State.QUEUED,
-                                       State.DOWNLOADING, State.MOVING, State.RE_ADDING):
-                        continue
-                    if normalize_content_name(p.source_name or "") != want_norm:
-                        continue
-                    if ts.total_bytes and p.total_bytes and p.total_bytes != ts.total_bytes:
-                        continue
-                    if not self._is_watch_row(p):
-                        continue
-                    peers.append(p)
-                except Exception:
-                    continue
-            if not peers:
-                return True, None
-            locked = sorted(
-                (p for p in peers if p.state in (State.QUEUED, State.DOWNLOADING,
-                                                 State.MOVING, State.RE_ADDING)),
-                key=lambda p: (p.source_infohash or "").lower(),
-            )
-            if locked:
-                return False, locked[0]
-
-            def _wkey(p: TorrentState) -> tuple[int, str, str]:
-                try:
-                    rank = self._watch_rank(p)
-                except Exception:
-                    rank = 2
-                return (rank, str(getattr(p, "created_at", "") or ""),
-                        (p.source_infohash or "").lower())
-
-            ordered = sorted([ts, *[p for p in peers
-                                      if p.state in (State.NEW, State.WAITING_DISK)]],
-                             key=_wkey)
-            winner = ordered[0]
-            if (winner.source_infohash or "").lower() == (ts.source_infohash or "").lower():
-                return True, None
-            return False, winner
+            rows = self.store.all()
+        except Exception as e:  # noqa: BLE001
+            log.warning("watch-dir election: cannot list rows (%s); proceeding solo", e)
+            return True, None
+        try:
+            winner = watch_election_winner(rows, ts, self.cfg)
         except Exception as e:  # noqa: BLE001
             log.warning("watch-dir election failed (%s); proceeding solo", e)
             return True, None
+        if winner is None:
+            return True, None
+        return False, winner
 
     def _watch_wait_note(self, ts: TorrentState) -> str:
         """Short human reason a watch row is deferred, or "" when it may proceed.
@@ -1720,29 +1689,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             return ""
 
     def _is_watch_row(self, ts: TorrentState) -> bool:
-        """True when this row originated from a watch-dir drop.
-
-        `cross_seed_source` is overwritten with the chosen SSD flavour
-        ("watch-dir" | "public-watch-dir" | "public-prowlarr"), so the
-        label alone cannot identify watch rows past NEW — a sacrificial
-        row would otherwise be mistaken for a VPS1 row and miss its
-        fuse injection. The persisted blob dir
-        (watch_cross_seeds/<infohash>/) is created for every watch row
-        that proceeds, and only for watch rows, so its presence is the
-        durable origin signal. Never raises.
-        """
+        """True when this row originated from a watch-dir drop."""
         try:
-            if (ts.cross_seed_source or "") in WATCH_ORIGIN_LABELS:
-                return True
-        except Exception:
-            pass
-        try:
-            base = Path(self.cfg.general.state_db).parent
-        except Exception:
-            return False
-        try:
-            blob_dir = base / "watch_cross_seeds" / (ts.source_infohash or "")
-            return blob_dir.is_dir() and any(blob_dir.glob("*.torrent"))
+            return bool(is_watch_row(ts, self.cfg))
         except Exception:
             return False
 
@@ -3291,6 +3240,25 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         while not self._stop:
             t = await self.dest_client.get_torrent(h)
             if t is None:
+                # Vanished entry + vanished row = the operator abandoned
+                # this torrent mid-download (forget/cancel): unwind quietly
+                # so the worker wrapper doesn't resurrect it as FAILED.
+                # Vanished entry + live row = real client-side loss: fail.
+                try:
+                    _gone = (
+                        getattr(self, "store", None) is not None
+                        and hasattr(self.store, "get")
+                        and self.store.get(ts.source_infohash) is None
+                    )
+                except Exception:
+                    _gone = False
+                if _gone:
+                    log.info(
+                        "worker: row gone for %s; stopping download",
+                        ts.source_infohash[:10],
+                    )
+                    raise AbandonedError(
+                        f"row forgotten while downloading: {h[:10]}")
                 raise RuntimeError(f"torrent vanished mid-download: {h}")
 
             if expected_files is not None:

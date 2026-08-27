@@ -1427,6 +1427,34 @@ async def test_do_new_watch_dir_partial_remote_still_parks(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_scan_watch_skips_ignored_drop_and_keeps_file(tmp_path: Path):
+    """A cancelled (ignored) hash re-dropped is left alone, not re-ingested."""
+    from racing_sync.state import StateStore
+
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    raw = _create_sample_torrent_data(
+        "Ignored.Show.S01E01", 5000, "https://alpha.cc/announce/xyz")
+    tfile = watch_dir / "ignored.torrent"
+    tfile.write_bytes(raw)
+    infohash, _, _, _ = _bencoded_info_hash(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    store.ignore_torrent(infohash, "Ignored.Show.S01E01")
+    coord = make_coordinator()
+    coord.store = store
+    wcfg = WatchDirConfig(path=watch_dir, glob="*.torrent", delete_after_pickup=True)
+    coord.watch = WatchDirScanner(wcfg, prowlarr=None)
+    coord.cfg.watch_dir = wcfg
+    try:
+        await coord.scan_watch()
+        assert store.get(infohash) is None
+        assert tfile.exists()
+    finally:
+        store.close()
+
+
 def test_watch_election_prefers_public(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     coord = _election_coord(tmp_path, store)

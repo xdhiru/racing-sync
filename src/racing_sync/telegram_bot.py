@@ -1212,10 +1212,28 @@ class TelegramBot:
             pass
         if detail_msg_id:
             await self._mark_detail_cancelled(detail_msg_id, name, infohash)
+        try:
+            for pair in result.get("paired_cancelled") or []:
+                try:
+                    await coord._ssd_release(pair.get("source_infohash") or "")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        pairs = result.get("paired_cancelled") or []
+        pair_note = ""
+        if pairs:
+            pair_note = " + {} waiting pair{}: {}".format(
+                len(pairs), "" if len(pairs) == 1 else "s",
+                ", ".join(str(p.get("source_name") or p.get("source_infohash", "")[:10])[:40]
+                          for p in pairs[:3]),
+            )
+            if len(pairs) > 3:
+                pair_note += f" (+{len(pairs) - 3} more)"
         errs = result.get("errors") or []
         if errs:
-            return f"Cancelled {name} with {len(errs)} error(s); check logs"
-        return f"Cancelled {name} (removed + ignored)"
+            return f"Cancelled {name}{pair_note} with {len(errs)} error(s); check logs"
+        return f"Cancelled {name}{pair_note} (removed + ignored)"
 
     async def _fetch_torrent(self, infohash: str) -> str:
         """Flag a WAITING_INDEXER row to use the VPS1 original now.

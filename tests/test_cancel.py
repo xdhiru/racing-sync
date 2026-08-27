@@ -464,6 +464,46 @@ async def test_cancel_torrent_forgets_and_ignores(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_cancel_torrent_auto_cancels_waiting_pairs(tmp_path: Path):
+    """Cancelling the SSD owner reports its deferred watch pairs."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Shared.Show",
+                              save_path=str(ssd), state=State.DOWNLOADING,
+                              cross_seed_source="watch-dir",
+                              source_announce_url="https://alpha.cc/announce/xyz",
+                              total_bytes=1000))
+    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Shared.Show",
+                              state=State.NEW, cross_seed_source="watch-dir",
+                              source_announce_url="https://alpha.cc/announce/xyz",
+                              total_bytes=1000))
+    coord = MagicMock()
+    cfg = MagicMock()
+    cfg.ssd.path = ssd
+    cfg.dest.save_path = ssd
+    cfg.general.state_db = tmp_path / "state.db"
+    coord.cfg = cfg
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
+    coord.dest_client.get_torrent = AsyncMock(return_value=None)
+    bot = _bot()
+    bot._coord = coord
+    bot._store = store
+    try:
+        msg = await bot._cancel_torrent("a" * 40)
+        assert msg.startswith("Cancelled")
+        assert "+ 1 waiting pair" in msg
+        assert "Shared.Show" in msg
+        assert store.get("a" * 40) is None
+        assert store.get("b" * 40) is None
+        assert store.is_ignored("b" * 40) is True
+    finally:
+        store.close()
+
+
 def test_render_active_has_cancel_command_per_task():
     from racing_sync.telegram_bot import render_active
 
