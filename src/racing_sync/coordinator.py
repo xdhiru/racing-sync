@@ -1698,7 +1698,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     def _watch_wait_note(self, ts: TorrentState) -> str:
         """Short human reason a watch row is deferred, or "" when it may proceed.
 
-        Names the winning copy's tracker ("Waiting turn · dl-indexer copy
+        Names the winning copy's tracker ("Waiting turn · <domain> copy
         first") so the card explains itself instead of reading as stuck.
         Never raises.
         """
