@@ -37,7 +37,17 @@ class BatchMoveIncompleteError(RuntimeError):
     """
 
 
+class AbandonedError(RuntimeError):
+    """A worker noticed its DB row is gone (forget/cancel removed it).
+
+    Must unwind the worker WITHOUT failing anything: the generic worker
+    wrapper transitions unhandled exceptions to FAILED, and that upsert
+    would resurrect the deliberately deleted row as a zombie FAILED row.
+    """
+
+
 __all__ = [
+    "AbandonedError",
     "BatchMoveIncompleteError",
     "WebUIUnresponsiveError",
     "_NOT_VISIBLE_DETAIL",

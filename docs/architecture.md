@@ -264,7 +264,10 @@ chat messages: a `/cancel_<...>` line from the configured chat/user
 resolves the prefix against tracked rows and runs forget+ignore
 immediately (row, dest entries, SSD data, blob cache) with no
 confirmation, then replies with the outcome and frees the SSD
-reservation. A `/fetch_<...>` line flags a waiting row (`force_direct`)
+reservation. Cancelling an SSD owner also forgets the watch rows
+currently deferred on it (same election winner), reported in the reply;
+cancelling a waiter leaves the rest alone. A `/fetch_<...>` line flags
+a waiting row (`force_direct`)
 and wakes it (WAITING_INDEXER → QUERYING) so the racing torrent's own
 bytes feed the SSD download at once; non-waiting targets get an
 explanatory reply. Unknown/ambiguous prefixes get an explanatory

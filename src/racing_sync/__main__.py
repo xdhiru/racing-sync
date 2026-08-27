@@ -385,6 +385,13 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
     print(f"  torrent: {src_name} ({src_hash[:10]}) [{src_state}]")
     for h in result["dest_entries"]:
         print(f"  dest entry: {h[:10]}")
+    for pair in result.get("paired_cancelled") or []:
+        _ph = pair.get("source_infohash") or ""
+        _pn = pair.get("source_name") or "?"
+        _verb = "auto-cancelled" if result["applied"] else "would auto-cancel"
+        print(f"  waiting pair ({_verb}): {_pn[:60]} ({_ph[:10]})")
+        for e in pair.get("errors") or []:
+            print(f"  error: {e}")
     for p in result["local_paths"]:
         verb = "removed" if result["applied"] and result["delete_files"] else "planned"
         print(f"  local path ({verb}): {p}")

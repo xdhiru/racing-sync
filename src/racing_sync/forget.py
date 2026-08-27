@@ -9,6 +9,11 @@ fused seed only stops reseeding it from VPS2.
 
 The CLI defaults to a dry-run plan; pass --apply to execute. The API
 endpoint always applies (it sits behind the same operator auth as retry).
+
+Forgetting an SSD owner also forgets the watch-dir rows currently
+deferred on it (same content, not yet started): they can never proceed
+usefully without it, and hunting them down one by one is busywork. The
+cascade is reported, never silent.
 """
 
 from __future__ import annotations
@@ -18,7 +23,9 @@ import logging
 import shutil
 from pathlib import Path
 
+from .coordinator_content import watch_election_winner
 from .rclone_ops import validate_safe_delete_path, wipe_local_tree
+from .state import State
 
 log = logging.getLogger(__name__)
 
@@ -151,28 +158,49 @@ async def _remove_path(path: Path, bases: list[Path]) -> None:
     await wipe_local_tree(path, base_dir=bases)
 
 
-async def forget_torrent(
+def _paired_waiter_identities(store, cfg, target) -> list[dict]:
+    """Watch rows currently deferred on `target` (same content, not started).
+
+    Only rows whose election winner IS the target are paired: cancelling a
+    waiter leaves its siblings alone, cancelling an owner takes its
+    waiters. DONE/FAILED/gone owners release election, so their rows never
+    match. Never raises (empty on any doubt).
+    """
+    try:
+        rows = store.all()
+    except Exception:
+        return []
+    target_hash = (target.source_infohash or "").lower()
+    if not target_hash:
+        return []
+    out: list[dict] = []
+    for cand in rows or []:
+        try:
+            ch = (cand.source_infohash or "").lower()
+            if not ch or ch == target_hash:
+                continue
+            if cand.state not in (State.NEW, State.WAITING_DISK):
+                continue
+            winner = watch_election_winner(rows, cand, cfg)
+            if winner is not None and (winner.source_infohash or "").lower() == target_hash:
+                out.append({"source_infohash": cand.source_infohash,
+                            "source_name": cand.source_name})
+        except Exception:
+            continue
+    return sorted(out, key=lambda d: d["source_infohash"])
+
+
+async def _forget_one(
     cfg,
     *,
     dest,
     store,
-    target: str,
+    row,
     apply: bool,
     delete_files: bool = True,
     ignore: bool = False,
 ) -> dict:
-    """Plan (apply=False) or execute (apply=True) abandoning one torrent.
-
-    Returns a result dict with the row identity, planned/removed dest
-    entries and local paths, skipped paths, and per-step errors. Lookup
-    failures raise LookupError; operational errors are collected, never
-    raised mid-way (a half-finished forget must be visible, not silent).
-
-    `ignore=True` additionally records the release on the ignore list so
-    discovery/recovery/re-injection never pick it up again while it stays
-    on the VPS1 racing client (only meaningful with apply=True).
-    """
-    row = resolve_row(store, target)
+    """Forget a single already-resolved row (no cascade)."""
     known = sorted(_row_hashes(row))
     entries: dict[str, object] = {}
     if known:
@@ -216,6 +244,42 @@ async def forget_torrent(
             log.info("forget: deleted dest entry %s (delete_files=%s)", h[:10], delete_files)
         except Exception as e:  # noqa: BLE001
             result["errors"].append(f"dest entry {h[:10]}: {e}")
+    if sorted(entries):
+        # Verify the deletes actually landed: a silently surviving entry
+        # is re-adopted by recovery (or re-attached by a same-hash row)
+        # and looks exactly like "cancel didn't remove it". Retry once,
+        # then report instead of claiming success.
+        try:
+            remaining = {
+                (getattr(t, "hash", "") or "").lower()
+                for t in await dest.list_torrents(hashes=sorted(entries)) or []
+                if getattr(t, "hash", "")
+            }
+        except Exception as e:  # noqa: BLE001
+            remaining = set()
+            log.warning("forget: cannot verify dest deletes for %s: %s",
+                        row.source_infohash[:10], e)
+        for h in sorted(remaining):
+            try:
+                await dest.delete(h, delete_files=delete_files)
+                log.info("forget: retry deleted dest entry %s", h[:10])
+            except Exception as e:  # noqa: BLE001
+                result["errors"].append(f"dest entry retry {h[:10]}: {e}")
+        try:
+            still = {
+                (getattr(t, "hash", "") or "").lower()
+                for t in await dest.list_torrents(hashes=sorted(remaining)) or []
+                if getattr(t, "hash", "")
+            }
+        except Exception:
+            still = set()
+        for h in sorted(still):
+            result["errors"].append(
+                f"dest entry {h[:10]} still present after delete")
+        if still:
+            log.warning("forget: %d dest entr%s still present for %s after delete",
+                        len(still), "y" if len(still) == 1 else "ies",
+                        row.source_infohash[:10])
     if delete_files:
         bases = _ssd_bases(cfg)
         try:
@@ -249,4 +313,72 @@ async def forget_torrent(
         store.delete(row.source_infohash)
     except Exception as e:  # noqa: BLE001
         result["errors"].append(f"db row: {e}")
+    return result
+
+
+async def forget_torrent(
+    cfg,
+    *,
+    dest,
+    store,
+    target: str,
+    apply: bool,
+    delete_files: bool = True,
+    ignore: bool = False,
+) -> dict:
+    """Plan (apply=False) or execute (apply=True) abandoning one torrent.
+
+    Returns a result dict with the row identity, planned/removed dest
+    entries and local paths, skipped paths, per-step errors, and
+    `paired_cancelled` (same-content watch rows deferred on this one,
+    planned or also forgotten with identical flags). Lookup failures raise
+    LookupError; operational errors are collected, never raised mid-way
+    (a half-finished forget must be visible, not silent).
+
+    `ignore=True` additionally records the release on the ignore list so
+    discovery/recovery/re-injection never pick it up again while it stays
+    on the VPS1 racing client (only meaningful with apply=True).
+    """
+    row = resolve_row(store, target)
+    paired = _paired_waiter_identities(store, cfg, row)
+    result = await _forget_one(
+        cfg, dest=dest, store=store, row=row,
+        apply=apply, delete_files=delete_files, ignore=ignore,
+    )
+    result["paired_cancelled"] = []
+    if not apply:
+        result["paired_cancelled"] = [
+            {"source_infohash": p["source_infohash"],
+             "source_name": p["source_name"], "errors": []}
+            for p in paired
+        ]
+        return result
+    for p in paired:
+        h = p["source_infohash"]
+        try:
+            prow = store.get(h)
+        except Exception:
+            prow = None
+        if prow is None:
+            continue
+        try:
+            pres = await _forget_one(
+                cfg, dest=dest, store=store, row=prow,
+                apply=True, delete_files=delete_files, ignore=ignore,
+            )
+        except LookupError:
+            continue
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append(f"paired {(h or '')[:10]}: {e}")
+            continue
+        log.info("forget: auto-cancelled waiting pair %s (%s) with %s",
+                 (p["source_name"] or "?")[:60], (h or "")[:10],
+                 (row.source_name or "?")[:60])
+        result["paired_cancelled"].append({
+            "source_infohash": h,
+            "source_name": p["source_name"],
+            "errors": list(pres.get("errors") or []),
+        })
+        for e in pres.get("errors") or []:
+            result["errors"].append(f"paired {(h or '')[:10]}: {e}")
     return result

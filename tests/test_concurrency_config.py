@@ -370,6 +370,98 @@ async def test_wait_for_completion_stall_timeout():
         await coord._wait_for_completion(ts)
 
 
+@pytest.mark.anyio
+async def test_wait_for_completion_abandoned_row_raises_abandoned(tmp_path: Path):
+    """Vanished entry + forgotten row unwinds quietly (no zombie FAILED)."""
+    from racing_sync.coordinator_errors import AbandonedError
+    from racing_sync.state import StateStore
+
+    coord = make_coordinator()
+    coord.cfg.general.download_stall_timeout_seconds = 0
+    coord.cfg.general.dest_poll_interval = 0.01
+    coord._stop = False
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=None)
+    ts = TorrentState(source_infohash="gone" + "0" * 36, source_name="Gone",
+                      state=State.DOWNLOADING)
+    try:
+        with pytest.raises(AbandonedError):
+            await coord._wait_for_completion(ts)
+        assert coord.store.get(ts.source_infohash) is None
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_wait_for_completion_vanish_live_row_still_fails(tmp_path: Path):
+    """Vanished entry + live row keeps the old fail-fast behavior."""
+    from racing_sync.state import StateStore
+
+    coord = make_coordinator()
+    coord.cfg.general.download_stall_timeout_seconds = 0
+    coord.cfg.general.dest_poll_interval = 0.01
+    coord._stop = False
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=None)
+    ts = TorrentState(source_infohash="h1", source_name="Live",
+                      state=State.DOWNLOADING)
+    coord.store.upsert(ts)
+    try:
+        with pytest.raises(RuntimeError, match="vanished mid-download"):
+            await coord._wait_for_completion(ts)
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_process_torrent_skips_failed_for_forgotten_row(tmp_path: Path):
+    """Worker errors on a deleted row must not resurrect it as FAILED."""
+    from racing_sync.state import StateStore
+
+    coord = make_coordinator()
+    coord.store = StateStore(tmp_path / "state.db")
+    coord._notify_telegram = AsyncMock()
+
+    async def raise_boom(_):
+        raise RuntimeError("boom!")
+
+    coord._process_torrent_inner = raise_boom
+    ts = TorrentState(source_infohash="gone" + "0" * 36, source_name="Gone",
+                      state=State.DOWNLOADING)
+    try:
+        await coord._process_torrent(ts)  # must not raise, must not resurrect
+        assert coord.store.get(ts.source_infohash) is None
+        coord._notify_telegram.assert_not_called()
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_process_torrent_still_fails_live_row(tmp_path: Path):
+    """Same error with the row present keeps the old FAILED behavior."""
+    from racing_sync.state import StateStore
+
+    coord = make_coordinator()
+    coord.store = StateStore(tmp_path / "state.db")
+    coord._notify_telegram = AsyncMock()
+
+    async def raise_boom(_):
+        raise RuntimeError("boom!")
+
+    coord._process_torrent_inner = raise_boom
+    ts = TorrentState(source_infohash="h1", source_name="Live",
+                      state=State.DOWNLOADING)
+    coord.store.upsert(ts)
+    try:
+        await coord._process_torrent(ts)
+        assert coord.store.get("h1").state == State.FAILED
+        coord._notify_telegram.assert_awaited_once()
+    finally:
+        coord.store.close()
+
+
 def test_config_strict_validations():
     from pydantic import ValidationError
     from racing_sync.config import (

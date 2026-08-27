@@ -93,6 +93,7 @@ class ForgetResult(BaseModel):
     skipped_paths: list[str]
     errors: list[str]
     ignored: bool = False
+    paired_cancelled: list[str] = []
 
 
 def build_app(coord: Coordinator) -> FastAPI:
@@ -229,6 +230,19 @@ def build_app(coord: Coordinator) -> FastAPI:
                 await coord._ssd_release(result.get("source_infohash") or normalized)
             except Exception:
                 pass
+        paired_hashes: list[str] = []
+        try:
+            for pair in result.get("paired_cancelled") or []:
+                _ph = (pair.get("source_infohash") or "").strip().lower()
+                if _ph:
+                    paired_hashes.append(_ph)
+        except Exception:
+            paired_hashes = []
+        try:
+            for _ph in paired_hashes:
+                await coord._ssd_release(_ph)
+        except Exception:
+            pass
         return ForgetResult(
             source_infohash=result["source_infohash"],
             source_name=result["source_name"],
@@ -238,6 +252,7 @@ def build_app(coord: Coordinator) -> FastAPI:
             skipped_paths=result["skipped_paths"],
             errors=result["errors"],
             ignored=bool(result.get("ignored", False)),
+            paired_cancelled=paired_hashes,
         )
 
     return app

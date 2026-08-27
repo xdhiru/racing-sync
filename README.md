@@ -102,8 +102,11 @@ python3 run.py forget --config config.toml <infohash|name> --apply --ignore
 
 `<infohash|name>` is a 40-char infohash (any known hash) or a unique name
 substring — ambiguous names abort with the candidate list instead of
-guessing. `--ignore` also records the release as cancelled so discovery,
-recovery, re-injection and late-seed never pick it up again while it stays
+guessing. Forgetting an SSD owner also forgets the watch-dir rows currently
+waiting on it (same content, not yet started), with identical flags —
+reported, never silent; cancelling just a waiter leaves the rest alone.
+`--ignore` also records the release as cancelled so discovery, recovery,
+re-injection and late-seed never pick it up again while it stays
 on VPS1; lift with:
 
 ```bash
