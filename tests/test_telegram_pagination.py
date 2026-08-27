@@ -371,10 +371,10 @@ def test_render_active_shows_wait_note_for_deferred_rows():
         source_infohash="f" * 40, source_name="Fresh.Show.S01E01",
         state=State.NEW, total_bytes=1000,
     )
-    notes = {"e" * 40: "Waiting turn · dl-indexer copy first"}
+    notes = {"e" * 40: "Waiting turn · dl-indexer.example.net copy first"}
     text, _, _ = render_active([(waiter, None), (fresh, None)],
                                page=0, page_size=5, notes=notes)
-    assert "  ⏳ Waiting turn · dl-indexer copy first · alpha.cc" in text
+    assert "  ⏳ Waiting turn · dl-indexer.example.net copy first · alpha.cc" in text
     # Row without a note keeps the plain NEW badge.
     assert "🆕 New" in text
     # Notes never leak onto other states.
@@ -394,8 +394,8 @@ def test_render_detail_shows_wait_note():
     ts = TorrentState(source_infohash="e" * 40, source_name="Twin.Show",
                       state=State.NEW, total_bytes=1000)
     assert "Waiting turn" not in render_detail(ts)
-    assert "⏳ Waiting turn · dl-indexer copy first" in render_detail(
-        ts, None, "Waiting turn · dl-indexer copy first")
+    assert "⏳ Waiting turn · dl-indexer.example.net copy first" in render_detail(
+        ts, None, "Waiting turn · dl-indexer.example.net copy first")
 
 
 @pytest.mark.anyio
@@ -413,7 +413,7 @@ async def test_refresh_attaches_watch_wait_notes():
     bot._coord = MagicMock()
     bot._coord.live_progress_map.return_value = {}
     bot._coord._watch_wait_note = MagicMock(
-        return_value="Waiting turn · dl-indexer copy first")
+        return_value="Waiting turn · dl-indexer.example.net copy first")
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
     bot._current_page = 0
     bot._active_msg_id = None
@@ -430,7 +430,7 @@ async def test_refresh_attaches_watch_wait_notes():
     ]
     await bot._refresh_active_message_inner()
     sent_text = bot._bot.send_message.call_args[0][1]
-    assert "⏳ Waiting turn · dl-indexer copy first" in sent_text
+    assert "⏳ Waiting turn · dl-indexer.example.net copy first" in sent_text
     bot._coord._watch_wait_note.assert_called_once()
 
 

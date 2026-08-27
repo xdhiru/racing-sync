@@ -1351,7 +1351,7 @@ class TelegramBot:
         except Exception:
             pass
         # Deferral notes for waiting watch rows (e.g. "Waiting turn ·
-        # dl-indexer copy first") so the list explains itself. Best-effort:
+        # <domain> copy first") so the list explains itself. Best-effort:
         # never break the refresh over a note.
         notes: dict[str, str] = {}
         try:

@@ -1320,7 +1320,7 @@ def test_is_watch_row_labels_and_blob_dir(tmp_path: Path):
             assert coord._is_watch_row(ts) is True
         # VPS1 flavours and empty labels do not — without a blob dir.
         for label in ("", "public-racing", "public-dl-indexer-fallback",
-                      "dl-indexer-cross-seed", "private-sftp-fallback",
+                  "dl-indexer-cross-seed", "private-sftp-fallback",
                       "private-export-fallback"):
             ts = TorrentState(source_infohash="b" * 40, cross_seed_source=label)
             assert coord._is_watch_row(ts) is False
