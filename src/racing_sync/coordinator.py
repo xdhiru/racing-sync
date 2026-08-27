@@ -2278,20 +2278,33 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 # shows nothing, and FAILED would trigger re-downloads).
                 try:
                     fuse_files = await self.dest_client.get_torrent_files(ext.hash)
+                    fuse_list_failed = False
                 except Exception as e:  # noqa: BLE001
                     log.warning(
                         "could not list fuse torrent files for %s: %s",
                         ts.source_infohash[:10], e,
                     )
                     fuse_files = []
+                    fuse_list_failed = True
                 fuse_expected = [
                     (f.name, f.size_bytes) for f in fuse_files
                     if getattr(f, "name", "")
                 ]
-                fuse_missing = (
-                    await self._missing_fuse_files(Path(save_path), fuse_expected)
-                    if fuse_expected else []
-                )
+                if fuse_list_failed or not fuse_expected:
+                    # Fail closed: an unlistable or empty file list must never
+                    # mark DONE (would strand unseeded bytes as complete).
+                    # Stay QUEUED so the next tick retries via this same check.
+                    log.warning(
+                        "fuse verification inconclusive for %s (list_failed=%s, files=%d); "
+                        "staying queued",
+                        ts.source_infohash[:10], fuse_list_failed, len(fuse_expected),
+                    )
+                    try:
+                        self.store.upsert(ts)
+                    except Exception:
+                        pass
+                    return
+                fuse_missing = await self._missing_fuse_files(Path(save_path), fuse_expected)
                 if fuse_missing:
                     ssd_root = find_content_on_ssd(self.cfg, fuse_expected)
                     if ssd_root is not None:
