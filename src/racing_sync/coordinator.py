@@ -327,6 +327,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         self._warn_if_log_dir_on_data_mount()
         self._download_sem = asyncio.Semaphore(self.cfg.max_active_downloads)
         self._move_sem = asyncio.Semaphore(self.cfg.max_concurrent_moves)
+        if self._ssd_lock is None:
+            # Eager-init so concurrent admissions cannot race lazy creation
+            # and install two different locks (split-brain budget).
+            self._ssd_lock = asyncio.Lock()
         log.info(
             "concurrency limits: max_active_downloads=%d, max_concurrent_moves=%d",
             self.cfg.max_active_downloads,
