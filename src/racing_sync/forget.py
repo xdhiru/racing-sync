@@ -190,6 +190,37 @@ def _paired_waiter_identities(store, cfg, target) -> list[dict]:
     return sorted(out, key=lambda d: d["source_infohash"])
 
 
+def _fuse_mounts(cfg) -> list[str]:
+    """Normalized fuse mount prefixes (posix, no trailing slash)."""
+    out: list[str] = []
+    try:
+        fuse = getattr(getattr(cfg, "rclone", None), "fuse", None)
+        for raw in (getattr(fuse, "mount", None), getattr(fuse, "mount_unsorted", None)):
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                continue
+            try:
+                norm = str(raw).rstrip("/\\").replace("\\", "/")
+            except Exception:
+                continue
+            if norm and norm not in out:
+                out.append(norm)
+    except Exception:
+        pass
+    return out
+
+
+def _is_fuse_save_path(cfg, save_path: str) -> bool:
+    sp = (save_path or "").rstrip("/\\").replace("\\", "/")
+    if not sp:
+        return False
+    for fm in _fuse_mounts(cfg):
+        if not fm:
+            continue
+        if sp == fm or sp.startswith(fm + "/"):
+            return True
+    return False
+
+
 async def _forget_one(
     cfg,
     *,
@@ -240,8 +271,16 @@ async def _forget_one(
         return result
     for h in sorted(entries):
         try:
-            await dest.delete(h, delete_files=delete_files)
-            log.info("forget: deleted dest entry %s (delete_files=%s)", h[:10], delete_files)
+            entry = entries[h]
+            entry_save = (getattr(entry, "save_path", "") or "")
+            # Fuse/remote copies are never touched: entries seeding from the
+            # fuse mount are removed without files even when the caller asked
+            # for delete_files=True (SSD entries still use the caller flag).
+            effective_delete_files = (
+                False if _is_fuse_save_path(cfg, entry_save) else delete_files
+            )
+            await dest.delete(h, delete_files=effective_delete_files)
+            log.info("forget: deleted dest entry %s (delete_files=%s)", h[:10], effective_delete_files)
         except Exception as e:  # noqa: BLE001
             result["errors"].append(f"dest entry {h[:10]}: {e}")
     if sorted(entries):
@@ -250,25 +289,31 @@ async def _forget_one(
         # and looks exactly like "cancel didn't remove it". Retry once,
         # then report instead of claiming success.
         try:
-            remaining = {
-                (getattr(t, "hash", "") or "").lower()
+            remaining_entries = {
+                (getattr(t, "hash", "") or "").lower(): t
                 for t in await dest.list_torrents(hashes=sorted(entries)) or []
                 if getattr(t, "hash", "")
             }
         except Exception as e:  # noqa: BLE001
-            remaining = set()
+            remaining_entries = {}
             log.warning("forget: cannot verify dest deletes for %s: %s",
                         row.source_infohash[:10], e)
-        for h in sorted(remaining):
+        for h in sorted(remaining_entries):
             try:
-                await dest.delete(h, delete_files=delete_files)
+                entry_save = (getattr(remaining_entries[h], "save_path", "") or "")
+                if not entry_save and h in entries:
+                    entry_save = (getattr(entries[h], "save_path", "") or "")
+                effective_delete_files = (
+                    False if _is_fuse_save_path(cfg, entry_save) else delete_files
+                )
+                await dest.delete(h, delete_files=effective_delete_files)
                 log.info("forget: retry deleted dest entry %s", h[:10])
             except Exception as e:  # noqa: BLE001
                 result["errors"].append(f"dest entry retry {h[:10]}: {e}")
         try:
             still = {
                 (getattr(t, "hash", "") or "").lower()
-                for t in await dest.list_torrents(hashes=sorted(remaining)) or []
+                for t in await dest.list_torrents(hashes=sorted(remaining_entries)) or []
                 if getattr(t, "hash", "")
             }
         except Exception:
