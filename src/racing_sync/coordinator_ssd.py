@@ -19,6 +19,12 @@ import logging
 
 from .state import State, TorrentState
 
+# Guards lazy SSD-lock creation so two coroutines cannot install two
+# different asyncio.Lock objects (split-brain over-admission).
+import threading as _threading
+
+_SSD_LOCK_GUARD = _threading.Lock()
+
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
 
@@ -88,6 +94,14 @@ class SSDLedgerMixin:
                 ts.batch_cap_bytes = cap
             except Exception:
                 pass
+            # Persist the freeze so a restart before any other upsert keeps
+            # the same batch boundaries under a persisted batch_index.
+            try:
+                store = getattr(self, "store", None)
+                if store is not None and hasattr(store, "upsert"):
+                    store.upsert(ts)
+            except Exception:
+                pass
         except Exception:
             pass
         return cap
@@ -147,7 +161,12 @@ class SSDLedgerMixin:
     async def _ssd_lock_for(self):
         """Per-coordinator SSD lock, lazily created (tolerates test doubles)."""
         lk = getattr(self, "_ssd_lock", None)
-        if lk is None or not hasattr(lk, "__aenter__"):
+        if lk is not None and hasattr(lk, "__aenter__"):
+            return lk
+        with _SSD_LOCK_GUARD:
+            lk = getattr(self, "_ssd_lock", None)
+            if lk is not None and hasattr(lk, "__aenter__"):
+                return lk
             try:
                 lk = asyncio.Lock()
             except Exception:
