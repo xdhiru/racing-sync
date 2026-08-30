@@ -271,6 +271,7 @@ CREATE TABLE IF NOT EXISTS ignored_torrents (
 
 SCHEMA_INDEXES = """
 CREATE INDEX IF NOT EXISTS ix_state ON torrent_state(state);
+CREATE INDEX IF NOT EXISTS ix_updated_at ON torrent_state(updated_at);
 CREATE INDEX IF NOT EXISTS ix_indexer_retry
     ON torrent_state(state, indexer_next_retry_at);
 CREATE INDEX IF NOT EXISTS ix_source_name ON torrent_state(source_name);
@@ -324,15 +325,26 @@ class StateStore:
             pass
         self._conn.executescript(SCHEMA_TABLES)
         self._conn.executescript(SCHEMA_INDEXES)
-        # Column added after 1.0.0: existing DBs predate it. CREATE TABLE
+        # Columns added after 1.0.0: existing DBs predate them. CREATE TABLE
         # IF NOT EXISTS never backfills, so migrate idempotently here.
-        try:
-            self._conn.execute(
-                "ALTER TABLE torrent_state "
-                "ADD COLUMN force_direct INTEGER NOT NULL DEFAULT 0"
-            )
-        except Exception:
-            pass
+        # _row_to_state tolerates missing columns on read, but upsert INSERTs
+        # every column and would OperationalError on an old DB.
+        for _ddl in (
+            "ADD COLUMN force_direct INTEGER NOT NULL DEFAULT 0",
+            "ADD COLUMN readd_first_attempted_at TEXT NOT NULL DEFAULT ''",
+            "ADD COLUMN readd_next_retry_at TEXT NOT NULL DEFAULT ''",
+            "ADD COLUMN readd_attempts INTEGER NOT NULL DEFAULT 0",
+            "ADD COLUMN failed_retries INTEGER NOT NULL DEFAULT 0",
+            "ADD COLUMN completed_at TEXT NOT NULL DEFAULT ''",
+            "ADD COLUMN vps1_last_activity_at TEXT NOT NULL DEFAULT ''",
+            "ADD COLUMN batch_cap_bytes INTEGER NOT NULL DEFAULT 0",
+            "ADD COLUMN readd_cycles INTEGER NOT NULL DEFAULT 0",
+            "ADD COLUMN telegram_message_id INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                self._conn.execute(f"ALTER TABLE torrent_state {_ddl}")
+            except Exception:
+                pass
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -401,6 +413,7 @@ class StateStore:
             )
 
     def list_by_state(self, *states: State) -> list[TorrentState]:
+        self._ensure_open()
         if not states:
             return []
         qmarks = ",".join(["?"] * len(states))
@@ -417,6 +430,7 @@ class StateStore:
         Used by the coordinator tick to decide which rows to wake up and
         re-query the download-target indexers.
         """
+        self._ensure_open()
         now = now or dt.datetime.now(dt.timezone.utc)
         with self._lock:
             rows = self._conn.execute(
@@ -433,6 +447,7 @@ class StateStore:
         Excludes DONE and FAILED — those have a settled detail message in
         chat history and should not clutter the live list.
         """
+        self._ensure_open()
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state NOT IN ('done','failed') "
@@ -441,6 +456,7 @@ class StateStore:
             return [_row_to_state(r) for r in rows]
 
     def get_telegram_message_id(self, source_infohash: str) -> int | None:
+        self._ensure_open()
         with self._lock:
             row = self._conn.execute(
                 "SELECT telegram_message_id FROM torrent_state WHERE source_infohash = ?",
@@ -451,6 +467,7 @@ class StateStore:
             return int(row["telegram_message_id"])
 
     def set_telegram_message_id(self, source_infohash: str, message_id: int) -> None:
+        self._ensure_open()
         with self._lock:
             self._conn.execute(
                 "UPDATE torrent_state SET telegram_message_id = ?, "
@@ -460,6 +477,7 @@ class StateStore:
             )
 
     def all_active(self, include_blob: bool = False, limit: int | None = None) -> list[TorrentState]:
+        self._ensure_open()
         cols = _TORRENT_STATE_COLUMNS_NO_BLOB if not include_blob else "*"
         with self._lock:
             if limit is not None:
@@ -481,6 +499,7 @@ class StateStore:
             return [_row_to_state(r) for r in rows]
 
     def all(self, include_blob: bool = False, limit: int | None = None, offset: int = 0) -> list[TorrentState]:
+        self._ensure_open()
         cols = "*" if include_blob else _TORRENT_STATE_COLUMNS_NO_BLOB
         with self._lock:
             if limit is not None:
@@ -504,6 +523,7 @@ class StateStore:
             return [_row_to_state(r) for r in rows]
 
     def find_by_name(self, source_name: str) -> list[TorrentState]:
+        self._ensure_open()
         clean_name = source_name.strip()
         for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v", ".torrent"):
             if clean_name.lower().endswith(ext):
@@ -533,6 +553,7 @@ class StateStore:
             return [_row_to_state(r) for r in rows]
 
     def delete(self, source_infohash: str) -> None:
+        self._ensure_open()
         with self._lock:
             self._conn.execute(
                 "DELETE FROM torrent_state WHERE source_infohash = ?", (source_infohash,)
@@ -702,6 +723,7 @@ class StateStore:
 
     def append_log(self, level: str, message: str,
                    source_infohash: str | None = None) -> None:
+        self._ensure_open()
         with self._lock:
             self._conn.execute(
                 "INSERT INTO run_log (ts, source_infohash, level, message) VALUES (?,?,?,?)",
@@ -715,6 +737,7 @@ class StateStore:
                 )
 
     def prune_logs(self, max_records: int = 5000) -> None:
+        self._ensure_open()
         # SQLite LIMIT -1 means "no limit" and would invert the prune.
         try:
             max_records = int(max_records)
@@ -729,6 +752,7 @@ class StateStore:
             )
 
     def iter_logs(self, limit: int = 200) -> list[sqlite3.Row]:
+        self._ensure_open()
         try:
             limit = int(limit)  # type: ignore[arg-type]
         except (TypeError, ValueError):
@@ -743,6 +767,7 @@ class StateStore:
 
     def get_meta(self, key: str, default: str | None = None) -> str | None:
         """Get a metadata value by key."""
+        self._ensure_open()
         with self._lock:
             cur = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,))
             row = cur.fetchone()
@@ -752,6 +777,7 @@ class StateStore:
 
     def set_meta(self, key: str, value: str) -> None:
         """Set or update a metadata key/value."""
+        self._ensure_open()
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
@@ -797,7 +823,12 @@ def _safe_dt(value: object) -> dt.datetime | None:
         # Legacy cells with trailing Z (UTC) — fromisoformat needs +00:00.
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
-        return dt.datetime.fromisoformat(s)
+        parsed = dt.datetime.fromisoformat(s)
+        # Legacy naive cells break aware arithmetic (now_utc - completed).
+        # Normalize to UTC instead of raising per-row forever.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed
     except (TypeError, ValueError):
         log.warning("state DB has corrupt datetime %r; treating as None", value)
         return None
