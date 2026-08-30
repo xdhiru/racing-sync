@@ -218,10 +218,10 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 p = float(value or 0.0)  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 return 0.0
-            # Daemon reports 0-100, but tolerate 0-1 callers/tests.
-            if p > 1.0:
-                p = p / 100.0
-            return min(1.0, max(0.0, p))
+            # Daemon reports 0-100 natively. Always normalize by /100:
+            # the old `> 1.0` heuristic misclassified exactly 1% (1.0)
+            # as complete.
+            return min(1.0, max(0.0, p / 100.0))
         for h, status in rows.items():
             if not isinstance(status, dict):
                 continue
@@ -302,17 +302,12 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 prios = status.get("file_priorities", []) or []
                 progs = status.get("file_progress", []) or []
                 # Deluge reports file_progress on a 0-100 scale (same as the
-                # torrent-level progress normalized in list_torrents). Decide
-                # the scale once: if any value exceeds 1, all are 0-100.
+                # torrent-level progress). Always normalize by /100.
                 def _fnum(v: object) -> float:
                     try:
                         return float(v or 0.0)  # type: ignore[arg-type]
                     except (TypeError, ValueError):
                         return 0.0
-                scale_100 = any(
-                    (_fnum(progs[i]) if i < len(progs) else 0.0) > 1.0
-                    for i in range(max(len(status["files"]), len(progs)))
-                )
                 out: list[TorrentFile] = []
                 for item in status["files"]:
                     idx = item.get("index", len(out))
@@ -329,7 +324,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                         prio_int = 1
                     prio_int = 0 if prio_int == 0 else 1
                     raw_prog = _fnum(progs[idx]) if 0 <= idx < len(progs) else 0.0
-                    prog = raw_prog / 100.0 if scale_100 else raw_prog
+                    prog = raw_prog / 100.0
                     try:
                         fsize = int(float(item.get("size", 0) or 0))
                     except (TypeError, ValueError):
