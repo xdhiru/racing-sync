@@ -135,8 +135,9 @@ class _SFTPConnection:
         self._client: paramiko.SSHClient | None = None
         self._sftp: paramiko.SFTPClient | None = None
         self._lock = threading.RLock()
-        # Set by close(): the member is dead — _lease must skip it instead
-        # of queueing behind its (possibly wedged-holder) lock.
+        # Set by close(): the member is dead — _lease revives it on demand
+        # instead of queueing behind its (possibly wedged-holder) lock.
+        self._closed = True
 
     def __enter__(self) -> _SFTPConnection:
         self.connect()
@@ -392,7 +393,15 @@ class _SFTPConnection:
             return None
 
     def fetch_many(self, infohashes: Iterable[str]) -> dict[str, bytes]:
-        return {h: data for h, data in ((h, self.fetch_torrent(h)) for h in infohashes) if data}
+        out: dict[str, bytes] = {}
+        for h in infohashes:
+            try:
+                data = self.fetch_torrent(h)
+            except Exception:
+                continue
+            if data:
+                out[h] = data
+        return out
 
     def disk_free_bytes(self, path: str) -> int | None:
         """Free bytes on the remote filesystem containing `path`.
@@ -565,19 +574,40 @@ class SFTPExporter:
                 self._members = [_SFTPConnection(self._cfg) for _ in range(self._pool_size)]
             return list(self._members)
 
+    def _try_revive(self, m: _SFTPConnection) -> bool:
+        """Best-effort re-dial of a closed member. True when usable."""
+        try:
+            if not getattr(m, "_closed", False):
+                return True
+            m.connect()
+            return not getattr(m, "_closed", False)
+        except Exception:
+            return False
+
     def _lease(self, what: str) -> _SFTPConnection:
         """Return a member with its lock held; caller must _release() it.
 
         Rotating start spreads concurrent callers across members. Each pass
         sweeps non-blocking first (a wedged member never stalls failover to
         a free one), then blocks in short slices so release wakes promptly
-        without sleep-spinning. Closed members are skipped outright, and a
-        fully-wedged pool still fails fast at the deadline.
+        without sleep-spinning. Closed members are re-dialed on demand so a
+        transient outage heals without a restart, and a fully-wedged pool
+        still fails fast at the deadline.
         """
         members = self._members_snapshot()
         with self._pool_lock:
             start = self._rr % len(members)
             self._rr += 1
+        # Revive closed members before leasing: without this a burst of
+        # transient failures closes every member and the pool stays dead
+        # until restart (only connect() revived, called at startup).
+        for i in range(len(members)):
+            m = members[(start + i) % len(members)]
+            try:
+                if getattr(m, "_closed", False):
+                    self._try_revive(m)
+            except Exception:
+                continue
         deadline = time.monotonic() + _POOL_LEASE_TIMEOUT
         while True:
             for i in range(len(members)):
@@ -675,7 +705,15 @@ class SFTPExporter:
             self._release(m)
 
     def fetch_many(self, infohashes: Iterable[str]) -> dict[str, bytes]:
-        return {h: data for h, data in ((h, self.fetch_torrent(h)) for h in infohashes) if data}
+        out: dict[str, bytes] = {}
+        for h in infohashes:
+            try:
+                data = self.fetch_torrent(h)
+            except Exception:
+                continue
+            if data:
+                out[h] = data
+        return out
 
     def disk_free_bytes(self, path: str) -> int | None:
         """Free bytes on the remote filesystem containing `path` (see member)."""
