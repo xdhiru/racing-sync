@@ -98,7 +98,10 @@ def _validate_rclone_binary(cfg: AppConfig) -> Path | None:
 def _env(cfg: AppConfig) -> dict[str, str]:
     env = dict(os.environ)
     if cfg.rclone.config_path:
-        env["RCLONE_CONFIG"] = str(cfg.rclone.config_path)
+        cfg_path = str(cfg.rclone.config_path)
+        if cfg_path.strip().startswith("-"):
+            raise RcloneError(f"refusing rclone config_path starting with '-': {cfg_path!r}")
+        env["RCLONE_CONFIG"] = cfg_path
     return env
 
 
@@ -112,9 +115,15 @@ def _reject_hijack_flags(flags: list[str] | None, where: str) -> None:
     for item in flags or []:
         try:
             flag = str(item).strip().lower().split("=", 1)[0]
+            # Normalize single-dash and underscore variants (-config,
+            # --password_command) to the canonical double-dash hyphen form.
+            norm = flag
+            if norm.startswith("-") and not norm.startswith("--"):
+                norm = "-" + norm
+            norm = norm.replace("_", "-")
         except Exception:
             continue
-        if flag in ("--config", "--password-command", "--ask-password"):
+        if norm in ("--config", "--password-command", "--ask-password"):
             raise RcloneError(
                 f"refusing rclone {where} flag that hijacks config/credentials: {item!r}"
             )
@@ -200,9 +209,13 @@ def _move_timeout_seconds(cfg: AppConfig) -> float:
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return 6 * 3600
     try:
-        return max(60.0, float(raw))
+        val = float(raw)
     except (TypeError, ValueError):
         return 6 * 3600
+    import math as _math
+    if not _math.isfinite(val):
+        return 6 * 3600
+    return max(60.0, val)
 
 
 async def run_rclone(
@@ -216,13 +229,16 @@ async def run_rclone(
     _validate_rclone_binary(cfg)
     log.info("rclone: %s", redact_rclone_cmd(cmd))
     t0 = time.monotonic()
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        stdin=asyncio.subprocess.DEVNULL,
-        env=_env(cfg),
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            env=_env(cfg),
+        )
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        raise RcloneError(f"could not spawn rclone {cmd[0]!r}: {e}") from e
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
@@ -290,6 +306,11 @@ async def run_rclone(
     dt = time.monotonic() - t0
     stdout = stdout_b.decode("utf-8", errors="replace")
     stderr = stderr_b.decode("utf-8", errors="replace")
+    # Bound memory: rclone -v can emit MBs; only the tail is ever logged.
+    if len(stdout) > 1_048_576:
+        stdout = stdout[-1_048_576:]
+    if len(stderr) > 1_048_576:
+        stderr = stderr[-1_048_576:]
     code = proc.returncode if proc.returncode is not None else -1
     res = RcloneResult(returncode=code,
                        stdout=stdout, stderr=stderr, duration=dt)
