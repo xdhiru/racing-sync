@@ -278,6 +278,8 @@ class TelegramConfig(BaseModel):
     # per second so a burst of state transitions (e.g. first run on a
     # racing client with 60+ torrents) doesn't trigger HTTP 429.
     outbound_rate: int = Field(default=5, ge=1)
+    # Number of active tasks displayed per page in the status message (default: 5)
+    page_size: int = Field(default=5, ge=1)
 
 
 class LoggingSinkConfig(BaseModel):

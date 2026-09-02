@@ -24,9 +24,9 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 
 from .config import TelegramConfig
 from .coordinator import Coordinator
@@ -41,16 +41,16 @@ log = logging.getLogger(__name__)
 
 
 _STATE_ICON = {
-    State.NEW: "[NEW]",
-    State.QUERYING: "[QUERY]",
-    State.WAITING_SEEDPOOL: "[WAIT-SP]",
-    State.WAITING_DISK: "[WAIT-SSD]",
-    State.QUEUED: "[Q]",
-    State.DOWNLOADING: "[DL]",
-    State.MOVING: "[MOVE]",
-    State.RE_ADDING: "[RE-ADD]",
-    State.DONE: "[DONE]",
-    State.FAILED: "[FAIL]",
+    State.NEW: "🆕 `NEW`",
+    State.QUERYING: "🔍 `QUERY`",
+    State.WAITING_SEEDPOOL: "⏳ `WAIT-SP`",
+    State.WAITING_DISK: "💾 `WAIT-SSD`",
+    State.QUEUED: "📋 `QUEUED`",
+    State.DOWNLOADING: "⬇️ `DOWNLOADING`",
+    State.MOVING: "📦 `MOVING`",
+    State.RE_ADDING: "🔄 `RE-ADDING`",
+    State.DONE: "✅ `DONE`",
+    State.FAILED: "❌ `FAILED`",
 }
 
 
@@ -150,30 +150,75 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     return "\n".join(lines)
 
 
-def render_active(active: list[tuple[TorrentState, float | None]]) -> str:
-    """Compact list of currently in-flight torrents.
+def render_active(
+    active: list[tuple[TorrentState, float | None]],
+    page: int = 0,
+    page_size: int = 5,
+) -> tuple[str, int, int]:
+    """Render paginated list of active tasks with numbered items."""
+    total_items = len(active)
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
+    cur_page = max(0, min(page, total_pages - 1))
 
-    Each line: filename (short), size, hash-end, state, batch.
-    """
     now = dt.datetime.now().strftime("%H:%M:%S")
-    lines = [f"*Active tasks* \\- `{now}`", ""]
     if not active:
-        lines.append("_idle_")
-    else:
-        for ts, progress in active[:30]:
-            name = _short_name(ts.source_name, 36)
-            size = _bytes_human(ts.total_bytes)
-            state = _STATE_ICON.get(ts.state, ts.state.value)
-            batch = f"{ts.batch_index}/{ts.batches_total}"
-            line = (
-                f"{state} `{name}`\n"
-                f"    `{ts.source_infohash[-5:]}` · {size} · batch `{batch}`"
-            )
-            if progress is not None and ts.state == State.DOWNLOADING:
-                pct = f"{progress * 100:4.0f}%"
-                line += f" · {pct}"
-            lines.append(line)
-    return "\n".join(lines)
+        return (
+            f"*Active Tasks*\n🕒 `{now}`\n\n_No active tasks in flight\\._",
+            0,
+            1,
+        )
+
+    start_idx = cur_page * page_size
+    end_idx = min(start_idx + page_size, total_items)
+    page_items = active[start_idx:end_idx]
+
+    lines = [
+        f"*Active Tasks* · *Page {cur_page + 1}/{total_pages}* ({total_items} in flight)",
+        f"🕒 `{now}`",
+        "",
+    ]
+
+    for i, (ts, progress) in enumerate(page_items):
+        item_num = start_idx + i + 1
+        name = _short_name(ts.source_name, 44)
+        size = _bytes_human(ts.total_bytes)
+        state_icon = _STATE_ICON.get(ts.state, f"`{ts.state.value}`")
+        short_hash = ts.source_infohash[-5:]
+
+        # Numbered item header
+        lines.append(f"*{item_num}.* {state_icon} *{_esc(name)}*")
+
+        # Subline details
+        details: list[str] = [f"`{size}`"]
+
+        if ts.state == State.DOWNLOADING:
+            if progress is not None:
+                pct = f"{progress * 100:.1f}%"
+                details.append(f"`{pct}`")
+            else:
+                details.append("`Downloading`")
+        elif ts.state == State.QUEUED:
+            details.append("`Queued`")
+        elif ts.state == State.MOVING:
+            details.append("`Moving`")
+        elif ts.state == State.RE_ADDING:
+            details.append("`Re-adding`")
+        elif ts.state == State.QUERYING:
+            details.append("`Querying`")
+        elif ts.state == State.WAITING_SEEDPOOL:
+            details.append(f"`Wait-SP #{ts.seedpool_attempts}`")
+        elif ts.state == State.WAITING_DISK:
+            details.append("`Wait-SSD`")
+
+        if ts.batches_total > 1:
+            details.append(f"Batch `{ts.batch_index}/{ts.batches_total}`")
+
+        details.append(f"`#{short_hash}`")
+
+        lines.append(f"    ↳ {' · '.join(details)}")
+        lines.append("")
+
+    return "\n".join(lines).strip(), cur_page, total_pages
 
 
 # --------------------------------------------------------------------------- #
@@ -200,7 +245,11 @@ class TelegramBot:
         self._store = store
         self._bot: Bot | None = None
         self._task: asyncio.Task | None = None
+        self._callback_task: asyncio.Task | None = None
+        self._stopped: bool = False
+        self._current_page: int = 0
         self._active_msg_id: int | None = None
+        self._prev_active_msg_id: int | None = None
         self._pinned_message_id: int | None = None
         # Outbound rate limiter: Telegram's bot API allows ~30
         # messages/sec across all chats per bot. We self-throttle to
@@ -213,14 +262,16 @@ class TelegramBot:
         # In-process cache: source_infohash -> message_id, so we don't
         # need to hit state.db for every send.
         self._detail_cache: dict[str, int] = {}
-        # Cached "last active-tasks text" so we skip identical edits.
+        # Cached "last active-tasks (page, total_pages, text)" so we skip identical edits.
         self._last_active_text: str = ""
+        self._last_active_cache: tuple[int, int, str] | None = None
 
     # ---- lifecycle ----
 
     async def start(self) -> None:
         if not self._cfg.enabled:
             return
+        self._stopped = False
         self._bot = Bot(token=self._cfg.bot_token)
         # Per-torrent message queue: bounded so a torrent flood doesn't
         # grow memory. 256 is well over what any operator needs.
@@ -239,8 +290,18 @@ class TelegramBot:
         except TelegramError as e:
             log.warning("telegram probe failed: %s", e)
         self._task = asyncio.create_task(self._loop(), name="rs-telegram")
+        self._callback_task = asyncio.create_task(
+            self._callback_loop(), name="rs-telegram-callbacks",
+        )
 
     async def stop(self) -> None:
+        self._stopped = True
+        if self._callback_task:
+            self._callback_task.cancel()
+            try:
+                await self._callback_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._detail_worker:
             self._detail_worker.cancel()
             try:
@@ -258,10 +319,12 @@ class TelegramBot:
 
     async def _loop(self) -> None:
         assert self._bot is not None
-        while True:
+        while not self._stopped:
             try:
                 await self._refresh_active_message()
                 await self._reconcile_pinned()
+            except (TimedOut, NetworkError) as e:
+                log.warning("telegram loop transient network error (%s); will retry next interval", e)
             except Exception as e:  # noqa: BLE001
                 log.warning("telegram loop error: %s", e)
             await asyncio.sleep(self._cfg.status_update_interval)
@@ -389,9 +452,90 @@ class TelegramBot:
                     self._detail_queue.put_nowait((infohash, progress))
                 except asyncio.QueueFull:
                     pass
+        except (TimedOut, NetworkError) as e:
+            log.warning("telegram detail send timed out (%s); will retry next interval", e)
+            if self._detail_queue is not None:
+                try:
+                    self._detail_queue.put_nowait((infohash, progress))
+                except asyncio.QueueFull:
+                    pass
         except TelegramError as e:
             log.warning("telegram detail send failed for %s: %s",
                         infohash[:10], e)
+
+    # ---- active tasks pagination & callback handling ----
+
+    def _build_keyboard(self, current_page: int, total_pages: int) -> InlineKeyboardMarkup | None:
+        if total_pages <= 1:
+            buttons = [
+                [InlineKeyboardButton("🔄 Refresh", callback_data="page:refresh")]
+            ]
+            return InlineKeyboardMarkup(buttons)
+
+        buttons = [
+            [
+                InlineKeyboardButton("◀️ Prev", callback_data="page:prev"),
+                InlineKeyboardButton(f"{current_page + 1} / {total_pages}", callback_data="page:refresh"),
+                InlineKeyboardButton("Next ▶️", callback_data="page:next"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Refresh", callback_data="page:refresh"),
+            ],
+        ]
+        return InlineKeyboardMarkup(buttons)
+
+    async def _callback_loop(self) -> None:
+        """Poll get_updates to handle pagination inline keyboard clicks."""
+        assert self._bot is not None
+        offset = 0
+        while not self._stopped:
+            try:
+                updates = await self._bot.get_updates(
+                    offset=offset,
+                    timeout=10,
+                    allowed_updates=["callback_query"],
+                )
+                for u in updates:
+                    offset = max(offset, u.update_id + 1)
+                    if u.callback_query:
+                        await self._handle_callback(u.callback_query)
+            except asyncio.CancelledError:
+                return
+            except (TimedOut, NetworkError):
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                msg = str(e).lower()
+                if "conflict" in msg:
+                    log.warning("telegram callback polling conflict (another bot session running?): %s", e)
+                    await asyncio.sleep(15)
+                else:
+                    log.debug("telegram callback polling error: %s", e)
+                    await asyncio.sleep(2)
+
+    async def _handle_callback(self, query: Any) -> None:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+        data = str(getattr(query, "data", "") or "")
+        if not data.startswith("page:"):
+            return
+
+        action = data.split(":", 1)[1]
+        rows = self._store.list_active_inflight()
+        page_size = self._cfg.page_size
+        total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+
+        if action == "prev":
+            self._current_page = (self._current_page - 1) % total_pages
+        elif action == "next":
+            self._current_page = (self._current_page + 1) % total_pages
+        elif action == "refresh":
+            pass
+
+        self._last_active_cache = None
+        await self._refresh_active_message()
 
     # ---- active tasks list ----
 
@@ -407,18 +551,43 @@ class TelegramBot:
             (ts, progress_map.get(ts.source_infohash.lower()))
             for ts in rows
         ]
-        text = render_active(items)
-        # Skip the API call entirely if the text is identical to last
-        # time. Saves 30+ API hits per minute when nothing is changing.
-        if text == self._last_active_text and self._active_msg_id is not None:
+        text, cur_page, total_pages = render_active(
+            items, page=self._current_page, page_size=self._cfg.page_size
+        )
+        self._current_page = cur_page
+        keyboard = self._build_keyboard(cur_page, total_pages)
+
+        # Skip the API call if page, total_pages, and text are identical
+        cache_key = (cur_page, total_pages, text)
+        if cache_key == self._last_active_cache and self._active_msg_id is not None:
             return
         self._last_active_text = text
+
         if self._active_msg_id is None:
-            sent = await self._bot.send_message(
-                self._cfg.chat_id, text,
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            self._active_msg_id = sent.message_id
+            # Clean up previously known message if any to prevent duplicate message spam
+            if self._prev_active_msg_id is not None and self._prev_active_msg_id > 0:
+                try:
+                    await self._bot.delete_message(
+                        chat_id=self._cfg.chat_id,
+                        message_id=self._prev_active_msg_id,
+                    )
+                except Exception:
+                    pass
+                self._prev_active_msg_id = None
+
+            try:
+                sent = await self._bot.send_message(
+                    self._cfg.chat_id, text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=keyboard,
+                )
+                self._active_msg_id = sent.message_id
+                self._prev_active_msg_id = sent.message_id
+                self._last_active_cache = cache_key
+            except (TimedOut, NetworkError) as e:
+                log.warning("active-tasks send timed out (%s); will retry next interval", e)
+            except TelegramError as e:
+                log.warning("active-tasks send failed: %s", e)
         else:
             try:
                 await self._bot.edit_message_text(
@@ -426,39 +595,50 @@ class TelegramBot:
                     chat_id=self._cfg.chat_id,
                     message_id=self._active_msg_id,
                     parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=keyboard,
                 )
+                self._last_active_cache = cache_key
             except TelegramError as e:
                 msg = str(e).lower()
-                # "Message is not modified" — Telegram returns 400 when the
-                # new text is byte-identical to the existing one. This is
-                # benign; just skip this tick.
+                # "Message is not modified" — Telegram returns 400 when byte-identical
                 if "not modified" in msg:
+                    self._last_active_cache = cache_key
                     return
-                # "Message to edit not found" / "MESSAGE_ID_INVALID" — the
-                # message was deleted from the chat; re-send.
-                if "message to edit not found" in msg or "message_id_invalid" in msg:
-                    log.warning("active-tasks message not found; resending")
-                    self._active_msg_id = None
+
+                # Rate limit / timeout / network error:
+                # NEVER clear _active_msg_id on temporary glitches!
+                if (
+                    isinstance(e, (RetryAfter, TimedOut, NetworkError))
+                    or "flood control" in msg
+                    or "too many requests" in msg
+                    or "timed out" in msg
+                    or "timeout" in msg
+                    or "connection" in msg
+                ):
+                    log.warning(
+                        "active-tasks edit skipped due to temporary network/rate-limit (%s); will retry next interval",
+                        e,
+                    )
                     return
-                # "Chat not found" — bot can send but not edit (permission issue,
-                # wrong chat_id format for editing, or bot not admin in channel).
-                # Don't spam; log once and stop trying to edit.
+
+                # "Chat not found" — permission issue
                 if "chat not found" in msg:
                     log.error(
                         "active-tasks edit failed: 'Chat not found'. "
-                        "Bot can send but not edit messages. "
-                        "Check: bot is admin in channel, chat_id is numeric (-100...), "
-                        "or disable active-tasks message. Disabling active-tasks updates."
+                        "Disabling active-tasks updates."
                     )
-                    self._active_msg_id = -1  # Sentinel: stop trying to edit
+                    self._active_msg_id = -1
                     return
-                # Rate limit / flood control — keep message_id and skip this interval
-                if isinstance(e, RetryAfter) or "flood control" in msg or "too many requests" in msg:
-                    log.warning("active-tasks edit rate-limited (%s); will retry on next interval", e)
+
+                # "Message to edit not found" / "MESSAGE_ID_INVALID" — deleted from chat
+                if "message to edit not found" in msg or "message_id_invalid" in msg:
+                    log.warning("active-tasks message not found in chat; will resend")
+                    self._active_msg_id = None
+                    self._last_active_cache = None
                     return
-                # Other errors — log and re-send once.
-                log.warning("active-tasks edit failed (%s); resending", e)
-                self._active_msg_id = None
+
+                # Other errors — keep message_id for next retry
+                log.warning("active-tasks edit failed (%s); keeping message_id for next retry", e)
 
     async def _reconcile_pinned(self) -> None:
         """Telegram allows at most one pinned message per chat; pin ours."""
