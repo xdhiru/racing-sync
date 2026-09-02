@@ -224,7 +224,7 @@ class FuseConfig(BaseModel):
 
 
 class RcloneConfig(BaseModel):
-    binary: Path = Path("/usr/bin/rclone")
+    binary: Path = Path("/usr/local/bin/rclone")
     config_path: Path | None = None
     remote: RemoteConfig
     fuse: FuseConfig

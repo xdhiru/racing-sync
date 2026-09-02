@@ -24,9 +24,6 @@ def test_concurrency_defaults():
     max_inflight_bytes = 1000000000
     skip_movie_larger_than_bytes = 1000000000
 
-    [rclone]
-    binary = "/usr/bin/rclone"
-
     [rclone.remote]
     default = "remote:movies/"
     unsorted = "remote:unsorted/"
@@ -37,6 +34,7 @@ def test_concurrency_defaults():
     """
     import tomllib
     cfg = AppConfig.model_validate(tomllib.loads(data))
+    assert cfg.rclone.binary == Path("/usr/local/bin/rclone")
     assert cfg.dest.max_active_downloads == 3
     assert cfg.rclone.max_concurrent_moves == 3
     assert cfg.max_active_downloads == 3
