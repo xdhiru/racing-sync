@@ -144,8 +144,10 @@ skip_movie_larger_than_bytes = 536870912000  # 500 GiB
 [rclone]
 # Absolute path to the rclone binary (defaults to /usr/local/bin/rclone)
 binary = "/usr/local/bin/rclone"
-# No rclone config path needed: rclone automatically uses the existing
-# configured remotes and credentials of the user running the app.
+# Optional: path to a specific rclone.conf file. If omitted or left empty,
+# rclone uses the default user config (~/.config/rclone/rclone.conf).
+# Useful if you want a dedicated, separate rclone.conf for this app.
+# config_path = "/path/to/rclone.conf"
 # Maximum concurrent rclone move commands running simultaneously (default: 3).
 # Limits parallel moves from SSD to remote to prevent CPU/network saturation.
 max_concurrent_moves = 3
