@@ -16,7 +16,7 @@ dist/
 .coverage
 htmlcov/
 
-# Local config with secrets
+# Local configs with secrets and debug log samples
 config.toml
 debug-config.toml
 debug-*.toml
