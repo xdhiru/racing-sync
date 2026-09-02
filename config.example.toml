@@ -1,0 +1,355 @@
+# ============================================================
+# racing-sync configuration
+# ============================================================
+
+[general]
+# Polling interval (seconds) for source client (VPS1)
+source_poll_interval = 30
+# Polling interval (seconds) for destination client (VPS2)
+dest_poll_interval = 15
+# SQLite state DB path
+state_db = "/var/lib/racing-sync/state.db"
+# Log directory (rotating files)
+log_dir = "/var/log/racing-sync"
+# Log retention days
+log_retention_days = 14
+
+# Safety margin added on top of every SSD free-space check (bytes).
+# Example: 10 GiB. Prevents races between disk_usage() check and torrent fill.
+disk_safety_margin_bytes = 10737418240
+
+# ============================================================
+# Source (VPS1) — racing client
+# ============================================================
+
+[source]
+# Type of client: "qbittorrent" or "deluge"
+type = "qbittorrent"
+
+# --- WebUI connection ---
+host = "http://127.0.0.1:8080"
+username = "admin"
+password = "change_me"
+# Filter racing torrents by category/label. Empty string = sync ALL
+# torrents regardless of category (recommended when the racing client
+# doesn't categorise its torrents, e.g. it just races everything).
+#
+# Examples:
+#   category = ""           # sync every torrent
+#   category = "racing"     # only sync torrents in category "racing"
+#   category = "auto,manual"  # qBittorrent supports comma-separated names
+category = ""
+
+# Skip torrents added on the racing client more than N seconds ago.
+# Protects against accidentally re-syncing long-running seeds when
+# the category filter is empty (sync-all mode).
+# 0 = sync every age (default; matches the racing workflow where every
+#     newly-added torrent is fair game).
+min_age_seconds = 0
+
+# Optional: nginx (or other reverse-proxy) auth in front of the WebUI.
+# Two modes:
+#
+#   mode = "basic"   (default, most common)
+#     The proxy uses HTTP Basic auth (`auth_basic` directive in nginx).
+#     The client sends `Authorization: Basic ...` on every request
+#     using the credentials from [source].username and [source].password.
+#     This is the popup your browser shows when you visit the WebUI.
+#     `url` is ignored.
+#
+#   mode = "form_post"  (unusual)
+#     The proxy returns a custom HTML login form on 401 (custom nginx
+#     `auth_request` flow). The client POSTs to `url` to obtain a
+#     session cookie, then proceeds with the WebUI's own login.
+#     `user_field` / `pass_field` are the HTML form's field NAMES.
+#
+#   mode = "off"  (no proxy auth)
+#     WebUI is reachable directly.
+#
+# For typical nginx `auth_basic` setups (which is what most people
+# use), you don't need to set anything here other than leaving the
+# defaults — credentials come from [source].username / password.
+[source.nginx]
+mode         = "basic"
+url          = ""           # only used when mode="form_post"
+user_field   = "username"   # only used when mode="form_post"
+pass_field   = "password"   # only used when mode="form_post"
+extra_fields = {}          # only used when mode="form_post"
+
+# --- Deluge-only: SFTP export of .torrent files from state dir ---
+[source.deluge_sftp]
+enabled = false
+ssh_host = "127.0.0.1"
+ssh_port = 22
+ssh_user = "deluge"
+# Authentication priority: ssh_key_path (with optional passphrase)
+# takes precedence over ssh_password. At least one must be set.
+#
+# Plain-password auth (used when ssh_key_path is empty):
+ssh_password = ""
+# Public-key auth:
+ssh_key_path = ""
+# Passphrase for the SSH key above. Leave empty for an unencrypted key.
+ssh_key_passphrase = ""
+# Path inside VPS1 to deluge state dir; typically ~/.config/deluge/state
+state_dir = "/home/deluge/.config/deluge/state"
+
+# ============================================================
+# Destination (VPS2) — long-term seed client (qbittorrent)
+# ============================================================
+
+[dest]
+host = "http://127.0.0.1:8080"
+username = "admin"
+password = "change_me"
+
+# Default save_path used for movies / season-root folders.
+# This MUST be on the local SSD (not the fuse mount) so qBittorrent
+# can hash-check normally.
+save_path = "/srv/qbittorrent/data"
+
+# Optional nginx basic-auth in front of the qBittorrent WebUI on VPS2.
+# Optional nginx auth in front of the qBittorrent WebUI on VPS2.
+# Same semantics as [source.nginx]. mode="basic" is the common case
+# (HTTP Basic auth via the Authorization header).
+[dest.nginx]
+mode         = "off"        # VPS2 typically has no nginx
+url          = ""
+user_field   = "username"
+pass_field   = "password"
+extra_fields = {}
+
+# ============================================================
+# SSD cap (VPS2 local storage)
+# ============================================================
+
+[ssd]
+# Path to check free space against (usually == dest.save_path)
+path = "/srv/qbittorrent/data"
+# Maximum bytes that may be occupied by an in-flight torrent at once.
+# Hard cap; batcher will not exceed this for season processing.
+max_inflight_bytes = 536870912000   # 500 GiB
+# If a single-file torrent (movie) is larger than this, skip it entirely.
+# (Season torrents are still processed in batches even if larger.)
+skip_movie_larger_than_bytes = 536870912000  # 500 GiB
+
+# ============================================================
+# rclone (VPS2)
+# ============================================================
+
+[rclone]
+# Absolute path to the rclone binary
+binary = "/usr/bin/rclone"
+# Path to rclone.conf (omit to use default ~/.config/rclone/rclone.conf)
+config_path = ""
+
+# Default remote + path for movies and full season-root folders.
+# These are rclone REMOTE paths (not fuse mount paths).
+# They get passed to:   rclone move <local> <remote_path>
+[rclone.remote]
+# e.g. "remote:qbittorrent/"
+default = "remote:qbittorrent/"
+# Subfolder for individual TV episodes that are not part of a
+# completed full-season move (req #6, #8).
+unsorted = "remote:qbittorrent/unsorted/"
+
+# Fuse mount paths on the destination client.
+# These are what qBittorrent uses as save_path AFTER files have been
+# moved to the remote and we want to seed from the mount.
+[rclone.fuse]
+# Mount for movies + season roots
+mount = "/mnt/remote/qbittorrent"
+# Mount for individual episodes
+mount_unsorted = "/mnt/remote/qbittorrent/unsorted"
+
+# Extra rclone flags applied to every `rclone move`.
+# Defaults are sensible for slow remotes; tune as needed.
+extra_move_flags = [
+    "--transfers=4",
+    "--checkers=8",
+    "--bwlimit=0",          # 0 = no limit; set a number if you need to cap
+    "--size-only",          # faster than --checksum on huge media files
+    "--retries=10",
+    "--low-level-retries=20",
+    "--log-level=INFO",
+    "--stats=30s",
+    "--stats-one-line",
+]
+
+# rclone move used for the per-batch episode transfers adds
+# --include patterns dynamically. These extra flags are appended
+# AFTER the auto-generated --include flags so they can still win
+# if needed.
+batch_move_extra_flags = [
+    "--delete-after",       # not strictly needed; batch folder is wiped locally anyway
+]
+
+# ============================================================
+# Classifier (movie / episode / season)
+# ============================================================
+
+[classifier]
+# Regex applied to a FILE NAME (not folder). If it matches, the file
+# is treated as an individual TV episode and routed to unsorted/.
+# Default: S01E03, s10e22, S1E1, etc. Tweak per your release naming.
+episode_regex = "(?i)\\bS\\d{1,2}E\\d{1,2}\\b"
+
+# ============================================================
+# Telegram notifications
+# ============================================================
+
+[telegram]
+# Telegram layout:
+#   - one message per torrent (detail card, edited in place as state
+#     advances, persists in chat as history)
+#   - one pinned message at the bottom of the chat (active tasks list,
+#     edited every status_update_interval seconds)
+#
+# App logging goes to local files only — there is no log forwarding
+# to Telegram.
+enabled = false
+bot_token = ""
+chat_id = ""
+# How often to edit the active-tasks list (seconds).
+status_update_interval = 45
+# Pin the active-tasks message so it stays at the bottom of the channel.
+pin_status_message = false
+# Pinning the active-tasks message in the chat requires the bot to
+# have admin rights with "can_pin_messages". If you don't have those,
+# the bot will log a warning and continue without pinning. Most users
+# don't need pinning — the active-tasks message stays at the bottom
+# of the chat naturally because new per-torrent messages are sent
+# above it.
+
+# ============================================================
+# Centralized logging (HTTP sink)
+# ============================================================
+
+[logging_sink]
+# Optional: POST structured log events to a central collector.
+# Useful when source (VPS1) and destination (VPS2) both run the
+# app and you want one log stream.
+enabled = false
+url = ""                    # e.g. "https://logs.example.com/ingest"
+auth_token = ""
+# Event levels to forward (must be >= telegram.log_min_level)
+forward_min_level = "INFO"
+
+# ============================================================
+# Watch directory (VPS2) — manual private torrent drops
+# req #3
+# ============================================================
+
+[watch_dir]
+path = "/srv/qbittorrent/watch"
+glob = "*.torrent"
+delete_after_pickup = true
+query_prowlarr = true
+# If prowlarr returns a hit on the configured indexer, prefer that
+# torrent over the manually-dropped file.
+prefer_prowlarr_result = true
+
+# ============================================================
+# Prowlarr — cross-seed lookups + indexer queries
+# req #5 + #6
+# ============================================================
+
+[prowlarr]
+enabled = true
+base_url = "http://127.0.0.1:9696"
+api_key = "CHANGE_ME"
+# Indexer used for SSD downloads and cross-seed searches. Must match
+# the EXACT name of the indexer in your Prowlarr instance (case-sensitive).
+# No default — you must set this when [prowlarr].enabled = true.
+download_indexer = "Seedpool (API)"
+timeout_seconds = 30.0
+max_results = 20
+
+# Tracker announce URL substring → prowlarr indexer name.
+# Used to figure out which prowlarr indexer to search when a torrent
+# from the racing client has only private sources.
+#
+# Each pair has TWO values:
+#   *_substr  the substring matched (case-insensitive) against the
+#             racing client's announce URL
+#   *_index   the corresponding prowlarr indexer name to search on
+# Tracker announce URL substring → prowlarr indexer name.
+# Used to figure out which prowlarr indexer to search when a torrent
+# from the racing client has only private sources.
+#
+# Fully user-defined. List every mapping you want. The racing client
+# announce URL is checked against each key (case-insensitive substring
+# match); the first match wins. The value is the prowlarr indexer name
+# to search on.
+#
+# Examples — replace with whatever trackers YOU actually race on:
+[prowlarr.tracker_map]
+"aither.cc"      = "Aither (API)"
+"beyond-hd"      = "BeyondHD"
+"animebytes.tv"  = "AnimeBytes"
+
+# ============================================================
+# Cross-seed strategy
+# req #1 + #2
+# ============================================================
+
+[cross_seed]
+# Policy summary (req #1 + #2):
+#   Public racing torrent exists on VPS1:
+#     SSD download   = use VPS1's existing public .torrent directly.
+#                     Prowlarr is NOT queried in this case.
+#     Re-injection   = every racing-client torrent (public + private) for
+#                     this content gets re-added on VPS2 fuse, skip_check.
+#   Only private racing torrents exist:
+#     SSD download   = query Prowlarr (download_indexer = "Seedpool (API)"
+#                     by default). Park + retry per prowlarr_retry_*
+#                     if no hit.
+#     Re-injection   = every racing-client torrent for this content gets
+#                     re-added on VPS2 fuse, skip_check.
+#
+# Flags below override these defaults.
+
+# When the racing client's public .torrent is unreachable on VPS1
+# (rare; e.g. BT_backup file deleted), fall back to Prowlarr for a
+# public cross-seed. Default false because racing-public is preferred.
+refetch_public_via_prowlarr = false
+# After rclone move, re-add every racing-client torrent (public + private)
+# for the content onto VPS2 fuse mount with skip_check=true.
+inject_racing_torrents_to_fuse = true
+# Whether to allow Prowlarr cross-seed lookups for the SSD download.
+# Disable this if you want VPS2 to always leech from VPS1 directly.
+allow_prowlarr_cross_seed = true
+# Whether to allow SFTP / SSH-export of the racing client's .torrent
+# state. Required for Deluge (no WebUI export). For qBittorrent this is
+# a last-resort fallback when no public torrent and no Prowlarr hit.
+allow_ssh_export = true
+# req #2 follow-up: when the configured download_indexer returns no
+# cross-seed for a brand-new release, re-query every
+# prowlarr_retry_interval_seconds. After prowlarr_max_age_seconds
+# (counted from the FIRST attempt), give up and mark the torrent FAILED
+# for manual handling.
+prowlarr_retry_interval_seconds = 1800   # 30 minutes
+prowlarr_max_age_seconds        = 86400  # 24 hours
+
+# ============================================================
+# Recovery / reconciliation
+# req #4
+# ============================================================
+
+[recovery]
+run_on_startup = true
+auto_fix_state = true
+batch_size = 50
+
+# ============================================================
+# Control API (optional, FastAPI)
+# ============================================================
+
+[api]
+enabled = false
+host = "127.0.0.1"
+port = 8765
+# If nginx basic-auth is in front, the API trusts X-Authenticated-User
+# header injected by nginx. Otherwise, set api_token below.
+trust_nginx_header = true
+api_token = ""
