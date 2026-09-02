@@ -1140,7 +1140,61 @@ class Coordinator:
         cls_files = await self.dest_client.get_torrent_files(h)
         cls = classify(cls_files, self.cfg)
 
-        # Decide target remote
+        # 1. Remove torrent from VPS2 client BEFORE move begins (delete_files=False).
+        # This closes file handles and stops seeding from the SSD, avoiding I/O errors.
+        log.info(
+            "pausing and deleting torrent %s from VPS2 client before move (delete_files=False)",
+            h[:10],
+        )
+        try:
+            await self.dest_client.pause(h)
+            await self.dest_client.delete(h, delete_files=False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not delete torrent from client before move: %s", e)
+
+        # 2. Separate completed files from incomplete piece-boundary files
+        src_dir = Path(self.cfg.dest.save_path)
+        folder = self._season_folder_for(cls_files, ts.source_name)
+        content_dir = folder if folder and folder.exists() else src_dir
+
+        completed_files: list[TorrentFile] = []
+        incomplete_files: list[TorrentFile] = []
+
+        for f in cls_files:
+            file_path = src_dir / f.name
+            if not file_path.exists():
+                continue
+            # A file is complete if progress >= 0.999 or its size on disk matches expected size
+            if f.progress >= 0.999 or file_path.stat().st_size >= f.size_bytes:
+                completed_files.append(f)
+            else:
+                incomplete_files.append(f)
+
+        # 3. Clean up incomplete piece-boundary files so they are NOT moved to remote
+        for f in incomplete_files:
+            file_path = src_dir / f.name
+            if file_path.exists():
+                log.info(
+                    "removing incomplete piece-boundary file: %s (%d/%d B)",
+                    f.name, file_path.stat().st_size, f.size_bytes,
+                )
+                try:
+                    if file_path.is_file():
+                        file_path.unlink()
+                    elif file_path.is_dir():
+                        shutil.rmtree(file_path, ignore_errors=True)
+                except OSError as e:
+                    log.warning("failed removing incomplete file %s: %s", f.name, e)
+
+        # Also purge any leftover temporary extension files like .!qB or .parts
+        if content_dir.exists():
+            for temp_file in list(content_dir.glob("**/*.!qB")) + list(content_dir.glob("**/*.parts")):
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
+
+        # 4. Decide target remote
         if cls.kind in ("season", "mixed") and ts.classification_kind != "season":
             # We moved per-batch; nothing left to do
             self.transition(ts, State.RE_ADDING)
@@ -1151,22 +1205,11 @@ class Coordinator:
         else:
             remote = self.cfg.rclone.remote.unsorted
 
-        src_dir = Path(self.cfg.dest.save_path)
+        # 5. Move completed files via rclone
         if cls.kind in ("movie", "season", "unknown"):
-            # Whole-dir move
-            local = src_dir / cls.single_file if cls.kind == "movie" else src_dir
-            # If the torrent files are nested in a folder, move that folder.
-            if cls.kind in ("season", "unknown"):
-                # Move the season folder under save_path
-                files = cls_files
-                if files:
-                    folder = self._season_folder_for(files, ts.source_name)
-                    if folder:
-                        local = folder
-                    else:
-                        local = src_dir
-                else:
-                    local = src_dir
+            local = src_dir / cls.single_file if (cls.kind == "movie" and cls.single_file and (src_dir / cls.single_file).exists()) else src_dir
+            if cls.kind in ("season", "unknown") and folder and folder.exists():
+                local = folder
             await self._rclone_move(local, remote, ts)
         else:
             # Mixed — per-episode moves with --include
@@ -1180,14 +1223,12 @@ class Coordinator:
                 await self._rclone_move(
                     src_dir, remote, ts, include=batch.include_patterns(),
                 )
-                # req #8: wipe local season folder between batches
-                folder = self._season_folder_for(cls_files, ts.source_name)
-                if folder:
-                    await wipe_local_tree(folder)
 
-        # Clean up: pause + remove torrent on VPS2 SSD; we'll re-add on fuse
-        await self.dest_client.pause(h)
-        await self.dest_client.delete(h, delete_files=True)
+        # 6. Delete local content folder on SSD after move
+        if folder and folder.resolve() != src_dir.resolve() and folder.exists():
+            log.info("deleting content folder after move: %s", folder)
+            await wipe_local_tree(folder)
+
         self.transition(ts, State.RE_ADDING)
 
     async def _rclone_move(self, local: Path, remote: str, ts: TorrentState,

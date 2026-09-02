@@ -190,19 +190,22 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         try:
             status = await self._rpc(
                 "core.get_torrent_status",
-                [torrent_hash, ["files", "file_priorities"]],
+                [torrent_hash, ["files", "file_priorities", "file_progress"]],
             )
             if status and "files" in status:
                 prios = status.get("file_priorities", []) or []
+                progs = status.get("file_progress", []) or []
                 out: list[TorrentFile] = []
                 for item in status["files"]:
                     idx = item.get("index", len(out))
                     prio = prios[idx] if idx < len(prios) else item.get("priority", 1)
+                    prog = progs[idx] if idx < len(progs) else 0.0
                     out.append(
                         TorrentFile(
                             name=item.get("path", ""),
                             size_bytes=int(item.get("size", 0)),
                             priority=int(prio),
+                            progress=float(prog),
                         )
                     )
                 if out:
