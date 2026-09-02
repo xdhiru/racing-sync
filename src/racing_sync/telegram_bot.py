@@ -76,14 +76,14 @@ def _short_name(name: str, limit: int = 56) -> str:
 
 def _bytes_human(n: int) -> str:
     if n < 1024:
-        return f"{n}B"
+        return f"{n} B"
     units = ("KB", "MB", "GB", "TB", "PB")
     f = float(n)
     idx = -1
     while f >= 1024 and idx < len(units) - 1:
         f /= 1024
         idx += 1
-    return f"{f:.1f}{units[idx]}"
+    return f"{f:.1f} {units[idx]}"
 
 
 # --------------------------------------------------------------------------- #
@@ -163,7 +163,7 @@ def render_active(
     now = dt.datetime.now().strftime("%H:%M:%S")
     if not active:
         return (
-            f"*Active Tasks*\n🕒 `{now}`\n\n_No active tasks in flight\\._",
+            f"*Active Tasks*\n🕒 {now}\n\n_No active tasks in flight._",
             0,
             1,
         )
@@ -174,48 +174,51 @@ def render_active(
 
     lines = [
         f"*Active Tasks* · *Page {cur_page + 1}/{total_pages}* ({total_items} in flight)",
-        f"🕒 `{now}`",
+        f"🕒 {now}",
         "",
     ]
 
     for i, (ts, progress) in enumerate(page_items):
         item_num = start_idx + i + 1
-        name = _short_name(ts.source_name, 44)
+        name = ts.source_name.replace("`", "'")
         size = _bytes_human(ts.total_bytes)
-        state_icon = _STATE_ICON.get(ts.state, f"`{ts.state.value}`")
-        short_hash = ts.source_infohash[-5:]
+        full_hash = (ts.source_infohash or "").lower()
 
-        # Numbered item header
-        lines.append(f"*{item_num}.* {state_icon} *{_esc(name)}*")
+        # 1. Full name of the torrent, copiable by click (in backticks, no escape chars)
+        lines.append(f"*{item_num}.* `{name}`")
 
-        # Subline details
-        details: list[str] = [f"`{size}`"]
+        # 2. Size below the name, separator dot with space, and full hash copiable by click
+        lines.append(f"    ↳ {size} · `{full_hash}`")
 
+        # 3. Next line shows the state (queued, downloading etc.) and batch if applicable (not in backticks)
         if ts.state == State.DOWNLOADING:
             if progress is not None:
-                pct = f"{progress * 100:.1f}%"
-                details.append(f"`{pct}`")
+                state_text = f"⬇️ Downloading · {progress * 100:.1f}%"
             else:
-                details.append("`Downloading`")
+                state_text = "⬇️ Downloading"
         elif ts.state == State.QUEUED:
-            details.append("`Queued`")
+            state_text = "📋 Queued"
         elif ts.state == State.MOVING:
-            details.append("`Moving`")
+            state_text = "📦 Moving"
         elif ts.state == State.RE_ADDING:
-            details.append("`Re-adding`")
+            state_text = "🔄 Re-adding"
         elif ts.state == State.QUERYING:
-            details.append("`Querying`")
+            state_text = "🔍 Querying"
         elif ts.state == State.WAITING_SEEDPOOL:
-            details.append(f"`Wait-SP #{ts.seedpool_attempts}`")
+            state_text = f"⏳ Waiting for Seedpool (#{ts.seedpool_attempts})"
         elif ts.state == State.WAITING_DISK:
-            details.append("`Wait-SSD`")
+            state_text = "💾 Waiting for SSD space"
+        elif ts.state == State.DONE:
+            state_text = "✅ Done"
+        elif ts.state == State.FAILED:
+            state_text = "❌ Failed"
+        else:
+            state_text = f"🆕 {ts.state.value.capitalize()}"
 
         if ts.batches_total > 1:
-            details.append(f"Batch `{ts.batch_index}/{ts.batches_total}`")
+            state_text += f" · Batch {ts.batch_index}/{ts.batches_total}"
 
-        details.append(f"`#{short_hash}`")
-
-        lines.append(f"    ↳ {' · '.join(details)}")
+        lines.append(f"    ↳ {state_text}")
         lines.append("")
 
     return "\n".join(lines).strip(), cur_page, total_pages

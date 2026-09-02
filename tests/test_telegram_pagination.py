@@ -10,16 +10,17 @@ def test_render_active_empty():
     assert cur_page == 0
     assert total_pages == 1
     assert "No active tasks" in text
+    assert "`" not in text  # No backticks in idle message
 
 
 def test_render_active_pagination_and_numbering():
     tasks = []
     for i in range(12):
         ts = TorrentState(
-            source_infohash=f"hash{i:02d}abcdef1234567890",
-            source_name=f"Release.Title.S01E{i+1:02d}.1080p.mkv",
+            source_infohash=f"hash{i:02d}abcdef1234567890abcdef1234567890",
+            source_name=f"[SubsPlease] Release Title - {i+1:02d} (1080p) [ABCD{i:04d}].mkv",
             state=State.DOWNLOADING if i % 2 == 0 else State.QUEUED,
-            total_bytes=(i + 1) * 1_000_000_000,
+            total_bytes=(i + 1) * 1024 * 1024 * 1024,
             batch_index=0,
             batches_total=2,
         )
@@ -31,18 +32,26 @@ def test_render_active_pagination_and_numbering():
     assert p0 == 0
     assert total0 == 3
     assert "*Page 1/3*" in text0
-    assert "*1.*" in text0
-    assert "*5.*" in text0
-    assert "*6.*" not in text0
-    assert "45.0%" in text0
+
+    # 1. Full name is visible in backticks, and NO backslash escapes for brackets
+    assert "*1.* `[SubsPlease] Release Title - 01 (1080p) [ABCD0000].mkv`" in text0
+    assert "\\[" not in text0
+    assert "\\]" not in text0
+
+    # 2. Size in plain text, followed by dot and full hash in backticks
+    assert "↳ 1.0 GB · `hash00abcdef1234567890abcdef1234567890`" in text0
+
+    # 3. Next line shows state and batch without backticks
+    assert "↳ ⬇️ Downloading · 45.0% · Batch 0/2" in text0
+    assert "↳ 📋 Queued · Batch 0/2" in text0
 
     # Page 1 (items 6..10)
     text1, p1, total1 = render_active(tasks, page=1, page_size=5)
     assert p1 == 1
     assert total1 == 3
     assert "*Page 2/3*" in text1
-    assert "*6.*" in text1
-    assert "*10.*" in text1
+    assert "*6.* `[SubsPlease] Release Title - 06 (1080p) [ABCD0005].mkv`" in text1
+    assert "*10.* `[SubsPlease] Release Title - 10 (1080p) [ABCD0009].mkv`" in text1
     assert "*1.*" not in text1
     assert "*11.*" not in text1
 
@@ -51,8 +60,8 @@ def test_render_active_pagination_and_numbering():
     assert p2 == 2
     assert total2 == 3
     assert "*Page 3/3*" in text2
-    assert "*11.*" in text2
-    assert "*12.*" in text2
+    assert "*11.* `[SubsPlease] Release Title - 11 (1080p) [ABCD0010].mkv`" in text2
+    assert "*12.* `[SubsPlease] Release Title - 12 (1080p) [ABCD0011].mkv`" in text2
     assert "*13.*" not in text2
 
     # Clamping out-of-bounds page
