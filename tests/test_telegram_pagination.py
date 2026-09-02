@@ -20,6 +20,7 @@ def test_render_active_pagination_and_numbering():
             source_infohash=f"hash{i:02d}abcdef1234567890abcdef1234567890",
             source_name=f"[SubsPlease] Release Title - {i+1:02d} (1080p) [ABCD{i:04d}].mkv",
             state=State.DOWNLOADING if i % 2 == 0 else State.QUEUED,
+            source_announce_url="http://nyaa.tracker.wf:7777/announce",
             total_bytes=(i + 1) * 1024 * 1024 * 1024,
             batch_index=0,
             batches_total=2,
@@ -38,12 +39,15 @@ def test_render_active_pagination_and_numbering():
     assert "\\[" not in text0
     assert "\\]" not in text0
 
-    # 2. Size in plain text, followed by dot and full hash in backticks
-    assert "↳ 1.0 GB · `hash00abcdef1234567890abcdef1234567890`" in text0
+    # 2. No ↳ symbol anywhere
+    assert "↳" not in text0
 
-    # 3. Next line shows state and batch without backticks
-    assert "↳ ⬇️ Downloading · 45.0% · Batch 0/2" in text0
-    assert "↳ 📋 Queued · Batch 0/2" in text0
+    # 3. Size in plain text, followed by dot and full hash in backticks
+    assert "  1.0 GB · `hash00abcdef1234567890abcdef1234567890`" in text0
+
+    # 4. Next line shows state, batch, and tracker domain at the end without backticks
+    assert "  ⬇️ Downloading · 45.0% · Batch 0/2 · nyaa.tracker.wf" in text0
+    assert "  📋 Queued · Batch 0/2 · nyaa.tracker.wf" in text0
 
     # Page 1 (items 6..10)
     text1, p1, total1 = render_active(tasks, page=1, page_size=5)
