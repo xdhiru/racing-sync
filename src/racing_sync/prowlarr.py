@@ -179,10 +179,14 @@ class ProwlarrClient:
                     if attempt == 2:
                         raise ProwlarrError(f"prowlarr indexer refresh failed: {e}") from e
                     await asyncio.sleep(0.5 * (2 ** attempt))
+                except aiohttp.ClientResponseError as e:
+                    raise ProwlarrError(f"prowlarr indexer refresh failed: HTTP {e.status}") from e
             if data is None:
                 if last_exc:
                     raise ProwlarrError(f"prowlarr indexer refresh failed: {last_exc}") from last_exc
                 raise ProwlarrError("prowlarr indexer refresh returned no data")
+            if not isinstance(data, list):
+                raise ProwlarrError(f"prowlarr indexer refresh returned unexpected shape: {type(data).__name__}")
             # Build temp dicts then swap atomically so readers never see empty.
             # One malformed indexer entry must not abort the whole refresh.
             by_name: dict[str, Indexer] = {}
@@ -404,7 +408,11 @@ class ProwlarrClient:
             hits = await self.search_indexer(idx, query)
             if not hits:
                 continue
-            exact = [h for h in hits if _is_exact_release_match(h.title, h.size_bytes, query, target_size)]
+            exact = [
+                h for h in hits
+                if h.download_url
+                and _is_exact_release_match(h.title, h.size_bytes, query, target_size)
+            ]
             if not exact:
                 log.info(
                     "prowlarr: %d hit(s) on %r for %r but none is the exact release; ignoring",
@@ -490,6 +498,32 @@ def release_title_matches(hit_title: str, hit_size: int, target_name: str, targe
     return size_within_tolerance(hit_size, target_size)
 
 
+def _findtext_ns(item: Any, name: str) -> str:
+    """Namespace-blind findtext for title/guid/comments/pubDate.
+
+    channel/item detection above is namespace-blind, but ElementTree
+    findtext("title") is namespace-sensitive — default-ns feeds would yield
+    empty titles that all compare equal in best_match. Match by local tag.
+    """
+    try:
+        direct = item.findtext(name)
+    except Exception:
+        direct = None
+    if direct:
+        return direct
+    target = name.split(":")[-1].lower()
+    for child in item:
+        tag = getattr(child, "tag", None)
+        if not isinstance(tag, str):
+            continue
+        if tag.rpartition("}")[2].split(":")[-1].lower() == target:
+            try:
+                return (child.text or "")
+            except Exception:
+                return ""
+    return ""
+
+
 def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
     """Tiny newznab XML parser. Avoids extra deps; prowlarr responses are simple."""
     import xml.etree.ElementTree as ET
@@ -549,15 +583,15 @@ def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
                 continue
             hits.append(
                 TorrentHit(
-                    title=(item.findtext("title") or "").strip(),
-                    guid=(item.findtext("guid") or "").strip(),
+                    title=(_findtext_ns(item, "title") or "").strip(),
+                    guid=(_findtext_ns(item, "guid") or "").strip(),
                     indexer=indexer.name,
                     indexer_id=indexer.id,
                     size_bytes=size,
                     download_url=download_url,
                     magnet_url=magnet_url,
-                    info_url=item.findtext("comments") or "",
-                    publish_date=item.findtext("pubDate") or "",
+                    info_url=_findtext_ns(item, "comments") or "",
+                    publish_date=_findtext_ns(item, "pubDate") or "",
                 )
             )
         except Exception as e:
