@@ -221,6 +221,8 @@ class RemoteConfig(BaseModel):
 class FuseConfig(BaseModel):
     mount: Path
     mount_unsorted: Path
+    # Delay in seconds before re-injecting torrents to fuse after rclone move (default: 30)
+    reinject_delay_seconds: int = Field(default=30, ge=0)
 
 
 class RcloneConfig(BaseModel):
@@ -232,6 +234,7 @@ class RcloneConfig(BaseModel):
     batch_move_extra_flags: list[str] = Field(default_factory=list)
     # Maximum concurrent rclone move commands running simultaneously (default: 3)
     max_concurrent_moves: int = Field(default=3, ge=1)
+    reinject_delay_seconds: int | None = Field(default=None, ge=0)
 
     @field_validator("config_path", mode="before")
     @classmethod
@@ -537,6 +540,12 @@ class AppConfig(BaseModel):
         if self.general.max_concurrent_moves is not None:
             return self.general.max_concurrent_moves
         return self.rclone.max_concurrent_moves
+
+    @property
+    def fuse_reinject_delay_seconds(self) -> int:
+        if self.rclone.reinject_delay_seconds is not None:
+            return self.rclone.reinject_delay_seconds
+        return self.rclone.fuse.reinject_delay_seconds
 
     def is_episode(self, name: str) -> bool:
         return bool(self.classifier._episode_re.search(name))

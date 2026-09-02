@@ -168,6 +168,9 @@ unsorted = "remote:qbittorrent/unsorted/"
 mount = "/mnt/remote/qbittorrent"
 # Mount for individual episodes
 mount_unsorted = "/mnt/remote/qbittorrent/unsorted"
+# Delay (seconds) before re-injecting torrents to fuse after rclone move (default: 30).
+# Allows cloud fuse mounts time to refresh directory caches and index the new files.
+reinject_delay_seconds = 30
 
 # Extra rclone flags applied to every `rclone move`.
 # Defaults are sensible for slow remotes; tune as needed.
