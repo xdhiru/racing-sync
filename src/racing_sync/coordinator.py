@@ -318,8 +318,23 @@ class Coordinator:
     _stop: bool = field(default=False, init=False)
     _live: dict[str, LiveItem] = field(default_factory=dict, init=False)
     _tasks: set[asyncio.Task] = field(default_factory=set, init=False)
+    _running_infohashes: set[str] = field(default_factory=set, init=False)
+    _download_sem: asyncio.Semaphore | None = field(default=None, init=False)
+    _move_sem: asyncio.Semaphore | None = field(default=None, init=False)
     _coordinator_started = False
     _shutdown_done: bool = field(default=False, init=False)
+
+    @property
+    def download_sem(self) -> asyncio.Semaphore:
+        if self._download_sem is None:
+            self._download_sem = asyncio.Semaphore(self.cfg.max_active_downloads)
+        return self._download_sem
+
+    @property
+    def move_sem(self) -> asyncio.Semaphore:
+        if self._move_sem is None:
+            self._move_sem = asyncio.Semaphore(self.cfg.max_concurrent_moves)
+        return self._move_sem
 
     # ---- lifecycle ----
 
@@ -328,6 +343,13 @@ class Coordinator:
 
     async def start(self) -> None:
         log.info("coordinator starting")
+        self._download_sem = asyncio.Semaphore(self.cfg.max_active_downloads)
+        self._move_sem = asyncio.Semaphore(self.cfg.max_concurrent_moves)
+        log.info(
+            "concurrency limits: max_active_downloads=%d, max_concurrent_moves=%d",
+            self.cfg.max_active_downloads,
+            self.cfg.max_concurrent_moves,
+        )
         try:
             if self.cfg.source.type == "qbittorrent":
                 self.source_client = QBittorrentClient(
@@ -613,37 +635,81 @@ class Coordinator:
             )
 
         # 3. Wake up WAITING_SEEDPOOL rows whose retry timer has elapsed.
-        #    (These may not be picked up by all_active() ordering if we
-        #    schedule them last; schedule them first so they get a turn
-        #    before new torrents crowd the worker pool.)
         ready_seedpool = self.store.list_seedpool_ready()
         for ts in ready_seedpool:
+            if ts.source_infohash in self._running_infohashes:
+                continue
             log.info(
                 "seedpool retry timer fired for %s (attempt #%d)",
                 ts.source_name[:40], ts.seedpool_attempts,
             )
             self.transition(ts, State.QUERYING)
+            h = ts.source_infohash
+            self._running_infohashes.add(h)
             task = asyncio.create_task(self._process_torrent(ts))
             self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            def _done_cb_seedpool(t: asyncio.Task, infohash: str = h) -> None:
+                self._tasks.discard(t)
+                self._running_infohashes.discard(infohash)
+            task.add_done_callback(_done_cb_seedpool)
 
         # 4. Schedule workers for active states that have no live task
         active = self.store.all_active()
         scheduled = 0
-        max_concurrent = 6
-        available_slots = max(0, max_concurrent - len(self._tasks))
+        max_concurrent_workers = max(
+            12,
+            self.cfg.max_active_downloads * 2 + self.cfg.max_concurrent_moves * 2,
+        )
+        available_slots = max(0, max_concurrent_workers - len(self._tasks))
+
+        active_downloads = sum(
+            1 for t in active
+            if t.source_infohash in self._running_infohashes
+            and t.state in (State.QUEUED, State.DOWNLOADING)
+        )
+        active_moves = sum(
+            1 for t in active
+            if t.source_infohash in self._running_infohashes
+            and t.state == State.MOVING
+        )
+
         for ts in active:
             if available_slots <= 0:
                 break
-            if ts.source_infohash in self._live:
+            if ts.source_infohash in self._running_infohashes:
                 continue
+
+            # Limit concurrent active qBittorrent additions / downloads on SSD
+            if ts.state == State.QUEUED and active_downloads >= self.cfg.max_active_downloads:
+                continue
+
+            # Limit concurrent active rclone move commands
+            if ts.state == State.MOVING and active_moves >= self.cfg.max_concurrent_moves:
+                continue
+
+            h = ts.source_infohash
+            self._running_infohashes.add(h)
             task = asyncio.create_task(self._process_torrent(ts))
             self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            def _done_cb(t: asyncio.Task, infohash: str = h) -> None:
+                self._tasks.discard(t)
+                self._running_infohashes.discard(infohash)
+            task.add_done_callback(_done_cb)
+
+            if ts.state in (State.QUEUED, State.DOWNLOADING):
+                active_downloads += 1
+            elif ts.state == State.MOVING:
+                active_moves += 1
+
             scheduled += 1
             available_slots -= 1
         if scheduled:
-            log.info("scheduled %d worker(s) for active torrents (cap=%d)", scheduled, max_concurrent)
+            log.info(
+                "scheduled %d worker(s) (active downloads=%d/%d, moves=%d/%d)",
+                scheduled,
+                active_downloads, self.cfg.max_active_downloads,
+                active_moves, self.cfg.max_concurrent_moves,
+            )
 
         # 4. Refresh live status (used by the Telegram bot)
         await self._refresh_live_status()
@@ -741,9 +807,13 @@ class Coordinator:
         if ts.state == State.WAITING_DISK:
             await self._wait_disk_then_queue(ts)
         if ts.state == State.QUEUED:
-            await self._do_queued(ts)
-        if ts.state == State.DOWNLOADING:
-            await self._do_downloading(ts)
+            async with self.download_sem:
+                await self._do_queued(ts)
+                if ts.state == State.DOWNLOADING:
+                    await self._do_downloading(ts)
+        elif ts.state == State.DOWNLOADING:
+            async with self.download_sem:
+                await self._do_downloading(ts)
         if ts.state == State.MOVING:
             await self._do_moving(ts)
         if ts.state == State.RE_ADDING:
@@ -1122,13 +1192,14 @@ class Coordinator:
 
     async def _rclone_move(self, local: Path, remote: str, ts: TorrentState,
                            *, include: list[str] | None = None) -> None:
-        log.info("rclone move %s -> %s (include=%s)", local, remote, include)
-        res = await move_local_to_remote(self.cfg, local, remote, include=include)
-        if not res.ok:
-            self.transition(
-                ts, State.FAILED, error=f"rclone rc={res.returncode}",
-            )
-            raise RuntimeError(f"rclone failed: rc={res.returncode}")
+        async with self.move_sem:
+            log.info("rclone move %s -> %s (include=%s)", local, remote, include)
+            res = await move_local_to_remote(self.cfg, local, remote, include=include)
+            if not res.ok:
+                self.transition(
+                    ts, State.FAILED, error=f"rclone rc={res.returncode}",
+                )
+                raise RuntimeError(f"rclone failed: rc={res.returncode}")
 
     # ---- state: RE_ADDING ----
 

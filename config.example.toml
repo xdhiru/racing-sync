@@ -108,6 +108,10 @@ password = "change_me"
 # can hash-check normally.
 save_path = "/srv/qbittorrent/data"
 
+# Maximum concurrent torrents actively downloading on VPS2 SSD (default: 3).
+# Limits additions to qBittorrent on SSD so disk I/O and network aren't overloaded.
+max_active_downloads = 3
+
 # Optional nginx basic-auth in front of the qBittorrent WebUI on VPS2.
 # Optional nginx auth in front of the qBittorrent WebUI on VPS2.
 # Same semantics as [source.nginx]. mode="basic" is the common case
@@ -142,6 +146,9 @@ skip_movie_larger_than_bytes = 536870912000  # 500 GiB
 binary = "/usr/bin/rclone"
 # Path to rclone.conf (omit to use default ~/.config/rclone/rclone.conf)
 config_path = ""
+# Maximum concurrent rclone move commands running simultaneously (default: 3).
+# Limits parallel moves from SSD to remote to prevent CPU/network saturation.
+max_concurrent_moves = 3
 
 # Default remote + path for movies and full season-root folders.
 # These are rclone REMOTE paths (not fuse mount paths).

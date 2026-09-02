@@ -191,6 +191,8 @@ class DestConfig(BaseModel):
     save_path: Path
     # Optional nginx basic-auth in front of the qBittorrent WebUI on VPS2.
     nginx: NginxAuthConfig = NginxAuthConfig()
+    # Maximum concurrent torrents actively downloading on VPS2 SSD (default: 3)
+    max_active_downloads: int = Field(default=3, ge=1)
 
 
 class SSDConfig(BaseModel):
@@ -228,6 +230,8 @@ class RcloneConfig(BaseModel):
     fuse: FuseConfig
     extra_move_flags: list[str] = Field(default_factory=list)
     batch_move_extra_flags: list[str] = Field(default_factory=list)
+    # Maximum concurrent rclone move commands running simultaneously (default: 3)
+    max_concurrent_moves: int = Field(default=3, ge=1)
 
 
 class ClassifierConfig(BaseModel):
@@ -486,6 +490,9 @@ class GeneralConfig(BaseModel):
     log_dir: Path = Path("/var/log/racing-sync")
     log_retention_days: int = Field(default=14, ge=1)
     disk_safety_margin_bytes: int = Field(default=0, ge=0)
+    # Optional overrides if specified under [general]
+    max_active_downloads: int | None = Field(default=None, ge=1)
+    max_concurrent_moves: int | None = Field(default=None, ge=1)
 
 
 class AppConfig(BaseModel):
@@ -510,6 +517,18 @@ class AppConfig(BaseModel):
         with open(path, "rb") as f:
             data = tomllib.load(f)
         return cls.model_validate(data)
+
+    @property
+    def max_active_downloads(self) -> int:
+        if self.general.max_active_downloads is not None:
+            return self.general.max_active_downloads
+        return self.dest.max_active_downloads
+
+    @property
+    def max_concurrent_moves(self) -> int:
+        if self.general.max_concurrent_moves is not None:
+            return self.general.max_concurrent_moves
+        return self.rclone.max_concurrent_moves
 
     def is_episode(self, name: str) -> bool:
         return bool(self.classifier._episode_re.search(name))
