@@ -1,0 +1,51 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local config with secrets
+config.toml
+debug-config.toml
+debug-*.toml
+
+# Syncthing
+.stfolder/
+.stversions/
+
+# App logs (configurable: [general].log_dir)
+*.log
+racing-sync.log
+
+# Runtime state
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+state.db
+state.db-*
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+.venv/
+venv/
+env/
