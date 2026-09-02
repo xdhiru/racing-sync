@@ -452,6 +452,10 @@ class TelegramBot:
                     )
                     self._active_msg_id = -1  # Sentinel: stop trying to edit
                     return
+                # Rate limit / flood control — keep message_id and skip this interval
+                if isinstance(e, RetryAfter) or "flood control" in msg or "too many requests" in msg:
+                    log.warning("active-tasks edit rate-limited (%s); will retry on next interval", e)
+                    return
                 # Other errors — log and re-send once.
                 log.warning("active-tasks edit failed (%s); resending", e)
                 self._active_msg_id = None

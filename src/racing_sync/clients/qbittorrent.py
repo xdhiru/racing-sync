@@ -194,14 +194,36 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
     async def pause(self, torrent_hash: str) -> None:
         data = aiohttp.FormData()
         data.add_field("hashes", torrent_hash)
-        async with await self.request("POST", "/api/v2/torrents/pause", data=data) as r:
-            await r.read()
+        try:
+            # qBittorrent v5.0+ renamed pause/resume to stop/start
+            async with await self.request("POST", "/api/v2/torrents/stop", data=data) as r:
+                await r.read()
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404:
+                # Legacy qBittorrent (< v5.0) fallback
+                data2 = aiohttp.FormData()
+                data2.add_field("hashes", torrent_hash)
+                async with await self.request("POST", "/api/v2/torrents/pause", data=data2) as r:
+                    await r.read()
+            else:
+                raise
 
     async def resume(self, torrent_hash: str) -> None:
         data = aiohttp.FormData()
         data.add_field("hashes", torrent_hash)
-        async with await self.request("POST", "/api/v2/torrents/resume", data=data) as r:
-            await r.read()
+        try:
+            # qBittorrent v5.0+ renamed pause/resume to stop/start
+            async with await self.request("POST", "/api/v2/torrents/start", data=data) as r:
+                await r.read()
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404:
+                # Legacy qBittorrent (< v5.0) fallback
+                data2 = aiohttp.FormData()
+                data2.add_field("hashes", torrent_hash)
+                async with await self.request("POST", "/api/v2/torrents/resume", data=data2) as r:
+                    await r.read()
+            else:
+                raise
 
     async def delete(self, torrent_hash: str, *, delete_files: bool = False) -> None:
         data = aiohttp.FormData()
