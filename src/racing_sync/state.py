@@ -62,7 +62,7 @@ ALLOWED: dict[State, set[State]] = {
     State.WAITING_SEEDPOOL: {State.QUERYING, State.WAITING_DISK,
                 State.QUEUED, State.FAILED},
     State.WAITING_DISK: {State.QUEUED, State.DOWNLOADING, State.FAILED},
-    State.QUEUED: {State.DOWNLOADING, State.FAILED},
+    State.QUEUED: {State.DOWNLOADING, State.DONE, State.FAILED},
     State.DOWNLOADING: {State.MOVING, State.FAILED},
     State.MOVING: {State.RE_ADDING, State.FAILED},
     State.RE_ADDING: {State.DONE, State.FAILED},
@@ -315,9 +315,15 @@ class StateStore:
         return [_row_to_state(r) for r in rows]
 
     def find_by_name(self, source_name: str) -> list[TorrentState]:
+        clean_name = source_name
+        for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v"):
+            if clean_name.lower().endswith(ext):
+                clean_name = clean_name[:-len(ext)]
+                break
         rows = self._conn.execute(
-            "SELECT * FROM torrent_state WHERE source_name = ? ORDER BY updated_at DESC",
-            (source_name,),
+            "SELECT * FROM torrent_state WHERE source_name = ? OR source_name = ? "
+            "OR source_name LIKE ? ORDER BY updated_at DESC",
+            (source_name, clean_name, f"{clean_name}.%"),
         ).fetchall()
         return [_row_to_state(r) for r in rows]
 

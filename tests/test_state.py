@@ -51,3 +51,32 @@ def test_seedpool_no_self_transition():
     # as illegal; callers must upsert() instead.
     with pytest.raises(ValueError):
         check_transition(State.WAITING_SEEDPOOL, State.WAITING_SEEDPOOL)
+
+
+def test_queued_to_done_is_allowed():
+    # When a torrent is already complete/seeding on VPS2, QUEUED fast-tracks to DONE.
+    check_transition(State.QUEUED, State.DONE)
+
+
+def test_find_by_name_extension_matching(tmp_path):
+    from racing_sync.state import StateStore, TorrentState
+
+    db_path = tmp_path / "test.db"
+    store = StateStore(db_path)
+
+    # Stored without .mkv (as Seedpool or VPS2 client might report)
+    ts = TorrentState(
+        source_infohash="hash123",
+        source_name="Game.Day.Murders.S01E06.1080p-Kitsune",
+        state=State.DONE,
+    )
+    store.upsert(ts)
+
+    # Query with .mkv (as Aither reports)
+    matches = store.find_by_name("Game.Day.Murders.S01E06.1080p-Kitsune.mkv")
+    assert len(matches) == 1
+    assert matches[0].source_infohash == "hash123"
+
+    # Query exact without .mkv
+    matches2 = store.find_by_name("Game.Day.Murders.S01E06.1080p-Kitsune")
+    assert len(matches2) == 1
