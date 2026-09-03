@@ -2117,3 +2117,85 @@ async def test_setup_queued_partial_remote_still_downloads(tmp_path):
         coord.dest_client.resume.assert_awaited_once()
     finally:
         coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_do_downloading_clears_live_on_batch_resolve_miss(tmp_path):
+    """A batch-resolution park must not leave a stale live entry polled."""
+    from racing_sync.coordinator import LiveItem
+    from racing_sync.state import StateStore, TorrentState, State
+
+    coord = make_coordinator()
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(
+        side_effect=RuntimeError("qB timeout"))
+    try:
+        ts = TorrentState(source_infohash="e" * 40, source_name="Show",
+                          dest_infohash="e" * 40, state=State.DOWNLOADING,
+                          batches_total=2, batch_index=0)
+        coord.store.upsert(ts)
+        coord._live["e" * 40] = LiveItem(
+            source_infohash="e" * 40, name="Show", state="downloading",
+            progress=0.0, size_mb=1.0)
+        await coord._do_downloading(ts)
+        assert ts.state == State.DOWNLOADING
+        assert "e" * 40 not in coord._live
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_do_moving_parks_on_transient_file_list_error(tmp_path):
+    """One qB timeout at MOVING entry parks instead of failing the row."""
+    from racing_sync.coordinator_errors import WebUIUnresponsiveError
+    from racing_sync.state import StateStore, TorrentState, State
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    coord = make_coordinator()
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(
+        side_effect=WebUIUnresponsiveError("timeout"))
+    coord.dest_client.pause = AsyncMock()
+    try:
+        ts = TorrentState(source_infohash="e" * 40, source_name="Show",
+                          dest_infohash="e" * 40, save_path=str(ssd),
+                          state=State.MOVING)
+        await coord._do_moving(ts)
+        row = coord.store.get("e" * 40)
+        assert row.state == State.MOVING
+        assert "could not list files" in (row.last_error or "")
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_move_and_clean_batch_refuses_traversal_names(tmp_path):
+    """Hostile `../` batch names never reach rclone (upload+delete outside SSD).
+
+    (Batch.file_names() already filters these; this guards the move layer
+    itself against any present/future caller passing raw names.)
+    """
+    from unittest.mock import MagicMock
+    from racing_sync.coordinator_errors import BatchMoveIncompleteError
+    from racing_sync.state import StateStore, TorrentState, State
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    coord = make_coordinator()
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.dest_client = AsyncMock()
+    coord._rclone_move = AsyncMock()
+    batch = MagicMock()
+    batch.file_names.return_value = ["../../etc/evil.mkv"]
+    ts = TorrentState(source_infohash="e" * 40, source_name="Evil",
+                      save_path=str(ssd), state=State.DOWNLOADING,
+                      batches_total=1, batch_index=0)
+    try:
+        with pytest.raises(BatchMoveIncompleteError, match="path-traversal"):
+            await coord._move_and_clean_batch(ts, batch)
+        coord._rclone_move.assert_not_called()
+    finally:
+        coord.store.close()
