@@ -1241,11 +1241,22 @@ class Coordinator:
                         local = folder / cls.single_file
                     else:
                         raise FileNotFoundError(f"completed {cls.kind} file not found on SSD: {local}")
-            elif cls.kind in ("season", "unknown") and folder and folder.exists():
-                local = folder
+            elif cls.kind in ("season", "unknown"):
+                if folder and folder.exists():
+                    local = folder
+                elif (src_dir / ts.source_name).exists():
+                    local = src_dir / ts.source_name
+                else:
+                    raise FileNotFoundError(
+                        f"completed {cls.kind} content not found on SSD: "
+                        f"neither {folder} nor {src_dir / ts.source_name} exists"
+                    )
             else:
                 cand = src_dir / ts.source_name
-                local = cand if cand.exists() else src_dir
+                if cand.exists():
+                    local = cand
+                else:
+                    raise FileNotFoundError(f"completed content not found on SSD: {cand}")
             await self._rclone_move(local, remote, ts)
         else:
             # Mixed — per-episode moves with --include
