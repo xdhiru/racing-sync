@@ -2908,6 +2908,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             (n or "").replace("\\", "/").strip("/") for n in (skip or set())
         }
         names = [n for n in batch.file_names() if n not in skip_norm]
+        unsafe = [n for n in names if _safe_ssd_join(src_dir, n or "") is None]
+        if unsafe:
+            # Every other move path traversal-guards its file list; a
+            # hostile `../` name here would upload and delete outside the
+            # SSD tree. Park loud (never advance, never move) for the
+            # operator instead of failing the row over client metadata.
+            raise BatchMoveIncompleteError(
+                f"refusing to move {len(unsafe)} path-traversal file(s) for "
+                f"{ts.source_name} (e.g. {unsafe[0]!r}); keeping batch"
+            )
         if not names:
             log.info(
                 "batch %d/%d for %s already on remote; skipping move",
@@ -3090,6 +3100,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         log.warning("batch resolution unavailable for %s; retry next tick",
                                     ts.source_name)
                         self.store.upsert(ts)
+                        self._live.pop(h.lower(), None)
                         return
                     if batches and len(batches) != ts.batches_total:
                         # File list / cap drifted mid-run (tracker sidecar
@@ -3153,6 +3164,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                                     ts.source_name, consecutive_batch_failures,
                                 )
                                 self.store.upsert(ts)
+                                self._live.pop(h.lower(), None)
                                 return
                             await asyncio.sleep(5)
                             continue
@@ -3171,6 +3183,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         except Exception:
                             pass
                         self.store.upsert(ts)
+                        self._live.pop(h.lower(), None)
                         return
                     except BatchMoveIncompleteError as e:
                         # Same-tick retry like the pause failure above: the
@@ -3188,6 +3201,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                                 ts.source_name, consecutive_batch_failures,
                             )
                             self.store.upsert(ts)
+                            self._live.pop(h.lower(), None)
                             return
                         await asyncio.sleep(5)
                         continue
@@ -3208,9 +3222,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                                 ts.source_name, e,
                             )
                             self.store.upsert(ts)
+                            self._live.pop(h.lower(), None)
                             return
                         if reset_pos is False or reset_pos is None:
                             self.store.upsert(ts)
+                            self._live.pop(h.lower(), None)
                             return
                         # Position contract: int (possibly reconciled on
                         # grouping shrink), or legacy True from test doubles.
@@ -3269,6 +3285,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
             break
 
+        self._live.pop(h.lower(), None)
         if not self._stop:
             self.transition(ts, State.MOVING)
 
@@ -3735,7 +3752,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
     async def _do_moving(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
-        cls_files = await self.dest_client.get_torrent_files(h)
+        try:
+            cls_files = await self.dest_client.get_torrent_files(h)
+        except _WEBUI_RETRY_ERRORS as e:
+            # Every other phase parks on transient client trouble; a single
+            # qB timeout here must not fail a fully-downloaded row.
+            self._park_moving(
+                ts,
+                f"could not list files for {h[:10]} before move "
+                f"({e}); will retry on next tick",
+            )
+            return
         cls = classify(cls_files, self.cfg)
         # Pin the QUEUED-time classification: only fill when unknown. A fresh
         # file list (tracker sidecar added, metadata completed) can flip
