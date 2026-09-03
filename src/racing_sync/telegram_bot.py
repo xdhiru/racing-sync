@@ -42,16 +42,16 @@ log = logging.getLogger(__name__)
 
 
 _STATE_ICON = {
-    State.NEW: "🆕 `NEW`",
-    State.QUERYING: "🔍 `QUERY`",
-    State.WAITING_SEEDPOOL: "⏳ `WAIT-SP`",
-    State.WAITING_DISK: "💾 `WAIT-SSD`",
-    State.QUEUED: "📋 `QUEUED`",
-    State.DOWNLOADING: "⬇️ `DOWNLOADING`",
-    State.MOVING: "📦 `MOVING`",
-    State.RE_ADDING: "🔄 `RE-ADDING`",
-    State.DONE: "✅ `DONE`",
-    State.FAILED: "❌ `FAILED`",
+    State.NEW: "🆕 NEW",
+    State.QUERYING: "🔍 QUERY",
+    State.WAITING_SEEDPOOL: "⏳ WAIT-SP",
+    State.WAITING_DISK: "💾 WAIT-SSD",
+    State.QUEUED: "📋 QUEUED",
+    State.DOWNLOADING: "⬇️ DOWNLOADING",
+    State.MOVING: "📦 MOVING",
+    State.RE_ADDING: "🔄 RE-ADDING",
+    State.DONE: "✅ DONE",
+    State.FAILED: "❌ FAILED",
 }
 
 
@@ -111,23 +111,26 @@ def _tracker_domain(url: str) -> str:
 
 def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     """Per-torrent detail message (edited in place as state advances)."""
-    icon = _STATE_ICON.get(ts.state, ts.state.value)
-    title = _short_name(ts.source_name, 80)
+    icon = _STATE_ICON.get(ts.state, ts.state.value.upper())
+    name = ts.source_name.replace("`", "'")
     size = _bytes_human(ts.total_bytes)
+    full_hash = (ts.source_infohash or "").lower()
 
     lines: list[str] = []
-    lines.append(f"{icon} *{_esc(title)}*")
-    lines.append(
-        f"`{ts.source_infohash[:5]}` · {size} · "
-        f"batch `{ts.batch_index}/{ts.batches_total}`"
-    )
+    # 1. Title line: state badge + full name copiable by click
+    lines.append(f"{icon} `{name}`")
+
+    # 2. Hash & size line: full hash copiable by click + size in plain text
+    meta_parts = [f"`{full_hash}`", size]
+    if ts.batches_total > 1:
+        meta_parts.append(f"batch {ts.batch_index}/{ts.batches_total}")
+    lines.append(" · ".join(meta_parts))
 
     # State-specific extras
     if ts.state == State.WAITING_SEEDPOOL and ts.seedpool_next_retry_at:
         when = ts.seedpool_next_retry_at.astimezone().strftime("%H:%M:%S")
         lines.append(
-            f"Seedpool miss \\#{ts.seedpool_attempts}; "
-            f"next retry at `{when}`"
+            f"Seedpool miss #{ts.seedpool_attempts}; next retry at {when}"
         )
     elif ts.state == State.WAITING_DISK:
         lines.append("Waiting for SSD cap to free up")
@@ -139,13 +142,13 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
             filled = int(round(progress * bar_len))
             bar = "█" * filled + "░" * (bar_len - filled)
             pct = f"{progress * 100:5.1f}%"
-            lines.append(f"`{bar}` {pct}")
+            lines.append(f"{bar} {pct}")
         else:
-            lines.append("Downloading\\…")
+            lines.append("Downloading…")
     elif ts.state == State.MOVING:
-        lines.append("rclone moving to remote\\…")
+        lines.append("rclone moving to remote…")
     elif ts.state == State.RE_ADDING:
-        lines.append("Re\\-adding on fuse mount")
+        lines.append("Re-adding on fuse mount")
     elif ts.state == State.DONE:
         lines.append("✓ Seeded from fuse mount")
     elif ts.state == State.FAILED:
@@ -154,16 +157,20 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
 
     # Cross-seed info
     if ts.cross_seed_source:
-        lines.append(
-            f"SSD source: `{ts.cross_seed_source}`"
-            + (f" · `{ts.cross_seed_infohash[:5]}`" if ts.cross_seed_infohash else "")
-        )
+        cs_hash = (ts.cross_seed_infohash or "").lower()
+        if cs_hash and len(cs_hash) >= 20:
+            lines.append(f"SSD source: {ts.cross_seed_source} · `{cs_hash}`")
+        else:
+            lines.append(f"SSD source: {ts.cross_seed_source}")
 
-    # Classifier + tracker context
+    # Classifier
     if ts.classification_kind and ts.classification_kind != "unknown":
-        lines.append(f"Classifier: `{ts.classification_kind}`")
-    if ts.source_tracker:
-        lines.append(f"Source: `{_esc(_short_name(ts.source_tracker, 60))}`")
+        lines.append(f"Classifier: {ts.classification_kind}")
+
+    # Tracker domain only (not full announce URL)
+    domain = _tracker_domain(ts.source_tracker) or _tracker_domain(ts.source_announce_url)
+    if domain:
+        lines.append(f"Source: {domain}")
 
     return "\n".join(lines)
 

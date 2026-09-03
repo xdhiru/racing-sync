@@ -93,3 +93,34 @@ def test_keyboard_builder():
     assert row0[1].text == "2 / 3"
     assert row0[2].text == "Next ▶️"
     assert kb3.inline_keyboard[1][0].text == "🔄 Refresh"
+
+
+def test_render_detail_formatting():
+    from racing_sync.telegram_bot import render_detail
+
+    ts = TorrentState(
+        source_infohash="c27de123456789abcdef0123456789abcdef0123",
+        source_name="[SubsPlease] Game.Day.Murders.S01E06.1080p.mkv",
+        state=State.DONE,
+        total_bytes=1900000000,
+        source_tracker="https://aither.cc/announce/2xxxxxxxxxxxxxxsxxxxxxxxxxxxxxxxxx9b",
+        classification_kind="movie",
+        cross_seed_source="seedpool-cross-seed",
+    )
+    detail = render_detail(ts)
+
+    # 1. State badge is plain text, name is full and in backticks (no backslashes)
+    assert "✅ DONE `[SubsPlease] Game.Day.Murders.S01E06.1080p.mkv`" in detail
+    assert "\\[" not in detail
+    assert "\\]" not in detail
+
+    # 2. Full 40-character hash in backticks
+    assert "`c27de123456789abcdef0123456789abcdef0123` · 1.8 GB" in detail
+
+    # 3. Source displays only domain (no secret passkey URL, no backticks)
+    assert "Source: aither.cc" in detail
+    assert "2xxxxxxxxxxxxxxs" not in detail
+
+    # 4. Other fields not in backticks
+    assert "SSD source: seedpool-cross-seed" in detail
+    assert "Classifier: movie" in detail
