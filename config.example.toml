@@ -276,6 +276,9 @@ api_key = "CHANGE_ME"
 # the EXACT name of the indexer in your Prowlarr instance (case-sensitive).
 # No default — you must set this when [prowlarr].enabled = true.
 download_indexer = "Seedpool (API)"
+# Announce URL substrings that identify this download indexer (e.g. if announce contains "seedpool").
+# Used to detect if a watch-dir dropped torrent already comes from the download indexer.
+download_indexer_substrings = ["seedpool"]
 timeout_seconds = 30.0
 max_results = 20
 

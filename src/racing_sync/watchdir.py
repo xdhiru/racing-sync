@@ -34,14 +34,16 @@ class WatchItem:
     infohash: str
     name: str
     size_bytes: int
+    announce_url: str = ""
+    torrent_bytes: bytes = b""
     # Filled in by the scanner if prowlarr was consulted.
     prowlarr_hit: TorrentHit | None = None
     # Final .torrent bytes the coordinator should hand to qBittorrent:
     prefer_dropped: bool = False
 
 
-def _bencoded_info_hash(data: bytes) -> tuple[str, int]:
-    """Decode a bencoded .torrent and return (name, total_size).
+def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
+    """Decode a bencoded .torrent and return (infohash, name, total_size, announce_url).
 
     We avoid `bencodepy` / `torf` as a dep by writing a minimal decoder good
     enough for top-level info extraction.
@@ -53,6 +55,11 @@ def _bencoded_info_hash(data: bytes) -> tuple[str, int]:
     name = info.get(b"name", b"")
     if isinstance(name, bytes):
         name = name.decode("utf-8", errors="replace")
+    announce = root.get(b"announce", b"")
+    if isinstance(announce, bytes):
+        announce = announce.decode("utf-8", errors="replace")
+    elif not isinstance(announce, str):
+        announce = ""
     pieces = info.get(b"files") or None
     total = 0
     if pieces is None:
@@ -66,7 +73,7 @@ def _bencoded_info_hash(data: bytes) -> tuple[str, int]:
     # we used sorted dicts in `_bdecode`. So the encoded form should be stable.
     info_bytes = _bencode(info)
     infohash = hashlib.sha1(info_bytes).hexdigest().lower()
-    return infohash, name, total
+    return infohash, name, total, announce
 
 
 def _bdecode(data: bytes, pos: int) -> tuple[int, object]:
@@ -90,7 +97,7 @@ def _bdecode(data: bytes, pos: int) -> tuple[int, object]:
         return pos + 1, out
     if ch.isdigit():
         colon = data.index(b":", pos)
-        length = int(data[pos:colon])
+        length = int(data[pos - 1:colon])
         pos = colon + 1
         return pos + length, data[pos:pos + length]
     raise ValueError(f"bad bencode at {pos}: {ch!r}")
@@ -114,9 +121,10 @@ def _bencode(obj: object) -> bytes:
     raise TypeError(f"cannot bencode {type(obj)}")
 
 
-def parse_torrent_file(path: Path) -> tuple[str, str, int]:
+def parse_torrent_file(path: Path) -> tuple[str, str, int, str, bytes]:
     data = path.read_bytes()
-    return _bencoded_info_hash(data)
+    infohash, name, total, announce = _bencoded_info_hash(data)
+    return infohash, name, total, announce, data
 
 
 # ---------- scanner ----------
@@ -132,7 +140,7 @@ class WatchDirScanner:
         out: list[WatchItem] = []
         for entry in sorted(Path(self._cfg.path).glob(self._cfg.glob)):
             try:
-                infohash, name, size = parse_torrent_file(entry)
+                infohash, name, size, announce, data = parse_torrent_file(entry)
             except Exception as e:  # noqa: BLE001
                 log.warning("watch-dir: skipping %s (%s)", entry, e)
                 continue
@@ -144,24 +152,14 @@ class WatchDirScanner:
                 infohash=infohash,
                 name=name,
                 size_bytes=size,
+                announce_url=announce,
+                torrent_bytes=data,
                 prefer_dropped=False,
             )
-            if self._cfg.query_prowlarr and self._prowlarr is not None:
-                try:
-                    hit = await self._prowlarr.best_match(name)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("prowlarr search failed for %s: %s", name, e)
-                    hit = None
-                item.prowlarr_hit = hit
-                if hit is not None and not self._cfg.prefer_prowlarr_result:
-                    item.prefer_dropped = True
-            else:
-                item.prefer_dropped = True
             out.append(item)
             log.info(
-                "watch-dir picked up: %s (%s) -> prowlarr=%s prefer_dropped=%s",
-                name, infohash[:10],
-                item.prowlarr_hit is not None, item.prefer_dropped,
+                "watch-dir picked up: %s (%s) announce=%s",
+                name, infohash[:10], announce,
             )
         return out
 
