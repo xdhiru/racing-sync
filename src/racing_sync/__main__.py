@@ -196,23 +196,9 @@ def _do_reset(cfg: AppConfig) -> list[str]:
         if refusal is not None:
             removed.append(refusal)
         elif log_dir.is_dir():
-            for child in sorted(log_dir.iterdir()):
-                try:
-                    if child.is_dir() and not child.is_symlink():
-                        shutil.rmtree(child)
-                    elif child.is_file() or child.is_symlink():
-                        child.unlink()
-                    else:
-                        # FIFOs, sockets, and other special files: unlink
-                        # explicitly instead of silently skipping them.
-                        try:
-                            child.unlink()
-                        except OSError as e:
-                            removed.append(f"could not delete {child}: {e}")
-                            continue
-                    removed.append(f"deleted log entry: {child}")
-                except OSError as e:
-                    removed.append(f"could not delete {child}: {e}")
+            # Reuse the validated clearer (per-child validate_safe_delete_path)
+            # instead of a raw iterdir+rmtree loop.
+            removed.extend(_clear_dir_children(log_dir, base_desc="log"))
         else:
             removed.append(f"log dir does not exist, nothing to clear: {log_dir}")
     if not removed:
@@ -320,8 +306,21 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
                 done.append(f"full reset: cannot resolve SSD dir {root}: {e}")
                 continue
             try:
-                if any(resolved == f.resolve() for f in fuse_roots if f.exists()):
-                    done.append(f"full reset: refusing to wipe SSD dir (is a fuse mount): {root}")
+                overlap = False
+                for f in fuse_roots:
+                    try:
+                        if not f.exists():
+                            continue
+                        fres = f.resolve()
+                    except OSError:
+                        continue
+                    # Exact, nested either way: SSD inside fuse wipes remote,
+                    # fuse inside SSD wipes the mount via the SSD clear.
+                    if resolved == fres or resolved.is_relative_to(fres) or fres.is_relative_to(resolved):
+                        overlap = True
+                        break
+                if overlap:
+                    done.append(f"full reset: refusing to wipe SSD dir (overlaps fuse mount): {root}")
                     continue
             except OSError:
                 pass
