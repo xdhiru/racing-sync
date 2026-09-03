@@ -133,6 +133,7 @@ async def test_do_new_watch_dir_already_download_tracker(tmp_path: Path):
     coord.cfg.general.disk_safety_margin_bytes = 1000
     coord.cfg.prowlarr.enabled = True
     coord.cfg.prowlarr.is_download_indexer = lambda url: "seedpool" in url
+    coord.cfg.prowlarr.should_skip_title.return_value = False
     coord.prowlarr = MagicMock()
     coord.store = store
     coord.transition = lambda t, s: setattr(t, "state", s)
@@ -172,6 +173,7 @@ async def test_do_new_watch_dir_already_download_tracker_still_searches_other_cr
     coord.cfg.general.disk_safety_margin_bytes = 1000
     coord.cfg.prowlarr.enabled = True
     coord.cfg.prowlarr.is_download_indexer = lambda url: "seedpool" in url
+    coord.cfg.prowlarr.should_skip_title.return_value = False
     coord.cfg.prowlarr.tracker_map.entries = {"beyond-hd": "BeyondHD"}
     coord.store = store
     coord.transition = lambda t, s: setattr(t, "state", s)
@@ -244,6 +246,7 @@ async def test_do_new_watch_dir_public_torrent_skips_sacrificial_copy(tmp_path: 
     coord.cfg.general.disk_safety_margin_bytes = 1000
     coord.cfg.prowlarr.enabled = True
     coord.cfg.prowlarr.is_download_indexer = lambda url: "seedpool" in url
+    coord.cfg.prowlarr.should_skip_title.return_value = False
     coord.cfg.prowlarr.tracker_map.entries = {"beyond-hd": "BeyondHD"}
     coord.store = store
     coord.transition = lambda t, s: setattr(t, "state", s)
@@ -316,6 +319,7 @@ async def test_do_new_watch_dir_with_prowlarr_search_and_cross_seeds(tmp_path: P
     coord.cfg.general.disk_safety_margin_bytes = 1000
     coord.cfg.prowlarr.enabled = True
     coord.cfg.prowlarr.is_download_indexer = lambda url: "seedpool" in url
+    coord.cfg.prowlarr.should_skip_title.return_value = False
     coord.cfg.prowlarr.tracker_map.entries = {"beyond-hd": "BeyondHD"}
     coord.store = store
     coord.transition = lambda t, s: setattr(t, "state", s)

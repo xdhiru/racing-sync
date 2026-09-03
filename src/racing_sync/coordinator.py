@@ -227,7 +227,8 @@ async def pick_ssd_source_for_racing(
         # is unreachable (e.g. VPS1 crash mid-cycle).
         if (cfg.cross_seed.refetch_public_via_prowlarr
                 and cfg.cross_seed.allow_prowlarr_cross_seed
-                and prowlarr is not None):
+                and prowlarr is not None
+                and not cfg.prowlarr.should_skip_title(source_torrent.name)):
             log.warning(
                 "racing client's public .torrent unavailable; "
                 "falling back to Prowlarr cross-seed for %s",
@@ -253,7 +254,13 @@ async def pick_ssd_source_for_racing(
     # All torrents are private. We only download from VPS2 SSD using a
     # cross-seed from the configured download_indexer ("Seedpool (API)" by default).
     # Private torrents are never downloaded directly on SSD.
-    if prowlarr is not None and cfg.cross_seed.allow_prowlarr_cross_seed:
+    should_skip_prowlarr = cfg.prowlarr.should_skip_title(source_torrent.name)
+    if should_skip_prowlarr:
+        log.info(
+            "prowlarr: skipping cross-seed query for %r (matches skip_query_substrings)",
+            source_torrent.name,
+        )
+    elif prowlarr is not None and cfg.cross_seed.allow_prowlarr_cross_seed:
         log.info(
             "private release; querying Prowlarr (%s) for cross-seed of %s",
             cfg.prowlarr.download_indexer,
@@ -919,8 +926,14 @@ class Coordinator:
         # Always persist the dropped .torrent so it can be seeded on FUSE
         (watch_cross_dir / f"{ts.source_infohash}.torrent").write_bytes(blob)
 
-        # If Prowlarr is enabled, perform single parallel search
-        if self.cfg.prowlarr.enabled and self.prowlarr is not None:
+        # If Prowlarr is enabled and not skipped, perform single parallel search
+        should_skip_prowlarr = self.cfg.prowlarr.should_skip_title(ts.source_name)
+        if should_skip_prowlarr:
+            log.info(
+                "prowlarr: skipping search for watch-dir release %r (matches skip_query_substrings)",
+                ts.source_name,
+            )
+        elif self.cfg.prowlarr.enabled and self.prowlarr is not None:
             indexers_to_query = []
             download_idx = None
             if needs_sacrificial_copy:
