@@ -613,6 +613,8 @@ class Coordinator:
                 # Content is already being managed by an existing TorrentState;
                 # keep display name fresh
                 existing_ts.source_name = name
+                if existing_ts.state == State.DONE and self.cfg.cross_seed.inject_racing_torrents_to_fuse:
+                    await self._check_and_inject_late_cross_seeds(existing_ts, group)
                 continue
 
             # Elect ONE primary torrent for SSD download:
@@ -1429,6 +1431,70 @@ class Coordinator:
                             t.infohash[:10], e)
 
         ts.injected_private_hashes = ",".join(injected)
+
+    async def _check_and_inject_late_cross_seeds(
+        self, ts: TorrentState, group: list[Torrent]
+    ) -> None:
+        """Check if new cross-seeds arrived on VPS1 for a completed release and inject them to FUSE."""
+        known_hashes = {
+            h.lower() for h in (
+                ts.source_infohash,
+                ts.dest_infohash,
+                ts.cross_seed_infohash,
+                *ts.injected_private_hashes.split(","),
+            ) if h
+        }
+
+        new_torrents = [t for t in group if t.infohash.lower() not in known_hashes]
+        if not new_torrents:
+            return
+
+        target_mount = self._target_mount_for(ts)
+        current_injected = [h for h in ts.injected_private_hashes.split(",") if h]
+        changed = False
+
+        for t in new_torrents:
+            log.info(
+                "detected late cross-seed for completed content '%s': %s (%s)",
+                ts.source_name[:40], t.infohash[:10], t.name[:40],
+            )
+            try:
+                blob = await self._fetch_racing_torrent_bytes(t.infohash)
+            except Exception as e:  # noqa: BLE001
+                log.warning("late cross-seed: fetch %s failed: %s", t.infohash[:10], e)
+                continue
+
+            if not blob:
+                log.warning("late cross-seed: no .torrent bytes available for %s", t.infohash[:10])
+                continue
+
+            try:
+                res = await self.dest_client.add_torrent(
+                    torrent_files=[blob],
+                    save_path=str(target_mount),
+                    category="racing",
+                    paused=False,
+                    skip_check=True,
+                    tags=["racing", "fuse"],
+                )
+                if res.accepted or "already" in res.detail.lower():
+                    log.info(
+                        "auto-injected late cross-seed %s (%s) onto fuse (%s)",
+                        t.infohash[:10], t.name[:40], target_mount,
+                    )
+                    current_injected.append(t.infohash)
+                    changed = True
+                else:
+                    log.warning(
+                        "late cross-seed: add %s rejected by dest client: %s",
+                        t.infohash[:10], res.detail,
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.warning("late cross-seed: add %s failed: %s", t.infohash[:10], e)
+
+        if changed:
+            ts.injected_private_hashes = ",".join(current_injected)
+            self.store.upsert(ts)
 
     async def _fetch_racing_torrent_bytes(self, infohash: str) -> bytes | None:
         """Fetch the raw .torrent bytes for a racing-client infohash.

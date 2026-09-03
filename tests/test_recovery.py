@@ -128,3 +128,47 @@ async def test_do_re_add_fails_if_add_torrent_rejected():
     assert ts.state == State.FAILED
 
 
+@pytest.mark.anyio
+async def test_check_and_inject_late_cross_seeds():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import AddResult, Torrent
+
+    coord = object.__new__(Coordinator)
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse"))
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=b"torrent-bytes")
+    coord.dest_client.add_torrent.return_value = AddResult(hash="newhash", accepted=True)
+
+    ts = TorrentState(
+        "sourcehash",
+        source_name="Show.Release",
+        dest_infohash="desthash",
+        injected_private_hashes="already1,already2",
+        state=State.DONE,
+    )
+
+    group = [
+        Torrent(hash="sourcehash", name="Show.Release", category="racing", save_path="", size_bytes=100, state="", progress=1.0),
+        Torrent(hash="already1", name="Show.Release", category="racing", save_path="", size_bytes=100, state="", progress=1.0),
+        Torrent(hash="newhash", name="Show.Release", category="racing", save_path="", size_bytes=100, state="", progress=1.0),
+    ]
+
+    await coord._check_and_inject_late_cross_seeds(ts, group)
+
+    coord.dest_client.add_torrent.assert_awaited_once_with(
+        torrent_files=[b"torrent-bytes"],
+        save_path=str(Path("/mnt/fuse")),
+        category="racing",
+        paused=False,
+        skip_check=True,
+        tags=["racing", "fuse"],
+    )
+
+    assert "newhash" in ts.injected_private_hashes
+    coord.store.upsert.assert_called_once_with(ts)
+
+
+
