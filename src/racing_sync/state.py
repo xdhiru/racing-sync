@@ -98,6 +98,10 @@ class TorrentState:
     # Cross-seed bookkeeping
     cross_seed_infohash: str = ""  # prowlarr / SFTP-fetched torrent used on SSD
     cross_seed_source: str = ""    # "prowlarr" | "sftp" | "self"
+    # Raw .torrent bytes used on SSD (prowlarr / SFTP-fetched). Persisted
+    # so that recovery after a restart can re-add the cross-seed torrent
+    # when only the racing torrents survived.
+    cross_seed_blob: bytes = b""
     injected_private_hashes: str = ""  # CSV of private hashes re-added to fuse
     # Seedpool retry policy
     seedpool_first_queried_at: dt.datetime | None = None
@@ -127,6 +131,7 @@ class TorrentState:
             "save_path": self.save_path,
             "cross_seed_infohash": self.cross_seed_infohash,
             "cross_seed_source": self.cross_seed_source,
+            "cross_seed_blob": self.cross_seed_blob,
             "injected_private_hashes": self.injected_private_hashes,
             "seedpool_first_queried_at":
                 self.seedpool_first_queried_at.isoformat()
@@ -157,6 +162,7 @@ CREATE TABLE IF NOT EXISTS torrent_state (
     save_path                TEXT NOT NULL DEFAULT '',
     cross_seed_infohash      TEXT NOT NULL DEFAULT '',
     cross_seed_source        TEXT NOT NULL DEFAULT '',
+    cross_seed_blob          BLOB NOT NULL DEFAULT '',
     injected_private_hashes  TEXT NOT NULL DEFAULT '',
     seedpool_first_queried_at TEXT NOT NULL DEFAULT '',
     seedpool_next_retry_at    TEXT NOT NULL DEFAULT '',
@@ -199,9 +205,26 @@ class StateStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
 
     def close(self) -> None:
         self._conn.close()
+
+    # ---- migrations ----
+
+    def _migrate(self) -> None:
+        """Idempotent column additions for older state DBs.
+
+        SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so we
+        inspect `PRAGMA table_info` and add missing columns manually.
+        """
+        cols = {row["name"] for row in self._conn.execute(
+            "PRAGMA table_info(torrent_state)"
+        ).fetchall()}
+        if "cross_seed_blob" not in cols:
+            self._conn.execute(
+                "ALTER TABLE torrent_state ADD COLUMN cross_seed_blob BLOB NOT NULL DEFAULT ''"
+            )
 
     # ---- CRUD ----
 
@@ -344,6 +367,7 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         save_path=row["save_path"],
         cross_seed_infohash=row["cross_seed_infohash"],
         cross_seed_source=row["cross_seed_source"],
+        cross_seed_blob=bytes(row["cross_seed_blob"]) if row["cross_seed_blob"] else b"",
         injected_private_hashes=row["injected_private_hashes"],
         seedpool_first_queried_at=(
             dt.datetime.fromisoformat(sp_first) if sp_first else None
