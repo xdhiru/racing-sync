@@ -463,7 +463,8 @@ class Coordinator:
         Single source of truth for "what is syncable from the racing
         client right now". Empty `category` in the config means
         "sync everything"; non-empty means filter by that category.
-        `min_age_seconds` further restricts to torrents added recently.
+        `min_age_seconds` ensures torrents have matured for at least N
+        seconds before sync starts (e.g. to allow cross-seeds to be added).
         """
         all_torrents = await self.source_client.list_torrents(
             category=self.cfg.source.category
@@ -1054,6 +1055,13 @@ class Coordinator:
         if should_skip_movie(cls, self.cfg):
             log.warning("skipping oversize movie: %s (%d B)",
                         ts.source_name, ts.total_bytes)
+            # Remove the paused torrent from VPS2 so it does not leak as an orphan
+            h = ts.dest_infohash or ts.source_infohash
+            if h:
+                try:
+                    await self.dest_client.delete(h, delete_files=True)
+                except Exception as e:
+                    log.warning("failed to delete skipped oversize movie %s: %s", h[:10], e)
             self.transition(
                 ts, State.FAILED, error="movie larger than skip threshold",
             )

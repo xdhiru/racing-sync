@@ -157,18 +157,15 @@ class SourceConfig(BaseModel):
     # filter parameter on each client.
     category: str = ""
     # Minimum age of a torrent (seconds since added on the racing
-    # client) before it is eligible for sync. Protects against
-    # accidentally re-syncing long-running seed torrents when the
-    # category filter is empty (i.e. sync-all mode).
+    # client) before it is eligible for sync. Gives cross-seeds and
+    # other private tracker torrents time to be added to the racing
+    # client before sync and re-injection begin.
     #
-    # 0 (default) — sync every torrent the racing client has, regardless
-    #   of age. Use this when the racing client doesn't categorise its
-    #   torrents and you genuinely want everything.
+    # 0 (default) — sync every torrent immediately, regardless of age.
     #
-    # 3600 (1 hour) — sync torrents that were added in the last hour.
-    #   Safer default if you ever change `category` away from "".
+    # 3600 (1 hour) — only sync torrents that are at least 1 hour old.
     #
-    # 86400 (24 h) — only sync torrents added within the last day.
+    # 86400 (24 h) — only sync torrents that are at least 24 hours old.
     min_age_seconds: int = Field(default=0, ge=0)
     # Optional nginx basic-auth in front of the WebUI. Leave url empty if
     # nginx is not used.
