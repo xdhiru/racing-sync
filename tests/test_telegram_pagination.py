@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from racing_sync.state import State, TorrentState
 from racing_sync.telegram_bot import render_active, TelegramBot
 from racing_sync.config import TelegramConfig
@@ -124,3 +126,40 @@ def test_render_detail_formatting():
     # 4. Other fields not in backticks
     assert "SSD source: seedpool-cross-seed" in detail
     assert "Classifier: movie" in detail
+
+
+@pytest.mark.anyio
+async def test_refresh_live_status_filters_by_hashes():
+    from unittest.mock import AsyncMock
+    from racing_sync.coordinator import Coordinator, LiveItem
+    from racing_sync.clients.abstract import Torrent
+
+    coord = object.__new__(Coordinator)
+    coord.dest_client = AsyncMock()
+    coord._live = {}
+
+    # Case 1: when _live is empty, list_torrents should not even be called
+    await coord._refresh_live_status()
+    coord.dest_client.list_torrents.assert_not_called()
+
+    # Case 2: when _live has entries, list_torrents should be called with hashes
+    coord._live = {
+        "hash1": LiveItem("hash1", "Show1", "downloading", 0.1, 100.0),
+        "hash2": LiveItem("hash2", "Show2", "downloading", 0.5, 200.0),
+    }
+    coord.dest_client.list_torrents.return_value = [
+        Torrent(
+            hash="hash1",
+            name="Show1",
+            category="racing",
+            save_path="",
+            size_bytes=1024 * 1024 * 500,
+            state="downloading",
+            progress=0.8,
+        )
+    ]
+
+    await coord._refresh_live_status()
+    coord.dest_client.list_torrents.assert_awaited_once_with(hashes=["hash1", "hash2"])
+    assert coord._live["hash1"].progress == 0.8
+
