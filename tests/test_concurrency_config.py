@@ -517,6 +517,41 @@ def test_config_strict_validations():
         APIConfig(enabled=True, api_token="")
 
 
+def test_sched_priority_pipeline_before_discovery():
+    """Bounded pipeline states must sort before unbounded NEW rows.
+
+    Regression: bulk NEW rows filled every worker slot each tick and
+    timer-expired RE_ADDING rows starved indefinitely (135s-delayed
+    re-adds never re-ran while 40+ NEW rows cycled).
+    """
+    from racing_sync.coordinator import _sched_priority
+
+    def _row(state):
+        return TorrentState(source_infohash="h1", source_name="x", state=state)
+
+    for st in (State.RE_ADDING, State.QUEUED, State.MOVING,
+               State.QUERYING, State.DOWNLOADING):
+        assert _sched_priority(_row(st))[0] == 0
+    assert _sched_priority(_row(State.NEW))[0] == 1
+    assert _sched_priority(_row(State.WAITING_DISK))[0] == 2
+    assert _sched_priority(_row(State.WAITING_INDEXER))[0] == 2
+
+
+def test_sched_priority_sorts_readding_before_new():
+    from racing_sync.coordinator import _sched_priority
+
+    new_rows = [
+        TorrentState(source_infohash=f"new{i:02d}", source_name="x",
+                     state=State.NEW)
+        for i in range(20)
+    ]
+    waiting = TorrentState(source_infohash="r1", source_name="y",
+                           state=State.RE_ADDING)
+    ordered = sorted([*new_rows, waiting], key=_sched_priority)
+    assert ordered[0].source_infohash == "r1"
+    assert all(t.state == State.NEW for t in ordered[1:])
+
+
 @pytest.mark.anyio
 async def test_pick_ssd_source_public_and_private_paths():
     from unittest.mock import patch
