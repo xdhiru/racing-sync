@@ -118,6 +118,43 @@ __all__ = [
 # (chunk 3/3 removed: direct-export fallback)
 
 
+_SCHED_STATE_PRIORITY = {
+    # Bounded pipeline work first: timer-expired re-adds, admissions,
+    # in-flight downloads/moves and indexer wakeups.
+    State.RE_ADDING: 0,
+    State.QUEUED: 0,
+    State.MOVING: 0,
+    State.QUERYING: 0,
+    State.DOWNLOADING: 0,
+    # Unbounded discovery after that: endless NEW rows must not crowd out
+    # the rows above.
+    State.NEW: 1,
+    # Parked rows last (pre-existing rule, kept).
+    State.WAITING_DISK: 2,
+    State.WAITING_INDEXER: 2,
+    State.DONE: 3,
+    State.FAILED: 3,
+}
+
+
+def _sched_priority(ts) -> tuple[int, str]:
+    """Worker-scheduling order key (lower first, then oldest first).
+
+    all_active() ordering is DB-dependent; without an explicit priority,
+    bulk NEW rows fill every worker slot each tick and starve the bounded
+    pipeline states behind them.
+    """
+    try:
+        prio = _SCHED_STATE_PRIORITY.get(ts.state, 1)
+    except Exception:
+        prio = 1
+    try:
+        updated = str(getattr(ts, "updated_at", "") or "")
+    except Exception:
+        updated = ""
+    return (prio, updated)
+
+
 def _left_on_disk(src_dir: Path, name: str) -> bool:
     """True iff `name` still occupies real SSD bytes (0-transfer detector).
 
@@ -861,11 +898,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             self._spawn_worker(ts)
 
         # 4. Schedule workers for active states that have no live task.
-        # WAITING_DISK rows sort last so real QUEUED/DOWNLOADING/MOVING work
-        # is never starved of worker slots by parked rows.
+        # Bounded pipeline work sorts before unbounded discovery: NEW rows
+        # are unlimited (bulk watch drops re-evaluate every tick) and would
+        # otherwise fill every worker slot each tick, starving timer-expired
+        # RE_ADDING rows indefinitely (live incident: 135s-delayed re-adds
+        # never re-ran while 40+ NEW rows cycled). WAITING_DISK still sorts
+        # last so parked rows never starve real work either.
         active = sorted(
             self.store.all_active(),
-            key=lambda t: t.state == State.WAITING_DISK,
+            key=_sched_priority,
         )
         scheduled = 0
         scheduled_waiting_disk = 0
