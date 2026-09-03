@@ -228,6 +228,78 @@ async def test_do_new_watch_dir_already_download_tracker_still_searches_other_cr
 
 
 @pytest.mark.anyio
+async def test_do_new_watch_dir_public_torrent_skips_sacrificial_copy(tmp_path: Path):
+    raw_data = _create_sample_torrent_data("Public.Movie.1080p", 5000, "http://tracker.opentrackr.org:1337/announce")
+    infohash, name, total, announce = _bencoded_info_hash(raw_data)
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 100000000
+    coord.cfg.general.state_db = db_path
+    coord.cfg.general.disk_safety_margin_bytes = 1000
+    coord.cfg.prowlarr.enabled = True
+    coord.cfg.prowlarr.is_download_indexer = lambda url: "seedpool" in url
+    coord.cfg.prowlarr.tracker_map.entries = {"beyond-hd": "BeyondHD"}
+    coord.store = store
+    coord.transition = lambda t, s: setattr(t, "state", s)
+
+    bhd_idx = Indexer(2, "BeyondHD", "torrent", True, [])
+    coord.prowlarr = MagicMock()
+    coord.prowlarr.get_download_indexer = MagicMock()
+    coord.prowlarr.get_indexer_by_name = MagicMock(side_effect=lambda n: bhd_idx if n == "BeyondHD" else None)
+    coord.prowlarr.search_indexers_parallel = AsyncMock()
+    coord.prowlarr.download_torrent = AsyncMock()
+
+    bhd_hit = TorrentHit(
+        title="Public.Movie.1080p",
+        guid="2",
+        indexer="BeyondHD",
+        indexer_id=2,
+        size_bytes=5000,
+        download_url="http://prowlarr/dl/2",
+        magnet_url="",
+        info_url="",
+        publish_date="",
+    )
+    coord.prowlarr.search_indexers_parallel.return_value = {
+        "beyondhd": [bhd_hit],
+    }
+
+    bhd_torrent_bytes = _create_sample_torrent_data("Public.Movie.1080p", 5000, "http://beyond-hd.me/announce", piece_length=32768)
+    coord.prowlarr.download_torrent.return_value = bhd_torrent_bytes
+
+    ts = TorrentState(
+        source_infohash=infohash,
+        source_name=name,
+        total_bytes=total,
+        source_announce_url=announce,
+        cross_seed_blob=raw_data,
+        cross_seed_source="watch-dir",
+        state=State.NEW,
+    )
+
+    await coord._do_new_watch_dir(ts)
+
+    # download_indexer should NOT be queried for a sacrificial copy
+    coord.prowlarr.get_download_indexer.assert_not_called()
+    # But BeyondHD was searched for cross-seeds!
+    coord.prowlarr.search_indexers_parallel.assert_called_once()
+    # Dropped public torrent used directly for SSD
+    assert ts.cross_seed_source == "public-watch-dir"
+    assert ts.cross_seed_blob == raw_data
+
+    # BeyondHD cross-seed was saved for FUSE injection
+    watch_cross_dir = tmp_path / "watch_cross_seeds" / infohash
+    saved_files = list(watch_cross_dir.glob("*.torrent"))
+    assert len(saved_files) == 2  # dropped public torrent + BeyondHD cross-seed
+
+
+@pytest.mark.anyio
 async def test_do_new_watch_dir_with_prowlarr_search_and_cross_seeds(tmp_path: Path):
     raw_data = _create_sample_torrent_data("Private.Movie.1080p", 5000, "http://aither.cc/announce")
     infohash, name, total, announce = _bencoded_info_hash(raw_data)
