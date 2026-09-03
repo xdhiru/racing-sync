@@ -61,3 +61,49 @@ def test_parse_episode_case_insensitive():
     assert parse_episode("Show.s10e22.mkv") == (10, 22)
     assert parse_episode("Show.S01E01.mkv") == (1, 1)
     assert parse_episode("no.episode.tag.mkv") is None
+
+
+def test_single_file_episode_is_classified_as_episode():
+    files = [TorrentFile("Game.Day.Murders.S01E08.1080p.mkv", 1_900_000_000)]
+    cls = classify(files, _cfg())
+    assert cls.kind == "episode"
+    assert cls.single_file == "Game.Day.Murders.S01E08.1080p.mkv"
+    assert len(cls.episodes) == 1
+    assert cls.episodes[0].season == 1
+    assert cls.episodes[0].episode == 8
+
+
+def test_single_episode_with_nfo_is_classified_as_episode():
+    files = [
+        TorrentFile("Show.S02E05.1080p.mkv", 2_000_000_000),
+        TorrentFile("Show.S02E05.nfo", 2000),
+    ]
+    cls = classify(files, _cfg())
+    assert cls.kind == "episode"
+    assert cls.single_file == "Show.S02E05.1080p.mkv"
+    assert len(cls.episodes) == 1
+    assert cls.episodes[0].season == 2
+    assert cls.episodes[0].episode == 5
+
+
+def test_coordinator_target_mount_routing():
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState
+
+    cfg = _cfg()
+    # Mock Coordinator with minimal fields to test _target_mount_for
+    coord = object.__new__(Coordinator)
+    coord.cfg = cfg
+
+    ts_movie = TorrentState("hash1", classification_kind="movie")
+    ts_season = TorrentState("hash2", classification_kind="season")
+    ts_ep = TorrentState("hash3", classification_kind="episode")
+    ts_mixed = TorrentState("hash4", classification_kind="mixed")
+
+    # Movies and full seasons -> default mount
+    assert coord._target_mount_for(ts_movie) == Path(cfg.rclone.fuse.mount)
+    assert coord._target_mount_for(ts_season) == Path(cfg.rclone.fuse.mount)
+
+    # Individual episodes and mixed -> mount_unsorted
+    assert coord._target_mount_for(ts_ep) == Path(cfg.rclone.fuse.mount_unsorted)
+    assert coord._target_mount_for(ts_mixed) == Path(cfg.rclone.fuse.mount_unsorted)
