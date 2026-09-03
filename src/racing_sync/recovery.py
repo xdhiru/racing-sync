@@ -96,7 +96,9 @@ def _save_path_on_ssd(cfg: AppConfig, save_path: str) -> bool:
     else (stale paths, other mounts) stay unknowns. Defensive against test
     doubles — unresolvable roots simply yield False.
     """
-    sp = (save_path or "").rstrip("/\\").replace("\\", "/")
+    from .coordinator_content import fold_path_case
+
+    sp = fold_path_case((save_path or "").rstrip("/\\").replace("\\", "/"))
     if not sp:
         return False
     roots: list[str] = []
@@ -105,7 +107,7 @@ def _save_path_on_ssd(cfg: AppConfig, save_path: str) -> bool:
         # MagicMock in unit tests) means membership is unknowable -> False.
         if not isinstance(raw, (str, Path)):
             continue
-        r = str(raw).rstrip("/\\").replace("\\", "/")
+        r = fold_path_case(str(raw).rstrip("/\\").replace("\\", "/"))
         if r:
             roots.append(r)
     if not roots:
