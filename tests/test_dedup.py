@@ -17,6 +17,19 @@ def test_looks_public():
     assert _looks_public(["https://beta.me/announce/passkey"]) is False
 
 
+def test_fold_path_case_folds_only_on_windows():
+    import os
+    from racing_sync.coordinator_content import fold_path_case
+
+    if os.name == "nt":
+        assert fold_path_case("G:/SSD/Data") == "g:/ssd/data"
+    else:
+        assert fold_path_case("G:/SSD/Data") == "G:/SSD/Data"
+        assert fold_path_case("/srv/data") == "/srv/data"
+    assert fold_path_case("") == ""
+    assert fold_path_case(None) == ""
+
+
 def test_announce_domain_never_returns_credential():
     from racing_sync.coordinator_content import announce_domain
 

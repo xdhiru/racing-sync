@@ -48,6 +48,7 @@ from .coordinator_content import (
     _verified_cross_seed_blob,
     announce_domain,
     cleanup_grace_seconds,
+    fold_path_case,
     is_watch_row,
     normalize_content_name,
     watch_election_winner,
@@ -5494,9 +5495,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         """True iff a client save_path points at a configured fuse mount."""
         if not isinstance(save_path, str) or not save_path:
             return False
-        sp = save_path.rstrip("/\\").replace("\\", "/")
+        sp = fold_path_case(save_path.rstrip("/\\").replace("\\", "/"))
         for fm in self._fuse_mount_strs():
-            if sp == fm or sp.startswith(fm + "/"):
+            fm_folded = fold_path_case(fm)
+            if sp == fm_folded or (fm_folded and sp.startswith(fm_folded + "/")):
                 return True
         return False
 
@@ -5547,8 +5549,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         """
         if not isinstance(save_path, str):
             return False
-        sp = save_path.rstrip("/\\").replace("\\", "/")
-        tm = str(target_mount).rstrip("/\\").replace("\\", "/")
+        sp = fold_path_case(save_path.rstrip("/\\").replace("\\", "/"))
+        tm = fold_path_case(str(target_mount).rstrip("/\\").replace("\\", "/"))
         return bool(tm) and (sp == tm or sp.startswith(tm + "/"))
 
     def _should_pause_public_on_fuse(self, blob: bytes | None) -> bool:

@@ -346,6 +346,22 @@ def watch_election_winner(rows, ts: TorrentState, cfg) -> TorrentState | None:
         return None
 
 
+def fold_path_case(p: str) -> str:
+    """OS-aware path string for comparisons (not for filesystem access).
+
+    Windows filesystems are case-insensitive (`G:/SSD` is `g:/ssd`);
+    POSIX is not. Fold only on nt so Linux behavior stays exact.
+    """
+    try:
+        import os as _os
+
+        if _os.name == "nt":
+            return (p or "").lower()
+    except Exception:
+        pass
+    return p or ""
+
+
 def announce_domain(url: str) -> str:
     """Host/domain of an announce URL for logging and display.
 
@@ -378,10 +394,10 @@ def announce_domain(url: str) -> str:
         return ""
 
 
-def _looks_public(tracker_urls: list[str]) -> bool:
+def _looks_public(tracker_urls: list[str] | None) -> bool:
     import urllib.parse as _up
 
-    for url in tracker_urls:
+    for url in tracker_urls or []:
         low = (url or "").strip().lower()
         if not low:
             continue
