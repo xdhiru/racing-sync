@@ -8,6 +8,7 @@ applies.
 from __future__ import annotations
 
 import datetime as dt
+import pytest
 
 from racing_sync.config import AppConfig
 from racing_sync.state import State, TorrentState
@@ -58,8 +59,18 @@ def test_expired_max_age_marks_failed():
     now = dt.datetime.now(dt.timezone.utc)
     elapsed = now - ts.seedpool_first_queried_at
     assert elapsed > dt.timedelta(seconds=cfg.cross_seed.seedpool_max_age_seconds)
-    # This is the exact decision _park_for_seedpool_retry would make.
-    should_fail = elapsed >= dt.timedelta(
-        seconds=cfg.cross_seed.seedpool_max_age_seconds
-    )
-    assert should_fail is True
+
+
+@pytest.mark.anyio
+async def test_process_torrent_inner_dispatches_querying_state():
+    from unittest.mock import AsyncMock
+    from racing_sync.coordinator import Coordinator
+
+    coord = object.__new__(Coordinator)
+    coord._do_waiting_seedpool = AsyncMock()
+
+    ts = TorrentState("hash1", state=State.QUERYING)
+    await coord._process_torrent_inner(ts)
+
+    # Must dispatch to _do_waiting_seedpool when in QUERYING state
+    coord._do_waiting_seedpool.assert_awaited_once_with(ts)

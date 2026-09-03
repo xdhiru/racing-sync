@@ -147,7 +147,10 @@ async def fix_orphan(
             paused=True,
             skip_check=False,
         )
-        store.transition(ts, State.DOWNLOADING)
+        if ts.state != State.DOWNLOADING:
+            store.transition(ts, State.DOWNLOADING)
+        else:
+            store.upsert(ts)
         return State.DOWNLOADING.value
 
     if ts.state == State.MOVING:

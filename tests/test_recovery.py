@@ -70,3 +70,27 @@ async def test_reconcile_adopts_fuse_and_completed_torrents(tmp_path: Path):
 
     t3 = store.get("3333333333333333333333333333333333333333")
     assert t3 is None
+
+
+@pytest.mark.anyio
+async def test_fix_orphan_already_downloading(tmp_path: Path):
+    from racing_sync.recovery import fix_orphan
+    from racing_sync.state import TorrentState
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    ts = TorrentState("hash1", state=State.DOWNLOADING)
+    store.upsert(ts)
+
+    dest = AsyncMock()
+    cfg = MagicMock()
+    cfg.dest.save_path = Path("/srv/qbittorrent/data")
+
+    # fix_orphan should NOT raise ValueError when already in DOWNLOADING
+    res = await fix_orphan(ts, cfg, dest=dest, store=store, sftp_bytes=b"dummy-bytes")
+    assert res == State.DOWNLOADING.value
+    recovered = store.get("hash1")
+    assert recovered is not None
+    assert recovered.state == State.DOWNLOADING
+

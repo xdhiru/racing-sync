@@ -805,7 +805,7 @@ class Coordinator:
         log.info("worker start: %s state=%s", ts.source_name, ts.state.value)
         if ts.state == State.NEW:
             await self._do_new(ts)
-        if ts.state == State.WAITING_SEEDPOOL:
+        if ts.state in (State.WAITING_SEEDPOOL, State.QUERYING):
             await self._do_waiting_seedpool(ts)
         if ts.state == State.WAITING_DISK:
             await self._wait_disk_then_queue(ts)
