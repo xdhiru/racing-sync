@@ -55,7 +55,13 @@ async def _runner(coord: Coordinator) -> int:
                 await main_task
             except (asyncio.CancelledError, Exception):
                 pass
-        await coord.shutdown()
+        # Bounded shutdown: a wedged close (dead mount, hung socket) must
+        # delay SIGTERM, never block it forever. SQLite WAL recovers
+        # natively, so abandoning a stuck shutdown is safe.
+        try:
+            await asyncio.wait_for(coord.shutdown(), timeout=30.0)
+        except asyncio.TimeoutError:
+            log.warning("shutdown timed out after 30s; exiting anyway")
 
 
 def _is_safe_dir_to_clear(path: Path, label: str = "log dir") -> str | None:
