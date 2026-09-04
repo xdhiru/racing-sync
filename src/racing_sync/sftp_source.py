@@ -142,6 +142,21 @@ class SFTPExporter:
 
     def fetch_torrent(self, infohash: str) -> bytes | None:
         """Return the .torrent bytes for `infohash` or None if missing."""
+        if not infohash or len(infohash) != 40 or not all(c in "0123456789abcdefABCDEF" for c in infohash):
+            return None
+
+        # Reconnect if connection dropped
+        if (self._client is None
+                or self._sftp is None
+                or self._client.get_transport() is None
+                or not self._client.get_transport().is_active()):
+            log.info("sftp connection dropped or not active; reconnecting...")
+            try:
+                self.connect()
+            except Exception as e:
+                log.warning("sftp reconnect failed: %s", e)
+                return None
+
         candidates = [
             Path(self._cfg.state_dir) / f"{infohash}.torrent",
         ]
@@ -160,8 +175,11 @@ class SFTPExporter:
                 log.warning("sftp: %s does not look like a bencoded torrent", path)
             except FileNotFoundError:
                 continue
-            except OSError as e:
+            except (OSError, paramiko.SSHException, EOFError) as e:
                 log.warning("sftp: read %s failed: %s", path, e)
+                continue
+            except Exception as e:  # noqa: BLE001
+                log.warning("sftp: unexpected error reading %s: %s", path, e)
                 continue
         return None
 

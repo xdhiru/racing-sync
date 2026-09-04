@@ -242,12 +242,17 @@ async def pick_ssd_source_for_racing(
                 hit = None
             if hit:
                 blob = await prowlarr.download_torrent(hit)
+                try:
+                    from .watchdir import _bencoded_info_hash
+                    real_hash, _, _, _ = _bencoded_info_hash(blob)
+                except Exception:
+                    real_hash = hit.guid if len(hit.guid) == 40 else ""
                 return SourceDecision(
                     torrent_bytes=blob,
                     source_label="public-seedpool-fallback",
                     name=source_torrent.name,
                     size_bytes=hit.size_bytes,
-                    infohash=hit.guid,
+                    infohash=real_hash,
                     announce_url=hit.download_url,
                 )
 
@@ -278,12 +283,17 @@ async def pick_ssd_source_for_racing(
                 hit.title, hit.size_bytes, hit.indexer,
             )
             blob = await prowlarr.download_torrent(hit)
+            try:
+                from .watchdir import _bencoded_info_hash
+                real_hash, _, _, _ = _bencoded_info_hash(blob)
+            except Exception:
+                real_hash = hit.guid if len(hit.guid) == 40 else ""
             return SourceDecision(
                 torrent_bytes=blob,
                 source_label="seedpool-cross-seed",
                 name=source_torrent.name,
                 size_bytes=hit.size_bytes,
-                infohash=hit.guid,
+                infohash=real_hash,
                 announce_url=hit.download_url,
             )
         if attempt_prowlarr:
@@ -551,6 +561,16 @@ class Coordinator:
                     log.error(
                         "auth still failing after retries; "
                         "backing off for one poll interval: %s", e,
+                    )
+                except (asyncio.TimeoutError, TimeoutError) as e:
+                    log.warning(
+                        "poll tick timed out (remote client connection dropped/slow); "
+                        "backing off for one poll interval: %s", e,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.error(
+                        "unexpected error in coordinator tick; "
+                        "backing off for one poll interval: %s", e, exc_info=True,
                     )
                 # Cancellable sleep so SIGINT/SIGTERM break out quickly.
                 try:
@@ -1568,23 +1588,6 @@ class Coordinator:
         # copies of the same release, all with identical display names.
         matches = [t for t in racing if t.name == ts.source_name]
 
-        # Also fetch the SSD-source torrent itself if it isn't in `matches`
-        # (e.g. because it was a cross-seed, not in the racing list).
-        cross_seed_infohash = ts.cross_seed_infohash
-        seen = {t.infohash.lower() for t in matches}
-        if cross_seed_infohash and cross_seed_infohash.lower() not in seen:
-            # Construct a synthetic Torrent just for re-injection.
-            matches.append(Torrent(
-                hash=cross_seed_infohash,
-                name=ts.source_name,
-                category="racing",
-                save_path="",
-                size_bytes=ts.total_bytes,
-                state="",
-                progress=1.0,
-                trackers=[],
-            ))
-
         for t in matches:
             try:
                 blob = await self._fetch_racing_torrent_bytes(t.infohash)
@@ -1732,12 +1735,27 @@ class Coordinator:
           2. The source client's own export endpoint (qB /api/v2/torrents/export,
              Deluge core.get_torrent_file).
         """
+        # Validate that infohash is a valid hex infohash
+        if not infohash or len(infohash) != 40 or not all(c in "0123456789abcdefABCDEF" for c in infohash):
+            log.warning("_fetch_racing_torrent_bytes: skipping invalid infohash %r", infohash)
+            return None
+
         if self.sftp is not None:
-            blob = self.sftp.fetch_torrent(infohash)
-            if blob:
-                return blob
+            try:
+                blob = await asyncio.wait_for(
+                    asyncio.to_thread(self.sftp.fetch_torrent, infohash),
+                    timeout=15.0,
+                )
+                if blob:
+                    return blob
+            except Exception as e:  # noqa: BLE001
+                log.warning("sftp fetch %s failed: %s", infohash[:10], e)
+
         try:
-            return await self.source_client.export_torrent(infohash)
+            return await asyncio.wait_for(
+                self.source_client.export_torrent(infohash),
+                timeout=15.0,
+            )
         except AttributeError:
             return None
         except Exception:  # noqa: BLE001
