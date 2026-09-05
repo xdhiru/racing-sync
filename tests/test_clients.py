@@ -818,3 +818,79 @@ async def test_qbittorrent_add_torrent_handles_duplicates_and_hex_validation():
     assert res_hex.accepted is True
 
 
+def _deluge_client():
+    cfg = SourceConfig(
+        type="deluge",
+        host="http://localhost:8112",
+        password="secret",
+        deluge_sftp={
+            "enabled": True,
+            "ssh_host": "127.0.0.1",
+            "ssh_password": "pwd",
+            "state_dir": "/var/lib/deluged/state",
+        },
+    )
+    return DelugeClient(cfg)
+
+
+class _JsonResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def json(self):
+        return self._payload
+
+    async def text(self):
+        return str(self._payload)
+
+
+@pytest.mark.anyio
+async def test_deluge_rpc_expiry_resets_authed():
+    """Session-expiry JSON must drop the session flag so next call re-logs in."""
+    from racing_sync.clients.http_base import AuthError
+
+    client = _deluge_client()
+    client._authed = True
+
+    async def mock_request(*args, **kwargs):
+        return _JsonResp({"error": {"message": "Not authenticated", "code": 1},
+                          "id": 1, "result": None})
+
+    client.request = mock_request
+    with pytest.raises(AuthError, match="session expired"):
+        await client._rpc("core.get_torrents_status", [{}, []])
+    assert client._authed is False
+
+
+@pytest.mark.anyio
+async def test_deluge_mutations_invalidate_scan_cache():
+    """Post-mutation reads must not serve the 5s pre-mutation snapshot."""
+    client = _deluge_client()
+    client._scan_cache = {"": (9999999999.0, {"old": {}})}
+    client._rpc = AsyncMock(return_value={})
+
+    await client.pause("h1")
+    assert client._scan_cache == {}
+    client._scan_cache = {"": (9999999999.0, {"old": {}})}
+    await client.resume("h1")
+    assert client._scan_cache == {}
+    client._scan_cache = {"": (9999999999.0, {"old": {}})}
+    await client.delete("h1")
+    assert client._scan_cache == {}
+    client._scan_cache = {"": (9999999999.0, {"old": {}})}
+    await client.recheck("h1")
+    assert client._scan_cache == {}
+    client._scan_cache = {"": (9999999999.0, {"old": {}})}
+    await client.set_file_priorities("h1", {})
+    assert client._scan_cache == {}
+    client._scan_cache = {"": (9999999999.0, {"old": {}})}
+    await client.add_torrent(urls=["http://example.com/x.torrent"], save_path="/dl")
+    assert client._scan_cache == {}
+
+
