@@ -37,10 +37,15 @@ async def test_qbittorrent_export_torrent():
     cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
     client = QBittorrentClient(cfg, label="dest-qb")
 
+    async def _chunks(payload: bytes):
+        yield payload
+
     class DummyResponseContext:
         async def __aenter__(self):
             resp = MagicMock()
             resp.read = AsyncMock(return_value=b"d8:announce...")
+            resp.content.iter_chunked = MagicMock(
+                side_effect=lambda size: _chunks(b"d8:announce..."))
             return resp
 
         async def __aexit__(self, *args):
@@ -55,6 +60,35 @@ async def test_qbittorrent_export_torrent():
     client.request = mock_request
     data = await client.export_torrent("abc12345")
     assert data == b"d8:announce..."
+
+
+@pytest.mark.anyio
+async def test_qbittorrent_export_torrent_rejects_oversize():
+    """A rogue export endpoint cannot OOM the daemon (stream cap)."""
+    from racing_sync.watchdir import MAX_TORRENT_BYTES
+
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+
+    async def _big_chunks():
+        yield b"x" * (MAX_TORRENT_BYTES + 1)
+
+    class DummyResponseContext:
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.content.iter_chunked = MagicMock(
+                side_effect=lambda size: _big_chunks())
+            return resp
+
+        async def __aexit__(self, *args):
+            pass
+
+    async def mock_request(method, endpoint, params=None, **kwargs):
+        return DummyResponseContext()
+
+    client.request = mock_request
+    with pytest.raises(ValueError, match="exceeds"):
+        await client.export_torrent("abc12345")
 
 
 @pytest.mark.anyio

@@ -396,12 +396,25 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         """Return the .torrent file bytes from qB's own state.
 
         This is the file we can re-add elsewhere without re-downloading
-        metadata.
+        metadata. Stream-capped like the Prowlarr/Deluge download paths so
+        a rogue endpoint cannot OOM the daemon with one response.
         """
+        from ..watchdir import MAX_TORRENT_BYTES
+
         async with await self.request(
             "GET", "/api/v2/torrents/export", params={"hash": torrent_hash}
         ) as r:
-            return await r.read()
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in r.content.iter_chunked(64 * 1024):
+                total += len(chunk)
+                if total > MAX_TORRENT_BYTES:
+                    raise ValueError(
+                        f"qB .torrent export for {torrent_hash} exceeds "
+                        f"{MAX_TORRENT_BYTES} bytes"
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks)
 
     async def get_properties(self, torrent_hash: str) -> dict[str, Any]:
         async with await self.request(
