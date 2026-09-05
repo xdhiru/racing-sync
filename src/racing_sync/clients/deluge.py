@@ -143,6 +143,10 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     body = await r.text()
                 except Exception:
                     pass
+                try:
+                    self._authed = False
+                except Exception:
+                    pass
                 raise AuthError(
                     f"deluge rpc {method} returned non-JSON (likely expired "
                     f"session/login page): {e}. Body: {body[:200]}"
@@ -152,6 +156,14 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             low = err_text.lower()
             if any(s in low for s in ("not authenticated", "not authorized", "login", "session")):
                 from .http_base import AuthError
+                # Drop the session flag so the next request() re-logs in
+                # instead of replaying the dead session forever: Deluge
+                # expiry arrives as HTTP 200 + JSON (never 401), so the
+                # http_base re-auth path never sees it.
+                try:
+                    self._authed = False
+                except Exception:
+                    pass
                 raise AuthError(f"deluge session expired: {err_text[:200]}")
             raise RuntimeError(f"deluge rpc {method} error: {data['error']}")
         return data.get("result")
@@ -252,6 +264,20 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             hash_set = {h.lower() for h in hash_list}
             out = [t for t in out if t.hash.lower() in hash_set]
         return out
+
+    def _invalidate_scan_cache(self) -> None:
+        """Drop the 5s scan cache after any mutation.
+
+        Stale reads right after add/delete/pause otherwise miss fresh rows
+        (e.g. get_torrent(new_hash) -> None -> duplicate add attempts).
+        Best-effort: a missed invalidation only costs one re-scan.
+        """
+        try:
+            cache = getattr(self, "_scan_cache", None)
+            if isinstance(cache, dict):
+                cache.clear()
+        except Exception:
+            pass
 
     async def _cached_scan(self, filt: dict[str, Any], status_keys: list[str]) -> dict:
         """Full-scan with a 5s per-filter cache (hash filtering is client-side)."""
@@ -467,6 +493,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         content_layout: str | None = None,
         tags: list[str] | None = None,
     ) -> AddResult:
+        self._invalidate_scan_cache()
         opts: dict[str, Any] = {
             "download_location": save_path,
             "add_paused": paused,
@@ -523,6 +550,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         self, torrent_hash: str, priorities: dict[str, int]
     ) -> None:
         from .http_base import AuthError
+        self._invalidate_scan_cache()
         try:
             status = await self._rpc(
                 "core.get_torrent_status",
@@ -560,18 +588,22 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             raise RuntimeError(f"deluge set_file_priorities failed for {torrent_hash}: {e}") from e
 
     async def pause(self, torrent_hash: str) -> None:
+        self._invalidate_scan_cache()
         await self._rpc("core.pause_torrent", [torrent_hash])
 
     async def resume(self, torrent_hash: str) -> None:
+        self._invalidate_scan_cache()
         await self._rpc("core.resume_torrent", [torrent_hash])
 
     async def delete(self, torrent_hash: str, *, delete_files: bool = False) -> None:
+        self._invalidate_scan_cache()
         await self._rpc(
             "core.remove_torrent",
             [torrent_hash, bool(delete_files)],
         )
 
     async def recheck(self, torrent_hash: str) -> None:
+        self._invalidate_scan_cache()
         await self._rpc("core.force_recheck", [torrent_hash])
 
     # ---- deluge-specific ----
