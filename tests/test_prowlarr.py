@@ -988,3 +988,77 @@ async def test_pick_ssd_source_labels_indexer_slug():
     )
     assert dec is not None
     assert dec.source_label == "second-indexer-api-cross-seed"
+
+
+def test_verified_blob_requires_name_and_size():
+    """A decodable torrent with no name/size proves nothing: reject it.
+
+    Falling back to the index title/size would verify the listing, not
+    the downloaded bytes.
+    """
+    from racing_sync.coordinator_content import _verified_cross_seed_blob
+
+    # No name key at all.
+    nameless = _bencode({
+        b"announce": b"http://x/announce",
+        b"info": {b"length": 100, b"piece length": 16384,
+                  b"pieces": b"12345678901234567890"},
+    })
+    assert _verified_cross_seed_blob(
+        nameless, target_name="Show.S01E01", target_size=100,
+        hit_title="Show.S01E01") is None
+    # Zero size with a good name.
+    zero_size = _bencode({
+        b"announce": b"http://x/announce",
+        b"info": {b"name": b"Show.S01E01", b"length": 0,
+                  b"piece length": 16384, b"pieces": b"12345678901234567890"},
+    })
+    assert _verified_cross_seed_blob(
+        zero_size, target_name="Show.S01E01", target_size=100,
+        hit_title="Show.S01E01") is None
+    # Well-formed blob still verifies.
+    good = _bencode({
+        b"announce": b"http://x/announce",
+        b"info": {b"name": b"Show.S01E01", b"length": 100,
+                  b"piece length": 16384, b"pieces": b"12345678901234567890"},
+    })
+    assert _verified_cross_seed_blob(
+        good, target_name="Show.S01E01", target_size=100,
+        hit_title="Show.S01E01") is not None
+
+
+@pytest.mark.anyio
+async def test_pick_download_fetch_failure_parks_instead_of_failing():
+    """A 500 fetching the payload parks for retry, never FAILED."""
+    hit = TorrentHit(
+        title="Priv.Movie", guid="9", indexer="Test Indexer (API)",
+        indexer_id=1, size_bytes=1000, download_url="http://prowlarr/9",
+        magnet_url="", info_url="", publish_date="",
+    )
+    prowlarr = AsyncMock()
+    prowlarr.get_download_indexers = MagicMock(return_value=[])
+    prowlarr.best_match = AsyncMock(return_value=hit)
+    prowlarr.download_torrent = AsyncMock(
+        side_effect=RuntimeError("indexer 500"))
+
+    cfg = MagicMock()
+    cfg.prowlarr.should_skip_title.return_value = False
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+    cfg.cross_seed.allow_ssh_export = False
+
+    t_priv = Torrent(
+        hash="hpriv", name="Priv.Movie", category="",
+        save_path="", size_bytes=1000, state="racing", progress=1.0,
+        trackers=["https://alpha.cc/announce/passkey"],
+    )
+    dec = await pick_ssd_source_for_racing(
+        cfg=cfg,
+        source_torrent=t_priv,
+        other_source_torrents=[],
+        prowlarr=prowlarr,
+        sftp=None,
+        source_client=AsyncMock(),
+        attempt_prowlarr=True,
+    )
+    # No decision -> caller parks in WAITING_INDEXER for retry.
+    assert dec is None
