@@ -381,3 +381,6 @@ async def test_forget_verify_after_delete_reports_survivors(tmp_path: Path):
     )
 
     assert any("still present after delete" in e for e in result["errors"])
+    # The row is kept (not resurrected later) so the operator can retry.
+    assert store.get("a" * 40) is not None
+    assert any("kept db row" in e for e in result["errors"])
