@@ -69,7 +69,7 @@ async def pick_ssd_source_for_racing(
     # client's .torrent is unreachable on VPS1 (then refetch_public_via_prowlarr
     # can fall back to Prowlarr as a last resort).
     publics = [t for t in [source_torrent] + other_source_torrents
-               if _looks_public(t.trackers)]
+               if _looks_public(getattr(t, "trackers", None) or [])]
 
     if publics:
         chosen = publics[0]
@@ -176,11 +176,19 @@ async def pick_ssd_source_for_racing(
             hit_size = 0
             if hit:
                 hit_size = hit.size_bytes
-                blob = await prowlarr.download_torrent(hit)
-                verified = _verified_cross_seed_blob(
-                    blob, target_name=chosen.name,
-                    target_size=chosen.size_bytes, hit_title=hit.title,
-                )
+                try:
+                    blob = await prowlarr.download_torrent(hit)
+                except Exception as e:  # noqa: BLE001
+                    # A 500/timeout fetching the payload is transient: fall
+                    # through to the export fallback below, never FAILED.
+                    log.warning("download-indexer fetch failed for %s: %s",
+                                chosen.name, e)
+                    blob = None
+                if blob is not None:
+                    verified = _verified_cross_seed_blob(
+                        blob, target_name=chosen.name,
+                        target_size=chosen.size_bytes, hit_title=hit.title,
+                    )
             if verified is not None:
                 blob, real_hash, announce = verified
                 return SourceDecision(
@@ -243,11 +251,19 @@ async def pick_ssd_source_for_racing(
                 "prowlarr hit: %s (size=%d B, indexer=%s)",
                 hit.title, hit.size_bytes, hit.indexer,
             )
-            blob = await prowlarr.download_torrent(hit)
-            verified = _verified_cross_seed_blob(
-                blob, target_name=source_torrent.name,
-                target_size=source_torrent.size_bytes, hit_title=hit.title,
-            )
+            try:
+                blob = await prowlarr.download_torrent(hit)
+            except Exception as e:  # noqa: BLE001
+                # Same transient class as a search failure: park and retry
+                # instead of failing a row over one bad fetch.
+                log.warning("download-indexer fetch failed for %s: %s",
+                            source_torrent.name, e)
+                blob = None
+            if blob is not None:
+                verified = _verified_cross_seed_blob(
+                    blob, target_name=source_torrent.name,
+                    target_size=source_torrent.size_bytes, hit_title=hit.title,
+                )
         if verified is not None:
             blob, real_hash, announce = verified
             return SourceDecision(

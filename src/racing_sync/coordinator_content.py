@@ -85,9 +85,16 @@ def _verified_cross_seed_blob(
         log.warning("cross-seed download for %s is not a decodable torrent; ignoring",
                     target_name)
         return None
+    if not blob_name or not blob_size:
+        # A decodable torrent with no name/size proves nothing about the
+        # payload: falling back to the index title/size would verify the
+        # listing, not the bytes. Park for retry instead of downloading on.
+        log.warning("cross-seed download for %s has no name/size inside; ignoring",
+                    target_name)
+        return None
     try:
         from .prowlarr import release_title_matches
-        ok = release_title_matches(blob_name or hit_title, blob_size or 0,
+        ok = release_title_matches(blob_name, blob_size,
                                    target_name, target_size)
     except Exception:
         ok = False
