@@ -269,6 +269,7 @@ async def _forget_one(
     }
     if not apply:
         return result
+    still: set[str] = set()
     for h in sorted(entries):
         try:
             entry = entries[h]
@@ -354,6 +355,16 @@ async def _forget_one(
         except Exception as e:  # noqa: BLE001
             result["errors"].append(f"ignore list: {e}")
             result["ignored"] = False
+    if still:
+        # Dest entries survived deletion: dropping the row would let
+        # recovery re-adopt the survivor as a fresh row (resurrecting the
+        # cancel). Keep the row so the operator can retry the forget.
+        log.warning("forget: keeping row for %s (%d dest entries survive)",
+                    row.source_infohash[:10], len(still))
+        result["errors"].append(
+            f"kept db row: {len(still)} dest entr"
+            f"{'y' if len(still) == 1 else 'ies'} still present")
+        return result
     try:
         store.delete(row.source_infohash)
     except Exception as e:  # noqa: BLE001
