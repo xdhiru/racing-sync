@@ -552,6 +552,60 @@ def test_sched_priority_sorts_readding_before_new():
     assert all(t.state == State.NEW for t in ordered[1:])
 
 
+def test_rclone_flag_validator_rejects_dash_variants():
+    from pydantic import ValidationError
+    from racing_sync.config import RcloneConfig
+
+    base = {
+        "binary": "/usr/bin/rclone",
+        "remote": {"default": "remote:qb/", "unsorted": "remote:qb/unsorted/"},
+        "fuse": {"mount": "/mnt/a", "mount_unsorted": "/mnt/a/u"},
+    }
+
+    def _cfg_with(flags):
+        return RcloneConfig(**{**base, "extra_move_flags": flags})
+
+    _cfg_with(["--transfers=4", "--bwlimit=0"])
+    for bad in ("--config", "-config", "---config", "--CONFIG=x",
+                "--password_command", "--ask-password=yes"):
+        with pytest.raises(ValidationError):
+            _cfg_with([bad])
+
+
+def test_warn_unknown_keys_descends_into_indexer_lists(caplog):
+    from racing_sync.config import AppConfig, _warn_unknown_keys
+
+    data = {
+        "general": {},
+        "source": {"type": "qbittorrent", "host": "http://x/"},
+        "dest": {"host": "http://y/", "save_path": "/s"},
+        "ssd": {"path": "/s", "max_inflight_bytes": 1,
+                "skip_movie_larger_than_bytes": 1},
+        "rclone": {
+            "remote": {"default": "r:a/", "unsorted": "r:a/u/"},
+            "fuse": {"mount": "/m", "mount_unsorted": "/m/u"},
+        },
+        "prowlarr": {
+            "download_indexers": [
+                {"name": "Idx", "announce_substrings": [],
+                 "indxer_typo": True},
+            ],
+        },
+    }
+    with caplog.at_level("WARNING", logger="racing_sync.config"):
+        _warn_unknown_keys(AppConfig, data)
+    assert any("indxer_typo" in r.message for r in caplog.records)
+
+
+def test_api_token_example_placeholder_rejected():
+    from pydantic import ValidationError
+    from racing_sync.config import APIConfig
+
+    with pytest.raises(ValidationError, match="placeholder"):
+        APIConfig(enabled=True, api_token="generate_a_random_token_here")
+    APIConfig(enabled=True, api_token="s3cr3t-ok-token")
+
+
 @pytest.mark.anyio
 async def test_pick_ssd_source_public_and_private_paths():
     from unittest.mock import patch

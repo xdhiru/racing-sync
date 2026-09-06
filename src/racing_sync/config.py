@@ -321,8 +321,12 @@ class RcloneConfig(BaseModel):
                 low = str(item).strip().lower()
             except Exception:
                 continue
-            flag = low.split("=", 1)[0]
-            if flag in ("--config", "--password-command", "--ask-password"):
+            # Normalize like the runtime guard (rclone_ops): any dash
+            # count and underscores collapse, so `-config`,
+            # `---config` and `--password_command` cannot slip past an
+            # exact-match blocklist.
+            norm = low.split("=", 1)[0].lstrip("-").replace("_", "-")
+            if norm in ("config", "password-command", "ask-password"):
                 bad.append(str(item))
         if bad:
             raise ValueError(
@@ -872,7 +876,12 @@ class APIConfig(BaseModel):
                 raise ValueError(
                     "api.api_token is required when api is enabled and trust_nginx_header is False"
                 )
-            if token and token.upper() in ("CHANGE_ME", "YOUR_API_TOKEN"):
+            if token and token.upper() in (
+                "CHANGE_ME", "YOUR_API_TOKEN",
+                # The literal shipped in config.example.toml: public to
+                # everyone who reads the repo, so never a real credential.
+                "GENERATE_A_RANDOM_TOKEN_HERE",
+            ):
                 raise ValueError("api.api_token cannot be a placeholder when enabled")
         return self
 
@@ -994,8 +1003,6 @@ def _descend_unknown(annotation: object, val: object, prefix: str) -> None:
         import types as _types
         import typing as _typing
 
-        if not isinstance(val, dict):
-            return
         origin = _typing.get_origin(annotation)
         args = [a for a in (_typing.get_args(annotation) or ()) if isinstance(a, type)]
         if origin in (_typing.Union, getattr(_types, "UnionType", _typing.Union)):
@@ -1003,6 +1010,25 @@ def _descend_unknown(annotation: object, val: object, prefix: str) -> None:
                 if isinstance(a, type) and issubclass(a, BaseModel):
                     _warn_unknown_keys(a, val, prefix)
                     return
+            return
+        # Lists/tuples of models (e.g. [[prowlarr.download_indexers]]):
+        # descend into each element instead of going blind.
+        if origin in (list, tuple, set, frozenset):
+            if not isinstance(val, (list, tuple)):
+                return
+            for i, item in enumerate(val):
+                for a in args:
+                    try:
+                        if isinstance(a, type) and issubclass(a, BaseModel):
+                            _warn_unknown_keys(a, item, f"{prefix}[{i}]")
+                        else:
+                            _descend_unknown(a, item, f"{prefix}[{i}]")
+                    except Exception:
+                        continue
+            return
+        if origin is dict:
+            return
+        if not isinstance(val, dict):
             return
         ann = annotation
         if isinstance(ann, type) and issubclass(ann, BaseModel):
