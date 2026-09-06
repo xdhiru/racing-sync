@@ -287,3 +287,36 @@ def test_build_app_without_fastapi_raises_error():
             build_app(coord)
 
 
+def test_api_docs_endpoints_disabled():
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(enabled=True, api_token="secret", trust_nginx_header=False)
+    coord = MagicMock()
+    coord.cfg = cfg
+
+    app = build_app(coord)
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.get("/docs").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
+
+
+def test_api_token_compare_is_stripped_and_ascii_safe():
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(enabled=True, api_token="secret", trust_nginx_header=False)
+    coord = MagicMock()
+    coord.cfg = cfg
+    coord.store.all.return_value = []
+
+    app = build_app(coord)
+    client = TestClient(app, raise_server_exceptions=False)
+    # Trailing whitespace authenticates like the validated config.
+    assert client.get("/api/state",
+                      headers={"X-Api-Token": "secret "}).status_code == 200
+    # Non-ASCII bytes 401 instead of 500ing inside compare_digest
+    # (raw latin-1 bytes survive HTTP; str.encode("ascii") would blow up).
+    assert client.get(
+        "/api/state",
+        headers={b"X-Api-Token": "sécret".encode("latin-1")}).status_code == 401
+    assert client.get("/api/state",
+                      headers={"X-Api-Token": "wrong"}).status_code == 401
+
+
