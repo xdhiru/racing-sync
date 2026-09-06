@@ -279,6 +279,41 @@ async def test_run_rclone_cancel_terminates_child(monkeypatch):
         mock_proc.terminate.assert_called()
 
 
+@pytest.mark.anyio
+async def test_run_rclone_kills_child_on_communicate_error(monkeypatch):
+    """Non-timeout communicate() failures must not orphan a running move."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.rclone_ops import run_rclone
+
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+    cfg.rclone.binary = Path("/usr/bin/rclone")
+
+    mock_proc = AsyncMock()
+    mock_proc.returncode = None
+    mock_proc.communicate.side_effect = OSError("broken pipe")
+    mock_proc.terminate = MagicMock()
+    mock_proc.kill = MagicMock()
+    mock_proc.wait = AsyncMock()
+
+    with monkeypatch.context() as m:
+        m.setattr("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc))
+        with pytest.raises(OSError, match="broken pipe"):
+            await run_rclone(cfg, ["rclone", "move", "/src", "remote:dst"], timeout=60)
+        mock_proc.terminate.assert_called_once()
+
+
+def test_reject_hijack_flags_normalizes_variants():
+    from racing_sync.rclone_ops import _reject_hijack_flags, RcloneError
+
+    for bad in ("--config", "-config", "---config", "--password_command",
+                "-password-command=x", "--ask-password"):
+        with pytest.raises(RcloneError):
+            _reject_hijack_flags([bad], "test")
+    # Legit tuning flags pass through untouched.
+    _reject_hijack_flags(["--transfers=4", "-v", "--bwlimit=0"], "test")
+
+
 def test_move_timeout_seconds_falls_back_for_test_doubles():
     """MagicMock configs must not poison the wait_for timeout."""
     from racing_sync.rclone_ops import _move_timeout_seconds
