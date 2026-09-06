@@ -103,7 +103,10 @@ def build_app(coord: Coordinator) -> FastAPI:
             "Install it via 'pip install racing-sync[api]'."
         )
     cfg = coord.cfg
-    app = FastAPI(title="racing-sync", version="0.1.0")
+    # No unauthenticated docs/openapi endpoints: the control plane sits
+    # behind token/nginx auth, its schema surface should too.
+    app = FastAPI(title="racing-sync", version="0.1.0",
+                  docs_url=None, openapi_url=None, redoc_url=None)
 
     def auth(
         request: Request,
@@ -118,13 +121,25 @@ def build_app(coord: Coordinator) -> FastAPI:
             if not _host_is_trusted(client_host, trusted_proxies):
                 raise HTTPException(403, "untrusted proxy for nginx auth header")
             return x_authenticated_user.strip()
-        token_str = (
-            cfg.api.api_token.get_secret_value()
-            if hasattr(cfg.api.api_token, "get_secret_value")
-            else str(cfg.api.api_token)
-        )
-        if token_str and x_api_token and secrets.compare_digest(x_api_token, token_str):
-            return "token"
+        try:
+            token_str = (
+                cfg.api.api_token.get_secret_value()
+                if hasattr(cfg.api.api_token, "get_secret_value")
+                else str(cfg.api.api_token)
+            )
+        except Exception:
+            token_str = ""
+        # Compare stripped UTF-8 bytes: config validation strips for its
+        # checks, so compare the same way (a trailing-space token
+        # validates but could never authenticate), and non-ASCII tokens
+        # must 401, not 500 out of compare_digest.
+        try:
+            want = (token_str or "").strip().encode("utf-8")
+            got = (x_api_token or "").strip().encode("utf-8")
+            if want and got and secrets.compare_digest(got, want):
+                return "token"
+        except Exception:
+            pass
         raise HTTPException(401, "auth required")
 
     @app.get("/api/state", dependencies=[Depends(auth)])
