@@ -115,15 +115,13 @@ def _reject_hijack_flags(flags: list[str] | None, where: str) -> None:
     for item in flags or []:
         try:
             flag = str(item).strip().lower().split("=", 1)[0]
-            # Normalize single-dash and underscore variants (-config,
-            # --password_command) to the canonical double-dash hyphen form.
-            norm = flag
-            if norm.startswith("-") and not norm.startswith("--"):
-                norm = "-" + norm
-            norm = norm.replace("_", "-")
+            # Normalize any dash count and underscores (-config,
+            # ---config, --password_command) to the bare canonical form,
+            # mirroring the config validator.
+            norm = flag.lstrip("-").replace("_", "-")
         except Exception:
             continue
-        if norm in ("--config", "--password-command", "--ask-password"):
+        if norm in ("config", "password-command", "ask-password"):
             raise RcloneError(
                 f"refusing rclone {where} flag that hijacks config/credentials: {item!r}"
             )
@@ -239,6 +237,25 @@ async def run_rclone(
         )
     except (FileNotFoundError, PermissionError, OSError) as e:
         raise RcloneError(f"could not spawn rclone {cmd[0]!r}: {e}") from e
+    async def _kill_child() -> None:
+        """Best-effort terminate+reap a still-running child (bounded)."""
+        try:
+            if proc.returncode is not None:
+                return
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
@@ -303,6 +320,13 @@ async def run_rclone(
             f"rclone timeout after {timeout}s (source intact, retry later): "
             f"{redact_rclone_cmd(cmd)}"
         ) from None
+    except Exception:
+        # Any other communicate() failure (OSError, broken pipe, ...):
+        # without a kill the child keeps running while the caller treats
+        # the move as failed, and the next tick starts a duplicate move
+        # of the same content. Reap boundedly, then re-raise.
+        await _kill_child()
+        raise
     dt = time.monotonic() - t0
     stdout = stdout_b.decode("utf-8", errors="replace")
     stderr = stderr_b.decode("utf-8", errors="replace")
