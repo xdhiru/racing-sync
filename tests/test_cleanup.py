@@ -336,6 +336,36 @@ async def test_moving_early_deletes_only_under_pressure(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_delete_source_group_partitions_by_size(tmp_path: Path):
+    """Same dir + same size shares files (deleted once); different sizes
+    are different files (each partition deletes its own)."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = StateStore(tmp_path / "s.db")
+    cfg = _base_cfg(ssd)
+    coord = _make_coord(ssd, store, _FakeSource([]), _FakeDest([]), cfg)
+
+    def _mem(h, size):
+        return Torrent(hash=h, name=FNAME, category="", save_path="/vps1/data",
+                       size_bytes=size, state="seeding", progress=1.0)
+    ts = TorrentState(source_infohash="a" * 40, source_name=FNAME)
+
+    # Same size: one shared copy, files deleted exactly once.
+    src = _FakeSource([_mem("a" * 40, 700), _mem("b" * 40, 700)])
+    coord.source_client = src
+    await coord._delete_source_group(
+        ts, [_mem("a" * 40, 700), _mem("b" * 40, 700)], cfg.cleanup, False)
+    assert src.deleted == [("a" * 40, True), ("b" * 40, False)]
+
+    # Different sizes: different files, each partition deletes its own.
+    src2 = _FakeSource([_mem("a" * 40, 700), _mem("c" * 40, 500)])
+    coord.source_client = src2
+    await coord._delete_source_group(
+        ts, [_mem("a" * 40, 700), _mem("c" * 40, 500)], cfg.cleanup, False)
+    assert src2.deleted == [("a" * 40, True), ("c" * 40, True)]
+
+
+@pytest.mark.anyio
 async def test_moving_early_skipped_when_ssd_bytes_gone(tmp_path: Path):
     ssd = tmp_path / "ssd"
     ssd.mkdir()
