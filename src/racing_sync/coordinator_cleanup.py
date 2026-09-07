@@ -502,11 +502,20 @@ class CleanupMixin:
             delete_files = bool(getattr(cfg, "delete_files", True))
         except (TypeError, ValueError):
             delete_files = True
-        parts: dict[str, list[Torrent]] = {}
+        # Partitioned by (save_path, size): same-directory same-size
+        # members are cross-seeds sharing files (deleted exactly once via
+        # the first member); different sizes are different files even under
+        # one directory (0-size rows match on name alone) and each
+        # partition's files must go, or entries vanish while data leaks.
+        parts: dict[tuple[str, int], list[Torrent]] = {}
         for m in group:
-            parts.setdefault(m.save_path or "", []).append(m)
+            try:
+                size_key = int(m.size_bytes or 0)
+            except (TypeError, ValueError):
+                size_key = 0
+            parts.setdefault((m.save_path or "", size_key), []).append(m)
         ok = True
-        for save_path, members in parts.items():
+        for (save_path, _size_key), members in parts.items():
             hashes = [m.infohash for m in members]
             # Members sharing a save_path hold the same on-disk files
             # (deleted exactly once via the first member), so the freed
