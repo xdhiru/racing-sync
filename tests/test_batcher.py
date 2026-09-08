@@ -2163,6 +2163,7 @@ async def test_do_moving_parks_on_transient_file_list_error(tmp_path):
         ts = TorrentState(source_infohash="e" * 40, source_name="Show",
                           dest_infohash="e" * 40, save_path=str(ssd),
                           state=State.MOVING)
+        coord.store.upsert(ts)  # workers only run on persisted snapshot rows
         await coord._do_moving(ts)
         row = coord.store.get("e" * 40)
         assert row.state == State.MOVING

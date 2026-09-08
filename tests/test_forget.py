@@ -384,3 +384,28 @@ async def test_forget_verify_after_delete_reports_survivors(tmp_path: Path):
     # The row is kept (not resurrected later) so the operator can retry.
     assert store.get("a" * 40) is not None
     assert any("kept db row" in e for e in result["errors"])
+
+
+@pytest.mark.anyio
+async def test_worker_never_resurrects_forgotten_row(tmp_path: Path):
+    """A row deleted mid-flight (forget) must stay deleted.
+
+    Terminal transitions, park funnels and the worker entry all refuse
+    to write for a gone row instead of upsert-resurrecting it.
+    """
+    from conftest import make_coordinator
+    from racing_sync.coordinator_errors import AbandonedError
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        store.upsert(_row())
+        coord = make_coordinator(store)
+        store.delete("a" * 40)  # operator forget lands mid-flight
+        with pytest.raises(AbandonedError):
+            coord.transition(_row(), State.RE_ADDING)
+        with pytest.raises(AbandonedError):
+            coord._park_moving(_row(), "test park")
+        await coord._process_torrent(_row())
+        assert store.get("a" * 40) is None
+    finally:
+        store.close()
