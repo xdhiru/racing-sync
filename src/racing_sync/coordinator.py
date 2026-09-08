@@ -1049,10 +1049,21 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # object overwrite the new state via a later upsert.
             try:
                 _fresh = None
+                _fresh_known = False
                 if getattr(self, "store", None) is not None and hasattr(self.store, "get"):
-                    _fresh = self.store.get(ts.source_infohash)
+                    _fresh = self.store.get(ts.source_infohash, include_blob=False)
+                    _fresh_known = True
             except Exception:
                 _fresh = None
+                _fresh_known = False
+            if _fresh_known and _fresh is None:
+                # Row deleted after the tick snapshot (forget/cancel):
+                # never let the worker resurrect it via a later write.
+                log.info(
+                    "worker: row gone for %s (forgotten?); not starting",
+                    ts.source_infohash[:10],
+                )
+                return
             if isinstance(_fresh, TorrentState):
                 if _fresh.state != ts.state:
                     log.info(
@@ -1135,6 +1146,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             log.warning("telegram notify failed for %s: %s",
                         ts.source_infohash[:10], e)
 
+    def _abandoned(self, ts: TorrentState) -> bool:
+        """True when the DB row was deleted after the tick snapshot.
+
+        Forget/cancel removes the row while a worker may still hold the
+        object; any later transition/upsert would resurrect it as a zombie
+        (store.upsert is INSERT ... ON CONFLICT). Confirmed-gone only: a
+        store error fails OPEN so a transient DB blip never abandons live
+        work.
+        """
+        try:
+            store = getattr(self, "store", None)
+            if store is None or not hasattr(store, "get"):
+                return False
+            return store.get(ts.source_infohash, include_blob=False) is None
+        except Exception:
+            return False
+
     def transition(self, ts: TorrentState, dst: State,
                    *, error: str = "", batch_index: int | None = None) -> None:
         """Wrap store.transition + log + queue a Telegram update.
@@ -1146,6 +1174,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         a row from the source poll) so a fresh install with hundreds
         of pre-existing racing torrents doesn't spam the channel.
         """
+        if self._abandoned(ts):
+            # Forget/cancel deleted this row mid-flight: transitioning
+            # would upsert-resurrect it. _process_torrent unwinds quietly
+            # on AbandonedError.
+            raise AbandonedError(
+                f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}; "
+                f"refusing {ts.state.value} -> {dst.value}"
+            )
         prev = ts.state
         self.store.transition(ts, dst, error=error, batch_index=batch_index)
         if dst in (State.DONE, State.FAILED):
@@ -2043,6 +2079,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if ts.state != State.WAITING_INDEXER:
             self.transition(ts, State.WAITING_INDEXER)
         else:
+            if self._abandoned(ts):
+                raise AbandonedError(
+                    f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}; "
+                    "not refreshing indexer park"
+                )
             self.store.upsert(ts)
             # No transition() fired, so push the updated timer manually.
             self._schedule_telegram_update(ts)
@@ -2275,6 +2316,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if n_down + others >= max_dl:
                 log.info("downloads full (%d/%d); %s stays queued",
                          n_down + others, max_dl, ts.source_name[:60])
+                if self._abandoned(ts):
+                    # Row forgotten after the snapshot: stay silent instead
+                    # of upsert-resurrecting it as QUEUED.
+                    return False
                 try:
                     self.store.upsert(ts)
                 except Exception:
@@ -3689,8 +3734,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         on advance, visible via API/DB meanwhile) and consecutive parks for
         the same row escalate from WARNING to ERROR so a gate that never
         passes (unverifiable pause, 0-transfer rclone, short bytes) can't
-        idle silently as plain "MOVING" forever. Never raises.
+        idle silently as plain "MOVING" forever. Raises AbandonedError when
+        the row was forgotten mid-flight (callers unwind quietly instead of
+        resurrecting it via the park upsert).
         """
+        if self._abandoned(ts):
+            raise AbandonedError(
+                f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}; "
+                "not parking in MOVING"
+            )
         key = (ts.source_infohash or "").lower()
         try:
             parks = getattr(self, "_moving_parks", None)
