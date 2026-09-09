@@ -206,3 +206,22 @@ async def test_waiting_retry_uses_remaining_batches_not_total(tmp_path):
     # Remainder (~5k), not the full 32k estimate.
     assert coord._ssd_reserved["w" * 40] == 5_000
     assert coord._ssd_reserved_total() == 37_000
+
+
+@pytest.mark.anyio
+async def test_grow_beyond_physical_disk_fails(tmp_path):
+    """A grow inside the global budget still fails when the disk is full.
+
+    Admission checks physical free for the (smaller) estimate only; the
+    refine-to-real step must re-check the delta or concurrent grows
+    overcommit past ENOSPC.
+    """
+    cap = 1_000_000
+    coord = _coord_with_cap(tmp_path, cap)
+    assert await coord._ssd_try_reserve("p" * 40, 10_000) is True
+    with patch("racing_sync.rclone_ops.disk_free_bytes_at", return_value=5_000):
+        assert await coord._ssd_adjust("p" * 40, 100_000) is False
+    assert coord._ssd_reserved["p" * 40] == 10_000
+    # A grow that fits the live disk still succeeds.
+    assert await coord._ssd_adjust("p" * 40, 12_000) is True
+    assert coord._ssd_reserved["p" * 40] == 12_000
