@@ -279,11 +279,11 @@ class SSDLedgerMixin:
     async def _ssd_adjust(self, infohash: str, new_amount: int) -> bool:
         """Refine a held reservation (post-classify shrink/grow).
 
-        Global-budget check only — physical free was verified at admission
-        (try_reserve) seconds earlier; re-checking free here breaks test
-        doubles with fake paths and adds no safety (disk can't fill in
-        seconds beyond the reserved upper bound). Growing beyond the global
-        budget fails (caller must roll back); shrinking always succeeds.
+        Shrinking always succeeds. Growing re-checks BOTH the global
+        budget and live physical free for the delta: admission verified
+        only the smaller estimate, and concurrent grows (or a disk filled
+        externally since admission) would otherwise overcommit past
+        ENOSPC. Growing beyond either fails (caller must roll back);
         Returns True on success.
         """
         try:
@@ -310,6 +310,15 @@ class SSDLedgerMixin:
                 return True
             cap = self._ssd_global_cap()
             if cap is not None and self._ssd_reserved_total() - old + new_amount > cap:
+                return False
+            # Grow: admission's physical check covered only the old
+            # (smaller) estimate — the delta must fit the live disk now.
+            try:
+                from . import coordinator as _c
+
+                if not _c.ssd_has_room(self.cfg, new_amount - old):
+                    return False
+            except Exception:
                 return False
             d[key] = new_amount
             return True
