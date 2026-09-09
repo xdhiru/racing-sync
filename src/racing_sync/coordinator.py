@@ -738,11 +738,136 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         async with lock:
             await self._tick_inner()
 
+    async def _poll_source_racing(self, src_torrents: list[Torrent]) -> None:
+        """Step 2: group source torrents by release and ingest/track each group.
+
+        One poisoned group (corrupt row, failing lookup, doomed injection)
+        must neither skip the remaining groups nor abort the rest of the
+        tick (indexer wakeups, workers, janitor): every group is isolated,
+        failures are logged and skipped.
+        """
+        # Group source torrents by content/release name. Multiple racing
+        # torrents for the same content (e.g. public release + multiple
+        # private cross-seeds) only produce ONE active SSD download.
+        by_name: dict[str, list[Torrent]] = {}
+        for st in src_torrents:
+            norm_key = normalize_content_name(st.name)
+            if not norm_key:
+                # Nameless entries must not collapse into a single "" group
+                # (would elect one primary and drop the rest). Track solo.
+                norm_key = f"__infohash__:{st.infohash.lower()}"
+            by_name.setdefault(norm_key, []).append(st)
+
+        for group in by_name.values():
+            try:
+                await self._process_source_group(group)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                try:
+                    _gname = group[0].name[:60] if group and group[0].name else "?"
+                except Exception:
+                    _gname = "?"
+                log.warning("source group %s failed; continuing with next group: %s",
+                            _gname, e)
+
+    async def _process_source_group(self, group: list[Torrent]) -> None:
+        """Ingest/track one release group from the source poll (step-2 body)."""
+        # Cancelled releases stay cancelled while listed on VPS1.
+        if _group_is_ignored(group, getattr(self, "store", None)):
+            log.info(
+                "ignoring cancelled release: %s (%d duplicate(s))",
+                group[0].name[:60], len(group),
+            )
+            return
+        # Check if any torrent in this release group is already tracked in state store
+        existing_ts: TorrentState | None = None
+        for t in group:
+            found_ts = (self.store.get(t.infohash.lower(), include_blob=False)
+                        or self.store.get(t.infohash, include_blob=False))
+            if found_ts is not None:
+                existing_ts = found_ts
+                break
+        if existing_ts is None:
+            for t in group:
+                matches = self.store.find_by_name(t.name)
+                if matches:
+                    # find_by_name is a fuzzy LIKE: require the same
+                    # normalized release AND (when both known) the same
+                    # size, or repacks/different seasons with common
+                    # prefixes ("Show.S01" vs "Show.S01E02") would be
+                    # swallowed as duplicates and never downloaded.
+                    norm_t = normalize_content_name(t.name)
+                    same = [
+                        m for m in matches
+                        if normalize_content_name(m.source_name or "") == norm_t
+                        and (not m.total_bytes or not t.size_bytes
+                             or m.total_bytes == t.size_bytes)
+                    ]
+                    if same:
+                        existing_ts = same[0]
+                        break
+
+        if existing_ts is not None:
+            # Content is already being managed by an existing TorrentState;
+            # keep display name fresh (persisted so Telegram/DB don't show stale names).
+            if group and group[0].name and group[0].name != existing_ts.source_name:
+                existing_ts.source_name = group[0].name
+                try:
+                    self.store.upsert(existing_ts)
+                except Exception:  # noqa: BLE001
+                    pass
+            if existing_ts.state == State.DONE and self.cfg.cross_seed.inject_racing_torrents_to_fuse:
+                await self._check_and_inject_late_cross_seeds(existing_ts, group)
+            return
+
+        # Elect ONE primary torrent for SSD download:
+        # 1. Prefer public torrent if available (req #1)
+        # 2. Otherwise pick first private torrent to query the download-target indexers (req #2)
+        primary = next((t for t in group if _looks_public(t.trackers)), group[0])
+        is_pub = _looks_public(primary.trackers)
+
+        ts = TorrentState(
+            source_infohash=primary.infohash.lower(),
+            source_name=primary.name,
+            total_bytes=primary.size_bytes,
+            source_announce_url=primary.trackers[0] if primary.trackers else "",
+            state=State.NEW,
+        )
+        self.store.upsert(ts)
+        log.info(
+            "discovered racing release: %s (%s) [elected %s primary from %d duplicate(s)]",
+            primary.name,
+            primary.infohash[:10],
+            "public" if is_pub else "private",
+            len(group),
+        )
+        # Intake-velocity signal for the VPS1 cleanup janitor: one
+        # timestamp per newly discovered racing release (spam bursts
+        # shorten deletion grace). Hard-capped so a disabled janitor
+        # can't grow it without bound; the janitor prunes hourly.
+        try:
+            arrivals = getattr(self, "_arrival_times", None)
+            if arrivals is None:
+                arrivals = []
+                self._arrival_times = arrivals
+            arrivals.append(time.monotonic())
+            if len(arrivals) > 5000:
+                del arrivals[:2500]
+        except Exception:
+            pass
+
     async def _tick_inner(self) -> None:
         """One iteration: poll sources, schedule work."""
         log.debug("tick: enter")
-        # 1. Watch dir (req #3)
-        await self.scan_watch()
+        # 1. Watch dir (req #3). Isolated like every tick step: a poisoned
+        # drop must not skip the source poll, workers or janitor below.
+        try:
+            await self.scan_watch()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("watch-dir scan failed; continuing tick: %s", e)
 
         # 2. Source racing client (req #1 / #2)
         src_torrents = await self._list_source_torrents()
@@ -759,101 +884,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 self.cfg.source.min_age_seconds,
             )
             self._last_source_log_ts = now
-        # Group source torrents by content/release name. Multiple racing
-        # torrents for the same content (e.g. public release + multiple
-        # private cross-seeds) only produce ONE active SSD download.
-        by_name: dict[str, list[Torrent]] = {}
-        for st in src_torrents:
-            norm_key = normalize_content_name(st.name)
-            if not norm_key:
-                # Nameless entries must not collapse into a single "" group
-                # (would elect one primary and drop the rest). Track solo.
-                norm_key = f"__infohash__:{st.infohash.lower()}"
-            by_name.setdefault(norm_key, []).append(st)
-
-        for _norm_name, group in by_name.items():
-            # Cancelled releases stay cancelled while listed on VPS1.
-            if _group_is_ignored(group, getattr(self, "store", None)):
-                log.info(
-                    "ignoring cancelled release: %s (%d duplicate(s))",
-                    group[0].name[:60], len(group),
-                )
-                continue
-            # Check if any torrent in this release group is already tracked in state store
-            existing_ts: TorrentState | None = None
-            for t in group:
-                found_ts = self.store.get(t.infohash.lower()) or self.store.get(t.infohash)
-                if found_ts is not None:
-                    existing_ts = found_ts
-                    break
-            if existing_ts is None:
-                for t in group:
-                    matches = self.store.find_by_name(t.name)
-                    if matches:
-                        # find_by_name is a fuzzy LIKE: require the same
-                        # normalized release AND (when both known) the same
-                        # size, or repacks/different seasons with common
-                        # prefixes ("Show.S01" vs "Show.S01E02") would be
-                        # swallowed as duplicates and never downloaded.
-                        norm_t = normalize_content_name(t.name)
-                        same = [
-                            m for m in matches
-                            if normalize_content_name(m.source_name or "") == norm_t
-                            and (not m.total_bytes or not t.size_bytes
-                                 or m.total_bytes == t.size_bytes)
-                        ]
-                        if same:
-                            existing_ts = same[0]
-                            break
-
-            if existing_ts is not None:
-                # Content is already being managed by an existing TorrentState;
-                # keep display name fresh (persisted so Telegram/DB don't show stale names).
-                if group and group[0].name and group[0].name != existing_ts.source_name:
-                    existing_ts.source_name = group[0].name
-                    try:
-                        self.store.upsert(existing_ts)
-                    except Exception:  # noqa: BLE001
-                        pass
-                if existing_ts.state == State.DONE and self.cfg.cross_seed.inject_racing_torrents_to_fuse:
-                    await self._check_and_inject_late_cross_seeds(existing_ts, group)
-                continue
-
-            # Elect ONE primary torrent for SSD download:
-            # 1. Prefer public torrent if available (req #1)
-            # 2. Otherwise pick first private torrent to query the download-target indexers (req #2)
-            primary = next((t for t in group if _looks_public(t.trackers)), group[0])
-            is_pub = _looks_public(primary.trackers)
-
-            ts = TorrentState(
-                source_infohash=primary.infohash.lower(),
-                source_name=primary.name,
-                total_bytes=primary.size_bytes,
-                source_announce_url=primary.trackers[0] if primary.trackers else "",
-                state=State.NEW,
-            )
-            self.store.upsert(ts)
-            log.info(
-                "discovered racing release: %s (%s) [elected %s primary from %d duplicate(s)]",
-                primary.name,
-                primary.infohash[:10],
-                "public" if is_pub else "private",
-                len(group),
-            )
-            # Intake-velocity signal for the VPS1 cleanup janitor: one
-            # timestamp per newly discovered racing release (spam bursts
-            # shorten deletion grace). Hard-capped so a disabled janitor
-            # can't grow it without bound; the janitor prunes hourly.
-            try:
-                arrivals = getattr(self, "_arrival_times", None)
-                if arrivals is None:
-                    arrivals = []
-                    self._arrival_times = arrivals
-                arrivals.append(time.monotonic())
-                if len(arrivals) > 5000:
-                    del arrivals[:2500]
-            except Exception:
-                pass
+        await self._poll_source_racing(src_torrents)
 
         # 2b. Manual fuse sweep: same infohash already seeding from fuse on
         # VPS2 (any category) with verified bytes needs no prowlarr/SSD work.
@@ -879,24 +910,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         for ts in ready_indexer:
             if _max_workers and max(0, _max_workers - len(self._tasks)) <= 0:
                 break
-            _key = (ts.source_infohash or "").lower()
-            if _key in self._running_infohashes:
-                continue
-            # Re-read: a worker may have moved this row (e.g. QUEUED via the
-            # SSD path) after the snapshot above — never demote it back.
             try:
-                fresh = self.store.get(ts.source_infohash)
-            except Exception:
-                fresh = None
-            if fresh is None or fresh.state != State.WAITING_INDEXER:
+                self._wakeup_indexer_row(ts)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("indexer wakeup for %s failed; continuing: %s",
+                            (getattr(ts, "source_infohash", "") or "")[:10], e)
                 continue
-            ts = fresh
-            log.info(
-                "download-indexer retry timer fired for %s (attempt #%d)",
-                ts.source_name[:40], ts.indexer_attempts,
-            )
-            self.transition(ts, State.QUERYING)
-            self._spawn_worker(ts)
 
         # 4. Schedule workers for active states that have no live task.
         # Bounded pipeline work sorts before unbounded discovery: NEW rows
@@ -966,7 +987,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if ts.state == State.MOVING and active_moves >= self.cfg.max_concurrent_moves:
                 continue
 
-            self._spawn_worker(ts)
+            try:
+                self._spawn_worker(ts)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("scheduling worker for %s failed; continuing: %s",
+                            _tkey[:10], e)
+                continue
 
             if ts.state in (State.QUEUED, State.DOWNLOADING):
                 active_downloads += 1
@@ -989,8 +1017,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 active_moves, self.cfg.max_concurrent_moves,
             )
 
-        # 4. Refresh live status (used by the Telegram bot)
-        await self._refresh_live_status()
+        # 4. Refresh live status (used by the Telegram bot). Isolated: a
+        # failing client must not skip the janitor below.
+        try:
+            await self._refresh_live_status()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("live status refresh failed; continuing tick: %s", e)
 
         # 5. VPS1 cleanup janitor (hourly no-op unless [cleanup].enabled).
         # Must never break the tick: all failures are caught and logged.
@@ -1309,6 +1343,27 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 return
         if ts.state == State.RE_ADDING:
             await self._do_re_add(ts)
+
+    def _wakeup_indexer_row(self, ts: TorrentState) -> None:
+        """Wake one timer-elapsed WAITING_INDEXER row (step-3 loop body)."""
+        _key = (ts.source_infohash or "").lower()
+        if _key in self._running_infohashes:
+            return
+        # Re-read: a worker may have moved this row (e.g. QUEUED via the
+        # SSD path) after the snapshot above — never demote it back.
+        try:
+            fresh = self.store.get(ts.source_infohash, include_blob=False)
+        except Exception:
+            fresh = None
+        if fresh is None or fresh.state != State.WAITING_INDEXER:
+            return
+        ts = fresh
+        log.info(
+            "download-indexer retry timer fired for %s (attempt #%d)",
+            ts.source_name[:40], ts.indexer_attempts,
+        )
+        self.transition(ts, State.QUERYING)
+        self._spawn_worker(ts)
 
     # ---- state: NEW ----
 
