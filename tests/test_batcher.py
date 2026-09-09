@@ -2200,3 +2200,34 @@ async def test_move_and_clean_batch_refuses_traversal_names(tmp_path):
         coord._rclone_move.assert_not_called()
     finally:
         coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_source_group_poison_does_not_skip_siblings(tmp_path):
+    """One failing release group must not skip the rest of the source poll."""
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import StateStore
+
+    def _t(h, name):
+        return Torrent(hash=h, name=name, category="racing", save_path="/x",
+                       size_bytes=100, state="downloading", progress=0.1)
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        t1 = _t("c" * 40, "Poison.Show.S01E01.1080p")
+        t2 = _t("d" * 40, "Healthy.Show.S01E01.1080p")
+        real_find = store.find_by_name
+
+        def _poisoned(name):
+            if "Poison" in name:
+                raise RuntimeError("poisoned lookup")
+            return real_find(name)
+
+        store.find_by_name = _poisoned
+        await coord._poll_source_racing([t1, t2])
+        assert store.get("c" * 40, include_blob=False) is None
+        row = store.get("d" * 40, include_blob=False)
+        assert row is not None and row.state.value == "new"
+    finally:
+        store.close()
