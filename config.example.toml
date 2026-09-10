@@ -341,6 +341,14 @@ prefer_prowlarr_result = true
 enabled = false
 base_url = "http://127.0.0.1:9696"
 api_key = "CHANGE_ME"
+# Substrings in release titles to skip querying Prowlarr for (case-insensitive).
+# Useful for groups (like DummySub) whose complex titles/symbols never match Prowlarr indexers.
+# NOTE: these are [prowlarr]-level keys — they must stay above the
+# [[prowlarr.download_indexers]] tables or TOML nests them into the
+# indexer (where they are silently ignored).
+skip_query_substrings = ["dummysub"]
+timeout_seconds = 30.0
+max_results = 20
 # SSD download-target indexers used for SSD downloads and cross-seed
 # searches, in priority order (first table = tried first; each is queried
 # in turn until one returns the exact release). `name` must match the
@@ -356,11 +364,6 @@ announce_substrings = ["my-indexer"]
 # [[prowlarr.download_indexers]]
 # name = "Another Indexer (API)"
 # announce_substrings = ["another"]
-# Substrings in release titles to skip querying Prowlarr for (case-insensitive).
-# Useful for groups (like DummySub) whose complex titles/symbols never match Prowlarr indexers.
-skip_query_substrings = ["dummysub"]
-timeout_seconds = 30.0
-max_results = 20
 # Network family for the Prowlarr session (see [source].use_ipv6).
 # use_ipv6 = false
 

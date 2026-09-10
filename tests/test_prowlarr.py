@@ -1062,3 +1062,22 @@ async def test_pick_download_fetch_failure_parks_instead_of_failing():
     )
     # No decision -> caller parks in WAITING_INDEXER for retry.
     assert dec is None
+
+
+def test_example_config_prowlarr_keys_not_nested(example_config):
+    """Shipped example must keep [prowlarr] keys above [[download_indexers]].
+
+    Regression: the keys once sat after the table header, so TOML nested
+    them into download_indexers[0] where extra='ignore' silently dropped
+    them (DummySub releases got queried despite the documented skip).
+    """
+    import tomllib
+
+    raw = tomllib.load(
+        open(Path(__file__).parent.parent / "config.example.toml", "rb"))
+    top = raw["prowlarr"]
+    assert top["skip_query_substrings"] == ["dummysub"]
+    assert top["timeout_seconds"] == 30.0
+    assert top["max_results"] == 20
+    assert "skip_query_substrings" not in top["download_indexers"][0]
+    assert "dummysub" in example_config.prowlarr.skip_query_substrings
