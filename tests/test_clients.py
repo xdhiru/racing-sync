@@ -928,3 +928,51 @@ async def test_deluge_mutations_invalidate_scan_cache():
     assert client._scan_cache == {}
 
 
+@pytest.mark.anyio
+async def test_qbittorrent_request_json_reauth_on_html():
+    """HTTP 200 + login HTML (expired session) re-logs in and retries once."""
+    import json
+
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+    calls = {"n": 0}
+
+    class DummyCtx:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def __aenter__(self):
+            resp = MagicMock()
+
+            async def _json():
+                if isinstance(self.payload, Exception):
+                    raise self.payload
+                return self.payload
+
+            resp.json = _json
+            return resp
+
+        async def __aexit__(self, *args):
+            pass
+
+    async def mock_request(method, endpoint, params=None, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return DummyCtx(json.JSONDecodeError("login page", "<html>", 0))
+        return DummyCtx([{"hash": "x"}])
+
+    auth_calls = {"n": 0}
+
+    async def mock_auth(force=False):
+        auth_calls["n"] += 1
+        client._authed = True
+
+    client.request = mock_request
+    client._auth = mock_auth
+    client._authed = True
+    data = await client._request_json("GET", "/api/v2/torrents/info", params={})
+    assert data == [{"hash": "x"}]
+    assert calls["n"] == 2
+    assert auth_calls["n"] == 1
+
+
