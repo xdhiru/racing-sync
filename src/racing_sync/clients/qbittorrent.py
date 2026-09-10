@@ -61,6 +61,31 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 f"addresses."
             )
 
+    async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
+        """Request + JSON-decode with re-auth on login-page responses.
+
+        An expired session can surface as HTTP 200 + login HTML (proxies,
+        older WebUI builds) instead of 401/403: r.json() then raises a
+        decode error with _authed still True, and every later call fails
+        identically until restart. Treat a decode failure as a dead
+        session: re-login once and retry once before surfacing the error.
+        """
+        try:
+            async with await self.request(method, path, **kwargs) as r:
+                return await r.json()
+        except (aiohttp.ContentTypeError, ValueError) as e:
+            log.warning(
+                "[%s] %s %s returned non-JSON (expired session?); re-authenticating",
+                self._label, method, path,
+            )
+        try:
+            self._authed = False
+        except Exception:
+            pass
+        await self._auth(force=True)
+        async with await self.request(method, path, **kwargs) as r:
+            return await r.json()
+
     # ---- introspection ----
 
     async def list_torrents(
@@ -82,8 +107,8 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 chunk = hash_list[i : i + 200]
                 chunk_params = dict(params)
                 chunk_params["hashes"] = "|".join(chunk)
-                async with await self.request("GET", "/api/v2/torrents/info", params=chunk_params) as r:
-                    data = await r.json()
+                data = await self._request_json(
+                    "GET", "/api/v2/torrents/info", params=chunk_params)
                 for row in data:
                     try:
                         out.append(_torrent_from_qb(row))
@@ -93,8 +118,8 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         elif hashes is not None:
             # Explicit empty filter: return nothing instead of everything.
             return []
-        async with await self.request("GET", "/api/v2/torrents/info", params=params) as r:
-            data = await r.json()
+        data = await self._request_json(
+            "GET", "/api/v2/torrents/info", params=params)
         torrents: list[Torrent] = []
         for row in data:
             try:
@@ -122,10 +147,8 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         return t
 
     async def get_torrent_files(self, torrent_hash: str) -> list[TorrentFile]:
-        async with await self.request(
-            "GET", "/api/v2/torrents/files", params={"hash": torrent_hash}
-        ) as r:
-            data = await r.json()
+        data = await self._request_json(
+            "GET", "/api/v2/torrents/files", params={"hash": torrent_hash})
         out: list[TorrentFile] = []
         for row in data:
             try:
@@ -151,10 +174,8 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         return out
 
     async def get_trackers(self, torrent_hash: str) -> list[str]:
-        async with await self.request(
-            "GET", "/api/v2/torrents/trackers", params={"hash": torrent_hash}
-        ) as r:
-            data = await r.json()
+        data = await self._request_json(
+            "GET", "/api/v2/torrents/trackers", params={"hash": torrent_hash})
         urls: list[str] = []
         for row in data:
             url = (row.get("url", "") or "").strip()
@@ -417,17 +438,13 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             return b"".join(chunks)
 
     async def get_properties(self, torrent_hash: str) -> dict[str, Any]:
-        async with await self.request(
-            "GET", "/api/v2/torrents/properties", params={"hash": torrent_hash}
-        ) as r:
-            return await r.json()
+        return await self._request_json(
+            "GET", "/api/v2/torrents/properties", params={"hash": torrent_hash})
 
     async def piece_state(self, torrent_hash: str) -> list[int]:
-        async with await self.request(
+        return await self._request_json(
             "GET", "/api/v2/torrents/pieceStates",
-            params={"hash": torrent_hash},
-        ) as r:
-            return await r.json()
+            params={"hash": torrent_hash})
 
 
 def _split_path(name: str) -> list[str]:
