@@ -409,3 +409,19 @@ async def test_worker_never_resurrects_forgotten_row(tmp_path: Path):
         assert store.get("a" * 40) is None
     finally:
         store.close()
+
+
+def test_resolve_row_rejects_short_hash_and_hash_dupes(tmp_path: Path):
+    """1-char fragments never match hashes; dupes error instead of first-wins."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        store.upsert(_row("a" * 40, "Show.S01.Pack"))
+        store.upsert(_row("b" * 40, "Show.S02.Pack", dest_infohash="a" * 40))
+        # "a" is a substring of the first row's hash but must not resolve.
+        with pytest.raises(LookupError):
+            resolve_row(store, "a")
+        # Full hash shared by two rows (repack dupe) is ambiguous.
+        with pytest.raises(LookupError, match="by hash"):
+            resolve_row(store, "a" * 40)
+    finally:
+        store.close()

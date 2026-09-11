@@ -44,16 +44,37 @@ def _row_hashes(ts) -> set[str]:
 def resolve_row(store, target: str):
     """Find the single DB row matching an infohash or unique name substring.
 
-    Raises LookupError when nothing matches or the name matches several rows.
+    Hash matching is exact-first: a full 40-char hash matching several
+    rows (duplicate dest hashes from repacks) errors instead of deleting
+    an arbitrary first row. Short hash fragments (<4 chars) never match —
+    a 1-char fragment matches nearly every row. Name substrings keep the
+    existing unique-or-error behavior.
+
+    Raises LookupError when nothing matches or the target is ambiguous.
     """
     norm = (target or "").strip()
     if not norm:
         raise LookupError("forget target must not be empty")
     rows = store.all()
     low = norm.lower()
+    hash_hits = []
     for ts in rows:
-        if low in _row_hashes(ts):
-            return ts
+        hashes = _row_hashes(ts)
+        if low in hashes:
+            # Exact match always counts (even short: a row literally
+            # hashed "e" would be bizarre, but exact is exact).
+            hash_hits.append(ts)
+        elif len(low) >= 4 and any(low in h for h in hashes):
+            hash_hits.append(ts)
+    if len(hash_hits) > 1:
+        preview = ", ".join(
+            f"{t.source_name} ({(t.source_infohash or '')[:10]})" for t in hash_hits[:5])
+        raise LookupError(
+            f"forget target {target!r} matches {len(hash_hits)} torrents by hash: "
+            f"{preview}; use a 40-char infohash to pick one"
+        )
+    if hash_hits:
+        return hash_hits[0]
     matches = [ts for ts in rows if low in (ts.source_name or "").lower()]
     if len(matches) == 1:
         return matches[0]
