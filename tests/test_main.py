@@ -189,3 +189,24 @@ def test_signal_handler_fallback_on_not_implemented(tmp_path: Path):
 
         rc = main(["run", "--config", str(cfg_file)])
         assert rc == 0
+
+
+def test_do_reset_refuses_unsafe_state_db(tmp_path: Path):
+    """--reset never unlinks a state.db outside racing-sync data."""
+    from racing_sync.__main__ import _do_reset
+    from racing_sync.config import AppConfig
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+    cfg = AppConfig.from_toml(cfg_file)
+    cfg.general.log_dir = tmp_path / "logs"
+    # A checkout-looking parent must refuse even a real file.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "pyproject.toml").write_text("")
+    victim = proj / "state.db"
+    victim.write_bytes(b"precious")
+    cfg.general.state_db = victim
+    lines = _do_reset(cfg)
+    assert victim.exists()
+    assert any("refusing" in ln for ln in lines)

@@ -134,6 +134,53 @@ def _is_safe_dir_to_clear(path: Path, label: str = "log dir") -> str | None:
     return None
 
 
+def _state_db_parent_refusal(cfg: AppConfig) -> str | None:
+    """Refuse destructive reset steps when state.db lives somewhere unsafe.
+
+    A fat-fingered state_db (system path, symlink, filesystem root, repo
+    checkout) plus --reset/--full must never delete outside racing-sync
+    data. Narrower than _is_safe_dir_to_clear (which guards clearing
+    directory CHILDREN): home/CWD parents are fine for unlinking three
+    bookkeeping files, but system dirs, roots and checkouts are not.
+    """
+    try:
+        db = Path(str(cfg.general.state_db))
+    except Exception:
+        return "cannot resolve state_db path"
+    try:
+        if db.is_symlink():
+            return f"refusing reset: state_db is a symlink: {db}"
+    except OSError:
+        pass
+    try:
+        resolved = db.resolve()
+        parent = resolved.parent
+        anchor = Path(resolved.anchor)
+    except OSError as e:
+        return f"refusing reset: cannot resolve state_db {db}: {e}"
+    if parent == anchor or str(parent) in ("/", "\\"):
+        return f"refusing reset: state_db at filesystem root: {db}"
+    try:
+        markers = ("pyproject.toml", ".git", "src", "run.py")
+        if any((parent / m).exists() for m in markers):
+            return f"refusing reset: state_db inside project checkout: {db}"
+    except OSError:
+        pass
+    denied_posix = {
+        "/var", "/var/log", "/etc", "/usr", "/bin", "/sbin",
+        "/home", "/root", "/tmp", "/var/tmp", "/",
+    }
+    if parent.as_posix() in denied_posix or str(parent) in denied_posix:
+        return f"refusing reset: state_db inside system directory: {db}"
+    try:
+        raw_posix = db.as_posix()
+    except Exception:
+        raw_posix = str(db)
+    if raw_posix in denied_posix or raw_posix.rstrip("/") in denied_posix:
+        return f"refusing reset: state_db inside system directory: {db}"
+    return None
+
+
 def _clear_dir_children(root: Path, *, base_desc: str) -> list[str]:
     """Delete every child of `root` (never `root` itself). Returns log lines."""
     from .rclone_ops import validate_safe_delete_path
@@ -181,9 +228,13 @@ def _do_reset(cfg: AppConfig) -> list[str]:
     Never raises on missing files — a fresh start on a clean machine is fine.
     """
     removed: list[str] = []
+    db_refusal = _state_db_parent_refusal(cfg)
     try:
         db = Path(cfg.general.state_db)
     except Exception:
+        db = None
+    if db is not None and db_refusal is not None:
+        removed.append(f"{db_refusal}; state.db kept")
         db = None
     if db is not None:
         for candidate in _db_sidecar_paths(db):
@@ -258,9 +309,14 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
             except Exception:
                 pass
     # Cached .torrent blobs (sibling of state.db): the whole directory.
+    # Guarded by the state_db parent check (base_dir=parent alone is
+    # worthless when parent is / or /etc).
+    blob_refusal = _state_db_parent_refusal(cfg)
     try:
         blob_root = Path(cfg.general.state_db).parent / "watch_cross_seeds"
-        if blob_root.is_dir() and not blob_root.is_symlink():
+        if blob_refusal is not None:
+            done.append(f"{blob_refusal}; blob cache kept")
+        elif blob_root.is_dir() and not blob_root.is_symlink():
             validate_safe_delete_path(
                 blob_root, base_dir=Path(cfg.general.state_db).parent)
             shutil.rmtree(blob_root)
