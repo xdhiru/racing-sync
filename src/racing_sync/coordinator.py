@@ -655,7 +655,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         for item in items:
             item_hash = item.infohash.lower()
             ingested = False
-            if self.store.get(item_hash) is None:
+            if self.store.get(item_hash, include_blob=False) is None:
                 try:
                     _ignored = self.store.is_ignored(item_hash) is True
                 except Exception:
@@ -701,7 +701,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     await self.watch.delete_picked_up(item)
                 else:
                     try:
-                        existing = self.store.get(item_hash)
+                        existing = self.store.get(item_hash, include_blob=False)
                     except Exception:
                         existing = None
                     if existing is not None and existing.state == State.DONE:
@@ -1138,7 +1138,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 _row_gone = (
                     getattr(self, "store", None) is not None
                     and hasattr(self.store, "get")
-                    and self.store.get(ts.source_infohash) is None
+                    and self.store.get(ts.source_infohash, include_blob=False) is None
                 )
             except Exception:
                 _row_gone = False
@@ -1603,7 +1603,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 # Concurrent actor already moved the row (e.g. tick sweep beat
                 # this worker to DONE). Treat as adopted, never overwrite.
                 try:
-                    fresh = self.store.get(ts.source_infohash)
+                    fresh = self.store.get(ts.source_infohash, include_blob=False)
                 except Exception:
                     fresh = None
                 if fresh is not None and fresh.state == State.DONE:
@@ -1727,7 +1727,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     # Re-read: a worker may have moved this row after the
                     # snapshot above — never overwrite a fresh state.
                     try:
-                        fresh = store.get(ts.source_infohash)
+                        fresh = store.get(ts.source_infohash, include_blob=False)
                     except Exception:
                         fresh = None
                     if fresh is None or fresh.state != ts.state:
@@ -3162,7 +3162,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             try:
                 _fresh_dl = None
                 if getattr(self, "store", None) is not None and hasattr(self.store, "get"):
-                    _fresh_dl = self.store.get(ts.source_infohash)
+                    _fresh_dl = self.store.get(ts.source_infohash, include_blob=False)
             except Exception:
                 _fresh_dl = None
             if _fresh_dl is None:
@@ -3424,7 +3424,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     _gone = (
                         getattr(self, "store", None) is not None
                         and hasattr(self.store, "get")
-                        and self.store.get(ts.source_infohash) is None
+                        and self.store.get(ts.source_infohash, include_blob=False) is None
                     )
                 except Exception:
                     _gone = False
