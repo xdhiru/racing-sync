@@ -921,3 +921,40 @@ async def test_do_downloading_fresh_row_prioritizes_batch_zero(tmp_path: Path):
     assert ts.state == State.MOVING
 
 
+@pytest.mark.anyio
+async def test_reconcile_adoption_carries_exported_blob(tmp_path: Path):
+    """Adopted rows must carry .torrent bytes (exported from dest).
+
+    Without a blob every downstream consumer needing bytes (batch
+    re-resolve, re-add) parks identically forever on a fresh DB.
+    """
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    cfg = MagicMock()
+    cfg.rclone.fuse.mount = Path("/mnt/fuse/torrents")
+    cfg.rclone.fuse.mount_unsorted = Path("/mnt/fuse/unsorted")
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [
+        Torrent(
+            hash="adopted_hash",
+            name="Adopted.Release.1080p",
+            size_bytes=4000,
+            save_path="/home/user/torrents/qbittorrent",
+            category="racing",
+            progress=1.0,
+            state="uploading",
+        ),
+    ]
+    dest.export_torrent = AsyncMock(return_value=b"d8:announce4:infod4:name4:testee")
+
+    report = await reconcile(cfg, dest=dest, store=store)
+    assert report.kept == ["adopted_hash"]
+
+    t = store.get("adopted_hash")
+    assert t is not None
+    assert t.cross_seed_blob == b"d8:announce4:infod4:name4:testee"
+    dest.export_torrent.assert_called_with("adopted_hash")
+
+

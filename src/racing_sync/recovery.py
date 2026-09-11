@@ -193,6 +193,26 @@ async def _classify_adopted(
         return "unknown"
 
 
+async def _adopt_blob(dest: TorrentClient, h: str) -> bytes:
+    """Best-effort .torrent bytes for a freshly adopted entry (b"" when absent).
+
+    Adopted rows (fresh DB, --reset) previously carried no blob, so every
+    downstream consumer needing bytes (batch re-resolve, re-add) parked or
+    wedged identically forever. Export from the dest client when it
+    supports it; failures keep the old blobless behavior.
+    """
+    try:
+        export = getattr(dest, "export_torrent", None)
+        if not callable(export):
+            return b""
+        blob = await export(h)
+        if isinstance(blob, (bytes, bytearray)) and blob:
+            return bytes(blob)
+        return b""
+    except Exception:
+        return b""
+
+
 async def _missing_under(mount: Path, expected: list[tuple[str, int]]) -> list[str] | None:
     """Files listed-but-absent under `mount`, or None when unverifiable.
 
@@ -557,6 +577,10 @@ async def reconcile(
                     classification_kind=kind,
                     state=adopt_state,
                 )
+                _adopted_blob = await _adopt_blob(dest, h)
+                if _adopted_blob:
+                    ts.cross_seed_blob = _adopted_blob
+                    ts._blob = _adopted_blob
                 store.upsert(ts)
                 rpt.kept.append(h)
                 rpt.adopted.append(h)
@@ -580,6 +604,10 @@ async def reconcile(
                     classification_kind=kind,
                     state=State.DOWNLOADING,
                 )
+                _adopted_blob = await _adopt_blob(dest, h)
+                if _adopted_blob:
+                    ts.cross_seed_blob = _adopted_blob
+                    ts._blob = _adopted_blob
                 store.upsert(ts)
                 rpt.resumed.append(h)
                 rpt.adopted.append(h)
