@@ -23,6 +23,7 @@ import logging
 import os
 import shutil
 import time
+import aiohttp
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,20 @@ from .state import State, StateStore, TorrentState
 from .watchdir import WatchDirScanner
 
 log = logging.getLogger(__name__)
+
+
+class WebUIUnresponsiveError(RuntimeError):
+    """Raised when destination WebUI times out, disconnects, or rejects re-injection under load."""
+
+
+_WEBUI_RETRY_ERRORS = (
+    TimeoutError,
+    asyncio.TimeoutError,
+    aiohttp.ClientError,
+    ConnectionError,
+    OSError,
+    WebUIUnresponsiveError,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -735,6 +750,12 @@ class Coordinator:
                 break
             if ts.source_infohash in self._running_infohashes:
                 continue
+
+            # Skip RE_ADDING rows whose backoff timer has not yet elapsed
+            if ts.state == State.RE_ADDING and ts.readd_next_retry_at:
+                now_utc = dt.datetime.now(dt.timezone.utc)
+                if ts.readd_next_retry_at > now_utc:
+                    continue
 
             # Limit concurrent active qBittorrent additions / downloads on SSD
             if ts.state == State.QUEUED and active_downloads >= self.cfg.max_active_downloads:
@@ -1492,72 +1513,146 @@ class Coordinator:
 
     async def _do_re_add(self, ts: TorrentState) -> None:
         delay = self.cfg.fuse_reinject_delay_seconds
-        if delay > 0:
+        if delay > 0 and ts.readd_attempts == 0:
             log.info(
                 "waiting %ds for fuse mount indexing before re-injection: %s",
                 delay, ts.source_name[:50],
             )
             await asyncio.sleep(delay)
 
-        h = ts.dest_infohash or ts.source_infohash
+        store = getattr(self, "store", None)
+        now = dt.datetime.now(dt.timezone.utc)
+        if ts.readd_first_attempted_at is None:
+            ts.readd_first_attempted_at = now
+            if store is not None:
+                store.upsert(ts)
 
-        # 1) Re-inject the racing-client torrents (private or otherwise)
-        # pointing at the fuse mount with skip_check=True (req #3).
-        # We need their .torrent bytes. Pull them via SFTP if possible;
-        # otherwise just skip if the racing client was deluge and SFTP
-        # is not enabled.
-        if self.cfg.cross_seed.inject_racing_torrents_to_fuse:
-            if ts.cross_seed_source == "watch-dir":
-                await self._re_inject_watch_dir_torrents(ts)
-            else:
-                await self._re_inject_racing_torrents(ts)
+        max_age_val = getattr(self.cfg, "fuse_reinject_max_age_seconds", 86400)
+        max_age_sec = max_age_val if isinstance(max_age_val, (int, float)) else 86400
+        max_age = dt.timedelta(seconds=max_age_sec)
 
-        # 2) Re-add the cross-seed torrent (the one we used to download
-        # on SSD) pointing at the fuse mount. Without re-check.
-        # Prefer the in-memory copy (set during the current run);
-        # fall back to the persisted copy so that recovery after a
-        # restart can still re-add the cross-seed torrent.
-        blob = ts._blob or ts.cross_seed_blob
-        if blob:
-            blob_hash = ""
+        retry_gap_val = getattr(self.cfg, "fuse_reinject_retry_gap_seconds", 120)
+        retry_gap = retry_gap_val if isinstance(retry_gap_val, (int, float)) else 120
+
+        backoff_val = getattr(self.cfg, "fuse_reinject_backoff_seconds", 1800)
+        backoff_interval = backoff_val if isinstance(backoff_val, (int, float)) else 1800
+
+        elapsed = now - ts.readd_first_attempted_at
+        if elapsed >= max_age:
+            err = (
+                f"re-injection timed out after {int(elapsed.total_seconds())}s "
+                f"(>24h limit): destination WebUI unresponsive"
+            )
+            log.error("giving up on %s: %s", ts.source_name, err)
+            ts.readd_next_retry_at = None
+            self.transition(ts, State.FAILED, error=err)
+            return
+
+        max_cycle_attempts = 2
+
+        for cycle_attempt in range(1, max_cycle_attempts + 1):
+            ts.readd_attempts += 1
             try:
-                from .watchdir import _bencoded_info_hash
-                blob_hash, _, _, _ = _bencoded_info_hash(blob)
-            except Exception:
-                pass
-            target_hash = blob_hash or ts.cross_seed_infohash or h
+                # 1) Re-inject the racing-client torrents (private or otherwise)
+                # pointing at the fuse mount with skip_check=True (req #3).
+                if self.cfg.cross_seed.inject_racing_torrents_to_fuse:
+                    if ts.cross_seed_source == "watch-dir":
+                        await self._re_inject_watch_dir_torrents(ts)
+                    else:
+                        await self._re_inject_racing_torrents(ts)
 
-            injected_hashes = {x.lower() for x in ts.injected_private_hashes.split(",") if x}
-            if target_hash and target_hash.lower() in injected_hashes:
-                log.info("cross-seed torrent %s already injected on fuse in step 1", target_hash[:10])
-            else:
-                target_mount = self._target_mount_for(ts)
-                res = await self.dest_client.add_torrent(
-                    torrent_files=[blob],
-                    save_path=str(target_mount),
-                    category="racing",
-                    paused=False,
-                    skip_check=True,
-                    tags=["racing", "fuse"],
-                )
-                already_exists = False
-                if not res.accepted and (res.detail == "Fails." or "already" in res.detail.lower()):
-                    try:
-                        dest_st = await self.dest_client.get_torrent(target_hash)
-                        if dest_st is not None:
-                            already_exists = True
-                    except Exception as e:  # noqa: BLE001
-                        log.debug("could not check dest client for %s: %s", target_hash[:10], e)
+                # 2) Re-add the cross-seed torrent
+                await self._re_add_cross_seed_torrent(ts)
 
-                if not res.accepted and not already_exists:
-                    err_msg = f"fuse re-add rejected: {res.detail or 'client rejected torrent'}"
-                    log.error("re-add cross-seed torrent failed for %s: %s", ts.source_name, err_msg)
-                    self.transition(ts, State.FAILED, error=err_msg)
+                if ts.state != State.FAILED:
+                    ts.readd_next_retry_at = None
+                    self.transition(ts, State.DONE)
+                return
+
+            except _WEBUI_RETRY_ERRORS as e:
+                now_curr = dt.datetime.now(dt.timezone.utc)
+                elapsed_curr = now_curr - ts.readd_first_attempted_at
+                if elapsed_curr >= max_age:
+                    err = (
+                        f"re-injection timed out after {int(elapsed_curr.total_seconds())}s "
+                        f"(>24h limit): {e}"
+                    )
+                    log.error("giving up on %s: %s", ts.source_name, err)
+                    ts.readd_next_retry_at = None
+                    self.transition(ts, State.FAILED, error=err)
                     return
-                elif already_exists:
-                    log.info("cross-seed torrent %s already exists on dest client; marking as injected", target_hash[:10])
 
-        self.transition(ts, State.DONE)
+                if cycle_attempt < max_cycle_attempts:
+                    log.warning(
+                        "WebUI unresponsive during re-add for %s (%s); "
+                        "retrying in %ds (attempt %d/%d)",
+                        ts.source_name[:50], e, retry_gap, cycle_attempt, max_cycle_attempts,
+                    )
+                    if store is not None:
+                        store.upsert(ts)
+                    await asyncio.sleep(retry_gap)
+                    if self._stop:
+                        return
+                else:
+                    ts.readd_next_retry_at = now_curr + dt.timedelta(seconds=backoff_interval)
+                    log.warning(
+                        "WebUI still unresponsive for %s after %d attempts (%s); "
+                        "backing off for %ds (30m) until %s (elapsed=%ds, max=%ds)",
+                        ts.source_name[:50], max_cycle_attempts, e, backoff_interval,
+                        ts.readd_next_retry_at.isoformat(timespec="seconds"),
+                        int(elapsed_curr.total_seconds()), int(max_age.total_seconds()),
+                    )
+                    if store is not None:
+                        store.upsert(ts)
+                    self._schedule_telegram_update(ts)
+                    return
+
+    async def _re_add_cross_seed_torrent(self, ts: TorrentState) -> None:
+        blob = ts._blob or ts.cross_seed_blob
+        if not blob:
+            return
+
+        h = ts.dest_infohash or ts.source_infohash
+        blob_hash = ""
+        try:
+            from .watchdir import _bencoded_info_hash
+            blob_hash, _, _, _ = _bencoded_info_hash(blob)
+        except Exception:
+            pass
+        target_hash = blob_hash or ts.cross_seed_infohash or h
+
+        injected_hashes = {x.lower() for x in ts.injected_private_hashes.split(",") if x}
+        if target_hash and target_hash.lower() in injected_hashes:
+            log.info("cross-seed torrent %s already injected on fuse in step 1", target_hash[:10])
+            return
+
+        target_mount = self._target_mount_for(ts)
+        res = await self.dest_client.add_torrent(
+            torrent_files=[blob],
+            save_path=str(target_mount),
+            category="racing",
+            paused=False,
+            skip_check=True,
+            tags=["racing", "fuse"],
+        )
+        already_exists = False
+        if not res.accepted and (res.detail == "Fails." or "already" in res.detail.lower()):
+            try:
+                dest_st = await self.dest_client.get_torrent(target_hash)
+                if dest_st is not None:
+                    already_exists = True
+            except Exception as e:  # noqa: BLE001
+                log.debug("could not check dest client for %s: %s", target_hash[:10], e)
+
+        if not res.accepted and not already_exists:
+            err_msg = f"fuse re-add rejected: {res.detail or 'client rejected torrent'}"
+            log.error("re-add cross-seed torrent failed for %s: %s", ts.source_name, err_msg)
+            if res.detail == "Fails." or not res.detail:
+                raise WebUIUnresponsiveError(err_msg)
+            self.transition(ts, State.FAILED, error=err_msg)
+            return
+        elif already_exists:
+            log.info("cross-seed torrent %s already exists on dest client; marking as injected", target_hash[:10])
 
     async def _re_inject_watch_dir_torrents(self, ts: TorrentState) -> None:
         """Re-add every watch-dir dropped torrent and discovered cross-seeds onto FUSE."""
@@ -1567,11 +1662,19 @@ class Coordinator:
         target_mount = self._target_mount_for(ts)
         injected = [h for h in ts.injected_private_hashes.split(",") if h]
 
-        for p in sorted(watch_cross_dir.glob("*.torrent")):
-            try:
-                blob = p.read_bytes()
-                from .watchdir import _bencoded_info_hash
-                h, _, _, _ = _bencoded_info_hash(blob)
+        try:
+            for p in sorted(watch_cross_dir.glob("*.torrent")):
+                try:
+                    blob = p.read_bytes()
+                    from .watchdir import _bencoded_info_hash
+                    h, _, _, _ = _bencoded_info_hash(blob)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("failed to read watch-dir torrent %s: %s", p.name, e)
+                    continue
+
+                if h in injected:
+                    continue
+
                 res = await self.dest_client.add_torrent(
                     torrent_files=[blob],
                     save_path=str(target_mount),
@@ -1597,56 +1700,37 @@ class Coordinator:
                         log.info("re-injected watch-dir torrent %s on fuse (%s)", h[:10], target_mount)
                 else:
                     log.warning("re-inject watch-dir torrent %s rejected: %s", h[:10], res.detail)
-            except Exception as e:  # noqa: BLE001
-                log.warning("failed to re-inject watch-dir torrent %s: %s", p.name, e)
-
-        ts.injected_private_hashes = ",".join(dict.fromkeys(injected))
+                    raise WebUIUnresponsiveError(f"re-inject watch-dir torrent {h[:10]} rejected: {res.detail}")
+        finally:
+            ts.injected_private_hashes = ",".join(dict.fromkeys(injected))
 
     async def _re_inject_racing_torrents(self, ts: TorrentState) -> None:
         """Re-add every racing-client torrent matching this content onto VPS2
         pointing at the fuse mount with skip_check=True.
-
-        Req #1 + #2 + #3: when VPS1 has multiple racing torrents for the
-        same file (e.g. one public + one or more private), we want ALL of
-        them seeding from VPS2 once the SSD download + rclone move
-        complete.
-
-        Implementation notes:
-          - The .torrent bytes are fetched via SFTP (Deluge state dir)
-            when available. For qBittorrent we use the WebUI's
-            /torrents/export endpoint directly.
-          - We avoid re-adding the SSD-source torrent if its infohash
-            already lives on VPS2 (the cross-seed torrent we used for
-            SSD download is also re-added later as `seedpool-cross-seed`
-            or `public-racing` in the calling code).
-          - Errors fetching individual torrents are logged and skipped,
-            so a single bad export doesn't fail the whole injection.
         """
         target_mount = self._target_mount_for(ts)
-        injected: list[str] = []
+        injected = [h for h in ts.injected_private_hashes.split(",") if h]
 
-        # 1. List racing torrents for this content
         try:
             racing = await self._list_source_torrents()
         except Exception as e:  # noqa: BLE001
             log.warning("could not list racing torrents for re-injection: %s", e)
             return
 
-        # Match by display name (the racing client shows release names).
-        # Note: VPS1 may have e.g. a public torrent + Aither + Beyond-HD
-        # copies of the same release, all with identical display names.
         matches = [t for t in racing if t.name == ts.source_name]
 
-        for t in matches:
-            try:
-                blob = await self._fetch_racing_torrent_bytes(t.infohash)
-            except Exception as e:  # noqa: BLE001
-                log.warning("re-inject: fetch %s failed: %s",
-                            t.infohash[:10], e)
-                continue
-            if not blob:
-                continue
-            try:
+        try:
+            for t in matches:
+                if t.infohash in injected:
+                    continue
+                try:
+                    blob = await self._fetch_racing_torrent_bytes(t.infohash)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("re-inject: fetch %s failed: %s",
+                                t.infohash[:10], e)
+                    continue
+                if not blob:
+                    continue
                 res = await self.dest_client.add_torrent(
                     torrent_files=[blob],
                     save_path=str(target_mount),
@@ -1669,7 +1753,7 @@ class Coordinator:
                         "re-inject: add %s rejected: %s",
                         t.infohash[:10], res.detail,
                     )
-                    continue
+                    raise WebUIUnresponsiveError(f"re-inject add {t.infohash[:10]} rejected: {res.detail}")
                 injected.append(t.infohash)
                 if already_exists:
                     log.info(
@@ -1681,11 +1765,8 @@ class Coordinator:
                         "re-injected racing torrent %s (%s) on fuse",
                         t.infohash[:10], t.name[:50],
                     )
-            except Exception as e:  # noqa: BLE001
-                log.warning("re-inject: add %s failed: %s",
-                            t.infohash[:10], e)
-
-        ts.injected_private_hashes = ",".join(injected)
+        finally:
+            ts.injected_private_hashes = ",".join(dict.fromkeys(injected))
 
     async def _check_and_inject_late_cross_seeds(
         self, ts: TorrentState, group: list[Torrent]

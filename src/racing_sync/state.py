@@ -107,6 +107,10 @@ class TorrentState:
     seedpool_first_queried_at: dt.datetime | None = None
     seedpool_next_retry_at: dt.datetime | None = None
     seedpool_attempts: int = 0
+    # Re-add retry policy
+    readd_first_attempted_at: dt.datetime | None = None
+    readd_next_retry_at: dt.datetime | None = None
+    readd_attempts: int = 0
     # Lifecycle
     state: State = State.NEW
     batch_index: int = 0
@@ -140,6 +144,15 @@ class TorrentState:
                 self.seedpool_next_retry_at.isoformat()
                 if self.seedpool_next_retry_at else "",
             "seedpool_attempts": self.seedpool_attempts,
+            "readd_first_attempted_at": (
+                self.readd_first_attempted_at.isoformat()
+                if self.readd_first_attempted_at else ""
+            ),
+            "readd_next_retry_at": (
+                self.readd_next_retry_at.isoformat()
+                if self.readd_next_retry_at else ""
+            ),
+            "readd_attempts": self.readd_attempts,
             "state": self.state.value,
             "batch_index": self.batch_index,
             "batches_total": self.batches_total,
@@ -167,6 +180,9 @@ CREATE TABLE IF NOT EXISTS torrent_state (
     seedpool_first_queried_at TEXT NOT NULL DEFAULT '',
     seedpool_next_retry_at    TEXT NOT NULL DEFAULT '',
     seedpool_attempts         INTEGER NOT NULL DEFAULT 0,
+    readd_first_attempted_at  TEXT NOT NULL DEFAULT '',
+    readd_next_retry_at       TEXT NOT NULL DEFAULT '',
+    readd_attempts            INTEGER NOT NULL DEFAULT 0,
     state                    TEXT NOT NULL,
     batch_index              INTEGER NOT NULL DEFAULT 0,
     batches_total            INTEGER NOT NULL DEFAULT 0,
@@ -224,6 +240,18 @@ class StateStore:
         if "cross_seed_blob" not in cols:
             self._conn.execute(
                 "ALTER TABLE torrent_state ADD COLUMN cross_seed_blob BLOB NOT NULL DEFAULT ''"
+            )
+        if "readd_first_attempted_at" not in cols:
+            self._conn.execute(
+                "ALTER TABLE torrent_state ADD COLUMN readd_first_attempted_at TEXT NOT NULL DEFAULT ''"
+            )
+        if "readd_next_retry_at" not in cols:
+            self._conn.execute(
+                "ALTER TABLE torrent_state ADD COLUMN readd_next_retry_at TEXT NOT NULL DEFAULT ''"
+            )
+        if "readd_attempts" not in cols:
+            self._conn.execute(
+                "ALTER TABLE torrent_state ADD COLUMN readd_attempts INTEGER NOT NULL DEFAULT 0"
             )
 
     # ---- CRUD ----
@@ -362,6 +390,9 @@ class StateStore:
 def _row_to_state(row: sqlite3.Row) -> TorrentState:
     sp_first = row["seedpool_first_queried_at"]
     sp_next = row["seedpool_next_retry_at"]
+    ra_first = row["readd_first_attempted_at"] if "readd_first_attempted_at" in row.keys() else ""
+    ra_next = row["readd_next_retry_at"] if "readd_next_retry_at" in row.keys() else ""
+    ra_attempts = row["readd_attempts"] if "readd_attempts" in row.keys() else 0
     return TorrentState(
         source_infohash=row["source_infohash"],
         dest_infohash=row["dest_infohash"],
@@ -382,6 +413,13 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
             dt.datetime.fromisoformat(sp_next) if sp_next else None
         ),
         seedpool_attempts=row["seedpool_attempts"],
+        readd_first_attempted_at=(
+            dt.datetime.fromisoformat(ra_first) if ra_first else None
+        ),
+        readd_next_retry_at=(
+            dt.datetime.fromisoformat(ra_next) if ra_next else None
+        ),
+        readd_attempts=ra_attempts,
         state=State(row["state"]),
         batch_index=row["batch_index"],
         batches_total=row["batches_total"],

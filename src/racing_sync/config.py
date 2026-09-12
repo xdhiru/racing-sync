@@ -220,6 +220,12 @@ class FuseConfig(BaseModel):
     mount_unsorted: Path
     # Delay in seconds before re-injecting torrents to fuse after rclone move (default: 30)
     reinject_delay_seconds: int = Field(default=30, ge=0)
+    # Gap in seconds between immediate re-injection retries when WebUI is unresponsive (default: 120 / 2 min)
+    reinject_retry_gap_seconds: int = Field(default=120, ge=1)
+    # Backoff interval in seconds between retry cycles when WebUI remains unresponsive (default: 1800 / 30 min)
+    reinject_backoff_seconds: int = Field(default=1800, ge=1)
+    # Maximum elapsed seconds since re-injection began before marking FAILED (default: 86400 / 24 hours)
+    reinject_max_age_seconds: int = Field(default=86400, ge=60)
 
 
 class RcloneConfig(BaseModel):
@@ -566,6 +572,18 @@ class AppConfig(BaseModel):
         if self.rclone.reinject_delay_seconds is not None:
             return self.rclone.reinject_delay_seconds
         return self.rclone.fuse.reinject_delay_seconds
+
+    @property
+    def fuse_reinject_retry_gap_seconds(self) -> int:
+        return self.rclone.fuse.reinject_retry_gap_seconds
+
+    @property
+    def fuse_reinject_backoff_seconds(self) -> int:
+        return self.rclone.fuse.reinject_backoff_seconds
+
+    @property
+    def fuse_reinject_max_age_seconds(self) -> int:
+        return self.rclone.fuse.reinject_max_age_seconds
 
     def is_episode(self, name: str) -> bool:
         return bool(self.classifier._episode_re.search(name))
