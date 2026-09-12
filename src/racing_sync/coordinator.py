@@ -29,7 +29,7 @@ from typing import Any
 
 from .batcher import Batch, make_batches
 from .classifier import Classification, classify, should_skip_movie
-from .clients.abstract import Torrent, TorrentClient
+from .clients.abstract import Torrent, TorrentClient, TorrentFile
 from .clients.deluge import DelugeClient
 from .clients.http_base import AuthError
 from .clients.qbittorrent import QBittorrentClient, build_qbtorrent_from_dest
