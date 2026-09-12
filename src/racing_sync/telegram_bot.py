@@ -289,7 +289,7 @@ class TelegramBot:
         # doesn't trigger HTTP 429 / Retry-After.
         self._rate_sem: asyncio.Semaphore | None = None
         # Pending detail-message work, drained by a background worker.
-        self._detail_queue: asyncio.Queue[asyncio.Task] | None = None
+        self._detail_queue: asyncio.Queue[tuple[str, float | None]] | None = None
         self._detail_worker: asyncio.Task | None = None
         # In-process cache: source_infohash -> message_id, so we don't
         # need to hit state.db for every send.
