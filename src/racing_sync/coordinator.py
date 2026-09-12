@@ -93,10 +93,8 @@ def _should_notify_telegram(prev: State, dst: State) -> bool:
       - The bot's per-torrent message will be created on the first
         such transition; subsequent updates just edit the same message.
     """
-    if dst == State.NEW and prev == State.NEW:
-        # Same-state re-entry shouldn't happen, but guard anyway.
-        return False
-    if prev == State.NEW and dst == State.NEW:
+    if prev == dst:
+        # Same-state re-entry shouldn't trigger duplicate notifications.
         return False
     return dst in _TELEGRAM_NOTIFY_STATES
 
