@@ -891,7 +891,9 @@ class Coordinator:
         # Make sure we have the source torrent metadata
         st = await self.source_client.get_torrent(ts.source_infohash)
         if st is None:
-            log.warning("source torrent vanished: %s", ts.source_infohash[:10])
+            err = f"source torrent vanished from client: {ts.source_infohash[:10]}"
+            log.warning(err)
+            self.transition(ts, State.FAILED, error=err)
             return
         ts.source_name = st.name
         ts.total_bytes = st.size_bytes
@@ -1116,7 +1118,9 @@ class Coordinator:
         # Pull fresh data from VPS1 in case the torrent name changed.
         st = await self.source_client.get_torrent(ts.source_infohash)
         if st is None:
-            log.warning("source torrent vanished: %s", ts.source_infohash[:10])
+            err = f"source torrent vanished from client: {ts.source_infohash[:10]}"
+            log.warning(err)
+            self.transition(ts, State.FAILED, error=err)
             return
         ts.source_name = st.name
         ts.total_bytes = st.size_bytes
