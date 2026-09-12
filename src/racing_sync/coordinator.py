@@ -342,6 +342,8 @@ class Coordinator:
     _move_sem: asyncio.Semaphore | None = field(default=None, init=False)
     _coordinator_started: bool = field(default=False, init=False)
     _shutdown_done: bool = field(default=False, init=False)
+    _source_torrents_cache: list[Torrent] = field(default_factory=list, init=False)
+    _source_torrents_cached_at: float = field(default=0.0, init=False)
 
     @property
     def download_sem(self) -> asyncio.Semaphore:
@@ -474,7 +476,7 @@ class Coordinator:
                 pass
             self.sftp = None
 
-    async def _list_source_torrents(self) -> list:
+    async def _list_source_torrents(self, *, force_refresh: bool = False) -> list:
         """Fetch racing torrents from VPS1 and apply the min-age filter.
 
         Single source of truth for "what is syncable from the racing
@@ -482,21 +484,37 @@ class Coordinator:
         "sync everything"; non-empty means filter by that category.
         `min_age_seconds` ensures torrents have matured for at least N
         seconds before sync starts (e.g. to allow cross-seeds to be added).
+
+        Cached for 10 seconds to prevent redundant RPC calls to VPS1 when
+        multiple tasks (e.g. _tick, _do_new, _do_waiting_seedpool) query
+        the source client within the same cycle.
         """
+        import time as _time
+        now_mono = _time.monotonic()
+        if (
+            not force_refresh
+            and hasattr(self, "_source_torrents_cached_at")
+            and (now_mono - self._source_torrents_cached_at) < 10.0
+        ):
+            return list(self._source_torrents_cache)
+
         all_torrents = await self.source_client.list_torrents(
             category=self.cfg.source.category
         )
         min_age = self.cfg.source.min_age_seconds
         if min_age <= 0:
-            return all_torrents
-        import time as _time
-        now = _time.time()
-        filtered = []
-        for t in all_torrents:
-            if t.added_on and (now - t.added_on) < min_age:
-                continue
-            filtered.append(t)
-        return filtered
+            filtered = all_torrents
+        else:
+            time_now = _time.time()
+            filtered = []
+            for t in all_torrents:
+                if t.added_on and (time_now - t.added_on) < min_age:
+                    continue
+                filtered.append(t)
+
+        self._source_torrents_cache = filtered
+        self._source_torrents_cached_at = now_mono
+        return list(filtered)
 
     def request_stop(self) -> None:
         log.warning("stop requested")

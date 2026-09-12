@@ -74,3 +74,36 @@ async def test_process_torrent_inner_dispatches_querying_state():
 
     # Must dispatch to _do_waiting_seedpool when in QUERYING state
     coord._do_waiting_seedpool.assert_awaited_once_with(ts)
+
+
+@pytest.mark.anyio
+async def test_list_source_torrents_caches_within_ttl():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.clients.abstract import Torrent
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.source.category = "racing"
+    coord.cfg.source.min_age_seconds = 0
+    coord._source_torrents_cache = []
+    coord._source_torrents_cached_at = 0.0
+
+    t1 = Torrent(hash="h1", name="Show.A", category="racing", save_path="", size_bytes=100, state="", progress=1.0)
+    coord.source_client = AsyncMock()
+    coord.source_client.list_torrents.return_value = [t1]
+
+    # First call: fetches from client
+    res1 = await coord._list_source_torrents()
+    assert len(res1) == 1
+    assert coord.source_client.list_torrents.await_count == 1
+
+    # Second call right after: returns cached result without RPC call
+    res2 = await coord._list_source_torrents()
+    assert len(res2) == 1
+    assert coord.source_client.list_torrents.await_count == 1
+
+    # Force refresh: bypasses cache and calls RPC again
+    res3 = await coord._list_source_torrents(force_refresh=True)
+    assert len(res3) == 1
+    assert coord.source_client.list_torrents.await_count == 2
