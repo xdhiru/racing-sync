@@ -496,3 +496,38 @@ def test_pool_close_does_not_hang_on_wedged_member():
     # Healthy member still closed.
     healthy_sftp.close.assert_called_once()
 
+
+def test_pool_connect_failure_closes_all_members():
+    """A failed pool dial must close every member, not just completed ones."""
+    from unittest.mock import patch
+    from racing_sync.sftp_source import SFTPExporter, _SFTPConnection
+
+    exporter = SFTPExporter(_sftp_cfg(), pool_size=3)
+    members = [_live_member(exporter._cfg) for _ in range(3)]
+    exporter._members = members
+
+    with patch.object(
+        _SFTPConnection, "connect",
+        side_effect=[None, RuntimeError("boom"), None],
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            exporter.connect()
+
+    for m in members:
+        assert m._sftp is None
+        assert m._client is None
+
+
+def test_disk_free_via_df_wedge_returns_none():
+    """A wedged df read (channel timeout) yields None, not a stuck member."""
+    import socket
+    from unittest.mock import MagicMock
+
+    m = _live_member(_sftp_cfg())
+    stdout = MagicMock()
+    stdout.read.side_effect = socket.timeout("wedged")
+    m._client.exec_command.return_value = (MagicMock(), stdout, MagicMock())
+
+    assert m._disk_free_via_df("/data") is None
+    stdout.channel.settimeout.assert_called_once_with(10.0)
+
