@@ -240,3 +240,32 @@ def test_check_config_flags_same_remote_and_cap(tmp_path: Path):
     cfg = AppConfig.from_toml(cfg_file)
     problems = _check_config_env(cfg)
     assert any("unsorted" in p for p in problems)
+
+
+def test_main_full_requires_yes(tmp_path: Path, capsys):
+    """Bare --full refuses before touching anything; --yes proceeds."""
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+
+    with patch("racing_sync.__main__.Coordinator"), \
+         patch("racing_sync.__main__.setup_logging"):
+        rc = main(["run", "--config", str(cfg_file), "--full"])
+        assert rc == 2
+        out = capsys.readouterr()
+        assert "--yes" in out.err
+
+    with patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
+         patch("racing_sync.__main__.setup_logging"):
+        mock_coord = MagicMock()
+
+        async def fake_run():
+            return 0
+
+        async def fake_shutdown():
+            pass
+
+        mock_coord.run.side_effect = fake_run
+        mock_coord.shutdown.side_effect = fake_shutdown
+        mock_coord_cls.return_value = mock_coord
+        rc = main(["run", "--config", str(cfg_file), "--full", "--yes"])
+        assert rc == 0
