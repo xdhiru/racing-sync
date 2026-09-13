@@ -626,7 +626,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="With --reset: also drop dest racing entries (with files), wipe "
              "SSD data and the cached .torrent blobs — a true clean slate "
-             "for testing. Implies --reset. Fuse/remote copies are untouched.",
+             "for testing. Implies --reset. Fuse/remote copies are untouched. "
+             "Requires --yes.",
+    )
+    p_run.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the destructive --full wipe (no prompt otherwise).",
     )
 
     p_forget = sub.add_parser(
@@ -701,6 +707,14 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_unignore(cfg, args)
 
     if getattr(args, "reset", False) or getattr(args, "full", False):
+        if getattr(args, "full", False) and not getattr(args, "yes", False):
+            print(
+                "refusing --full without --yes: this drops dest racing "
+                "entries (with files), wipes SSD data and the cached "
+                ".torrent blobs. Re-run with 'run --full --yes' to confirm.",
+                file=sys.stderr,
+            )
+            return 2
         for line in _do_reset(cfg):
             print(line)
         if getattr(args, "full", False):
