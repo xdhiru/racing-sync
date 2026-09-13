@@ -567,6 +567,42 @@ def _check_config_env(cfg: AppConfig) -> list[str]:
             problems.append(f"rclone.binary not executable: {b}")
     except Exception as e:  # noqa: BLE001
         problems.append(f"rclone.binary check failed: {e}")
+    # Cross-field advisories: fatal overlap is rejected by the AppConfig
+    # validator; these stay check-config warnings (existing setups keep
+    # running, new ones get told).
+    try:
+        if cfg.rclone.remote.default == cfg.rclone.remote.unsorted:
+            problems.append(
+                "rclone.remote.default == rclone.remote.unsorted "
+                f"({cfg.rclone.remote.default!r}): movies and unsorted "
+                "content share one remote path — intentional?"
+            )
+    except Exception:
+        pass
+    for _label, _raw in (
+        ("ssd.path", getattr(cfg.ssd, "path", "")),
+        ("dest.save_path", getattr(cfg.dest, "save_path", "")),
+        ("general.state_db", getattr(cfg.general, "state_db", "")),
+    ):
+        try:
+            if str(_raw).strip() and not Path(str(_raw)).is_absolute():
+                problems.append(
+                    f"{_label} is relative ({_raw!r}): resolves against the "
+                    "working directory — use an absolute path for a daemon"
+                )
+        except Exception:
+            pass
+    try:
+        _cap = int(getattr(cfg.ssd, "max_inflight_bytes", 0) or 0)
+        _total = shutil.disk_usage(str(cfg.ssd.path)).total
+        if _cap > _total:
+            problems.append(
+                f"ssd.max_inflight_bytes ({_cap}) exceeds the SSD disk total "
+                f"({_total}): grows can overcommit past ENOSPC — size the cap "
+                "below the disk"
+            )
+    except Exception:
+        pass
     return problems
 
 

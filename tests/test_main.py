@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from racing_sync.__main__ import main
 
 MINIMAL_CONFIG = """
@@ -210,3 +212,31 @@ def test_do_reset_refuses_unsafe_state_db(tmp_path: Path):
     lines = _do_reset(cfg)
     assert victim.exists()
     assert any("refusing" in ln for ln in lines)
+
+
+def test_app_config_rejects_ssd_fuse_overlap(tmp_path: Path):
+    """SSD nested in a fuse mount is rejected at load, not warned at runtime."""
+    import pydantic
+
+    from racing_sync.config import AppConfig
+
+    bad = MINIMAL_CONFIG.replace('mount = "/mnt/fuse"',
+                                 'mount = "/downloads"')
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(bad)
+    with pytest.raises(pydantic.ValidationError, match="overlap"):
+        AppConfig.from_toml(cfg_file)
+
+
+def test_check_config_flags_same_remote_and_cap(tmp_path: Path):
+    """default==unsorted and cap>disk surface as check-config problems."""
+    from racing_sync.__main__ import _check_config_env
+    from racing_sync.config import AppConfig
+
+    same_remote = MINIMAL_CONFIG.replace('unsorted = "remote:unsorted/"',
+                                         'unsorted = "remote:movies/"')
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(same_remote)
+    cfg = AppConfig.from_toml(cfg_file)
+    problems = _check_config_env(cfg)
+    assert any("unsorted" in p for p in problems)

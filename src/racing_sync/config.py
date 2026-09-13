@@ -960,6 +960,41 @@ class AppConfig(BaseModel):
     def is_episode(self, name: str) -> bool:
         return bool(self.classifier._episode_re.search(name))
 
+    @model_validator(mode="after")
+    def _cross_validate_storage(self) -> "AppConfig":
+        """Reject storage layouts that silently corrupt data.
+
+        SSD dirs nested inside (or containing) a fuse mount misclassify
+        every torrent (on_fuse detection, move sources and wipe guards all
+        assume disjoint trees) — advisory warnings were not enough. Path
+        comparison mirrors the startup overlap warning.
+        """
+        def _norm(p: object) -> str:
+            try:
+                return str(p or "").rstrip("/\\").replace("\\", "/")
+            except Exception:
+                return ""
+
+        try:
+            ssd_dirs = [_norm(self.ssd.path), _norm(self.dest.save_path)]
+        except Exception:
+            return self
+        try:
+            fuse = [_norm(self.rclone.fuse.mount),
+                    _norm(self.rclone.fuse.mount_unsorted)]
+        except Exception:
+            return self
+        for s in ssd_dirs:
+            for fm in fuse:
+                if s and fm and (s == fm or s.startswith(fm + "/")
+                                 or fm.startswith(s + "/")):
+                    raise ValueError(
+                        f"storage overlap: SSD path {s!r} overlaps fuse mount "
+                        f"{fm!r} — use disjoint paths ([ssd].path/[dest].save_path "
+                        "must not equal or nest inside [rclone.fuse] mounts)"
+                    )
+        return self
+
 
 def _warn_unknown_keys(model: type[BaseModel], data: object, prefix: str = "") -> None:
     """Log likely-typo config keys that pydantic would silently ignore.
