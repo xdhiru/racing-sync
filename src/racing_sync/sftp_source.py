@@ -88,40 +88,6 @@ def _ipv4_socket(host: str, port: int, *, timeout: float = 15) -> socket.socket:
     raise SFTPError(f"could not connect to {host}:{port} (IPv4): {last_err}")
 
 
-def _read_with_timeout(read_fn: object, *, timeout: float) -> bytes | None:
-    """Run a blocking stream read with a timeout; None on timeout/error.
-
-    Used for SSH exec output where paramiko offers no read timeout: without
-    it a wedged transport holds the pool member lock until the caller's
-    outer wait gives up, and the abandoned thread wedges the member. The
-    worker is detached (not joined) on timeout so the caller never blocks.
-    """
-    import concurrent.futures as _fut
-
-    try:
-        pool = _fut.ThreadPoolExecutor(max_workers=1)
-    except Exception:
-        return None
-    try:
-        fut = pool.submit(read_fn)  # type: ignore[arg-type]
-        try:
-            return fut.result(timeout=timeout)
-        except Exception:
-            return None
-        finally:
-            try:
-                pool.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
-    except Exception:
-        try:
-            pool.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
-        return None
-
-
-
 class _SFTPConnection:
     """One SSH/SFTP connection (single transport, lock-guarded).
 
@@ -460,9 +426,14 @@ class _SFTPConnection:
             return None
         try:
             _, stdout, _ = client.exec_command(f"df -kP {shlex.quote(path)}")
-            # Bound the read: a wedged transport must not hold the member
-            # lock forever (the exporter only fail-fasts on acquisition).
-            out = _read_with_timeout(stdout.read, timeout=10.0)
+            # Bound the read at the channel: a wedged transport must not
+            # hold the member lock forever. (A per-call helper thread was
+            # the old mechanism — it leaked one thread per wedged df.)
+            try:
+                stdout.channel.settimeout(10.0)
+            except Exception:
+                pass
+            out = stdout.read()
             if out is None:
                 return None
             out = out.decode("utf-8", errors="replace")
@@ -658,12 +629,12 @@ class SFTPExporter:
 
     def connect(self) -> None:
         # Members are independent transports: dial in parallel instead of
-        # serially (~3x45s worst case before). First failure closes what
-        # opened and raises.
+        # serially (~3x45s worst case before). First failure closes EVERY
+        # member and raises: pending dials that succeed after the raise
+        # would otherwise leak (only already-completed ones were closed).
         import concurrent.futures as _fut
 
         members = self._members_snapshot()
-        opened: list[_SFTPConnection] = []
         try:
             with _fut.ThreadPoolExecutor(
                 max_workers=max(1, len(members)), thread_name_prefix="sftp-dial",
@@ -673,9 +644,8 @@ class SFTPExporter:
                     exc = fut.exception()
                     if exc is not None:
                         raise exc
-                    opened.append(futs[fut])
         except Exception:
-            for m in opened:
+            for m in members:
                 try:
                     m.close()
                 except Exception:
