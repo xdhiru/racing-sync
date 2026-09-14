@@ -18,6 +18,8 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
+import aiohttp
+
 from ..config import SourceConfig
 from .abstract import AddResult, Torrent, TorrentClient, TorrentFile
 from .http_base import HTTPClientBase
@@ -83,20 +85,36 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             "params": [self._cfg.password.get_secret_value() if hasattr(self._cfg.password, "get_secret_value") else str(self._cfg.password)],
             "id": 1,
         }
-        async with self.session.post("json", json=payload) as r:
-            if r.status >= 400:
-                body = await r.text()
-                raise AuthError(
-                    f"deluge login HTTP {r.status} at {self._cfg.host}: {body[:200]}"
-                )
-            data = await r.json()
-            if data.get("error"):
-                raise AuthError(f"deluge auth error: {data['error']}")
-            if data.get("result") is False:
-                raise AuthError(
-                    f"deluge auth.login at {self._cfg.host} failed (returned False). "
-                    f"Check [source].username / [source].password in config.toml."
-                )
+        # The login POST bypasses HTTPClientBase.request (which would
+        # deadlock on the auth lock): retry transient network errors here
+        # so one blip at startup doesn't fail the whole daemon.
+        login_status, login_data, login_body = None, {}, ""
+        for attempt in range(3):
+            try:
+                async with self.session.post("json", json=payload) as r:
+                    login_status = r.status
+                    if r.status >= 400:
+                        login_body = await r.text()
+                    else:
+                        login_data = await r.json()
+                break
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+                if attempt == 2:
+                    raise AuthError(
+                        f"deluge login unreachable at {self._cfg.host}: {e}"
+                    ) from e
+                await asyncio.sleep(0.5 * (2 ** attempt))
+        if login_status >= 400:
+            raise AuthError(
+                f"deluge login HTTP {login_status} at {self._cfg.host}: {login_body[:200]}"
+            )
+        if login_data.get("error"):
+            raise AuthError(f"deluge auth error: {login_data['error']}")
+        if login_data.get("result") is False:
+            raise AuthError(
+                f"deluge auth.login at {self._cfg.host} failed (returned False). "
+                f"Check [source].username / [source].password in config.toml."
+            )
 
         # Check if WebUI is connected to a daemon; auto-connect if disconnected
         try:
@@ -131,42 +149,58 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             "params": params,
             "id": self._req_id,
         }
-        async with await self.request(
-            "POST", "json", json_body=payload
-        ) as r:
-            try:
-                data = await r.json()
-            except Exception as e:
-                from .http_base import AuthError
-                body = ""
+        for attempt in range(2):
+            async with await self.request(
+                "POST", "json", json_body=payload
+            ) as r:
                 try:
-                    body = await r.text()
-                except Exception:
-                    pass
-                try:
-                    self._authed = False
-                except Exception:
-                    pass
-                raise AuthError(
-                    f"deluge rpc {method} returned non-JSON (likely expired "
-                    f"session/login page): {e}. Body: {body[:200]}"
-                ) from e
-        if "error" in data and data["error"]:
-            err_text = str(data["error"])
-            low = err_text.lower()
-            if any(s in low for s in ("not authenticated", "not authorized", "login", "session")):
-                from .http_base import AuthError
-                # Drop the session flag so the next request() re-logs in
-                # instead of replaying the dead session forever: Deluge
-                # expiry arrives as HTTP 200 + JSON (never 401), so the
-                # http_base re-auth path never sees it.
-                try:
-                    self._authed = False
-                except Exception:
-                    pass
-                raise AuthError(f"deluge session expired: {err_text[:200]}")
-            raise RuntimeError(f"deluge rpc {method} error: {data['error']}")
-        return data.get("result")
+                    data = await r.json()
+                except Exception as e:
+                    from .http_base import AuthError
+                    body = ""
+                    try:
+                        body = await r.text()
+                    except Exception:
+                        pass
+                    try:
+                        self._authed = False
+                    except Exception:
+                        pass
+                    if attempt == 0 and await self._reauth_once():
+                        continue
+                    raise AuthError(
+                        f"deluge rpc {method} returned non-JSON (likely expired "
+                        f"session/login page): {e}. Body: {body[:200]}"
+                    ) from e
+            if "error" in data and data["error"]:
+                err_text = str(data["error"])
+                low = err_text.lower()
+                if any(s in low for s in ("not authenticated", "not authorized", "login", "session")):
+                    from .http_base import AuthError
+                    # Drop the session flag so the next request() re-logs in
+                    # instead of replaying the dead session forever: Deluge
+                    # expiry arrives as HTTP 200 + JSON (never 401), so the
+                    # http_base re-auth path never sees it. Re-login and
+                    # retry once: one expired call must not cost the row.
+                    try:
+                        self._authed = False
+                    except Exception:
+                        pass
+                    if attempt == 0 and await self._reauth_once():
+                        continue
+                    raise AuthError(f"deluge session expired: {err_text[:200]}")
+                raise RuntimeError(f"deluge rpc {method} error: {data['error']}")
+            return data.get("result")
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    async def _reauth_once(self) -> bool:
+        """Re-login after a detected expiry; True when the retry may proceed."""
+        try:
+            await self._auth(force=True)
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("deluge re-login after expiry failed: %s", e)
+            return False
 
     # ---- introspection ----
 
