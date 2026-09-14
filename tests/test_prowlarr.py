@@ -1081,3 +1081,93 @@ def test_example_config_prowlarr_keys_not_nested(example_config):
     assert top["max_results"] == 20
     assert "skip_query_substrings" not in top["download_indexers"][0]
     assert "dummysub" in example_config.prowlarr.skip_query_substrings
+
+
+def _dl_hit(url):
+    from racing_sync.prowlarr import TorrentHit
+
+    return TorrentHit(
+        title="Test", guid="1", indexer="indexer1", indexer_id=1,
+        size_bytes=100, download_url=url, magnet_url="",
+        info_url="", publish_date="",
+    )
+
+
+def _dl_resp(payload: bytes):
+    from unittest.mock import AsyncMock, MagicMock
+
+    class _Chunks:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not hasattr(self, "_done"):
+                self._done = True
+                return payload
+            raise StopAsyncIteration
+
+    resp = AsyncMock()
+    resp.raise_for_status = MagicMock()
+    resp.headers = {"Content-Length": str(len(payload))}
+    resp.content.iter_chunked = MagicMock(return_value=_Chunks())
+    return resp
+
+
+def _dl_cm(resp):
+    from unittest.mock import MagicMock, AsyncMock
+
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=resp)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
+@pytest.mark.anyio
+async def test_download_torrent_retries_transient_then_succeeds():
+    """One 429 must not fail the row: download retries like search does."""
+    import aiohttp
+    from racing_sync.prowlarr import ProwlarrClient
+
+    cfg = ProwlarrConfig(
+        enabled=True,
+        base_url="http://prowlarr.local:9696",
+        api_key="prowlarr_key",
+        download_indexers=[DownloadIndexerConfig(name="indexer1")],
+    )
+    client = ProwlarrClient(cfg)
+    client._session = MagicMock()
+
+    fail = _dl_resp(b"")
+    fail.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(
+        request_info=MagicMock(), history=(), status=429,
+        headers={"Retry-After": "0"},
+    ))
+    client._session.get.side_effect = [
+        _dl_cm(fail), _dl_cm(_dl_resp(b"d8:announcee")),
+    ]
+
+    data = await client.download_torrent(
+        _dl_hit("https://external.tracker.org/download.php?id=123"))
+    assert data == b"d8:announcee"
+    assert client._session.get.call_count == 2
+
+
+@pytest.mark.anyio
+async def test_download_torrent_sends_key_to_same_host_only():
+    """Same-Prowlarr enclosure URLs authenticate; third-party hosts stay clean."""
+    from racing_sync.prowlarr import ProwlarrClient
+
+    cfg = ProwlarrConfig(
+        enabled=True,
+        base_url="http://prowlarr.local:9696",
+        api_key="prowlarr_key",
+        download_indexers=[DownloadIndexerConfig(name="indexer1")],
+    )
+    client = ProwlarrClient(cfg)
+    client._session = MagicMock()
+    client._session.get.return_value = _dl_cm(_dl_resp(b"d8:announcee"))
+
+    await client.download_torrent(
+        _dl_hit("http://prowlarr.local:9696/api/v1/download/1"))
+    call_args = client._session.get.call_args
+    assert call_args.kwargs.get("headers") == {"X-Api-Key": "prowlarr_key"}

@@ -320,38 +320,69 @@ class ProwlarrClient:
             raise ProwlarrError(f"invalid or unsafe download_url scheme: {safe_url!r}")
         # Never attach the Prowlarr X-Api-Key to third-party enclosure hosts
         # (it would leak); instead refuse non-routable targets outright.
+        # Exception: Prowlarr serving the enclosure itself (same netloc as
+        # base_url) requires the key — without it same-host downloads 401.
         if not _is_fetchable_http_url(hit.download_url):
             raise ProwlarrError(f"refusing non-routable download_url: {safe_url!r}")
-
+        headers = None
         try:
-            async with self._session.get(hit.download_url) as r:
-                r.raise_for_status()
-                content_length = r.headers.get("Content-Length")
-                max_bytes = 20 * 1024 * 1024
-                if content_length:
-                    cl = content_length.replace(",", "").strip()
-                    if cl.isdigit() and int(cl) > max_bytes:
-                        raise ProwlarrError(
-                            f"torrent download from {safe_url} exceeds max size: {content_length} bytes"
-                        )
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in r.content.iter_chunked(64 * 1024):
-                    total += len(chunk)
-                    if total > max_bytes:
-                        raise ProwlarrError(
-                            f"torrent download from {safe_url} exceeded max size of {max_bytes} bytes"
-                        )
-                    chunks.append(chunk)
-                data = b"".join(chunks)
-        except aiohttp.ClientResponseError as e:
-            raise ProwlarrError(
-                f"torrent download from {safe_url} failed with HTTP status {e.status}"
-            ) from e
-        except (TimeoutError, asyncio.TimeoutError, aiohttp.ClientError) as e:
-            raise ProwlarrError(
-                f"torrent download from {safe_url} failed: {type(e).__name__}"
-            ) from e
+            if parsed.netloc.lower() == urlsplit(self._cfg.base_url).netloc.lower():
+                headers = self._auth_headers
+        except Exception:
+            headers = None
+
+        last_exc: Exception | None = None
+        data = b""
+        for attempt in range(3):
+            try:
+                async with self._session.get(hit.download_url, headers=headers) as r:
+                    r.raise_for_status()
+                    content_length = r.headers.get("Content-Length")
+                    max_bytes = 20 * 1024 * 1024
+                    if content_length:
+                        cl = content_length.replace(",", "").strip()
+                        if cl.isdigit() and int(cl) > max_bytes:
+                            raise ProwlarrError(
+                                f"torrent download from {safe_url} exceeds max size: {content_length} bytes"
+                            )
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in r.content.iter_chunked(64 * 1024):
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise ProwlarrError(
+                                f"torrent download from {safe_url} exceeded max size of {max_bytes} bytes"
+                            )
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                break
+            except ProwlarrError:
+                # Size-cap violations are local verdicts, not retryable.
+                raise
+            except aiohttp.ClientResponseError as e:
+                # Rate-limit / gateway hiccups mirror the search retry set;
+                # anything else fails fast.
+                if e.status not in (408, 425, 429, 502, 503, 504):
+                    raise ProwlarrError(
+                        f"torrent download from {safe_url} failed with HTTP status {e.status}"
+                    ) from e
+                last_exc = e
+            except (TimeoutError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                last_exc = e
+            if attempt == 2:
+                raise ProwlarrError(
+                    f"torrent download from {safe_url} failed: {last_exc}"
+                ) from last_exc
+            delay = 0.5 * (2 ** attempt)
+            try:
+                retry_after = None
+                if isinstance(last_exc, aiohttp.ClientResponseError):
+                    retry_after = last_exc.headers.get("Retry-After") if last_exc.headers else None
+                if retry_after:
+                    delay = min(5.0, float(retry_after))
+            except (TypeError, ValueError):
+                pass
+            await asyncio.sleep(delay)
 
         if not data.startswith(b"d"):
             raise ProwlarrError(
