@@ -313,12 +313,23 @@ class SSDLedgerMixin:
                 return False
             # Grow: admission's physical check covered only the old
             # (smaller) estimate — the delta must fit the live disk now.
+            # Best-effort: when free space is unmeasurable (unstatable
+            # path, test doubles) fail open with a warning — the global
+            # budget still binds and the download itself surfaces a broken
+            # path. Only an explicit out-of-room verdict fails the grow.
+            # (disk_free_bytes_at conflates unstatable with 0-free, so
+            # probe statability directly first.)
             try:
+                import shutil as _shutil
+
                 from . import coordinator as _c
 
-                if not _c.ssd_has_room(self.cfg, new_amount - old):
-                    return False
-            except Exception:
+                _shutil.disk_usage(str(self.cfg.ssd.path))
+                _room_ok = _c.ssd_has_room(self.cfg, new_amount - old)
+            except Exception as e:
+                log.warning("ssd grow physical check unavailable (%s); proceeding on global budget", e)
+                _room_ok = True
+            if not _room_ok:
                 return False
             d[key] = new_amount
             return True

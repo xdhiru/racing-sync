@@ -219,7 +219,8 @@ async def test_grow_beyond_physical_disk_fails(tmp_path):
     cap = 1_000_000
     coord = _coord_with_cap(tmp_path, cap)
     assert await coord._ssd_try_reserve("p" * 40, 10_000) is True
-    with patch("racing_sync.rclone_ops.disk_free_bytes_at", return_value=5_000):
+    cramped = MagicMock(total=1_000_000, used=995_000, free=5_000)
+    with patch("shutil.disk_usage", return_value=cramped):
         assert await coord._ssd_adjust("p" * 40, 100_000) is False
     assert coord._ssd_reserved["p" * 40] == 10_000
     # A grow that fits the live disk still succeeds.
