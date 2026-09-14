@@ -976,3 +976,27 @@ async def test_qbittorrent_request_json_reauth_on_html():
     assert auth_calls["n"] == 1
 
 
+@pytest.mark.anyio
+async def test_deluge_rpc_retries_once_after_expiry():
+    """One expired call re-logs in and retries instead of failing the row."""
+    client = _deluge_client()
+    client._authed = True
+    calls = {"n": 0}
+
+    async def mock_request(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _JsonResp({"error": {"message": "Not authenticated", "code": 1},
+                              "id": 1, "result": None})
+        return _JsonResp({"error": None, "id": 1, "result": {"ok": 1}})
+
+    async def mock_auth(force=False):
+        client._authed = True
+
+    client.request = mock_request
+    client._auth = mock_auth
+    result = await client._rpc("core.get_torrents_status", [{}, []])
+    assert result == {"ok": 1}
+    assert calls["n"] == 2
+
+
