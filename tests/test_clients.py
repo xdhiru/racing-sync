@@ -1000,3 +1000,12 @@ async def test_deluge_rpc_retries_once_after_expiry():
     assert calls["n"] == 2
 
 
+def test_host_with_userinfo_rejected():
+    """Credentials in host URLs would leak via AuthError/log interpolation."""
+    from racing_sync.clients.http_base import _ensure_base_url
+
+    with pytest.raises(ValueError, match="credentials"):
+        _ensure_base_url("http://user:pass@localhost:8080")
+    assert _ensure_base_url("http://localhost:8080") == "http://localhost:8080/"
+
+
