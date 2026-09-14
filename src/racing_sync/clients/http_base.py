@@ -62,6 +62,12 @@ def _ensure_base_url(host: str) -> str:
         raise ValueError(f"host must include a hostname, got: {host!r}")
     if parts.query or parts.fragment:
         raise ValueError(f"host must not include query/fragment, got: {host!r}")
+    if parts.username or parts.password:
+        # Credentials in the URL would flow into AuthError messages and
+        # request logs via host interpolation — refuse (message deliberately
+        # omits the host so the secret never lands in logs either).
+        raise ValueError("host must not embed credentials (user:pass@); "
+                         "use the username/password settings instead")
     return host.rstrip("/") + "/"
 
 
@@ -380,8 +386,10 @@ class HTTPClientBase:
                 "[%s] %s %s -> HTTP %d; retrying in %.1fs (attempt %d/3)",
                 self._label, method, path, r.status, delay, attempt + 1,
             )
-            await r.read()
-            r.close()
+            try:
+                await r.read()
+            finally:
+                r.close()
             await asyncio.sleep(delay)
             r = await _do()
 
@@ -446,8 +454,10 @@ class HTTPClientBase:
                 "[%s] %s %s -> HTTP %d after re-auth; retrying in %.1fs (attempt %d/3)",
                 self._label, method, path, r.status, delay, attempt + 1,
             )
-            await r.read()
-            r.close()
+            try:
+                await r.read()
+            finally:
+                r.close()
             await asyncio.sleep(delay)
             r = await _do()
 
