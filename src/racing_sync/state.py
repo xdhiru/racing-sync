@@ -268,7 +268,11 @@ class StateStore:
         row = ts.to_row()
         cols = ", ".join(row.keys())
         placeholders = ", ".join(["?"] * len(row))
-        updates = ", ".join(f"{k}=excluded.{k}" for k in row if k != "source_infohash")
+        updates = ", ".join(
+            f"{k}=excluded.{k}"
+            for k in row
+            if k not in ("source_infohash", "created_at")
+        )
         self._conn.execute(
             f"INSERT INTO torrent_state ({cols}) VALUES ({placeholders}) "
             f"ON CONFLICT(source_infohash) DO UPDATE SET {updates}",
