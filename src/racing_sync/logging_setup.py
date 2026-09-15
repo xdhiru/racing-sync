@@ -132,6 +132,12 @@ class HTTPSinkHandler(logging.handlers.QueueHandler):
             return
         super().emit(record)
 
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        super().close()
+
     def _run(self) -> None:
         import urllib.request
 
@@ -184,10 +190,13 @@ def setup_logging(cfg: AppConfig) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
+    root.setLevel(logging.INFO)
     # Wipe anything pre-existing (e.g. uvicorn defaults)
     for h in list(root.handlers):
         root.removeHandler(h)
+
+    # Scope DEBUG to racing_sync application logger
+    logging.getLogger("racing_sync").setLevel(logging.DEBUG)
 
     # Console (stderr) at INFO
     console = logging.StreamHandler()
@@ -229,7 +238,7 @@ def setup_logging(cfg: AppConfig) -> None:
         root.addHandler(sink)
 
     # Silence overly chatty libraries
-    for noisy in ("aiohttp.access", "asyncio", "urllib3"):
+    for noisy in ("aiohttp.access", "asyncio", "urllib3", "paramiko", "uvicorn"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     logging.getLogger("racing_sync").info(
