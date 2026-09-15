@@ -14,6 +14,11 @@ from racing_sync.config import AppConfig
 from racing_sync.state import State, TorrentState
 
 
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
 def _cfg() -> AppConfig:
     return AppConfig.from_toml(
         __file__.replace("\\", "/").rsplit("/", 1)[0] + "/../config.example.toml"
@@ -217,3 +222,68 @@ def test_should_notify_telegram_policy():
     assert _should_notify_telegram(State.RE_ADDING, State.DONE)
     assert _should_notify_telegram(State.RE_ADDING, State.FAILED)
     assert _should_notify_telegram(State.NEW, State.WAITING_SEEDPOOL)
+
+
+@pytest.mark.anyio
+async def test_process_torrent_inner_does_not_fallthrough_to_waiting_seedpool_from_new():
+    from unittest.mock import AsyncMock
+    from racing_sync.coordinator import Coordinator
+
+    coord = object.__new__(Coordinator)
+    coord._do_waiting_seedpool = AsyncMock()
+
+    async def fake_do_new(ts: TorrentState) -> None:
+        ts.state = State.WAITING_SEEDPOOL
+
+    coord._do_new = AsyncMock(side_effect=fake_do_new)
+
+    ts = TorrentState("hash_new", state=State.NEW)
+    await coord._process_torrent_inner(ts)
+
+    coord._do_new.assert_awaited_once_with(ts)
+    coord._do_waiting_seedpool.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_tick_skips_waiting_seedpool_in_step_4():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.max_active_downloads = 3
+    coord.cfg.max_concurrent_moves = 3
+    coord._tasks = set()
+    coord._running_infohashes = set()
+    coord._live = {}
+    coord._check_and_inject_late_cross_seeds = AsyncMock()
+    coord.watch = None
+    coord.store = MagicMock()
+    coord.store.list_seedpool_ready.return_value = []
+    coord._list_source_torrents = AsyncMock(return_value=[])
+
+    ts_waiting = TorrentState(
+        source_infohash="waiting_seedpool",
+        source_name="Waiting.Seedpool.Release",
+        state=State.WAITING_SEEDPOOL,
+    )
+    ts_queued = TorrentState(
+        source_infohash="queued_ready",
+        source_name="Queued.Release",
+        state=State.QUEUED,
+    )
+    coord.store.all_active.return_value = [ts_waiting, ts_queued]
+
+    scheduled: list[str] = []
+
+    async def fake_process(ts: TorrentState) -> None:
+        scheduled.append(ts.source_infohash)
+
+    coord._process_torrent = fake_process
+
+    await coord._tick()
+    await asyncio.sleep(0.01)
+
+    assert "waiting_seedpool" not in scheduled
+    assert "queued_ready" in scheduled
