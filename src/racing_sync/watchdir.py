@@ -331,23 +331,36 @@ def parse_torrent_file(path: Path) -> tuple[str, str, int, str, bytes]:
 
 
 class WatchDirScanner:
-    # Metadata-only file cache: (mtime, size, infohash, name, size, announce).
-    # Torrent bytes are re-read on emission only, so the cache can never
-    # hold onto megabytes per file.
+    # Metadata-only file cache: (mtime, size, infohash, name, size,
+    # announce, sha256-of-bytes). Torrent bytes are re-read on emission
+    # only, so the cache can never hold onto megabytes per file; the
+    # byte-hash proves identity on mtime+size hits (same-size swaps).
     _FILE_CACHE_MAX = 512
 
     def __init__(self, cfg: WatchDirConfig, prowlarr: ProwlarrClient | None):
         self._cfg = cfg
         self._prowlarr = prowlarr
         self._seen: set[str] = set()  # infohashes already picked up
-        self._file_cache: dict[Path, tuple[float, int, str, str, int, str]] = {}
+        self._file_cache: dict[Path, tuple[float, int, str, str, int, str, str]] = {}
         self._bad_files: dict[Path, tuple[float, int]] = {}
 
     async def scan_once(self) -> list[WatchItem]:
         out: list[WatchItem] = []
         current_files: set[Path] = set()
         current_infohashes: set[str] = set()
-        for entry in sorted(Path(self._cfg.path).glob(self._cfg.glob)):
+        # Case-insensitive torrent suffix: Path.glob is case-sensitive on
+        # Linux, so a dropped "Show.TORRENT" would be silently ignored
+        # (Windows dev boxes never see this — NTFS matches either way).
+        patterns = [self._cfg.glob]
+        if ".torrent" in self._cfg.glob and ".TORRENT" not in self._cfg.glob:
+            patterns.append(self._cfg.glob.replace(".torrent", ".TORRENT"))
+        entries: set[Path] = set()
+        for pattern in patterns:
+            try:
+                entries.update(Path(self._cfg.path).glob(pattern))
+            except Exception:
+                continue
+        for entry in sorted(entries):
             if entry.is_symlink():
                 log.warning("watch-dir: skipping symlink %s", entry.name)
                 continue
@@ -385,10 +398,29 @@ class WatchDirScanner:
                     if len(data) != fsize:
                         self._file_cache.pop(entry, None)
                         continue
+                    # Same-size replacement guard: an mtime+size hit must
+                    # still prove byte-identity, or a swapped file serves
+                    # the stale infohash forever. Re-parse on mismatch.
+                    _tag = hashlib.sha256(data).hexdigest()
+                    if len(cached) <= 6 or cached[6] != _tag:
+                        self._file_cache.pop(entry, None)
+                        try:
+                            infohash, name, size, announce = _bencoded_info_hash(data)
+                        except Exception as parse_err:
+                            if time.time() - mtime < 2.0:
+                                continue
+                            self._bad_files[entry] = (mtime, fsize)
+                            log.warning("watch-dir: re-parse failed for swapped %s (%s)",
+                                        entry.name, parse_err)
+                            continue
+                        self._file_cache[entry] = (
+                            mtime, fsize, infohash, name, size, announce, _tag)
                 else:
                     try:
                         infohash, name, size, announce, data = parse_torrent_file(entry)
-                        self._file_cache[entry] = (mtime, fsize, infohash, name, size, announce)
+                        self._file_cache[entry] = (
+                            mtime, fsize, infohash, name, size, announce,
+                            hashlib.sha256(data).hexdigest())
                         if len(self._file_cache) > self._FILE_CACHE_MAX:
                             # Evict oldest-inserted (dicts preserve order).
                             for k in list(self._file_cache.keys())[: len(self._file_cache) - self._FILE_CACHE_MAX]:

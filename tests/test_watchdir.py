@@ -1603,3 +1603,47 @@ async def test_wait_disk_then_queue_defers_for_watch_election(tmp_path: Path):
 
     assert waiter.state == State.WAITING_DISK
     coord._ssd_try_reserve.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_watchdir_same_size_swap_reparsed(tmp_path: Path):
+    """An mtime+size cache hit must still prove byte-identity.
+
+    Same-size replacement with a preserved mtime (syncthing-style) must
+    not serve the stale infohash forever.
+    """
+    import os
+
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    tfile = watch_dir / "swap.torrent"
+    data_a = _create_sample_torrent_data("AAAA.Release", 5000, "http://tracker.example.com/announce")
+    data_b = _create_sample_torrent_data("BBBB.Release", 5000, "http://tracker.example.com/announce")
+    assert len(data_a) == len(data_b)
+    tfile.write_bytes(data_a)
+
+    cfg = WatchDirConfig(path=watch_dir, glob="*.torrent", delete_after_pickup=False)
+    scanner = WatchDirScanner(cfg, prowlarr=None)
+    items = await scanner.scan_once()
+    assert len(items) == 1 and items[0].name == "AAAA.Release"
+
+    st = tfile.stat()
+    tfile.write_bytes(data_b)
+    os.utime(tfile, (st.st_atime, st.st_mtime))
+    scanner._seen.clear()
+    items2 = await scanner.scan_once()
+    assert len(items2) == 1 and items2[0].name == "BBBB.Release"
+
+
+@pytest.mark.anyio
+async def test_watchdir_picks_up_uppercase_suffix(tmp_path: Path):
+    """Show.TORRENT must not be silently ignored (Linux glob is exact-case)."""
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    (watch_dir / "Show.TORRENT").write_bytes(
+        _create_sample_torrent_data("Upper.Release", 5000, "http://tracker.example.com/announce"))
+
+    cfg = WatchDirConfig(path=watch_dir, glob="*.torrent", delete_after_pickup=False)
+    scanner = WatchDirScanner(cfg, prowlarr=None)
+    items = await scanner.scan_once()
+    assert len(items) == 1 and items[0].name == "Upper.Release"
