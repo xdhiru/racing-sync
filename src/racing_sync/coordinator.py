@@ -62,7 +62,7 @@ from .coordinator_errors import (
     BatchMoveIncompleteError,
     WebUIUnresponsiveError,
 )
-from .coordinator_paths import _safe_ssd_join
+from .coordinator_paths import _safe_ssd_join, _watch_cross_seed_dir
 from .coordinator_picker import pick_ssd_source_for_racing
 from .coordinator_ssd import SSDLedgerMixin
 from .prowlarr import ProwlarrClient, TorrentHit
@@ -1904,11 +1904,19 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         chosen_infohash = ts.source_infohash
         chosen_size = ts.total_bytes
 
-        # Prepare persistence directory for cross-seed torrents
-        watch_cross_dir = Path(self.cfg.general.state_db).parent / "watch_cross_seeds" / ts.source_infohash
-        await asyncio.to_thread(watch_cross_dir.mkdir, parents=True, exist_ok=True)
-        # Always persist the dropped .torrent so it can be seeded on FUSE
-        await asyncio.to_thread((watch_cross_dir / f"{ts.source_infohash}.torrent").write_bytes, blob)
+        # Prepare persistence directory for cross-seed torrents. The
+        # infohash is hex-validated by the helper: untrusted values can
+        # never escape the blob root via join/mkdir.
+        watch_cross_dir = _watch_cross_seed_dir(
+            self.cfg.general.state_db, ts.source_infohash)
+        if watch_cross_dir is not None:
+            await asyncio.to_thread(watch_cross_dir.mkdir, parents=True, exist_ok=True)
+            # Always persist the dropped .torrent so it can be seeded on FUSE
+            _safe_name = f"{ts.source_infohash.strip().lower()}.torrent"
+            await asyncio.to_thread((watch_cross_dir / _safe_name).write_bytes, blob)
+        else:
+            log.warning("refusing blob persistence for %s: bad infohash %r",
+                        ts.source_name[:60], ts.source_infohash)
 
         query_prowlarr = True
         prefer_prowlarr = True
@@ -4757,8 +4765,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
     async def _re_inject_watch_dir_torrents(self, ts: TorrentState) -> None:
         """Re-add every watch-dir dropped torrent and discovered cross-seeds onto FUSE."""
-        watch_cross_dir = Path(self.cfg.general.state_db).parent / "watch_cross_seeds" / ts.source_infohash
-        if not watch_cross_dir.exists():
+        watch_cross_dir = _watch_cross_seed_dir(
+            self.cfg.general.state_db, ts.source_infohash)
+        if watch_cross_dir is None or not watch_cross_dir.exists():
             return
         ts_fallback_mount = self._target_mount_for(ts)
         injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
