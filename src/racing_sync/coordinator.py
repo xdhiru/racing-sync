@@ -603,6 +603,8 @@ class Coordinator:
                         "unexpected error in coordinator tick; "
                         "backing off for one poll interval: %s", e, exc_info=True,
                     )
+                if self._stop:
+                    break
                 # Cancellable sleep so SIGINT/SIGTERM break out quickly.
                 try:
                     await asyncio.sleep(
