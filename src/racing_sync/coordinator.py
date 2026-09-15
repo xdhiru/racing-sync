@@ -1200,11 +1200,10 @@ class Coordinator:
     async def _wait_disk_then_queue(self, ts: TorrentState) -> None:
         # The size check uses total_bytes; for seasons the real SSD footprint
         # is bounded by the batch cap. The actual add will re-check.
-        while not self._stop:
-            if ssd_has_room(self.cfg, ts.total_bytes):
-                self.transition(ts, State.QUEUED)
-                return
-            await asyncio.sleep(10)
+        if self._stop:
+            return
+        if ssd_has_room(self.cfg, ts.total_bytes):
+            self.transition(ts, State.QUEUED)
 
     # ---- state: QUEUED ----
 
