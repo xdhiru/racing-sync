@@ -1497,7 +1497,10 @@ class Coordinator:
         # 6. Delete local content folder on SSD after move
         if folder and folder.resolve() != src_dir.resolve() and folder.exists():
             log.info("deleting content folder after move: %s", folder)
-            await wipe_local_tree(folder)
+            await wipe_local_tree(
+                folder,
+                base_dir=[self.cfg.ssd.path, Path(self.cfg.dest.save_path)],
+            )
 
         self.transition(ts, State.RE_ADDING)
 
