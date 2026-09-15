@@ -97,18 +97,15 @@ def _ssd_bases(cfg) -> list[Path]:
 
 def _watch_cross_seeds_dir(cfg, source_infohash: str) -> Path | None:
     """Cached .torrent dir for one row (sibling of state.db), if configured."""
-    norm = (source_infohash or "").strip().lower()
-    if not norm:
-        # Never return the blob root itself: forgetting a hash-less row
-        # must not wipe every cached .torrent.
-        return None
+    from .coordinator_paths import _watch_cross_seed_dir
+
     try:
-        db = Path(getattr(cfg.general, "state_db", ""))
+        db = getattr(cfg.general, "state_db", "")
     except Exception:
         return None
     if not str(db):
         return None
-    return db.parent / "watch_cross_seeds" / norm
+    return _watch_cross_seed_dir(db, source_infohash)
 
 
 async def _candidate_local_paths(cfg, dest, row, entry_hashes: list[str]) -> tuple[list[Path], list[str]]:
@@ -234,11 +231,27 @@ def _is_fuse_save_path(cfg, save_path: str) -> bool:
     sp = (save_path or "").rstrip("/\\").replace("\\", "/")
     if not sp:
         return False
+    # Resolve symlinks/.. on both sides (fail-safe direction): an
+    # SSD-looking path that resolves under a fuse mount must still count
+    # as fuse (delete_files=False), or a symlinked save_path bypasses the
+    # protection and deletes remote data.
+    candidates = {sp}
+    try:
+        candidates.add(str(Path(sp).resolve()).replace("\\", "/"))
+    except OSError:
+        pass
     for fm in _fuse_mounts(cfg):
         if not fm:
             continue
-        if sp == fm or sp.startswith(fm + "/"):
-            return True
+        fm_cands = {fm}
+        try:
+            fm_cands.add(str(Path(fm).resolve()).replace("\\", "/"))
+        except OSError:
+            pass
+        for cand in candidates:
+            for base in fm_cands:
+                if cand == base or cand.startswith(base + "/"):
+                    return True
     return False
 
 

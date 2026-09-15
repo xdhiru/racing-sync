@@ -425,3 +425,35 @@ def test_resolve_row_rejects_short_hash_and_hash_dupes(tmp_path: Path):
             resolve_row(store, "a" * 40)
     finally:
         store.close()
+
+
+def test_is_fuse_save_path_resolves_symlinks(tmp_path: Path):
+    """A symlinked save_path pointing at fuse still counts as fuse."""
+    from racing_sync.forget import _is_fuse_save_path
+
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+    (fuse / "unsorted").mkdir()
+    link = tmp_path / "ssdlink"
+    try:
+        link.symlink_to(fuse, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    cfg = MagicMock()
+    cfg.rclone.fuse.mount = str(fuse)
+    cfg.rclone.fuse.mount_unsorted = str(fuse / "unsorted")
+    assert _is_fuse_save_path(cfg, str(link)) is True
+    assert _is_fuse_save_path(cfg, str(link / "sub")) is True
+    assert _is_fuse_save_path(cfg, str(tmp_path / "ssd")) is False
+
+
+def test_watch_cross_seed_dir_rejects_hostile_hash(tmp_path: Path):
+    """Infohash path joins accept 40-hex only (no traversal, no root)."""
+    from racing_sync.coordinator_paths import _watch_cross_seed_dir
+
+    db = tmp_path / "state.db"
+    good = _watch_cross_seed_dir(db, "a" * 40)
+    assert good == tmp_path / "watch_cross_seeds" / ("a" * 40)
+    assert _watch_cross_seed_dir(db, "../../evil") is None
+    assert _watch_cross_seed_dir(db, "") is None
+    assert _watch_cross_seed_dir(db, "z" * 40) is None
