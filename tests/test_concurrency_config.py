@@ -512,6 +512,76 @@ async def test_wait_disk_then_queue_false_branch():
 
 
 @pytest.mark.anyio
+async def test_pick_ssd_source_private_primary_with_public_dupe():
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.coordinator import pick_ssd_source_for_racing
+
+    t_priv = Torrent(
+        hash="priv_hash_1111",
+        name="Movie.2024.1080p",
+        category="",
+        save_path="",
+        size_bytes=2000,
+        state="racing",
+        progress=1.0,
+        trackers=["https://aither.cc/announce/passkey"],
+    )
+    t_pub = Torrent(
+        hash="pub_hash_2222",
+        name="Movie.2024.1080p",
+        category="",
+        save_path="",
+        size_bytes=2000,
+        state="racing",
+        progress=1.0,
+        trackers=["udp://tracker.opentrackr.org:1337/announce"],
+    )
+
+    source_client = AsyncMock()
+    source_client.export_torrent.return_value = b"pub_torrent_bytes"
+    sftp = MagicMock()
+    sftp.fetch_torrent.return_value = b"sftp_pub_bytes"
+
+    # 1. SFTP export path: must export the public torrent hash, NOT the private one
+    cfg_sftp = MagicMock()
+    cfg_sftp.cross_seed.allow_ssh_export = True
+    cfg_sftp.cross_seed.refetch_public_via_prowlarr = False
+
+    dec_sftp = await pick_ssd_source_for_racing(
+        cfg=cfg_sftp,
+        source_torrent=t_priv,
+        other_source_torrents=[t_pub],
+        prowlarr=None,
+        sftp=sftp,
+        source_client=source_client,
+    )
+    assert dec_sftp is not None
+    assert dec_sftp.source_label == "public-racing"
+    assert dec_sftp.infohash == "pub_hash_2222"
+    assert dec_sftp.torrent_bytes == b"sftp_pub_bytes"
+    sftp.fetch_torrent.assert_called_once_with("pub_hash_2222")
+
+    # 2. WebUI export path: must export the public torrent hash via client
+    cfg_webui = MagicMock()
+    cfg_webui.cross_seed.allow_ssh_export = False
+    cfg_webui.cross_seed.refetch_public_via_prowlarr = False
+
+    dec_webui = await pick_ssd_source_for_racing(
+        cfg=cfg_webui,
+        source_torrent=t_priv,
+        other_source_torrents=[t_pub],
+        prowlarr=None,
+        sftp=None,
+        source_client=source_client,
+    )
+    assert dec_webui is not None
+    assert dec_webui.source_label == "public-racing"
+    assert dec_webui.infohash == "pub_hash_2222"
+    assert dec_webui.torrent_bytes == b"pub_torrent_bytes"
+    source_client.export_torrent.assert_awaited_once_with("pub_hash_2222")
+
+
+@pytest.mark.anyio
 async def test_do_queued_happy_path():
     coord = object.__new__(Coordinator)
     coord.cfg = MagicMock()
