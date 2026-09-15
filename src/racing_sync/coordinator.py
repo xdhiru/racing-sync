@@ -1205,10 +1205,10 @@ class Coordinator:
             ]
             save_path = ext.save_path.rstrip("/")
             on_fuse = any(save_path.startswith(fm) for fm in fuse_mounts if fm)
-            if on_fuse or ext.is_complete():
+            if on_fuse and ext.is_complete():
                 log.info(
-                    "torrent %s is already completed on VPS2 (fuse=%s, complete=%s); marking DONE",
-                    ts.source_infohash[:10], on_fuse, ext.is_complete(),
+                    "torrent %s is already completed on VPS2 fuse mount; marking DONE",
+                    ts.source_infohash[:10],
                 )
                 ts.dest_infohash = ext.hash
                 ts.save_path = ext.save_path
@@ -1217,7 +1217,12 @@ class Coordinator:
                 self.transition(ts, State.DONE)
                 return
 
-            log.info("torrent already downloading on VPS2: %s", ts.source_infohash[:10])
+            log.info(
+                "torrent already on VPS2: %s (complete=%s, on_fuse=False)",
+                ts.source_infohash[:10], ext.is_complete(),
+            )
+            ts.dest_infohash = ext.hash
+            ts.save_path = ext.save_path
             self.transition(ts, State.DOWNLOADING)
             return
 
