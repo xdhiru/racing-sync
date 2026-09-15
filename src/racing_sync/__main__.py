@@ -41,15 +41,21 @@ def main(argv: list[str] | None = None) -> int:
     
     main_task = None
     
-    def _signal_handler():
+    def _signal_handler(*_args: object) -> None:
         nonlocal main_task
         log.info("Signal received, stopping...")
         coord.request_stop()
         if main_task and not main_task.done():
-            main_task.cancel()
-    
+            loop.call_soon_threadsafe(main_task.cancel)
+
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _signal_handler)
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except (NotImplementedError, RuntimeError):
+            try:
+                signal.signal(sig, _signal_handler)
+            except (ValueError, OSError):
+                pass
 
     try:
         main_task = loop.create_task(coord.run())
