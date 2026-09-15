@@ -204,3 +204,59 @@ def test_cross_seed_tolerance_rejects_large_relative_difference_for_small_files(
     assert abs(candidate_size - total_bytes) > tolerance
 
 
+@pytest.mark.anyio
+async def test_prowlarr_best_match_ranking():
+    cfg = ProwlarrConfig(
+        enabled=True,
+        base_url="http://127.0.0.1:9696",
+        api_key="secret",
+        download_indexer="Seedpool (API)",
+    )
+    client = ProwlarrClient(cfg)
+    idx = Indexer(1, "Seedpool (API)", "torrent", True, [])
+    client.get_download_indexer = MagicMock(return_value=idx)
+
+    h_partial_large = TorrentHit(
+        title="Movie.2024.Extended.1080p",
+        guid="1",
+        indexer="Seedpool",
+        indexer_id=1,
+        size_bytes=10_000_000_000,
+        download_url="http://prowlarr/1",
+        magnet_url="",
+        info_url="",
+        publish_date="",
+    )
+    h_exact_small = TorrentHit(
+        title="Movie.2024.1080p",
+        guid="2",
+        indexer="Seedpool",
+        indexer_id=1,
+        size_bytes=5_000_000_000,
+        download_url="http://prowlarr/2",
+        magnet_url="",
+        info_url="",
+        publish_date="",
+    )
+    h_exact_large = TorrentHit(
+        title="Movie.2024.1080p",
+        guid="3",
+        indexer="Seedpool",
+        indexer_id=1,
+        size_bytes=8_000_000_000,
+        download_url="http://prowlarr/3",
+        magnet_url="",
+        info_url="",
+        publish_date="",
+    )
+
+    client.search_indexer = AsyncMock(return_value=[h_partial_large, h_exact_small, h_exact_large])
+
+    best = await client.best_match("Movie.2024.1080p")
+    assert best is not None
+    # Exact match wins over partial match even if partial is larger,
+    # and largest exact match wins between the two exact matches.
+    assert best.guid == "3"
+    assert best.size_bytes == 8_000_000_000
+
+

@@ -409,3 +409,130 @@ def test_config_strict_validations():
     # 6. APIConfig token placeholder
     with pytest.raises(ValidationError, match="placeholder"):
         APIConfig(enabled=True, api_token="CHANGE_ME")
+
+
+@pytest.mark.anyio
+async def test_pick_ssd_source_public_and_private_paths():
+    from unittest.mock import patch
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.coordinator import pick_ssd_source_for_racing
+
+    source_client = AsyncMock()
+    source_client.export_torrent.return_value = b"d8:announce...e"
+    prowlarr = AsyncMock()
+
+    # Public path: public tracker present -> direct export from source_client, no Prowlarr
+    t_public = Torrent(
+        hash="hpub",
+        name="Public.Movie",
+        category="",
+        save_path="",
+        size_bytes=1000,
+        state="racing",
+        progress=1.0,
+        trackers=["http://tracker.openbittorrent.com/announce"],
+    )
+    cfg = MagicMock()
+    cfg.cross_seed.allow_ssh_export = False
+    cfg.cross_seed.refetch_public_via_prowlarr = False
+
+    dec = await pick_ssd_source_for_racing(
+        cfg=cfg,
+        source_torrent=t_public,
+        other_source_torrents=[],
+        prowlarr=prowlarr,
+        sftp=None,
+        source_client=source_client,
+    )
+    assert dec is not None
+    assert dec.source_label == "public-racing"
+    assert dec.torrent_bytes == b"d8:announce...e"
+    prowlarr.best_match.assert_not_called()
+
+    # Private path: only private tracker present -> query Prowlarr
+    t_priv = Torrent(
+        hash="hpriv",
+        name="Priv.Movie",
+        category="",
+        save_path="",
+        size_bytes=1000,
+        state="racing",
+        progress=1.0,
+        trackers=["https://aither.cc/announce/passkey"],
+    )
+    cfg_priv = MagicMock()
+    cfg_priv.prowlarr.enabled = True
+    cfg_priv.prowlarr.should_skip_title.return_value = False
+    cfg_priv.prowlarr.download_indexer = "Seedpool (API)"
+    cfg_priv.prowlarr.tracker_map = {"aither.cc": "Aither (API)"}
+    cfg_priv.prowlarr.get_download_indexer.return_value = MagicMock()
+    cfg_priv.cross_seed.allow_prowlarr_cross_seed = True
+
+    hit = MagicMock(title="Priv.Movie", size_bytes=1000, download_url="http://seedpool/1")
+    prowlarr.best_match.return_value = hit
+    prowlarr.download_torrent.return_value = b"prowlarr_blob"
+
+    dec_priv = await pick_ssd_source_for_racing(
+        cfg=cfg_priv,
+        source_torrent=t_priv,
+        other_source_torrents=[],
+        prowlarr=prowlarr,
+        sftp=None,
+        source_client=source_client,
+    )
+    assert dec_priv is not None
+    assert dec_priv.source_label == "seedpool-cross-seed"
+    assert dec_priv.torrent_bytes == b"prowlarr_blob"
+
+
+@pytest.mark.anyio
+async def test_wait_disk_then_queue_false_branch():
+    from unittest.mock import patch
+
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord._stop = False
+    coord.transition = MagicMock()
+
+    ts = TorrentState(source_infohash="h1", state=State.WAITING_DISK, total_bytes=1000)
+
+    call_count = 0
+    def fake_has_room(cfg, size):
+        nonlocal call_count
+        call_count += 1
+        coord._stop = True
+        return False
+
+    with patch("racing_sync.coordinator.ssd_has_room", side_effect=fake_has_room), \
+         patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        await coord._wait_disk_then_queue(ts)
+        assert call_count == 1
+        mock_sleep.assert_awaited_once_with(10)
+        coord.transition.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_do_queued_happy_path():
+    coord = object.__new__(Coordinator)
+    coord.cfg = MagicMock()
+    coord.cfg.rclone.fuse.mount = "/mnt/fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = "/mnt/fuse/unsorted"
+    coord.cfg.classifier._episode_re = None
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 10_000_000_000
+
+    ts = TorrentState(source_infohash="h1", source_name="Movie.2024", state=State.QUEUED, save_path="/downloads")
+    ts._blob = b"d8:announce..."
+
+    coord.dest_client = MagicMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    coord.dest_client.add_torrent = AsyncMock(return_value=AddResult(hash="dest_h1", accepted=True))
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[TorrentFile("Movie.2024.mkv", 5_000_000_000)])
+    coord.dest_client.resume = AsyncMock()
+
+    coord.transition = MagicMock()
+
+    await coord._do_queued(ts)
+
+    coord.dest_client.add_torrent.assert_awaited_once()
+    assert ts.dest_infohash == "dest_h1"
+    coord.transition.assert_called_once_with(ts, State.DOWNLOADING)
