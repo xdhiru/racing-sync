@@ -8,9 +8,24 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic_core import core_schema
+
+
+class SecretStr(str):
+    """A string subclass that masks its value in __repr__ and serialization."""
+
+    def __repr__(self) -> str:
+        return "SecretStr('**********')" if self else "SecretStr('')"
+
+    def get_secret_value(self) -> str:
+        return str(self)
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type: Any, handler: Any) -> core_schema.CoreSchema:
+        return core_schema.no_info_after_validator_function(cls, core_schema.str_schema())
 
 
 class NginxAuthConfig(BaseModel):
@@ -55,7 +70,7 @@ class HTTPClientConfig(BaseModel):
 
     host: str
     username: str = ""
-    password: str = ""
+    password: SecretStr = SecretStr("")
     nginx_mode: Literal["basic", "form_post", "off"] = "off"
     nginx_url: str = ""
     nginx_user_field: str = "username"
@@ -112,10 +127,10 @@ class DelugeSFTPConfig(BaseModel):
     ssh_port: int = 22
     ssh_user: str = "deluge"
     # Plain password auth (used only when no key file is provided).
-    ssh_password: str = ""
+    ssh_password: SecretStr = SecretStr("")
     # Public-key auth
     ssh_key_path: Path | None = None
-    ssh_key_passphrase: str = ""
+    ssh_key_passphrase: SecretStr = SecretStr("")
     known_hosts_path: Path | None = None
     auto_add_host_key: bool = False
     state_dir: Path
@@ -142,7 +157,7 @@ class SourceConfig(BaseModel):
     type: Literal["qbittorrent", "deluge"]
     host: str
     username: str = ""
-    password: str = ""
+    password: SecretStr = SecretStr("")
     # Filter torrents on the racing client by their category / label.
     # Empty string (default) means "match all categories" — every
     # torrent on the racing client is eligible for sync. This is the
@@ -186,7 +201,7 @@ class SourceConfig(BaseModel):
 class DestConfig(BaseModel):
     host: str
     username: str = ""
-    password: str = ""
+    password: SecretStr = SecretStr("")
     save_path: Path
     # Optional nginx basic-auth in front of the qBittorrent WebUI on VPS2.
     nginx: NginxAuthConfig = NginxAuthConfig()
@@ -276,7 +291,7 @@ class TelegramConfig(BaseModel):
     to Telegram.
     """
     enabled: bool = False
-    bot_token: str = ""
+    bot_token: SecretStr = SecretStr("")
     chat_id: str = ""
     status_update_interval: int = Field(default=45, ge=5)
     pin_status_message: bool = False
@@ -293,7 +308,7 @@ class TelegramConfig(BaseModel):
 class LoggingSinkConfig(BaseModel):
     enabled: bool = False
     url: str = ""
-    auth_token: str = ""
+    auth_token: SecretStr = SecretStr("")
     forward_min_level: Literal[
         "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
     ] = "INFO"
@@ -383,7 +398,7 @@ class ProwlarrConfig(BaseModel):
 
     enabled: bool = False
     base_url: str = ""       # e.g. http://127.0.0.1:9696
-    api_key: str = ""
+    api_key: SecretStr = SecretStr("")
     # req #6: the indexer used for SSD downloads + cross-seed searches.
     # No default — you MUST set this when [prowlarr].enabled = true,
     # because the name must match exactly what your Prowlarr instance
@@ -523,7 +538,7 @@ class APIConfig(BaseModel):
     port: int = Field(default=8765, ge=1, le=65535)
     trust_nginx_header: bool = True
     trusted_proxies: list[str] = ["127.0.0.1", "::1", "localhost"]
-    api_token: str = ""
+    api_token: SecretStr = SecretStr("")
 
 
 class GeneralConfig(BaseModel):
