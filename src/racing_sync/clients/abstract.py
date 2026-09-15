@@ -50,12 +50,17 @@ class AddResult:
 class TorrentClient(ABC):
     """Abstract interface for torrent client operations.
 
-    Note: lifecycle methods `start()` and `close()` are intentionally NOT
-    declared here. They are provided by the concrete client (e.g.
-    `HTTPClientBase`) and abstracting them just creates an MRO conflict
-    with multiple-inheritance clients (qB / Deluge) where the concrete
-    base defines them.
+    Concrete clients like `QBittorrentClient` and `DelugeClient` also inherit
+    `HTTPClientBase`, which provides the underlying session management.
+    `close()` invokes `super().close()` if defined to properly clean up
+    the underlying HTTP session while satisfying static type checking.
     """
+
+    async def close(self) -> None:
+        """Close client connections and release resources."""
+        close_fn = getattr(super(), "close", None)
+        if callable(close_fn):
+            await close_fn()
 
     @abstractmethod
     async def list_torrents(
