@@ -6,6 +6,7 @@ requires SFTP, rclone remote paths must be `name:path/`).
 
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -276,7 +277,12 @@ class ClassifierConfig(BaseModel):
 
     @property
     def _episode_re(self) -> re.Pattern[str]:
-        return re.compile(self.episode_regex)
+        cached = self.__dict__.get("_cached_re_tuple")
+        if cached and cached[0] == self.episode_regex:
+            return cached[1]
+        compiled = re.compile(self.episode_regex)
+        self.__dict__["_cached_re_tuple"] = (self.episode_regex, compiled)
+        return compiled
 
 
 class TelegramConfig(BaseModel):
