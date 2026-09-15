@@ -1076,6 +1076,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
     # ---- per-torrent worker ----
 
+    def _drop_live_for(self, ts: TorrentState) -> None:
+        """Pop _live entries owned by this worker (throw-path backstop).
+
+        Expected exits pop their own keys; an unexpected throw between
+        insert and pop would otherwise poll a dead hash forever. Ended
+        workers own nothing live by definition, so this is idempotent.
+        """
+        try:
+            want = (ts.source_infohash or "").lower()
+            live = getattr(self, "_live", None)
+            if not want or not isinstance(live, dict) or not live:
+                return
+            for k in [k for k, v in live.items()
+                      if (getattr(v, "source_infohash", "") or "").lower() == want]:
+                live.pop(k, None)
+        except Exception:
+            pass
+
     async def _process_torrent(self, ts: TorrentState) -> None:
         try:
             # Fresh-state guard: API retry / forget / recovery may have moved
@@ -1105,7 +1123,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         ts.source_infohash[:10], ts.state.value, _fresh.state.value,
                     )
                     return
-            await self._process_torrent_inner(ts)
+            try:
+                await self._process_torrent_inner(ts)
+            finally:
+                self._drop_live_for(ts)
         except AbandonedError as e:
             # The DB row is gone (forget/cancel removed it mid-flight):
             # unwind quietly. Failing here would upsert-resurrect the
@@ -1242,6 +1263,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     except (TypeError, ValueError):
                         _interval = 60.0
                     _wd[(ts.source_infohash or "").lower()] = time.monotonic() + _interval
+                    if len(_wd) > 5000:
+                        # Bound quiet-wait hints (forgotten rows bypass
+                        # transition pops; the prune reaps them, this caps).
+                        for _k in list(_wd.keys())[: len(_wd) - 5000]:
+                            _wd.pop(_k, None)
             except Exception:
                 pass
         # SSD ledger: reservation held only while the row can occupy SSD
@@ -2920,6 +2946,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     async def _await_hash_for_name(self, name: str, *, timeout_s: float = 60) -> str | None:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
+            if getattr(self, "_stop", False):
+                return None
             # Dest entries are always added with category="racing": filter
             # server-side instead of pulling 10k long-term seeds per poll.
             rows = await self.dest_client.list_torrents(category="racing")
@@ -3806,6 +3834,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 self._moving_parks = parks
             n = int(parks.get(key, 0) or 0) + 1
             parks[key] = n
+            if len(parks) > 5000:
+                for _k in list(parks.keys())[: len(parks) - 5000]:
+                    parks.pop(_k, None)
         except Exception:
             n = 1
         try:

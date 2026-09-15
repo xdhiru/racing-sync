@@ -245,6 +245,19 @@ def build_app(coord: Coordinator) -> FastAPI:
                 await coord._ssd_release(result.get("source_infohash") or normalized)
             except Exception:
                 pass
+            # Same for the quiet-wait / MOVING-park maps (transition pops
+            # bypassed); the admission set reconciles itself via
+            # _running_infohashes, and the prune reaps the rest.
+            try:
+                _gone = (result.get("source_infohash") or normalized).lower()
+                _wd = getattr(coord, "_waiting_disk_next_check", None)
+                if isinstance(_wd, dict):
+                    _wd.pop(_gone, None)
+                _mp = getattr(coord, "_moving_parks", None)
+                if isinstance(_mp, dict):
+                    _mp.pop(_gone, None)
+            except Exception:
+                pass
         paired_hashes: list[str] = []
         try:
             for pair in result.get("paired_cancelled") or []:

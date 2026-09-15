@@ -178,32 +178,61 @@ class SSDLedgerMixin:
         return lk
 
     def _ssd_prune_stale(self) -> None:
-        """Drop reservations for rows no longer needing SSD (forget/crash drift)."""
+        """Drop bookkeeping for rows no longer needing it (forget/crash drift).
+
+        Covers the SSD ledger plus the quiet-wait and MOVING-park maps,
+        whose transition-time pops are bypassed by forget/cancel (CLI or
+        API). Runs on every admission attempt — cheap fast path when the
+        maps are small.
+        """
         try:
-            d = getattr(self, "_ssd_reserved", None)
-            if not isinstance(d, dict) or not d:
-                return
             store = getattr(self, "store", None)
             if store is None or not hasattr(store, "get"):
                 return
-            for h in list(d.keys()):
+            d = getattr(self, "_ssd_reserved", None)
+            if isinstance(d, dict) and d:
+                for h in list(d.keys()):
+                    try:
+                        row = store.get(h, include_blob=False)
+                    except Exception:
+                        continue
+                    # Deleted row → free. Known non-SSD states → free. Unknown
+                    # doubles (MagicMock state) → keep (can't prove stale).
+                    if row is None:
+                        d.pop(h, None)
+                        continue
+                    try:
+                        st = getattr(row, "state", None)
+                    except Exception:
+                        continue
+                    if isinstance(st, State) and st not in (
+                        State.QUEUED, State.DOWNLOADING, State.MOVING,
+                    ):
+                        d.pop(h, None)
+            # Quiet-wait hints / MOVING-park counters for rows that left
+            # (or lost) those states without a transition pop.
+            for attr, want in (("_waiting_disk_next_check", State.WAITING_DISK),
+                               ("_moving_parks", State.MOVING)):
                 try:
-                    row = store.get(h)
+                    m = getattr(self, attr, None)
+                    if not isinstance(m, dict) or not m:
+                        continue
+                    for h in list(m.keys()):
+                        try:
+                            row = store.get(h, include_blob=False)
+                        except Exception:
+                            continue
+                        if row is None:
+                            m.pop(h, None)
+                            continue
+                        try:
+                            st = getattr(row, "state", None)
+                        except Exception:
+                            continue
+                        if isinstance(st, State) and st != want:
+                            m.pop(h, None)
                 except Exception:
                     continue
-                # Deleted row → free. Known non-SSD states → free. Unknown
-                # doubles (MagicMock state) → keep (can't prove stale).
-                if row is None:
-                    d.pop(h, None)
-                    continue
-                try:
-                    st = getattr(row, "state", None)
-                except Exception:
-                    continue
-                if isinstance(st, State) and st not in (
-                    State.QUEUED, State.DOWNLOADING, State.MOVING,
-                ):
-                    d.pop(h, None)
         except Exception:
             pass
 

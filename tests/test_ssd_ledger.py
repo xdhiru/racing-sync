@@ -226,3 +226,23 @@ async def test_grow_beyond_physical_disk_fails(tmp_path):
     # A grow that fits the live disk still succeeds.
     assert await coord._ssd_adjust("p" * 40, 12_000) is True
     assert coord._ssd_reserved["p" * 40] == 12_000
+
+
+def test_prune_stale_reaps_forgotten_wait_and_park_keys(tmp_path):
+    """Forget bypasses transition pops: the prune reaps orphaned hints."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="q" * 40, source_name="X",
+                                  state=State.WAITING_DISK))
+        coord = make_coordinator(store)
+        coord.cfg = MagicMock()
+        coord._waiting_disk_next_check = {"q" * 40: 1.0, "z" * 40: 2.0}
+        coord._moving_parks = {"q" * 40: 3}
+        coord._ssd_reserved = {}
+        coord._ssd_prune_stale()
+        # Live WAITING_DISK row keeps its hint; gone rows and wrong-state
+        # counters are reaped.
+        assert coord._waiting_disk_next_check == {"q" * 40: 1.0}
+        assert coord._moving_parks == {}
+    finally:
+        store.close()
