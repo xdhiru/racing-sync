@@ -622,9 +622,10 @@ class Coordinator:
             return []
         items = await self.watch.scan_once()
         for item in items:
-            if self.store.get(item.infohash) is None:
+            item_hash = item.infohash.lower()
+            if self.store.get(item_hash) is None and self.store.get(item.infohash) is None:
                 ts = TorrentState(
-                    source_infohash=item.infohash,
+                    source_infohash=item_hash,
                     source_name=item.name,
                     total_bytes=item.size_bytes,
                     source_announce_url=item.announce_url,
@@ -678,7 +679,7 @@ class Coordinator:
             # Check if any torrent in this release group is already tracked in state store
             existing_ts: TorrentState | None = None
             for t in group:
-                found_ts = self.store.get(t.infohash)
+                found_ts = self.store.get(t.infohash.lower()) or self.store.get(t.infohash)
                 if found_ts is not None:
                     existing_ts = found_ts
                     break
@@ -702,7 +703,7 @@ class Coordinator:
             is_pub = _looks_public(primary.trackers)
 
             ts = TorrentState(
-                source_infohash=primary.infohash,
+                source_infohash=primary.infohash.lower(),
                 source_name=primary.name,
                 total_bytes=primary.size_bytes,
                 source_announce_url=primary.trackers[0] if primary.trackers else "",
@@ -963,7 +964,7 @@ class Coordinator:
             self._park_for_seedpool_retry(ts)
             return
 
-        ts.cross_seed_infohash = decision.infohash
+        ts.cross_seed_infohash = decision.infohash.lower()
         ts.cross_seed_source = decision.source_label
         ts.save_path = str(self.cfg.dest.save_path)
 
@@ -1089,7 +1090,7 @@ class Coordinator:
                         except Exception as e:  # noqa: BLE001
                             log.warning("could not download cross-seed from %s: %s", hit.indexer, e)
 
-        ts.cross_seed_infohash = chosen_infohash
+        ts.cross_seed_infohash = chosen_infohash.lower()
         ts.cross_seed_source = chosen_label
         ts.cross_seed_blob = chosen_blob
         ts._blob = chosen_blob
@@ -1186,7 +1187,7 @@ class Coordinator:
             self._park_for_seedpool_retry(ts)
             return
 
-        ts.cross_seed_infohash = decision.infohash
+        ts.cross_seed_infohash = decision.infohash.lower()
         ts.cross_seed_source = decision.source_label
         ts.save_path = str(self.cfg.dest.save_path)
         ts.cross_seed_blob = decision.torrent_bytes
@@ -1230,7 +1231,7 @@ class Coordinator:
                     "torrent %s is already completed on VPS2 fuse mount; marking DONE",
                     ts.source_infohash[:10],
                 )
-                ts.dest_infohash = ext.hash
+                ts.dest_infohash = ext.hash.lower()
                 ts.save_path = ext.save_path
                 if self.cfg.cross_seed.inject_racing_torrents_to_fuse:
                     await self._re_inject_racing_torrents(ts)
@@ -1241,7 +1242,7 @@ class Coordinator:
                 "torrent already on VPS2: %s (complete=%s, on_fuse=False)",
                 ts.source_infohash[:10], ext.is_complete(),
             )
-            ts.dest_infohash = ext.hash
+            ts.dest_infohash = ext.hash.lower()
             ts.save_path = ext.save_path
             self.transition(ts, State.DOWNLOADING)
             return
@@ -1273,7 +1274,7 @@ class Coordinator:
             new_hash = await self._await_hash_for_name(ts.source_name)
 
         if new_hash:
-            ts.dest_infohash = new_hash
+            ts.dest_infohash = new_hash.lower()
 
         # Classify
         files = await self.dest_client.get_torrent_files(ts.dest_infohash or ts.source_infohash)
@@ -1324,7 +1325,7 @@ class Coordinator:
             rows = await self.dest_client.list_torrents()
             for t in rows:
                 if t.name == name:
-                    return t.hash
+                    return t.hash.lower()
             await asyncio.sleep(2)
         return None
 
@@ -1701,17 +1702,18 @@ class Coordinator:
         if not blob:
             return
 
-        h = ts.dest_infohash or ts.source_infohash
+        h = (ts.dest_infohash or ts.source_infohash or "").lower()
         blob_hash = ""
         try:
             from .watchdir import _bencoded_info_hash
-            blob_hash, _, _, _ = _bencoded_info_hash(blob)
+            parsed_hash, _, _, _ = _bencoded_info_hash(blob)
+            blob_hash = parsed_hash.lower()
         except Exception:
             pass
-        target_hash = blob_hash or ts.cross_seed_infohash or h
+        target_hash = (blob_hash or ts.cross_seed_infohash or h).lower()
 
         injected_hashes = {x.lower() for x in ts.injected_private_hashes.split(",") if x}
-        if target_hash and target_hash.lower() in injected_hashes:
+        if target_hash and target_hash in injected_hashes:
             log.info("cross-seed torrent %s already injected on fuse in step 1", target_hash[:10])
             return
 
@@ -1749,7 +1751,8 @@ class Coordinator:
         if not watch_cross_dir.exists():
             return
         target_mount = self._target_mount_for(ts)
-        injected = [h for h in ts.injected_private_hashes.split(",") if h]
+        injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
+        injected_set = set(injected)
 
         try:
             for p in sorted(watch_cross_dir.glob("*.torrent")):
@@ -1761,7 +1764,8 @@ class Coordinator:
                     log.warning("failed to read watch-dir torrent %s: %s", p.name, e)
                     continue
 
-                if h in injected:
+                h_low = h.lower()
+                if h_low in injected_set:
                     continue
 
                 res = await self.dest_client.add_torrent(
@@ -1775,14 +1779,15 @@ class Coordinator:
                 already_exists = False
                 if not res.accepted:
                     try:
-                        dest_st = await self.dest_client.get_torrent(h)
+                        dest_st = await self.dest_client.get_torrent(h_low)
                         if dest_st is not None:
                             already_exists = True
                     except Exception as e:  # noqa: BLE001
                         log.debug("could not check dest client for %s: %s", h[:10], e)
 
                 if res.accepted or already_exists or "already" in (res.detail or "").lower():
-                    injected.append(h)
+                    injected.append(h_low)
+                    injected_set.add(h_low)
                     if already_exists:
                         log.info("watch-dir torrent %s already exists on dest client; marking as injected", h[:10])
                     else:
@@ -1798,7 +1803,8 @@ class Coordinator:
         pointing at the fuse mount with skip_check=True.
         """
         target_mount = self._target_mount_for(ts)
-        injected = [h for h in ts.injected_private_hashes.split(",") if h]
+        injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
+        injected_set = set(injected)
 
         try:
             racing = await self._list_source_torrents()
@@ -1810,7 +1816,8 @@ class Coordinator:
 
         try:
             for t in matches:
-                if t.infohash in injected:
+                h_low = t.infohash.lower()
+                if h_low in injected_set:
                     continue
                 try:
                     blob = await self._fetch_racing_torrent_bytes(t.infohash)
@@ -1831,7 +1838,7 @@ class Coordinator:
                 already_exists = False
                 if not res.accepted:
                     try:
-                        dest_st = await self.dest_client.get_torrent(t.infohash)
+                        dest_st = await self.dest_client.get_torrent(h_low)
                         if dest_st is not None:
                             already_exists = True
                     except Exception as e:  # noqa: BLE001
@@ -1843,7 +1850,8 @@ class Coordinator:
                         t.infohash[:10], res.detail,
                     )
                     raise WebUIUnresponsiveError(f"re-inject add {t.infohash[:10]} rejected: {res.detail}")
-                injected.append(t.infohash)
+                injected.append(h_low)
+                injected_set.add(h_low)
                 if already_exists:
                     log.info(
                         "racing torrent %s (%s) already exists on dest client; marking as injected",
@@ -1875,7 +1883,8 @@ class Coordinator:
             return
 
         target_mount = self._target_mount_for(ts)
-        current_injected = [h for h in ts.injected_private_hashes.split(",") if h]
+        current_injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
+        current_injected_set = set(current_injected)
         changed = False
 
         if not hasattr(self, "_failed_late_cross_seeds"):
@@ -1917,7 +1926,7 @@ class Coordinator:
                     # qBittorrent returns "Fails." when a torrent already exists.
                     # Verify if it's already present on VPS2.
                     try:
-                        dest_st = await self.dest_client.get_torrent(t.infohash)
+                        dest_st = await self.dest_client.get_torrent(h_low)
                         if dest_st is not None:
                             already_exists = True
                     except Exception as e:  # noqa: BLE001
@@ -1934,7 +1943,8 @@ class Coordinator:
                             "auto-injected late cross-seed %s (%s) onto fuse (%s)",
                             t.infohash[:10], t.name[:40], target_mount,
                         )
-                    current_injected.append(t.infohash)
+                    current_injected.append(h_low)
+                    current_injected_set.add(h_low)
                     changed = True
                     self._failed_late_cross_seeds.pop(h_low, None)
                 else:
