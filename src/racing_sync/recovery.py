@@ -64,7 +64,12 @@ async def reconcile(
 
     for ts in all_rows:
         h = ts.source_infohash.lower()
-        present = h in actual_by_hash
+        known_hashes = {
+            k.lower()
+            for k in (ts.source_infohash, ts.dest_infohash, ts.cross_seed_infohash)
+            if k
+        }
+        present = any(k in actual_by_hash for k in known_hashes)
         if ts.state == State.DONE:
             if present:
                 rpt.kept.append(h)
@@ -86,7 +91,16 @@ async def reconcile(
     # 3. Anything on VPS2 not in the DB?
     # If it is already seeding from the fuse mount or 100% complete, adopt it into state DB as DONE
     # so we don't treat it as a new release and re-download/re-move it.
-    db_hashes = {ts.source_infohash.lower() for ts in all_rows}
+    db_hashes: set[str] = set()
+    for ts in all_rows:
+        for k in (ts.source_infohash, ts.dest_infohash, ts.cross_seed_infohash):
+            if k:
+                db_hashes.add(k.lower())
+        if ts.injected_private_hashes:
+            for iph in ts.injected_private_hashes.split(","):
+                if iph.strip():
+                    db_hashes.add(iph.strip().lower())
+
     fuse_mounts = [
         str(cfg.rclone.fuse.mount).rstrip("/"),
         str(cfg.rclone.fuse.mount_unsorted).rstrip("/"),
@@ -95,7 +109,8 @@ async def reconcile(
         if h not in db_hashes:
             save_path = getattr(t, "save_path", "").rstrip("/")
             on_fuse = any(save_path.startswith(fm) for fm in fuse_mounts if fm)
-            is_done = getattr(t, "is_complete", lambda: False)()
+            comp = getattr(t, "is_complete", False)
+            is_done = comp() if callable(comp) else bool(comp)
             if on_fuse or is_done:
                 name = getattr(t, "name", h)
                 matches = store.find_by_name(name)

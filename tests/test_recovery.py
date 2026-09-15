@@ -241,5 +241,47 @@ async def test_reconcile_links_same_name_torrents_to_single_state(tmp_path: Path
     assert rows[0].state == State.DONE
 
 
+@pytest.mark.anyio
+async def test_reconcile_recognizes_dest_and_cross_seed_infohash(tmp_path: Path):
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.state import StateStore, State, TorrentState
+    from racing_sync.recovery import reconcile
+    from racing_sync.clients.abstract import Torrent
+
+    cfg = MagicMock()
+    cfg.rclone.fuse.mount = tmp_path / "fuse"
+    cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse_unsorted"
+    db_path = tmp_path / "test.db"
+    store = StateStore(db_path)
+
+    # In-flight torrent where destination client hash is dest_infohash (cross-seed)
+    ts = TorrentState(
+        source_infohash="source_h",
+        dest_infohash="dest_h",
+        source_name="Movie.2024",
+        state=State.DOWNLOADING,
+    )
+    store.upsert(ts)
+
+    # Destination client returns the torrent under dest_h
+    t_dest = Torrent(
+        hash="dest_h",
+        name="Movie.2024",
+        category="racing",
+        save_path="/downloads",
+        size_bytes=5000,
+        state="downloading",
+        progress=0.5,
+    )
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [t_dest]
+
+    rpt = await reconcile(cfg, dest=dest, store=store)
+    # Must be recognized as resumed, NOT an orphan
+    assert "source_h" in rpt.resumed
+    assert "source_h" not in rpt.orphans
+    assert len(rpt.unknowns) == 0
+
+
 
 
