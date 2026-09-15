@@ -502,8 +502,7 @@ class Coordinator:
         multiple tasks (e.g. _tick, _do_new, _do_waiting_seedpool) query
         the source client within the same cycle.
         """
-        import time as _time
-        now_mono = _time.monotonic()
+        now_mono = time.monotonic()
         if (
             not force_refresh
             and hasattr(self, "_source_torrents_cached_at")
@@ -518,7 +517,7 @@ class Coordinator:
         if min_age <= 0:
             filtered = all_torrents
         else:
-            time_now = _time.time()
+            time_now = time.time()
             filtered = []
             for t in all_torrents:
                 if t.added_on and (time_now - t.added_on) < min_age:
@@ -649,8 +648,7 @@ class Coordinator:
         # spamming the log every poll cycle.
         if not hasattr(self, "_last_source_log_ts"):
             self._last_source_log_ts = 0.0
-        import time as _t
-        now = _t.monotonic()
+        now = time.monotonic()
         if now - self._last_source_log_ts > 300:
             log.info(
                 "source poll: %d torrent(s) matching category=%r min_age=%ds",
