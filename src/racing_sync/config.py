@@ -417,7 +417,8 @@ class WatchDirConfig(BaseModel):
     """req #3: manual private torrents dropped here are processed."""
 
     path: Path
-    # Glob of filenames to accept (lowercase). Anything else is ignored.
+    # Glob of filenames to accept (matched case-insensitively for the
+    # .torrent suffix: Show.TORRENT is picked up too). Anything else is ignored.
     glob: str = "*.torrent"
     # If true, delete the .torrent after it has been picked up.
     delete_after_pickup: bool = True
