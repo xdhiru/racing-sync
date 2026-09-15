@@ -191,7 +191,7 @@ async def pick_ssd_source_for_racing(
                 "SFTP-exporting %s from VPS1 for SSD download",
                 source_torrent.infohash[:10],
             )
-            blob = sftp.fetch_torrent(source_torrent.infohash)
+            blob = await asyncio.to_thread(sftp.fetch_torrent, source_torrent.infohash)
             if blob:
                 return SourceDecision(
                     torrent_bytes=blob,
@@ -904,11 +904,10 @@ class Coordinator:
         if ts.state == State.QUEUED:
             async with self.download_sem:
                 await self._do_queued(ts)
-                if ts.state == State.DOWNLOADING:
-                    await self._do_downloading(ts)
-        elif ts.state == State.DOWNLOADING:
-            async with self.download_sem:
+            if ts.state == State.DOWNLOADING:
                 await self._do_downloading(ts)
+        elif ts.state == State.DOWNLOADING:
+            await self._do_downloading(ts)
         if ts.state == State.MOVING:
             await self._do_moving(ts)
         if ts.state == State.RE_ADDING:
@@ -1191,9 +1190,11 @@ class Coordinator:
     async def _wait_disk_then_queue(self, ts: TorrentState) -> None:
         # The size check uses total_bytes; for seasons the real SSD footprint
         # is bounded by the batch cap. The actual add will re-check.
-        while not ssd_has_room(self.cfg, ts.total_bytes):
-            await asyncio.sleep(60)
-        self.transition(ts, State.QUEUED)
+        while not self._stop:
+            if ssd_has_room(self.cfg, ts.total_bytes):
+                self.transition(ts, State.QUEUED)
+                return
+            await asyncio.sleep(10)
 
     # ---- state: QUEUED ----
 
@@ -1249,8 +1250,19 @@ class Coordinator:
             )
             return
 
-        # Wait for the torrent to be registered and learn its hash
-        new_hash = await self._await_hash_for_name(ts.source_name)
+        # Derive infohash: prefer add_torrent result, then blob hash, fallback to polling
+        new_hash = result.hash.lower() if result.hash else None
+        if not new_hash and blob:
+            try:
+                from .watchdir import _bencoded_info_hash
+                parsed_hash, _, _, _ = _bencoded_info_hash(blob)
+                new_hash = parsed_hash.lower()
+            except Exception:
+                new_hash = None
+
+        if not new_hash:
+            new_hash = await self._await_hash_for_name(ts.source_name)
+
         if new_hash:
             ts.dest_infohash = new_hash
 
