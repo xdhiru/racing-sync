@@ -674,6 +674,62 @@ async def test_do_queued_fails_when_fuse_complete_torrent_has_no_files(tmp_path:
 
 
 @pytest.mark.anyio
+async def test_re_inject_racing_torrents_replaces_stale_ssd_entry(tmp_path: Path):
+    """A duplicate hash pointing at SSD (not fuse) must be replaced, not marked.
+
+    This is the fresh-DB trap: the SSD torrent still exists when RE_ADDING
+    runs, so qB reports "Fails." — marking it injected would leave a
+    fuse-claimed torrent seeding from SSD (or broken), with no fuse entry.
+    """
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    ssd_dir = tmp_path / "ssd"
+    ssd_dir.mkdir()
+    (fuse_dir / "Stale.Movie.2026.mkv").write_bytes(b"z" * 80)
+
+    blob = _single_file_torrent_bytes("Stale.Movie.2026.mkv", 80)
+    from racing_sync.watchdir import _bencoded_info_hash
+    real_hash = _bencoded_info_hash(blob)[0].lower()
+
+    coord = object.__new__(Coordinator)
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
+    coord.dest_client = AsyncMock()
+    # First add fails (duplicate); second add after replace succeeds.
+    coord.dest_client.add_torrent = AsyncMock(side_effect=[
+        AddResult(hash=None, accepted=False, detail="Fails."),
+        AddResult(hash=None, accepted=True, detail="Ok."),
+    ])
+    ssd_entry = Torrent(
+        hash=real_hash, name="Stale.Movie.2026", category="racing",
+        save_path=str(ssd_dir), size_bytes=80, state="seeding", progress=1.0,
+    )
+    fuse_entry = Torrent(
+        hash=real_hash, name="Stale.Movie.2026", category="racing",
+        save_path=str(fuse_dir), size_bytes=80, state="seeding", progress=1.0,
+    )
+    coord.dest_client.get_torrent = AsyncMock(side_effect=[ssd_entry, fuse_entry])
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
+
+    ts = TorrentState(
+        source_infohash="src_stale_1",
+        source_name="Stale.Movie.2026",
+        injected_private_hashes="",
+    )
+    t_match = Torrent(
+        hash=real_hash, name="Stale.Movie.2026", category="",
+        save_path="", size_bytes=80, state="racing", progress=1.0,
+    )
+    coord._list_source_torrents = AsyncMock(return_value=[t_match])
+
+    await coord._re_inject_racing_torrents(ts)
+
+    # Stale SSD entry deleted (files kept), fuse entry added + recorded.
+    coord.dest_client.delete.assert_awaited_once_with(real_hash, delete_files=False)
+    assert coord.dest_client.add_torrent.await_count == 2
+    assert ts.injected_private_hashes == real_hash
+
+
+@pytest.mark.anyio
 async def test_re_inject_racing_torrents_skips_missing_fuse_content(tmp_path: Path):
     coord = object.__new__(Coordinator)
     fuse_dir = tmp_path / "fuse-empty"
