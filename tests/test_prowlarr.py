@@ -171,6 +171,28 @@ def test_parse_newznab_sanitizes_unsafe_download_url():
     assert hits[0].download_url == ""
 
 
+def test_parse_newznab_extracts_namespaced_magnet_url():
+    from racing_sync.prowlarr import _parse_newznab, Indexer
+
+    idx = Indexer(1, "Indexer", "torrent", True, [])
+    xml = """<?xml version="1.0"?>
+    <rss xmlns:torznab="http://torznab.com/schemas/2015/feed">
+      <channel>
+        <item>
+          <title>Test.Show.S01E01.1080p</title>
+          <guid>abcdef123456</guid>
+          <enclosure url="https://indexer.example/download/123.torrent" length="1048576" />
+          <torznab:attr name="magneturl" value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567" />
+        </item>
+      </channel>
+    </rss>"""
+
+    hits = _parse_newznab(xml, idx)
+    assert len(hits) == 1
+    assert hits[0].magnet_url == "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+    assert hits[0].download_url == "https://indexer.example/download/123.torrent"
+
+
 @pytest.mark.anyio
 async def test_download_torrent_validates_scheme():
     from racing_sync.prowlarr import ProwlarrClient, ProwlarrError, TorrentHit
