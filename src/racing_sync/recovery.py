@@ -81,7 +81,7 @@ async def reconcile(
         elif ts.state == State.FAILED:
             # Leave for manual retry
             rpt.kept.append(h)
-        elif ts.state in (State.NEW, State.QUERYING, State.WAITING_DISK):
+        elif ts.state in (State.NEW, State.QUERYING, State.WAITING_SEEDPOOL, State.WAITING_DISK):
             # Not yet added to VPS2 — safe to leave for coordinator to process
             rpt.resumed.append(h)
         else:
