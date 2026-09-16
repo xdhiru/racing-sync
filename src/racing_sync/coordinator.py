@@ -495,13 +495,17 @@ class Coordinator:
                     ts for ts in self.store.all()
                     if ts.state == State.FAILED
                 ]
-                if failed_rows:
-                    log.info(
-                        "auto-retrying %d previously-FAILED row(s)",
-                        len(failed_rows),
-                    )
-                    for ts in failed_rows:
-                        self.transition(ts, State.NEW)
+                max_retries = getattr(self.cfg.recovery, "max_failed_retries", 3)
+                for ts in failed_rows:
+                    if ts.failed_retries >= max_retries:
+                        log.warning(
+                            "skipping auto-retry for %s: reached max retries (%d/%d)",
+                            ts.source_name, ts.failed_retries, max_retries,
+                        )
+                        continue
+                    ts.failed_retries += 1
+                    self.store.upsert(ts)
+                    self.transition(ts, State.NEW)
 
             # Optional Telegram bot
             from .telegram_bot import TelegramBot
@@ -1318,7 +1322,7 @@ class Coordinator:
                 str(self.cfg.rclone.fuse.mount_unsorted).rstrip("/"),
             ]
             save_path = ext.save_path.rstrip("/")
-            on_fuse = any(save_path.startswith(fm) for fm in fuse_mounts if fm)
+            on_fuse = any(save_path == fm or save_path.startswith(fm + "/") for fm in fuse_mounts if fm)
             if on_fuse and ext.is_complete():
                 log.info(
                     "torrent %s is already completed on VPS2 fuse mount; marking DONE",
@@ -1337,6 +1341,7 @@ class Coordinator:
             )
             ts.dest_infohash = ext.hash.lower()
             ts.save_path = ext.save_path
+            await self.dest_client.resume(ext.hash)
             self.transition(ts, State.DOWNLOADING)
             return
 

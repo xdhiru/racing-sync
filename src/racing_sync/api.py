@@ -119,6 +119,7 @@ def build_app(coord: Coordinator) -> FastAPI:
             raise HTTPException(404, "unknown hash")
         if ts.state != State.FAILED:
             raise HTTPException(409, f"state is {ts.state.value}")
+        ts.failed_retries = 0
         await asyncio.to_thread(coord.store.transition, ts, State.QUEUED, error="")
         return RetryResult(source_infohash=source_infohash, new_state=ts.state.value)
 
