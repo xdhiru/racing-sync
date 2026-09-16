@@ -15,12 +15,14 @@ import json
 import logging
 import logging.handlers
 import queue
+import re
 import sys
 import threading
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Deque
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -28,6 +30,30 @@ from .config import AppConfig, LoggingSinkConfig
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s :: %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+SENSITIVE_KEY_WORDS = ("passkey", "api_key", "apikey", "token", "auth", "secret", "password")
+
+_SENSITIVE_PARAM_RE = re.compile(
+    r"((?:passkey|api_key|apikey|token|auth|secret|password)=)[^&\s'\"]+",
+    re.IGNORECASE,
+)
+_BEARER_TOKEN_RE = re.compile(
+    r"(Bearer\s+)[A-Za-z0-9_\-\.]+",
+    re.IGNORECASE,
+)
+
+
+def sanitize_log_text(text: str) -> str:
+    """Scrub sensitive credentials, tokens, and passkeys from log messages."""
+    text = _SENSITIVE_PARAM_RE.sub(r"\1***", text)
+    text = _BEARER_TOKEN_RE.sub(r"\1***", text)
+    return text
+
+
+def is_sensitive_key(key: str) -> bool:
+    """Check if a dictionary key indicates sensitive credentials."""
+    k_lower = key.lower()
+    return any(w in k_lower for w in SENSITIVE_KEY_WORDS)
 
 
 # --------------------------------------------------------------------------- #
@@ -44,13 +70,9 @@ class LogEvent:
 
 
 class RingBufferHandler(logging.Handler):
-    """A logging handler that keeps the last N events in a deque.
+    """Keep the last N log records in memory for quick diagnostic dumps."""
 
-    Read by the Telegram bot to render the "recent activity" section of the
-    live status message.
-    """
-
-    def __init__(self, capacity: int = 200):
+    def __init__(self, capacity: int = 500):
         super().__init__()
         self._buf: Deque[LogEvent] = deque(maxlen=capacity)
         self._lock = threading.Lock()
@@ -61,7 +83,7 @@ class RingBufferHandler(logging.Handler):
                 ts=dt.datetime.fromtimestamp(record.created, tz=dt.timezone.utc),
                 level=record.levelno,
                 logger=record.name,
-                message=record.getMessage(),
+                message=sanitize_log_text(record.getMessage()),
             )
             with self._lock:
                 self._buf.append(ev)
@@ -86,7 +108,7 @@ class JsonlFormatter(logging.Formatter):
             "ts": dt.datetime.fromtimestamp(record.created, tz=dt.timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": sanitize_log_text(record.getMessage()),
         }
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
@@ -98,6 +120,9 @@ class JsonlFormatter(logging.Formatter):
                 "relativeCreated", "stack_info", "thread", "threadName",
                 "taskName",
             ):
+                continue
+            if is_sensitive_key(k):
+                payload[k] = "***"
                 continue
             try:
                 json.dumps(v)
@@ -145,9 +170,20 @@ class HTTPSinkHandler(logging.handlers.QueueHandler):
             "Content-Type": "application/json",
             "User-Agent": "racing-sync-log-sink/1.0",
         }
-        auth_token = self._cfg.auth_token.get_secret_value() if hasattr(self._cfg.auth_token, "get_secret_value") else str(self._cfg.auth_token)
+        auth_token = (
+            self._cfg.auth_token.get_secret_value()
+            if hasattr(self._cfg.auth_token, "get_secret_value")
+            else str(self._cfg.auth_token)
+        )
         if auth_token:
-            headers["Authorization"] = f"Bearer {auth_token}"
+            parsed = urlsplit(self._cfg.url)
+            is_local = parsed.hostname in ("localhost", "127.0.0.1", "::1")
+            if parsed.scheme == "https" or is_local:
+                headers["Authorization"] = f"Bearer {auth_token}"
+            else:
+                sys.stderr.write(
+                    f"[log-sink] Warning: refusing to send bearer auth token over insecure unencrypted {parsed.scheme}:// to {parsed.hostname}\n"
+                )
 
         while not self._stop.is_set():
             try:
@@ -158,7 +194,7 @@ class HTTPSinkHandler(logging.handlers.QueueHandler):
                 "ts": dt.datetime.fromtimestamp(record.created, tz=dt.timezone.utc).isoformat(),
                 "level": record.levelname,
                 "logger": record.name,
-                "message": record.getMessage(),
+                "message": sanitize_log_text(record.getMessage()),
             }
             try:
                 data = json.dumps(payload).encode("utf-8")
