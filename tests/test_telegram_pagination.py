@@ -329,4 +329,49 @@ async def test_active_msg_id_restored_from_store():
     bot._store.get_meta.assert_called_with("telegram_active_msg_id")
 
 
+def test_safe_truncate_markdown_balances_tags():
+    from racing_sync.telegram_bot import _safe_truncate_markdown
+
+    # Unclosed backtick within max_len limit
+    long_code = "`" + "A" * 5000
+    truncated = _safe_truncate_markdown(long_code, max_len=100)
+    assert len(truncated) <= 100
+    assert truncated.endswith("...")
+    assert truncated.count("`") % 2 == 0
+
+    # Unclosed bold and italic
+    long_bold = "*_bold_italic " + "B" * 5000
+    truncated_bold = _safe_truncate_markdown(long_bold, max_len=100)
+    assert len(truncated_bold) <= 100
+    assert truncated_bold.endswith("...")
+    assert truncated_bold.count("*") % 2 == 0
+    assert truncated_bold.count("_") % 2 == 0
+
+
+@pytest.mark.anyio
+async def test_notify_falls_back_to_plain_text_on_parse_error():
+    from unittest.mock import AsyncMock, MagicMock
+    from telegram.error import TelegramError
+
+    bot = object.__new__(TelegramBot)
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
+    bot._bot = MagicMock()
+
+    # First call with MARKDOWN raises entity parse error; second call succeeds
+    bot._bot.send_message = AsyncMock(
+        side_effect=[
+            TelegramError("Can't find end of the entity starting at byte offset 20"),
+            MagicMock(message_id=999),
+        ]
+    )
+
+    await bot.notify("Download [unclosed bracket failed for test_torrent_name")
+    assert bot._bot.send_message.call_count == 2
+    first_call = bot._bot.send_message.call_args_list[0]
+    second_call = bot._bot.send_message.call_args_list[1]
+    assert "parse_mode" in first_call[1]
+    assert "parse_mode" not in second_call[1]
+
+
+
 
