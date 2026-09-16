@@ -15,6 +15,9 @@ class TorrentFile:
     progress: float = 0.0
 
 
+COMPLETE_THRESHOLD = 0.999
+
+
 @dataclass(slots=True)
 class Torrent:
     hash: str
@@ -34,10 +37,12 @@ class Torrent:
 
     @property
     def infohash(self) -> str:
-        return self.hash
+        return self.hash.lower()
 
     def is_complete(self) -> bool:
-        return self.progress >= 0.999
+        # Both qB and Deluge report progress on a 0–1 scale here
+        # (Deluge's native 0–100 is normalized in the client).
+        return self.progress >= COMPLETE_THRESHOLD
 
 
 @dataclass(slots=True)

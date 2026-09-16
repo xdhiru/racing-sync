@@ -37,8 +37,16 @@ def _ensure_base_url(host: str) -> str:
     """
     if not host or not host.strip():
         raise ValueError("host must not be empty")
+    host = host.strip()
     if "://" not in host:
         raise ValueError(f"host must include scheme (http:// or https://), got: {host!r}")
+    parts = urllib.parse.urlsplit(host)
+    if parts.scheme not in ("http", "https"):
+        raise ValueError(f"host scheme must be http(s)://, got: {host!r}")
+    if not parts.hostname:
+        raise ValueError(f"host must include a hostname, got: {host!r}")
+    if parts.query or parts.fragment:
+        raise ValueError(f"host must not include query/fragment, got: {host!r}")
     return host.rstrip("/") + "/"
 
 
@@ -102,6 +110,8 @@ def _clone_formdata(fd: aiohttp.FormData) -> aiohttp.FormData:
     aiohttp payload objects can be consumed on the first send; reusing the
     same FormData across network/transient retries risks truncated re-sends
     (notably `torrents/add` with 20MiB blobs). Re-add each stored field.
+    File-like values are rewound with seek(0) where possible; small
+    bytes values are re-buffered.
     """
     try:
         fields = list(getattr(fd, "_fields", []) or [])
@@ -127,6 +137,17 @@ def _clone_formdata(fd: aiohttp.FormData) -> aiohttp.FormData:
             name, filename = None, None
         if name is None:
             continue
+        # Rewind file-likes so retries don't send truncated bodies.
+        try:
+            if hasattr(value, "seek") and hasattr(value, "tell"):
+                try:
+                    value.seek(0)
+                except Exception:
+                    pass
+            elif isinstance(value, (bytearray, memoryview)):
+                value = bytes(value)
+        except Exception:
+            pass
         ctype = headers.get("Content-Type") if isinstance(headers, dict) else None
         try:
             out.add_field(name, value, filename=filename, content_type=ctype)
@@ -139,6 +160,12 @@ def _clone_formdata(fd: aiohttp.FormData) -> aiohttp.FormData:
 
 
 
+
+
+# Transient gateway / rate-limit statuses worth retrying.
+# NOTE: deliberately excludes 500 — qB returns 500 for application errors
+# (e.g. missing torrent) that must surface immediately, not be retried.
+_TRANSIENT_STATUSES = (408, 425, 429, 502, 503, 504)
 
 
 class HTTPClientBase:
@@ -169,11 +196,20 @@ class HTTPClientBase:
             creds = f"{self._cfg.username}:{pw}".encode()
             headers["Authorization"] = "Basic " + base64.b64encode(creds).decode()
         # Set Origin and Referer to satisfy WebUI CSRF protection (e.g. qBittorrent)
-        # RFC 6454: Origin must be scheme://netloc without any path component.
+        # RFC 6454: Origin must be scheme://host[:port] without path, params,
+        # query, fragment — and MUST NOT include userinfo.
         host_str = str(self._cfg.host)
-        host_clean = host_str.rstrip("/")
-        parsed = urllib.parse.urlsplit(host_str)
-        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else host_clean
+        host_clean = host_str.strip().rstrip("/")
+        parsed = urllib.parse.urlsplit(host_str.strip())
+        if parsed.scheme and parsed.hostname:
+            origin = f"{parsed.scheme}://{parsed.hostname}"
+            try:
+                if parsed.port:
+                    origin += f":{parsed.port}"
+            except ValueError:
+                pass
+        else:
+            origin = host_clean
         headers["Origin"] = origin
         headers["Referer"] = host_clean + "/"
 
@@ -220,6 +256,10 @@ class HTTPClientBase:
                         raise AuthError(
                             f"nginx auth failed for {self._label}: HTTP {r.status}"
                         )
+                    # NOTE: do NOT check for bare `type="password"` here —
+                    # the qBittorrent login page legitimately contains a
+                    # password input even after successful nginx auth, which
+                    # caused false-positive AuthErrors.
                     body = await r.text()
                     body_lower = body.lower()
                     if any(
@@ -228,7 +268,8 @@ class HTTPClientBase:
                             "invalid password",
                             "invalid credentials",
                             "login failed",
-                            'type="password"',
+                            "authentication failed",
+                            "access denied",
                         )
                     ):
                         raise AuthError(
@@ -281,11 +322,8 @@ class HTTPClientBase:
                         headers=headers,
                     )
                 except (
-                    aiohttp.ClientOSError,
-                    aiohttp.ServerDisconnectedError,
-                    aiohttp.ClientConnectionResetError,
-                    aiohttp.ClientConnectorError,
-                    TimeoutError,
+                    aiohttp.ClientConnectionError,
+                    asyncio.TimeoutError,
                 ) as e:
                     if attempt == 2:
                         raise
@@ -299,7 +337,6 @@ class HTTPClientBase:
         r = await _do()
 
         # Retry transient gateway / rate-limit errors
-        _TRANSIENT_STATUSES = (429, 502, 503, 504)
         for attempt in range(3):
             if r.status not in _TRANSIENT_STATUSES:
                 break
@@ -387,9 +424,17 @@ class HTTPClientBase:
 
         if r.status >= 400:
             try:
-                body = await r.text()
+                try:
+                    body = await r.text()
+                except Exception:
+                    # Binary error pages (or undecodable bytes) must not mask
+                    # the original HTTP status.
+                    body = f"<undecodable body, status={r.status}>"
             finally:
-                r.close()
+                try:
+                    r.close()
+                except Exception:
+                    pass
             raise aiohttp.ClientResponseError(
                 request_info=r.request_info,
                 history=r.history,
