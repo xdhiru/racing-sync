@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .batcher import Batch, make_batches
+from .batcher import Batch, escape_rclone_glob, make_batches
 from .classifier import Classification, classify, should_skip_movie
 from .clients.abstract import Torrent, TorrentClient, TorrentFile
 from .clients.deluge import DelugeClient
@@ -403,6 +403,27 @@ async def pick_ssd_source_for_racing(
         source_torrent.name,
     )
     return None
+
+
+def _top_include_for_folder(src_dir: Path, folder: Path) -> list[str] | None:
+    """`--include` patterns moving `folder` while preserving its top dir.
+
+    `rclone move <folder> <remote>` transfers the folder's CONTENTS (top
+    dir stripped), but batch moves (`rclone move <src_dir> <remote>
+    --include=**/<top>/<file>`) preserve torrent-relative paths. A stripped
+    layout never matches `save_path/mount + torrent file names`, so fuse
+    re-adds with `skip_check=True` would point at missing data. Moving from
+    `src_dir` with `<top>/**` keeps both paths identical.
+    Returns None when `folder` is not a direct child layout of `src_dir`
+    (caller falls back to the exact-path move).
+    """
+    try:
+        rel = folder.resolve().relative_to(src_dir.resolve())
+    except Exception:
+        return None
+    if len(rel.parts) != 1 or rel.parts[0] in (".", "..", ""):
+        return None
+    return [f"--include={escape_rclone_glob(rel.parts[0])}/**"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1404,6 +1425,31 @@ class Coordinator:
             save_path = ext.save_path.rstrip("/\\").replace("\\", "/")
             on_fuse = any(save_path == fm or save_path.startswith(fm + "/") for fm in fuse_mounts if fm)
             if on_fuse and ext.is_complete():
+                # Verify the bytes are really behind the fuse path: a torrent
+                # added with skip_check=True reports complete even when its
+                # files were never moved. Never mark DONE on missing bytes.
+                try:
+                    fuse_files = await self.dest_client.get_torrent_files(ext.hash)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "could not list fuse torrent files for %s: %s",
+                        ts.source_infohash[:10], e,
+                    )
+                    fuse_files = []
+                fuse_expected = [(f.name, f.size_bytes) for f in fuse_files if f.name]
+                fuse_missing = (
+                    await self._missing_fuse_files(Path(save_path), fuse_expected)
+                    if fuse_expected else []
+                )
+                if fuse_missing:
+                    err = (
+                        f"torrent {ts.source_infohash[:10]} reports complete on fuse mount "
+                        f"{save_path} but {len(fuse_missing)}/{len(fuse_expected)} file(s) are "
+                        f"missing (e.g. {fuse_missing[0]}); not marking DONE"
+                    )
+                    log.error(err)
+                    self.transition(ts, State.FAILED, error=err)
+                    return
                 log.info(
                     "torrent %s is already completed on VPS2 fuse mount; marking DONE",
                     ts.source_infohash[:10],
@@ -1915,6 +1961,9 @@ class Coordinator:
             remote = self.cfg.rclone.remote.unsorted
 
         # 5. Move completed files via rclone
+        # (local_include preserves the top dir for whole-folder moves so the
+        # remote layout matches torrent-relative names; see helper above.)
+        local_include: list[str] | None = None
         if ts.batches_total > 1:
             local_folder = folder if (folder and folder.exists()) else (src_dir / ts.source_name if (src_dir / ts.source_name).exists() else None)
             remaining_payload: list[Path] = []
@@ -1930,7 +1979,13 @@ class Coordinator:
                         "multi-batch torrent %s: incomplete batch move (batch %d/%d, %d remaining files); moving to remote before cleanup",
                         ts.source_name, ts.batch_index, ts.batches_total, len(remaining_payload),
                     )
-                    await self._rclone_move(local_folder, remote, ts)
+                    # Preserve the top dir so the remote layout matches
+                    # torrent-relative names (same as batch moves).
+                    top_include = _top_include_for_folder(src_dir, local_folder)
+                    if top_include is not None:
+                        await self._rclone_move(src_dir, remote, ts, include=top_include)
+                    else:
+                        await self._rclone_move(local_folder, remote, ts)
                 else:
                     log.info(
                         "multi-batch torrent %s: batches already moved (no remaining local content)",
@@ -1952,6 +2007,10 @@ class Coordinator:
             elif cls.kind in ("season", "unknown") or (cls.kind == "movie" and not cls.single_file):
                 if folder and folder.exists():
                     local = folder
+                    # Preserve the top dir (same layout as batch moves);
+                    # a bare folder move would strip it and fuse re-adds
+                    # would point at missing paths.
+                    local_include = _top_include_for_folder(src_dir, folder)
                 elif (src_dir / ts.source_name).exists():
                     local = src_dir / ts.source_name
                 else:
@@ -1965,7 +2024,10 @@ class Coordinator:
                     local = cand
                 else:
                     raise FileNotFoundError(f"completed content not found on SSD: {cand}")
-            await self._rclone_move(local, remote, ts)
+            if local_include is not None:
+                await self._rclone_move(src_dir, remote, ts, include=local_include)
+            else:
+                await self._rclone_move(local, remote, ts)
         else:
             # Mixed — per-episode moves with --include (single batch)
             cap = self._batch_cap_bytes()
@@ -2071,6 +2133,37 @@ class Coordinator:
             ts.readd_next_retry_at = None
             self.transition(ts, State.FAILED, error=err)
             return
+
+        # FUSE AVAILABILITY GATE (public + private): the rclone move must
+        # have landed the cross-seed's files at the fuse target BEFORE we
+        # inject anything with skip_check=True. Blind injection creates
+        # torrents that can never seed (e.g. SSD-complete data that was
+        # never moved). Park — don't FAILED — so mount lag or a slow remote
+        # can heal on retry; persistent absence trips max_age above.
+        gate_blob = ts._blob or ts.cross_seed_blob
+        if not gate_blob and store is not None:
+            try:
+                gate_blob = await asyncio.to_thread(store.get_blob, ts.source_infohash)
+            except Exception:
+                gate_blob = None
+        gate_expected = self._expected_fuse_files(gate_blob)
+        if gate_expected:
+            gate_target = self._target_mount_for(ts)
+            gate_missing = await self._missing_fuse_files(gate_target, gate_expected)
+            if gate_missing:
+                preview = ", ".join(gate_missing[:5])
+                if len(gate_missing) > 5:
+                    preview += f", …+{len(gate_missing) - 5} more"
+                log.warning(
+                    "fuse content not yet available for %s at %s "
+                    "(%d/%d missing, e.g. %s); parking re-add instead of injecting blind",
+                    ts.source_name[:50], gate_target,
+                    len(gate_missing), len(gate_expected), preview,
+                )
+                ts.readd_next_retry_at = now + dt.timedelta(seconds=retry_gap)
+                if store is not None:
+                    store.upsert(ts)
+                return
 
         max_cycle_attempts = 2
 
@@ -2220,6 +2313,17 @@ class Coordinator:
                 if h_low in injected_set:
                     continue
 
+                # Fuse gate: never point a re-added torrent at missing data.
+                watch_expected = self._expected_fuse_files(blob)
+                if watch_expected:
+                    watch_missing = await self._missing_fuse_files(target_mount, watch_expected)
+                    if watch_missing:
+                        log.warning(
+                            "re-inject watch-dir torrent %s: fuse content missing at %s (%d files); skipping blind injection",
+                            h[:10], target_mount, len(watch_missing),
+                        )
+                        continue
+
                 res = await self.dest_client.add_torrent(
                     torrent_files=[blob],
                     save_path=str(target_mount),
@@ -2283,6 +2387,18 @@ class Coordinator:
                     continue
                 if not blob:
                     continue
+                # Per-match fuse gate: only inject torrents whose content is
+                # actually available at the target (same release name does not
+                # guarantee the bytes were moved).
+                match_expected = self._expected_fuse_files(blob)
+                if match_expected:
+                    match_missing = await self._missing_fuse_files(target_mount, match_expected)
+                    if match_missing:
+                        log.warning(
+                            "re-inject: fuse content missing for %s (%s) at %s (%d files); skipping blind injection",
+                            t.infohash[:10], t.name[:50], target_mount, len(match_missing),
+                        )
+                        continue
                 res = await self.dest_client.add_torrent(
                     torrent_files=[blob],
                     save_path=str(target_mount),
@@ -2367,6 +2483,20 @@ class Coordinator:
             if not blob:
                 log.warning("late cross-seed: no .torrent bytes available for %s", t.infohash[:10])
                 continue
+
+            # Fuse gate: a DONE row proves the original content moved, not
+            # that this late arrival's bytes did — verify before injecting.
+            # Missing content reuses the 30m failure backoff (no per-tick storm).
+            late_expected = self._expected_fuse_files(blob)
+            if late_expected:
+                late_missing = await self._missing_fuse_files(target_mount, late_expected)
+                if late_missing:
+                    log.warning(
+                        "late cross-seed: fuse content missing for %s (%s) at %s (%d files); deferring injection",
+                        t.infohash[:10], t.name[:40], target_mount, len(late_missing),
+                    )
+                    self._failed_late_cross_seeds[h_low] = now_utc
+                    continue
 
             try:
                 res = await self.dest_client.add_torrent(
@@ -2455,6 +2585,53 @@ class Coordinator:
             return None
         except Exception:  # noqa: BLE001
             return None
+
+    @staticmethod
+    def _expected_fuse_files(blob: bytes | None) -> list[tuple[str, int]] | None:
+        """Decode (torrent-relative name, size) pairs from .torrent bytes.
+
+        Returns None when there is nothing to verify (no blob / undecodable /
+        empty) — callers then keep existing behavior and let downstream steps
+        fail loudly instead of gating on an empty expectation.
+        """
+        if not blob or not isinstance(blob, (bytes, bytearray)):
+            return None
+        try:
+            from .watchdir import extract_torrent_files_from_bencoded
+            pairs = [
+                (f.name, f.size_bytes)
+                for f in extract_torrent_files_from_bencoded(blob)
+                if f.name
+            ]
+            return pairs or None
+        except Exception:
+            return None
+
+    async def _missing_fuse_files(
+        self, target_mount: Path, files: list[tuple[str, int]]
+    ) -> list[str]:
+        """Expected files absent (or size-mismatched) under the fuse target.
+
+        Blocking fuse stats are offloaded to a thread. A failed check itself
+        counts as missing — never inject blind when the mount can't be read.
+        """
+        def _check() -> list[str]:
+            missing: list[str] = []
+            for name, want in files:
+                try:
+                    actual = (target_mount / name).stat().st_size
+                except OSError:
+                    missing.append(name)
+                    continue
+                if want and actual != want:
+                    missing.append(f"{name} (size {actual}!={want})")
+            return missing
+
+        try:
+            return await asyncio.to_thread(_check)
+        except Exception as e:  # noqa: BLE001
+            log.warning("fuse availability check failed for %s: %s", target_mount, e)
+            return [f"<availability check failed: {e}>"]
 
     def _target_mount_for(self, ts: TorrentState) -> Path:
         """Where on the fuse mount should this torrent's data live?"""
