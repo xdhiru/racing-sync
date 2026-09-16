@@ -55,7 +55,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             raise AuthError(
                 f"qB login at {self._cfg.host} rejected credentials "
                 f"(user={self._cfg.username!r}): {text!r}. "
-                f"Check [dest].username / [dest].password in config.toml. "
+                f"Check [{self._label}].username / [{self._label}].password in config.toml. "
                 f"If the WebUI has 'Bypass authentication for clients on "
                 f"localhost' enabled, this might still fail from non-loopback "
                 f"addresses."
@@ -102,15 +102,26 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             "GET", "/api/v2/torrents/files", params={"hash": torrent_hash}
         ) as r:
             data = await r.json()
-        return [
-            TorrentFile(
-                name=row["name"],
-                size_bytes=row["size"],
-                priority=row.get("priority", 1),
-                progress=float(row.get("progress", 0.0)),
-            )
-            for row in data
-        ]
+        out: list[TorrentFile] = []
+        for row in data:
+            try:
+                name = row.get("name", "")
+                size = int(row.get("size", 0) or 0)
+                try:
+                    prog = float(row.get("progress", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    prog = 0.0
+                out.append(
+                    TorrentFile(
+                        name=name,
+                        size_bytes=size,
+                        priority=row.get("priority", 1),
+                        progress=prog,
+                    )
+                )
+            except Exception:
+                continue
+        return out
 
     async def get_trackers(self, torrent_hash: str) -> list[str]:
         async with await self.request(
@@ -119,8 +130,8 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             data = await r.json()
         urls: list[str] = []
         for row in data:
-            url = row.get("url", "")
-            if url and not url.startswith("**"):
+            url = (row.get("url", "") or "").strip()
+            if url and not url.startswith("**") and url not in urls:
                 urls.append(url)
         return urls
 
@@ -158,8 +169,9 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         for k, v in fields.items():
             data.add_field(k, v)
         if urls:
-            for u in urls:
-                data.add_field("urls", u)
+            # qB expects a single `urls` field, newline-separated.
+            # Sending multiple `urls` parts keeps only the last on some versions.
+            data.add_field("urls", "\n".join(urls))
         if torrent_files:
             for idx, blob in enumerate(torrent_files):
                 fname = f"torrent_{idx}.torrent"
@@ -195,17 +207,33 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                         continue
             elif urls:
                 for u in urls:
-                    m = re.search(r"xt=urn:btih:([0-9a-zA-Z]{32,40})", u)
+                    m = re.search(
+                        r"xt=urn:btih:([A-Za-z0-9]{32,64})", u
+                    )
                     if m:
                         raw = m.group(1)
                         if len(raw) == 32:
+                            # 32 chars: base32 (v1) — but 32-char hex also
+                            # matches; try b32decode first, fall back to hex.
                             try:
                                 import base64
                                 candidate_hash = base64.b32decode(raw.upper()).hex()
                             except Exception:
-                                candidate_hash = None
+                                candidate_hash = raw.lower()
+                        elif len(raw) in (40, 64):
+                            # v1 hex (40) or v2 hex (64)
+                            if all(c in "0123456789abcdefABCDEF" for c in raw):
+                                candidate_hash = raw.lower()
+                            else:
+                                continue
                         else:
-                            candidate_hash = raw.lower()
+                            # 52-char base32 (v1+v2 hybrid) or other lengths
+                            try:
+                                import base64
+                                padded = raw.upper() + "=" * (-len(raw) % 8)
+                                candidate_hash = base64.b32decode(padded).hex()
+                            except Exception:
+                                continue
                         break
 
             if candidate_hash:
@@ -222,7 +250,10 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
 
             return AddResult(hash=None, accepted=False, detail=text)
 
-        return AddResult(hash=None, accepted=True, detail=text)
+        # Unknown response text (e.g. HTML login page, "Torrent is not valid"):
+        # never treat as success — caller must see accepted=False.
+        log.warning("qB add_torrent unexpected response: %r", text[:200])
+        return AddResult(hash=None, accepted=False, detail=text)
 
     async def set_file_priorities(
         self, torrent_hash: str, priorities: dict[str, int]
@@ -232,6 +263,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         `priorities` is a {file_name: priority_int}. Internally qB uses file
         indexes, so we look up the index for each file first, then batch file
         indices by priority using qBittorrent's piped id format ('0|1|2').
+        Valid qB priorities are 0 (skip), 1 (normal), 6 (high), 7 (max).
         """
         files = await self.get_torrent_files(torrent_hash)
         index_map = {f.name: i for i, f in enumerate(files)}
@@ -241,7 +273,18 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             if idx is None:
                 log.warning("set_file_priorities: file %r not in torrent", name)
                 continue
+            if prio not in (0, 1, 6, 7):
+                log.warning(
+                    "set_file_priorities: invalid qB priority %r for %r; "
+                    "expected one of 0,1,6,7",
+                    prio, name,
+                )
+                continue
             prio_to_ids.setdefault(prio, []).append(str(idx))
+
+        if not prio_to_ids:
+            log.warning("set_file_priorities: no valid files to update for %s", torrent_hash)
+            return
 
         for prio, ids in prio_to_ids.items():
             data = aiohttp.FormData()
@@ -340,10 +383,15 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             return await r.json()
 
 
+def _split_path(name: str) -> list[str]:
+    """Split on both POSIX and Windows separators for cross-platform save_path."""
+    return [p for p in re.split(r"[\\/]+", name) if p]
+
+
 def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
     state = (
         d.get("state")
-        or ("completed" if d.get("progress", 0) >= 1.0 else "downloading")
+        or ("completed" if (d.get("progress", 0) or 0) >= 1.0 else "downloading")
     )
     # qB `save_path` is always a directory — never truncate it on suffix
     # alone (that corrupts dotted dirs like `/data/My.Show.S01`). The only
@@ -353,23 +401,31 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
     torrent_name = str(d.get("name") or "").strip()
     cp_raw = str(d.get("content_path") or "").strip()
     if not sp and cp_raw:
-        cp = Path(cp_raw)
-        if torrent_name and cp.name == torrent_name:
-            sp = str(cp.parent)
+        cp_parts = _split_path(cp_raw)
+        leading = "/" if cp_raw.startswith("/") else ("\\" if cp_raw.startswith("\\") else "")
+        if torrent_name and cp_parts and cp_parts[-1] == torrent_name:
+            parent = "/".join(cp_parts[:-1])
+            sp = (leading + parent) if parent else (leading or cp_raw)
         else:
-            sp = str(cp)
+            sp = cp_raw
     elif sp and torrent_name and cp_raw:
-        if Path(sp).name == torrent_name and Path(cp_raw).name == torrent_name:
-            sp = str(Path(sp).parent)
+        if _split_path(sp)[-1:] == [torrent_name] and _split_path(cp_raw)[-1:] == [torrent_name]:
+            parent_parts = _split_path(sp)[:-1]
+            leading = "/" if sp.startswith("/") else ("\\" if sp.startswith("\\") else "")
+            joined = "/".join(parent_parts)
+            sp = (leading + joined) if joined else sp
+    infohash = str(d.get("hash") or "").strip().lower()
+    if not infohash:
+        raise ValueError(f"qB torrent row missing infohash: {d!r}")
     return Torrent(
-        hash=d["hash"],
-        name=d["name"],
-        category=d.get("category", ""),
+        hash=infohash,
+        name=torrent_name or infohash,
+        category=d.get("category", "") or "",
         save_path=sp,
         size_bytes=int(d.get("size", d.get("total_size", 0)) or 0),
         state=str(state),
-        progress=float(d.get("progress", 0.0)),
-        ratio=float(d.get("ratio", 0.0)),
+        progress=float(d.get("progress", 0.0) or 0.0),
+        ratio=float(d.get("ratio", 0.0) or 0.0),
         trackers=[],
         files=[],
         added_on=int(d.get("added_on") or 0),
