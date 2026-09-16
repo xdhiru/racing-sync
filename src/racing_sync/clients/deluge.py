@@ -137,8 +137,9 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         filt: dict[str, Any] = {}
         if category:
             filt["label"] = category
-        if hashes:
-            filt["hash"] = list(hashes)
+        hash_list = list(hashes) if hashes is not None else None
+        if hash_list:
+            filt["hash"] = hash_list
         status_keys = [
             "name",
             "total_size",
@@ -171,8 +172,8 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     added_on=int(status.get("time_added", 0) or 0),
                 )
             )
-        if hashes:
-            hash_set = {h.lower() for h in hashes}
+        if hash_list:
+            hash_set = {h.lower() for h in hash_list}
             out = [t for t in out if t.hash.lower() in hash_set]
         return out
 
