@@ -405,3 +405,122 @@ async def test_do_moving_purges_only_own_temp_files_when_no_season_folder(tmp_pa
     # Concurrent downloads' temporary files must NOT be unlinked
     assert concurrent_temp1.exists()
     assert concurrent_temp2.exists()
+
+
+@pytest.mark.anyio
+async def test_do_downloading_fails_fast_when_batch_unresolvable():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord._live = {}
+    coord.store = MagicMock()
+    coord.dest_client = MagicMock()
+    coord._get_batches_for_torrent = AsyncMock(return_value=[])
+    coord._wait_for_completion = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="testhash",
+        source_name="Test.Show.S01",
+        classification_kind="season",
+        batches_total=2,
+        batch_index=0,
+        state=State.DOWNLOADING,
+    )
+
+    with pytest.raises(RuntimeError, match="could not be resolved"):
+        await coord._do_downloading(ts)
+
+    # Batch index must NOT be advanced when batch move cannot be resolved
+    assert ts.batch_index == 0
+
+
+@pytest.mark.anyio
+async def test_wait_for_completion_fails_fast_on_missing_expected_files():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import Torrent, TorrentFile
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord._live = {}
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=Torrent(
+            hash="h1", name="Show", category="racing", save_path="",
+            size_bytes=1000, state="downloading", progress=0.5, trackers=[],
+        )
+    )
+    # Torrent metadata is loaded with only Ep01, but batch expects Ep02
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Show.S01E01.mkv", size_bytes=500, progress=1.0, priority=1)
+        ]
+    )
+
+    ts = TorrentState(
+        source_infohash="h1",
+        source_name="Show.S01",
+        classification_kind="season",
+        state=State.DOWNLOADING,
+    )
+
+    with pytest.raises(RuntimeError, match="expected batch files missing from torrent"):
+        await coord._wait_for_completion(ts, expected_files=["Show.S01E01.mkv", "Show.S01E02.mkv"])
+
+
+@pytest.mark.anyio
+async def test_do_moving_moves_remaining_files_when_batches_incomplete(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.rclone.remote.default = "remote:media/"
+    coord.dest_client = MagicMock()
+
+    show_folder = tmp_path / "Show.S01"
+    show_folder.mkdir()
+    ep2_file = show_folder / "Show.S01E02.mkv"
+    ep2_file.write_bytes(b"ep2 content")
+
+    cls_file = TorrentFile(
+        name="Show.S01/Show.S01E02.mkv",
+        size_bytes=len(b"ep2 content"),
+        progress=1.0,
+        priority=1,
+    )
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[cls_file])
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.delete = AsyncMock()
+    coord._rclone_move = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="hash1",
+        source_name="Show.S01",
+        classification_kind="season",
+        batches_total=2,
+        batch_index=1,  # Only batch 1 finished; crash before final move
+        state=State.MOVING,
+    )
+
+    with patch("racing_sync.coordinator.classify") as mock_classify, \
+         patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock):
+        mock_cls = MagicMock()
+        mock_cls.kind = "season"
+        mock_cls.single_file = None
+        mock_classify.return_value = mock_cls
+
+        await coord._do_moving(ts)
+
+    # Incomplete batches with remaining payload files MUST be moved before cleanup
+    coord._rclone_move.assert_called_once()
+    assert ts.state == State.RE_ADDING
