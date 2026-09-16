@@ -132,7 +132,12 @@ class DelugeSFTPConfig(BaseModel):
     @model_validator(mode="after")
     def _check_auth(self) -> "DelugeSFTPConfig":
         # Only enforce credentials when the section is actually in use.
-        if self.enabled and not self.ssh_key_path and not self.ssh_password:
+        has_pwd = bool(
+            self.ssh_password.get_secret_value().strip()
+            if hasattr(self.ssh_password, "get_secret_value")
+            else str(self.ssh_password).strip()
+        )
+        if self.enabled and not self.ssh_key_path and not has_pwd:
             raise ValueError(
                 "Deluge SFTP requires ssh_password or ssh_key_path when enabled"
             )

@@ -17,6 +17,29 @@ def test_sftp_exporter_requires_auth():
         )
 
 
+def test_sftp_config_rejects_empty_or_whitespace_password():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="Deluge SFTP requires ssh_password or ssh_key_path when enabled"):
+        DelugeSFTPConfig(
+            enabled=True,
+            ssh_host="localhost",
+            ssh_user="x",
+            ssh_password="",
+            state_dir=Path("/tmp"),
+        )
+
+    with pytest.raises(ValidationError, match="Deluge SFTP requires ssh_password or ssh_key_path when enabled"):
+        DelugeSFTPConfig(
+            enabled=True,
+            ssh_host="localhost",
+            ssh_user="x",
+            ssh_password="   ",
+            state_dir=Path("/tmp"),
+        )
+
+
+
 def test_sftp_exporter_close_cleans_resources():
     from unittest.mock import MagicMock
     from racing_sync.sftp_source import SFTPExporter
