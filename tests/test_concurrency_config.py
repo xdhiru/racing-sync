@@ -473,7 +473,7 @@ async def test_pick_ssd_source_public_and_private_paths():
     cfg_priv.prowlarr.get_download_indexer.return_value = MagicMock()
     cfg_priv.cross_seed.allow_prowlarr_cross_seed = True
 
-    hit = MagicMock(title="Priv.Movie", size_bytes=1000, download_url="http://seedpool/1")
+    hit = MagicMock(title="Priv.Movie", size_bytes=1000, download_url="http://seedpool/1", guid="0123456789012345678901234567890123456789")
     prowlarr.best_match.return_value = hit
     prowlarr.download_torrent.return_value = b"prowlarr_blob"
 
@@ -488,6 +488,7 @@ async def test_pick_ssd_source_public_and_private_paths():
     assert dec_priv is not None
     assert dec_priv.source_label == "seedpool-cross-seed"
     assert dec_priv.torrent_bytes == b"prowlarr_blob"
+    assert dec_priv.infohash == ""
 
 
 @pytest.mark.anyio
