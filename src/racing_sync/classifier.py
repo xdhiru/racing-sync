@@ -44,11 +44,31 @@ class Classification:
     total_bytes: int
 
 
+_DELIM_START = r"(?:(?<=[._\-\s\[\(])|^)"
+_DELIM_END = r"(?:(?=[._\-\s\]\)])|$)"
+
+_BLACKLIST_TAGS_RE = re.compile(
+    r"(?i)(?:(?<=[._\-\s\[\(])|^)"
+    r"(?:"
+    r"\d{3,4}x\d{3,4}"                   # 1920x1080, 3840x2160, 1280x720, etc.
+    r"|\d{3,4}[pi]"                      # 720p, 1080p, 1080i, 2160p, 480p, 576p
+    r"|[xh]\.?26[45]"                    # x264, x265, h264, h265, x.264
+    r"|[0-9]\.[0-1]"                     # 5.1, 7.1, 2.0 (audio channels)
+    r"|4k|8k"                            # 4k, 8k
+    r")"
+    r"(?:(?=[._\-\s\]\)])|$)"
+)
+
 EP_RE = re.compile(
-    r"[Ss](\d{1,2})[Ee](\d{1,2})"       # S01E08, s1e2
-    r"|(\d{1,2})x(\d{1,2})"             # 1x08
-    r"|[Ee][Pp]?(\d{1,3})"              # E08, EP08
-    r"|(?:\b|_)[Ss]eason\s*(\d{1,2})\s*[Ee]pisode\s*(\d{1,2})"
+    r"(?i)"
+    + _DELIM_START
+    + r"(?:"
+    r"[Ss](\d{1,2})[._\-\s]*[Ee](\d{1,2})"
+    r"|(?<!\d)(\d{1,2})x(\d{1,2})(?!\d)"
+    r"|(?:[Ee][Pp]?|[Ee]pisode)[._\-\s]*(\d{1,3})(?!\d)"
+    r"|[Ss]eason[._\-\s]*(\d{1,2})[._\-\s]*[Ee]pisode[._\-\s]*(\d{1,2})"
+    r")"
+    + _DELIM_END
 )
 
 
@@ -67,20 +87,21 @@ def parse_episode(name: str, regex: re.Pattern[str] | str | None = None) -> tupl
     else:
         pattern = regex
 
-    m = pattern.search(name)
+    clean_name = _BLACKLIST_TAGS_RE.sub(" ", name)
+    m = pattern.search(clean_name)
     if not m:
         return None
 
-    # If pattern has capture groups, use them
-    groups = m.groups()
-    if len(groups) >= 2 and groups[0] and groups[1]:
+    # If pattern has capture groups, use non-None matched groups
+    matched_groups = [g for g in m.groups() if g is not None]
+    if len(matched_groups) >= 2:
         try:
-            return int(groups[0]), int(groups[1])
+            return int(matched_groups[0]), int(matched_groups[1])
         except ValueError:
             pass
-    elif len(groups) == 1 and groups[0]:
+    elif len(matched_groups) == 1:
         try:
-            return 1, int(groups[0])
+            return 1, int(matched_groups[0])
         except ValueError:
             pass
 

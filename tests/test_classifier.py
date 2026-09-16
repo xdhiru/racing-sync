@@ -315,3 +315,49 @@ def test_season_with_subtitles_filters_non_video_from_episodes():
         assert ep.episode == i
         assert ep.file_name.endswith(".mkv")
         assert ep.size_bytes == 1_000_000_000
+
+
+def test_classifier_false_positive_prevention():
+    from racing_sync.classifier import parse_episode
+
+    # Video resolutions (e.g. 1920x1080 -> 20x10, 3840x2160 -> 40x21, 1280x720 -> 80x72)
+    assert parse_episode("Movie.2020.1920x1080.mkv") is None
+    assert parse_episode("Movie.2020.3840x2160.mkv") is None
+    assert parse_episode("Movie.2020.1280x720.mkv") is None
+
+    # Title words with 'e' followed by digits (e.g. Se7en, Blade2, Drive1997, Scene2)
+    assert parse_episode("Se7en.1995.1080p.mkv") is None
+    assert parse_episode("Blade2.2002.1080p.mkv") is None
+    assert parse_episode("Drive1997.mkv") is None
+    assert parse_episode("Scene2.mkv") is None
+
+    # Resolution, codec, and audio channels
+    assert parse_episode("Sample.720p.mkv") is None
+    assert parse_episode("Film.720p.x264.mkv") is None
+    assert parse_episode("Film.1080p.x265.5.1.mkv") is None
+    assert parse_episode("Film.2160p.TrueHD.7.1.mkv") is None
+
+    # Ensure movie classification routes correctly to movie, NOT episode
+    cfg = _cfg()
+    movie_res = [TorrentFile("Movie.2020.1920x1080.mkv", 4_000_000_000)]
+    assert classify(movie_res, cfg).kind == "movie"
+
+    movie_se7en = [TorrentFile("Se7en.1995.1080p.BluRay.x264.DTS.5.1.mkv", 10_000_000_000)]
+    assert classify(movie_se7en, cfg).kind == "movie"
+
+
+def test_classifier_episode_delimiter_support():
+    from racing_sync.classifier import parse_episode
+
+    # Standard delimited episodes
+    assert parse_episode("Show.Name.S01E08.1080p.mkv") == (1, 8)
+    assert parse_episode("Show.Name.s01e02.mkv") == (1, 2)
+    assert parse_episode("Show.Name.1x08.720p.mkv") == (1, 8)
+    assert parse_episode("Show.Name.EP08.mkv") == (1, 8)
+    assert parse_episode("Show.Name.E08.mkv") == (1, 8)
+    assert parse_episode("Show.Name.Episode.08.mkv") == (1, 8)
+    assert parse_episode("Show.Name.Season.1.Episode.2.mkv") == (1, 2)
+    assert parse_episode("Show_Name_S02E05.mkv") == (2, 5)
+    assert parse_episode("Show Name - [01x08] - Title.mkv") == (1, 8)
+    assert parse_episode("S01E01 - Pilot.mkv") == (1, 1)
+
