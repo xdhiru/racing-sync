@@ -209,7 +209,14 @@ async def pick_ssd_source_for_racing(
                 "SFTP-exporting %s from VPS1 for SSD download",
                 chosen.infohash[:10],
             )
-            blob = await asyncio.to_thread(sftp.fetch_torrent, chosen.infohash)
+            blob = None
+            try:
+                blob = await asyncio.wait_for(
+                    asyncio.to_thread(sftp.fetch_torrent, chosen.infohash),
+                    timeout=15.0,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("sftp fetch %s failed: %s", chosen.infohash[:10], e)
             if blob:
                 return SourceDecision(
                     torrent_bytes=blob,
@@ -226,7 +233,10 @@ async def pick_ssd_source_for_racing(
         # source_infohash), try to use qBittorrent's WebUI
         # /torrents/export endpoint directly via the source_client.
         try:
-            blob = await source_client.export_torrent(chosen.infohash)
+            blob = await asyncio.wait_for(
+                source_client.export_torrent(chosen.infohash),
+                timeout=15.0,
+            )
         except AttributeError:
             blob = None
         except Exception as e:  # noqa: BLE001
@@ -272,9 +282,11 @@ async def pick_ssd_source_for_racing(
                 hit = None
             if hit:
                 blob = await prowlarr.download_torrent(hit)
+                real_hash = ""
+                announce = ""
                 try:
                     from .watchdir import _bencoded_info_hash
-                    real_hash, _, _, _ = _bencoded_info_hash(blob)
+                    real_hash, _, _, announce = _bencoded_info_hash(blob)
                 except Exception:
                     real_hash = ""
                 return SourceDecision(
@@ -283,12 +295,20 @@ async def pick_ssd_source_for_racing(
                     name=chosen.name,
                     size_bytes=hit.size_bytes,
                     infohash=real_hash,
-                    announce_url=hit.download_url,
+                    announce_url=announce or (chosen.trackers[0] if chosen.trackers else ""),
                 )
+
+        log.warning(
+            "public torrent present but could not export .torrent for %s (sftp=%s, qb=%s)",
+            chosen.name,
+            cfg.cross_seed.allow_ssh_export and sftp is not None,
+            source_client is not None,
+        )
+        return None
 
     # All torrents are private. We only download from VPS2 SSD using a
     # cross-seed from the configured download_indexer ("Seedpool (API)" by default).
-    # Private torrents are never downloaded directly on SSD.
+    # Private torrents are never downloaded directly on SSD unless SFTP fallback is explicitly used.
     should_skip_prowlarr = cfg.prowlarr.should_skip_title(source_torrent.name)
     if should_skip_prowlarr:
         log.info(
@@ -313,9 +333,11 @@ async def pick_ssd_source_for_racing(
                 hit.title, hit.size_bytes, hit.indexer,
             )
             blob = await prowlarr.download_torrent(hit)
+            real_hash = ""
+            announce = ""
             try:
                 from .watchdir import _bencoded_info_hash
-                real_hash, _, _, _ = _bencoded_info_hash(blob)
+                real_hash, _, _, announce = _bencoded_info_hash(blob)
             except Exception:
                 real_hash = ""
             return SourceDecision(
@@ -324,7 +346,7 @@ async def pick_ssd_source_for_racing(
                 name=source_torrent.name,
                 size_bytes=hit.size_bytes,
                 infohash=real_hash,
-                announce_url=hit.download_url,
+                announce_url=announce or (source_torrent.trackers[0] if source_torrent.trackers else ""),
             )
         if attempt_prowlarr:
             log.info(
@@ -332,6 +354,33 @@ async def pick_ssd_source_for_racing(
                 source_torrent.name,
             )
             return None
+
+    # SFTP fallback for private when attempt_prowlarr is False or Prowlarr is unavailable/skipped
+    if not attempt_prowlarr and cfg.cross_seed.allow_ssh_export and sftp is not None:
+        log.info(
+            "Prowlarr bypass/fallback: SFTP-exporting private torrent %s from VPS1",
+            source_torrent.infohash[:10],
+        )
+        blob = None
+        try:
+            blob = await asyncio.wait_for(
+                asyncio.to_thread(sftp.fetch_torrent, source_torrent.infohash),
+                timeout=15.0,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("sftp fallback fetch %s failed: %s", source_torrent.infohash[:10], e)
+        if blob:
+            return SourceDecision(
+                torrent_bytes=blob,
+                source_label="private-sftp-fallback",
+                name=source_torrent.name,
+                size_bytes=source_torrent.size_bytes,
+                infohash=source_torrent.infohash,
+                announce_url=(
+                    source_torrent.trackers[0]
+                    if source_torrent.trackers else ""
+                ),
+            )
 
     log.warning(
         "no public torrent and no Seedpool cross-seed available for %s",
