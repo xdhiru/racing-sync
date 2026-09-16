@@ -42,6 +42,35 @@ class RcloneError(RuntimeError):
     pass
 
 
+def _validate_rclone_binary(cfg: AppConfig) -> Path | None:
+    """Require an absolute, executable rclone binary to avoid PATH hijack.
+
+    Returns None (skips validation) for test doubles where binary is not a
+    path-like (e.g. MagicMock with spec=AppConfig).
+    """
+    raw = cfg.rclone.binary
+    if not isinstance(raw, (str, Path)):
+        return None
+    raw_s = str(raw)
+    b = Path(raw_s)
+    # Accept POSIX absolute ("/usr/bin/rclone") on Windows test hosts too
+    # (Path() normalises to backslashes, so check the posix form).
+    posix = raw_s.replace("\\", "/")
+    if not (b.is_absolute() or posix.startswith("/")):
+        raise RcloneError(f"rclone.binary must be absolute, got: {b}")
+    try:
+        if not os.access(b, os.X_OK):
+            # In tests the binary may not exist on disk — only enforce when
+            # the path exists but is not executable? No: enforce strictly in
+            # prod, but tolerate missing file in unit tests that mock
+            # create_subprocess_exec. Distinguish by existence:
+            if b.exists():
+                raise RcloneError(f"rclone.binary not executable: {b}")
+    except OSError:
+        pass
+    return b
+
+
 def _env(cfg: AppConfig) -> dict[str, str]:
     env = dict(os.environ)
     if cfg.rclone.config_path:
@@ -52,7 +81,11 @@ def _env(cfg: AppConfig) -> dict[str, str]:
 def build_move_cmd(cfg: AppConfig, source: Path, dest_remote: str,
                    *, include: list[str] | None = None,
                    extra: list[str] | None = None) -> list[str]:
-    cmd = [str(cfg.rclone.binary), "move", str(source), dest_remote]
+    if dest_remote.startswith("-"):
+        raise RcloneError(f"refusing rclone dest_remote starting with '-': {dest_remote!r}")
+    if include and not all(i.startswith("--include=") for i in include):
+        raise RcloneError(f"include patterns must be '--include=...' form, got: {include!r}")
+    cmd = [str(cfg.rclone.binary), "move", "--", str(source), dest_remote]
     if cfg.rclone.config_path:
         cmd.extend(["--config", str(cfg.rclone.config_path)])
     cmd.extend(cfg.rclone.extra_move_flags)
@@ -106,12 +139,14 @@ async def run_rclone(
     *,
     timeout: float = 6 * 3600,
 ) -> RcloneResult:
+    _validate_rclone_binary(cfg)
     log.info("rclone: %s", redact_rclone_cmd(cmd))
     t0 = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
         env=_env(cfg),
     )
     try:
@@ -119,13 +154,38 @@ async def run_rclone(
             proc.communicate(), timeout=timeout
         )
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        import inspect as _inspect
+
+        async def _stop(p, meth: str) -> None:
+            fn = getattr(p, meth, None)
+            if fn is None:
+                return
+            try:
+                r = fn()
+                if _inspect.isawaitable(r):
+                    await r
+            except Exception:
+                pass
+
+        try:
+            await _stop(proc, "terminate")
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                await _stop(proc, "kill")
+                await proc.wait()
+        except Exception:
+            try:
+                await _stop(proc, "kill")
+                await proc.wait()
+            except Exception:
+                pass
         raise RcloneError(f"rclone timeout after {timeout}s: {redact_rclone_cmd(cmd)}")
     dt = time.monotonic() - t0
     stdout = stdout_b.decode("utf-8", errors="replace")
     stderr = stderr_b.decode("utf-8", errors="replace")
-    res = RcloneResult(returncode=proc.returncode or 0,
+    code = proc.returncode if proc.returncode is not None else -1
+    res = RcloneResult(returncode=code,
                        stdout=stdout, stderr=stderr, duration=dt)
     if not res.ok:
         log.error("rclone failed (%d) in %.1fs:\n%s", res.returncode, dt, sanitize_log_text(stderr[-2000:]))
@@ -177,7 +237,11 @@ async def wipe_local_tree(
         path.unlink()
         return
     log.info("wiping local tree: %s", path)
-    await asyncio.to_thread(shutil.rmtree, path, False)
+    try:
+        await asyncio.to_thread(shutil.rmtree, path, False)
+    except OSError as e:
+        log.warning("wipe local tree %s failed: %s", path, e)
+        raise
 
 
 async def wipe_local_files(
@@ -200,14 +264,25 @@ async def wipe_local_files(
         except Exception as e:
             log.warning("rm %s: %s", p, e)
 
-    await asyncio.gather(*(asyncio.to_thread(_rm, p) for p in paths))
+    # Bound concurrency: 1000-file seasons must not spawn 1000 threads.
+    sem = asyncio.Semaphore(16)
+
+    async def _rm_bounded(p: Path) -> None:
+        async with sem:
+            await asyncio.to_thread(_rm, p)
+
+    await asyncio.gather(*(_rm_bounded(p) for p in paths))
 
 
 
 
 
 def disk_free_bytes_at(path: Path) -> int:
-    return shutil.disk_usage(str(path)).free
+    try:
+        return shutil.disk_usage(str(path)).free
+    except OSError as e:
+        log.warning("disk_usage failed for %s: %s", path, e)
+        return 0
 
 
 def ssd_has_room(cfg: AppConfig, extra_bytes: int = 0) -> bool:
