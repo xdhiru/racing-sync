@@ -90,7 +90,8 @@ class ProwlarrClient:
 
     @property
     def _auth_headers(self) -> dict[str, str]:
-        return {"X-Api-Key": self._cfg.api_key}
+        key = self._cfg.api_key.get_secret_value() if hasattr(self._cfg.api_key, "get_secret_value") else str(self._cfg.api_key)
+        return {"X-Api-Key": key}
 
     async def close(self) -> None:
         if self._session and not self._session.closed:

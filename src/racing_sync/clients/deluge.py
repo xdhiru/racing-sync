@@ -66,7 +66,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         from .http_base import AuthError
         payload = {
             "method": "auth.login",
-            "params": [self._cfg.password],
+            "params": [self._cfg.password.get_secret_value() if hasattr(self._cfg.password, "get_secret_value") else str(self._cfg.password)],
             "id": 1,
         }
         async with self.session.post("json", json=payload) as r:

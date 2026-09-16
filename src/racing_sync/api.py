@@ -54,7 +54,11 @@ def build_app(coord: Coordinator) -> FastAPI:
             if client_host not in trusted_proxies:
                 raise HTTPException(403, "untrusted proxy for nginx auth header")
             return x_authenticated_user
-        token_str = str(cfg.api.api_token)
+        token_str = (
+            cfg.api.api_token.get_secret_value()
+            if hasattr(cfg.api.api_token, "get_secret_value")
+            else str(cfg.api.api_token)
+        )
         if token_str and x_api_token and secrets.compare_digest(x_api_token, token_str):
             return "token"
         raise HTTPException(401, "auth required")

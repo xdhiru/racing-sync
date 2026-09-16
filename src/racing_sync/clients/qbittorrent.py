@@ -36,7 +36,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             "api/v2/auth/login",
             data={
                 "username": self._cfg.username,
-                "password": self._cfg.password,
+                "password": self._cfg.password.get_secret_value() if hasattr(self._cfg.password, "get_secret_value") else str(self._cfg.password),
             },
         ) as r:
             if r.status != 200:
