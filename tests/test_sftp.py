@@ -189,3 +189,96 @@ def test_sftp_host_key_policy_auto_add_opt_in():
         args, _ = client.set_missing_host_key_policy.call_args
         assert isinstance(args[0], paramiko.AutoAddPolicy)
 
+
+def test_ipv4_socket_closes_socket_on_oserror():
+    import socket
+    from unittest.mock import MagicMock, patch
+    from racing_sync.sftp_source import _ipv4_socket, SFTPError
+
+    mock_s1 = MagicMock()
+    mock_s1.connect.side_effect = OSError("connect failed")
+
+    with patch("socket.getaddrinfo") as mock_gai, patch("socket.socket") as mock_sock:
+        mock_gai.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 22)),
+        ]
+        mock_sock.return_value = mock_s1
+
+        with pytest.raises(SFTPError):
+            _ipv4_socket("127.0.0.1", 22, timeout=5)
+
+        # Socket must have been closed when connect failed
+        mock_s1.close.assert_called_once()
+
+
+def test_connect_failure_cleans_up_socket_and_client():
+    from unittest.mock import MagicMock, patch
+    from racing_sync.sftp_source import SFTPExporter
+
+    cfg = DelugeSFTPConfig(
+        enabled=True,
+        ssh_host="localhost",
+        ssh_user="x",
+        ssh_password="pwd",
+        state_dir=Path("/tmp"),
+    )
+    exporter = SFTPExporter(cfg)
+    mock_sock = MagicMock()
+
+    with patch("racing_sync.sftp_source._ipv4_socket", return_value=mock_sock), \
+         patch("paramiko.SSHClient") as mock_ssh_cls:
+        client = MagicMock()
+        mock_ssh_cls.return_value = client
+        client.connect.side_effect = RuntimeError("auth error")
+
+        with pytest.raises(RuntimeError, match="auth error"):
+            exporter.connect()
+
+        mock_sock.close.assert_called_once()
+        client.close.assert_called_once()
+        assert exporter._client is None
+        assert exporter._sftp is None
+
+
+def test_fetch_torrent_uses_posix_path_and_caps_read():
+    from unittest.mock import MagicMock
+    from racing_sync.sftp_source import SFTPExporter, MAX_TORRENT_BYTES
+
+    cfg = DelugeSFTPConfig(
+        enabled=True,
+        ssh_host="localhost",
+        ssh_user="x",
+        ssh_password="pwd",
+        state_dir=Path(r"\var\data\deluge\state"),
+    )
+    exporter = SFTPExporter(cfg)
+    mock_client = MagicMock()
+    mock_client.get_transport().is_active.return_value = True
+    mock_sftp = MagicMock()
+    exporter._client = mock_client
+    exporter._sftp = mock_sftp
+
+    # 1. Normal file read
+    mock_file = MagicMock()
+    mock_file.read.return_value = b"d8:announcee"
+    mock_file.__enter__.return_value = mock_file
+    mock_sftp.open.return_value = mock_file
+
+    hash_val = "1" * 40
+    data = exporter.fetch_torrent(hash_val)
+    assert data == b"d8:announcee"
+
+    # Verify POSIX forward slashes were used in SFTP remote open call
+    opened_path = mock_sftp.open.call_args[0][0]
+    assert "\\" not in opened_path
+    assert opened_path == f"/var/data/deluge/state/{hash_val}.torrent"
+    # Verify read was capped
+    mock_file.read.assert_called_once_with(MAX_TORRENT_BYTES + 1)
+
+    # 2. Oversize file (> 20MB)
+    mock_file.reset_mock()
+    mock_file.read.return_value = b"d" + (b"0" * (MAX_TORRENT_BYTES + 10))
+    mock_sftp.open.return_value = mock_file
+    data_oversize = exporter.fetch_torrent(hash_val)
+    assert data_oversize is None
+
