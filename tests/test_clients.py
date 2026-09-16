@@ -190,3 +190,103 @@ async def test_http_client_auth_retry_releases_initial_response():
     resp_401.close.assert_called_once()
     client._auth.assert_awaited_once()
 
+
+@pytest.mark.anyio
+async def test_deluge_list_torrents_progress_and_hash_filtering():
+    cfg = SourceConfig(
+        type="deluge",
+        host="http://localhost:8112",
+        password="secret",
+        deluge_sftp={
+            "enabled": True,
+            "ssh_host": "127.0.0.1",
+            "ssh_password": "pwd",
+            "state_dir": "/var/lib/deluged/state",
+        },
+    )
+    client = DelugeClient(cfg)
+
+    mock_torrents = {
+        "hash_1": {
+            "name": "Torrent 1",
+            "progress": 1.5,  # 1.5% in Deluge
+            "state": "Downloading",
+            "total_size": 1000,
+            "label": "",
+            "save_path": "/downloads",
+            "ratio": 0.0,
+            "trackers": [],
+            "time_added": 123456,
+        },
+        "hash_2": {
+            "name": "Torrent 2",
+            "progress": 100.0,  # 100% in Deluge
+            "state": "Seeding",
+            "total_size": 2000,
+            "label": "",
+            "save_path": "/downloads",
+            "ratio": 1.0,
+            "trackers": [],
+            "time_added": 123457,
+        },
+    }
+
+    client._rpc = AsyncMock(return_value=mock_torrents)
+
+    # 1. Full list: progress should be scaled 0.0-1.0
+    torrents = await client.list_torrents()
+    assert len(torrents) == 2
+    t1 = next(t for t in torrents if t.hash == "hash_1")
+    t2 = next(t for t in torrents if t.hash == "hash_2")
+    assert pytest.approx(t1.progress, 0.001) == 0.015
+    assert not t1.is_complete()
+    assert pytest.approx(t2.progress, 0.001) == 1.0
+    assert t2.is_complete()
+
+    # 2. Filtered by hash
+    filtered = await client.list_torrents(hashes=["HASH_2"])
+    assert len(filtered) == 1
+    assert filtered[0].hash == "hash_2"
+
+    # 3. get_torrent: selects the specific requested torrent even when RPC returns all
+    client.get_torrent_files = AsyncMock(return_value=[])
+    got_t2 = await client.get_torrent("hash_2")
+    assert got_t2 is not None
+    assert got_t2.hash == "hash_2"
+
+
+@pytest.mark.anyio
+async def test_deluge_set_file_priorities_indexed():
+    cfg = SourceConfig(
+        type="deluge",
+        host="http://localhost:8112",
+        password="secret",
+        deluge_sftp={
+            "enabled": True,
+            "ssh_host": "127.0.0.1",
+            "ssh_password": "pwd",
+            "state_dir": "/var/lib/deluged/state",
+        },
+    )
+    client = DelugeClient(cfg)
+
+    async def mock_rpc(method, params=None):
+        if method == "core.get_torrent_status":
+            return {
+                "files": [
+                    {"path": "file0.mkv", "index": 0},
+                    {"path": "file1.mkv", "index": 1},
+                ],
+                "file_priorities": [1, 1],
+            }
+        if method == "core.set_torrent_file_priorities":
+            return True
+        return None
+
+    rpc_mock = AsyncMock(side_effect=mock_rpc)
+    client._rpc = rpc_mock
+
+    await client.set_file_priorities("hash_abc", {"file1.mkv": 0})
+    rpc_mock.assert_any_call("core.set_torrent_file_priorities", ["hash_abc", [1, 0]])
+
+
