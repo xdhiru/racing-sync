@@ -460,6 +460,13 @@ class ProwlarrConfig(BaseModel):
                     "Set it to the exact name of the indexer in your "
                     "Prowlarr instance (case-sensitive)."
                 )
+            if not self.download_indexer_substrings:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "prowlarr enabled but download_indexer_substrings is empty — "
+                    "is_download_indexer() will always return False and "
+                    "sacrificial detection is disabled",
+                )
         return self
 
 
@@ -526,6 +533,17 @@ class CrossSeedConfig(BaseModel):
     inject_racing_torrents_to_fuse: bool = True
     allow_prowlarr_cross_seed: bool = True
     allow_ssh_export: bool = True
+
+    @model_validator(mode="after")
+    def _check_strategy(self) -> "CrossSeedConfig":
+        if not self.allow_prowlarr_cross_seed and not self.allow_ssh_export:
+            raise ValueError(
+                "cross_seed: allow_prowlarr_cross_seed=false + allow_ssh_export=false "
+                "leaves no SSD-source strategy for private torrents "
+                "(every torrent would park in WAITING_SEEDPOOL until FAILED). "
+                "Enable at least one unless this is a public-only deployment."
+            )
+        return self
 
 
 class RecoveryConfig(BaseModel):

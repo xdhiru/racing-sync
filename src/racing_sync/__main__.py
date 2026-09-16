@@ -60,17 +60,33 @@ def main(argv: list[str] | None = None) -> int:
     p_check.add_argument("--config", type=Path, required=True)
 
     args = parser.parse_args(argv)
-    cfg = AppConfig.from_toml(args.config)
+    try:
+        cfg = AppConfig.from_toml(args.config)
+    except FileNotFoundError as e:
+        print(f"Invalid config: file not found: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        # TOML decode errors + pydantic ValidationError — clean message, no traceback.
+        print(f"Invalid config {args.config}: {e}", file=sys.stderr)
+        return 2
 
     if args.cmd == "check-config":
         print(f"OK: {args.config}")
         return 0
 
-    setup_logging(cfg)
+    try:
+        setup_logging(cfg)
+    except Exception as e:
+        print(f"Failed to initialise logging ({cfg.general.log_dir}): {e}", file=sys.stderr)
+        return 2
     log = logging.getLogger("racing_sync")
     log.info("starting racing-sync")
 
-    coord = Coordinator(cfg)
+    try:
+        coord = Coordinator(cfg)
+    except Exception as e:
+        print(f"Failed to initialise coordinator: {e}", file=sys.stderr)
+        return 2
     try:
         return asyncio.run(_runner(coord))
     except KeyboardInterrupt:

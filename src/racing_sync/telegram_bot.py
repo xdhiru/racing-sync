@@ -172,7 +172,7 @@ def _tracker_domain(url: str) -> str:
 def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     """Per-torrent detail message (edited in place as state advances)."""
     icon = _STATE_ICON.get(ts.state, ts.state.value.upper())
-    name = ts.source_name.replace("`", "'").rstrip("\\")
+    name = ts.source_name.replace("`", "'").replace("\n", " ").replace("\r", " ").rstrip("\\")
     size = _bytes_human(ts.total_bytes)
     full_hash = (ts.source_infohash or "").lower()
 
@@ -216,13 +216,15 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     elif ts.state == State.DONE:
         lines.append("✓ Seeded from fuse mount")
     elif ts.state == State.FAILED:
-        err = _esc(ts.last_error[:200]) if ts.last_error else "no detail"
+        from .logging_setup import sanitize_log_text as _san
+        raw_err = (ts.last_error or "")[:200].replace("\n", " ").replace("\r", " ")
+        err = _esc(_san(raw_err)) if raw_err else "no detail"
         lines.append(f"✗ Failed: {err}")
 
     # Cross-seed info
     if ts.cross_seed_source:
         cs_hash = (ts.cross_seed_infohash or "").lower()
-        if cs_hash and len(cs_hash) >= 20:
+        if cs_hash and len(cs_hash) == 40 and all(c in "0123456789abcdef" for c in cs_hash):
             lines.append(f"SSD source: {_esc(ts.cross_seed_source)} · `{cs_hash}`")
         else:
             lines.append(f"SSD source: {_esc(ts.cross_seed_source)}")
