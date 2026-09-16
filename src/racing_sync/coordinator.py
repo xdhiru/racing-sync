@@ -985,6 +985,11 @@ class Coordinator:
         """Process a manual torrent drop from the watch directory."""
         blob = ts._blob or ts.cross_seed_blob
         if not blob:
+            blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
+            if blob:
+                ts.cross_seed_blob = blob
+                ts._blob = blob
+        if not blob:
             log.error("watch-dir torrent has no bytes: %s", ts.source_name)
             self.transition(ts, State.FAILED, error="missing .torrent bytes for watch-dir drop")
             return
@@ -1210,6 +1215,11 @@ class Coordinator:
 
     async def _do_queued(self, ts: TorrentState) -> None:
         blob: bytes = ts._blob or ts.cross_seed_blob
+        if not blob:
+            blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
+            if blob:
+                ts.cross_seed_blob = blob
+                ts._blob = blob
         if not blob:
             log.error("missing _blob for %s; cannot add", ts.source_infohash[:10])
             self.transition(ts, State.FAILED, error="no blob")
@@ -1700,6 +1710,12 @@ class Coordinator:
     async def _re_add_cross_seed_torrent(self, ts: TorrentState) -> None:
         blob = ts._blob or ts.cross_seed_blob
         if not blob:
+            blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
+            if blob:
+                ts.cross_seed_blob = blob
+                ts._blob = blob
+        if not blob:
+            log.warning("missing blob for re-adding cross-seed torrent %s", ts.source_infohash[:10])
             return
 
         h = (ts.dest_infohash or ts.source_infohash or "").lower()
