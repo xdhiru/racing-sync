@@ -220,21 +220,25 @@ def test_api_retry_and_ssd_endpoints():
 
     # 2. /api/retry/{hash} 404 (unknown hash)
     coord.store.get.return_value = None
-    resp_404 = client.post("/api/retry/unknown123", headers=headers)
+    resp_404 = client.post("/api/retry/" + "a" * 40, headers=headers)
     assert resp_404.status_code == 404
     assert resp_404.json()["detail"] == "unknown hash"
 
-    # 3. /api/retry/{hash} 409 (not FAILED)
-    ts_downloading = TorrentState(source_infohash="down123", state=State.DOWNLOADING)
+    # 2b. /api/retry/{hash} 422 (not a 40-char hex infohash)
+    resp_422 = client.post("/api/retry/not-a-hash", headers=headers)
+    assert resp_422.status_code == 422
+
+    # 3. /api/retry/{hash} 409 (not FAILED) — uppercase accepted via normalization
+    ts_downloading = TorrentState(source_infohash="b" * 40, state=State.DOWNLOADING)
     coord.store.get.return_value = ts_downloading
-    resp_409 = client.post("/api/retry/down123", headers=headers)
+    resp_409 = client.post("/api/retry/" + "B" * 40, headers=headers)
     assert resp_409.status_code == 409
     assert resp_409.json()["detail"] == "state is downloading"
 
     # 4. /api/retry/{hash} 200 (in FAILED state)
-    ts_failed = TorrentState(source_infohash="fail123", state=State.FAILED)
+    ts_failed = TorrentState(source_infohash="c" * 40, state=State.FAILED)
     coord.store.get.return_value = ts_failed
-    resp_200 = client.post("/api/retry/fail123", headers=headers)
+    resp_200 = client.post("/api/retry/" + "c" * 40, headers=headers)
     assert resp_200.status_code == 200
     coord.store.transition.assert_called_once_with(ts_failed, State.QUEUED, error="")
 

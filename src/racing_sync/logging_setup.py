@@ -34,12 +34,19 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 SENSITIVE_KEY_WORDS = ("passkey", "api_key", "apikey", "token", "auth", "secret", "password")
 
 _SENSITIVE_PARAM_RE = re.compile(
-    r"((?:passkey|api_key|apikey|token|auth|secret|password)=)[^&\s'\"]+",
+    r"((?:passkey|api[_-]?key|auth[_-]?key|secret[_-]?key|token|secret|password|auth)\s*[:=]\s*[\"']?)([^&\s\"'},;]+)",
     re.IGNORECASE,
 )
 _BEARER_TOKEN_RE = re.compile(
-    r"(Bearer\s+)[A-Za-z0-9_\-\.]+",
+    r"((?:Bearer|Token|ApiKey)\s+)[A-Za-z0-9_\-\.~\+/=]+",
     re.IGNORECASE,
+)
+_SENSITIVE_KEY_RE = re.compile(
+    r"passkey|api[_-]?key|auth[_-]?key|secret[_-]?key|token|secret|password|^auth$|auth[_-]",
+    re.IGNORECASE,
+)
+_SENSITIVE_HEADER_KEYS = frozenset(
+    {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "x-api-token"}
 )
 
 
@@ -53,7 +60,9 @@ def sanitize_log_text(text: str) -> str:
 def is_sensitive_key(key: str) -> bool:
     """Check if a dictionary key indicates sensitive credentials."""
     k_lower = key.lower()
-    return any(w in k_lower for w in SENSITIVE_KEY_WORDS)
+    if k_lower in _SENSITIVE_HEADER_KEYS:
+        return True
+    return bool(_SENSITIVE_KEY_RE.search(key))
 
 
 class SanitizingFormatter(logging.Formatter):
@@ -119,7 +128,7 @@ class JsonlFormatter(logging.Formatter):
             "message": sanitize_log_text(record.getMessage()),
         }
         if record.exc_info:
-            payload["exc"] = self.formatException(record.exc_info)
+            payload["exc"] = sanitize_log_text(self.formatException(record.exc_info))
         for k, v in record.__dict__.items():
             if k in (
                 "args", "asctime", "created", "exc_info", "exc_text", "filename",
@@ -134,9 +143,9 @@ class JsonlFormatter(logging.Formatter):
                 continue
             try:
                 json.dumps(v)
-                payload[k] = v
+                payload[k] = sanitize_log_text(v) if isinstance(v, str) else v
             except TypeError:
-                payload[k] = repr(v)
+                payload[k] = sanitize_log_text(repr(v))
         return json.dumps(payload, ensure_ascii=False)
 
 
