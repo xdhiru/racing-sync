@@ -278,6 +278,38 @@ def test_season_folder_for_security(tmp_path):
     assert folder_custom == (custom_base / "Show.S01").resolve()
 
 
+def test_season_folder_for_ignores_file_order(tmp_path):
+    """Top dir comes from ALL files, not files[0] (qB order not guaranteed).
+
+    Regression: a root-level extra listed first used to yield None, pushing
+    _do_moving into a bare `rclone move <folder>` fallback that strips the
+    top dir on the remote (season packs landing flat in the remote root).
+    """
+    from racing_sync.clients.abstract import TorrentFile
+
+    cfg = _cfg()
+    cfg.dest.save_path = str(tmp_path / "downloads")
+    coord = object.__new__(Coordinator)
+    coord.cfg = cfg
+
+    files = [
+        TorrentFile("sample.mkv", 100),
+        TorrentFile("Vigil.S03.1080p/Vigil.S03E01.mkv", 1000),
+        TorrentFile("Vigil.S03.1080p/Vigil.S03E02.mkv", 1000),
+    ]
+    # Not all files share the top dir -> None (conservative), but a pure
+    # pack in any order must still resolve.
+    assert coord._season_folder_for(files, "Vigil.S03.1080p") is None
+
+    pack_shuffled = [
+        TorrentFile("Vigil.S03.1080p/Vigil.S03E02.mkv", 1000),
+        TorrentFile("Vigil.S03.1080p/Vigil.S03E01.mkv", 1000),
+        TorrentFile("Vigil.S03.1080p/Vigil.S03E03.mkv", 1000),
+    ]
+    folder = coord._season_folder_for(pack_shuffled, "Vigil.S03.1080p")
+    assert folder == (tmp_path / "downloads" / "Vigil.S03.1080p").resolve()
+
+
 def test_parse_episode_without_digits_returns_none():
     from racing_sync.classifier import parse_episode
     import re
