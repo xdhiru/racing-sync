@@ -21,6 +21,7 @@ import asyncio
 import datetime as dt
 import logging
 import os
+import re
 import shutil
 import time
 import aiohttp
@@ -63,6 +64,22 @@ _WEBUI_RETRY_ERRORS = (
     OSError,
     WebUIUnresponsiveError,
 )
+
+
+def normalize_content_name(name: str) -> str:
+    """Normalize release/torrent names for deduplication and grouping.
+
+    Strips trailing indexer tags (e.g. '[Seedpool]', '[FL]'), trailing
+    file extensions ('.torrent', '.mkv', etc.), and case-folds/strips.
+    """
+    s = name.strip()
+    s = re.sub(r"\.torrent$", "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"\s*\[[^\]]+\]\s*$", "", s).strip()
+    for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v"):
+        if s.lower().endswith(ext):
+            s = s[:-len(ext)].strip()
+            break
+    return s.lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -673,9 +690,10 @@ class Coordinator:
         # private cross-seeds) only produce ONE active SSD download.
         by_name: dict[str, list[Torrent]] = {}
         for st in src_torrents:
-            by_name.setdefault(st.name, []).append(st)
+            norm_key = normalize_content_name(st.name)
+            by_name.setdefault(norm_key, []).append(st)
 
-        for name, group in by_name.items():
+        for norm_name, group in by_name.items():
             # Check if any torrent in this release group is already tracked in state store
             existing_ts: TorrentState | None = None
             for t in group:
@@ -684,14 +702,16 @@ class Coordinator:
                     existing_ts = found_ts
                     break
             if existing_ts is None:
-                matches = self.store.find_by_name(name)
-                if matches:
-                    existing_ts = matches[0]
+                for t in group:
+                    matches = self.store.find_by_name(t.name)
+                    if matches:
+                        existing_ts = matches[0]
+                        break
 
             if existing_ts is not None:
                 # Content is already being managed by an existing TorrentState;
                 # keep display name fresh
-                existing_ts.source_name = name
+                existing_ts.source_name = group[0].name
                 if existing_ts.state == State.DONE and self.cfg.cross_seed.inject_racing_torrents_to_fuse:
                     await self._check_and_inject_late_cross_seeds(existing_ts, group)
                 continue
@@ -947,8 +967,11 @@ class Coordinator:
         # qB/Deluge don't have a content-id, so heuristic: same name + same
         # total size. We use name match — usually racing has 1-3 dupes.
         all_source = await self._list_source_torrents()
-        others = [t for t in all_source
-                  if t.infohash != st.infohash and t.name == st.name]
+        st_norm = normalize_content_name(st.name)
+        others = [
+            t for t in all_source
+            if t.infohash != st.infohash and (t.name == st.name or normalize_content_name(t.name) == st_norm)
+        ]
 
         decision = await pick_ssd_source_for_racing(
             cfg=self.cfg,
@@ -1828,7 +1851,11 @@ class Coordinator:
             log.warning("could not list racing torrents for re-injection: %s", e)
             return
 
-        matches = [t for t in racing if t.name == ts.source_name]
+        target_norm = normalize_content_name(ts.source_name)
+        matches = [
+            t for t in racing
+            if t.name == ts.source_name or normalize_content_name(t.name) == target_norm
+        ]
 
         try:
             for t in matches:
