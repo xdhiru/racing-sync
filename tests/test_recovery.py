@@ -6,7 +6,7 @@ from pathlib import Path
 
 from racing_sync.config import AppConfig
 from racing_sync.recovery import reconcile
-from racing_sync.state import State, StateStore
+from racing_sync.state import State, StateStore, TorrentState
 from racing_sync.clients.abstract import Torrent
 
 
@@ -281,6 +281,115 @@ async def test_reconcile_recognizes_dest_and_cross_seed_infohash(tmp_path: Path)
     assert "source_h" in rpt.resumed
     assert "source_h" not in rpt.orphans
     assert len(rpt.unknowns) == 0
+
+
+@pytest.mark.anyio
+async def test_reconcile_adopts_ssd_complete_as_moving_and_fuse_as_done(tmp_path: Path):
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    cfg = MagicMock()
+    cfg.rclone.fuse.mount = Path("/mnt/fuse/torrents")
+    cfg.rclone.fuse.mount_unsorted = Path("/mnt/fuse/unsorted")
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [
+        # Torrent 1: 100% complete on SSD (NOT on fuse) -> MUST adopt as MOVING
+        Torrent(
+            hash="ssd_done_hash",
+            name="SSD.Done.Release.1080p",
+            size_bytes=4000,
+            save_path="/home/kevin/torrents/qbittorrent",
+            category="racing",
+            progress=1.0,
+            state="uploading",
+        ),
+        # Torrent 2: on fuse mount -> adopt as DONE
+        Torrent(
+            hash="fuse_done_hash",
+            name="Fuse.Done.Release.1080p",
+            size_bytes=5000,
+            save_path="/mnt/fuse/torrents",
+            category="racing",
+            progress=1.0,
+            state="seeding",
+        ),
+    ]
+
+    report = await reconcile(cfg, dest=dest, store=store)
+    assert len(report.kept) == 2
+
+    # Verify SSD complete torrent is adopted as MOVING (so coordinator moves it to remote)
+    t_ssd = store.get("ssd_done_hash")
+    assert t_ssd is not None
+    assert t_ssd.state == State.MOVING
+
+    # Verify fuse torrent is adopted as DONE
+    t_fuse = store.get("fuse_done_hash")
+    assert t_fuse is not None
+    assert t_fuse.state == State.DONE
+
+
+@pytest.mark.anyio
+async def test_reconcile_invokes_fix_orphan_for_missing_inflight(tmp_path: Path):
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    cfg = MagicMock()
+    cfg.dest.save_path = tmp_path / "downloads"
+    cfg.rclone.fuse.mount = Path("/mnt/fuse/torrents")
+    cfg.rclone.fuse.mount_unsorted = Path("/mnt/fuse/unsorted")
+
+    # An in-flight DOWNLOADING torrent in DB whose torrent is missing on VPS2
+    ts = TorrentState(
+        source_infohash="orphan_hash_1",
+        source_name="Orphan.Release",
+        state=State.DOWNLOADING,
+        cross_seed_blob=b"torrent-bytes",
+    )
+    store.upsert(ts)
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = []  # Missing on VPS2
+
+    report = await reconcile(cfg, dest=dest, store=store)
+    assert "orphan_hash_1" in report.orphans
+    # fix_orphan should have re-added the torrent paused and kept/resumed DOWNLOADING
+    dest.add_torrent.assert_awaited_once()
+    reloaded = store.get("orphan_hash_1")
+    assert reloaded is not None
+    assert reloaded.state == State.DOWNLOADING
+
+
+@pytest.mark.anyio
+async def test_fix_orphan_glob_escape_matches_special_characters(tmp_path: Path):
+    from racing_sync.recovery import fix_orphan
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    cfg = MagicMock()
+    cfg.dest.save_path = tmp_path / "downloads"
+    cfg.dest.save_path.mkdir(parents=True, exist_ok=True)
+
+    # Torrent name with square brackets, e.g. release groups
+    name = "[SubsPlease] Show Name - 01 [1080p]"
+    content_file = cfg.dest.save_path / f"{name}.mkv"
+    content_file.write_bytes(b"video-data")
+
+    ts = TorrentState(
+        source_infohash="bracket_hash",
+        source_name=name,
+        state=State.MOVING,
+        save_path=str(cfg.dest.save_path),
+    )
+    store.upsert(ts)
+
+    dest = AsyncMock()
+    res = await fix_orphan(ts, cfg, dest=dest, store=store)
+    # Because content exists and glob.escape properly escapes '[', content_exists is True -> MOVING
+    assert res == State.MOVING.value
+
 
 
 
