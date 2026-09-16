@@ -687,4 +687,118 @@ async def test_http_client_does_not_conflate_403_with_auth_error():
     assert exc_info.value.status == 403
 
 
+def test_torrent_from_qb_sanitizes_single_file_content_path():
+    from racing_sync.clients.qbittorrent import _torrent_from_qb
+
+    # 1. content_path is a single file when save_path is empty
+    d1 = {
+        "hash": "abc12345",
+        "name": "Movie.mkv",
+        "save_path": "",
+        "content_path": "/mnt/nvme/downloads/Movie.mkv",
+    }
+    t1 = _torrent_from_qb(d1)
+    assert t1.save_path.replace("\\", "/") == "/mnt/nvme/downloads"
+
+    # 2. save_path itself accidentally has a file extension
+    d2 = {
+        "hash": "abc12345",
+        "name": "Movie.mkv",
+        "save_path": "/mnt/nvme/downloads/Movie.mkv",
+        "content_path": "/mnt/nvme/downloads/Movie.mkv",
+    }
+    t2 = _torrent_from_qb(d2)
+    assert t2.save_path.replace("\\", "/") == "/mnt/nvme/downloads"
+
+    # 3. normal directory save_path
+    d3 = {
+        "hash": "abc12345",
+        "name": "Show.S01",
+        "save_path": "/mnt/nvme/downloads",
+        "content_path": "/mnt/nvme/downloads/Show.S01",
+    }
+    t3 = _torrent_from_qb(d3)
+    assert t3.save_path.replace("\\", "/") == "/mnt/nvme/downloads"
+
+
+@pytest.mark.anyio
+async def test_qbittorrent_get_torrent_parallelizes_rtts():
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+
+    mock_t = MagicMock()
+    mock_t.hash = "abc"
+    client.list_torrents = AsyncMock(return_value=[mock_t])
+    client.get_torrent_files = AsyncMock(return_value=[])
+    client.get_trackers = AsyncMock(return_value=["http://tracker"])
+
+    t = await client.get_torrent("abc")
+    assert t is mock_t
+    assert t.trackers == ["http://tracker"]
+    client.list_torrents.assert_awaited_once_with(hashes=["abc"])
+    client.get_torrent_files.assert_awaited_once_with("abc")
+    client.get_trackers.assert_awaited_once_with("abc")
+
+
+@pytest.mark.anyio
+async def test_qbittorrent_add_torrent_handles_duplicates_and_hex_validation():
+    from racing_sync.watchdir import _bencode
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+
+    torrent_blob = _bencode({
+        b"announce": b"http://tracker/announce",
+        b"info": {
+            b"name": b"Duplicate.Movie",
+            b"length": 1000,
+            b"piece length": 16384,
+            b"pieces": b"12345678901234567890",
+        },
+    })
+    from racing_sync.watchdir import _bencoded_info_hash
+    expected_hash, _, _, _ = _bencoded_info_hash(torrent_blob)
+
+    class DummyResponseContext:
+        def __init__(self, text):
+            self.text = text
+
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.text = AsyncMock(return_value=self.text)
+            return resp
+
+        async def __aexit__(self, *args):
+            pass
+
+    # 1. qB returns "Fails.", but torrent already exists on qB -> accepted=True, detail="already added"
+    client.request = AsyncMock(return_value=DummyResponseContext("Fails."))
+    existing_t = MagicMock()
+    client.get_torrent = AsyncMock(return_value=existing_t)
+
+    res_dup = await client.add_torrent(torrent_files=[torrent_blob], save_path="/downloads")
+    assert res_dup.accepted is True
+    assert res_dup.hash == expected_hash.lower()
+    assert res_dup.detail == "already added"
+
+    # 2. qB returns "Fails." and torrent does not exist -> accepted=False
+    client.get_torrent = AsyncMock(return_value=None)
+    res_fail = await client.add_torrent(torrent_files=[torrent_blob], save_path="/downloads")
+    assert res_fail.accepted is False
+    assert res_fail.detail == "Fails."
+
+    # 3. 40-character non-hex response (e.g. error message) -> hash must be None
+    non_hex_40 = "This is an error message of 40 chars!!!!"
+    assert len(non_hex_40) == 40
+    client.request = AsyncMock(return_value=DummyResponseContext(non_hex_40))
+    res_non_hex = await client.add_torrent(urls=["http://example.com/test.torrent"], save_path="/downloads")
+    assert res_non_hex.hash is None
+
+    # 4. 40-character hex response -> hash is parsed
+    hex_40 = "a" * 40
+    client.request = AsyncMock(return_value=DummyResponseContext(hex_40))
+    res_hex = await client.add_torrent(urls=["http://example.com/test.torrent"], save_path="/downloads")
+    assert res_hex.hash == hex_40
+    assert res_hex.accepted is True
+
+
 
