@@ -73,8 +73,12 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         if category:
             params["category"] = category
             params["filter"] = "all"
-        if hashes:
-            params["hashes"] = "|".join(hashes)
+        hash_list = list(hashes) if hashes is not None else None
+        if hash_list:
+            params["hashes"] = "|".join(hash_list)
+        elif hashes is not None:
+            # Explicit empty filter: return nothing instead of everything.
+            return []
         async with await self.request("GET", "/api/v2/torrents/info", params=params) as r:
             data = await r.json()
         return [_torrent_from_qb(t) for t in data]
@@ -116,7 +120,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         urls: list[str] = []
         for row in data:
             url = row.get("url", "")
-            if url and url != "** [DHT] **" and "** [PeX] **" not in url:
+            if url and not url.startswith("**"):
                 urls.append(url)
         return urls
 
@@ -181,21 +185,32 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             # Check if the torrent already exists in qBittorrent.
             candidate_hash: str | None = None
             if torrent_files:
-                try:
-                    from ..watchdir import _bencoded_info_hash
-                    candidate_hash, _, _, _ = _bencoded_info_hash(torrent_files[0])
-                except Exception:
-                    candidate_hash = None
+                for blob in torrent_files:
+                    try:
+                        from ..watchdir import _bencoded_info_hash
+                        candidate_hash, _, _, _ = _bencoded_info_hash(blob)
+                        break
+                    except Exception:
+                        candidate_hash = None
+                        continue
             elif urls:
                 for u in urls:
                     m = re.search(r"xt=urn:btih:([0-9a-zA-Z]{32,40})", u)
                     if m:
-                        candidate_hash = m.group(1)
+                        raw = m.group(1)
+                        if len(raw) == 32:
+                            try:
+                                import base64
+                                candidate_hash = base64.b32decode(raw.upper()).hex()
+                            except Exception:
+                                candidate_hash = None
+                        else:
+                            candidate_hash = raw.lower()
                         break
 
             if candidate_hash:
                 try:
-                    existing = await self.get_torrent(candidate_hash)
+                    existing = await self.get_torrent(candidate_hash.lower())
                     if existing is not None:
                         log.info(
                             "qB add_torrent returned 'Fails.' but torrent %s already exists",
@@ -330,12 +345,18 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
         d.get("state")
         or ("completed" if d.get("progress", 0) >= 1.0 else "downloading")
     )
+    # qB `save_path` is always a directory — never truncate it. Only fall
+    # back to content_path when save_path is missing, and only take the
+    # parent when content_path is clearly a single file (its basename
+    # matches the torrent name).
     sp = str(d.get("save_path") or "").strip()
     if not sp and d.get("content_path"):
         cp = Path(str(d["content_path"]).strip())
-        sp = str(cp.parent) if cp.suffix else str(cp)
-    elif sp and Path(sp).suffix:
-        sp = str(Path(sp).parent)
+        torrent_name = str(d.get("name") or "").strip()
+        if torrent_name and cp.name == torrent_name:
+            sp = str(cp.parent)
+        else:
+            sp = str(cp)
     return Torrent(
         hash=d["hash"],
         name=d["name"],
