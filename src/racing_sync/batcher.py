@@ -61,6 +61,10 @@ class Batch:
             normalized = e.file_name.replace("\\", "/").strip("/")
             parts = normalized.split("/")
             escaped_path = "/".join(escape_rclone_glob(p) for p in parts if p)
+            if not escaped_path or escaped_path == "**/":
+                # Empty/blank file name would match everything — never emit it.
+                log.warning("batcher: skipping empty episode file name for include patterns")
+                continue
             if not escaped_path.startswith("**/"):
                 escaped_path = f"**/{escaped_path}"
             patterns.append(f"--include={escaped_path}")
@@ -91,6 +95,8 @@ def make_batches(
     cur: list[Episode] = []
     cur_size = 0
     for ep in episodes:
+        if ep.size_bytes < 0:
+            raise ValueError(f"episode {ep.file_name!r} has negative size {ep.size_bytes}")
         if cur and (cur_size + ep.size_bytes > cap_bytes or len(cur) >= max_files):
             batches.append(Batch(episodes=cur))
             cur, cur_size = [], 0
