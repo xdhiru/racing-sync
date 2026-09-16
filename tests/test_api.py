@@ -70,12 +70,34 @@ def test_auth_accepts_nginx_header_from_trusted_client():
     coord.store.all.return_value = []
 
     app = build_app(coord)
-    # Default TestClient has client.host == "testclient" which is in trusted set
-    client = TestClient(app)
+    # 127.0.0.1 is in default trusted_proxies
+    client = TestClient(app, client=("127.0.0.1", 50000))
 
     resp = client.get("/api/state", headers={"X-Authenticated-User": "admin"})
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+def test_auth_rejects_loopback_when_not_in_custom_trusted_proxies():
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(
+        enabled=True,
+        api_token="",
+        trust_nginx_header=True,
+        trusted_proxies=["10.0.0.1"],
+    )
+
+    coord = MagicMock()
+    coord.cfg = cfg
+    coord.store = MagicMock()
+    coord.store.all.return_value = []
+
+    app = build_app(coord)
+    # Connecting from 127.0.0.1 is rejected when trusted_proxies only contains 10.0.0.1
+    client = TestClient(app, client=("127.0.0.1", 50000))
+    resp = client.get("/api/state", headers={"X-Authenticated-User": "admin"})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "untrusted proxy for nginx auth header"
 
 
 def test_auth_token_validation():

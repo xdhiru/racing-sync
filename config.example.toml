@@ -381,7 +381,13 @@ batch_size = 50
 enabled = false
 host = "127.0.0.1"
 port = 8765
-# If nginx basic-auth is in front, the API trusts X-Authenticated-User
-# header injected by nginx. Otherwise, set api_token below.
-trust_nginx_header = true
-api_token = ""
+# When using a reverse proxy (e.g. nginx with auth_basic), you can enable
+# trust_nginx_header to trust X-Authenticated-User from trusted_proxies.
+# SECURITY REQUIREMENT:
+# Nginx MUST overwrite (never forward) X-Authenticated-User from the client:
+#   proxy_set_header X-Authenticated-User $remote_user;
+# Otherwise, untrusted clients can spoof the header and bypass authentication.
+trust_nginx_header = false
+trusted_proxies = ["127.0.0.1", "::1", "localhost"]
+# API token for direct authentication (required if trust_nginx_header is false):
+api_token = "generate_a_random_token_here"
