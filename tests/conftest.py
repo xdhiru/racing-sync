@@ -14,3 +14,8 @@ def example_config() -> AppConfig:
     return AppConfig.from_toml(
         Path(__file__).parent.parent / "config.example.toml"
     )
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
