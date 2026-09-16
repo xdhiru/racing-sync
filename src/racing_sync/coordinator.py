@@ -156,10 +156,28 @@ PUBLIC_TRACKER_HOSTS = (
 
 
 def _looks_public(tracker_urls: list[str]) -> bool:
+    import urllib.parse as _up
+
     for url in tracker_urls:
-        low = url.lower()
-        if any(host in low for host in PUBLIC_TRACKER_HOSTS):
-            return True
+        low = (url or "").strip().lower()
+        if not low:
+            continue
+        try:
+            host = (_up.urlsplit(low).hostname or "").lower()
+        except Exception:
+            host = ""
+        hay = host or low
+        for pub in PUBLIC_TRACKER_HOSTS:
+            p = pub.lower()
+            # Bounded substring on hostname: `nyaa` matches `nyaa.tracker.wf`
+            # and `tracker.opentrackr.org`, but NOT `bannyaa.com` (where the
+            # match is embedded in a longer alphanumeric label).
+            try:
+                if re.search(r"(?<![a-z0-9])" + re.escape(p) + r"(?![a-z0-9])", hay):
+                    return True
+            except re.error:
+                if p in hay:
+                    return True
     return False
 
 
@@ -514,9 +532,10 @@ class Coordinator:
                     and self.cfg.source.deluge_sftp.enabled):
                 self.sftp = SFTPExporter(self.cfg.source.deluge_sftp)
                 self.sftp.connect()
-            elif (self.cfg.cross_seed.allow_ssh_export
-                  and self.cfg.source.type == "qbittorrent"):
-                self.sftp = None
+            # NOTE: qBittorrent sources have no SFTP config (SourceConfig only
+            # defines deluge_sftp) — SFTP fallback for qB goes through the
+            # source client's export_torrent() endpoint instead. self.sftp
+            # stays None (set in __init__) for qB sources.
 
             if self.cfg.watch_dir is not None:
                 self.watch = WatchDirScanner(self.cfg.watch_dir, self.prowlarr)
@@ -2615,7 +2634,8 @@ class Coordinator:
             )
         except AttributeError:
             return None
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            log.warning("_fetch_racing_torrent_bytes export failed for %s: %s", infohash[:10], e)
             return None
 
     @staticmethod
