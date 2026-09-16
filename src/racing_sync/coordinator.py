@@ -1725,10 +1725,21 @@ class Coordinator:
 
         # 1. Pause torrent on VPS2 client BEFORE move begins to stop active seeding from SSD
         log.info("pausing torrent %s on VPS2 client before move", h[:10])
-        try:
-            await self.dest_client.pause(h)
-        except Exception as e:  # noqa: BLE001
-            log.warning("could not pause torrent in client before move: %s", e)
+        paused = False
+        pause_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                await self.dest_client.pause(h)
+                paused = True
+                break
+            except Exception as e:  # noqa: BLE001
+                pause_err = e
+                log.warning("attempt %d: could not pause torrent in client before move: %s", attempt + 1, e)
+                await asyncio.sleep(1)
+        if not paused:
+            raise RuntimeError(
+                f"failed to pause torrent {h[:10]} before move; aborting move to prevent remote corruption: {pause_err}"
+            )
 
         # 2. Separate completed files from incomplete piece-boundary files
         src_dir = (
@@ -1908,20 +1919,26 @@ class Coordinator:
     # ---- state: RE_ADDING ----
 
     async def _do_re_add(self, ts: TorrentState) -> None:
-        delay = self.cfg.fuse_reinject_delay_seconds
-        if delay > 0 and ts.readd_attempts == 0:
-            log.info(
-                "waiting %ds for fuse mount indexing before re-injection: %s",
-                delay, ts.source_name[:50],
-            )
-            await asyncio.sleep(delay)
-
         store = getattr(self, "store", None)
         now = dt.datetime.now(dt.timezone.utc)
         if ts.readd_first_attempted_at is None:
             ts.readd_first_attempted_at = now
             if store is not None:
                 store.upsert(ts)
+
+        delay = self.cfg.fuse_reinject_delay_seconds
+        if delay > 0 and ts.readd_attempts == 0 and ts.readd_next_retry_at is None:
+            log.info(
+                "parking %s for %ds fuse mount indexing before re-injection",
+                ts.source_name[:50], delay,
+            )
+            if delay > 5:
+                ts.readd_next_retry_at = now + dt.timedelta(seconds=delay)
+                if store is not None:
+                    store.upsert(ts)
+                return
+            else:
+                await asyncio.sleep(delay)
 
         max_age_val = getattr(self.cfg, "fuse_reinject_max_age_seconds", 86400)
         max_age_sec = max_age_val if isinstance(max_age_val, (int, float)) else 86400
@@ -1984,11 +2001,17 @@ class Coordinator:
                         "retrying in %ds (attempt %d/%d)",
                         ts.source_name[:50], e, retry_gap, cycle_attempt, max_cycle_attempts,
                     )
-                    if store is not None:
-                        store.upsert(ts)
-                    await asyncio.sleep(retry_gap)
-                    if self._stop:
+                    if retry_gap > 5:
+                        ts.readd_next_retry_at = now_curr + dt.timedelta(seconds=retry_gap)
+                        if store is not None:
+                            store.upsert(ts)
                         return
+                    else:
+                        if store is not None:
+                            store.upsert(ts)
+                        await asyncio.sleep(retry_gap)
+                        if self._stop:
+                            return
                 else:
                     ts.readd_next_retry_at = now_curr + dt.timedelta(seconds=backoff_interval)
                     log.warning(
@@ -2004,6 +2027,13 @@ class Coordinator:
                     return
 
     async def _re_add_cross_seed_torrent(self, ts: TorrentState) -> None:
+        h = (ts.dest_infohash or ts.source_infohash or "").lower()
+        target_hash = (ts.cross_seed_infohash or h).lower()
+        injected_hashes = {x.lower() for x in ts.injected_private_hashes.split(",") if x}
+        if target_hash and target_hash in injected_hashes:
+            log.info("cross-seed torrent %s already injected on fuse in step 1", target_hash[:10])
+            return
+
         blob = ts._blob or ts.cross_seed_blob
         if not blob:
             blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
@@ -2011,10 +2041,11 @@ class Coordinator:
                 ts.cross_seed_blob = blob
                 ts._blob = blob
         if not blob:
-            log.warning("missing blob for re-adding cross-seed torrent %s", ts.source_infohash[:10])
+            err = f"missing blob for re-adding cross-seed torrent {ts.source_infohash[:10]}"
+            log.error(err)
+            self.transition(ts, State.FAILED, error=err)
             return
 
-        h = (ts.dest_infohash or ts.source_infohash or "").lower()
         blob_hash = ""
         try:
             from .watchdir import _bencoded_info_hash
@@ -2023,8 +2054,6 @@ class Coordinator:
         except Exception:
             pass
         target_hash = (blob_hash or ts.cross_seed_infohash or h).lower()
-
-        injected_hashes = {x.lower() for x in ts.injected_private_hashes.split(",") if x}
         if target_hash and target_hash in injected_hashes:
             log.info("cross-seed torrent %s already injected on fuse in step 1", target_hash[:10])
             return

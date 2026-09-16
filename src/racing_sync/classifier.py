@@ -131,7 +131,8 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
     if not files:
         return Classification(kind="unknown", episodes=[], single_file=None, total_bytes=0)
 
-    ep_regex = getattr(cfg.classifier, "_episode_re", None) or EP_RE
+    ep_re_attr = getattr(cfg.classifier, "_episode_re", None)
+    ep_regex = ep_re_attr if isinstance(ep_re_attr, (re.Pattern, str)) else EP_RE
 
     # Filter out non-video files (.srt, .nfo, etc.) when evaluating episodes
     video_files = [f for f in files if Path(f.name).suffix.lower() not in NON_VIDEO_EXTENSIONS]
