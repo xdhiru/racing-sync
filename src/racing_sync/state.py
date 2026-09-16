@@ -450,6 +450,7 @@ class StateStore:
     def transition(self, ts: TorrentState, dst: State,
                    *, error: str = "", batch_index: int | None = None) -> None:
         check_transition(ts.state, dst)
+        src = ts.state
         ts.state = dst
         ts.last_error = error
         if dst in (State.NEW, State.QUEUED):
@@ -461,6 +462,16 @@ class StateStore:
             ts.readd_attempts = 0
         elif dst == State.DONE:
             ts.failed_retries = 0
+            ts.readd_first_attempted_at = None
+            ts.readd_next_retry_at = None
+            ts.readd_attempts = 0
+        elif dst == State.RE_ADDING and src == State.DONE:
+            # Fresh re-add cycle (e.g. lost fuse torrent via recovery):
+            # stale timers from the previous cycle must not instantly trip
+            # the max-age guard in _do_re_add.
+            ts.readd_first_attempted_at = None
+            ts.readd_next_retry_at = None
+            ts.readd_attempts = 0
         if batch_index is not None:
             ts.batch_index = batch_index
         self.upsert(ts)
