@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -176,7 +177,10 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     if domain:
         lines.append(f"Source: {domain}")
 
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if len(text) > 4096:
+        text = text[:4093] + "..."
+    return text
 
 
 def render_active(
@@ -256,7 +260,10 @@ def render_active(
         lines.append(f"  {state_text}")
         lines.append("")
 
-    return "\n".join(lines).strip(), cur_page, total_pages
+    rendered = "\n".join(lines).strip()
+    if len(rendered) > 4096:
+        rendered = rendered[:4093] + "..."
+    return rendered, cur_page, total_pages
 
 
 # --------------------------------------------------------------------------- #
@@ -303,6 +310,7 @@ class TelegramBot:
         # Cached "last active-tasks (page, total_pages, text)" so we skip identical edits.
         self._last_active_text: str = ""
         self._last_active_cache: tuple[int, int, str] | None = None
+        self._last_callback_time: float = 0.0
 
     # ---- lifecycle ----
 
@@ -317,9 +325,18 @@ class TelegramBot:
         self._detail_queue = asyncio.Queue(maxsize=256)
         # Pre-fill cache from the store so we don't re-send every
         # torrent on restart.
-        for ts in self._store.all():
+        all_items = await asyncio.to_thread(self._store.all)
+        for ts in all_items:
             if ts.telegram_message_id:
                 self._detail_cache[ts.source_infohash] = ts.telegram_message_id
+        # Restore active message ID across restarts to prevent duplicate messages
+        raw_active_id = await asyncio.to_thread(self._store.get_meta, "telegram_active_msg_id")
+        if raw_active_id:
+            try:
+                self._active_msg_id = int(raw_active_id)
+                self._prev_active_msg_id = self._active_msg_id
+            except ValueError:
+                pass
         self._detail_worker = asyncio.create_task(
             self._detail_worker_loop(), name="rs-telegram-detail",
         )
@@ -391,9 +408,15 @@ class TelegramBot:
         try:
             self._detail_queue.put_nowait((ts.source_infohash, progress))
         except asyncio.QueueFull:
-            # Queue is small; if it's full, drop and let the next
-            # iteration refill it.
-            pass
+            # Queue is full: evict oldest entry to prevent dropping freshest updates
+            try:
+                self._detail_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self._detail_queue.put_nowait((ts.source_infohash, progress))
+            except asyncio.QueueFull:
+                pass
 
     async def _detail_worker_loop(self) -> None:
         """Drain the per-torrent detail-message queue.
@@ -439,12 +462,15 @@ class TelegramBot:
         """Send or edit the detail message for a single torrent."""
         if self._bot is None:
             return
-        ts = self._store.get(infohash)
+        ts = await asyncio.to_thread(self._store.get, infohash)
         if ts is None:
             return
         text = render_detail(ts, progress)
-        msg_id = self._detail_cache.get(infohash) or \
-            self._store.get_telegram_message_id(infohash)
+        if len(text) > 4096:
+            text = text[:4093] + "..."
+        msg_id = self._detail_cache.get(infohash)
+        if msg_id is None:
+            msg_id = await asyncio.to_thread(self._store.get_telegram_message_id, infohash)
         try:
             if msg_id is None:
                 sent = await self._bot.send_message(
@@ -452,7 +478,8 @@ class TelegramBot:
                     parse_mode=ParseMode.MARKDOWN,
                 )
                 self._detail_cache[infohash] = sent.message_id
-                self._store.set_telegram_message_id(
+                await asyncio.to_thread(
+                    self._store.set_telegram_message_id,
                     infohash, sent.message_id,
                 )
             else:
@@ -474,7 +501,8 @@ class TelegramBot:
                             parse_mode=ParseMode.MARKDOWN,
                         )
                         self._detail_cache[infohash] = sent.message_id
-                        self._store.set_telegram_message_id(
+                        await asyncio.to_thread(
+                            self._store.set_telegram_message_id,
                             infohash, sent.message_id,
                         )
                     else:
@@ -555,6 +583,30 @@ class TelegramBot:
                     await asyncio.sleep(2)
 
     async def _handle_callback(self, query: Any) -> None:
+        # Authenticate callback: query must originate from configured chat or user
+        chat_id = None
+        if hasattr(query, "message") and query.message and hasattr(query.message, "chat"):
+            chat_id = getattr(query.message.chat, "id", None)
+        user_id = getattr(getattr(query, "from_user", None), "id", None)
+        cfg_chat = str(self._cfg.chat_id)
+        if str(chat_id) != cfg_chat and str(user_id) != cfg_chat:
+            log.warning("unauthorized callback query from chat=%s user=%s", chat_id, user_id)
+            try:
+                await query.answer("Unauthorized", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        # Throttle callback handling (0.5s debounce)
+        now = time.monotonic()
+        if now - self._last_callback_time < 0.5:
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            return
+        self._last_callback_time = now
+
         try:
             await query.answer()
         except Exception:
@@ -565,7 +617,7 @@ class TelegramBot:
             return
 
         action = data.split(":", 1)[1]
-        rows = self._store.list_active_inflight()
+        rows = await asyncio.to_thread(self._store.list_active_inflight)
         page_size = self._cfg.page_size
         total_pages = max(1, (len(rows) + page_size - 1) // page_size)
 
@@ -586,7 +638,7 @@ class TelegramBot:
         # Sentinel -1 means "stop trying to edit" (e.g. chat permission issue)
         if self._active_msg_id == -1:
             return
-        rows = self._store.list_active_inflight()
+        rows = await asyncio.to_thread(self._store.list_active_inflight)
         # Pull live progress from coordinator's tracker
         progress_map = self._coord.live_progress_map()
         items: list[tuple[TorrentState, float | None]] = [
@@ -596,6 +648,8 @@ class TelegramBot:
         text, cur_page, total_pages = render_active(
             items, page=self._current_page, page_size=self._cfg.page_size
         )
+        if len(text) > 4096:
+            text = text[:4093] + "..."
         self._current_page = cur_page
         keyboard = self._build_keyboard(cur_page, total_pages)
 
@@ -626,6 +680,9 @@ class TelegramBot:
                 self._active_msg_id = sent.message_id
                 self._prev_active_msg_id = sent.message_id
                 self._last_active_cache = cache_key
+                await asyncio.to_thread(
+                    self._store.set_meta, "telegram_active_msg_id", str(sent.message_id)
+                )
             except (TimedOut, NetworkError) as e:
                 log.warning("active-tasks send timed out (%s); will retry next interval", e)
             except TelegramError as e:
@@ -670,6 +727,9 @@ class TelegramBot:
                         "Disabling active-tasks updates."
                     )
                     self._active_msg_id = -1
+                    await asyncio.to_thread(
+                        self._store.set_meta, "telegram_active_msg_id", ""
+                    )
                     return
 
                 # "Message to edit not found" / "MESSAGE_ID_INVALID" — deleted from chat
@@ -677,6 +737,9 @@ class TelegramBot:
                     log.warning("active-tasks message not found in chat; will resend")
                     self._active_msg_id = None
                     self._last_active_cache = None
+                    await asyncio.to_thread(
+                        self._store.set_meta, "telegram_active_msg_id", ""
+                    )
                     return
 
                 # Other errors — keep message_id for next retry

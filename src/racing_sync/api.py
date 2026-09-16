@@ -12,12 +12,20 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel
+
+try:
+    from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+    HAS_FASTAPI = True
+except ImportError:
+    HAS_FASTAPI = False
+    Depends = Header = HTTPException = Query = Request = object  # type: ignore[assignment,misc]
+    FastAPI = Any  # type: ignore[assignment,misc]
 
 from .coordinator import Coordinator
 from .rclone_ops import ssd_free_bytes
@@ -33,6 +41,11 @@ class RetryResult(BaseModel):
 
 
 def build_app(coord: Coordinator) -> FastAPI:
+    if not HAS_FASTAPI:
+        raise RuntimeError(
+            "FastAPI is required to run the control plane API. "
+            "Install it via 'pip install racing-sync[api]'."
+        )
     cfg = coord.cfg
     app = FastAPI(title="racing-sync", version="0.1.0")
 
@@ -59,23 +72,26 @@ def build_app(coord: Coordinator) -> FastAPI:
         raise HTTPException(401, "auth required")
 
     @app.get("/api/state", dependencies=[Depends(auth)])
-    def state() -> list[dict[str, Any]]:
-        return [_ts_to_dict(t) for t in coord.store.all()]
+    async def state() -> list[dict[str, Any]]:
+        rows = await asyncio.to_thread(coord.store.all)
+        return [_ts_to_dict(t) for t in rows]
 
     @app.get("/api/active", dependencies=[Depends(auth)])
-    def active() -> list[dict[str, Any]]:
-        return [_ts_to_dict(t) for t in coord.store.all_active()]
+    async def active() -> list[dict[str, Any]]:
+        rows = await asyncio.to_thread(coord.store.all_active)
+        return [_ts_to_dict(t) for t in rows]
 
     @app.get("/api/logs", dependencies=[Depends(auth)])
-    def logs(
+    async def logs(
         limit: int = Query(default=200, ge=1, le=1000),
     ) -> list[dict[str, Any]]:
-        rows = list(coord.store.iter_logs(limit=limit))
+        rows = await asyncio.to_thread(lambda: list(coord.store.iter_logs(limit=limit)))
         return [dict(r) for r in rows]
 
     @app.get("/api/ssd", dependencies=[Depends(auth)])
-    def ssd() -> dict[str, Any]:
-        return {"free_bytes": ssd_free_bytes(cfg), "path": str(cfg.ssd.path)}
+    async def ssd() -> dict[str, Any]:
+        free_bytes = await asyncio.to_thread(ssd_free_bytes, cfg)
+        return {"free_bytes": free_bytes, "path": str(cfg.ssd.path)}
 
     @app.post("/api/recover", dependencies=[Depends(auth)])
     async def recover() -> dict[str, Any]:
@@ -98,12 +114,12 @@ def build_app(coord: Coordinator) -> FastAPI:
 
     @app.post("/api/retry/{source_infohash}", dependencies=[Depends(auth)])
     async def retry(source_infohash: str) -> RetryResult:
-        ts = coord.store.get(source_infohash)
+        ts = await asyncio.to_thread(coord.store.get, source_infohash)
         if ts is None:
             raise HTTPException(404, "unknown hash")
         if ts.state != State.FAILED:
             raise HTTPException(409, f"state is {ts.state.value}")
-        coord.store.transition(ts, State.QUEUED, error="")
+        await asyncio.to_thread(coord.store.transition, ts, State.QUEUED, error="")
         return RetryResult(source_infohash=source_infohash, new_state=ts.state.value)
 
     return app
