@@ -68,7 +68,11 @@ ALLOWED: dict[State, set[State]] = {
     State.DOWNLOADING: {State.MOVING, State.FAILED},
     State.MOVING: {State.RE_ADDING, State.FAILED},
     State.RE_ADDING: {State.DONE, State.FAILED},
-    State.DONE: {State.RE_ADDING},
+    # DONE -> MOVING is the fresh-DB self-heal: recovery may have adopted an
+    # SSD-complete torrent as DONE (e.g. stale DB, misclassified save_path);
+    # the late cross-seed guard demotes it back to MOVING so the rclone move
+    # runs before any fuse injection. DONE -> RE_ADDING stays for lost fuses.
+    State.DONE: {State.RE_ADDING, State.MOVING},
     State.FAILED: {State.QUEUED, State.NEW},  # allow manual and auto retry
 }
 
@@ -483,6 +487,12 @@ class StateStore:
             # Fresh re-add cycle (e.g. lost fuse torrent via recovery):
             # stale timers from the previous cycle must not instantly trip
             # the max-age guard in _do_re_add.
+            ts.readd_first_attempted_at = None
+            ts.readd_next_retry_at = None
+            ts.readd_attempts = 0
+        elif dst == State.MOVING and src == State.DONE:
+            # Self-heal for falsely adopted DONE (SSD bytes never moved):
+            # start a fresh move cycle with no stale re-add timers.
             ts.readd_first_attempted_at = None
             ts.readd_next_retry_at = None
             ts.readd_attempts = 0

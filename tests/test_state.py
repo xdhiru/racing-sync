@@ -13,7 +13,10 @@ def anyio_backend():
 
 def test_done_can_only_transition_to_re_adding():
     check_transition(State.DONE, State.RE_ADDING)
-    for s in [State.NEW, State.QUEUED, State.DOWNLOADING, State.MOVING,
+    # Fresh-DB self-heal: falsely adopted DONE (SSD bytes never moved) demotes
+    # back to MOVING so the rclone move runs before any fuse injection.
+    check_transition(State.DONE, State.MOVING)
+    for s in [State.NEW, State.QUEUED, State.DOWNLOADING,
               State.WAITING_DISK, State.QUERYING, State.FAILED]:
         with pytest.raises(ValueError):
             check_transition(State.DONE, s)
