@@ -930,6 +930,33 @@ class TelegramBot:
                     log.debug("telegram callback polling error: %s", e)
                     await asyncio.sleep(2)
 
+    def _debounced(self, key: str, *, window: float = 0.5) -> bool:
+        """True when `key` fired within `window` seconds (caller skips).
+
+        Shared by callback pagination and /cancel_/fetch_ chat commands: a
+        double-tap (or flooding client) re-resolves and re-acts otherwise.
+        Fail-open on bookkeeping errors (never drop user input on doubt).
+        """
+        now = time.monotonic()
+        try:
+            times = getattr(self, "_callback_times", None)
+            if not isinstance(times, dict):
+                times = {}
+                self._callback_times = times
+            last = float(times.get(key, 0.0) or 0.0)
+        except Exception:
+            return False
+        if now - last < window:
+            return True
+        try:
+            times[key] = now
+            if len(times) > 1000:
+                for k in list(times.keys())[:500]:
+                    times.pop(k, None)
+        except Exception:
+            pass
+        return False
+
     async def _handle_callback(self, query: Any) -> None:
         # Authenticate callback: query must originate from configured chat or user
         chat_id = None
@@ -947,32 +974,16 @@ class TelegramBot:
 
         # Throttle callback handling (0.5s debounce per chat/user — a
         # global throttle lets one spammer block pagination for all chats).
-        now = time.monotonic()
         try:
             _debounce_key = str(chat_id) if chat_id is not None else str(user_id)
         except Exception:
             _debounce_key = ""
-        try:
-            _times = getattr(self, "_callback_times", None)
-            if not isinstance(_times, dict):
-                _times = {}
-                self._callback_times = _times
-            _last = float(_times.get(_debounce_key, 0.0) or 0.0)
-        except Exception:
-            _last = 0.0
-        if now - _last < 0.5:
+        if self._debounced(_debounce_key):
             try:
                 await query.answer()
             except Exception:
                 pass
             return
-        try:
-            _times[_debounce_key] = now
-            if len(_times) > 1000:
-                for _k in list(_times.keys())[:500]:
-                    _times.pop(_k, None)
-        except Exception:
-            pass
 
         try:
             await query.answer()
@@ -1079,6 +1090,15 @@ class TelegramBot:
             user_id = getattr(from_user, "id", None)
             cfg_chat = str(self._cfg.chat_id)
             if str(chat_id) != cfg_chat and str(user_id) != cfg_chat:
+                return
+            # Same 0.5s debounce as callbacks: a double-sent /cancel_ or
+            # /fetch_ must not resolve+act twice (double forget/double
+            # re-inject). Namespaced apart from callback keys.
+            try:
+                _ckey = f"cmd:{chat_id}" if chat_id is not None else f"cmd:{user_id}"
+            except Exception:
+                _ckey = ""
+            if _ckey and self._debounced(_ckey):
                 return
             text = (
                 getattr(message, "text", None)
