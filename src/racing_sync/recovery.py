@@ -224,6 +224,28 @@ async def reconcile(
         present = any(k in actual_by_hash for k in known_hashes)
         if ts.state == State.DONE:
             if present:
+                if ts.classification_kind == "unknown":
+                    # Pre-fix rows fast-tracked QUEUED->DONE without
+                    # classification gate every later check at unsorted even
+                    # when the pack lives at the default mount. Heal once,
+                    # best-effort, from the live dest file list.
+                    hit = next((k for k in known_hashes if k in actual_by_hash), None)
+                    if hit is not None:
+                        try:
+                            _files = await dest.get_torrent_files(hit)
+                            _kind = _classify_kind_for_files(_files or [], cfg)
+                        except Exception:
+                            _kind = "unknown"
+                        if _kind and _kind != "unknown":
+                            ts.classification_kind = _kind
+                            try:
+                                store.upsert(ts)
+                            except Exception:
+                                pass
+                            log.info(
+                                "reconcile: classified previously-unknown DONE %s as %s",
+                                ts.source_name[:60], _kind,
+                            )
                 rpt.kept.append(h)
             else:
                 # Lost — re-add pointing at fuse. The data is on remote.

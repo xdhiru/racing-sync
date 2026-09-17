@@ -79,6 +79,58 @@ async def test_reconcile_adopts_fuse_and_completed_torrents(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_reconcile_heals_unknown_done_classification(tmp_path: Path):
+    """Pre-fix DONE rows (fast-tracked without kind) get classified in place.
+
+    Without this a season pack at the default mount keeps kind="unknown"
+    (-> unsorted) and its RE_ADDING fuse gate parks forever checking the
+    wrong directory.
+    """
+    from racing_sync.clients.abstract import TorrentFile
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    h = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ts = TorrentState(
+        source_infohash=h,
+        source_name="Heal.Pack.S01",
+        dest_infohash=h,
+        save_path="/mnt/fuse/torrents",
+        state=State.DONE,
+    )
+    assert ts.classification_kind == "unknown"
+    store.upsert(ts)
+
+    cfg = MagicMock()
+    cfg.rclone.fuse.mount = Path("/mnt/fuse/torrents")
+    cfg.rclone.fuse.mount_unsorted = Path("/mnt/fuse/unsorted")
+    cfg.dest.save_path = Path("/home/kevin/torrents/qbittorrent")
+    cfg.ssd.path = Path("/home/kevin/torrents/qbittorrent")
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [
+        Torrent(
+            hash=h, name="Heal.Pack.S01", size_bytes=200,
+            save_path="/mnt/fuse/torrents", category="racing",
+            progress=1.0, state="seeding",
+        ),
+    ]
+    dest.get_torrent_files.return_value = [
+        TorrentFile(name="Heal.Pack.S01/Heal.Pack.S01E01.mkv", size_bytes=100, progress=1.0),
+        TorrentFile(name="Heal.Pack.S01/Heal.Pack.S01E02.mkv", size_bytes=100, progress=1.0),
+    ]
+
+    report = await reconcile(cfg, dest=dest, store=store)
+
+    healed = store.get(h)
+    assert healed is not None
+    assert healed.state == State.DONE
+    assert healed.classification_kind == "season"
+    assert h in report.kept
+
+
+@pytest.mark.anyio
 async def test_fix_orphan_already_downloading(tmp_path: Path):
     from racing_sync.recovery import fix_orphan
     from racing_sync.state import TorrentState
