@@ -33,11 +33,13 @@ def _extract_tracker_urls(raw: list) -> list[str]:
     out: list[str] = []
     for t in raw or []:
         if isinstance(t, dict):
-            url = t.get("url") or ""
-            if url and url not in out:
+            url = (t.get("url") or "").strip()
+            if url and not url.startswith("**") and url not in out:
                 out.append(url)
-        elif isinstance(t, str) and t and t not in out:
-            out.append(t)
+        elif isinstance(t, str):
+            url = t.strip()
+            if url and not url.startswith("**") and url not in out:
+                out.append(url)
     return out
 
 
@@ -156,6 +158,10 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         if category:
             filt["label"] = category
         hash_list = list(hashes) if hashes is not None else None
+        if hash_list is not None and not hash_list:
+            # Explicit empty filter: match qB contract, return nothing
+            # instead of every torrent.
+            return []
         # NOTE: Deluge daemon does not support server-side hash filtering;
         # we fetch (possibly all) and filter client-side.
         status_keys = [
@@ -179,13 +185,32 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         ]
         info = await self._rpc("core.get_torrents_status", [filt, status_keys])
         rows = info or {}
+        if not isinstance(rows, dict):
+            log.warning("deluge get_torrents_status returned unexpected shape %s", type(rows).__name__)
+            return []
         out: list[Torrent] = []
         def _num(value: object) -> int:
             try:
                 return int(float(value or 0))  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 return 0
+        def _ratio(value: object) -> float:
+            try:
+                return float(value or 0.0)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return 0.0
+        def _progress(value: object) -> float:
+            try:
+                p = float(value or 0.0)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return 0.0
+            # Daemon reports 0-100, but tolerate 0-1 callers/tests.
+            if p > 1.0:
+                p = p / 100.0
+            return min(1.0, max(0.0, p))
         for h, status in rows.items():
+            if not isinstance(status, dict):
+                continue
             peers = _num(status.get("num_peers"))
             seeds = _num(status.get("num_seeds"))
             out.append(
@@ -194,15 +219,15 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     name=status.get("name", ""),
                     category=status.get("label", "") or "",
                     save_path=status.get("save_path", "") or "",
-                    size_bytes=int(status.get("total_size", 0) or 0),
+                    size_bytes=_num(status.get("total_size", 0)),
                     state=status.get("state", ""),
-                    progress=min(1.0, max(0.0, float(status.get("progress", 0.0) or 0.0) / 100.0)),
-                    ratio=float(status.get("ratio", 0.0) or 0.0),
+                    progress=_progress(status.get("progress", 0.0)),
+                    ratio=_ratio(status.get("ratio", 0.0)),
                     trackers=_extract_tracker_urls(
                         status.get("trackers", []) or []
                     ),
                     files=[],
-                    added_on=int(status.get("time_added", 0) or 0),
+                    added_on=_num(status.get("time_added", 0)),
                     upspeed_bps=_num(status.get("upload_payload_rate")),
                     num_leechers=max(0, peers - seeds),
                     total_uploaded_bytes=_num(status.get("total_uploaded")),
@@ -256,7 +281,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                         idx = int(idx)
                     except (TypeError, ValueError):
                         idx = len(out)
-                    prio = prios[idx] if 0 <= idx < len(progs) and idx < len(prios) else item.get("priority", 1)
+                    prio = prios[idx] if 0 <= idx < len(prios) else item.get("priority", 1)
                     # Map qB-scale priorities (0/1/6/7) to Deluge scale (0/1):
                     # 0=skip stays 0, anything else becomes 1 (normal).
                     try:
@@ -266,10 +291,14 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     prio_int = 0 if prio_int == 0 else 1
                     raw_prog = _fnum(progs[idx]) if 0 <= idx < len(progs) else 0.0
                     prog = raw_prog / 100.0 if scale_100 else raw_prog
+                    try:
+                        fsize = int(float(item.get("size", 0) or 0))
+                    except (TypeError, ValueError):
+                        fsize = 0
                     out.append(
                         TorrentFile(
                             name=item.get("path", ""),
-                            size_bytes=int(item.get("size", 0) or 0),
+                            size_bytes=fsize,
                             priority=prio_int,
                             progress=min(1.0, max(0.0, float(prog))),
                         )
