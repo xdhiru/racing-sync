@@ -178,3 +178,19 @@ def test_sanitizing_formatter_scrubs_secrets_in_text_logs():
     assert "Bearer ***" in formatted
 
 
+def test_logging_sink_plaintext_fails_closed():
+    """Plaintext http:// to a non-local host needs explicit opt-in."""
+    import pydantic
+
+    try:
+        LoggingSinkConfig(enabled=True, url="http://logs.example.com/ingest")
+        assert False, "expected ValidationError"
+    except pydantic.ValidationError as e:
+        assert "allow_plaintext" in str(e)
+    # Opt-in, https, and localhost stay valid.
+    LoggingSinkConfig(enabled=True, url="http://logs.example.com/ingest",
+                      allow_plaintext=True)
+    LoggingSinkConfig(enabled=True, url="https://logs.example.com/ingest")
+    LoggingSinkConfig(enabled=True, url="http://localhost:8080/ingest")
+
+
