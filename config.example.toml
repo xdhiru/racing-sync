@@ -317,6 +317,8 @@ url = ""                    # e.g. "https://logs.example.com/ingest"
 auth_token = ""
 # Event levels to forward: "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
 forward_min_level = "INFO"
+# Plaintext http:// to a non-local host is refused unless this is true.
+allow_plaintext = false
 
 # ============================================================
 # Watch directory (VPS2) — manual private torrent drops

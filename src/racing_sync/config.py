@@ -404,12 +404,31 @@ class LoggingSinkConfig(BaseModel):
     forward_min_level: Literal[
         "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
     ] = "INFO"
+    # Plaintext http:// to a non-local host ships log bodies unencrypted:
+    # fail closed unless the operator explicitly opts in.
+    allow_plaintext: bool = False
 
     @model_validator(mode="after")
     def _validate(self) -> "LoggingSinkConfig":
         if self.enabled:
             if not self.url or not self.url.strip().startswith(("http://", "https://")):
                 raise ValueError("logging_sink.url must be a valid http(s) URL when enabled")
+            try:
+                from urllib.parse import urlsplit as _split
+
+                parts = _split(self.url.strip())
+                if (parts.scheme == "http"
+                        and parts.hostname not in ("localhost", "127.0.0.1", "::1")
+                        and not self.allow_plaintext):
+                    raise ValueError(
+                        "logging_sink.url is plaintext http:// to a non-local host: "
+                        "log bodies would ship unencrypted — use https:// or set "
+                        "logging_sink.allow_plaintext=true to confirm"
+                    )
+            except ValueError:
+                raise
+            except Exception:
+                pass
         return self
 
 
