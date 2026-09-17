@@ -684,9 +684,14 @@ async def test_do_moving_persists_blob_for_adopted_rows_without_one(tmp_path: Pa
         TorrentFile(name="Adopted.Movie.2026.mkv", size_bytes=64, progress=1.0),
     ])
     coord.dest_client.export_torrent = AsyncMock(return_value=blob)
-    coord._rclone_move = AsyncMock(
-        return_value=MagicMock(ok=True, returncode=0, stdout="", stderr="")
-    )
+
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        # Simulate a real rclone move: the single file leaves local disk.
+        local = Path(local)
+        if local.is_file():
+            local.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
 
     # Adopted-style row: hashes known, but no blob anywhere (fresh DB).

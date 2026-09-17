@@ -32,44 +32,30 @@ def escape_rclone_glob(s: str) -> str:
     return "".join(res)
 
 
-def include_patterns_for_names(names: Iterable[str]) -> list[str]:
-    """Rclone --include patterns for exact torrent-relative file names.
+def files_from_names(names: Iterable[str]) -> list[str]:
+    """Normalized torrent-relative names for rclone --files-from-raw.
 
     Shared by batch moves and the end-of-download leftover sweep so both
-    preserve torrent-relative paths identically. Only the listed files can
-    transfer — piece-boundary partials of deselected files never match and
-    therefore can neither reach the remote nor overwrite an older batch's
-    moved file.
-
-    Ancestor directories are emitted as well (trailing-slash dir rules,
-    before the file rules): any --include implies a bottom `- **` rule,
-    and rclone cannot imply directory-traversal rules from `**/`-prefixed
-    file patterns — without explicit dir rules every directory is excluded
-    and the move transfers zero files with exit 0.
+    address torrent-relative paths identically. Only the listed files can
+    transfer — piece-boundary partials of deselected files are never named
+    and therefore can neither reach the remote nor overwrite an older
+    batch's moved file. Raw mode needs no glob escaping and preserves the
+    relative tree on the remote exactly.
     """
-    patterns: list[str] = []
+    out: list[str] = []
     seen: set[str] = set()
-    file_patterns: list[str] = []
     for raw in names:
         # Normalize path separators to POSIX forward slashes
         normalized = (raw or "").replace("\\", "/").strip("/")
         parts = [p for p in normalized.split("/") if p]
         if not parts:
-            # Empty/blank file name would match everything — never emit it.
-            log.warning("batcher: skipping empty file name for include patterns")
+            log.warning("batcher: skipping empty file name for file list")
             continue
-        for i in range(1, len(parts)):
-            dir_pat = f"--include=**/{'/'.join(escape_rclone_glob(p) for p in parts[:i])}/"
-            if dir_pat not in seen:
-                seen.add(dir_pat)
-                patterns.append(dir_pat)
-        escaped_path = f"**/{'/'.join(escape_rclone_glob(p) for p in parts)}"
-        file_pat = f"--include={escaped_path}"
-        if file_pat not in seen:
-            seen.add(file_pat)
-            file_patterns.append(file_pat)
-    patterns.extend(file_patterns)
-    return patterns
+        name = "/".join(parts)
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
 
 
 @dataclass(slots=True)
@@ -94,9 +80,9 @@ class Batch:
             return None
         return self.episodes[-1].season, self.episodes[-1].episode
 
-    def include_patterns(self) -> list[str]:
-        """Rclone --include patterns for this batch's episodes with subfolder and glob escaping."""
-        return include_patterns_for_names([e.file_name for e in self.episodes])
+    def file_names(self) -> list[str]:
+        """Torrent-relative names for this batch's rclone --files-from-raw list."""
+        return files_from_names([e.file_name for e in self.episodes])
 
 
 def make_batches(
