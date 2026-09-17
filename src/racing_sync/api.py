@@ -17,6 +17,7 @@ import asyncio
 import logging
 import re
 import secrets
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -41,6 +42,31 @@ log = logging.getLogger(__name__)
 
 
 _INFOHASH_RE = re.compile(r"[0-9a-f]{40}")
+
+# Brute-force throttle: per-IP auth-failure timestamps (monotonic).
+_AUTH_FAILURES: dict[str, list[float]] = {}
+_AUTH_WINDOW_S = 60.0
+_AUTH_MAX_FAILURES = 10
+
+
+def _note_auth_failure(ip: str) -> bool:
+    """Record an auth failure; True when the IP is now throttled (429)."""
+    now = time.monotonic()
+    try:
+        fails = _AUTH_FAILURES.get(ip)
+        if not isinstance(fails, list):
+            fails = []
+            _AUTH_FAILURES[ip] = fails
+        cutoff = now - _AUTH_WINDOW_S
+        while fails and fails[0] < cutoff:
+            fails.pop(0)
+        fails.append(now)
+        if len(_AUTH_FAILURES) > 1000:
+            for k in list(_AUTH_FAILURES.keys())[:500]:
+                _AUTH_FAILURES.pop(k, None)
+        return len(fails) > _AUTH_MAX_FAILURES
+    except Exception:
+        return False
 
 
 def _host_is_trusted(client_host: str, trusted_proxies: set[str]) -> bool:
@@ -119,6 +145,7 @@ def build_app(coord: Coordinator) -> FastAPI:
         trusted_proxies = set(getattr(cfg.api, "trusted_proxies", ["127.0.0.1", "::1", "localhost"]))
         if cfg.api.trust_nginx_header and x_authenticated_user and x_authenticated_user.strip():
             if not _host_is_trusted(client_host, trusted_proxies):
+                log.warning("api auth rejected for untrusted proxy %r", client_host)
                 raise HTTPException(403, "untrusted proxy for nginx auth header")
             return x_authenticated_user.strip()
         try:
@@ -140,6 +167,11 @@ def build_app(coord: Coordinator) -> FastAPI:
                 return "token"
         except Exception:
             pass
+        _fail_ip = (client_host or "unknown").strip() or "unknown"
+        if _note_auth_failure(_fail_ip):
+            log.warning("api auth throttled for %s (too many failures)", _fail_ip)
+            raise HTTPException(429, "too many auth failures; backing off")
+        log.warning("api auth failure from %s", _fail_ip)
         raise HTTPException(401, "auth required")
 
     @app.get("/api/state", dependencies=[Depends(auth)])

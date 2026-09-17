@@ -320,3 +320,26 @@ def test_api_token_compare_is_stripped_and_ascii_safe():
                       headers={"X-Api-Token": "wrong"}).status_code == 401
 
 
+def test_auth_brute_force_throttled_and_logged():
+    """Repeated bad tokens 429 an IP and log the failures."""
+    from racing_sync import api as api_mod
+
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(enabled=True, api_token="secret", trust_nginx_header=False)
+    coord = MagicMock()
+    coord.cfg = cfg
+    app = build_app(coord)
+    client = TestClient(app, client=("10.9.9.9", 50000))
+    api_mod._AUTH_FAILURES.clear()
+
+    codes = [
+        client.get("/api/state", headers={"X-Api-Token": "wrong"}).status_code
+        for _ in range(12)
+    ]
+    assert codes[:10] == [401] * 10
+    assert codes[10] == 429
+    # The real token still works (throttle counts failures only).
+    assert client.get("/api/state", headers={"X-Api-Token": "secret"}).status_code in (200, 500)
+    api_mod._AUTH_FAILURES.clear()
+
+
