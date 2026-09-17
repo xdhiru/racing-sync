@@ -329,13 +329,22 @@ async def pick_ssd_source_for_racing(
                 chosen.infohash[:10],
             )
             blob = None
-            try:
-                blob = await asyncio.wait_for(
-                    asyncio.to_thread(sftp.fetch_torrent, chosen.infohash),
-                    timeout=15.0,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning("sftp fetch %s failed: %s", chosen.infohash[:10], e)
+            # One retry on timeout: workers share a single SFTP connection
+            # behind a lock, so bursts can stall one fetch past the budget.
+            # A clean miss (file absent) returns None and is not retried.
+            for attempt in (1, 2):
+                try:
+                    blob = await asyncio.wait_for(
+                        asyncio.to_thread(sftp.fetch_torrent, chosen.infohash),
+                        timeout=15.0,
+                    )
+                    break
+                except (asyncio.TimeoutError, TimeoutError):
+                    log.warning("sftp fetch %s timed out after 15s (attempt %d/2)",
+                                chosen.infohash[:10], attempt)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("sftp fetch %s failed: %s", chosen.infohash[:10], e)
+                    break
             if blob:
                 return SourceDecision(
                     torrent_bytes=blob,
@@ -349,8 +358,9 @@ async def pick_ssd_source_for_racing(
                     ),
                 )
         # If allow_ssh_export=false (or SFTP returned nothing for the
-        # source_infohash), try to use qBittorrent's WebUI
-        # /torrents/export endpoint directly via the source_client.
+        # source_infohash), try the source client's own export endpoint
+        # (qBittorrent /torrents/export; Deluge daemons have no equivalent
+        # RPC, so a failure there after an SFTP miss is routine).
         try:
             blob = await asyncio.wait_for(
                 source_client.export_torrent(chosen.infohash),
@@ -359,7 +369,7 @@ async def pick_ssd_source_for_racing(
         except AttributeError:
             blob = None
         except Exception as e:  # noqa: BLE001
-            log.warning("qB export_torrent failed for %s: %s",
+            log.warning("source export_torrent failed for %s: %s",
                         chosen.infohash[:10], e)
             blob = None
         if blob:
@@ -1807,8 +1817,16 @@ class Coordinator:
             attempt_prowlarr=True,
         )
         if decision is None:
-            # Seedpool miss + private tracker recognised → park and retry.
-            self._park_for_seedpool_retry(ts)
+            # No SSD source right now → park and retry. Label honestly: a
+            # public group never touched Seedpool (its .torrent export
+            # failed), so "seedpool miss" would send operators hunting the
+            # wrong subsystem.
+            reason = (
+                "source export miss"
+                if any(_looks_public(t.trackers) for t in [st, *others])
+                else "seedpool miss"
+            )
+            self._park_for_seedpool_retry(ts, reason=reason)
             return
 
         ts.cross_seed_infohash = decision.infohash.lower()
@@ -1985,7 +2003,7 @@ class Coordinator:
         else:
             self.transition(ts, State.QUEUED)
 
-    def _park_for_seedpool_retry(self, ts: TorrentState) -> None:
+    def _park_for_seedpool_retry(self, ts: TorrentState, *, reason: str = "seedpool miss") -> None:
         """Park into WAITING_SEEDPOOL with an escalating retry timer.
 
         The first attempt: retry after seedpool_retry_interval_seconds.
@@ -2006,8 +2024,8 @@ class Coordinator:
         elapsed = now - ts.seedpool_first_queried_at
 
         log.info(
-            "seedpool miss #%d for %s; next retry at %s (elapsed=%ds, max=%ds)",
-            ts.seedpool_attempts, ts.source_name,
+            "%s #%d for %s; next retry at %s (elapsed=%ds, max=%ds)",
+            reason, ts.seedpool_attempts, ts.source_name,
             next_retry.isoformat(timespec="seconds"),
             int(elapsed.total_seconds()), int(max_age.total_seconds()),
         )
