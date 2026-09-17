@@ -279,6 +279,37 @@ class SFTPExporter:
     def fetch_many(self, infohashes: Iterable[str]) -> dict[str, bytes]:
         return {h: data for h, data in ((h, self.fetch_torrent(h)) for h in infohashes) if data}
 
+    def disk_free_bytes(self, path: str) -> int | None:
+        """Free bytes on the remote filesystem containing `path`.
+
+        Used by the VPS1 cleanup janitor to scale grace with real disk
+        pressure. Returns None when unknown (disconnected, unsupported,
+        any error) — callers degrade to time-only grace, never to zero.
+        """
+        with self._lock:
+            if (self._client is None
+                    or self._sftp is None
+                    or self._client.get_transport() is None
+                    or not self._client.get_transport().is_active()):
+                try:
+                    self.connect()
+                except Exception as e:
+                    log.warning("sftp disk-free reconnect failed: %s", e)
+                    return None
+            try:
+                st = self._sftp.statvfs(path)  # type: ignore[union-attr]
+            except Exception as e:
+                log.warning("sftp statvfs %s failed: %s", path, e)
+                return None
+        try:
+            frsize = int(getattr(st, "f_frsize", 0) or 0) or int(getattr(st, "f_bsize", 0) or 0)
+            avail = int(getattr(st, "f_bavail", 0) or 0)
+            if frsize <= 0 or avail < 0:
+                return None
+            return avail * frsize
+        except (TypeError, ValueError):
+            return None
+
     def list_state_dir(self) -> list[str]:
         with self._lock:
             # Mirror fetch_torrent: reconnect if the connection dropped.
