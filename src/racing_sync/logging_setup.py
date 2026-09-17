@@ -306,8 +306,10 @@ def setup_logging(cfg: AppConfig) -> None:
         sink.setLevel(getattr(logging, level_name))
         root.addHandler(sink)
 
-    # Silence overly chatty libraries
-    for noisy in ("aiohttp.access", "asyncio", "urllib3", "paramiko", "uvicorn"):
+    # Silence overly chatty libraries (httpx/httpcore back the Telegram
+    # bot's HTTP calls and log every request at INFO without this).
+    for noisy in ("aiohttp.access", "asyncio", "urllib3", "paramiko", "uvicorn",
+                  "httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     logging.getLogger("racing_sync").info(
