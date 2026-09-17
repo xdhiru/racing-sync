@@ -283,8 +283,10 @@ class SFTPExporter:
         """Free bytes on the remote filesystem containing `path`.
 
         Used by the VPS1 cleanup janitor to scale grace with real disk
-        pressure. Returns None when unknown (disconnected, unsupported,
-        any error) — callers degrade to time-only grace, never to zero.
+        pressure. Prefers SFTP statvfs, falling back to `df -kP` over the
+        SSH channel (some paramiko versions lack SFTPClient.statvfs).
+        Returns None when unknown (disconnected, unsupported, any error) —
+        callers degrade to time-only grace, never to zero.
         """
         with self._lock:
             if (self._client is None
@@ -296,11 +298,18 @@ class SFTPExporter:
                 except Exception as e:
                     log.warning("sftp disk-free reconnect failed: %s", e)
                     return None
-            try:
-                st = self._sftp.statvfs(path)  # type: ignore[union-attr]
-            except Exception as e:
-                log.warning("sftp statvfs %s failed: %s", path, e)
-                return None
+            statvfs = getattr(self._sftp, "statvfs", None)
+            if callable(statvfs):
+                try:
+                    st = statvfs(path)
+                except Exception as e:
+                    log.warning("sftp statvfs %s failed: %s", path, e)
+                    return self._disk_free_via_df(path)
+                return self._free_from_statvfs(st)
+            return self._disk_free_via_df(path)
+
+    @staticmethod
+    def _free_from_statvfs(st: object) -> int | None:
         try:
             frsize = int(getattr(st, "f_frsize", 0) or 0) or int(getattr(st, "f_bsize", 0) or 0)
             avail = int(getattr(st, "f_bavail", 0) or 0)
@@ -308,6 +317,31 @@ class SFTPExporter:
                 return None
             return avail * frsize
         except (TypeError, ValueError):
+            return None
+
+    def _disk_free_via_df(self, path: str) -> int | None:
+        """Parse `df -kP` (POSIX, 1K blocks) for free bytes. Caller holds the lock."""
+        import shlex
+
+        client = self._client
+        if client is None:
+            return None
+        try:
+            _, stdout, _ = client.exec_command(f"df -kP {shlex.quote(path)}")
+            out = stdout.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            log.warning("ssh df %s failed: %s", path, e)
+            return None
+        try:
+            lines = [ln.split() for ln in out.splitlines() if ln.split()]
+            # Header + one data line; data line has >=6 fields with Available 4th.
+            data = lines[1] if len(lines) > 1 else []
+            if len(data) < 6:
+                log.warning("ssh df %s returned unparsable output: %r", path, out[:200])
+                return None
+            return int(data[3]) * 1024
+        except (TypeError, ValueError, IndexError) as e:
+            log.warning("ssh df %s returned unparsable output: %s", path, e)
             return None
 
     def list_state_dir(self) -> list[str]:

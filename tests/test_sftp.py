@@ -305,3 +305,65 @@ def test_fetch_torrent_uses_posix_path_and_caps_read():
     data_oversize = exporter.fetch_torrent(hash_val)
     assert data_oversize is None
 
+
+def test_disk_free_bytes_prefers_statvfs():
+    import threading
+    from unittest.mock import MagicMock
+    from racing_sync.sftp_source import SFTPExporter
+
+    exporter = object.__new__(SFTPExporter)
+    exporter._lock = threading.RLock()
+    mock_client = MagicMock()
+    mock_client.get_transport().is_active.return_value = True
+    mock_sftp = MagicMock()
+    mock_sftp.statvfs.return_value = MagicMock(f_frsize=4096, f_bavail=1000)
+    exporter._client = mock_client
+    exporter._sftp = mock_sftp
+
+    assert exporter.disk_free_bytes("/data") == 4096 * 1000
+    mock_client.exec_command.assert_not_called()
+
+
+def test_disk_free_bytes_falls_back_to_df_without_statvfs():
+    """Paramiko builds without SFTPClient.statvfs (as on the VPS) must still
+    report free space via `df -kP` instead of degrading to unknown."""
+    import threading
+    from unittest.mock import MagicMock
+    from racing_sync.sftp_source import SFTPExporter
+
+    exporter = object.__new__(SFTPExporter)
+    exporter._lock = threading.RLock()
+    mock_client = MagicMock()
+    mock_client.get_transport().is_active.return_value = True
+    mock_stdout = MagicMock()
+    mock_stdout.read.return_value = (
+        b"Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+        b"/dev/sda1 80000000 76000000 4000000 95% /home\n"
+    )
+    mock_client.exec_command.return_value = (MagicMock(), mock_stdout, MagicMock())
+    # No statvfs attribute at all, mirroring the older paramiko on the VPS.
+    mock_sftp = MagicMock(spec=[])
+    exporter._client = mock_client
+    exporter._sftp = mock_sftp
+
+    assert exporter.disk_free_bytes("/home/kevin/.config/deluge/state") == 4000000 * 1024
+    mock_client.exec_command.assert_called_once()
+
+
+def test_disk_free_bytes_none_on_unparsable_df():
+    import threading
+    from unittest.mock import MagicMock
+    from racing_sync.sftp_source import SFTPExporter
+
+    exporter = object.__new__(SFTPExporter)
+    exporter._lock = threading.RLock()
+    mock_client = MagicMock()
+    mock_client.get_transport().is_active.return_value = True
+    mock_stdout = MagicMock()
+    mock_stdout.read.return_value = b"garbage\n"
+    mock_client.exec_command.return_value = (MagicMock(), mock_stdout, MagicMock())
+    exporter._client = mock_client
+    exporter._sftp = MagicMock(spec=[])
+
+    assert exporter.disk_free_bytes("/data") is None
+
