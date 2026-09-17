@@ -266,6 +266,12 @@ status_update_interval = 45
 page_size = 5
 # Pin the active-tasks message so it stays at the bottom of the channel.
 pin_status_message = false
+# Re-post (delete + silently resend, no notification buzz) the active-tasks
+# message every N seconds so it stays the newest message at the bottom even
+# when per-torrent updates scroll the chat. 0 = disabled (edit in place).
+# Minimum effective value is 5 (lower values are clamped) to respect
+# Telegram rate limits. Start with 10.
+active_repost_interval_seconds = 0
 # Pinning the active-tasks message in the chat requires the bot to
 # have admin rights with "can_pin_messages". If you don't have those,
 # the bot will log a warning and continue without pinning. Most users
