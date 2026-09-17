@@ -337,6 +337,139 @@ async def test_reconcile_adopts_ssd_complete_as_moving_and_fuse_as_done(tmp_path
 
 
 @pytest.mark.anyio
+async def test_reconcile_adopts_fuse_entry_with_missing_files_as_moving_when_on_ssd(tmp_path: Path):
+    """Fuse-pointing entry + bytes on SSD = never-moved data: adopt MOVING fixed up."""
+    from racing_sync.clients.abstract import TorrentFile
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    ssd_dir = tmp_path / "ssd"
+    ssd_dir.mkdir()
+    (ssd_dir / "Stranded.Movie.2026.mkv").write_bytes(b"s" * 100)
+
+    db_path = tmp_path / "test.db"
+    store = StateStore(db_path)
+
+    cfg = MagicMock()
+    cfg.dest.save_path = ssd_dir
+    cfg.ssd.path = ssd_dir
+    cfg.rclone.fuse.mount = fuse_dir
+    cfg.rclone.fuse.mount_unsorted = fuse_dir / "unsorted"
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [
+        Torrent(
+            hash="stranded_hash",
+            name="Stranded.Movie.2026",
+            size_bytes=100,
+            save_path=str(fuse_dir),
+            category="racing",
+            progress=1.0,
+            state="seeding",
+        ),
+    ]
+    dest.get_torrent_files.return_value = [
+        TorrentFile(name="Stranded.Movie.2026.mkv", size_bytes=100, progress=1.0),
+    ]
+
+    report = await reconcile(cfg, dest=dest, store=store)
+
+    t = store.get("stranded_hash")
+    assert t is not None
+    assert t.state == State.MOVING
+    assert t.save_path == str(ssd_dir)
+    assert "stranded_hash" in report.kept
+
+
+@pytest.mark.anyio
+async def test_reconcile_keeps_done_when_fuse_files_present(tmp_path: Path):
+    """Bytes verified behind the fuse path: adoption stays DONE."""
+    from racing_sync.clients.abstract import TorrentFile
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    (fuse_dir / "Good.Movie.2026.mkv").write_bytes(b"g" * 100)
+
+    db_path = tmp_path / "test.db"
+    store = StateStore(db_path)
+
+    cfg = MagicMock()
+    cfg.dest.save_path = tmp_path / "ssd"
+    cfg.ssd.path = tmp_path / "ssd"
+    cfg.rclone.fuse.mount = fuse_dir
+    cfg.rclone.fuse.mount_unsorted = fuse_dir / "unsorted"
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [
+        Torrent(
+            hash="good_hash",
+            name="Good.Movie.2026",
+            size_bytes=100,
+            save_path=str(fuse_dir),
+            category="racing",
+            progress=1.0,
+            state="seeding",
+        ),
+    ]
+    dest.get_torrent_files.return_value = [
+        TorrentFile(name="Good.Movie.2026.mkv", size_bytes=100, progress=1.0),
+    ]
+
+    await reconcile(cfg, dest=dest, store=store)
+
+    t = store.get("good_hash")
+    assert t is not None
+    assert t.state == State.DONE
+
+
+@pytest.mark.anyio
+async def test_reconcile_keeps_done_when_fuse_files_missing_everywhere(tmp_path: Path):
+    """Files missing everywhere: keep DONE (mount may be warming), don't strand.
+
+    Verification may only upgrade handling toward a verified-good path; a
+    dead mount also shows nothing, and FAILED churn would cause re-downloads.
+    Late injections stay gated downstream regardless.
+    """
+    from racing_sync.clients.abstract import TorrentFile
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    ssd_dir = tmp_path / "ssd"
+    ssd_dir.mkdir()
+
+    db_path = tmp_path / "test.db"
+    store = StateStore(db_path)
+
+    cfg = MagicMock()
+    cfg.dest.save_path = ssd_dir
+    cfg.ssd.path = ssd_dir
+    cfg.rclone.fuse.mount = fuse_dir
+    cfg.rclone.fuse.mount_unsorted = fuse_dir / "unsorted"
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [
+        Torrent(
+            hash="ghost_hash",
+            name="Ghost.Movie.2026",
+            size_bytes=100,
+            save_path=str(fuse_dir),
+            category="racing",
+            progress=1.0,
+            state="seeding",
+        ),
+    ]
+    dest.get_torrent_files.return_value = [
+        TorrentFile(name="Ghost.Movie.2026.mkv", size_bytes=100, progress=1.0),
+    ]
+
+    await reconcile(cfg, dest=dest, store=store)
+
+    t = store.get("ghost_hash")
+    assert t is not None
+    assert t.state == State.DONE
+
+
+@pytest.mark.anyio
 async def test_reconcile_invokes_fix_orphan_for_missing_inflight(tmp_path: Path):
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)

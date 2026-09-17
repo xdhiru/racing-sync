@@ -64,7 +64,7 @@ ALLOWED: dict[State, set[State]] = {
     State.WAITING_SEEDPOOL: {State.QUERYING, State.WAITING_DISK,
                 State.QUEUED, State.FAILED},
     State.WAITING_DISK: {State.QUEUED, State.DOWNLOADING, State.FAILED},
-    State.QUEUED: {State.DOWNLOADING, State.DONE, State.FAILED},
+    State.QUEUED: {State.DOWNLOADING, State.RE_ADDING, State.DONE, State.FAILED},
     State.DOWNLOADING: {State.MOVING, State.FAILED},
     State.MOVING: {State.RE_ADDING, State.FAILED},
     State.RE_ADDING: {State.DONE, State.FAILED},
