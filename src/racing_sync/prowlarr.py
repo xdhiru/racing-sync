@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote_plus, urlsplit, urlunsplit
@@ -277,12 +278,27 @@ class ProwlarrClient:
         query: str,
         *,
         prefer_indexer: Indexer | None = None,
+        target_size: int = 0,
     ) -> TorrentHit | None:
-        """Search the configured download indexer and return the most-relevant hit.
+        """Search the configured download indexer for the EXACT release.
 
-        Relevance heuristic (no fancy ML): exact title match wins, then
-        largest size wins. Good enough for cross-seed matching where the
-        query is the original torrent name.
+        Cross-seed correctness demands byte-identical content: a same-episode
+        different-group release (e.g. `...H.264-Kitsune` vs `...H.264-playWEB`)
+        must never be accepted, or the racing torrents would later be pointed
+        at foreign bytes. So unlike a similarity ranking, this returns None
+        unless a hit matches exactly:
+
+          - normalized title equality (trailing indexer tags and `.torrent`
+            / media extensions stripped, case-folded; `.`/`_`/` `/`-runs
+            unified so punctuation variants still match, while release-group
+            and tag tokens keep discriminating), AND
+          - when `target_size > 0`, total size within min(50 MiB, 2%) —
+            same rule as `coordinator._matches_release` (kept in sync
+            manually; the two modules cannot import each other).
+
+        Among exact matches the largest wins (deterministic). Returns None
+        when nothing matches exactly — callers treat that as "no cross-seed
+        yet" and park/retry instead of downloading the wrong release.
         """
         if self._cfg.should_skip_title(query):
             log.info("prowlarr: skipping best_match for %r (matches skip_query_substrings)", query)
@@ -291,14 +307,15 @@ class ProwlarrClient:
         hits = await self.search_indexer(idx, query)
         if not hits:
             return None
-        ql = query.lower()
-        hits.sort(
-            key=lambda h: (
-                h.title.lower() != ql,             # exact match first
-                -h.size_bytes,                    # larger first
+        exact = [h for h in hits if _is_exact_release_match(h.title, h.size_bytes, query, target_size)]
+        if not exact:
+            log.info(
+                "prowlarr: %d hit(s) for %r but none is the exact release; ignoring",
+                len(hits), query,
             )
-        )
-        return hits[0]
+            return None
+        exact.sort(key=lambda h: -h.size_bytes)
+        return exact[0]
 
     async def search_indexers_parallel(
         self,
@@ -327,6 +344,51 @@ class ProwlarrClient:
 
 
 # ---------- helpers ----------
+
+def _norm_title_for_match(name: str) -> str:
+    """Normalize a release title for exact-release comparison.
+
+    Mirrors `coordinator.normalize_content_name` (trailing `[...]` indexer
+    tags and `.torrent`/media extensions stripped, case-folded) and additionally
+    unifies `.`/`_`/`-`/space runs so punctuation variants of the same release
+    still match. Release-group suffixes (`-Kitsune` vs `-playWEB`) and other
+    tokens survive as-is and keep discriminating.
+    """
+    s = (name or "").strip()
+    s = re.sub(r"\.torrent$", "", s, flags=re.IGNORECASE).strip()
+    for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v"):
+        if s.lower().endswith(ext):
+            s = s[: -len(ext)].strip()
+            break
+    # Strip AFTER extensions: indexer tags trail the filename
+    # ("... [A1B2C3D4].mkv"), so tag stripping must see the bare name.
+    # (Deliberately local: coordinator.normalize_content_name keeps the
+    # opposite order so differently-tagged releases stay separate rows.)
+    s = re.sub(r"\s*\[[^\]]+\]\s*$", "", s).strip()
+    s = re.sub(r"[._\- ]+", " ", s).strip()
+    return s.lower()
+
+
+def _is_exact_release_match(hit_title: str, hit_size: int, target_name: str, target_size: int) -> bool:
+    """True iff a Prowlarr hit is the same release (not just similar)."""
+    return release_title_matches(hit_title, hit_size, target_name, target_size)
+
+
+def release_title_matches(hit_title: str, hit_size: int, target_name: str, target_size: int) -> bool:
+    """Public exact-release predicate shared with the coordinator.
+
+    Same rules as the `best_match` selection gate (normalized title equality
+    with unified separators, plus min(50 MiB, 2%) size agreement), so a
+    downloaded `.torrent` whose *internal* name/size drifted from its index
+    listing is still rejected before its bytes reach any client.
+    """
+    if _norm_title_for_match(hit_title) != _norm_title_for_match(target_name):
+        return False
+    if hit_size > 0 and target_size > 0:
+        tolerance = min(1024 * 1024 * 50, int(target_size * 0.02))
+        return abs(hit_size - target_size) <= tolerance
+    return True
+
 
 def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
     """Tiny newznab XML parser. Avoids extra deps; prowlarr responses are simple."""

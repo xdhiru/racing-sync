@@ -382,6 +382,80 @@ async def test_prowlarr_best_match_ranking():
     assert best.size_bytes == 8_000_000_000
 
 
+def _hit(title: str, size: int, guid: str = "g") -> TorrentHit:
+    return TorrentHit(
+        title=title, guid=guid, indexer="Seedpool", indexer_id=1,
+        size_bytes=size, download_url="http://prowlarr/dl",
+        magnet_url="", info_url="", publish_date="",
+    )
+
+
+def _seedpool_client() -> ProwlarrClient:
+    from racing_sync.prowlarr import Indexer
+    cfg = ProwlarrConfig(
+        enabled=True,
+        base_url="http://127.0.0.1:9696",
+        api_key="secret",
+        download_indexer="Seedpool (API)",
+    )
+    client = ProwlarrClient(cfg)
+    idx = Indexer(1, "Seedpool (API)", "torrent", True, [])
+    client.get_download_indexer = MagicMock(return_value=idx)
+    return client
+
+
+@pytest.mark.anyio
+async def test_best_match_rejects_different_release_group():
+    """Same episode, different group (Kitsune vs playWEB) must never match,
+    even when sizes agree within tolerance — pointing racing torrents at
+    foreign bytes corrupts the seed."""
+    client = _seedpool_client()
+    query = "Star.Trek.Strange.New.Worlds.S04E08.Orders.of.Magnitude.1080p.AMZN.WEB-DL.DDP5.1.H.264-Kitsune.mkv"
+    wrong_group = (
+        "Star.Trek.Strange.New.Worlds.S04E08.Orders.of.Magnitude.1080p.AMZN.WEB-DL.DDP5.1.H.264-playWEB.mkv"
+    )
+    size = 1_450_000_000
+    client.search_indexer = AsyncMock(return_value=[_hit(wrong_group, size + 5_000_000)])
+
+    assert await client.best_match(query, target_size=size) is None
+
+
+@pytest.mark.anyio
+async def test_best_match_accepts_punctuation_variants_and_strips_tags():
+    client = _seedpool_client()
+    size = 1_450_000_000
+    # Dots vs spaces must not split the same release...
+    client.search_indexer = AsyncMock(return_value=[
+        _hit("Star.Trek.Strange.New.Worlds.S04E08.Orders.of.Magnitude.1080p.AMZN.WEB-DL.DDP5.1.H.264-Kitsune", size),
+    ])
+    query = ("Star Trek Strange New Worlds S04E08 Orders of Magnitude 1080p "
+             "AMZN WEB-DL DDP5.1 H.264-Kitsune")
+    best = await client.best_match(query, target_size=size)
+    assert best is not None
+
+    # ...while trailing indexer tags and media extensions are ignored.
+    client.search_indexer = AsyncMock(return_value=[
+        _hit("[SubsPlease] Frieren - 28 (1080p) [A1B2C3D4].mkv", size),
+    ])
+    best = await client.best_match("[SubsPlease] Frieren - 28 (1080p)", target_size=size)
+    assert best is not None
+
+
+@pytest.mark.anyio
+async def test_best_match_size_gate_needs_target_size():
+    """Same normalized title but wildly different size: gated only when the
+    caller passes target_size (best_match can't know it otherwise)."""
+    client = _seedpool_client()
+    title = "Show.S01E01.1080p-GRP"
+    client.search_indexer = AsyncMock(return_value=[_hit(title, 10_000_000_000)])
+    # No target size -> title match alone suffices (legacy callers).
+    assert await client.best_match(title) is not None
+    # 1 GB target vs 10 GB hit -> rejected.
+    assert await client.best_match(title, target_size=1_000_000_000) is None
+    # Within min(50MB, 2%) -> accepted (40 MB diff < 50 MB cap).
+    assert await client.best_match(title, target_size=9_960_000_000) is not None
+
+
 @pytest.mark.anyio
 async def test_prowlarr_headers_not_leaked_to_external_hosts():
     from unittest.mock import AsyncMock, MagicMock
@@ -679,6 +753,56 @@ async def test_pick_ssd_source_private_sftp_fallback_when_not_attempting_prowlar
     assert dec.source_label == "private-sftp-fallback"
     assert dec.torrent_bytes == b"private_sftp_blob"
     assert dec.announce_url == "https://aither.cc/announce"
+
+
+@pytest.mark.anyio
+async def test_pick_rejects_hit_whose_payload_is_another_release():
+    """Defense in depth: even if selection passed a wrong-group hit, the
+    decoded payload check must refuse it (park, never download onward)."""
+    from racing_sync.clients.abstract import Torrent
+
+    kitsune = "Star.Trek.Strange.New.Worlds.S04E08.Orders.of.Magnitude.1080p.AMZN.WEB-DL.DDP5.1.H.264-Kitsune.mkv"
+    playweb = "Star.Trek.Strange.New.Worlds.S04E08.Orders.of.Magnitude.1080p.AMZN.WEB-DL.DDP5.1.H.264-playWEB.mkv"
+    size = 1_450_000_000
+    playweb_blob = _bencode({
+        b"announce": b"http://tracker.seedpool.org/announce",
+        b"info": {
+            b"name": playweb.encode(),
+            b"length": size,
+            b"piece length": 262144,
+            b"pieces": b"12345678901234567890",
+        },
+    })
+
+    cfg = MagicMock()
+    cfg.prowlarr.should_skip_title.return_value = False
+    cfg.prowlarr.download_indexer = "Seedpool (API)"
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+    cfg.cross_seed.allow_ssh_export = False
+
+    prowlarr = AsyncMock()
+    prowlarr.best_match.return_value = TorrentHit(
+        title=playweb, guid="9", indexer="Seedpool (API)", indexer_id=1,
+        size_bytes=size, download_url="http://prowlarr/9",
+        magnet_url="", info_url="", publish_date="",
+    )
+    prowlarr.download_torrent.return_value = playweb_blob
+
+    dec = await pick_ssd_source_for_racing(
+        cfg=cfg,
+        source_torrent=Torrent(
+            hash="kitsunehash", name=kitsune, category="racing",
+            save_path="", size_bytes=size, state="seeding", progress=1.0,
+            trackers=["https://aither.cc/announce"],
+        ),
+        other_source_torrents=[],
+        prowlarr=prowlarr,
+        sftp=None,
+        source_client=AsyncMock(),
+        attempt_prowlarr=True,
+    )
+    # Treated exactly like "no hit": park for retry, never a decision.
+    assert dec is None
 
 
 

@@ -98,6 +98,39 @@ def _matches_release(hit_title: str, hit_size: int, target_name: str, target_siz
     return True
 
 
+def _verified_cross_seed_blob(
+    blob: bytes | None, *, target_name: str, target_size: int, hit_title: str
+) -> tuple[bytes, str, str] | None:
+    """Decode downloaded cross-seed bytes and prove they are the exact release.
+
+    Index listings can drift from the payload behind them, so selection-time
+    matching is re-checked against the authoritative decoded name/size here.
+    Returns (blob, real_infohash, announce_url) or None — callers treat None
+    exactly like "no hit" (park/retry/fallback), never downloading onward.
+    """
+    if not blob:
+        return None
+    try:
+        from .watchdir import _bencoded_info_hash
+        real_hash, blob_name, blob_size, announce = _bencoded_info_hash(blob)
+    except Exception:
+        log.warning("cross-seed download for %s is not a decodable torrent; ignoring",
+                    target_name)
+        return None
+    try:
+        from .prowlarr import release_title_matches
+        ok = release_title_matches(blob_name or hit_title, blob_size or 0,
+                                   target_name, target_size)
+    except Exception:
+        ok = False
+    if not ok:
+        log.warning("cross-seed mismatch for %s: got %r (%d B), want the exact "
+                    "release; ignoring download",
+                    target_name, blob_name, blob_size)
+        return None
+    return blob, (real_hash or "").lower(), announce or ""
+
+
 def _lerp(x: float, x0: float, x1: float, y0: float, y1: float) -> float:
     """Linear interpolation of y over [x0, x1], clamped to [y0, y1]."""
     if x1 <= x0:
@@ -356,25 +389,27 @@ async def pick_ssd_source_for_racing(
                 chosen.name,
             )
             try:
-                hit = await prowlarr.best_match(chosen.name)
+                hit = await prowlarr.best_match(chosen.name, target_size=chosen.size_bytes)
             except Exception as e:  # noqa: BLE001
                 log.warning("seedpool search failed for %s: %s",
                             chosen.name, e)
                 hit = None
+            verified = None
+            hit_size = 0
             if hit:
+                hit_size = hit.size_bytes
                 blob = await prowlarr.download_torrent(hit)
-                real_hash = ""
-                announce = ""
-                try:
-                    from .watchdir import _bencoded_info_hash
-                    real_hash, _, _, announce = _bencoded_info_hash(blob)
-                except Exception:
-                    real_hash = ""
+                verified = _verified_cross_seed_blob(
+                    blob, target_name=chosen.name,
+                    target_size=chosen.size_bytes, hit_title=hit.title,
+                )
+            if verified is not None:
+                blob, real_hash, announce = verified
                 return SourceDecision(
                     torrent_bytes=blob,
                     source_label="public-seedpool-fallback",
                     name=chosen.name,
-                    size_bytes=hit.size_bytes,
+                    size_bytes=hit_size,
                     infohash=real_hash,
                     announce_url=announce or (chosen.trackers[0] if chosen.trackers else ""),
                 )
@@ -414,29 +449,31 @@ async def pick_ssd_source_for_racing(
             source_torrent.name,
         )
         try:
-            hit = await prowlarr.best_match(source_torrent.name)
+            hit = await prowlarr.best_match(source_torrent.name, target_size=source_torrent.size_bytes)
         except Exception as e:  # noqa: BLE001
             log.warning("seedpool search failed for %s: %s",
                         source_torrent.name, e)
             hit = None
+        verified = None
+        hit_size = 0
         if hit:
+            hit_size = hit.size_bytes
             log.info(
                 "prowlarr hit: %s (size=%d B, indexer=%s)",
                 hit.title, hit.size_bytes, hit.indexer,
             )
             blob = await prowlarr.download_torrent(hit)
-            real_hash = ""
-            announce = ""
-            try:
-                from .watchdir import _bencoded_info_hash
-                real_hash, _, _, announce = _bencoded_info_hash(blob)
-            except Exception:
-                real_hash = ""
+            verified = _verified_cross_seed_blob(
+                blob, target_name=source_torrent.name,
+                target_size=source_torrent.size_bytes, hit_title=hit.title,
+            )
+        if verified is not None:
+            blob, real_hash, announce = verified
             return SourceDecision(
                 torrent_bytes=blob,
                 source_label="seedpool-cross-seed",
                 name=source_torrent.name,
-                size_bytes=hit.size_bytes,
+                size_bytes=hit_size,
                 infohash=real_hash,
                 announce_url=announce or (source_torrent.trackers[0] if source_torrent.trackers else ""),
             )
