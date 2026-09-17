@@ -47,6 +47,12 @@ class NginxAuthConfig(BaseModel):
     pass_field: str = "password"
     extra_fields: dict[str, str] = {}
 
+    @model_validator(mode="after")
+    def _check_url(self) -> NginxAuthConfig:
+        if self.mode == "form_post" and not self.url.strip():
+            raise ValueError('nginx mode="form_post" requires a non-empty url')
+        return self
+
 
 class HTTPClientConfig(BaseModel):
     """Internal helper used by clients.http_base.
@@ -197,7 +203,7 @@ class DestConfig(BaseModel):
     # Optional nginx basic-auth in front of the qBittorrent WebUI on VPS2.
     nginx: NginxAuthConfig = NginxAuthConfig()
     # Maximum concurrent torrents actively downloading on VPS2 SSD (default: 3)
-    max_active_downloads: int = Field(default=3, ge=1)
+    max_active_downloads: int = Field(default=3, ge=1, le=100)
 
 
 class SSDConfig(BaseModel):
@@ -214,9 +220,21 @@ class RemoteConfig(BaseModel):
     @field_validator("default", "unsorted")
     @classmethod
     def _must_look_remote(cls, v: str) -> str:
-        if not re.match(r"^[A-Za-z0-9_\-]+:", v):
+        v = v.strip()
+        m = re.match(r"^([A-Za-z0-9_\-]+):(.*)$", v)
+        if not m:
             raise ValueError(
                 f"rclone remote path must be of form 'name:path', got: {v!r}"
+            )
+        name, path = m.group(1), m.group(2)
+        # Reject Windows drive letters (C:/, C:\) mistaken for remotes.
+        if len(name) == 1 and path.startswith(("/", "\\")):
+            raise ValueError(
+                f"rclone remote path looks like a Windows drive, got: {v!r}"
+            )
+        if not path or path.strip() in ("", "/"):
+            raise ValueError(
+                f"rclone remote path must include a path after 'name:', got: {v!r}"
             )
         if not v.endswith("/"):
             raise ValueError(f"rclone remote path must end with '/', got: {v!r}")
@@ -244,7 +262,7 @@ class RcloneConfig(BaseModel):
     extra_move_flags: list[str] = Field(default_factory=list)
     batch_move_extra_flags: list[str] = Field(default_factory=list)
     # Maximum concurrent rclone move commands running simultaneously (default: 3)
-    max_concurrent_moves: int = Field(default=3, ge=1)
+    max_concurrent_moves: int = Field(default=3, ge=1, le=100)
     reinject_delay_seconds: int | None = Field(default=None, ge=0)
 
     @field_validator("config_path", mode="before")
@@ -397,9 +415,21 @@ class ProwlarrTrackerMap(BaseModel):
                         f'  "beyond-hd" = "BeyondHD"'
                     )
             if "entries" in data and isinstance(data["entries"], dict):
-                return data
-            # Otherwise the input is the flat dict.
-            return {"entries": {str(k): str(v) for k, v in data.items()}}
+                entries = data["entries"]
+            else:
+                # Otherwise the input is the flat dict.
+                entries = {str(k): str(v) for k, v in data.items()}
+            for k, val in entries.items():
+                if not str(k).strip():
+                    raise ValueError(
+                        "[prowlarr.tracker_map] has an empty substring key "
+                        "which would match every announce URL"
+                    )
+                if not str(val).strip():
+                    raise ValueError(
+                        f"[prowlarr.tracker_map] entry {k!r} has an empty indexer name"
+                    )
+            return {"entries": entries}
         return data
 
     def resolve(self, announce_url: str) -> str | None:
@@ -407,6 +437,8 @@ class ProwlarrTrackerMap(BaseModel):
             return None
         low = announce_url.lower()
         for sub, name in self.entries.items():
+            if not sub or not sub.strip():
+                continue
             if sub.lower() in low:
                 return name
         return None
@@ -560,7 +592,7 @@ class RecoveryConfig(BaseModel):
     # Allowed transition states when reconciling (anything else = force fix)
     auto_fix_state: bool = True
     # How many torrents to inspect per pass (avoid hammering API)
-    batch_size: int = 50
+    batch_size: int = Field(default=50, ge=1, le=1000)
     # Reset previously-FAILED rows back to NEW on startup so they
     # get re-processed with the current code. Useful after a fix that
     # would have prevented the failure in the first place (e.g. a
@@ -570,7 +602,7 @@ class RecoveryConfig(BaseModel):
     auto_retry_failed: bool = True
     # Maximum number of times a FAILED row will be auto-retried on boot
     # before being left in FAILED to avoid infinite failure loops.
-    max_failed_retries: int = 3
+    max_failed_retries: int = Field(default=3, ge=0, le=100)
 
 
 
@@ -695,8 +727,8 @@ class GeneralConfig(BaseModel):
     log_retention_days: int = Field(default=14, ge=1)
     disk_safety_margin_bytes: int = Field(default=0, ge=0)
     # Optional overrides if specified under [general]
-    max_active_downloads: int | None = Field(default=None, ge=1)
-    max_concurrent_moves: int | None = Field(default=None, ge=1)
+    max_active_downloads: int | None = Field(default=None, ge=1, le=100)
+    max_concurrent_moves: int | None = Field(default=None, ge=1, le=100)
     download_stall_timeout_seconds: int = Field(default=0, ge=0)
 
 
