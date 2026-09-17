@@ -316,6 +316,166 @@ async def test_wait_for_completion_resolves_when_expected_files_complete():
 
 
 @pytest.mark.anyio
+async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
+    """Piece-boundary partials must never reach the remote via the sweep.
+
+    Regression: qBittorrent pre-allocates deselected files at full size, so
+    a partial of a not-yet-processed episode looks "full" on disk while its
+    progress is < 1. The old bare `<top>/**` sweep uploaded such corrupt
+    data (potentially overwriting an older batch's moved file). The sweep
+    must transfer only client-verified-complete files, leave the partial
+    for the folder wipe, and still finish RE_ADDING.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    top = ssd / "Big.Show.S01"
+    top.mkdir()
+    partial = top / "Big.Show.S01E04.mkv"
+    partial.write_bytes(b"e" * 500)  # preallocated full size...
+    cover = top / "cover.jpg"
+    cover.write_bytes(b"cover!")
+    gone_locally = "Big.Show.S01/Big.Show.S01E01.mkv"  # moved by its batch
+
+    cls_files = [
+        TorrentFile(name=gone_locally, size_bytes=500, progress=1.0),
+        TorrentFile(name="Big.Show.S01/Big.Show.S01E04.mkv", size_bytes=500, progress=0.4),
+        TorrentFile(name="Big.Show.S01/cover.jpg", size_bytes=6, progress=1.0),
+    ]
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = ssd / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+    coord.cfg.rclone.batch_move_extra_flags = []
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=cls_files)
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.delete = AsyncMock()
+    coord.dest_client.export_torrent = AsyncMock(return_value=b"blob")
+    coord._rclone_move = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="b" * 40,
+        source_name="Big.Show.S01",
+        dest_infohash="b" * 40,
+        save_path=str(ssd),
+        classification_kind="season",
+        batches_total=3,
+        batch_index=3,  # all batches moved during downloading
+        state=State.MOVING,
+    )
+    coord.store.upsert(ts)
+
+    row = coord.store.get("b" * 40)
+    with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock):
+        await coord._do_moving(row)
+
+    assert row.state == State.RE_ADDING
+    # Exactly one sweep move, covering ONLY the verified-complete leftover.
+    coord._rclone_move.assert_awaited_once()
+    includes = coord._rclone_move.call_args.kwargs.get("include")
+    assert includes == ["--include=**/Big.Show.S01/cover.jpg"]
+    # The preallocated partial was neither moved nor individually deleted.
+    assert partial.exists()
+
+
+@pytest.mark.anyio
+async def test_do_moving_skips_move_when_no_verified_leftovers(tmp_path):
+    """All-remaining-are-partials: no rclone call at all, still RE_ADDING."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    top = ssd / "Big.Show.S01"
+    top.mkdir()
+    (top / "Big.Show.S01E04.mkv").write_bytes(b"e" * 500)
+
+    cls_files = [
+        TorrentFile(name="Big.Show.S01/Big.Show.S01E04.mkv", size_bytes=500, progress=0.4),
+    ]
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = ssd / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+    coord.cfg.rclone.batch_move_extra_flags = []
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=cls_files)
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.delete = AsyncMock()
+    coord.dest_client.export_torrent = AsyncMock(return_value=b"blob")
+    coord._rclone_move = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="c" * 40,
+        source_name="Big.Show.S01",
+        dest_infohash="c" * 40,
+        save_path=str(ssd),
+        classification_kind="season",
+        batches_total=3,
+        batch_index=3,
+        state=State.MOVING,
+    )
+    coord.store.upsert(ts)
+
+    row = coord.store.get("c" * 40)
+    with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock):
+        await coord._do_moving(row)
+
+    assert row.state == State.RE_ADDING
+    coord._rclone_move.assert_not_called()
+
+
+def test_make_batches_huge_season_many_small_nested_episodes():
+    """900 GB pack of ~1 GB nested episodes under a 37 GiB cap.
+
+    Every batch fits the cap, every episode lands in exactly one batch, and
+    include patterns keep full nested paths (remote layout == torrent layout).
+    """
+    from racing_sync.classifier import Episode
+
+    eps = [
+        Episode(f"Giant.S01/Part{i // 100 + 1:02d}/Giant.S01E{i:03d}.mkv", 1, i, 1_000_000_000)
+        for i in range(1, 901)
+    ]
+    batches = make_batches(eps, cap_bytes=37 * 1024**3)
+    per_batch = (37 * 1024**3) // 1_000_000_000  # whole 1 GB episodes per batch
+    assert len(batches) == -(-900 // per_batch)
+    seen: list[str] = []
+    for b in batches:
+        assert b.size_bytes <= 37 * 1024**3
+        assert len(b.episodes) <= 100
+        for pat in b.include_patterns():
+            assert pat.startswith("--include=**/Giant.S01/")
+        seen.extend(e.file_name for e in b.episodes)
+    assert sorted(seen) == sorted(e.file_name for e in eps)
+
+
+@pytest.mark.anyio
 async def test_do_moving_skips_move_when_already_batched(tmp_path):
     from unittest.mock import AsyncMock, MagicMock, patch
     from racing_sync.coordinator import Coordinator
