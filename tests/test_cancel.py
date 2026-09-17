@@ -857,3 +857,18 @@ def test_full_reset_refuses_symlink_ssd(tmp_path: Path, monkeypatch):
     assert any("refusing to wipe SSD" in ln for ln in lines)
     # Real SSD data untouched through the symlink refusal.
     assert (ssd / "Pack").exists()
+
+
+@pytest.mark.anyio
+async def test_chat_command_double_tap_debounced(tmp_path: Path):
+    """A double-sent /cancel_ resolves+acts once (0.5s debounce)."""
+    store = StateStore(tmp_path / "state.db")
+    bot = _bot()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/cancel_dddddddddd"))
+        await bot._handle_chat_message(_message(text="/cancel_dddddddddd"))
+        # Unknown hash replies once; the second tap is dropped silently.
+        bot._bot.send_message.assert_awaited_once()
+    finally:
+        store.close()
