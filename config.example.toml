@@ -18,6 +18,15 @@ log_retention_days = 14
 # Example: 10 GiB. Prevents races between disk_usage() check and torrent fill.
 disk_safety_margin_bytes = 10737418240
 
+# Optional global overrides (all commented = use per-section values):
+#   max_active_downloads       overrides [dest].max_active_downloads
+#   max_concurrent_moves       overrides [rclone].max_concurrent_moves
+# max_active_downloads = 3
+# max_concurrent_moves = 3
+# Stall timeout (seconds) for a VPS2 SSD download with zero progress.
+# 0 = disabled (default); set e.g. 3600 to fail visibly-stuck downloads.
+# download_stall_timeout_seconds = 0
+
 # ============================================================
 # Source (VPS1) — racing client
 # ============================================================
@@ -90,6 +99,16 @@ ssh_password = ""
 ssh_key_path = ""
 # Passphrase for the SSH key above. Leave empty for an unencrypted key.
 ssh_key_passphrase = ""
+# Host-key verification for the SSH connection.
+#   known_hosts_path   file with the VPS1 host key (e.g. "~/.ssh/known_hosts").
+#                      Empty = use the system host keys.
+#   auto_add_host_key  true = trust the host key on first connect (weaker:
+#                      vulnerable to first-connection MITM). Needed when the
+#                      host is not in known_hosts, otherwise startup fails with
+#                      "Server ... not found in known_hosts".
+#                      Pin via `ssh-keyscan -p <ssh_port> <ssh_host>` instead.
+known_hosts_path = ""
+auto_add_host_key = false
 # Path inside VPS1 to deluge state dir; typically ~/.config/deluge/state
 state_dir = "/home/deluge/.config/deluge/state"
 
@@ -135,6 +154,9 @@ max_inflight_bytes = 536870912000   # 500 GiB
 # If a single-file torrent (movie) is larger than this, skip it entirely.
 # (Season torrents are still processed in batches even if larger.)
 skip_movie_larger_than_bytes = 536870912000  # 500 GiB
+# Extra per-check safety margin for SSD operations (bytes, default 0).
+# Adds to [general].disk_safety_margin_bytes for SSD-space decisions.
+safety_margin_bytes = 0
 
 # ============================================================
 # rclone (VPS2)
@@ -149,7 +171,11 @@ binary = "/usr/local/bin/rclone"
 # config_path = "/path/to/rclone.conf"
 # Maximum concurrent rclone move commands running simultaneously (default: 3).
 # Limits parallel moves from SSD to remote to prevent CPU/network saturation.
+# Can be overridden globally via [general].max_concurrent_moves.
 max_concurrent_moves = 3
+# Optional override for the fuse re-inject delay below (seconds).
+# Empty/unset = use [rclone.fuse].reinject_delay_seconds.
+# reinject_delay_seconds = 30
 
 # Default remote + path for movies and full season-root folders.
 # These are rclone REMOTE paths (not fuse mount paths).
@@ -246,6 +272,9 @@ pin_status_message = false
 # don't need pinning — the active-tasks message stays at the bottom
 # of the chat naturally because new per-torrent messages are sent
 # above it.
+# Outbound rate limit (messages/second) for per-torrent detail messages.
+# Prevents Telegram HTTP 429 on bursts (e.g. first run with many torrents).
+outbound_rate = 5
 
 # ============================================================
 # Centralized logging (HTTP sink)
@@ -297,14 +326,6 @@ skip_query_substrings = ["subsplease"]
 timeout_seconds = 30.0
 max_results = 20
 
-# Tracker announce URL substring → prowlarr indexer name.
-# Used to figure out which prowlarr indexer to search when a torrent
-# from the racing client has only private sources.
-#
-# Each pair has TWO values:
-#   *_substr  the substring matched (case-insensitive) against the
-#             racing client's announce URL
-#   *_index   the corresponding prowlarr indexer name to search on
 # Tracker announce URL substring → prowlarr indexer name.
 # Used to figure out which prowlarr indexer to search when a torrent
 # from the racing client has only private sources.
@@ -372,6 +393,13 @@ prowlarr_max_age_seconds        = 86400  # 24 hours
 run_on_startup = true
 auto_fix_state = true
 batch_size = 50
+# Reset previously-FAILED rows back to NEW on startup so they get another
+# chance with the current code (e.g. after an upgrade that fixes the cause).
+# Set false if FAILED rows should stay failed for manual intervention.
+auto_retry_failed = true
+# Maximum times a FAILED row is auto-retried before being left FAILED,
+# guarding against infinite failure loops.
+max_failed_retries = 3
 
 # ============================================================
 # Control API (optional, FastAPI)
