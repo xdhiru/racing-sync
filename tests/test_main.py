@@ -40,6 +40,31 @@ def test_main_check_config(tmp_path: Path):
     assert rc == 0
 
 
+def test_main_run_startup_failure_is_clean(tmp_path: Path, capsys):
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+
+    with patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
+         patch("racing_sync.__main__.setup_logging"):
+        mock_coord = MagicMock()
+
+        async def fake_run():
+            raise Exception("Server '[h]:1' not found in known_hosts")
+
+        async def fake_shutdown():
+            pass
+
+        mock_coord.run.side_effect = fake_run
+        mock_coord.shutdown.side_effect = fake_shutdown
+        mock_coord_cls.return_value = mock_coord
+
+        rc = main(["run", "--config", str(cfg_file)])
+        assert rc == 2
+    err = capsys.readouterr().err
+    assert "Failed to start" in err
+    assert "known_hosts" in err
+
+
 def test_main_run_reset_clears_state_db_and_logs(tmp_path: Path):
     from racing_sync.config import AppConfig
 
