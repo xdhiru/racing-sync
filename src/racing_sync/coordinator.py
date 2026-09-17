@@ -340,16 +340,27 @@ async def pick_ssd_source_for_racing(
         )
         return None
 
-    # All torrents are private. We only download from VPS2 SSD using a
-    # cross-seed from the configured download_indexer ("Seedpool (API)" by default).
-    # Private torrents are never downloaded directly on SSD unless SFTP fallback is explicitly used.
+    # All torrents are private. Preferred SSD source is a cross-seed from the
+    # configured download_indexer ("Seedpool (API)" by default) — unless the
+    # title matches skip_query_substrings (a query can never match, so don't
+    # park for one) or Prowlarr is unavailable/disabled. Those cases fall
+    # straight through to the direct-export fallback below instead of
+    # entering the WAITING_SEEDPOOL retry loop for a query that will never
+    # run. Private torrents are never downloaded directly on SSD unless
+    # allow_ssh_export (or the source export endpoint) is used.
     should_skip_prowlarr = cfg.prowlarr.should_skip_title(source_torrent.name)
+    can_query_prowlarr = (
+        prowlarr is not None
+        and cfg.cross_seed.allow_prowlarr_cross_seed
+        and not should_skip_prowlarr
+    )
     if should_skip_prowlarr:
         log.info(
-            "prowlarr: skipping cross-seed query for %r (matches skip_query_substrings)",
+            "prowlarr: skipping cross-seed query for %r (matches skip_query_substrings); "
+            "using the racing torrent's own bytes",
             source_torrent.name,
         )
-    elif prowlarr is not None and cfg.cross_seed.allow_prowlarr_cross_seed:
+    elif can_query_prowlarr:
         log.info(
             "private release; querying Prowlarr (%s) for cross-seed of %s",
             cfg.prowlarr.download_indexer,
@@ -389,24 +400,55 @@ async def pick_ssd_source_for_racing(
             )
             return None
 
-    # SFTP fallback for private when attempt_prowlarr is False or Prowlarr is unavailable/skipped
-    if not attempt_prowlarr and cfg.cross_seed.allow_ssh_export and sftp is not None:
-        log.info(
-            "Prowlarr bypass/fallback: SFTP-exporting private torrent %s from VPS1",
-            source_torrent.infohash[:10],
-        )
+    # Direct-export fallback: VPS2 leeches the racing private torrent's own
+    # bytes. Reached when the Prowlarr query is skipped by config,
+    # unavailable/disabled, or bypassed by the caller — never after a real
+    # query that merely missed with attempt_prowlarr=True (that parks above).
+    if cfg.cross_seed.allow_ssh_export:
         blob = None
-        try:
-            blob = await asyncio.wait_for(
-                asyncio.to_thread(sftp.fetch_torrent, source_torrent.infohash),
-                timeout=15.0,
+        label = ""
+        if sftp is not None:
+            log.info(
+                "Prowlarr bypass/fallback: SFTP-exporting private torrent %s from VPS1",
+                source_torrent.infohash[:10],
             )
-        except Exception as e:  # noqa: BLE001
-            log.warning("sftp fallback fetch %s failed: %s", source_torrent.infohash[:10], e)
+            try:
+                blob = await asyncio.wait_for(
+                    asyncio.to_thread(sftp.fetch_torrent, source_torrent.infohash),
+                    timeout=15.0,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                log.warning("sftp fallback fetch %s timed out after 15s",
+                            source_torrent.infohash[:10])
+            except Exception as e:  # noqa: BLE001
+                log.warning("sftp fallback fetch %s failed: %s", source_torrent.infohash[:10], e)
+            if blob:
+                label = "private-sftp-fallback"
+        if blob is None:
+            # qBittorrent sources expose every torrent via /torrents/export;
+            # Deluge sources rely on SFTP (their RPC has no torrent-file
+            # method), so a failure here after an SFTP miss is routine.
+            try:
+                blob = await asyncio.wait_for(
+                    source_client.export_torrent(source_torrent.infohash),
+                    timeout=15.0,
+                )
+            except AttributeError:
+                blob = None
+            except Exception as e:  # noqa: BLE001
+                if sftp is not None and isinstance(source_client, DelugeClient):
+                    log.debug("private export fallback unavailable for %s: %s",
+                              source_torrent.infohash[:10], e)
+                else:
+                    log.warning("private export fallback fetch %s failed: %s",
+                                source_torrent.infohash[:10], e)
+                blob = None
+            if blob:
+                label = "private-export-fallback"
         if blob:
             return SourceDecision(
                 torrent_bytes=blob,
-                source_label="private-sftp-fallback",
+                source_label=label,
                 name=source_torrent.name,
                 size_bytes=source_torrent.size_bytes,
                 infohash=source_torrent.infohash,

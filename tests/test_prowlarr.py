@@ -94,8 +94,84 @@ async def test_pick_ssd_source_for_racing_skips_prowlarr():
         attempt_prowlarr=True,
     )
 
-    # Prowlarr should NOT be called at all
+    # Prowlarr should NOT be called at all; instead of parking for a query
+    # that can never run, the racing torrent's own bytes are used at once.
     prowlarr.best_match.assert_not_called()
+    assert decision is not None
+    assert decision.source_label == "private-sftp-fallback"
+    assert decision.torrent_bytes == b"sftp-torrent-bytes"
+
+
+@pytest.mark.anyio
+async def test_pick_ssd_source_skipped_title_uses_export_endpoint_without_sftp():
+    """Skipped titles on qBittorrent sources (no SFTP) use /torrents/export."""
+    from racing_sync.clients.abstract import Torrent
+
+    cfg = MagicMock()
+    cfg.prowlarr.should_skip_title = lambda title: "subsplease" in title.lower()
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+    cfg.cross_seed.allow_ssh_export = True
+
+    prowlarr = AsyncMock()
+    source_client = AsyncMock()
+    source_client.export_torrent.return_value = b"qb-exported-bytes"
+
+    torrent = Torrent(
+        hash="aa11bb22",
+        name="[SubsPlease] Frieren - 29 (1080p)",
+        category="racing",
+        save_path="",
+        size_bytes=2000,
+        state="",
+        progress=1.0,
+        trackers=["http://privatetracker.org/announce"],
+    )
+
+    decision = await pick_ssd_source_for_racing(
+        cfg=cfg,
+        source_torrent=torrent,
+        other_source_torrents=[],
+        prowlarr=prowlarr,
+        sftp=None,
+        source_client=source_client,
+        attempt_prowlarr=True,
+    )
+
+    prowlarr.best_match.assert_not_called()
+    assert decision is not None
+    assert decision.source_label == "private-export-fallback"
+    assert decision.torrent_bytes == b"qb-exported-bytes"
+    source_client.export_torrent.assert_awaited_once_with("aa11bb22")
+
+
+@pytest.mark.anyio
+async def test_pick_ssd_source_skipped_title_parks_when_no_export_path():
+    """Skipped titles park only when every direct-export path fails."""
+    from racing_sync.clients.abstract import Torrent
+
+    cfg = MagicMock()
+    cfg.prowlarr.should_skip_title = lambda title: "subsplease" in title.lower()
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+    cfg.cross_seed.allow_ssh_export = False
+
+    decision = await pick_ssd_source_for_racing(
+        cfg=cfg,
+        source_torrent=Torrent(
+            hash="bb22cc33",
+            name="[SubsPlease] Frieren - 30 (1080p)",
+            category="racing",
+            save_path="",
+            size_bytes=2000,
+            state="",
+            progress=1.0,
+            trackers=["http://privatetracker.org/announce"],
+        ),
+        other_source_torrents=[],
+        prowlarr=AsyncMock(),
+        sftp=None,
+        source_client=AsyncMock(),
+        attempt_prowlarr=True,
+    )
     assert decision is None
 
 
