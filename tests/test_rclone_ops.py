@@ -116,12 +116,16 @@ def test_build_move_cmd(tmp_path: Path):
         extra=["--dry-run"],
     )
     assert cmd[0] == str(Path("/usr/bin/rclone"))
-    assert cmd[1:5] == ["move", "--", str(tmp_path / "src"), "remote:dest"]
-    assert "--config" in cmd
-    assert str(Path("/etc/rclone.conf")) in cmd
-    assert "--transfers=4" in cmd
-    assert "--include=*.mkv" in cmd
-    assert "--dry-run" in cmd
+    assert cmd[1] == "move"
+    # Flags before `--`, positionals last — rclone treats everything after
+    # `--` as positionals, so flags there break with rc=2 (see prod log).
+    assert cmd[-3:] == ["--", str(tmp_path / "src"), "remote:dest"]
+    dash_idx = cmd.index("--")
+    assert "--config" in cmd[:dash_idx]
+    assert str(Path("/etc/rclone.conf")) in cmd[:dash_idx]
+    assert "--transfers=4" in cmd[:dash_idx]
+    assert "--include=*.mkv" in cmd[:dash_idx]
+    assert "--dry-run" in cmd[:dash_idx]
 
 
 @pytest.mark.anyio
