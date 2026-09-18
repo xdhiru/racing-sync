@@ -4,20 +4,26 @@
 
 ```
 src/racing_sync/
-  __main__.py         CLI
+  __main__.py         CLI (run / forget / check-config)
   config.py           Pydantic schema, cross-validates everything
   logging_setup.py    Rotating files + JSONL + ring buffer + optional HTTP sink
   state.py            SQLite state machine (State, ALLOWED, StateStore)
   classifier.py       movie / episode / season
   batcher.py          SSD-aware episode batching
   rclone_ops.py       rclone subprocess wrapper
-  sftp_source.py      paramiko-based .torrent export
+  sftp_source.py      paramiko-based .torrent export (pooled)
   prowlarr.py         Prowlarr client (indexers, search, download)
   watchdir.py         Watch-dir scanner with bencoded torrent parser
   recovery.py         Startup reconciler
-  coordinator.py      Main async loop + per-torrent workers
+  forget.py           Abandon-torrent off-switch (row + entries + SSD data)
+  coordinator.py      Main async loop + per-torrent workers (tick, dispatch)
+  coordinator_ssd.py  SSD batch caps + global reservation ledger
+  coordinator_picker.py  Cross-seed SSD-source picker (req #1/#2)
+  coordinator_cleanup.py VPS1 cleanup janitor
+  coordinator_paths.py   Untrusted torrent-relative path guard
+  coordinator_errors.py  Retryable WebUI / batch-move error contract
   coordinator_content.py  Stateless helpers (normalize, grace, notify filter)
-  telegram_bot.py     Live status + log forwarding
+  telegram_bot.py     Per-torrent detail cards + active-tasks list
   api.py              Optional FastAPI control plane
   clients/
     abstract.py       TorrentClient ABC + dataclasses
@@ -30,16 +36,30 @@ src/racing_sync/
 
 ```
 NEW ──┬─> QUERYING ──> WAITING_SEEDPOOL ──> WAITING_DISK ──> QUEUED ──> DOWNLOADING ──> MOVING ──> RE_ADDING ──> DONE
-      │       │                │                  │              │            │
-      └───────┴────────────────┴──────────────────┴──────────────┴────────────┴──> (any) ──> FAILED
-                                                                                              │
-                                                                                              └──> QUEUED (retry)
+      │       │                │                  │    │          │            │             │                  │ ^
+      │       │                │                  │    │          │            │             │                  │ │
+      └───────┴────────────────┴──────────────────┴────┴──────────┴────────────┴──> (any) ──> FAILED ──────────┘ │
+                                                                                  │  │                          │
+                                                                          QUEUED/NEW retry  │  lost fuse ───────┘
+                                                                                            │  (RE_ADDING, ≤5 rapid
+                                                                                            │   flaps, else FAILED)
+                                                                             false DONE ────────────────────────┘
+                                                                                  (self-heal via MOVING)
 ```
 
-`DONE` and `FAILED` are terminal-ish: `FAILED → QUEUED` is allowed for manual retry.
+`DONE` is terminal-ish but not final: a lost fuse entry demotes
+`DONE → RE_ADDING`, a falsely adopted `DONE` (bytes never moved) demotes
+`DONE → MOVING`. Rapid `DONE` demotions are counted (`readd_cycles`);
+past 5 in 24h the row fails for operator attention instead of flapping
+forever. `FAILED → QUEUED/NEW` allows manual and auto retry.
 
-The state lives in `state.db` (SQLite, WAL journal). Every state transition is
-audited in the `run_log` table.
+The state lives in `state.db` (SQLite, WAL journal). Transitions are
+written through `StateStore.transition`, which restores the in-memory row
+if the `upsert` fails (e.g. full disk) so memory never disagrees with the
+DB. Failures are logged to the app log and to the `run_log` table (pruned
+to 5000 rows). Two extra persisted columns keep long-run behavior stable
+across restarts: `batch_cap_bytes` (frozen batch boundaries) and
+`readd_cycles` (flap counter).
 
 ## Per-torrent workflow
 
@@ -62,95 +82,133 @@ audited in the `run_log` table.
    - `category = "racing"`
 
 4. **Classify** (`classifier.classify`):
-   - Individual episode matching episode regex -> `episode`
-   - Single file or multi-file bundle without episode tags -> `movie`
-   - Multi-episode pack (>= 90% episodes) -> `season`
-   - Multiple episodes with many extras -> `mixed`
-   - Skip movie if total size > `ssd.skip_movie_larger_than_bytes` (req #7)
+    - Individual episode matching episode regex -> `episode`
+    - Single file or multi-file bundle without episode tags -> `movie`
+    - Multi-episode pack (>= 90% episodes) -> `season`
+    - Multiple episodes with many extras -> `mixed`
+    - A single *file* larger than `ssd.skip_movie_larger_than_bytes` fails
+      the row; total torrent size never disqualifies batched content.
 
-5. **Batch & download**:
-   - For `season`/`mixed`: `make_batches(episodes, cap=ssd_max_inflight_bytes)`.
-     The cap is `min(ssd.max_inflight_bytes, free - safety_margin)` so we always
-     respect actual disk headroom.
-   - Set file priorities: priority 1 for batch N, priority 0 for everything else.
-   - Resume; poll until `progress >= 0.999`.
-   - After completion of batch N: wipe the season folder (req #8), prepare
-     batch N+1, repeat.
+5. **Batch & download** (global SSD budget + isolated batches):
+    - Admission reserves `min(total, max_inflight_bytes)` from the *global*
+      ledger before `QUEUED`; over-budget rows park in `WAITING_DISK` and
+      re-check quietly (≤1/minute). After classification the reservation
+      refines to the real footprint (max batch for seasons/games, total for
+      singles); singles that no longer fit roll back to `WAITING_DISK`.
+    - For `season`/`mixed`: `make_batches(episodes, cap=frozen_cap)`; for
+      multi-file non-episodic content: name-sorted file groups. The cap is
+      frozen per row and persisted, so restarts keep identical boundaries.
+    - Set file priorities: priority 1 for batch N, 0 for everything else.
+      Resume; poll until the batch's files are client-complete *and* present
+      on SSD at full size (a desynced piece map alone never counts).
+    - After a verified move (rclone exit 0 *plus* nothing left on disk),
+      the torrent entry is deleted **with files** and re-added fresh for
+      batch N+1, so shared piece-boundary partials can't leak across
+      batches. Only complete files ever reach the remote.
 
 6. **Move to remote** (`rclone_ops.move_local_to_remote`):
-   - `rclone move <local> <remote> --size-only --checkers=8 …`
-   - For season batch moves, append `--include=<exact filename>` patterns for
-     only that batch's episodes (req #8).
-   - Movies + full season roots → `rclone.remote.default`
-   - Individual episodes → `rclone.remote.unsorted`
+    - `rclone move <local> <remote> -- <extra_move_flags>` with per-file
+      `--files-from-raw` lists (literal paths, no globs) preserving the
+      torrent-relative tree. `extra_move_flags` / `batch_move_extra_flags`
+      live under `[rclone]` and reject config/credential-hijack flags.
+    - A move only counts when rclone exits 0 *and* the listed files are gone
+      from SSD (symlinks/unreadables count as leftovers); otherwise the
+      batch stays put for retry — never wipe unmoved data.
+    - Movies + full season roots → `rclone.remote.default`
+    - Individual episodes → `rclone.remote.unsorted`
+    - The classification pinned at queue time routes the move, so a file
+      list that changed mid-flight (tracker sidecar added) can't reroute it.
 
 7. **Re-inject** (`coordinator._do_re_add`):
-   - Delete the SSD torrent.
-   - For each racing-client torrent for the content:
-     - SFTP-export `.torrent` bytes.
-     - `add_torrent(save_path=fuse.mount, skip_check=True, paused=False)`.
-   - Also re-add the cross-seed torrent (the one that ran on SSD) on the
-     fuse mount — same call, same `skip_check=True`.
+    - Fail closed on the fuse gate first: the cross-seed's files must be
+      stat-able at the blob-derived target mount before anything is injected
+      with `skip_check=True`. Missing blob parks; undecodable test blobs
+      warn through.
+    - Delete the SSD torrent entry (`delete_files=False`; bytes already moved).
+    - For each racing-client torrent for the content (+ the cross-seed):
+      `add_torrent(save_path=fuse.mount, skip_check=True, paused=False)`.
+    - Every fresh add is **verified visible at the target** (4×2s). The fuse
+      index lags while rclone is busy, so accepted-but-invisible parks and
+      retries — never `DONE`, never destructive. Transient rejections park;
+      hard rejections skip just that torrent.
+    - Duplicate entries pointing elsewhere are replaced; already-correct
+      entries are kept as-is.
 
-8. **Mark DONE**.
+8. **Mark DONE** (recording the fuse mount as `save_path`).
 
 ## Recovery (req #4)
 
-On startup `reconcile()` audits active states against destination client torrents and the local/remote filesystem:
+On startup `reconcile()` audits active states against destination client
+torrents and the local/remote filesystem:
 
 - `state=downloading` + missing on destination -> re-add torrent to continue download.
 - `state=moving` + missing on SSD -> verify if data arrived on remote; transition to `RE_ADDING` if complete.
 - `state=done` + missing on fuse -> re-add to fuse mount via `RE_ADDING` (data already on remote).
+- `state=done` + present but byte-missing (skip_check ghost) with bytes on
+  SSD -> demote to `MOVING` for a real move; without SSD bytes it keeps
+  trust (mount may be warming) and the fuse gate parks re-adds.
+- Torrents on destination client not tracked in `state.db` are adopted
+  (`DONE` on fuse with verified bytes, `MOVING` when SSD-complete,
+  `DOWNLOADING` for partials) only under known SSD/fuse roots — foreign
+  placements stay `unknowns`. Name matching requires the same normalized
+  release, so repacks get their own rows instead of merging.
 - Torrents on destination client not tracked in `state.db` are audited and logged as orphans.
 
 The state DB is the source of truth; VPS2 + filesystem are reality. The
-reconciler bridges them.
+reconciler bridges them. After recovery the SSD ledger rebuilds from
+`QUEUED/DOWNLOADING/MOVING` rows, so an abrupt stop resumes with a correct
+budget instead of double-spending freed space.
 
-## SSD cap
+## SSD budget
 
-`ssd_max_inflight_bytes(cfg)` calculates dynamic disk headroom:
+`ssd.max_inflight_bytes` is a **global** budget shared by every concurrent
+download — not a per-torrent cap:
 
-```
-min(ssd.max_inflight_bytes, ssd_free - general.disk_safety_margin_bytes)
-```
+- Admission reserves `min(total, max_inflight_bytes)`; over budget parks in
+  `WAITING_DISK` (quiet, ≤1 re-check/minute; download-slot checked too).
+- Post-classify refinement: max batch size for seasons/games (varying
+  episode sizes covered), full total for singles; singles that no longer
+  fit roll back (entry deleted, row parked).
+- Reservations release on `WAITING_DISK` / `RE_ADDING` / `DONE` / `FAILED` /
+  `forget`, stale rows are pruned, and abrupt stops rebuild from the DB.
 
-This is used by `batcher.make_batches` and disk space checks so the coordinator always respects actual disk headroom.
+`ssd_max_inflight_bytes(cfg)` (live free-space headroom) still sizes each
+row's *batch* cap; the ledger caps their *sum*.
+
+## Fuse verification & lag
+
+The fuse (rclone) index updates asynchronously — it can lag while the
+remote is busy with another move. The pipeline treats "accepted but not
+yet visible" as *not yet*, not *failed*: every injection path verifies the
+entry at its target mount and parks on unconfirmed results. A dead mount
+short-circuits on one mount stat instead of one failing stat per file per
+row per tick. Late cross-seeds for `DONE` rows are checked per tick but
+memoized 30 minutes when healthy (new arrivals wait at most one window).
 
 ## Logging
 
-- `racing-sync.log` — human, rotated daily.
-- `racing-sync.jsonl` — structured, for grep/jq/vector.
-- `RingBufferHandler` — last 300 events, drained by the Telegram bot for the
-  "Recent" section of the live status message.
+- `racing-sync.log` — human, rotated daily. Handlers disable themselves on
+  `ENOSPC` instead of traceback-storming a full disk; startup warns when
+  the log dir shares a filesystem with SSD/state data.
+- `racing-sync.jsonl` — structured, secrets scrubbed recursively, for grep/jq/vector.
+- `RingBufferHandler` — last 300 events in memory.
 - `[logging_sink]` — optional HTTPS POST to a central collector.
 
 ## Telegram
 
-The bot edits one message in the chat every `status_update_interval` seconds:
-
-```
-racing-sync — 14:23:01
-SSD free: /srv/qbittorrent/data
-
-In flight
-• abc12345 The.Movie.2024.1080p.WEB.mkv
-   state=downloading size=4500MB batch=0/1
-• def67890 Show.Name.S01
-   state=moving size=20000MB batch=2/4
-
-Recent
-14:22:30 INFO  rclone ok in 23s
-14:22:55 WARN  disk free 30 GB, parking
-```
-
-Pinned on startup. Log forwarding is opt-in; default is to only post
-ERROR/CRITICAL events to avoid floods.
+One message per torrent (detail card, edited in place as the state
+advances) plus one active-tasks list message, refreshed every
+`status_update_interval` seconds with pagination buttons. Callback
+debounce is per chat/user; pinning disables itself only on permanent
+errors. `notify()` posts out-of-band errors as plain-text fallback.
 
 ## FastAPI control plane
 
-`POST /api/recover`, `POST /api/retry/{hash}`, `GET /api/state`, etc. Useful
-when the Telegram bot isn't enough. Auth via nginx-injected
-`X-Authenticated-User` header or a static token.
+`GET /api/state` (paginated) · `GET /api/active` (bounded) ·
+`GET /api/logs` · `GET /api/ssd` · `POST /api/recover` ·
+`POST /api/retry/{hash}` · `POST /api/forget/{hash}` (always applies) ·
+`POST /api/scan-watch`. Useful when the Telegram bot isn't enough. Auth via
+nginx-injected `X-Authenticated-User` header or a static token.
 
 ## Cross-seed tracker map
 
@@ -165,11 +223,21 @@ This is what `prowlarr.resolve_indexer_for_announce(url)` uses internally.
 
 - Always run the destination qBittorrent as a separate user; the SSD save_path
   must be writable by that user.
+- Keep `general.log_dir` on a **different filesystem** from SSD/state data:
+  a full SSD otherwise takes down logging and `state.db` with it (startup
+  warns when they share a device).
 - The fuse mount (`/mnt/remote/...`) should be **read-only** to qBittorrent
   if possible, but qB doesn't care: it only reads from `save_path` after the
   files are there.
-- rclone `--size-only` is the default because `--checksum` over a fuse mount
-  can be very slow. Switch to `--checksum` if your releases frequently change
-  piece sizes mid-race.
+- Isolated batches re-download shared boundary pieces per batch: budget a
+  few extra GB of swarm traffic per season for the guarantee that only
+  complete files reach the remote.
+- Extra rclone tuning belongs under `[rclone]` (`extra_move_flags`,
+  `batch_move_extra_flags`); keys under `[rclone.fuse]` are ignored (with a
+  warning). Config flags `--config`/`--password-command`/`--ask-password`
+  are rejected outright.
+- HTTP sessions are IPv4-only by default (`use_ipv6 = false` on
+  `[source]`/`[dest]`/`[prowlarr`) — tracker allowlists and seedbox egress
+  are overwhelmingly v4. Enable only on v6-capable setups.
 - The state DB is append-only-safe; it can be inspected with the `sqlite3` CLI:
   `sqlite3 /var/lib/racing-sync/state.db "select state, count(*) from torrent_state group by state"`.
