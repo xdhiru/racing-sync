@@ -290,6 +290,7 @@ async def test_coordinator_lazy_loads_blob_on_queued_and_re_adding(tmp_path: Pat
     assert ts_readd_resumed._blob == b""
 
     coord._target_mount_for = MagicMock(return_value=Path("/mnt/remote"))
+    coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path="/mnt/remote"))
     await coord._re_add_cross_seed_torrent(ts_readd_resumed)
     assert ts_readd_resumed.cross_seed_blob == test_blob
     coord.dest_client.add_torrent.assert_awaited_once()
