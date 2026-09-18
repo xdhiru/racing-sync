@@ -1044,6 +1044,23 @@ async def test_batch_cap_bytes_single_helper():
 
 
 @pytest.mark.anyio
+async def test_frozen_batch_cap_stable_across_free_space_changes():
+    """Batch cap must freeze per row so boundaries never shift mid-download."""
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState
+
+    coord = object.__new__(Coordinator)
+    coord._batch_cap_cache = {}
+    coord._batch_cap_bytes = MagicMock(return_value=10_000_000_000)
+    ts = TorrentState(source_infohash="frozen_cap_hash")
+
+    assert coord._frozen_batch_cap(ts) == 10_000_000_000
+    # Free space drops: dynamic helper would shrink, frozen must not.
+    coord._batch_cap_bytes = MagicMock(return_value=1_000_000_000)
+    assert coord._frozen_batch_cap(ts) == 10_000_000_000
+
+
+@pytest.mark.anyio
 async def test_get_batches_respects_custom_episode_regex():
     import re
     from racing_sync.coordinator import Coordinator
