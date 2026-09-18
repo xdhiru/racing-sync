@@ -90,7 +90,12 @@ src/racing_sync/
   rclone_ops.py       # rclone subprocess wrapper
   sftp_source.py      # SSH / SFTP torrent export
   state.py            # SQLite-backed state machine
-  coordinator.py      # Main async loop
+  coordinator.py      # Main async loop (tick, dispatch, transitions)
+  coordinator_ssd.py  # SSD batch caps + global reservation ledger
+  coordinator_picker.py # Cross-seed SSD-source picker (req #1/#2)
+  coordinator_cleanup.py # VPS1 cleanup janitor
+  coordinator_paths.py # Untrusted torrent-relative path guard
+  coordinator_errors.py # Retryable WebUI / batch-move error contract
   recovery.py         # Reconciler (req #4)
   forget.py           # Abandon a torrent (row + client entries + SSD data)
   watchdir.py         # Manual torrent drop scanner
