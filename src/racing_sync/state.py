@@ -83,6 +83,17 @@ def check_transition(src: State, dst: State) -> None:
         raise ValueError(f"illegal state transition: {src.value} -> {dst.value}")
 
 
+# DONE -> RE_ADDING / DONE -> MOVING demotions look like fresh incidents, but a
+# row flapping rapidly (lost fuse entry re-added, lost again, ...) would reset
+# its re-add timer forever and never trip the 24h max-age guard. Count rapid
+# demotions (within _FLAP_WINDOW_SECONDS of entering DONE) in readd_cycles;
+# a long healthy DONE period resets the count (unrelated later incident).
+_FLAP_WINDOW_SECONDS = 24 * 3600
+# Consecutive rapid DONE -> re-add demotions before the row is marked FAILED
+# for operator attention.
+_MAX_READD_CYCLES = 5
+
+
 # --------------------------------------------------------------------------- #
 # Persistent record
 # --------------------------------------------------------------------------- #
@@ -130,6 +141,13 @@ class TorrentState:
     state: State = State.NEW
     batch_index: int = 0
     batches_total: int = 0
+    # Frozen per-torrent SSD batch cap (persisted so restarts keep the same
+    # batch boundaries instead of re-freezing at whatever free space says).
+    batch_cap_bytes: int = 0
+    # Consecutive rapid DONE -> RE_ADDING/MOVING demotions (flap counter for
+    # the re-add max-age guard; reset by long healthy DONE periods and fresh
+    # pipeline entries).
+    readd_cycles: int = 0
     last_error: str = ""
     created_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc))
     updated_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc))
@@ -178,6 +196,8 @@ class TorrentState:
             "state": self.state.value,
             "batch_index": self.batch_index,
             "batches_total": self.batches_total,
+            "batch_cap_bytes": self.batch_cap_bytes,
+            "readd_cycles": self.readd_cycles,
             "last_error": self.last_error,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -211,6 +231,8 @@ CREATE TABLE IF NOT EXISTS torrent_state (
     state                    TEXT NOT NULL,
     batch_index              INTEGER NOT NULL DEFAULT 0,
     batches_total            INTEGER NOT NULL DEFAULT 0,
+    batch_cap_bytes          INTEGER NOT NULL DEFAULT 0,
+    readd_cycles             INTEGER NOT NULL DEFAULT 0,
     last_error               TEXT NOT NULL DEFAULT '',
     telegram_message_id      INTEGER NOT NULL DEFAULT 0,
     created_at               TEXT NOT NULL,
@@ -247,7 +269,7 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = (
     "'' AS cross_seed_blob, injected_private_hashes, seedpool_first_queried_at, "
     "seedpool_next_retry_at, seedpool_attempts, readd_first_attempted_at, "
     "readd_next_retry_at, readd_attempts, failed_retries, completed_at, "
-    "vps1_last_activity_at, state, batch_index, batches_total, "
+    "vps1_last_activity_at, state, batch_index, batches_total, batch_cap_bytes, readd_cycles, "
     "last_error, created_at, updated_at, telegram_message_id"
 )
 
@@ -342,6 +364,8 @@ class StateStore:
             "state": "TEXT NOT NULL DEFAULT 'new'",
             "batch_index": "INTEGER NOT NULL DEFAULT 0",
             "batches_total": "INTEGER NOT NULL DEFAULT 0",
+            "batch_cap_bytes": "INTEGER NOT NULL DEFAULT 0",
+            "readd_cycles": "INTEGER NOT NULL DEFAULT 0",
             "last_error": "TEXT NOT NULL DEFAULT ''",
             "telegram_message_id": "INTEGER NOT NULL DEFAULT 0",
             "created_at": "TEXT NOT NULL DEFAULT ''",
@@ -532,43 +556,80 @@ class StateStore:
                    *, error: str = "", batch_index: int | None = None) -> None:
         check_transition(ts.state, dst)
         src = ts.state
-        ts.state = dst
-        ts.last_error = error
-        if dst in (State.NEW, State.QUEUED):
-            ts.seedpool_first_queried_at = None
-            ts.seedpool_next_retry_at = None
-            ts.seedpool_attempts = 0
-            ts.readd_first_attempted_at = None
-            ts.readd_next_retry_at = None
-            ts.readd_attempts = 0
-            # NOTE: failed_retries is intentionally preserved here (lifetime
-            # cap for auto_retry_failed). Callers requesting a fresh retry
-            # (e.g. POST /api/retry) reset it explicitly before transition.
-        elif dst == State.DONE:
-            ts.failed_retries = 0
-            ts.readd_first_attempted_at = None
-            ts.readd_next_retry_at = None
-            ts.readd_attempts = 0
-            # Grace anchor for the VPS1 cleanup janitor ([cleanup]): every
-            # entry into DONE restarts the clock (e.g. after a lost-fuse
-            # re-add cycle finishes seeding again).
-            ts.completed_at = dt.datetime.now(dt.timezone.utc)
-        elif dst == State.RE_ADDING and src == State.DONE:
-            # Fresh re-add cycle (e.g. lost fuse torrent via recovery):
-            # stale timers from the previous cycle must not instantly trip
-            # the max-age guard in _do_re_add.
-            ts.readd_first_attempted_at = None
-            ts.readd_next_retry_at = None
-            ts.readd_attempts = 0
-        elif dst == State.MOVING and src == State.DONE:
-            # Self-heal for falsely adopted DONE (SSD bytes never moved):
-            # start a fresh move cycle with no stale re-add timers.
-            ts.readd_first_attempted_at = None
-            ts.readd_next_retry_at = None
-            ts.readd_attempts = 0
-        if batch_index is not None:
-            ts.batch_index = batch_index
-        self.upsert(ts)
+        now = dt.datetime.now(dt.timezone.utc)
+        # Snapshot everything this method mutates: a failed upsert (SQLITE_FULL,
+        # locked) must leave the in-memory object identical to the DB row.
+        _snapshot = (
+            ts.state, ts.last_error,
+            ts.seedpool_first_queried_at, ts.seedpool_next_retry_at,
+            ts.seedpool_attempts, ts.readd_first_attempted_at,
+            ts.readd_next_retry_at, ts.readd_attempts, ts.failed_retries,
+            ts.completed_at, ts.batch_index, ts.readd_cycles,
+        )
+        try:
+            ts.state = dst
+            ts.last_error = error
+            if dst in (State.NEW, State.QUEUED):
+                ts.seedpool_first_queried_at = None
+                ts.seedpool_next_retry_at = None
+                ts.seedpool_attempts = 0
+                ts.readd_first_attempted_at = None
+                ts.readd_next_retry_at = None
+                ts.readd_attempts = 0
+                ts.readd_cycles = 0
+                # NOTE: failed_retries is intentionally preserved here (lifetime
+                # cap for auto_retry_failed). Callers requesting a fresh retry
+                # (e.g. POST /api/retry) reset it explicitly before transition.
+            elif dst == State.DONE:
+                ts.failed_retries = 0
+                ts.readd_first_attempted_at = None
+                ts.readd_next_retry_at = None
+                ts.readd_attempts = 0
+                # Grace anchor for the VPS1 cleanup janitor ([cleanup]): every
+                # entry into DONE restarts the clock (e.g. after a lost-fuse
+                # re-add cycle finishes seeding again).
+                ts.completed_at = now
+            elif dst == State.RE_ADDING and src == State.DONE:
+                # Fresh re-add cycle (e.g. lost fuse torrent via recovery):
+                # stale timers from the previous cycle must not instantly trip
+                # the max-age guard in _do_re_add.
+                ts.readd_first_attempted_at = None
+                ts.readd_next_retry_at = None
+                ts.readd_attempts = 0
+                # Flap counting: a demotion long after DONE is a new incident
+                # (reset); a rapid one keeps accumulating toward FAILED.
+                try:
+                    rapid = (
+                        ts.completed_at is not None
+                        and (now - ts.completed_at).total_seconds() < _FLAP_WINDOW_SECONDS
+                    )
+                except Exception:
+                    rapid = True
+                ts.readd_cycles = (ts.readd_cycles + 1) if rapid else 0
+            elif dst == State.MOVING and src == State.DONE:
+                # Self-heal for falsely adopted DONE (SSD bytes never moved):
+                # start a fresh move cycle with no stale re-add timers.
+                ts.readd_first_attempted_at = None
+                ts.readd_next_retry_at = None
+                ts.readd_attempts = 0
+                try:
+                    rapid = (
+                        ts.completed_at is not None
+                        and (now - ts.completed_at).total_seconds() < _FLAP_WINDOW_SECONDS
+                    )
+                except Exception:
+                    rapid = True
+                ts.readd_cycles = (ts.readd_cycles + 1) if rapid else 0
+            if batch_index is not None:
+                ts.batch_index = batch_index
+            self.upsert(ts)
+        except Exception:
+            (ts.state, ts.last_error,
+             ts.seedpool_first_queried_at, ts.seedpool_next_retry_at,
+             ts.seedpool_attempts, ts.readd_first_attempted_at,
+             ts.readd_next_retry_at, ts.readd_attempts, ts.failed_retries,
+             ts.completed_at, ts.batch_index, ts.readd_cycles) = _snapshot
+            raise
         log.info("state %s -> %s for %s", ts.source_infohash[:8], dst.value, ts.source_name)
 
     def append_log(self, level: str, message: str,
@@ -728,6 +789,8 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         state=_safe_state(row["state"]) if "state" in keys else State.NEW,
         batch_index=_safe_int(row["batch_index"]) if "batch_index" in keys else 0,
         batches_total=_safe_int(row["batches_total"]) if "batches_total" in keys else 0,
+        batch_cap_bytes=_safe_int(row["batch_cap_bytes"]) if "batch_cap_bytes" in keys else 0,
+        readd_cycles=_safe_int(row["readd_cycles"]) if "readd_cycles" in keys else 0,
         last_error=row["last_error"] if "last_error" in keys else "",
         created_at=(
             _safe_dt(row["created_at"])
