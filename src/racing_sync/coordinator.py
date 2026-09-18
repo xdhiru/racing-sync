@@ -359,9 +359,28 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # only required when enabled).
             # Rebuild the SSD ledger from DB AFTER recovery/auto-retry so an
             # abrupt stop (kill -9, power loss) resumes with correct budget
-            # instead of double-spending freed space.
+            # instead of double-spending freed space. Pre-seed quiet-wait
+            # deadlines for already-parked rows so tick one doesn't herd them.
             try:
                 await self._ssd_rebuild_from_db()
+            except Exception:
+                pass
+            try:
+                _interval = float(getattr(self, "WAITING_DISK_RECHECK_SECONDS", 60.0))
+            except (TypeError, ValueError):
+                _interval = 60.0
+            try:
+                _wd = getattr(self, "_waiting_disk_next_check", None)
+                if not isinstance(_wd, dict):
+                    _wd = {}
+                    self._waiting_disk_next_check = _wd  # type: ignore[attr-defined]
+                _now_m = time.monotonic()
+                for _row in self.store.all_active():
+                    if getattr(_row, "state", None) == State.WAITING_DISK:
+                        _wd.setdefault(
+                            (getattr(_row, "source_infohash", "") or "").lower(),
+                            _now_m + _interval,
+                        )
             except Exception:
                 pass
             self._tg = None
@@ -551,7 +570,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         items = await self.watch.scan_once()
         for item in items:
             item_hash = item.infohash.lower()
-            if self.store.get(item_hash) is None and self.store.get(item.infohash) is None:
+            ingested = False
+            if self.store.get(item_hash) is None:
                 ts = TorrentState(
                     source_infohash=item_hash,
                     source_name=item.name,
@@ -564,6 +584,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 )
                 ts._blob = item.torrent_bytes
                 self.store.upsert(ts)
+                ingested = True
                 log.info(
                     "discovered watch-dir release: %s (%s, %d bytes) announce=%s",
                     item.name,
@@ -571,7 +592,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     item.size_bytes,
                     item.announce_url,
                 )
-            if self.cfg.watch_dir and self.cfg.watch_dir.delete_after_pickup:
+            # Delete only what this scan ingested: an already-tracked drop
+            # still belongs to the user — never destroy what we didn't
+            # consume on this run.
+            if ingested and self.cfg.watch_dir and self.cfg.watch_dir.delete_after_pickup:
                 await self.watch.delete_picked_up(item)
         return items
 
@@ -629,8 +653,21 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 for t in group:
                     matches = self.store.find_by_name(t.name)
                     if matches:
-                        existing_ts = matches[0]
-                        break
+                        # find_by_name is a fuzzy LIKE: require the same
+                        # normalized release AND (when both known) the same
+                        # size, or repacks/different seasons with common
+                        # prefixes ("Show.S01" vs "Show.S01E02") would be
+                        # swallowed as duplicates and never downloaded.
+                        norm_t = normalize_content_name(t.name)
+                        same = [
+                            m for m in matches
+                            if normalize_content_name(m.source_name or "") == norm_t
+                            and (not m.total_bytes or not t.size_bytes
+                                 or m.total_bytes == t.size_bytes)
+                        ]
+                        if same:
+                            existing_ts = same[0]
+                            break
 
             if existing_ts is not None:
                 # Content is already being managed by an existing TorrentState;
@@ -682,8 +719,19 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 pass
 
         # 3. Wake up WAITING_SEEDPOOL rows whose retry timer has elapsed.
+        # Seedpool wakeups still respect worker capacity: an unbounded timer
+        # burst must not spawn unbounded workers.
+        try:
+            _max_workers = max(
+                12,
+                self.cfg.max_active_downloads * 2 + self.cfg.max_concurrent_moves * 2,
+            )
+        except (TypeError, ValueError):
+            _max_workers = 0
         ready_seedpool = self.store.list_seedpool_ready()
         for ts in ready_seedpool:
+            if _max_workers and max(0, _max_workers - len(self._tasks)) <= 0:
+                break
             _key = (ts.source_infohash or "").lower()
             if _key in self._running_infohashes:
                 continue
@@ -1403,10 +1451,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # max_active_downloads gate (checked at schedule time) — re-check
             # here so parked bursts can't overshoot concurrent downloads.
             # The SSD reservation is already held; release it if we stay parked.
-            try:
-                _max_dl = int(getattr(self.cfg, "max_active_downloads", 0) or 0)
-            except (TypeError, ValueError):
+            # Non-int configs (test doubles) skip the count check.
+            _max_dl_raw = getattr(self.cfg, "max_active_downloads", 0)
+            if isinstance(_max_dl_raw, bool) or not isinstance(_max_dl_raw, (int, float)):
                 _max_dl = 0
+            else:
+                _max_dl = int(_max_dl_raw or 0)
             if _max_dl > 0:
                 try:
                     _active_dl = len(self.store.list_by_state(State.QUEUED, State.DOWNLOADING))
@@ -2056,9 +2106,28 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         max_batch_failures_per_tick = 5
 
         while not self._stop:
-            # Live tracking
+            # Fresh-state re-guard: this loop runs for hours across batch
+            # resets — an operator forget / API retry mid-download must stop
+            # the worker instead of letting later upserts resurrect the row.
+            try:
+                _fresh_dl = None
+                if getattr(self, "store", None) is not None and hasattr(self.store, "get"):
+                    _fresh_dl = self.store.get(ts.source_infohash)
+            except Exception:
+                _fresh_dl = None
+            if isinstance(_fresh_dl, TorrentState) and _fresh_dl.state != State.DOWNLOADING:
+                log.info(
+                    "worker: %s left DOWNLOADING while downloading (%s); stopping",
+                    ts.source_infohash[:10], _fresh_dl.state.value,
+                )
+                return
+            if isinstance(_fresh_dl, TorrentState):
+                ts = _fresh_dl
+                h = ts.dest_infohash or ts.source_infohash
+            # Live tracking, keyed by dest hash for client polling; the
+            # source hash is recorded inside for progress-map aliasing.
             self._live[h.lower()] = LiveItem(
-                source_infohash=h.lower(),
+                source_infohash=(ts.source_infohash or "").lower(),
                 name=ts.source_name,
                 state="downloading",
                 progress=0.0,
@@ -2107,6 +2176,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
             try:
                 await self._wait_for_completion(ts, expected_files=expected_files)
+            except TimeoutError as e:
+                # Stalled swarm, not a dead torrent: park in DOWNLOADING for
+                # retry instead of FAILED (transient lulls heal; the stall
+                # baseline restarts next tick for a fresh window).
+                log.warning("download stalled for %s (%s); parking", ts.source_name, e)
+                self.store.upsert(ts)
+                return
             finally:
                 self._live.pop(h.lower(), None)
 
@@ -2195,7 +2271,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     else:
                         ts.batch_index = next_index
                         self.store.upsert(ts)
-                elif hasattr(self, "_move_and_clean_batch") and hasattr(getattr(self, "_move_and_clean_batch"), "mock_calls"):
+                elif hasattr(self, "_move_and_clean_batch") and hasattr(self._move_and_clean_batch, "mock_calls"):
                     # Mock in unit test (e.g. AsyncMock)
                     await self._move_and_clean_batch(ts, None)  # type: ignore[arg-type]
                     ts.batch_index += 1
@@ -2270,9 +2346,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 total_sz = sum(f.size_bytes for f in batch_files)
                 done_sz = sum(f.size_bytes * f.progress for f in batch_files)
                 prog = done_sz / total_sz if total_sz > 0 else 0.0
+                # Zero-size files carry no bytes: presence on SSD (verified
+                # below) is completion for them, not client progress.
                 all_done = (
                     len(batch_files) == len(expected_files)
-                    and all(f.progress >= 0.999 for f in batch_files)
+                    and all((f.progress or 0.0) >= 0.999 or not (f.size_bytes or 0)
+                            for f in batch_files)
                 )
                 if all_done and not await self._batch_bytes_on_disk(ts, batch_files):
                     # Client reports complete but bytes are not on SSD
@@ -2702,8 +2781,18 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     _on_disk = file_path.stat().st_size if file_path.is_file() else -1
                 except OSError:
                     _on_disk = -1
-                if _on_disk >= (f.size_bytes or 0):
+                if _on_disk == (f.size_bytes or 0):
                     completed_files.append(f)
+                    continue
+                if _on_disk > (f.size_bytes or 0):
+                    # Bigger than the torrent metadata says: foreign bytes
+                    # (shared save_path collision), never move nor delete
+                    # individually — same handling as preallocated partials.
+                    log.warning(
+                        "file %s oversized on SSD (%d/%d B); leaving for folder wipe, never moving",
+                        f.name, max(_on_disk, 0), f.size_bytes,
+                    )
+                    uncertain_files.append(f)
                     continue
                 log.warning(
                     "file %s reports complete but is short on SSD (%d/%d B); not moving",
@@ -2808,10 +2897,25 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             local_folder = folder if (folder and folder.exists()) else (_top_join if _top_exists else None)
             remaining_payload: list[Path] = []
             if local_folder and local_folder.exists() and local_folder.resolve() != src_dir.resolve():
-                remaining_payload = [
-                    p for p in local_folder.rglob("*")
-                    if p.is_file() and not p.name.endswith((".!qB", ".parts"))
-                ]
+                # Bounded, symlink-safe walk: rglob follows directory symlinks
+                # (escape + loop risk), so skip links, contain results to
+                # the folder, and cap the listing.
+                try:
+                    _scan = list(local_folder.rglob("*"))[:100000]
+                    _folder_real = local_folder.resolve()
+                except OSError:
+                    _scan = []
+                    _folder_real = None
+                for p in _scan:
+                    try:
+                        if p.is_symlink():
+                            continue
+                        if not p.is_file() or p.name.endswith((".!qB", ".parts")):
+                            continue
+                        if _folder_real is not None and p.resolve().is_relative_to(_folder_real):
+                            remaining_payload.append(p)
+                    except OSError:
+                        continue
 
             if ts.batch_index < ts.batches_total or remaining_payload:
                 if local_folder and local_folder.exists():
