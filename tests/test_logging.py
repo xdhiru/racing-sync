@@ -55,10 +55,13 @@ def test_http_sink_handler_posts_log():
 
 
 def test_http_sink_refuses_bearer_over_insecure_http():
+    # Explicit opt-in (plaintext is now refused at load without it); the
+    # runtime bearer refusal stays as defense in depth.
     cfg = LoggingSinkConfig(
         enabled=True,
         url="http://remote-collector.com/logs",
         auth_token="secret-token",
+        allow_plaintext=True,
     )
 
     mock_resp = MagicMock()
