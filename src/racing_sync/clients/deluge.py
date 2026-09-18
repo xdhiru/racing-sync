@@ -63,6 +63,10 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         # connection). Falls back to a fresh per-call connection when unset
         # (e.g. standalone use in tests).
         self._shared_sftp = None
+        # The daemon has no server-side hash filter: every lookup is a full
+        # get_torrents_status scan. Cache raw scans briefly (5s per label
+        # filter) so per-hash get_torrent bursts collapse to one RPC.
+        self._scan_cache: dict[str, tuple[float, dict]] = {}
 
     def set_sftp_exporter(self, exporter) -> None:
         """Reuse the coordinator's shared SFTP connection for .torrent fallback."""
@@ -171,7 +175,9 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             # instead of every torrent.
             return []
         # NOTE: Deluge daemon does not support server-side hash filtering;
-        # we fetch (possibly all) and filter client-side.
+        # we fetch (possibly all) and filter client-side. Raw scans are
+        # cached 5s per label filter so single-hash get_torrent bursts
+        # (late-seed, live status) don't each pay a full scan.
         status_keys = [
             "name",
             "total_size",
@@ -191,7 +197,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             "total_uploaded",
             "seeding_time",
         ]
-        info = await self._rpc("core.get_torrents_status", [filt, status_keys])
+        info = await self._cached_scan(filt, status_keys)
         rows = info or {}
         if not isinstance(rows, dict):
             log.warning("deluge get_torrents_status returned unexpected shape %s", type(rows).__name__)
@@ -246,6 +252,31 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             hash_set = {h.lower() for h in hash_list}
             out = [t for t in out if t.hash.lower() in hash_set]
         return out
+
+    async def _cached_scan(self, filt: dict[str, Any], status_keys: list[str]) -> dict:
+        """Full-scan with a 5s per-filter cache (hash filtering is client-side)."""
+        import time as _time
+
+        try:
+            key = str(filt.get("label") or "")
+        except Exception:
+            key = ""
+        try:
+            cached = self._scan_cache.get(key)
+            if cached and _time.monotonic() - cached[0] < 5.0 and isinstance(cached[1], dict):
+                return cached[1]
+        except Exception:
+            pass
+        info = await self._rpc("core.get_torrents_status", [filt, status_keys])
+        try:
+            if isinstance(info, dict):
+                self._scan_cache[key] = (_time.monotonic(), info)
+                if len(self._scan_cache) > 32:
+                    oldest = min(self._scan_cache, key=lambda k: self._scan_cache[k][0])
+                    self._scan_cache.pop(oldest, None)
+        except Exception:
+            pass
+        return info if isinstance(info, dict) else {}
 
     async def get_torrent(self, torrent_hash: str) -> Torrent | None:
         rows = await self.list_torrents(hashes=[torrent_hash])

@@ -205,3 +205,56 @@ def test_rclone_flags_reject_hijack():
         _cfg(batch_move_extra_flags=["--password-command=echo x"])
     # Legit tuning still passes.
     assert _cfg(extra_move_flags=["--transfers=4", "--s3-chunk-size=64M"]).extra_move_flags
+
+
+@pytest.mark.anyio
+async def test_deluge_scan_cached_across_hash_lookups():
+    """Single-hash get_torrent bursts share one full scan (5s TTL)."""
+    from unittest.mock import AsyncMock
+    from racing_sync.config import SourceConfig
+    from racing_sync.clients.deluge import DelugeClient
+
+    cfg = SourceConfig(
+        type="deluge", host="http://localhost:8112", password="secret",
+        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1",
+                     "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+    )
+    client = DelugeClient(cfg)
+    client._rpc = AsyncMock(return_value={
+        "hash_1": {"name": "T1", "progress": 100.0, "state": "Seeding",
+                   "total_size": 1000, "label": "", "save_path": "/d",
+                   "ratio": 0.0, "trackers": [], "time_added": 1},
+    })
+    client.get_torrent_files = AsyncMock(return_value=[])
+    assert await client.get_torrent("hash_1") is not None
+    assert await client.get_torrent("hash_1") is not None
+    assert await client.list_torrents() is not None
+    assert client._rpc.await_count == 1
+
+
+def test_sftp_close_never_leaks_wedged_member():
+    """close() marks dead + closes even when a holder wedges the lock."""
+    import threading
+    from racing_sync.sftp_source import _SFTPConnection
+
+    cfg = MagicMock()
+    cfg.ssh_key_path = None
+    cfg.ssh_password = ""
+    m = _SFTPConnection(cfg)
+    held = threading.Event()
+    release = threading.Event()
+
+    def _holder():
+        m._lock.acquire()
+        held.set()
+        assert release.wait(timeout=10)
+        m._lock.release()
+
+    t = threading.Thread(target=_holder, daemon=True)
+    t.start()
+    assert held.wait(timeout=10)
+    m.close()  # must return (not hang 5s+), transports cleared
+    assert m._closed is True
+    assert m._sftp is None and m._client is None
+    release.set()
+    t.join(timeout=10)

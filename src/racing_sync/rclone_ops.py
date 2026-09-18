@@ -89,6 +89,24 @@ def _env(cfg: AppConfig) -> dict[str, str]:
     return env
 
 
+def _reject_hijack_flags(flags: list[str] | None, where: str) -> None:
+    """Refuse rclone flags that swap config/credentials (defense in depth).
+
+    The config validator is the primary gate; this covers programmatic
+    callers. Narrow on purpose: tuning flags (--transfers, --bwlimit,
+    --s3-chunk-size, ...) pass through untouched.
+    """
+    for item in flags or []:
+        try:
+            flag = str(item).strip().lower().split("=", 1)[0]
+        except Exception:
+            continue
+        if flag in ("--config", "--password-command", "--ask-password"):
+            raise RcloneError(
+                f"refusing rclone {where} flag that hijacks config/credentials: {item!r}"
+            )
+
+
 def build_move_cmd(cfg: AppConfig, source: Path, dest_remote: str,
                    *, include: list[str] | None = None,
                    files_from: str | None = None,
@@ -103,6 +121,8 @@ def build_move_cmd(cfg: AppConfig, source: Path, dest_remote: str,
         raise RcloneError("rclone move takes either include= or files_from=, not both")
     if files_from and files_from.startswith("-"):
         raise RcloneError(f"refusing rclone files-from list starting with '-': {files_from!r}")
+    _reject_hijack_flags(cfg.rclone.extra_move_flags, "extra_move_flags")
+    _reject_hijack_flags(list(extra or []), "extra")
     # Flags first, `--` + positionals last: rclone parses everything after
     # `--` as positionals, so --config/extra flags placed there become
     # spurious "arguments" (rc=2). `--` still shields a `-`-leading source.
