@@ -110,6 +110,28 @@ __all__ = [
 # (chunk 3/3 removed: direct-export fallback)
 
 
+def _left_on_disk(src_dir: Path, name: str) -> bool:
+    """True iff `name` still occupies real SSD bytes (0-transfer detector).
+
+    Goes through the traversal guard and treats symlinks/unreadables as
+    leftovers: `Path.exists()` is False for broken symlinks and can lie on
+    permission errors, and neither case means "reached the remote". Doubt
+    fails closed (leftover → retry, never advance).
+    """
+    try:
+        p = _safe_ssd_join(src_dir, name)
+    except OSError:
+        return True
+    if p is None:
+        return True
+    try:
+        if p.is_symlink():
+            return True
+        return p.exists()
+    except OSError:
+        return True
+
+
 # --------------------------------------------------------------------------- #
 # Coordinator
 # --------------------------------------------------------------------------- #
@@ -1844,13 +1866,18 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             return make_file_batches(files, cap_bytes=cap_bytes)
         return []
 
-    async def _get_batches_for_torrent(self, ts: TorrentState) -> list[Batch]:
+    async def _get_batches_for_torrent(self, ts: TorrentState) -> list[Batch] | None:
+        """Batch list, [] when genuinely single-flow, None on transient RPC failure.
+
+        Callers must not confuse the two: None means "unknown, retry next
+        tick", never "full-torrent flow".
+        """
         h = ts.dest_infohash or ts.source_infohash
         try:
             files = await self.dest_client.get_torrent_files(h)
         except Exception as e:
             log.warning("could not get torrent files for batches: %s", e)
-            return []
+            return None
         # Same rule as _do_queued so batch counts stay consistent across
         # the download loop.
         kind = ts.classification_kind
@@ -1859,7 +1886,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 kind = classify(files, self.cfg).kind
             except Exception as e:
                 log.warning("could not classify files for batches: %s", e)
-                return []
+                return None
         cap = self._frozen_batch_cap(ts)
         if cap <= 0:
             cap = sum(f.size_bytes for f in files) or 1
@@ -1867,7 +1894,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             return self._resolve_batches(files, kind, cap)
         except Exception as e:
             log.warning("could not make batches for %s: %s", ts.source_name, e)
-            return []
+            return None
 
     async def _move_and_clean_batch(
         self, ts: TorrentState, batch: Batch, skip: set[str] | None = None
@@ -1913,18 +1940,103 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         # by rclone are already gone, so anything still present never reached
         # the remote. Raising (instead of deleting) keeps the batch retryable
         # and the data intact.
-        stragglers = [n for n in names if (src_dir / n).exists()]
+        stragglers = [n for n in names if _left_on_disk(src_dir, n)]
         if stragglers:
             raise BatchMoveIncompleteError(
                 f"rclone move reported ok but {len(stragglers)} batch file(s) "
                 f"never reached {remote} (e.g. {stragglers[0]}); not advancing batch"
             )
 
+    @staticmethod
+    def _client_reports_paused(state_str: object) -> bool:
+        """True when a client torrent state reads as paused/stopped.
+
+        Covers qBittorrent v5 (`stoppedDL/stoppedUP`) and legacy (`pausedDL/
+        pausedUP`) spellings. A vanished entry (None) or non-string state
+        (test doubles) counts as paused — verification best-effort only.
+        """
+        if state_str is None:
+            return True
+        if not isinstance(state_str, str):
+            return True
+        s = state_str.lower()
+        return "paus" in s or "stop" in s
+
+    async def _pause_verified(self, h: str) -> tuple[bool, Exception | None]:
+        """Pause and verify the client actually stopped IO (3 attempts).
+
+        Re-reads the entry after each pause RPC: without verification a
+        resume in the gap (auto-manage, operator) leaves qB writing while
+        rclone moves. A failed verification read still counts the pause
+        itself as success.
+        """
+        err: Exception | None = None
+        for attempt in range(3):
+            try:
+                await self.dest_client.pause(h)
+                try:
+                    cur = await self.dest_client.get_torrent(h)
+                    state = getattr(cur, "state", "") if cur is not None else ""
+                    if cur is None or self._client_reports_paused(state):
+                        return True, None
+                    err = RuntimeError(f"client still reports state={state!r} after pause")
+                except Exception:
+                    return True, None
+            except Exception as e:  # noqa: BLE001
+                err = e
+            if attempt < 2:
+                await asyncio.sleep(1)
+        return False, err
+
+    async def _batch_bytes_on_disk(self, ts: TorrentState, batch_files: list) -> bool:
+        """True iff every expected batch file is present on SSD at full size.
+
+        Offloaded to a thread (fuse-adjacent stat can block). A truncated or
+        preallocated-but-incomplete file reads as missing — the caller keeps
+        polling so the client re-fetches instead of moving air.
+        """
+        try:
+            base = Path(ts.save_path) if ts.save_path else Path(self.cfg.dest.save_path)
+        except Exception:
+            return False
+
+        def _check() -> bool:
+            for f in batch_files:
+                try:
+                    name = getattr(f, "name", "") or ""
+                    want = getattr(f, "size_bytes", 0) or 0
+                    p = _safe_ssd_join(base, name)
+                    if p is None or not p.is_file():
+                        return False
+                    if want and p.stat().st_size < want:
+                        return False
+                except OSError:
+                    return False
+            return True
+
+        try:
+            return await asyncio.to_thread(_check)
+        except Exception:
+            return False
+
     async def _do_downloading(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
         if ts.batches_total <= 0 and hasattr(self, "dest_client"):
             batches = await self._get_batches_for_torrent(ts)
+            if batches is None:
+                # Transient RPC failure — not "single flow". Retry next tick
+                # rather than persisting batches_total=0 as truth.
+                log.warning("could not resolve batches for adopted %s; retry next tick",
+                            ts.source_infohash[:10])
+                self.store.upsert(ts)
+                return
             ts.batches_total = len(batches)
+            # Clamp a stale index (e.g. file list shrank since the cursors
+            # were persisted) instead of degrading to full-torrent flow.
+            if ts.batch_index >= len(batches) and batches:
+                log.warning("clamping stale batch_index %d to %d for %s",
+                            ts.batch_index, len(batches) - 1, ts.source_name)
+                ts.batch_index = len(batches) - 1
             self.store.upsert(ts)
             # Freshly adopted rows (e.g. recovery after --reset wiped the batch
             # cursors) skip QUEUED setup, so no batch was ever prioritized and
@@ -1960,6 +2072,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if is_batched and hasattr(self, "dest_client"):
                 try:
                     batches = await self._get_batches_for_torrent(ts)
+                    if batches is None:
+                        # Transient RPC failure (not "no batches"): park this
+                        # tick rather than degrading to a full-torrent wait
+                        # that would defeat the SSD cap.
+                        log.warning("batch resolution unavailable for %s; retry next tick",
+                                    ts.source_name)
+                        self.store.upsert(ts)
+                        return
+                    if batches and len(batches) != ts.batches_total:
+                        # File list / cap drifted mid-run (tracker sidecar
+                        # added, cap re-frozen): heal the total instead of
+                        # comparing a stale index against a stale total.
+                        log.warning("batch count drifted %d -> %d for %s; healing",
+                                    ts.batches_total, len(batches), ts.source_name)
+                        ts.batches_total = len(batches)
+                        if ts.batch_index >= len(batches):
+                            ts.batch_index = max(0, len(batches) - 1)
+                        self.store.upsert(ts)
                     if batches and ts.batch_index < len(batches):
                         cur_batch = batches[ts.batch_index]
                         # Already on the remote from a previous run: neither
@@ -1986,15 +2116,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if is_batched:
                 if cur_batch is not None:
                     if hasattr(self, "dest_client"):
-                        paused_ok = False
-                        pause_err: Exception | None = None
-                        for _ in range(3):
-                            try:
-                                await self.dest_client.pause(h)
-                                paused_ok = True
-                                break
-                            except Exception as e:
-                                pause_err = e
+                        paused_ok, pause_err = await self._pause_verified(h)
                         if not paused_ok:
                             # Never move while qB is still writing — retry
                             # shortly instead of corrupting the remote.
@@ -2047,7 +2169,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         # failure replays this already-moved batch as a no-op
                         # via _fuse_skipped next tick.
                         try:
-                            ok = await self._reset_torrent_for_next_batch(ts, next_index)
+                            reset_pos = await self._reset_torrent_for_next_batch(ts, next_index)
                         except _WEBUI_RETRY_ERRORS as e:
                             log.warning(
                                 "isolated batch reset hit transient dest error for %s (%s); retry next tick",
@@ -2055,10 +2177,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                             )
                             self.store.upsert(ts)
                             return
-                        if not ok:
+                        if reset_pos is False or reset_pos is None:
                             self.store.upsert(ts)
                             return
-                        ts.batch_index = next_index
+                        # Position contract: int (possibly reconciled on
+                        # grouping shrink), or legacy True from test doubles.
+                        ts.batch_index = reset_pos if isinstance(reset_pos, int) else next_index
                         self.store.upsert(ts)
                         # dest hash may have changed on re-add; refresh live key.
                         try:
@@ -2081,10 +2205,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     ts.batch_index += 1
                     self.store.upsert(ts)
                 else:
-                    # Batch resolution is transient (RPC/cap hiccup) but the
-                    # wait above already covered the full torrent, so fall
-                    # through to MOVING for a full move instead of failing
-                    # after successful downloads.
+                    # Reachable only when re-resolution yields genuinely no
+                    # batches (kind flipped single mid-run): fall through to
+                    # MOVING for a full move instead of failing after
+                    # successful downloads. (RPC-transient None parks above.)
                     log.warning(
                         "current batch %d could not be resolved for %s; "
                         "falling back to full move",
@@ -2134,7 +2258,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 files = await self.dest_client.get_torrent_files(h)
                 f_map = {f.name: f for f in files}
                 missing_files = [fn for fn in expected_files if fn not in f_map]
-                if missing_files and files:
+                if missing_files:
+                    # No `and files` guard: an empty file list this far into
+                    # DOWNLOADING is pathological (registration lag only
+                    # applies right after add) — fail fast instead of polling
+                    # a torrent whose file list can never satisfy the batch.
                     raise RuntimeError(
                         f"expected batch files missing from torrent {ts.source_name}: {missing_files}"
                     )
@@ -2146,6 +2274,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     len(batch_files) == len(expected_files)
                     and all(f.progress >= 0.999 for f in batch_files)
                 )
+                if all_done and not await self._batch_bytes_on_disk(ts, batch_files):
+                    # Client reports complete but bytes are not on SSD
+                    # (desynced piece map after a move deleted files): keep
+                    # polling so the client re-fetches instead of moving air.
+                    log.warning(
+                        "batch %d for %s reports complete but bytes missing on SSD; waiting",
+                        ts.batch_index + 1, ts.source_name,
+                    )
+                    all_done = False
             else:
                 prog = t.progress
                 all_done = t.is_complete()
@@ -2219,7 +2356,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 prio_map[ep.file_name] = 1
         await self.dest_client.set_file_priorities(h, prio_map)
 
-    async def _reset_torrent_for_next_batch(self, ts: TorrentState, next_index: int) -> bool:
+    async def _reset_torrent_for_next_batch(self, ts: TorrentState, next_index: int) -> int | bool:
         """Delete + fresh re-add for isolated per-batch downloads.
 
         After batch N is verified moved (straggler check passed), the old
@@ -2231,9 +2368,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         ``rclone move`` — guaranteeing 100% of bytes land on the remote.
 
         Crash-safe: batch_index is only advanced by the caller AFTER this
-        returns True. A crash before then replays the already-moved batch,
-        which is a no-op via _fuse_skipped. Returns False on transient
-        failure (stay DOWNLOADING, retry next tick).
+        returns a position. A crash before then replays the already-moved
+        batch, which is a no-op via _fuse_skipped.
+
+        Returns the batch position the caller must record, or False on
+        transient failure (stay DOWNLOADING, retry next tick). When the
+        re-resolved grouping shrank (kind flip) past ``next_index``, the
+        total/index are reconciled to the finished position instead of
+        parking forever.
         """
         h_old = ts.dest_infohash or ts.source_infohash
         blob = getattr(ts, "_blob", None) or ts.cross_seed_blob or None
@@ -2368,12 +2510,27 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         except Exception as e:  # noqa: BLE001
             log.warning("isolated batch: could not resolve batches for %s: %s", ts.source_name, e)
             return False
-        if not batches or next_index >= len(batches):
+        if not batches:
             log.warning(
-                "isolated batch: next batch %d out of range for %s (%d batches); retry next tick",
-                next_index, ts.source_name, len(batches),
+                "isolated batch: no batches resolvable for %s; retry next tick",
+                ts.source_name,
             )
             return False
+        if next_index >= len(batches):
+            # Grouping shrank under us (kind flip / sidecar change) and the
+            # requested batch no longer exists: everything resolvable is done.
+            # Reconcile cursors to finished instead of parking forever.
+            log.warning(
+                "isolated batch: grouping shrank to %d batches for %s; finishing",
+                len(batches), ts.source_name,
+            )
+            ts.batches_total = len(batches)
+            ts.batch_index = len(batches)
+            try:
+                self.store.upsert(ts)
+            except Exception:
+                pass
+            return len(batches)
         nxt = batches[next_index]
         try:
             skip = await self._fuse_skipped(
@@ -2398,7 +2555,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             "isolated batch: ready for batch %d/%d for %s (%d file(s) wanted)",
             next_index + 1, ts.batches_total, ts.source_name, len(wanted),
         )
-        return True
+        return next_index
 
     def _season_folder_for(
         self,
@@ -2473,29 +2630,28 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         h = ts.dest_infohash or ts.source_infohash
         cls_files = await self.dest_client.get_torrent_files(h)
         cls = classify(cls_files, self.cfg)
-        # Persist classification so RE_ADDING (_target_mount_for) routes to
-        # the same remote the files were just moved to. Fresh-DB adoptions
-        # start as "unknown" and would otherwise default to unsorted.
-        if cls.kind and cls.kind != ts.classification_kind:
+        # Pin the QUEUED-time classification: only fill when unknown. A fresh
+        # file list (tracker sidecar added, metadata completed) can flip
+        # episode<->mixed and would otherwise reroute the remote and branch
+        # mid-flight. Layout below still follows the fresh list; routing
+        # follows the pinned kind.
+        pinned_kind = ts.classification_kind or "unknown"
+        if (not pinned_kind or pinned_kind == "unknown") and cls.kind:
             ts.classification_kind = cls.kind
+            pinned_kind = cls.kind
             try:
                 self.store.upsert(ts)
             except Exception:  # noqa: BLE001
                 pass
+        elif cls.kind and cls.kind != pinned_kind:
+            log.warning(
+                "classification flipped %s -> %s for %s after queue; keeping pinned %s for routing",
+                pinned_kind, cls.kind, ts.source_name, pinned_kind,
+            )
 
         # 1. Pause torrent on VPS2 client BEFORE move begins to stop active seeding from SSD
         log.info("pausing torrent %s on VPS2 client before move", h[:10])
-        paused = False
-        pause_err: Exception | None = None
-        for attempt in range(3):
-            try:
-                await self.dest_client.pause(h)
-                paused = True
-                break
-            except Exception as e:  # noqa: BLE001
-                pause_err = e
-                log.warning("attempt %d: could not pause torrent in client before move: %s", attempt + 1, e)
-                await asyncio.sleep(1)
+        paused, pause_err = await self._pause_verified(h)
         if not paused:
             # Never move while the client is still writing, but don't fail
             # terminally on a transient WebUI hiccup — stay in MOVING so the
@@ -2521,20 +2677,39 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         incomplete_files: list[TorrentFile] = []
         uncertain_files: list[TorrentFile] = []
 
+        missing_on_disk: list[str] = []
         for f in cls_files:
             file_path = _safe_ssd_join(src_dir, f.name)
             if file_path is None:
                 continue
             if not file_path.exists():
+                # Not in any set below: record loudly so a desynced piece map
+                # (files deleted from disk, client still complete) can't slip
+                # silently into wipe + RE_ADDING.
+                missing_on_disk.append(f.name)
                 continue
-            # Client-verified complete: the ONLY set ever moved to remote.
+            # Client-verified complete AND present on disk at full size: the
+            # ONLY set ever moved to remote.
             # NOTE: on-disk size alone must NOT mark completeness — qBittorrent
             # pre-allocates deselected files at full size, so a piece-boundary
             # partial of a deselected episode looks "full" while its progress
             # is < 1. Moving it would upload corrupt data (and could overwrite
-            # an older batch's moved file). Progress is authoritative.
+            # an older batch's moved file). Progress is authoritative, disk
+            # size is the second gate (a 1.0-progress truncated file must not
+            # move either).
             if (f.progress or 0.0) >= 0.999:
-                completed_files.append(f)
+                try:
+                    _on_disk = file_path.stat().st_size if file_path.is_file() else -1
+                except OSError:
+                    _on_disk = -1
+                if _on_disk >= (f.size_bytes or 0):
+                    completed_files.append(f)
+                    continue
+                log.warning(
+                    "file %s reports complete but is short on SSD (%d/%d B); not moving",
+                    f.name, max(_on_disk, 0), f.size_bytes,
+                )
+                incomplete_files.append(f)
                 continue
             try:
                 on_disk = file_path.stat().st_size
@@ -2551,6 +2726,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 "leaving %d unverified file(s) for folder wipe (not individually "
                 "deleted, never moved): e.g. %s",
                 len(uncertain_files), uncertain_files[0].name,
+            )
+        if missing_on_disk:
+            log.warning(
+                "move found %d file(s) missing on SSD (e.g. %s); they move nowhere "
+                "and the fuse gate must still pass before re-add",
+                len(missing_on_disk), missing_on_disk[0],
             )
 
         # 3. Clean up incomplete piece-boundary files so they are NOT moved to remote
@@ -2610,8 +2791,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         except OSError:
                             pass
 
-        # 4. Decide target remote
-        if cls.kind in ("movie", "season"):
+        # 4. Decide target remote from the PINNED kind (see above): batches
+        # were moved under it, so the sweep must land beside them even if the
+        # fresh file list classifies differently.
+        if pinned_kind in ("movie", "season"):
             remote = self.cfg.rclone.remote.default
         else:
             remote = self.cfg.rclone.remote.unsorted
@@ -2676,10 +2859,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         # Same 0-transfer hazard as batch moves (rclone exits 0
                         # even when it transferred nothing): proceeding to the
                         # folder wipe below would destroy unmoved data. Stay MOVING.
-                        def _still_on_disk(n: str) -> bool:
-                            p = _safe_ssd_join(src_dir, n)
-                            return p is not None and p.exists()
-                        stuck = [n for n in leftover_files if _still_on_disk(n)]
+                        stuck = [n for n in leftover_files if _left_on_disk(src_dir, n)]
                         if stuck:
                             log.warning(
                                 "leftover sweep for %s moved nothing "
@@ -2760,7 +2940,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 if folder_names:
                     await self._rclone_move(src_dir, remote, ts, files_from=folder_names)
                     # A 0-transfer folder move must not proceed to the wipe below.
-                    stuck = [n for n in folder_names if (_p := _safe_ssd_join(src_dir, n)) is not None and _p.exists()]
+                    stuck = [n for n in folder_names if _left_on_disk(src_dir, n)]
                     if stuck:
                         log.warning(
                             "folder move for %s left files on disk; "
@@ -2789,7 +2969,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 raise RuntimeError(f"refusing bare folder move of {local}")
             else:
                 await self._rclone_move(local, remote, ts)
-                if local.exists():
+                try:
+                    _left = local.is_symlink() or local.exists()
+                except OSError:
+                    _left = True
+                if _left:
                     log.warning(
                         "single-file move for %s left %s on disk; "
                         "staying in MOVING without wiping",
@@ -2835,7 +3019,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     files_from=names,
                     extra=self.cfg.rclone.batch_move_extra_flags,
                 )
-                stuck = [n for n in names if (src_dir / n).exists()]
+                stuck = [n for n in names if _left_on_disk(src_dir, n)]
                 if stuck:
                     log.warning(
                         "mixed-torrent batch move for %s moved nothing "
