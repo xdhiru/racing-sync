@@ -109,6 +109,20 @@ def test_main_run_reset_clears_state_db_and_logs(tmp_path: Path):
     assert list(log_dir.iterdir()) == []
 
 
+def test_do_reset_refuses_system_log_dir(tmp_path: Path):
+    from racing_sync.__main__ import _do_reset
+    from racing_sync.config import AppConfig
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+    cfg = AppConfig.from_toml(cfg_file)
+    cfg.general.state_db = tmp_path / "state.db"
+    for unsafe in (Path("/var/log"), Path("/"), Path.home()):
+        cfg.general.log_dir = unsafe
+        lines = _do_reset(cfg)
+        assert any("refusing" in ln for ln in lines), unsafe
+
+
 def test_signal_handler_fallback_on_not_implemented(tmp_path: Path):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(MINIMAL_CONFIG)
