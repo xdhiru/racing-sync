@@ -195,6 +195,9 @@ async def test_reinject_immediate_retry_succeeds():
         asyncio.TimeoutError("WebUI connection timed out"),
         AddResult(hash=None, accepted=True, detail="Ok."),
     ]
+    # Registration is visible at the fuse target (verified first-add path).
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=MagicMock(save_path="/mnt/fuse"))
 
     ts = TorrentState(
         source_infohash="retry_success_hash",
@@ -464,6 +467,9 @@ async def test_check_and_inject_late_cross_seeds_normalizes_hash(tmp_path: Path)
     coord.dest_client.add_torrent = AsyncMock(return_value=AddResult(hash="new_h", accepted=True))
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord.store = MagicMock()
+    # Registration visible (verified first-add path is covered separately).
+    coord._save_path_points_at_target = MagicMock(return_value=True)
+    coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path="x"))
 
     ts = TorrentState(
         source_infohash="src_1",
@@ -625,6 +631,8 @@ async def test_do_re_add_proceeds_when_fuse_content_present(tmp_path: Path):
     coord._stop = False
     coord.dest_client = AsyncMock()
     coord.dest_client.add_torrent.return_value = AddResult(hash=None, accepted=True, detail="Ok.")
+    coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path="x"))
+    coord._save_path_points_at_target = MagicMock(return_value=True)
     coord.store = MagicMock()
     fuse_dir = tmp_path / "fuse"
     fuse_dir.mkdir()
@@ -1371,6 +1379,8 @@ async def test_late_cross_seed_repairs_skipped_racing_injection(tmp_path: Path):
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord.store = MagicMock()
     coord._failed_late_cross_seeds = {}
+    coord._save_path_points_at_target = MagicMock(return_value=True)
+    coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path="x"))
 
     racing_hash = "b" * 40   # VPS1 private torrent (SFTP timed out in RE_ADDING)
     seedpool_hash = "c" * 40  # cross-seed actually injected

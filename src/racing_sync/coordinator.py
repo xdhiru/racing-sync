@@ -1637,11 +1637,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         def _check() -> set[str]:
             skipped: set[str] = set()
             for name, size in items:
-                norm = (name or "").replace("\\", "/").strip("/")
-                if not norm:
+                joined = _safe_ssd_join(mount, name or "")
+                if joined is None:
                     continue
                 try:
-                    actual = (mount / norm).stat().st_size
+                    actual = joined.stat().st_size
                 except OSError:
                     continue
                 want = size or 0
@@ -3322,7 +3322,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             log.info("cross-seed torrent %s already injected on fuse in step 1", target_hash[:10])
             return
 
-        target_mount = self._target_mount_for(ts)
+        target_mount = self._target_mount_for_blob(blob, self._target_mount_for(ts))
         ok, detail = await self._ensure_fuse_entry(
             blob=blob, infohash=target_hash, target_mount=target_mount,
             label="cross-seed torrent",
@@ -3389,8 +3389,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     injected.append(h_low)
                     injected_set.add(h_low)
                 else:
-                    log.warning("re-inject watch-dir torrent %s rejected: %s", h[:10], detail)
-                    raise WebUIUnresponsiveError(f"re-inject watch-dir torrent {h[:10]} rejected: {detail}")
+                    # Split like _re_add_cross_seed_torrent: transient client
+                    # states park the row for retry; a hard rejection (e.g.
+                    # invalid blob) skips just this torrent so one bad .torrent
+                    # can't hold the whole row (and its moved bytes) hostage.
+                    if (not detail or detail == "Fails."
+                            or detail == _NOT_VISIBLE_DETAIL
+                            or "already" in detail.lower()):
+                        log.warning("re-inject watch-dir torrent %s rejected: %s", h[:10], detail)
+                        raise WebUIUnresponsiveError(f"re-inject watch-dir torrent {h[:10]} rejected: {detail}")
+                    log.warning(
+                        "re-inject watch-dir torrent %s hard-rejected (%s); skipping it",
+                        h[:10], detail,
+                    )
+                    continue
         finally:
             ts.injected_private_hashes = ",".join(dict.fromkeys(injected))
 
@@ -3461,11 +3473,22 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     label="racing torrent",
                 )
                 if not ok:
+                    # Split like _re_add_cross_seed_torrent: transient client
+                    # states park the row for retry; a hard rejection skips
+                    # just this torrent so the cross-seed still lands.
+                    if (not detail or detail == "Fails."
+                            or detail == _NOT_VISIBLE_DETAIL
+                            or "already" in detail.lower()):
+                        log.warning(
+                            "re-inject: add %s rejected: %s",
+                            t.infohash[:10], detail,
+                        )
+                        raise WebUIUnresponsiveError(f"re-inject add {t.infohash[:10]} rejected: {detail}")
                     log.warning(
-                        "re-inject: add %s rejected: %s",
+                        "re-inject: add %s hard-rejected (%s); skipping it",
                         t.infohash[:10], detail,
                     )
-                    raise WebUIUnresponsiveError(f"re-inject add {t.infohash[:10]} rejected: {detail}")
+                    continue
                 injected.append(h_low)
                 injected_set.add(h_low)
                 added += 1
@@ -3580,6 +3603,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         await self._ensure_source_fuse_entry(ts, group, now_utc)
 
         new_torrents = [t for t in group if t.infohash.lower() not in known_hashes]
+
+        # Repair the original entry even on quiet ticks (no new arrivals):
+        # otherwise an original SSD leftover only heals when something else
+        # arrives. Failed-map gating inside keeps the steady state cheap.
+        await self._ensure_original_fuse_entry(
+            ts, self._target_mount_for(ts),
+        )
+
         if not new_torrents:
             # Fully healthy and nothing new: back off success for 30m instead
             # of export+stat per DONE row per tick. New VPS1 arrivals wait
@@ -3594,12 +3625,6 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         current_injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
         current_injected_set = set(current_injected)
         changed = False
-
-        # Repair the original entry first: the adopted public hash may still
-        # point at SSD while only privates get injected (reported symptom).
-        # Best-effort — a missing original blob must not block new seeds
-        # whose own fuse gate already proves the bytes are available.
-        await self._ensure_original_fuse_entry(ts, ts_fallback_mount)
 
         for t in new_torrents:
             h_low = t.infohash.lower()
@@ -4145,8 +4170,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 return [f"<mount unavailable: {mount} ({e})>"]
             missing: list[str] = []
             for name, want in files:
+                target = _safe_ssd_join(mount, name or "")
+                if target is None:
+                    missing.append(name)
+                    continue
                 try:
-                    actual = (mount / name).stat().st_size
+                    actual = target.stat().st_size
                 except OSError:
                     missing.append(name)
                     continue
@@ -4269,8 +4298,26 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         res = await self.dest_client.add_torrent(**add_kwargs)  # type: ignore[arg-type]
         detail = res.detail if isinstance(res.detail, str) else ""
         if res.accepted and "already" not in detail.lower():
-            log.info("re-injected %s %s on fuse (%s)", label, h_low[:10], target_mount)
-            return True, detail
+            # Verify the entry actually landed where asked: the fuse index
+            # can lag (rclone busy with another move), and an accepted-but-
+            # invisible entry must park/retry — never mark DONE, never touch
+            # the moved files. Same patience window as the replace path.
+            for _ in range(4):
+                try:
+                    _st = await self.dest_client.get_torrent(h_low)
+                except Exception:
+                    _st = None
+                if _st is not None and self._save_path_points_at_target(
+                    getattr(_st, "save_path", ""), target_mount
+                ):
+                    log.info("re-injected %s %s on fuse (%s)", label, h_low[:10], target_mount)
+                    return True, detail
+                await asyncio.sleep(2)
+            log.warning(
+                "%s %s accepted but not yet visible on fuse (%s); parking re-add",
+                label, h_low[:10], target_mount,
+            )
+            return False, _NOT_VISIBLE_DETAIL
         if not (detail == "Fails." or "already" in detail.lower()):
             return False, detail
         # Possible duplicate: inspect what's actually there.
