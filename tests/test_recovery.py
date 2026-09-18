@@ -531,6 +531,42 @@ async def test_reconcile_keeps_done_when_fuse_files_present(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_reconcile_adopts_fuse_incomplete_as_re_adding(tmp_path: Path):
+    """Fuse-pointing but incomplete entries must never adopt as DONE."""
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    ssd_dir = tmp_path / "ssd"
+    ssd_dir.mkdir()
+
+    store = StateStore(tmp_path / "test.db")
+
+    cfg = MagicMock()
+    cfg.dest.save_path = ssd_dir
+    cfg.ssd.path = ssd_dir
+    cfg.rclone.fuse.mount = fuse_dir
+    cfg.rclone.fuse.mount_unsorted = fuse_dir / "unsorted"
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [
+        Torrent(
+            hash="partial_fuse_hash",
+            name="Partial.Fuse.Release.2026",
+            size_bytes=100,
+            save_path=str(fuse_dir),
+            category="racing",
+            progress=0.5,
+            state="downloading",
+        ),
+    ]
+
+    await reconcile(cfg, dest=dest, store=store)
+
+    t = store.get("partial_fuse_hash")
+    assert t is not None
+    assert t.state == State.RE_ADDING
+
+
+@pytest.mark.anyio
 async def test_reconcile_keeps_done_when_fuse_files_missing_everywhere(tmp_path: Path):
     """Files missing everywhere: keep DONE (mount may be warming), don't strand.
 
