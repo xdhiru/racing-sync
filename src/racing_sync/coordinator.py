@@ -496,6 +496,11 @@ class Coordinator:
     # different episodes (skip/repeat). Frozen at first use, reused for the
     # row's lifetime; cleared on terminal states to bound memory.
     _batch_cap_cache: dict[str, int] = field(default_factory=dict, init=False)
+    # Quiet-wait for SSD-full parking: WAITING_DISK rows are re-checked at
+    # most once per interval instead of every tick, so a full disk doesn't
+    # spam "worker start/scheduled" INFO lines (which themselves fill the
+    # log disk faster once ENOSPC starts).
+    _waiting_disk_next_check: dict[str, float] = field(default_factory=dict, init=False)
 
     @property
     def download_sem(self) -> asyncio.Semaphore:
@@ -539,12 +544,53 @@ class Coordinator:
                         s, fm,
                     )
 
+    def _warn_if_log_dir_on_data_mount(self) -> None:
+        """Warn when log_dir shares a filesystem with SSD/state (ENOSPC feedback loop).
+
+        TimedRotatingFileHandler has no size cap: per-tick INFO lines fill the
+        log disk, and once ENOSPC hits every log call emits a traceback that
+        fills it faster while SQLite upserts start failing with SQLITE_FULL.
+        Advisory only — never fatal.
+        """
+        try:
+            from pathlib import Path as _Path
+
+            log_dir = _Path(str(self.cfg.general.log_dir))
+            data_paths = [
+                _Path(str(self.cfg.general.state_db)).parent,
+                _Path(str(self.cfg.ssd.path)),
+                _Path(str(self.cfg.dest.save_path)),
+            ]
+            try:
+                log_dev = log_dir.stat().st_dev if log_dir.exists() else None
+            except OSError:
+                log_dev = None
+            if log_dev is None:
+                return
+            for dp in data_paths:
+                try:
+                    if not dp.exists():
+                        continue
+                    if dp.stat().st_dev == log_dev:
+                        log.warning(
+                            "log dir %s shares a filesystem with data path %s — "
+                            "a full SSD will take down logging and state.db; "
+                            "put logs on a separate mount with retention",
+                            log_dir, dp,
+                        )
+                        break
+                except OSError:
+                    continue
+        except Exception:
+            return
+
     async def start(self) -> None:
         log.info("coordinator starting")
         # Build marker: proves which ordering-guarantee build a log file ran.
         # Bump when the fresh-DB / late-seed ordering rules change.
         log.info("build ordering-guard v3 active (move-before-inject, DONE->MOVING demotion)")
         self._warn_if_storage_paths_overlap()
+        self._warn_if_log_dir_on_data_mount()
         self._download_sem = asyncio.Semaphore(self.cfg.max_active_downloads)
         self._move_sem = asyncio.Semaphore(self.cfg.max_concurrent_moves)
         log.info(
@@ -958,6 +1004,7 @@ class Coordinator:
         # 4. Schedule workers for active states that have no live task
         active = self.store.all_active()
         scheduled = 0
+        scheduled_waiting_disk = 0
         max_concurrent_workers = max(
             12,
             self.cfg.max_active_downloads * 2 + self.cfg.max_concurrent_moves * 2,
@@ -985,6 +1032,18 @@ class Coordinator:
             # by Step 3 when their seedpool_next_retry_at timer elapses.
             if ts.state == State.WAITING_SEEDPOOL:
                 continue
+
+            # Quiet-wait for SSD-full parking: re-check at most once per
+            # 60s instead of every tick. Batches drain via MOVING in the
+            # meantime; the next check promotes to QUEUED automatically.
+            if ts.state == State.WAITING_DISK:
+                try:
+                    _wd = getattr(self, "_waiting_disk_next_check", None)
+                    nxt = _wd.get(ts.source_infohash) if isinstance(_wd, dict) else None
+                except Exception:
+                    nxt = None
+                if nxt is not None and time.monotonic() < nxt:
+                    continue
 
             # Skip RE_ADDING rows whose backoff timer has not yet elapsed
             if ts.state == State.RE_ADDING and ts.readd_next_retry_at:
@@ -1015,9 +1074,15 @@ class Coordinator:
                 active_moves += 1
 
             scheduled += 1
+            if ts.state == State.WAITING_DISK:
+                scheduled_waiting_disk += 1
             available_slots -= 1
         if scheduled:
-            log.info(
+            # Quiet-wait: a tick that only re-checked parked WAITING_DISK
+            # rows is routine while batches drain — debug, not info, so a
+            # full disk doesn't fill the log disk with its own status lines.
+            _log = log.debug if scheduled == scheduled_waiting_disk else log.info
+            _log(
                 "scheduled %d worker(s) (active downloads=%d/%d, moves=%d/%d)",
                 scheduled,
                 active_downloads, self.cfg.max_active_downloads,
@@ -1609,6 +1674,13 @@ class Coordinator:
         self.store.transition(ts, dst, error=error, batch_index=batch_index)
         if dst in (State.DONE, State.FAILED):
             self._drop_frozen_batch_cap(ts)
+        if dst != State.WAITING_DISK:
+            try:
+                _wd = getattr(self, "_waiting_disk_next_check", None)
+                if isinstance(_wd, dict):
+                    _wd.pop(ts.source_infohash, None)
+            except Exception:
+                pass
         log.info(
             "%s %s -> %s (batch %s/%s)",
             ts.source_name[:60],
@@ -1639,7 +1711,12 @@ class Coordinator:
             pass
 
     async def _process_torrent_inner(self, ts: TorrentState) -> None:
-        log.info("worker start: %s state=%s", ts.source_name, ts.state.value)
+        # Quiet-wait: parked WAITING_DISK re-checks are routine while batch
+        # moves drain — debug, not info, to avoid filling the log disk.
+        if ts.state == State.WAITING_DISK:
+            log.debug("worker start: %s state=%s", ts.source_name, ts.state.value)
+        else:
+            log.info("worker start: %s state=%s", ts.source_name, ts.state.value)
         if ts.state == State.NEW:
             await self._do_new(ts)
         if ts.state == State.QUERYING:
@@ -2057,6 +2134,10 @@ class Coordinator:
         else:
             self.transition(ts, State.QUEUED)
 
+    # How long a still-full WAITING_DISK row stays quiet before its next
+    # SSD re-check. Batches drain via MOVING in the meantime.
+    WAITING_DISK_RECHECK_SECONDS = 60.0
+
     async def _wait_disk_then_queue(self, ts: TorrentState) -> None:
         # The size check uses min(total_bytes, per-batch cap); for seasons the real SSD footprint
         # is bounded by the batch cap. The actual add will re-check.
@@ -2064,7 +2145,31 @@ class Coordinator:
             return
         needed = self._effective_inflight_cap(ts.total_bytes)
         if ssd_has_room(self.cfg, needed):
+            try:
+                _wd = getattr(self, "_waiting_disk_next_check", None)
+                if isinstance(_wd, dict):
+                    _wd.pop(ts.source_infohash, None)
+            except Exception:
+                pass
             self.transition(ts, State.QUEUED)
+            return
+        # Still full: stay parked quietly until the next interval instead of
+        # hot-looping every tick while batch moves drain.
+        try:
+            _wd = getattr(self, "_waiting_disk_next_check", None)
+            if _wd is None:
+                _wd = {}
+                self._waiting_disk_next_check = _wd  # type: ignore[attr-defined]
+            _wd[ts.source_infohash] = (
+                time.monotonic() + self.WAITING_DISK_RECHECK_SECONDS
+            )
+        except Exception:
+            pass
+        log.debug(
+            "ssd still full; %s stays waiting_disk (need ~%d MB, re-check in %ds)",
+            ts.source_name[:60], needed // (1024 * 1024),
+            int(self.WAITING_DISK_RECHECK_SECONDS),
+        )
 
     # ---- state: QUEUED ----
 
