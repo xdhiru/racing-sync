@@ -261,6 +261,9 @@ reinject_max_age_seconds = 86400
 # is treated as an individual TV episode and routed to unsorted/.
 # Default: S01E03, s10e22, S1E1, S36E171, etc. The episode number allows
 # up to 3 digits for long-running daily shows (S36E171, S62E010, ...).
+# NOTE: SxxEyy form only — "Show.1x01" style names do NOT match and those
+# files classify as movie (default remote). Extend the regex if your
+# indexers use 1x01 naming.
 # Tweak per your release naming.
 episode_regex = "(?i)\\bS\\d{1,2}E\\d{1,3}\\b"
 
