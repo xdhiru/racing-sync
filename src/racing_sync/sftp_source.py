@@ -11,6 +11,7 @@ import io
 import logging
 import socket
 import threading
+import time
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 
@@ -26,6 +27,25 @@ MAX_TORRENT_BYTES: int = 20 * 1024 * 1024  # 20 MiB safety cap, matching Prowlar
 # Must stay comfortably below the coordinator's 15s asyncio.wait_for budget
 # around SFTP calls so contention surfaces as a catchable timeout there.
 _SFTP_LOCK_TIMEOUT: float = 10.0
+
+# Pool lease budget (seconds): how long a call waits for ANY free pool
+# member before failing fast. Also kept below the coordinator's 15s budget
+# so the wait + a fetch attempt still fit inside it.
+_POOL_LEASE_TIMEOUT: float = 8.0
+_POOL_SIZE_DEFAULT: int = 3
+_POOL_SIZE_MIN: int = 1
+_POOL_SIZE_MAX: int = 8
+
+
+def _coerce_pool_size(raw: object) -> int:
+    """Clamp pool size to [_POOL_SIZE_MIN, _POOL_SIZE_MAX]; default on garbage."""
+    if isinstance(raw, bool):
+        return _POOL_SIZE_DEFAULT
+    try:
+        n = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return _POOL_SIZE_DEFAULT
+    return max(_POOL_SIZE_MIN, min(_POOL_SIZE_MAX, n))
 
 _HEX40_RE = None  # lazy compiled in list_state_dir to avoid import cost
 
@@ -69,14 +89,21 @@ def _ipv4_socket(host: str, port: int, *, timeout: float = 15) -> socket.socket:
 
 
 
-class SFTPExporter:
+class _SFTPConnection:
+    """One SSH/SFTP connection (single transport, lock-guarded).
+
+    Internal unit of the pooled SFTPExporter below; API mirrors the old
+    single-connection exporter so delegation is mechanical. All public
+    methods are thread-safe via the re-entrant instance lock.
+    """
+
     def __init__(self, cfg: DelugeSFTPConfig):
         self._cfg = cfg
         self._client: paramiko.SSHClient | None = None
         self._sftp: paramiko.SFTPClient | None = None
         self._lock = threading.RLock()
 
-    def __enter__(self) -> "SFTPExporter":
+    def __enter__(self) -> _SFTPConnection:
         self.connect()
         return self
 
@@ -446,3 +473,138 @@ class SFTPExporter:
                     if _HEX40_RE is not None and _HEX40_RE.fullmatch(digest):
                         out.append(digest.lower())
             return out
+
+
+class SFTPExporter:
+    """Pooled SFTP exporter: N independent SSH/SFTP connections.
+
+    Re-inject bursts from concurrent coordinator workers used to serialize
+    on a single paramiko transport behind one lock (the 15s-timeout
+    clusters in the log). The pool leases a free member per call with
+    round-robin start and fails over when one wedges; only when every
+    member is busy does the caller get a fast TimeoutError for its
+    existing retry path.
+
+    Public API is unchanged from the old single-connection exporter
+    (connect/close/fetch_torrent/fetch_many/disk_free_bytes/list_state_dir
+    plus the context manager), so all existing call sites keep working.
+    `pool_size` defaults to `[source.deluge_sftp].pool_size` (3).
+    """
+
+    def __init__(self, cfg: DelugeSFTPConfig, pool_size: int | None = None):
+        self._cfg = cfg
+        if pool_size is None:
+            pool_size = _coerce_pool_size(getattr(cfg, "pool_size", _POOL_SIZE_DEFAULT))
+        else:
+            pool_size = _coerce_pool_size(pool_size)
+        self._pool_size = pool_size
+        self._members: list[_SFTPConnection] = []
+        self._pool_lock = threading.Lock()
+        self._rr = 0
+
+    def __enter__(self) -> SFTPExporter:
+        self.connect()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    @property
+    def pool_size(self) -> int:
+        return self._pool_size
+
+    # ---- pool plumbing ----
+
+    def _members_snapshot(self) -> list[_SFTPConnection]:
+        with self._pool_lock:
+            if not self._members:
+                self._members = [_SFTPConnection(self._cfg) for _ in range(self._pool_size)]
+            return list(self._members)
+
+    def _lease(self, what: str) -> _SFTPConnection:
+        """Return a member with its lock held; caller must _release() it.
+
+        Rotating start spreads concurrent callers across members; a wedged
+        member is simply skipped while it stays busy.
+        """
+        members = self._members_snapshot()
+        with self._pool_lock:
+            start = self._rr % len(members)
+            self._rr += 1
+        deadline = time.monotonic() + _POOL_LEASE_TIMEOUT
+        while True:
+            for i in range(len(members)):
+                m = members[(start + i) % len(members)]
+                try:
+                    if m._lock.acquire(blocking=False):
+                        return m
+                except Exception:
+                    continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"sftp busy: {what} gave up waiting for a free connection"
+                )
+            time.sleep(0.05)
+
+    def _release(self, m: _SFTPConnection) -> None:
+        try:
+            m._lock.release()
+        except Exception:
+            pass
+
+    # ---- lifecycle ----
+
+    def connect(self) -> None:
+        members = self._members_snapshot()
+        opened: list[_SFTPConnection] = []
+        try:
+            for m in members:
+                m.connect()
+                opened.append(m)
+        except Exception:
+            for m in opened:
+                try:
+                    m.close()
+                except Exception:
+                    pass
+            raise
+
+    def close(self) -> None:
+        with self._pool_lock:
+            members = list(self._members)
+        for m in members:
+            try:
+                m.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ---- operations (lease a member, delegate, release) ----
+
+    def fetch_torrent(self, infohash: str) -> bytes | None:
+        """Return the .torrent bytes for `infohash` or None if missing."""
+        if not infohash or len(infohash) != 40 or not all(c in "0123456789abcdefABCDEF" for c in infohash):
+            return None
+        infohash = infohash.lower()
+        m = self._lease(f"fetch {infohash[:10]}")
+        try:
+            return m.fetch_torrent(infohash)
+        finally:
+            self._release(m)
+
+    def fetch_many(self, infohashes: Iterable[str]) -> dict[str, bytes]:
+        return {h: data for h, data in ((h, self.fetch_torrent(h)) for h in infohashes) if data}
+
+    def disk_free_bytes(self, path: str) -> int | None:
+        """Free bytes on the remote filesystem containing `path` (see member)."""
+        m = self._lease(f"disk-free {path}")
+        try:
+            return m.disk_free_bytes(path)
+        finally:
+            self._release(m)
+
+    def list_state_dir(self) -> list[str]:
+        m = self._lease("list state dir")
+        try:
+            return m.list_state_dir()
+        finally:
+            self._release(m)
