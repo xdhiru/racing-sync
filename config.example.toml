@@ -39,6 +39,10 @@ type = "qbittorrent"
 host = "http://127.0.0.1:8080"
 username = "admin"
 password = "change_me"
+# Network family for the WebUI session. false (default) forces IPv4 —
+# intentional: tracker allowlists, split-horizon DNS and jail/VPN egress on
+# seedboxes are overwhelmingly v4. Set true only for v6-capable setups.
+# use_ipv6 = false
 # Filter racing torrents by category/label. Empty string = sync ALL
 # torrents regardless of category (recommended when the racing client
 # doesn't categorise its torrents, e.g. it just races everything).
@@ -133,6 +137,8 @@ save_path = "/srv/qbittorrent/data"
 # Maximum concurrent torrents actively downloading on VPS2 SSD (default: 3).
 # Limits additions to qBittorrent on SSD so disk I/O and network aren't overloaded.
 max_active_downloads = 3
+# Network family for the WebUI session (see [source].use_ipv6).
+# use_ipv6 = false
 
 # Optional nginx basic-auth in front of the qBittorrent WebUI on VPS2.
 # Optional nginx auth in front of the qBittorrent WebUI on VPS2.
@@ -338,6 +344,8 @@ download_indexer_substrings = ["seedpool"]
 skip_query_substrings = ["subsplease"]
 timeout_seconds = 30.0
 max_results = 20
+# Network family for the Prowlarr session (see [source].use_ipv6).
+# use_ipv6 = false
 
 # Tracker announce URL substring → prowlarr indexer name.
 # Used to figure out which prowlarr indexer to search when a torrent
