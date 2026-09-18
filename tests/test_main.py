@@ -269,3 +269,22 @@ def test_main_full_requires_yes(tmp_path: Path, capsys):
         mock_coord_cls.return_value = mock_coord
         rc = main(["run", "--config", str(cfg_file), "--full", "--yes"])
         assert rc == 0
+
+
+def test_check_config_warns_not_fails_on_down_fuse_mount(tmp_path: Path):
+    """A down fuse mount warns (runtime parks) instead of failing the check."""
+    from racing_sync.__main__ import _check_config_env, _check_config_warnings
+    from racing_sync.config import AppConfig
+
+    text = MINIMAL_CONFIG.replace('mount = "/mnt/fuse"',
+                                  f'mount = "{(tmp_path / "no-such-mount").as_posix()}"')
+    text = text.replace('mount_unsorted = "/mnt/fuse/unsorted"',
+                        f'mount_unsorted = "{(tmp_path / "no-such-mount-unsorted").as_posix()}"')
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(text)
+    cfg = AppConfig.from_toml(cfg_file)
+    assert _check_config_env(cfg) == [] or all(
+        "fuse" not in p for p in _check_config_env(cfg))
+    warnings = _check_config_warnings(cfg)
+    assert len(warnings) == 2
+    assert all("parks" in w for w in warnings)

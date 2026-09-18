@@ -144,7 +144,8 @@ Enable `[telegram]` in config. Restart. Expect:
 
 1. A pinned "racing-sync online" message at the top of the chat.
 2. The same message gets edited every `status_update_interval` seconds.
-3. ERROR-level log lines cause a separate message in the chat.
+3. A `FAILED` transition posts a detail card in the chat (raw log lines
+   are never forwarded — app logging goes to local files only).
 
 ## 11. FastAPI
 

@@ -538,8 +538,6 @@ def _check_config_env(cfg: AppConfig) -> list[str]:
     for label, val in (
         ("dest.save_path", getattr(cfg.dest, "save_path", "")),
         ("ssd.path", getattr(cfg.ssd, "path", "")),
-        ("rclone.fuse.mount", getattr(cfg.rclone.fuse, "mount", "")),
-        ("rclone.fuse.mount_unsorted", getattr(cfg.rclone.fuse, "mount_unsorted", "")),
     ):
         try:
             _need_dir(label, val, must_exist=True)
@@ -604,6 +602,34 @@ def _check_config_env(cfg: AppConfig) -> list[str]:
     except Exception:
         pass
     return problems
+
+
+def _check_config_warnings(cfg: AppConfig) -> list[str]:
+    """Non-fatal check-config advisories (printed, exit still 0).
+
+    Fuse mounts fail soft by design: the daemon parks fuse-gated work
+    until the mount appears instead of refusing to start, so a down
+    mount must not fail check-config — but the operator should know.
+    """
+    warnings: list[str] = []
+    for label, val in (
+        ("rclone.fuse.mount", getattr(cfg.rclone.fuse, "mount", "")),
+        ("rclone.fuse.mount_unsorted", getattr(cfg.rclone.fuse, "mount_unsorted", "")),
+    ):
+        try:
+            p = Path(str(val))
+        except Exception:
+            continue
+        try:
+            if not p.exists():
+                warnings.append(
+                    f"{label} does not exist ({p}): fuse-gated work parks "
+                    "until the mount appears — start the mount first if rows "
+                    "should flow immediately"
+                )
+        except Exception:
+            pass
+    return warnings
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -693,6 +719,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "check-config":
         problems = _check_config_env(cfg)
+        for w in _check_config_warnings(cfg):
+            print(f"config warning: {w}")
         if problems:
             for p in problems:
                 print(f"config problem: {p}", file=sys.stderr)

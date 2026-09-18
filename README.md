@@ -71,6 +71,8 @@ python3 run.py run --config config.toml
 # Ctrl+C stops gracefully
 ```
 
+There is no config reload: restart the daemon after editing `config.toml`.
+
 Help for every command:
 
 ```bash
@@ -88,7 +90,7 @@ recovery and resume where they left off, so torrent data is never deleted:
 python3 run.py run --config config.toml --reset
 # Full wipe for mid-testing (also drops dest entries with files,
 # SSD data and cached .torrent blobs; fuse/remote copies stay untouched):
-python3 run.py run --config config.toml --reset --full
+python3 run.py run --config config.toml --full --yes
 ```
 
 ### Abandon a torrent (`forget`)
