@@ -34,7 +34,7 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 SENSITIVE_KEY_WORDS = ("passkey", "api_key", "apikey", "token", "auth", "secret", "password")
 
 _SENSITIVE_PARAM_RE = re.compile(
-    r"((?:passkey|api[_-]?key|auth[_-]?key|secret[_-]?key|token|secret|password|auth)\s*[:=]\s*[\"']?)([^&\s\"'},;]+)",
+    r"((?:passkey|passwd|pwd|pass[_-]?key|api[_-]?key|auth[_-]?key|secret[_-]?key|token|secret|password|auth)\s*[:=]\s*[\"']?)([^&\s\"'},;]+)",
     re.IGNORECASE,
 )
 _BEARER_TOKEN_RE = re.compile(
@@ -42,7 +42,7 @@ _BEARER_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 _SENSITIVE_KEY_RE = re.compile(
-    r"passkey|api[_-]?key|auth[_-]?key|secret[_-]?key|token|secret|password|^auth$|auth[_-]",
+    r"passkey|passwd|pwd|pass[_-]?key|api[_-]?key|auth[_-]?key|secret[_-]?key|token|secret|password|^auth$|auth[_-]",
     re.IGNORECASE,
 )
 _SENSITIVE_HEADER_KEYS = frozenset(
@@ -257,9 +257,14 @@ def setup_logging(cfg: AppConfig) -> None:
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    # Wipe anything pre-existing (e.g. uvicorn defaults)
+    # Wipe anything pre-existing (e.g. uvicorn defaults) and close them
+    # so repeated setup_logging() in tests doesn't leak FDs.
     for h in list(root.handlers):
         root.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
 
     # Scope DEBUG to racing_sync application logger
     logging.getLogger("racing_sync").setLevel(logging.DEBUG)
@@ -309,7 +314,7 @@ def setup_logging(cfg: AppConfig) -> None:
     # Silence overly chatty libraries (httpx/httpcore back the Telegram
     # bot's HTTP calls and log every request at INFO without this).
     for noisy in ("aiohttp.access", "asyncio", "urllib3", "paramiko", "uvicorn",
-                  "httpx", "httpcore"):
+                  "httpx", "httpcore", "telegram", "telegram.ext"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     logging.getLogger("racing_sync").info(

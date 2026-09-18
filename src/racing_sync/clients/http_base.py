@@ -211,7 +211,16 @@ class HTTPClientBase:
         else:
             origin = host_clean
         headers["Origin"] = origin
-        headers["Referer"] = host_clean + "/"
+        # Referer keeps the configured sub-path (some reverse proxies check
+        # it) but must never leak userinfo: rebuild from the parsed,
+        # userinfo-stripped origin + path.
+        if parsed.scheme and parsed.hostname:
+            _path = parsed.path or "/"
+            if not _path.endswith("/"):
+                _path += "/"
+            headers["Referer"] = origin + _path
+        else:
+            headers["Referer"] = host_clean + "/"
 
         self._session = aiohttp.ClientSession(
             base_url=_ensure_base_url(self._cfg.host),
