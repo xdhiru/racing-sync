@@ -3404,6 +3404,7 @@ class Coordinator:
         ts_fallback_mount = self._target_mount_for(ts)
         injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
         injected_set = set(injected)
+        added = 0
 
         try:
             racing = await self._list_source_torrents()
@@ -3429,6 +3430,14 @@ class Coordinator:
                                 t.infohash[:10], e)
                     continue
                 if not blob:
+                    # SFTP clean-miss + no export endpoint (Deluge has no
+                    # core.get_torrent_file) surface nowhere else — log
+                    # loudly so a skipped racing seed is visible.
+                    log.warning(
+                        "re-inject: no .torrent bytes available for %s (%s); "
+                        "skipping for now (late-seed job will retry)",
+                        t.infohash[:10], t.name[:50],
+                    )
                     continue
                 # Per-torrent mount: ts.kind may be stale "unknown" (fresh
                 # adoption); the blob's own layout is authoritative.
@@ -3462,8 +3471,24 @@ class Coordinator:
                     raise WebUIUnresponsiveError(f"re-inject add {t.infohash[:10]} rejected: {detail}")
                 injected.append(h_low)
                 injected_set.add(h_low)
+                added += 1
         finally:
             ts.injected_private_hashes = ",".join(dict.fromkeys(injected))
+
+        if added == 0:
+            pending = [t for t in matches if t.infohash.lower() not in injected_set]
+            if pending:
+                log.warning(
+                    "re-inject: 0/%d racing torrent(s) injected for %s "
+                    "(VPS1 still lists them); row proceeds with cross-seed "
+                    "only and the late-seed job will retry the racing injection",
+                    len(pending), ts.source_name[:60],
+                )
+            elif not matches:
+                log.info(
+                    "re-inject: no racing torrents left on VPS1 for %s; cross-seed only",
+                    ts.source_name[:60],
+                )
 
     async def _check_and_inject_late_cross_seeds(
         self, ts: TorrentState, group: list[Torrent]
@@ -3506,6 +3531,18 @@ class Coordinator:
             ) if h
         }
 
+        if not hasattr(self, "_failed_late_cross_seeds"):
+            self._failed_late_cross_seeds = {}
+        now_utc = dt.datetime.now(dt.timezone.utc)
+
+        # Repair a racing (source) injection that RE_ADDING step 1 silently
+        # skipped (SFTP timeout bursts + no Deluge export fallback): the
+        # source hash is in known_hashes by construction, so the
+        # new-torrent loop below would never retry it and the row would
+        # seed the cross-seed only. Runs before the early return so rows
+        # with no *new* arrivals still heal.
+        await self._ensure_source_fuse_entry(ts, group, now_utc)
+
         new_torrents = [t for t in group if t.infohash.lower() not in known_hashes]
         if not new_torrents:
             return
@@ -3514,11 +3551,6 @@ class Coordinator:
         current_injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
         current_injected_set = set(current_injected)
         changed = False
-
-        if not hasattr(self, "_failed_late_cross_seeds"):
-            self._failed_late_cross_seeds = {}
-
-        now_utc = dt.datetime.now(dt.timezone.utc)
 
         # Repair the original entry first: the adopted public hash may still
         # point at SSD while only privates get injected (reported symptom).
@@ -3623,6 +3655,117 @@ class Coordinator:
         if changed:
             ts.injected_private_hashes = ",".join(dict.fromkeys(current_injected))
             self.store.upsert(ts)
+
+    async def _ensure_source_fuse_entry(
+        self, ts: TorrentState, group: list[Torrent], now_utc: dt.datetime
+    ) -> None:
+        """Repair a missing racing-torrent fuse seed on DONE rows.
+
+        Step 1 of RE_ADDING can silently skip the VPS1 torrent (SFTP
+        timeout bursts; Deluge daemons have no torrent-file export
+        fallback), leaving the row DONE with only the cross-seed seeding.
+        The source hash sits in known_hashes by construction, so the
+        new-torrent loop never retries it. Repair it here while VPS1 still
+        lists it. Best-effort with the same 30m failure backoff as late
+        cross-seeds (no per-tick SFTP storm); skipped entirely when the
+        row needs no repair.
+        """
+        try:
+            inject_flag = bool(self.cfg.cross_seed.inject_racing_torrents_to_fuse)
+        except Exception:
+            inject_flag = True
+        if not inject_flag:
+            return
+        if (ts.cross_seed_source or "") == "watch-dir":
+            return  # watch-dir drops have their own injector + blob store.
+        source_low = (ts.source_infohash or "").lower()
+        if not source_low:
+            return
+        # The source hash itself is always "known"; what matters is whether
+        # it was ever injected (recorded) or IS the SSD/cross-seed torrent
+        # itself (public path: same bytes, already seeding).
+        injected_set = {h.lower() for h in ts.injected_private_hashes.split(",") if h}
+        if source_low in injected_set:
+            return
+        if source_low in {(ts.dest_infohash or "").lower(), (ts.cross_seed_infohash or "").lower()} - {""}:
+            return
+        src_entry = next(
+            (t for t in (group or []) if t.infohash.lower() == source_low), None,
+        )
+        if src_entry is None:
+            return  # VPS1 cleaned already; nothing to repair.
+        failed_at = self._failed_late_cross_seeds.get(source_low)
+        if failed_at and (now_utc - failed_at).total_seconds() < 1800:
+            return
+        log.info(
+            "late cross-seed: racing torrent %s (%s) never injected for %s; repairing",
+            source_low[:10], (src_entry.name or "")[:40], ts.source_name[:40],
+        )
+        try:
+            blob = await self._fetch_racing_torrent_bytes(ts.source_infohash)
+        except Exception as e:  # noqa: BLE001
+            log.warning("late cross-seed: repair fetch %s failed: %s", source_low[:10], e)
+            self._failed_late_cross_seeds[source_low] = now_utc
+            return
+        if not blob:
+            log.warning(
+                "late cross-seed: repair of racing torrent %s deferred (no .torrent bytes yet)",
+                source_low[:10],
+            )
+            self._failed_late_cross_seeds[source_low] = now_utc
+            return
+        try:
+            fallback = self._target_mount_for(ts)
+        except Exception:  # noqa: BLE001
+            return
+        target_mount = self._target_mount_for_blob(blob, fallback)
+        expected = self._expected_fuse_files(blob)
+        if not expected:
+            log.warning(
+                "late cross-seed: repair cannot decode file list for %s; deferring",
+                source_low[:10],
+            )
+            self._failed_late_cross_seeds[source_low] = now_utc
+            return
+        try:
+            missing = await self._missing_fuse_files(target_mount, expected)
+        except Exception:  # noqa: BLE001
+            self._failed_late_cross_seeds[source_low] = now_utc
+            return
+        if missing:
+            log.warning(
+                "late cross-seed: repair of racing torrent %s deferred "
+                "(fuse content missing at %s, %d files)",
+                source_low[:10], target_mount, len(missing),
+            )
+            self._failed_late_cross_seeds[source_low] = now_utc
+            return
+        try:
+            ok, detail = await self._ensure_fuse_entry(
+                blob=blob, infohash=source_low, target_mount=target_mount,
+                label="racing torrent (repair)",
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("late cross-seed: repair add %s failed: %s", source_low[:10], e)
+            self._failed_late_cross_seeds[source_low] = now_utc
+            return
+        if not ok:
+            log.warning(
+                "late cross-seed: repair add %s rejected by dest client: %s",
+                source_low[:10], detail,
+            )
+            self._failed_late_cross_seeds[source_low] = now_utc
+            return
+        log.info(
+            "auto-injected missing racing torrent %s (%s) onto fuse (%s) (repair)",
+            source_low[:10], (src_entry.name or "")[:40], target_mount,
+        )
+        current = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
+        if source_low not in current:
+            current.append(source_low)
+        ts.injected_private_hashes = ",".join(dict.fromkeys(current))
+        self.store.upsert(ts)
+        self._failed_late_cross_seeds.pop(source_low, None)
 
     async def _verified_fuse_mount_for_done_row(self, ts: TorrentState) -> Path | None:
         """Prove a DONE row really seeds from fuse; return the mount or None.
