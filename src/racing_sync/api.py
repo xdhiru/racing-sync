@@ -136,8 +136,10 @@ def build_app(coord: Coordinator) -> FastAPI:
         return [_ts_to_dict(t) for t in rows]
 
     @app.get("/api/active", dependencies=[Depends(auth)])
-    async def active() -> list[dict[str, Any]]:
-        rows = await asyncio.to_thread(coord.store.all_active)
+    async def active(
+        limit: int = Query(default=500, ge=1, le=5000),
+    ) -> list[dict[str, Any]]:
+        rows = await asyncio.to_thread(coord.store.all_active, False, limit)
         return [_ts_to_dict(t) for t in rows]
 
     @app.get("/api/logs", dependencies=[Depends(auth)])
@@ -255,10 +257,14 @@ def _ts_to_dict(t) -> dict[str, Any]:
         state_val = t.state.value
     except Exception:
         state_val = str(getattr(t, "state", "unknown"))
+    try:
+        name_val = str(t.source_name or "")[:200]
+    except Exception:
+        name_val = ""
     return {
         "source_infohash": t.source_infohash,
         "dest_infohash": t.dest_infohash,
-        "source_name": t.source_name,
+        "source_name": name_val,
         "classification_kind": t.classification_kind,
         "state": state_val,
         "total_bytes": t.total_bytes,
