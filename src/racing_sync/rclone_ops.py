@@ -77,6 +77,10 @@ def _validate_rclone_binary(cfg: AppConfig) -> Path | None:
             # create_subprocess_exec. Distinguish by existence:
             if b.exists():
                 raise RcloneError(f"rclone.binary not executable: {b}")
+            log.warning(
+                "rclone.binary not found at %s (tolerated: unit tests mock "
+                "spawn; check-config flags this in prod)", b,
+            )
     except OSError:
         pass
     return b
@@ -162,7 +166,8 @@ def redact_rclone_cmd(cmd: list[str]) -> str:
             continue
         lower = arg.lower()
         if any(lower == flag or lower.startswith(flag + "=") for flag in _SENSITIVE_FLAGS) or any(
-            f in lower for f in ("secret", "pass", "token", "apikey", "api_key")
+            f in lower for f in ("secret", "pass", "token", "apikey", "api_key",
+                                 "api-key", "auth-key", "authkey")
         ):
             if "=" in arg:
                 key, _ = arg.split("=", 1)
@@ -217,11 +222,21 @@ async def run_rclone(
                 await asyncio.wait_for(proc.wait(), timeout=10.0)
             except asyncio.TimeoutError:
                 await _stop(proc, "kill")
-                await proc.wait()
+                try:
+                    # Bounded: an unkillable (D-state) process must not wedge
+                    # the move worker (and its semaphore slot) forever. The
+                    # orphan is reaped by the event loop on exit; the row
+                    # stays put for retry via the straggler check.
+                    await asyncio.wait_for(proc.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    pass
         except Exception:
             try:
                 await _stop(proc, "kill")
-                await proc.wait()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    pass
             except Exception:
                 pass
         raise RcloneError(f"rclone timeout after {timeout}s: {redact_rclone_cmd(cmd)}")
