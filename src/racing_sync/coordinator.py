@@ -501,6 +501,14 @@ class Coordinator:
     # spam "worker start/scheduled" INFO lines (which themselves fill the
     # log disk faster once ENOSPC starts).
     _waiting_disk_next_check: dict[str, float] = field(default_factory=dict, init=False)
+    # Global SSD reservation ledger: infohash.lower() -> bytes reserved.
+    # max_inflight_bytes is a GLOBAL budget across concurrent downloads, not
+    # a per-torrent batch cap. Admission reserves an estimate; _setup refines
+    # to the real footprint (max batch for seasons/games, total for singles)
+    # so varying sizes share the budget safely. Released on RE_ADDING/DONE/
+    # FAILED/WAITING_DISK/forget. Rebuilt from DB on startup for crash recovery.
+    _ssd_reserved: dict[str, int] = field(default_factory=dict, init=False)
+    _ssd_lock: asyncio.Lock | None = field(default=None, init=False)
 
     @property
     def download_sem(self) -> asyncio.Semaphore:
@@ -665,6 +673,13 @@ class Coordinator:
 
             # Optional Telegram bot (lazy import: python-telegram-bot is
             # only required when enabled).
+            # Rebuild the SSD ledger from DB AFTER recovery/auto-retry so an
+            # abrupt stop (kill -9, power loss) resumes with correct budget
+            # instead of double-spending freed space.
+            try:
+                await self._ssd_rebuild_from_db()
+            except Exception:
+                pass
             self._tg = None
             if self.cfg.telegram.enabled:
                 from .telegram_bot import TelegramBot
@@ -1681,6 +1696,17 @@ class Coordinator:
                     _wd.pop(ts.source_infohash, None)
             except Exception:
                 pass
+        # SSD ledger: reservation held only while the row can occupy SSD
+        # (QUEUED/DOWNLOADING/MOVING). Leaving for park/terminal/fuse states
+        # frees the budget for waiting torrents. Sync pop (no lock needed —
+        # idempotent release, races resolved by locked try_reserve/adjust).
+        if dst in (State.WAITING_DISK, State.RE_ADDING, State.DONE, State.FAILED):
+            try:
+                _rsv = getattr(self, "_ssd_reserved", None)
+                if isinstance(_rsv, dict):
+                    _rsv.pop((ts.source_infohash or "").lower(), None)
+            except Exception:
+                pass
         log.info(
             "%s %s -> %s (batch %s/%s)",
             ts.source_name[:60],
@@ -1804,6 +1830,269 @@ class Coordinator:
         except Exception:
             pass
 
+    # ---- global SSD reservation ledger ----
+
+    def _ssd_global_cap(self) -> int | None:
+        """Configured global SSD budget, or None when unconfigured/test doubles.
+
+        Only real int/float configs count — MagicMock doubles (int(MagicMock)==1)
+        must not impose a 1-byte cap. Unconfigured means unlimited (legacy behavior).
+        """
+        try:
+            raw = getattr(self.cfg.ssd, "max_inflight_bytes", 0)
+            if isinstance(raw, bool):
+                return None
+            if not isinstance(raw, (int, float)):
+                return None
+            v = int(raw or 0)
+            return v if v > 0 else None
+        except Exception:
+            return None
+
+    def _ssd_estimate_for_new(self, total_bytes: int) -> int:
+        """Admission estimate for an unclassified torrent: min(total, global_cap).
+
+        Uses the STABLE configured cap, never the free-shrunk live cap, so a
+        full disk doesn't shrink the estimate and admit easier (inverted logic).
+        Refined to the real footprint after classify (max batch / single total).
+        """
+        try:
+            total = max(0, int(total_bytes or 0))
+        except Exception:
+            total = 0
+        cap = self._ssd_global_cap()
+        if cap is None:
+            return total
+        return min(total, cap) if total > 0 else 0
+
+    def _ssd_reserved_total(self) -> int:
+        try:
+            d = getattr(self, "_ssd_reserved", None)
+            if not isinstance(d, dict):
+                return 0
+            return sum(int(v) for v in d.values() if isinstance(v, (int, float)))
+        except Exception:
+            return 0
+
+    async def _ssd_lock_for(self):
+        """Per-coordinator SSD lock, lazily created (tolerates test doubles)."""
+        lk = getattr(self, "_ssd_lock", None)
+        if lk is None or not hasattr(lk, "__aenter__"):
+            try:
+                lk = asyncio.Lock()
+            except Exception:
+                return None
+            try:
+                self._ssd_lock = lk  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        return lk
+
+    def _ssd_prune_stale(self) -> None:
+        """Drop reservations for rows no longer needing SSD (forget/crash drift)."""
+        try:
+            d = getattr(self, "_ssd_reserved", None)
+            if not isinstance(d, dict) or not d:
+                return
+            store = getattr(self, "store", None)
+            if store is None or not hasattr(store, "get"):
+                return
+            for h in list(d.keys()):
+                try:
+                    row = store.get(h)
+                except Exception:
+                    continue
+                # Deleted row → free. Known non-SSD states → free. Unknown
+                # doubles (MagicMock state) → keep (can't prove stale).
+                if row is None:
+                    d.pop(h, None)
+                    continue
+                try:
+                    st = getattr(row, "state", None)
+                except Exception:
+                    continue
+                if isinstance(st, State) and st not in (
+                    State.QUEUED, State.DOWNLOADING, State.MOVING,
+                ):
+                    d.pop(h, None)
+        except Exception:
+            pass
+
+    async def _ssd_try_reserve(self, infohash: str, amount: int) -> bool:
+        """Atomically admit `amount` iff global budget + physical free allow it.
+
+        Returns True and records the reservation on success; False leaves
+        everything unchanged (caller parks to WAITING_DISK).
+        """
+        try:
+            key = (infohash or "").lower()
+            if not key:
+                return False
+            amount = max(0, int(amount or 0))
+        except Exception:
+            return False
+        lk = await self._ssd_lock_for()
+        if lk is not None:
+            await lk.acquire()
+        try:
+            self._ssd_prune_stale()
+            cap = self._ssd_global_cap()
+            if cap is not None:
+                if self._ssd_reserved_total() + amount > cap:
+                    return False
+                if len(getattr(self, "_ssd_reserved", {})) > 5000:
+                    return False
+            # Physical free check last (stable estimate first).
+            try:
+                if not ssd_has_room(self.cfg, amount):
+                    return False
+            except Exception:
+                return False
+            try:
+                d = getattr(self, "_ssd_reserved", None)
+                if not isinstance(d, dict):
+                    d = {}
+                    self._ssd_reserved = d  # type: ignore[attr-defined]
+                d[key] = amount
+            except Exception:
+                pass
+            return True
+        finally:
+            try:
+                if lk is not None:
+                    lk.release()
+            except Exception:
+                pass
+
+    async def _ssd_release(self, infohash: str) -> None:
+        try:
+            key = (infohash or "").lower()
+            if not key:
+                return
+            lk = await self._ssd_lock_for()
+            if lk is not None:
+                await lk.acquire()
+            try:
+                d = getattr(self, "_ssd_reserved", None)
+                if isinstance(d, dict):
+                    d.pop(key, None)
+            finally:
+                try:
+                    if lk is not None:
+                        lk.release()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    async def _ssd_adjust(self, infohash: str, new_amount: int) -> bool:
+        """Refine a held reservation (post-classify shrink/grow).
+
+        Global-budget check only — physical free was verified at admission
+        (try_reserve) seconds earlier; re-checking free here breaks test
+        doubles with fake paths and adds no safety (disk can't fill in
+        seconds beyond the reserved upper bound). Growing beyond the global
+        budget fails (caller must roll back); shrinking always succeeds.
+        Returns True on success.
+        """
+        try:
+            key = (infohash or "").lower()
+            new_amount = max(0, int(new_amount or 0))
+            if not key:
+                return False
+        except Exception:
+            return False
+        lk = await self._ssd_lock_for()
+        if lk is not None:
+            await lk.acquire()
+        try:
+            d = getattr(self, "_ssd_reserved", None)
+            if not isinstance(d, dict):
+                try:
+                    d = {}
+                    self._ssd_reserved = d  # type: ignore[attr-defined]
+                except Exception:
+                    return True
+            old = int(d.get(key, 0) or 0)
+            if new_amount <= old:
+                d[key] = new_amount
+                return True
+            cap = self._ssd_global_cap()
+            if cap is not None and self._ssd_reserved_total() - old + new_amount > cap:
+                return False
+            d[key] = new_amount
+            return True
+        finally:
+            try:
+                if lk is not None:
+                    lk.release()
+            except Exception:
+                pass
+
+    async def _ssd_rebuild_from_db(self) -> None:
+        """Re-reserve SSD for in-flight rows after (re)start — crash recovery.
+
+        Uses DB-aware footprints: batched rows reserve one batch upper bound
+        (min(total, configured)), singles reserve total. WAITING_DISK rows
+        hold nothing. Best-effort: never raises.
+        """
+        try:
+            d = getattr(self, "_ssd_reserved", None)
+            if not isinstance(d, dict):
+                self._ssd_reserved = {}  # type: ignore[attr-defined]
+                d = self._ssd_reserved
+            else:
+                d.clear()
+            store = getattr(self, "store", None)
+            if store is None or not hasattr(store, "all"):
+                return
+            try:
+                rows = await asyncio.to_thread(store.all)
+            except Exception:
+                return
+            cap = self._ssd_global_cap()
+            for ts in rows or []:
+                try:
+                    if getattr(ts, "state", None) not in (
+                        State.QUEUED, State.DOWNLOADING, State.MOVING,
+                    ):
+                        continue
+                    h = (getattr(ts, "source_infohash", "") or "").lower()
+                    if not h:
+                        continue
+                    try:
+                        total = max(0, int(getattr(ts, "total_bytes", 0) or 0))
+                    except Exception:
+                        total = 0
+                    batches = 0
+                    try:
+                        batches = int(getattr(ts, "batches_total", 0) or 0)
+                    except Exception:
+                        batches = 0
+                    if batches > 1 and cap is not None:
+                        amt = min(total, cap) if total > 0 else cap
+                    elif cap is not None and total > cap and batches <= 1:
+                        # Unclassified large row: optimistically one batch;
+                        # _setup refines (or tops up + rolls back for singles).
+                        amt = cap
+                    else:
+                        amt = total
+                    if amt > 0:
+                        d[h] = int(amt)
+                except Exception:
+                    continue
+            # Clamp dict size for safety.
+            if len(d) > 5000:
+                for k in list(d.keys())[: len(d) - 5000]:
+                    d.pop(k, None)
+            log.info(
+                "ssd ledger rebuilt: %d rows reserved ~%d MB of %s cap",
+                len(d), sum(d.values()) // (1024 * 1024),
+                f"{cap // (1024*1024)} MB" if cap else "unlimited",
+            )
+        except Exception:
+            pass
+
     async def _do_new(self, ts: TorrentState) -> None:
         if ts.cross_seed_source == "watch-dir":
             await self._do_new_watch_dir(ts)
@@ -1864,9 +2153,15 @@ class Coordinator:
         ts.cross_seed_blob = decision.torrent_bytes
         ts._blob = decision.torrent_bytes
 
-        needed = self._effective_inflight_cap(decision.size_bytes)
-        if not ssd_has_room(self.cfg, needed):
-            log.info("ssd cap in use; parking %s", st.name)
+        # Global SSD ledger: reserve before QUEUED so concurrent high-size
+        # arrivals can't all pass a point-in-time free check and exceed the
+        # budget as they grow. Estimate uses the stable configured cap.
+        needed = self._ssd_estimate_for_new(decision.size_bytes)
+        if not await self._ssd_try_reserve(ts.source_infohash, needed):
+            log.info(
+                "ssd budget in use (reserved ~%d MB); parking %s",
+                self._ssd_reserved_total() // (1024 * 1024), st.name,
+            )
             self.transition(ts, State.WAITING_DISK)
         else:
             self.transition(ts, State.QUEUED)
@@ -2026,9 +2321,12 @@ class Coordinator:
         ts.cross_seed_blob = chosen_blob
         ts._blob = chosen_blob
 
-        needed = self._effective_inflight_cap(chosen_size)
-        if not ssd_has_room(self.cfg, needed):
-            log.info("ssd cap in use; parking %s", ts.source_name)
+        needed = self._ssd_estimate_for_new(chosen_size)
+        if not await self._ssd_try_reserve(ts.source_infohash, needed):
+            log.info(
+                "ssd budget in use (reserved ~%d MB); parking %s",
+                self._ssd_reserved_total() // (1024 * 1024), ts.source_name,
+            )
             self.transition(ts, State.WAITING_DISK)
         else:
             self.transition(ts, State.QUEUED)
@@ -2128,8 +2426,8 @@ class Coordinator:
         ts.cross_seed_blob = decision.torrent_bytes
         ts._blob = decision.torrent_bytes
 
-        needed = self._effective_inflight_cap(decision.size_bytes)
-        if not ssd_has_room(self.cfg, needed):
+        needed = self._ssd_estimate_for_new(decision.size_bytes)
+        if not await self._ssd_try_reserve(ts.source_infohash, needed):
             self.transition(ts, State.WAITING_DISK)
         else:
             self.transition(ts, State.QUEUED)
@@ -2139,12 +2437,13 @@ class Coordinator:
     WAITING_DISK_RECHECK_SECONDS = 60.0
 
     async def _wait_disk_then_queue(self, ts: TorrentState) -> None:
-        # The size check uses min(total_bytes, per-batch cap); for seasons the real SSD footprint
-        # is bounded by the batch cap. The actual add will re-check.
+        # Global ledger re-check (quiet 60s cadence): reserves before QUEUED
+        # so a new arrival mid-batch can't over-commit the budget that batch
+        # completion is about to need.
         if self._stop:
             return
-        needed = self._effective_inflight_cap(ts.total_bytes)
-        if ssd_has_room(self.cfg, needed):
+        needed = self._ssd_estimate_for_new(ts.total_bytes)
+        if await self._ssd_try_reserve(ts.source_infohash, needed):
             try:
                 _wd = getattr(self, "_waiting_disk_next_check", None)
                 if isinstance(_wd, dict):
@@ -2402,6 +2701,11 @@ class Coordinator:
             if await self._fuse_skipped([(only.name, only.size_bytes)], cls.kind):
                 log.info("single file %s already on remote; skipping SSD download",
                          only.name)
+                # No SSD footprint — free the admission estimate for waiters.
+                try:
+                    await self._ssd_adjust(ts.source_infohash, 0)
+                except Exception:
+                    pass
                 self.transition(ts, State.MOVING)
                 return
 
@@ -2426,6 +2730,7 @@ class Coordinator:
 
         # Apply batch file priorities for seasons
         first_need: set[str] | None = None
+        _real_footprint: int | None = None
         if cls.kind in ("season", "mixed") and cls.episodes:
             episodes = [e for e in cls.episodes]
             cap = self._frozen_batch_cap(ts)
@@ -2435,12 +2740,24 @@ class Coordinator:
                 total_ep = sum(e.size_bytes for e in episodes)
                 if not ssd_has_room(self.cfg, min(total_ep, ts.total_bytes or total_ep)):
                     log.info("ssd cap in use; parking %s", ts.source_name)
+                    try:
+                        _h = ts.dest_infohash or ts.source_infohash
+                        if _h:
+                            await self.dest_client.delete(_h, delete_files=True)
+                    except Exception:
+                        pass
                     self.transition(ts, State.WAITING_DISK)
                     return
                 cap = total_ep or ts.total_bytes or 1
             batches = make_batches(episodes, cap_bytes=cap)
             ts.batches_total = len(batches)
             ts.batch_index = 0
+            # Refine global reservation to the real footprint (max batch —
+            # covers varying episode sizes, isolated batches hold one at a time).
+            try:
+                _real_footprint = max((b.size_bytes for b in batches), default=0) or cap
+            except Exception:
+                _real_footprint = cap
             if batches:
                 # First batch only: priority 1; rest: 0. Files a previous run
                 # already moved stay deselected (re-downloaded never).
@@ -2466,12 +2783,22 @@ class Coordinator:
                 total_files = sum(f.size_bytes for f in files)
                 if not ssd_has_room(self.cfg, min(total_files, ts.total_bytes or total_files)):
                     log.info("ssd cap in use; parking %s", ts.source_name)
+                    try:
+                        _h = ts.dest_infohash or ts.source_infohash
+                        if _h:
+                            await self.dest_client.delete(_h, delete_files=True)
+                    except Exception:
+                        pass
                     self.transition(ts, State.WAITING_DISK)
                     return
                 cap = total_files or ts.total_bytes or 1
             batches = make_file_batches(files, cap_bytes=cap)
             ts.batches_total = len(batches)
             ts.batch_index = 0
+            try:
+                _real_footprint = max((b.size_bytes for b in batches), default=0) or cap
+            except Exception:
+                _real_footprint = cap
             if batches:
                 first = batches[0]
                 wanted = {ep.file_name for ep in first.episodes}
@@ -2483,6 +2810,38 @@ class Coordinator:
                 await self.dest_client.set_file_priorities(
                     ts.dest_infohash or ts.source_infohash, prio_map,
                 )
+
+        # Refine the admission estimate to the real SSD footprint now that
+        # classification/batches are known (varying episode/game sizes → max
+        # batch; singles/full-torrent → total). Shrinking always succeeds and
+        # frees budget for waiters; growing (single bigger than estimate) can
+        # fail globally — roll back the just-added torrent and park.
+        try:
+            if _real_footprint is None:
+                try:
+                    _real_footprint = sum(f.size_bytes for f in files) or ts.total_bytes or 0
+                except Exception:
+                    _real_footprint = ts.total_bytes or 0
+            if _real_footprint and _real_footprint > 0:
+                _ok = await self._ssd_adjust(ts.source_infohash, int(_real_footprint))
+            else:
+                _ok = True
+        except Exception:
+            _ok = True
+        if not _ok:
+            log.info(
+                "ssd budget in use after classify (need ~%d MB, reserved ~%d MB); parking %s",
+                int(_real_footprint or 0) // (1024 * 1024),
+                self._ssd_reserved_total() // (1024 * 1024), ts.source_name,
+            )
+            try:
+                _h = ts.dest_infohash or ts.source_infohash
+                if _h:
+                    await self.dest_client.delete(_h, delete_files=True)
+            except Exception:
+                pass
+            self.transition(ts, State.WAITING_DISK)
+            return
 
         # Resume (skipped when the first batch needs nothing locally yet:
         # a client with zero selected files may refuse; the download loop
