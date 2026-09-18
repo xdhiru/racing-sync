@@ -270,12 +270,27 @@ class StateStore:
             str(db_path), isolation_level=None, timeout=30.0, check_same_thread=False
         )
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        journal_mode = self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        try:
+            mode = (journal_mode[0] if journal_mode else "").lower()
+        except Exception:
+            mode = ""
+        if mode != "wal":
+            log.warning("state DB journal_mode is %r, not WAL; performance may degrade", journal_mode)
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=30000")
+        # Bound WAL growth on long-lived coordinators doing per-tick upserts.
+        try:
+            self._conn.execute("PRAGMA journal_size_limit=67108864")
+        except Exception:
+            pass
         self._conn.executescript(SCHEMA_TABLES)
         self._migrate()
         self._conn.executescript(SCHEMA_INDEXES)
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("StateStore is closed")
 
     def close(self) -> None:
         with self._lock:
@@ -341,6 +356,7 @@ class StateStore:
     # ---- CRUD ----
 
     def get(self, source_infohash: str, include_blob: bool = True) -> TorrentState | None:
+        self._ensure_open()
         cols = "*" if include_blob else _TORRENT_STATE_COLUMNS_NO_BLOB
         with self._lock:
             row = self._conn.execute(
@@ -350,6 +366,7 @@ class StateStore:
             return _row_to_state(row) if row else None
 
     def get_blob(self, source_infohash: str) -> bytes:
+        self._ensure_open()
         with self._lock:
             row = self._conn.execute(
                 "SELECT cross_seed_blob FROM torrent_state WHERE source_infohash = ?",
@@ -360,6 +377,7 @@ class StateStore:
             return b""
 
     def upsert(self, ts: TorrentState) -> None:
+        self._ensure_open()
         with self._lock:
             ts.updated_at = dt.datetime.now(dt.timezone.utc)
             row = ts.to_row()
@@ -450,9 +468,24 @@ class StateStore:
             ).fetchall()
             return [_row_to_state(r) for r in rows]
 
-    def all(self, include_blob: bool = False) -> list[TorrentState]:
+    def all(self, include_blob: bool = False, limit: int | None = None, offset: int = 0) -> list[TorrentState]:
         cols = "*" if include_blob else _TORRENT_STATE_COLUMNS_NO_BLOB
         with self._lock:
+            if limit is not None:
+                try:
+                    limit = int(limit)
+                except (TypeError, ValueError):
+                    limit = None
+                try:
+                    offset = int(offset)
+                except (TypeError, ValueError):
+                    offset = 0
+                if limit is not None and limit > 0:
+                    rows = self._conn.execute(
+                        f"SELECT {cols} FROM torrent_state ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                        (limit, max(0, offset)),
+                    ).fetchall()
+                    return [_row_to_state(r) for r in rows]
             rows = self._conn.execute(
                 f"SELECT {cols} FROM torrent_state ORDER BY updated_at DESC"
             ).fetchall()
@@ -508,6 +541,9 @@ class StateStore:
             ts.readd_first_attempted_at = None
             ts.readd_next_retry_at = None
             ts.readd_attempts = 0
+            # NOTE: failed_retries is intentionally preserved here (lifetime
+            # cap for auto_retry_failed). Callers requesting a fresh retry
+            # (e.g. POST /api/retry) reset it explicitly before transition.
         elif dst == State.DONE:
             ts.failed_retries = 0
             ts.readd_first_attempted_at = None
@@ -564,6 +600,12 @@ class StateStore:
             )
 
     def iter_logs(self, limit: int = 200) -> list[sqlite3.Row]:
+        try:
+            limit = int(limit)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            limit = 200
+        # SQLite LIMIT -1 means "no limit" — clamp to avoid API-driven OOM.
+        limit = max(1, min(limit, 5000))
         with self._lock:
             return self._conn.execute(
                 "SELECT ts, source_infohash, level, message FROM run_log ORDER BY id DESC LIMIT ?",
@@ -599,11 +641,20 @@ def _safe_state(value: object) -> State:
 
 
 def _safe_int(value: object, default: int = 0) -> int:
-    """Float-tolerant int parse; one corrupt cell must not kill a listing."""
+    """Exact int parse; one corrupt cell must not kill a listing."""
     try:
         if value is None or value == "":
             return default
-        return int(float(value))  # type: ignore[arg-type]
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        # Exact first (avoids float precision loss >2**53), float fallback
+        # for "1e3"/"10.0" legacy cells.
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return int(float(value))  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
 
@@ -613,7 +664,11 @@ def _safe_dt(value: object) -> dt.datetime | None:
     if not value:
         return None
     try:
-        return dt.datetime.fromisoformat(str(value))
+        s = str(value).strip()
+        # Legacy cells with trailing Z (UTC) — fromisoformat needs +00:00.
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return dt.datetime.fromisoformat(s)
     except (TypeError, ValueError):
         log.warning("state DB has corrupt datetime %r; treating as None", value)
         return None
