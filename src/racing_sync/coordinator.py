@@ -1033,6 +1033,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup janitor failed: %s", e)
 
+        # 5b. Tombstone GC (hourly): hard-delete forgets older than the TTL.
+        # Must never break the tick either.
+        try:
+            _now = time.monotonic()
+            _last_gc = getattr(self, "_tombstone_last_gc", 0.0)
+            try:
+                _last_gc = float(_last_gc or 0.0)
+            except (TypeError, ValueError):
+                _last_gc = 0.0
+            if _now - _last_gc >= 3600:
+                self._tombstone_last_gc = _now
+                _n = await asyncio.to_thread(self.store.gc_tombstones)
+                if _n:
+                    log.info("tombstone GC removed %d expired forget row(s)", _n)
+        except Exception as e:  # noqa: BLE001
+            log.warning("tombstone GC failed: %s", e)
+
     async def _refresh_live_status(self) -> None:
         """Re-query VPS2 progress and update the live map."""
         if not self._live:

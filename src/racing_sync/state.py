@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
+from .coordinator_errors import AbandonedError
+
 log = logging.getLogger(__name__)
 
 
@@ -161,6 +163,11 @@ class TorrentState:
     updated_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc))
     # Telegram detail message id (0 if not yet sent).
     telegram_message_id: int = 0
+    # Forget tombstone (forget() stamps instead of deleting): tombstoned
+    # rows are invisible to every read and refuse every write for
+    # _TOMBSTONE_TTL_SECONDS, then the janitor hard-deletes them. New
+    # writers are safe by default — no per-site forget guards needed.
+    deleted_at: dt.datetime | None = None
     # Transient in-memory storage for the .torrent bytes during processing
     _blob: bytes = b""
 
@@ -211,6 +218,9 @@ class TorrentState:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "telegram_message_id": self.telegram_message_id,
+            "deleted_at":
+                self.deleted_at.isoformat()
+                if self.deleted_at else "",
         }
 
 
@@ -246,7 +256,8 @@ CREATE TABLE IF NOT EXISTS torrent_state (
     last_error               TEXT NOT NULL DEFAULT '',
     telegram_message_id      INTEGER NOT NULL DEFAULT 0,
     created_at               TEXT NOT NULL,
-    updated_at               TEXT NOT NULL
+    updated_at               TEXT NOT NULL,
+    deleted_at               TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS run_log (
@@ -287,8 +298,13 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = (
     "indexer_next_retry_at, indexer_attempts, force_direct, readd_first_attempted_at, "
     "readd_next_retry_at, readd_attempts, failed_retries, completed_at, "
     "vps1_last_activity_at, state, batch_index, batches_total, batch_cap_bytes, readd_cycles, "
-    "last_error, created_at, updated_at, telegram_message_id"
+    "last_error, created_at, updated_at, telegram_message_id, deleted_at"
 )
+
+
+# Forget-tombstone lifetime: stamped rows stay invisible/refusing for a
+# day (covers in-flight workers, retries and re-discovery), then GC.
+_TOMBSTONE_TTL_SECONDS = 24 * 3600
 
 
 class StateStore:
@@ -340,6 +356,7 @@ class StateStore:
             "ADD COLUMN batch_cap_bytes INTEGER NOT NULL DEFAULT 0",
             "ADD COLUMN readd_cycles INTEGER NOT NULL DEFAULT 0",
             "ADD COLUMN telegram_message_id INTEGER NOT NULL DEFAULT 0",
+            "ADD COLUMN deleted_at TEXT NOT NULL DEFAULT ''",
         ):
             try:
                 self._conn.execute(f"ALTER TABLE torrent_state {_ddl}")
@@ -372,7 +389,8 @@ class StateStore:
         cols = "*" if include_blob else _TORRENT_STATE_COLUMNS_NO_BLOB
         with self._lock:
             row = self._conn.execute(
-                f"SELECT {cols} FROM torrent_state WHERE source_infohash = ?",
+                f"SELECT {cols} FROM torrent_state WHERE source_infohash = ? "
+                "AND deleted_at = ''",
                 (source_infohash,),
             ).fetchone()
             return _row_to_state(row) if row else None
@@ -381,15 +399,38 @@ class StateStore:
         self._ensure_open()
         with self._lock:
             row = self._conn.execute(
-                "SELECT cross_seed_blob FROM torrent_state WHERE source_infohash = ?",
+                "SELECT cross_seed_blob FROM torrent_state WHERE source_infohash = ? "
+                "AND deleted_at = ''",
                 (source_infohash,),
             ).fetchone()
             if row and row["cross_seed_blob"]:
                 return bytes(row["cross_seed_blob"])
             return b""
 
+    def _is_tombstoned(self, source_infohash: str) -> bool:
+        """True when the hash carries a live forget tombstone.
+
+        Fail-open (False) on any store error: a transient DB blip must
+        never divert live work, and the coordinator-level _abandoned()
+        re-check bounds the race anyway.
+        """
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT deleted_at FROM torrent_state WHERE source_infohash = ?",
+                    (source_infohash,),
+                ).fetchone()
+            return bool(row and row["deleted_at"])
+        except Exception:
+            return False
+
     def upsert(self, ts: TorrentState) -> None:
         self._ensure_open()
+        if self._is_tombstoned(ts.source_infohash):
+            # Forget tombstone: the operator abandoned this torrent — drop
+            # the write instead of resurrecting it. Applies to creates too
+            # (re-discovery while tombstoned stays away until GC expiry).
+            return
         with self._lock:
             ts.updated_at = dt.datetime.now(dt.timezone.utc)
             row = ts.to_row()
@@ -419,7 +460,7 @@ class StateStore:
         qmarks = ",".join(["?"] * len(states))
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state IN ({qmarks}) ORDER BY updated_at",
+                f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state IN ({qmarks}) AND deleted_at = '' ORDER BY updated_at",
                 [s.value for s in states],
             ).fetchall()
             return [_row_to_state(r) for r in rows]
@@ -435,6 +476,7 @@ class StateStore:
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state = 'waiting_indexer' "
+                "AND deleted_at = '' "
                 "AND indexer_next_retry_at != '' "
                 "AND indexer_next_retry_at <= ? ORDER BY indexer_next_retry_at",
                 (now.isoformat(),),
@@ -451,6 +493,7 @@ class StateStore:
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state NOT IN ('done','failed') "
+                "AND deleted_at = '' "
                 "ORDER BY updated_at DESC"
             ).fetchall()
             return [_row_to_state(r) for r in rows]
@@ -459,7 +502,8 @@ class StateStore:
         self._ensure_open()
         with self._lock:
             row = self._conn.execute(
-                "SELECT telegram_message_id FROM torrent_state WHERE source_infohash = ?",
+                "SELECT telegram_message_id FROM torrent_state WHERE source_infohash = ? "
+                "AND deleted_at = ''",
                 (source_infohash,),
             ).fetchone()
             if row is None or not row["telegram_message_id"]:
@@ -471,7 +515,7 @@ class StateStore:
         with self._lock:
             self._conn.execute(
                 "UPDATE torrent_state SET telegram_message_id = ?, "
-                "updated_at = ? WHERE source_infohash = ?",
+                "updated_at = ? WHERE source_infohash = ? AND deleted_at = ''",
                 (message_id, dt.datetime.now(dt.timezone.utc).isoformat(),
                  source_infohash),
             )
@@ -487,13 +531,13 @@ class StateStore:
                     limit = None
             if limit is not None and limit > 0:
                 rows = self._conn.execute(
-                    f"SELECT {cols} FROM torrent_state WHERE state != 'done' AND state != 'failed' "
+                    f"SELECT {cols} FROM torrent_state WHERE state != 'done' AND state != 'failed' AND deleted_at = '' "
                     "ORDER BY updated_at DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
                 return [_row_to_state(r) for r in rows]
             rows = self._conn.execute(
-                f"SELECT {cols} FROM torrent_state WHERE state != 'done' AND state != 'failed' "
+                f"SELECT {cols} FROM torrent_state WHERE state != 'done' AND state != 'failed' AND deleted_at = '' "
                 "ORDER BY updated_at"
             ).fetchall()
             return [_row_to_state(r) for r in rows]
@@ -513,12 +557,12 @@ class StateStore:
                     offset = 0
                 if limit is not None and limit > 0:
                     rows = self._conn.execute(
-                        f"SELECT {cols} FROM torrent_state ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                        f"SELECT {cols} FROM torrent_state WHERE deleted_at = '' ORDER BY updated_at DESC LIMIT ? OFFSET ?",
                         (limit, max(0, offset)),
                     ).fetchall()
                     return [_row_to_state(r) for r in rows]
             rows = self._conn.execute(
-                f"SELECT {cols} FROM torrent_state ORDER BY updated_at DESC"
+                f"SELECT {cols} FROM torrent_state WHERE deleted_at = '' ORDER BY updated_at DESC"
             ).fetchall()
             return [_row_to_state(r) for r in rows]
 
@@ -538,9 +582,9 @@ class StateStore:
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state "
-                "WHERE source_name = ? OR source_name = ? "
+                "WHERE deleted_at = '' AND (source_name = ? OR source_name = ? "
                 "OR source_name = ? OR source_name LIKE ? ESCAPE '\\' "
-                "OR source_name LIKE ? ESCAPE '\\' "
+                "OR source_name LIKE ? ESCAPE '\\') "
                 "ORDER BY updated_at DESC",
                 (
                     source_name,
@@ -558,6 +602,39 @@ class StateStore:
             self._conn.execute(
                 "DELETE FROM torrent_state WHERE source_infohash = ?", (source_infohash,)
             )
+
+    def tombstone(self, source_infohash: str) -> bool:
+        """Stamp a forget tombstone; True when a live row was stamped.
+
+        The row stays (invisible to reads, refusing writes) for
+        _TOMBSTONE_TTL_SECONDS so in-flight workers, retries and
+        re-discovery cannot resurrect it, then gc_tombstones() hard-deletes
+        it. Idempotent: re-stamping refreshes the stamp.
+        """
+        self._ensure_open()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE torrent_state SET deleted_at = ?, updated_at = ? "
+                "WHERE source_infohash = ? AND deleted_at = ''",
+                (now, now, source_infohash),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def gc_tombstones(self, ttl_seconds: int = _TOMBSTONE_TTL_SECONDS) -> int:
+        """Hard-delete tombstones older than the TTL. Returns rows removed."""
+        self._ensure_open()
+        try:
+            cutoff = (dt.datetime.now(dt.timezone.utc)
+                      - dt.timedelta(seconds=max(0, int(ttl_seconds or 0)))).isoformat()
+        except (TypeError, ValueError):
+            return 0
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM torrent_state WHERE deleted_at != '' AND deleted_at <= ?",
+                (cutoff,),
+            )
+            return cur.rowcount or 0
 
     # ---- ignore list (cancelled releases) ----
 
@@ -654,6 +731,12 @@ class StateStore:
 
     def transition(self, ts: TorrentState, dst: State,
                    *, error: str = "", batch_index: int | None = None) -> None:
+        if self._is_tombstoned(ts.source_infohash):
+            # Forget won this row: transitioning would upsert-resurrect it.
+            raise AbandonedError(
+                f"row tombstoned (forgotten?) for {(ts.source_infohash or '')[:10]}; "
+                f"refusing {ts.state.value} -> {dst.value}"
+            )
         check_transition(ts.state, dst)
         src = ts.state
         now = dt.datetime.now(dt.timezone.utc)
@@ -902,4 +985,9 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
             or dt.datetime.now(dt.timezone.utc)
         ) if "updated_at" in keys else dt.datetime.now(dt.timezone.utc),
         telegram_message_id=_safe_int(row["telegram_message_id"]) if "telegram_message_id" in keys else 0,
+        deleted_at=(
+            _safe_dt(row["deleted_at"])
+            if ("deleted_at" in keys and row["deleted_at"])
+            else None
+        ),
     )

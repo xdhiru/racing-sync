@@ -20,6 +20,7 @@ from pathlib import Path
 
 from .clients.abstract import TorrentClient, TorrentFile
 from .config import AppConfig
+from .coordinator_errors import AbandonedError
 from .rclone_ops import ssd_free_bytes
 from .state import State, StateStore, TorrentState
 
@@ -635,6 +636,10 @@ def _force_state(store: StateStore, ts: TorrentState, dst: State, *, error: str 
     """
     try:
         store.transition(ts, dst, error=error)
+    except AbandonedError:
+        # Tombstoned mid-recovery (concurrent forget): the operator won —
+        # leave the tombstone alone instead of resurrecting it.
+        return
     except ValueError:
         ts.state = dst
         if error:

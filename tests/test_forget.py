@@ -457,3 +457,30 @@ def test_watch_cross_seed_dir_rejects_hostile_hash(tmp_path: Path):
     assert _watch_cross_seed_dir(db, "../../evil") is None
     assert _watch_cross_seed_dir(db, "") is None
     assert _watch_cross_seed_dir(db, "z" * 40) is None
+
+
+@pytest.mark.anyio
+async def test_forget_tombstones_row_and_blocks_reingest(tmp_path: Path):
+    """Forget stamps a tombstone: the row stays but reads miss it and a
+    same-hash re-ingest (still-listed source) does not resurrect it."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(_row(save_path=str(ssd)))
+    dest = FakeDest()
+
+    result = await forget_torrent(
+        _cfg(ssd), dest=dest, store=store, target="a" * 40,
+        apply=True, delete_files=True,
+    )
+    assert result["applied"] is True
+    # Physically present (tombstoned), logically gone.
+    raw = store._conn.execute(
+        "SELECT deleted_at FROM torrent_state WHERE source_infohash = ?",
+        ("a" * 40,)).fetchone()
+    assert raw and raw["deleted_at"]
+    assert store.get("a" * 40) is None
+    # Re-discovery while tombstoned is a silent no-op.
+    store.upsert(_row(save_path=str(ssd)))
+    assert store.get("a" * 40) is None
+    store.close()
