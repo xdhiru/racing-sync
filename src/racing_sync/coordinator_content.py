@@ -171,6 +171,11 @@ class SourceDecision:
     size_bytes: int
     infohash: str
     announce_url: str = ""
+    # False only for a direct (SFTP/export) fallback onto a private
+    # non-download swarm — the one commit the preferred-copy grace may
+    # hold. Everything else (public, cross-seed, redirected direct) is
+    # already preferred.
+    preferred: bool = True
 
 
 def indexer_slug(name: str) -> str:

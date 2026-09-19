@@ -242,6 +242,13 @@ def test_check_config_flags_same_remote_and_cap(tmp_path: Path):
     assert any("unsorted" in p for p in problems)
 
 
+def test_general_config_preferred_grace_default():
+    """Preferred-copy grace defaults to 1 hour (0 disables)."""
+    from racing_sync.config import GeneralConfig
+
+    assert GeneralConfig().preferred_copy_grace_seconds == 3600
+
+
 def test_main_full_requires_yes(tmp_path: Path, capsys):
     """Bare --full refuses before touching anything; --yes proceeds."""
     cfg_file = tmp_path / "config.toml"

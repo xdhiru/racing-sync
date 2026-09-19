@@ -923,6 +923,13 @@ class GeneralConfig(BaseModel):
     max_active_downloads: int | None = Field(default=None, ge=1, le=100)
     max_concurrent_moves: int | None = Field(default=None, ge=1, le=100)
     download_stall_timeout_seconds: int = Field(default=0, ge=0)
+    # Preferred-copy grace (seconds): a NEW row whose source is private
+    # and NOT from a download-target indexer holds (stays NEW) this long
+    # before locking the download, giving a download-indexer copy of the
+    # same content time to arrive and preempt it. Prevents burning ratio
+    # on a non-preferred swarm when the preferred one shows up moments
+    # later. 0 = disabled (today's immediate behavior).
+    preferred_copy_grace_seconds: int = Field(default=3600, ge=0)
 
 
 class AppConfig(BaseModel):

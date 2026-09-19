@@ -285,13 +285,55 @@ async def pick_ssd_source_for_racing(
     # bytes. Reached when the Prowlarr query is skipped by config,
     # unavailable/disabled, or bypassed by the caller — never after a real
     # query that merely missed with attempt_prowlarr=True (that parks above).
+    # Prefer a same-content racing copy from a download indexer when one is
+    # visible: leech the preferred swarm, not the source's non-preferred
+    # one. (Prowlarr cross-seeds already come from download indexers, so
+    # this only redirects the SFTP/export fallback. Name/size stay with
+    # the row's own source; only bytes/hash/announce follow the pick.)
+    direct_t = source_torrent
+    try:
+        _entries = getattr(getattr(cfg, "prowlarr", None), "download_indexers", None)
+        if _entries:
+            for _t in [source_torrent, *(other_source_torrents or [])]:
+                try:
+                    _urls = getattr(_t, "trackers", None) or []
+                except Exception:
+                    continue
+                try:
+                    if any(cfg.prowlarr.is_download_indexer(u or "") for u in _urls):
+                        direct_t = _t
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        direct_t = source_torrent
+    # Preferred unless we fall back onto the source's own private
+    # non-download swarm (same-hash cross-tracker variants share an
+    # infohash, so this is decided here — where the registration was
+    # chosen — not by comparing hashes downstream).
+    try:
+        _st_urls = getattr(source_torrent, "trackers", None) or []
+        _st_preferred = _looks_public(_st_urls) or any(
+            cfg.prowlarr.is_download_indexer(u or "") for u in _st_urls)
+    except Exception:
+        _st_preferred = False
+    direct_preferred = (direct_t is not source_torrent) or bool(_st_preferred)
+    if direct_t is not source_torrent:
+        try:
+            log.info(
+                "direct fallback prefers download-indexer racing copy %s over %s",
+                (getattr(direct_t, "infohash", "") or "")[:10],
+                (source_torrent.infohash or "")[:10],
+            )
+        except Exception:
+            pass
     if cfg.cross_seed.allow_ssh_export:
         blob = None
         label = ""
         if sftp is not None:
             log.info(
                 "Prowlarr bypass/fallback: SFTP-exporting private torrent %s from VPS1",
-                source_torrent.infohash[:10],
+                direct_t.infohash[:10],
             )
             # One retry on timeout (same rationale as the public branch:
             # shared transports stall single calls past the budget; a
@@ -299,15 +341,15 @@ async def pick_ssd_source_for_racing(
             for attempt in (1, 2):
                 try:
                     blob = await asyncio.wait_for(
-                        asyncio.to_thread(sftp.fetch_torrent, source_torrent.infohash),
+                        asyncio.to_thread(sftp.fetch_torrent, direct_t.infohash),
                         timeout=15.0,
                     )
                     break
                 except TimeoutError:
                     log.warning("sftp fallback fetch %s timed out after 15s (attempt %d/2)",
-                                source_torrent.infohash[:10], attempt)
+                                direct_t.infohash[:10], attempt)
                 except Exception as e:  # noqa: BLE001
-                    log.warning("sftp fallback fetch %s failed: %s", source_torrent.infohash[:10], e)
+                    log.warning("sftp fallback fetch %s failed: %s", direct_t.infohash[:10], e)
                     break
             if blob:
                 label = "private-sftp-fallback"
@@ -317,7 +359,7 @@ async def pick_ssd_source_for_racing(
             # method), so a failure here after an SFTP miss is routine.
             try:
                 blob = await asyncio.wait_for(
-                    source_client.export_torrent(source_torrent.infohash),
+                    source_client.export_torrent(direct_t.infohash),
                     timeout=15.0,
                 )
             except AttributeError:
@@ -325,10 +367,10 @@ async def pick_ssd_source_for_racing(
             except Exception as e:  # noqa: BLE001
                 if sftp is not None and isinstance(source_client, DelugeClient):
                     log.debug("private export fallback unavailable for %s: %s",
-                              source_torrent.infohash[:10], e)
+                              direct_t.infohash[:10], e)
                 else:
                     log.warning("private export fallback fetch %s failed: %s",
-                                source_torrent.infohash[:10], e)
+                                direct_t.infohash[:10], e)
                 blob = None
             if blob:
                 label = "private-export-fallback"
@@ -338,11 +380,12 @@ async def pick_ssd_source_for_racing(
                 source_label=label,
                 name=source_torrent.name,
                 size_bytes=source_torrent.size_bytes,
-                infohash=source_torrent.infohash,
+                infohash=direct_t.infohash,
                 announce_url=(
-                    source_torrent.trackers[0]
-                    if source_torrent.trackers else ""
+                    direct_t.trackers[0]
+                    if direct_t.trackers else ""
                 ),
+                preferred=direct_preferred,
             )
 
     log.warning(

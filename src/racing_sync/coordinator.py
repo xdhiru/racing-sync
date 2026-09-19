@@ -55,6 +55,7 @@ from .coordinator_content import (
     watch_rank,
 )
 from .coordinator_content import WATCH_ORIGIN_LABELS
+from .coordinator_content import WATCH_ELECTION_WAITER_STATES
 from .coordinator_errors import (
     _NOT_VISIBLE_DETAIL,
     _WEBUI_RETRY_ERRORS,
@@ -1499,6 +1500,37 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 self._park_for_indexer_retry(ts, reason=park_reason)
                 return
 
+        # Preferred-copy grace, post-decision (NEW rows only): the Prowlarr
+        # query above ran as normal; hold only when it commits to
+        # non-preferred direct bytes (a download-indexer copy may still
+        # arrive, or a later search may hit). Cross-seed and public
+        # decisions always proceed; parks never hold. Nothing is reserved
+        # yet, so returning keeps the row NEW with no leakage.
+        _grace_exempted = False
+        try:
+            _ex = getattr(self, "_grace_exempt", None)
+            if isinstance(_ex, dict):
+                _grace_exempted = bool(_ex.pop((ts.source_infohash or "").lower(), None))
+        except Exception:
+            pass
+        if (ts.state == State.NEW and not getattr(ts, "force_direct", 0)
+                and not _grace_exempted and not bool(getattr(decision, "preferred", True))
+                and self._in_preferred_grace(ts)):
+            _hold = False
+            try:
+                if getattr(getattr(self.cfg, "prowlarr", None),
+                           "download_indexers", None):
+                    _hold = True
+            except Exception:
+                _hold = False
+            if _hold:
+                log.info(
+                    "holding %s for preferred copy (non-preferred direct, "
+                    "%ds grace left)",
+                    ts.source_name[:60], self._preferred_grace_left(ts),
+                )
+                return
+
         ts.cross_seed_infohash = decision.infohash.lower()
         ts.cross_seed_source = decision.source_label
         ts.save_path = str(self.cfg.dest.save_path)
@@ -1816,6 +1848,115 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         """SSD-download priority for a watch-dir row: public (0) first."""
         return watch_rank(ts, self.cfg)
 
+    def _preferred_grace_seconds(self) -> int:
+        """Preferred-copy grace window, or 0 when disabled/unconfigured.
+
+        Non-numeric doubles (MagicMock cfg in unit tests) count as 0 —
+        grace is opt-in runtime policy, never test-double behavior.
+        """
+        try:
+            raw = getattr(getattr(self.cfg, "general", None),
+                          "preferred_copy_grace_seconds", 0)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                return 0
+            return max(0, int(raw or 0))
+        except Exception:
+            return 0
+
+    def _in_preferred_grace(self, ts: TorrentState) -> bool:
+        """True while a non-preferred NEW row must wait for a preferred copy.
+
+        Anchored on the persisted created_at (restart-safe, no extra
+        bookkeeping): a row older than the window proceeds. Any doubt
+        fails open (proceed) — grace delays work, so it must never
+        trigger spuriously.
+        """
+        try:
+            grace = self._preferred_grace_seconds()
+            if grace <= 0:
+                return False
+            created = getattr(ts, "created_at", None)
+            if created is None:
+                return False
+            now = dt.datetime.now(dt.timezone.utc)
+            try:
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=dt.timezone.utc)
+            except Exception:
+                return False
+            return (now - created).total_seconds() < grace
+        except Exception:
+            return False
+
+    def _preferred_grace_left(self, ts: TorrentState) -> int:
+        """Whole seconds of grace remaining (0 when none)."""
+        try:
+            grace = self._preferred_grace_seconds()
+            created = getattr(ts, "created_at", None)
+            if grace <= 0 or created is None:
+                return 0
+            now = dt.datetime.now(dt.timezone.utc)
+            try:
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=dt.timezone.utc)
+            except Exception:
+                return 0
+            return max(0, int(grace - (now - created).total_seconds()))
+        except Exception:
+            return 0
+
+    def _grace_holds_peer(self, peer: TorrentState, ts: TorrentState) -> bool:
+        """True when a fellow waiter blocks nobody (phantom-owner guard).
+
+        A waiter that is itself grace-held owns nothing yet — deferring to
+        it serializes behind a download that may never start. Follows the
+        hold rule exactly (rank-2, prefer-possible, in-window); locked rows
+        always block, /prefer_-exempt rows always block, and anything
+        doubtful blocks (fail-safe: skipping is the exceptional path).
+        """
+        try:
+            try:
+                if (peer.source_infohash or "").lower() == (ts.source_infohash or "").lower():
+                    return False
+            except Exception:
+                return False
+            try:
+                if peer.state not in WATCH_ELECTION_WAITER_STATES:
+                    return False
+            except Exception:
+                return False
+            try:
+                if not self._is_watch_row(peer):
+                    return False
+            except Exception:
+                return False
+            try:
+                if self._watch_rank(peer) < 2:
+                    return False
+            except Exception:
+                return False
+            try:
+                prow = getattr(self.cfg, "prowlarr", None)
+                if not (bool(getattr(prow, "enabled", False))
+                        and bool(getattr(prow, "download_indexers", None))):
+                    return False
+            except Exception:
+                return False
+            try:
+                if not self._in_preferred_grace(peer):
+                    return False
+            except Exception:
+                return False
+            try:
+                ex = getattr(self, "_grace_exempt", None)
+                if isinstance(ex, dict) and (peer.source_infohash or "").lower() in ex:
+                    return False
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
     def _watch_election(self, ts: TorrentState) -> tuple[bool, TorrentState | None]:
         """Whether this watch-dir row may proceed to SSD admission.
 
@@ -1829,12 +1970,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         Origin is checked with `_is_watch_row` (labels change past NEW),
         never one label. Never raises: any doubt proceeds solo (today's
         behavior).
+
+        Grace-held peers own nothing yet (no SSD budget, no client entry),
+        so they never block: they are dropped before electing, letting
+        fellow waiters evaluate — and hold — independently instead of
+        deferring to a phantom owner. Whoever locks first (grace expiry,
+        /prefer_) blocks the rest via the unchanged locked rule; exempt
+        (/prefer_'d) rows always block. Inert when grace is disabled.
         """
         try:
             rows = self.store.all()
         except Exception as e:  # noqa: BLE001
             log.warning("watch-dir election: cannot list rows (%s); proceeding solo", e)
             return True, None
+        try:
+            rows = [r for r in (rows or []) if not self._grace_holds_peer(r, ts)]
+        except Exception:
+            pass
         try:
             winner = watch_election_winner(rows, ts, self.cfg)
         except Exception as e:  # noqa: BLE001
@@ -1854,6 +2006,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         try:
             proceed, owner = self._watch_election(ts)
             if proceed or owner is None:
+                # No owner — but a sacrificial row inside its preferred-copy
+                # grace is still deliberately held: say so on the card.
+                try:
+                    if (proceed and owner is None and self._watch_rank(ts) >= 2
+                            and self._in_preferred_grace(ts)):
+                        return (f"Waiting for preferred copy · "
+                                f"{self._preferred_grace_left(ts)}s left")
+                except Exception:
+                    pass
                 return ""
             domain = announce_domain(owner.source_announce_url) or announce_domain(
                 owner.source_tracker)
@@ -1907,6 +2068,39 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                      ts.source_name[:60], _owner_desc)
             return
 
+        # Preferred-copy grace candidacy (decided after the Prowlarr search
+        # below, which runs as normal): a sacrificial (rank-2) row with no
+        # preferred bytes yet holds instead of locking, so a preferred drop
+        # can preempt it. A /prefer_ operator override exempts one row
+        # (one-shot, consumed here). Public/rank-1 rows, expired graces, and
+        # setups with no download indexers configured (rank-1 unreachable)
+        # never hold.
+        try:
+            _rank_now = self._watch_rank(ts)
+        except Exception:
+            _rank_now = 2
+        # One-shot /prefer_ exemption (consumed here): the operator already
+        # chose this row, so the hold below must not re-arm on it.
+        _exempted = False
+        try:
+            _ex = getattr(self, "_grace_exempt", None)
+            if isinstance(_ex, dict):
+                _exempted = bool(_ex.pop((ts.source_infohash or "").lower(), None))
+        except Exception:
+            pass
+        try:
+            _prow = getattr(self.cfg, "prowlarr", None)
+            _prefer_possible = bool(getattr(_prow, "enabled", False)) and bool(
+                getattr(_prow, "download_indexers", None))
+        except Exception:
+            _prefer_possible = False
+        _hold_candidate = (not _exempted and _rank_now >= 2 and _prefer_possible
+                           and self._in_preferred_grace(ts))
+        # Set when the search below secures download-indexer bytes: a
+        # preferred source found automatically releases the hold.
+        _found_preferred = False
+        _h = (ts.source_infohash or "").lower()
+
         ts.save_path = str(self.cfg.dest.save_path)
         tracker_list = [u for u in ts.source_announce_url.split(",") if u] or ([ts.source_tracker] if ts.source_tracker else [])
         is_public = _looks_public(tracker_list)
@@ -1928,9 +2122,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             self.cfg.general.state_db, ts.source_infohash)
         if watch_cross_dir is not None:
             await asyncio.to_thread(watch_cross_dir.mkdir, parents=True, exist_ok=True)
-            # Always persist the dropped .torrent so it can be seeded on FUSE
+            # Always persist the dropped .torrent so it can be seeded on FUSE.
+            # Skip the rewrite when already persisted: held rows re-run this
+            # worker every tick and must not churn megabytes to SSD.
             _safe_name = f"{ts.source_infohash.strip().lower()}.torrent"
-            await asyncio.to_thread((watch_cross_dir / _safe_name).write_bytes, blob)
+            try:
+                _persisted = await asyncio.to_thread((watch_cross_dir / _safe_name).exists)
+            except OSError:
+                _persisted = False
+            if not _persisted:
+                await asyncio.to_thread((watch_cross_dir / _safe_name).write_bytes, blob)
         else:
             log.warning("refusing blob persistence for %s: bad infohash %r",
                         ts.source_name[:60], ts.source_infohash)
@@ -1947,6 +2148,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
         # If Prowlarr is enabled and not skipped, perform single parallel search
         should_skip_prowlarr = self.cfg.prowlarr.should_skip_title(ts.source_name)
+        # Defaults for the skip/disabled branches below (which define
+        # nothing): empty search scope, empty hits.
+        indexers_to_query = []
+        download_idx_names: list[str] = []
+        hits_by_indexer: dict[str, list[TorrentHit]] = {}
         if not query_prowlarr:
             log.info("prowlarr: skipping search for watch-dir release %r (watch_dir.query_prowlarr is False)", ts.source_name)
         elif should_skip_prowlarr:
@@ -1976,7 +2182,26 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     seen_names.add(idx.name.lower())
 
             hits_by_indexer: dict[str, list[TorrentHit]] = {}
-            if indexers_to_query:
+            # Prowlarr search runs as normal (it is itself a preferred-source
+            # finder): a sacrificial hit below releases the hold immediately.
+            # While holding, repeats wait out prowlarr_retry_interval_seconds —
+            # the same cadence as the WAITING_INDEXER retry loop — instead of
+            # hammering the indexers every tick.
+            _search_due = True
+            if _hold_candidate:
+                _search_due = False
+                try:
+                    _ri = getattr(getattr(self.cfg, "cross_seed", None),
+                                  "prowlarr_retry_interval_seconds", 1800)
+                    if isinstance(_ri, bool) or not isinstance(_ri, (int, float)):
+                        raise TypeError
+                    _interval = max(60.0, float(_ri))
+                    _ls = getattr(self, "_last_grace_search", None)
+                    _last = _ls.get(_h) if isinstance(_ls, dict) else None
+                    _search_due = _last is None or (time.monotonic() - float(_last)) >= _interval
+                except Exception:
+                    _search_due = True
+            if _search_due and indexers_to_query:
                 try:
                     hits_by_indexer = await self.prowlarr.search_indexers_parallel(
                         indexers_to_query, ts.source_name
@@ -1984,6 +2209,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 except Exception as e:
                     log.warning("watch-dir: prowlarr search failed for %s: %s", ts.source_name, e)
                     hits_by_indexer = {}
+                try:
+                    _ls = getattr(self, "_last_grace_search", None)
+                    if not isinstance(_ls, dict):
+                        _ls = {}
+                        self._last_grace_search = _ls  # type: ignore[attr-defined]
+                    _ls[_h] = time.monotonic()
+                    if len(_ls) > 5000:
+                        for _k in list(_ls.keys())[: len(_ls) - 5000]:
+                            _ls.pop(_k, None)
+                except Exception:
+                    pass
 
             # 1. Sacrificial download torrent from the download-target
             # indexers, in priority order — first exact match wins.
@@ -2024,6 +2260,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                             "watch-dir: using sacrificial download torrent from %s (%s)",
                             best_dl.indexer, best_dl.title,
                         )
+                        # Download-indexer bytes secured: a preferred source
+                        # was found automatically (the primary choice) — the
+                        # grace hold below must not re-arm on this run.
+                        _found_preferred = True
                     except Exception as e:  # noqa: BLE001
                         log.warning(
                             "failed to fetch download indexer torrent: %s; using dropped file", e
@@ -2082,6 +2322,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         ts.cross_seed_source = chosen_label
         ts.cross_seed_blob = chosen_blob
         ts._blob = chosen_blob
+
+        # Preferred-copy grace, post-search: hold only when falling back to
+        # the dropped non-preferred bytes (a preferred drop may still
+        # arrive, or a later search may hit). A secured sacrificial copy,
+        # public/rank-1 rows, expired graces, /prefer_'d rows and setups
+        # without download indexers proceed immediately. Nothing is
+        # reserved yet, so returning keeps the row NEW with no leakage.
+        if (_hold_candidate and not _found_preferred
+                and self._in_preferred_grace(ts)):
+            log.info(
+                "watch-dir: holding %s for preferred copy (rank 2, %ds grace left)",
+                ts.source_name[:60], self._preferred_grace_left(ts),
+            )
+            return
 
         # Admit-time all-remote skip: the bytes already sit verified on
         # fuse, so no SSD budget is reserved at all (even reserve(0) can

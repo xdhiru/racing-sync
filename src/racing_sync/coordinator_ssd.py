@@ -211,8 +211,13 @@ class SSDLedgerMixin:
                         d.pop(h, None)
             # Quiet-wait hints / MOVING-park counters for rows that left
             # (or lost) those states without a transition pop.
+            # Quiet-wait hints / MOVING-park counters / prefer exemptions /
+            # grace-search timestamps for rows that left (or lost) those
+            # states without a transition pop.
             for attr, want in (("_waiting_disk_next_check", State.WAITING_DISK),
-                               ("_moving_parks", State.MOVING)):
+                               ("_moving_parks", State.MOVING),
+                               ("_grace_exempt", State.NEW),
+                               ("_last_grace_search", State.NEW)):
                 try:
                     m = getattr(self, attr, None)
                     if not isinstance(m, dict) or not m:
