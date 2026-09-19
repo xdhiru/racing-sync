@@ -217,6 +217,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     # FAILED/WAITING_DISK/forget. Rebuilt from DB on startup for crash recovery.
     _ssd_reserved: dict[str, int] = field(default_factory=dict, init=False)
     _ssd_lock: asyncio.Lock | None = field(default=None, init=False)
+    # Download admission set: hashes admitted at the QUEUED edge with a live
+    # worker, bounding concurrent DOWNLOADING admissions to the configured
+    # cap across same-tick racers (sync check+record; cleared on leaving
+    # QUEUED, reconciled against _running_infohashes on each check).
+    _download_admissions: set[str] = field(default_factory=set, init=False)
     # Consecutive MOVING-park counter: infohash.lower() -> parks in a row.
     # _do_moving parks (pause unverified, 0-transfer rclone, short bytes…)
     # with only a warning, so a gate that never passes idles as plain
@@ -1064,6 +1069,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     _rsv.pop((ts.source_infohash or "").lower(), None)
             except Exception:
                 pass
+        # Download admission slot: leaving QUEUED frees it (admission is
+        # recorded at the QUEUED edge; every exit — DOWNLOADING, FAILED,
+        # WAITING_DISK — must release, or parked rows starve).
+        if prev == State.QUEUED and dst != State.QUEUED:
+            try:
+                _adm = getattr(self, "_download_admissions", None)
+                if isinstance(_adm, set):
+                    _adm.discard((ts.source_infohash or "").lower())
+            except Exception:
+                pass
         # MOVING stall counter: leaving MOVING resets consecutive parks
         # (a later re-entry starts fresh). transition() also clears the
         # parked last_error via error="".
@@ -1574,6 +1589,66 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
     # ---- state: QUEUED ----
 
+    def _try_admit_download(self, ts: TorrentState) -> bool:
+        """Admit one QUEUED row into downloading; False parks it (stay QUEUED).
+
+        The tick loop only gates rows that are QUEUED at snapshot time, so a
+        fresh-start burst of NEW workers can sail past it into DOWNLOADING
+        (live incident: 5 concurrent against max 3). This edge check closes
+        it. Admission is atomic in the event loop (sync check+record, no
+        await between), so same-tick workers racing through slow RPCs can't
+        all read a stale count. Rows already DOWNLOADING are grandfathered
+        (they drain; only new admissions wait). The client entry (if any)
+        is left paused as-is and the SSD reservation stays held — the next
+        tick retries through the same path with no delete/re-add churn and
+        no double reservation. Stale admissions (dead workers) are dropped
+        via the live `_running_infohashes` set, so a cancelled worker can
+        only over-park transiently, never deadlock. Non-int configs (test
+        doubles) always admit. Never raises.
+        """
+        key = (ts.source_infohash or "").lower()
+        try:
+            raw = getattr(self.cfg, "max_active_downloads", 0)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                return True
+            max_dl = int(raw or 0)
+            if max_dl <= 0:
+                return True
+            adm = getattr(self, "_download_admissions", None)
+            if not isinstance(adm, set):
+                adm = set()
+                self._download_admissions = adm
+            running = getattr(self, "_running_infohashes", None)
+            if isinstance(running, set):
+                # Drop admissions whose worker is gone (cancelled/shutdown):
+                # only live workers pin slots.
+                adm.intersection_update(running)
+            try:
+                n_down = len(self.store.list_by_state(State.DOWNLOADING))
+            except Exception:
+                n_down = 0
+            others = len(adm - {key}) if key else len(adm)
+            if n_down + others >= max_dl:
+                log.info("downloads full (%d/%d); %s stays queued",
+                         n_down + others, max_dl, ts.source_name[:60])
+                try:
+                    self.store.upsert(ts)
+                except Exception:
+                    pass
+                return False
+            if key:
+                adm.add(key)
+            return True
+        except Exception:
+            return True
+
+    def _park_queued_for_download_slot(self, ts: TorrentState) -> bool:
+        """Stay QUEUED when the download cap is full; True when parked."""
+        try:
+            return not self._try_admit_download(ts)
+        except Exception:
+            return False
+
     async def _do_queued(self, ts: TorrentState) -> None:
         blob: bytes = ts._blob or ts.cross_seed_blob
         if not blob:
@@ -1635,6 +1710,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         )
                         ts.dest_infohash = ext.hash.lower()
                         ts.save_path = str(ssd_root)
+                        if self._park_queued_for_download_slot(ts):
+                            return
                         self.transition(ts, State.DOWNLOADING)
                         return
                     log.warning(
@@ -1677,6 +1754,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             )
             ts.dest_infohash = ext.hash.lower()
             ts.save_path = ext.save_path
+            if self._park_queued_for_download_slot(ts):
+                return
             try:
                 await self.dest_client.resume(ext.hash)
             except Exception as e:  # noqa: BLE001
@@ -1692,6 +1771,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             self.transition(ts, State.DOWNLOADING)
             return
 
+        # Brand-new entry: gate before adding so a fresh-start burst of NEW
+        # workers can't sail past the tick's snapshot-QUEUED-only cap into
+        # concurrent DOWNLOADING (live incident: 5 at once against max 3).
+        if self._park_queued_for_download_slot(ts):
+            return
         result = await self.dest_client.add_torrent(
             torrent_files=[blob],
             save_path=ts.save_path,
@@ -1947,7 +2031,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
         # Resume (skipped when the first batch needs nothing locally yet:
         # a client with zero selected files may refuse; the download loop
-        # resumes on reaching the first batch with work).
+        # resumes on reaching the first batch with work). Gate first: setup
+        # (add + prioritize) already ran, so park with the paused entry
+        # intact — the next tick resumes through the existing-entry path.
+        if self._park_queued_for_download_slot(ts):
+            return
         if first_need is None or first_need:
             await self.dest_client.resume(ts.dest_infohash or ts.source_infohash)
         self.transition(ts, State.DOWNLOADING)
