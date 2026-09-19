@@ -337,7 +337,13 @@ class RcloneConfig(BaseModel):
 
 
 class ClassifierConfig(BaseModel):
-    episode_regex: str = r"(?i)\bS\d{1,2}E\d{1,3}\b"
+    # SxxEyy (1-3 digits each side) plus the anime scene "Title - NN (…)"
+    # single-episode form (dash + number + opening paren, e.g. a fansub
+    # "Show - 10 (1080p) [HASH].mkv"). The trailing paren is what keeps
+    # batch ranges ("(01-13) (1080p) [Batch]", no dash-number) and bare
+    # titles from matching as episodes. Numbers over 3 digits stay out,
+    # so year-titled movies ("Film - 2019 (2024)") don't match either.
+    episode_regex: str = r"(?i)(?:\bS\d{1,3}E\d{1,3}\b| - (\d{1,3}) \()"
 
     @field_validator("episode_regex")
     @classmethod
