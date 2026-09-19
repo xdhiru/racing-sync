@@ -596,6 +596,22 @@ async def reconcile(
     return rpt
 
 
+def _force_state(store: StateStore, ts: TorrentState, dst: State, *, error: str = "") -> None:
+    """transition() when legal, else force-assign + upsert.
+
+    Recovery must never crash on odd rows (e.g. a state the machine no
+    longer allows from here); a non-empty error is preserved verbatim
+    for operators, an empty one leaves last_error untouched.
+    """
+    try:
+        store.transition(ts, dst, error=error)
+    except ValueError:
+        ts.state = dst
+        if error:
+            ts.last_error = error
+        store.upsert(ts)
+
+
 async def fix_orphan(
     ts: TorrentState,
     cfg: AppConfig,
@@ -615,12 +631,7 @@ async def fix_orphan(
         # We need to re-add it. Caller (coordinator) provides .torrent bytes.
         if sftp_bytes is None:
             log.error("orphan %s: no .torrent bytes available to re-add", h)
-            try:
-                store.transition(ts, State.FAILED, error="orphan: no .torrent bytes")
-            except ValueError:
-                ts.state = State.FAILED
-                ts.last_error = "orphan: no .torrent bytes"
-                store.upsert(ts)
+            _force_state(store, ts, State.FAILED, error="orphan: no .torrent bytes")
             return State.FAILED.value
         # Add paused, then resolve the new hash, resume, and let coordinator drive.
         try:
@@ -633,12 +644,7 @@ async def fix_orphan(
             )
         except Exception as e:
             log.error("orphan %s: re-add failed: %s", h[:10] if len(h) > 10 else h, e)
-            try:
-                store.transition(ts, State.FAILED, error=f"orphan re-add failed: {e}")
-            except ValueError:
-                ts.state = State.FAILED
-                ts.last_error = f"orphan re-add failed: {e}"
-                store.upsert(ts)
+            _force_state(store, ts, State.FAILED, error=f"orphan re-add failed: {e}")
             return State.FAILED.value
         new_hash = ""
         if res is not None and getattr(res, "hash", None):
@@ -659,11 +665,7 @@ async def fix_orphan(
         except Exception as e:
             log.warning("orphan %s: resume after re-add failed: %s", h, e)
         if ts.state != State.DOWNLOADING:
-            try:
-                store.transition(ts, State.DOWNLOADING)
-            except ValueError:
-                ts.state = State.DOWNLOADING
-                store.upsert(ts)
+            _force_state(store, ts, State.DOWNLOADING)
         else:
             store.upsert(ts)
         return State.DOWNLOADING.value
@@ -714,19 +716,10 @@ async def fix_orphan(
 
         # Files no longer on SSD; rclone move completed, proceed to re-add to fuse
         log.info("orphan %s: files moved from SSD; will re-add to fuse", h)
-        try:
-            store.transition(ts, State.RE_ADDING)
-        except ValueError:
-            ts.state = State.RE_ADDING
-            store.upsert(ts)
+        _force_state(store, ts, State.RE_ADDING)
         return State.RE_ADDING.value
 
     log.warning("orphan %s: cannot infer recovery path from state %s",
                 h, ts.state.value)
-    try:
-        store.transition(ts, State.FAILED, error=f"orphan in state {ts.state.value}")
-    except ValueError:
-        ts.state = State.FAILED
-        ts.last_error = f"orphan in state {ts.state.value}"
-        store.upsert(ts)
+    _force_state(store, ts, State.FAILED, error=f"orphan in state {ts.state.value}")
     return State.FAILED.value

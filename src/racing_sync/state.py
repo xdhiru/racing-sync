@@ -649,26 +649,15 @@ class StateStore:
                 # entry into DONE restarts the clock (e.g. after a lost-fuse
                 # re-add cycle finishes seeding again).
                 ts.completed_at = now
-            elif dst == State.RE_ADDING and src == State.DONE:
-                # Fresh re-add cycle (e.g. lost fuse torrent via recovery):
-                # stale timers from the previous cycle must not instantly trip
-                # the max-age guard in _do_re_add.
-                ts.readd_first_attempted_at = None
-                ts.readd_next_retry_at = None
-                ts.readd_attempts = 0
-                # Flap counting: a demotion long after DONE is a new incident
-                # (reset); a rapid one keeps accumulating toward FAILED.
-                try:
-                    rapid = (
-                        ts.completed_at is not None
-                        and (now - ts.completed_at).total_seconds() < _FLAP_WINDOW_SECONDS
-                    )
-                except Exception:
-                    rapid = True
-                ts.readd_cycles = (ts.readd_cycles + 1) if rapid else 0
-            elif dst == State.MOVING and src == State.DONE:
-                # Self-heal for falsely adopted DONE (SSD bytes never moved):
-                # start a fresh move cycle with no stale re-add timers.
+            elif dst in (State.RE_ADDING, State.MOVING) and src == State.DONE:
+                # Demotion of a DONE row back into the pipeline:
+                #  - DONE -> RE_ADDING: lost fuse torrent (recovery) or late
+                #    cross-seed repair; stale timers from the previous cycle
+                #    must not instantly trip the max-age guard in _do_re_add.
+                #  - DONE -> MOVING: self-heal for falsely adopted DONE (SSD
+                #    bytes never moved); start a fresh move cycle.
+                # A demotion long after DONE is a new incident (reset the
+                # flap count); a rapid one keeps accumulating toward FAILED.
                 ts.readd_first_attempted_at = None
                 ts.readd_next_retry_at = None
                 ts.readd_attempts = 0
