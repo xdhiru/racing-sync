@@ -128,11 +128,6 @@ def _is_safe_dir_to_clear(path: Path, label: str = "log dir") -> str | None:
     return None
 
 
-def _is_safe_log_dir_to_clear(log_dir: Path) -> str | None:
-    """Back-compat wrapper: log-dir safety check."""
-    return _is_safe_dir_to_clear(log_dir, "log dir")
-
-
 def _clear_dir_children(root: Path, *, base_desc: str) -> list[str]:
     """Delete every child of `root` (never `root` itself). Returns log lines."""
     from .rclone_ops import validate_safe_delete_path
@@ -197,7 +192,7 @@ def _do_reset(cfg: AppConfig) -> list[str]:
     except Exception:
         log_dir = None
     if log_dir is not None:
-        refusal = _is_safe_log_dir_to_clear(log_dir)
+        refusal = _is_safe_dir_to_clear(log_dir, "log dir")
         if refusal is not None:
             removed.append(refusal)
         elif log_dir.is_dir():
