@@ -416,3 +416,35 @@ def test_state_store_meta(tmp_path: Path):
         assert store.get_meta("key1") == "val2"
     finally:
         store.close()
+
+
+def test_tombstone_hides_and_refuses_writes(tmp_path: Path):
+    """Forget tombstones: invisible to reads, refusing writes, GC'd by age."""
+    from racing_sync.coordinator_errors import AbandonedError
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        ts = TorrentState(source_infohash="t" * 40, source_name="Tomb",
+                          state=State.MOVING)
+        store.upsert(ts)
+        assert store.tombstone("t" * 40) is True
+        assert store.tombstone("t" * 40) is False  # already stamped
+        assert store.get("t" * 40) is None
+        assert store.get_blob("t" * 40) == b""
+        assert store.all() == []
+        assert store.all_active() == []
+        assert store.find_by_name("Tomb") == []
+        assert store.list_by_state(State.MOVING) == []
+        # Every write path refuses instead of resurrecting.
+        store.upsert(ts)
+        assert store.get("t" * 40) is None
+        with pytest.raises(AbandonedError):
+            store.transition(ts, State.RE_ADDING)
+        # Fresh tombstones survive GC; expired ones are hard-deleted.
+        assert store.gc_tombstones() == 0
+        store._conn.execute(
+            "UPDATE torrent_state SET deleted_at = '2000-01-01T00:00:00+00:00' "
+            "WHERE source_infohash = ?", ("t" * 40,))
+        assert store.gc_tombstones() == 1
+    finally:
+        store.close()

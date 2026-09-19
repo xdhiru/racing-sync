@@ -400,7 +400,10 @@ async def _forget_one(
             f"{'y' if len(still) == 1 else 'ies'} still present")
         return result
     try:
-        store.delete(row.source_infohash)
+        # Tombstone, not hard-delete: in-flight workers, retries and
+        # re-discovery refuse tombstoned hashes instead of resurrecting
+        # them; the janitor hard-deletes after the TTL.
+        store.tombstone(row.source_infohash)
     except Exception as e:  # noqa: BLE001
         result["errors"].append(f"db row: {e}")
     return result
