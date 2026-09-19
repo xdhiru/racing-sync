@@ -181,3 +181,35 @@ async def test_stale_reservation_pruned_after_forget(tmp_path):
     # New 16GB torrent: prune frees 30k first, then 16k fits.
     assert await coord._ssd_try_reserve("n" * 40, 16_000) is True
     assert "gone" + "0" * 36 not in coord._ssd_reserved
+
+@pytest.mark.anyio
+async def test_waiting_retry_uses_remaining_batches_not_total(tmp_path):
+    """A partially-moved season retries WAITING_DISK on its remainder.
+
+    Live case: full 32 GB estimate never fits the 37 GB budget alongside
+    other rows, while the one unmoved batch (~5 GB) would. The retry must
+    reserve the remainder, not the total.
+    """
+    from unittest.mock import AsyncMock
+    from racing_sync.clients.abstract import TorrentFile
+
+    cap = 40_000
+    coord = _coord_with_cap(tmp_path, cap)
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Show.S01E01.mkv", size_bytes=27_000, progress=1.0),
+        TorrentFile(name="Show.S01E02.mkv", size_bytes=5_000, progress=0.0),
+    ])
+    coord._batch_cap_cache = {("w" * 40): 30_000}
+
+    assert await coord._ssd_try_reserve("x" * 40, 32_000) is True
+    ts = TorrentState(source_infohash="w" * 40, source_name="Season32",
+                      dest_infohash="w" * 40, total_bytes=32_000,
+                      classification_kind="season", batches_total=2,
+                      batch_index=1, state=State.WAITING_DISK)
+    await coord._wait_disk_then_queue(ts)
+
+    assert ts.state == State.QUEUED
+    # Remainder (~5k), not the full 32k estimate.
+    assert coord._ssd_reserved["w" * 40] == 5_000
+    assert coord._ssd_reserved_total() == 37_000

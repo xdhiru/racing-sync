@@ -177,9 +177,12 @@ download — not a per-torrent cap:
 
 - Admission reserves `min(total, max_inflight_bytes)`; over budget parks in
   `WAITING_DISK` (quiet, ≤1 re-check/minute; download-slot checked too).
-- Post-classify refinement: max batch size for seasons/games (varying
-  episode sizes covered), full total for singles; singles that no longer
-  fit roll back (entry deleted, row parked).
+- Post-classify refinement: max *remaining* batch (fuse-present bytes
+  excluded — a 32 GB season with 20 GB already moved holds ~12 GB, not
+  32 GB), full total for singles; singles that no longer fit roll back
+  (entry deleted, row parked). Each completed batch re-tightens to the
+  batches still outstanding, and WAITING_DISK retries of cursor-having
+  rows reserve the remainder, not the total.
 - Reservations release on `WAITING_DISK` / `RE_ADDING` / `DONE` / `FAILED` /
   `forget`, stale rows are pruned, and abrupt stops rebuild from the DB.
 

@@ -1880,3 +1880,152 @@ def test_queued_gate_ignores_non_int_configs():
     coord.store = MagicMock()
     assert coord._try_admit_download(MagicMock()) is True
     assert coord._park_queued_for_download_slot(MagicMock()) is False
+
+@pytest.mark.anyio
+async def test_setup_footprint_excludes_remote_skipped_bytes(tmp_path):
+    """Reservation must cover remaining work, not the full torrent.
+
+    Live case: a 32 GB season with most batches already moved held 32 GB
+    while only ~12 GB still needed SSD, blocking a 16 GB waiter. The setup
+    footprint now subtracts fuse-present bytes.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+    # 2 of 3 episodes already on the remote (exact sizes).
+    (fuse / "Show.S01E01.mkv").write_bytes(b"x" * 100)
+    (fuse / "Show.S01E02.mkv").write_bytes(b"x" * 100)
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.store = MagicMock()
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.ssd.max_inflight_bytes = 100_000
+    coord.cfg.rclone.fuse.mount = fuse
+    coord.cfg.rclone.fuse.mount_unsorted = fuse
+    coord._batch_cap_cache = {}
+    coord._ssd_reserved = {}
+    coord._ssd_lock = None
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=1.0),
+        TorrentFile(name="Show.S01E02.mkv", size_bytes=100, progress=1.0),
+        TorrentFile(name="Show.S01E03.mkv", size_bytes=100, progress=0.0),
+    ])
+    coord.dest_client.set_file_priorities = AsyncMock()
+    coord.dest_client.resume = AsyncMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(source_infohash="s" * 40, source_name="Show.S01",
+                      dest_infohash="s" * 40, save_path=str(ssd),
+                      total_bytes=300, state=State.QUEUED)
+    # Admission held the full 300; setup must shrink to the ~100 remaining.
+    coord._ssd_reserved["s" * 40] = 300
+
+    await coord._setup_queued_download(ts, b"blob")
+
+    assert ts.state == State.DOWNLOADING
+    assert coord._ssd_reserved["s" * 40] == 100
+
+
+@pytest.mark.anyio
+async def test_setup_footprint_zero_when_fully_remote(tmp_path):
+    """Everything already moved -> hold nothing, still finish to MOVING."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+    (fuse / "Show.S01E01.mkv").write_bytes(b"x" * 100)
+    (fuse / "Show.S01E02.mkv").write_bytes(b"x" * 100)
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.store = MagicMock()
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.ssd.max_inflight_bytes = 100_000
+    coord.cfg.rclone.fuse.mount = fuse
+    coord.cfg.rclone.fuse.mount_unsorted = fuse
+    coord._batch_cap_cache = {}
+    coord._ssd_reserved = {}
+    coord._ssd_lock = None
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=1.0),
+        TorrentFile(name="Show.S01E02.mkv", size_bytes=100, progress=1.0),
+    ])
+    coord.dest_client.set_file_priorities = AsyncMock()
+    coord.dest_client.resume = AsyncMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(source_infohash="z" * 40, source_name="Show.S01",
+                      dest_infohash="z" * 40, save_path=str(ssd),
+                      total_bytes=200, state=State.QUEUED)
+    coord._ssd_reserved["z" * 40] = 200
+
+    await coord._setup_queued_download(ts, b"blob")
+
+    assert ts.state == State.DOWNLOADING
+    assert coord._ssd_reserved["z" * 40] == 0
+    coord.dest_client.resume.assert_not_called()  # nothing needs downloading
+
+@pytest.mark.anyio
+async def test_download_loop_tightens_reservation_per_batch(tmp_path):
+    """Completed batches must stop blocking waiters mid-season.
+
+    After batch 0 of 2 moves, the reservation shrinks to the remaining
+    batches (not the original max), freeing budget while the season is
+    still downloading.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.state import TorrentState, State
+    from racing_sync.batcher import Batch
+    from racing_sync.classifier import Episode
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord._live = {}
+    coord.store = MagicMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+    coord.cfg = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord._get_batches_for_torrent = AsyncMock(return_value=[
+        Batch(episodes=[Episode("Show.S01E01.mkv", 1, 1, 100)]),
+        Batch(episodes=[Episode("Show.S01E02.mkv", 1, 2, 100)]),
+    ])
+    coord._wait_for_completion = AsyncMock()
+    # cur_skip (batch 0, nothing remote yet), adjust (batch 0 now remote),
+    # cur_skip (batch 1).
+    coord._fuse_skipped = AsyncMock(side_effect=[
+        set(), {"Show.S01E01.mkv"}, set(),
+    ])
+    coord._move_and_clean_batch = AsyncMock()
+    coord._reset_torrent_for_next_batch = AsyncMock(side_effect=lambda ts, nxt: nxt)
+    coord._ssd_reserved = {"k" * 40: 200}
+    coord._ssd_lock = None
+
+    ts = TorrentState(source_infohash="k" * 40, source_name="Show.S01",
+                      classification_kind="season", batches_total=2,
+                      batch_index=0, state=State.DOWNLOADING)
+
+    await coord._do_downloading(ts)
+
+    assert ts.state == State.MOVING
+    assert coord._ssd_reserved["k" * 40] == 100
