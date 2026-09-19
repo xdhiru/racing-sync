@@ -1647,3 +1647,167 @@ async def test_watchdir_picks_up_uppercase_suffix(tmp_path: Path):
     scanner = WatchDirScanner(cfg, prowlarr=None)
     items = await scanner.scan_once()
     assert len(items) == 1 and items[0].name == "Upper.Release"
+
+
+def _grace_coord(tmp_path: Path, store: StateStore):
+    """Watch scaffold with an explicit preferred-copy grace window."""
+    coord = make_coordinator()
+    coord.store = store
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.general.state_db = tmp_path / "state.db"
+    coord.cfg.general.preferred_copy_grace_seconds = 3600
+    coord.cfg.prowlarr.enabled = True
+    coord.cfg.prowlarr.download_indexers = [MagicMock()]
+    coord.cfg.prowlarr.tracker_map.entries = {}
+    coord.cfg.prowlarr.is_download_indexer = lambda url: "dl-indexer" in (url or "")
+    coord.cfg.prowlarr.should_skip_title = MagicMock(return_value=False)
+    coord.cfg.cross_seed.prowlarr_retry_interval_seconds = 1800
+    coord.prowlarr = MagicMock()
+    coord.dest_client = MagicMock()
+    from unittest.mock import AsyncMock
+
+    coord.dest_client.delete = AsyncMock()
+    transitioned = []
+    coord.transition = lambda t, s, **k: transitioned.append(s)
+    coord.transitioned = transitioned
+    return coord
+
+
+@pytest.mark.anyio
+async def test_watch_sacrificial_holds_preferred_grace(tmp_path: Path):
+    """A rank-2 NEW drop holds (stays NEW) instead of locking immediately."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        ts = _watch_drop(store, "Grace.Hold.1080p", 5000, _PRIV_ANNOUNCE, 16384)
+        await coord._do_new_watch_dir(ts)
+        assert coord.transitioned == []
+        assert store.get(ts.source_infohash, include_blob=False).state == State.NEW
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_watch_sacrificial_proceeds_after_grace(tmp_path: Path):
+    """An aged rank-2 drop proceeds (no indefinite hold)."""
+    import datetime as dt
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        ts = _watch_drop(store, "Grace.Aged.1080p", 5000, _PRIV_ANNOUNCE, 16384)
+        ts.created_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)
+        store.upsert(ts)
+        await coord._do_new_watch_dir(ts)
+        assert coord.transitioned == [State.WAITING_DISK]
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_watch_rank1_proceeds_despite_grace(tmp_path: Path):
+    """A fresh download-indexer drop never waits (already preferred)."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        ts = _watch_drop(store, "Grace.Rank1.1080p", 5000,
+                         "https://dl-indexer.example.net/announce/xyz", 16384)
+        await coord._do_new_watch_dir(ts)
+        assert coord.transitioned == [State.WAITING_DISK]
+    finally:
+        store.close()
+
+
+def test_watch_wait_note_preferred_grace(tmp_path: Path):
+    """Grace-held rows get a card note instead of looking stuck."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _election_coord(tmp_path, store)
+        coord.cfg.general.preferred_copy_grace_seconds = 300
+        waiter = _watch_drop(store, "Grace.Note.1080p", 5000, _PRIV_ANNOUNCE, 16384)
+        assert coord._watch_wait_note(waiter).startswith("Waiting for preferred copy")
+    finally:
+        store.close()
+
+
+def _grace_pair(store: StateStore):
+    """Two same-content NEW priv drops (distinct hashes), both fresh.
+
+    The first is backdated seconds so ordering is deterministic while
+    both stay inside the grace window.
+    """
+    import datetime as dt
+
+    a = _watch_drop(store, "Skip.Grace.1080p", 5000, _PRIV_ANNOUNCE, 16384)
+    b = _watch_drop(store, "Skip.Grace.1080p", 5000, _PRIV_ANNOUNCE, 32768)
+    assert a.source_infohash != b.source_infohash
+    a.created_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=10)
+    store.upsert(a)
+    return a, b
+
+
+def test_watch_election_skips_grace_held_peers(tmp_path: Path):
+    """No phantom owners: a grace-held peer blocks nobody.
+
+    Two fresh rank-2 drops evaluate independently (both proceed to hold);
+    with grace disabled the later still defers to the earlier.
+    """
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        a, b = _grace_pair(store)
+        ok, owner = coord._watch_election(b)
+        assert ok is True and owner is None
+        coord.cfg.general.preferred_copy_grace_seconds = 0
+        ok2, owner2 = coord._watch_election(b)
+        assert ok2 is False and owner2 is not None
+        assert owner2.source_infohash == a.source_infohash
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_watch_sacrificial_hit_skips_hold(tmp_path: Path):
+    """A download-indexer hit found by the search releases the hold at once."""
+    from racing_sync.prowlarr import Indexer, TorrentHit
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        ts = _watch_drop(store, "Grace.Hit.1080p", 5000, _PRIV_ANNOUNCE, 16384)
+        idx = Indexer(1, "Preferred (API)", "torrent", True, [])
+        coord.prowlarr.get_download_indexers = MagicMock(return_value=[idx])
+        raw = _create_sample_torrent_data("Grace.Hit.1080p", 5000,
+                                          "http://preferred.example.net/announce")
+        coord.prowlarr.search_indexers_parallel = AsyncMock(
+            return_value={"preferred (api)": [
+                TorrentHit(title="Grace.Hit.1080p", guid="g", indexer="Preferred (API)",
+                           indexer_id=1, size_bytes=5000,
+                           download_url="http://preferred.example.net/dl",
+                           magnet_url="", info_url="", publish_date="")]})
+        coord.prowlarr.download_torrent = AsyncMock(return_value=raw)
+        await coord._do_new_watch_dir(ts)
+        assert coord.transitioned == [State.WAITING_DISK]
+        assert ts.cross_seed_source == "public-prowlarr"
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_watch_grace_search_throttled_while_holding(tmp_path: Path):
+    """Repeat evaluations inside the window don't re-query per tick."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        from racing_sync.prowlarr import Indexer
+
+        coord.prowlarr.get_download_indexers = MagicMock(
+            return_value=[Indexer(1, "Preferred (API)", "torrent", True, [])])
+        coord.prowlarr.search_indexers_parallel = AsyncMock(return_value={})
+        ts = _watch_drop(store, "Grace.Throttle.1080p", 5000, _PRIV_ANNOUNCE, 16384)
+        await coord._do_new_watch_dir(ts)
+        await coord._do_new_watch_dir(ts)
+        assert coord.prowlarr.search_indexers_parallel.await_count == 1
+        assert coord.transitioned == []
+    finally:
+        store.close()

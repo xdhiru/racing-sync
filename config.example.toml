@@ -27,6 +27,12 @@ disk_safety_margin_bytes = 1073741824
 # 0 = disabled (default); set e.g. 3600 to park visibly-stuck downloads
 # back in DOWNLOADING for retry instead of failing them.
 # download_stall_timeout_seconds = 0
+# Preferred-copy grace (seconds): a NEW row from a private non-download
+# indexer holds this long before locking its download, so a
+# download-indexer copy of the same content dropped/discovered moments
+# later preempts it instead of both racing the wrong swarm. Protects
+# tracker ratio on the non-preferred side. 0 = admit immediately.
+preferred_copy_grace_seconds = 3600
 
 # ============================================================
 # Source (VPS1) — racing client
@@ -436,6 +442,13 @@ pause_public_torrents_on_fuse = true
 # (counted from the FIRST attempt), give up and mark the torrent FAILED
 # for manual handling — unless fallback_to_racing_torrent_on_prowlarr_timeout
 # below is true.
+# Lifecycle of one private non-preferred row, end to end:
+#   birth:  preferred_copy_grace_seconds ([general]) holds NEW rows from
+#           non-download swarms so a preferred copy can preempt them.
+#   middle: re-query on this interval.
+#   end:    after max_age (counted from the first attempt, so the grace
+#           shifts the deadline by up to its own length), FAILED — or the
+#           racing-torrent fallback below when enabled.
 prowlarr_retry_interval_seconds = 1800   # 30 minutes
 prowlarr_max_age_seconds        = 86400  # 24 hours
 # When true, a private torrent with no Prowlarr hit after prowlarr_max_age_seconds

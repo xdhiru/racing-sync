@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import pytest
 from conftest import make_coordinator
+from unittest.mock import AsyncMock, MagicMock
 
 from racing_sync.config import AppConfig
 from racing_sync.state import State, TorrentState
@@ -781,3 +782,92 @@ def test_fallback_config_validation():
     with pytest.raises(ValueError, match="allow_ssh_export"):
         CrossSeedConfig(fallback_to_racing_torrent_on_prowlarr_timeout=True,
                         allow_ssh_export=False)
+
+
+def _grace_st(infohash: str, tracker: str):
+    from racing_sync.clients.abstract import Torrent
+
+    return Torrent(hash=infohash, name="Grace.Show.S01E01", category="",
+                   save_path="", size_bytes=100, state="seeding",
+                   progress=1.0, trackers=[tracker])
+
+
+@pytest.mark.anyio
+async def test_pick_and_admit_holds_nonpreferred_direct():
+    """A direct commit to a non-preferred swarm holds in grace (not parks)."""
+    coord = _pick_coord()
+    coord.cfg.general.preferred_copy_grace_seconds = 3600
+    coord.cfg.prowlarr.download_indexers = [MagicMock()]
+    coord.cfg.prowlarr.is_download_indexer = MagicMock(return_value=False)
+    coord.prowlarr = None
+    ts = TorrentState(source_infohash="e" * 40, source_name="Grace.Show",
+                      state=State.NEW)
+    await coord._pick_and_admit(ts, _grace_st("e" * 40, "https://unknown.example/announce"), [])
+    assert ts.state == State.NEW
+    coord.transition.assert_not_called()
+    coord._park_for_indexer_retry.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_pick_and_admit_exemption_and_preferred_proceed():
+    """/prefer_ exemption and preferred direct commits skip the hold."""
+    coord = _pick_coord()
+    coord.cfg.general.preferred_copy_grace_seconds = 3600
+    coord.cfg.prowlarr.download_indexers = [MagicMock()]
+    coord.cfg.prowlarr.is_download_indexer = MagicMock(return_value=False)
+    coord.prowlarr = None
+    # Exempted non-preferred direct -> admits (exemption consumed).
+    coord._grace_exempt = {"e" * 40: 1.0}
+    ts = TorrentState(source_infohash="e" * 40, source_name="Grace.Show",
+                      state=State.NEW)
+    await coord._pick_and_admit(ts, _grace_st("e" * 40, "https://unknown.example/announce"), [])
+    assert ts.state == State.QUEUED
+    assert coord._grace_exempt == {}
+    # Preferred direct (visible download-indexer copy) -> admits outright.
+    coord.cfg.prowlarr.is_download_indexer = lambda url: "dl-indexer" in (url or "")
+    ts2 = TorrentState(source_infohash="g" * 40, source_name="Grace.Show",
+                       state=State.NEW)
+    other = _grace_st("h" * 40, "https://dl-indexer.example.net/announce")
+    await coord._pick_and_admit(
+        ts2, _grace_st("g" * 40, "https://unknown.example/announce"), [other])
+    assert ts2.state == State.QUEUED
+    assert ts2.cross_seed_infohash == "h" * 40
+
+
+@pytest.mark.anyio
+async def test_picker_direct_fallback_prefers_download_indexer_copy():
+    """The SFTP/export fallback leeches the preferred swarm, not st's."""
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.config import DownloadIndexerConfig, ProwlarrConfig
+    from racing_sync.coordinator_picker import pick_ssd_source_for_racing
+
+    pcfg = ProwlarrConfig(
+        enabled=False, base_url="http://127.0.0.1:9696", api_key="secret",
+        download_indexers=[DownloadIndexerConfig(
+            name="Preferred (API)", announce_substrings=["preferred"])],
+    )
+    cfg = MagicMock()
+    cfg.prowlarr = pcfg
+    cfg.cross_seed.allow_ssh_export = True
+
+    def _t(h, tracker):
+        return Torrent(hash=h, name="Show", category="", save_path="",
+                       size_bytes=100, state="seeding", progress=1.0,
+                       trackers=[tracker])
+
+    st = _t("a" * 40, "https://unknown.example/announce")
+    other = _t("b" * 40, "https://preferred.example.net/announce/xyz")
+    sftp = MagicMock()
+    sftp.fetch_torrent = MagicMock(return_value=b"d8:announce...")
+    dec = await pick_ssd_source_for_racing(
+        cfg=cfg, source_torrent=st, other_source_torrents=[other],
+        prowlarr=None, sftp=sftp, source_client=MagicMock())
+    assert dec.infohash == "b" * 40
+    sftp.fetch_torrent.assert_called_once_with("b" * 40)
+
+    sftp2 = MagicMock()
+    sftp2.fetch_torrent = MagicMock(return_value=b"d8:announce...")
+    dec2 = await pick_ssd_source_for_racing(
+        cfg=cfg, source_torrent=st, other_source_torrents=[],
+        prowlarr=None, sftp=sftp2, source_client=MagicMock())
+    assert dec2.infohash == "a" * 40
