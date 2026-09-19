@@ -1165,33 +1165,36 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
     # (batch caps + SSD ledger live in coordinator_ssd.SSDLedgerMixin)
 
-    async def _do_new(self, ts: TorrentState) -> None:
-        if ts.cross_seed_source == "watch-dir":
-            await self._do_new_watch_dir(ts)
-            return
-
-        # Make sure we have the source torrent metadata
+    async def _fetch_source_or_fail(self, ts: TorrentState):
+        """Fresh VPS1 metadata, or None (row already moved to FAILED)."""
         st = await self.source_client.get_torrent(ts.source_infohash)
         if st is None:
             err = f"source torrent vanished from client: {ts.source_infohash[:10]}"
             log.warning(err)
             self.transition(ts, State.FAILED, error=err)
-            return
-        ts.source_name = st.name
-        ts.total_bytes = st.size_bytes
-        ts.source_tracker = st.trackers[0] if st.trackers else ""
-        ts.source_announce_url = ts.source_tracker or ts.source_announce_url
+            return None
+        return st
 
-        # Find other source torrents for the same content (req #1).
-        # qB/Deluge don't have a content-id, so heuristic: same name + same
-        # total size. We use name match — usually racing has 1-3 dupes.
-        all_source = await self._list_source_torrents()
+    def _same_content_torrents(self, all_source: list, st) -> list:
+        """Other racing-client torrents for the same content (req #1).
+
+        qB/Deluge don't have a content-id, so heuristic: same name + same
+        total size. We use name match — usually racing has 1-3 dupes.
+        """
         st_norm = normalize_content_name(st.name)
-        others = [
+        return [
             t for t in all_source
             if t.infohash != st.infohash and (t.name == st.name or normalize_content_name(t.name) == st_norm)
         ]
 
+    async def _pick_and_admit(self, ts: TorrentState, st, others: list,
+                              *, park_reason: str | None = None) -> None:
+        """Pick the SSD source, then park (miss) or admit (WAITING_DISK/QUEUED).
+
+        `park_reason=None` derives source-export-miss vs indexer-miss from
+        whether the group is public (a public group never queries the
+        download-target indexers, so "indexer miss" would mislead).
+        """
         decision = await pick_ssd_source_for_racing(
             cfg=self.cfg,
             source_torrent=st,
@@ -1202,16 +1205,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             attempt_prowlarr=True,
         )
         if decision is None:
-            # No SSD source right now → park and retry. Label honestly: a
-            # public group never touched the download-target indexers (its
-            # .torrent export failed), so "indexer miss" would send
-            # operators hunting the wrong subsystem.
-            reason = (
-                "source export miss"
-                if any(_looks_public(t.trackers) for t in [st, *others])
-                else "indexer miss"
-            )
-            self._park_for_indexer_retry(ts, reason=reason)
+            # No SSD source right now → park and retry.
+            if park_reason is None:
+                park_reason = (
+                    "source export miss"
+                    if any(_looks_public(t.trackers) for t in [st, *others])
+                    else "indexer miss"
+                )
+            self._park_for_indexer_retry(ts, reason=park_reason)
             return
 
         ts.cross_seed_infohash = decision.infohash.lower()
@@ -1243,6 +1244,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 # prune only drops non-SSD states on later admissions).
                 await self._ssd_release(ts.source_infohash)
                 raise
+
+    async def _do_new(self, ts: TorrentState) -> None:
+        if ts.cross_seed_source == "watch-dir":
+            await self._do_new_watch_dir(ts)
+            return
+
+        # Make sure we have the source torrent metadata
+        st = await self._fetch_source_or_fail(ts)
+        if st is None:
+            return
+        ts.source_name = st.name
+        ts.total_bytes = st.size_bytes
+        ts.source_tracker = st.trackers[0] if st.trackers else ""
+        ts.source_announce_url = ts.source_tracker or ts.source_announce_url
+
+        all_source = await self._list_source_torrents()
+        await self._pick_and_admit(ts, st, self._same_content_torrents(all_source, st))
 
     async def _do_new_watch_dir(self, ts: TorrentState) -> None:
         """Process a manual torrent drop from the watch directory."""
@@ -1479,52 +1497,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         Called by _tick when the row's indexer_next_retry_at has elapsed.
         """
         # Pull fresh data from VPS1 in case the torrent name changed.
-        st = await self.source_client.get_torrent(ts.source_infohash)
+        st = await self._fetch_source_or_fail(ts)
         if st is None:
-            err = f"source torrent vanished from client: {ts.source_infohash[:10]}"
-            log.warning(err)
-            self.transition(ts, State.FAILED, error=err)
             return
         ts.source_name = st.name
         ts.total_bytes = st.size_bytes
 
         all_source = await self._list_source_torrents()
-        st_norm = normalize_content_name(st.name)
-        others = [
-            t for t in all_source
-            if t.infohash != st.infohash and (t.name == st.name or normalize_content_name(t.name) == st_norm)
-        ]
-
-        decision = await pick_ssd_source_for_racing(
-            cfg=self.cfg,
-            source_torrent=st,
-            other_source_torrents=others,
-            prowlarr=self.prowlarr,
-            sftp=self.sftp,
-            source_client=self.source_client,
-            attempt_prowlarr=True,
+        await self._pick_and_admit(
+            ts, st, self._same_content_torrents(all_source, st),
+            park_reason="indexer miss",
         )
-        if decision is None:
-            # Still no hit — re-park, escalating the failure to FAILED
-            # when the max_age window is exceeded.
-            self._park_for_indexer_retry(ts)
-            return
-
-        ts.cross_seed_infohash = decision.infohash.lower()
-        ts.cross_seed_source = decision.source_label
-        ts.save_path = str(self.cfg.dest.save_path)
-        ts.cross_seed_blob = decision.torrent_bytes
-        ts._blob = decision.torrent_bytes
-
-        needed = self._ssd_estimate_for_new(decision.size_bytes)
-        if not await self._ssd_try_reserve(ts.source_infohash, needed):
-            self.transition(ts, State.WAITING_DISK)
-        else:
-            try:
-                self.transition(ts, State.QUEUED)
-            except Exception:
-                await self._ssd_release(ts.source_infohash)
-                raise
 
     # How long a still-full WAITING_DISK row stays quiet before its next
     # SSD re-check. Batches drain via MOVING in the meantime.
