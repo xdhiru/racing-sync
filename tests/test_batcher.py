@@ -1598,3 +1598,119 @@ async def test_do_moving_branches_on_pinned_kind_despite_flip(tmp_path):
     assert row.batches_total == 0
     coord._rclone_move.assert_awaited_once()
     assert coord._rclone_move.call_args.kwargs.get("extra") is None
+
+@pytest.mark.anyio
+async def test_do_moving_timeout_parks_instead_of_failing(tmp_path):
+    """A hung rclone move must park in MOVING, never FAIL (bytes intact).
+
+    Live incident: 3 `rclone move` to teldrive: hung with zero output;
+    6 MOVING workers wedged (moves=6/3 every tick), SSD never freed, fuse
+    never injected. Timeouts now park for retry with the reason recorded.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.rclone_ops import RcloneTimeoutError
+    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    (ssd / "Show.S01E01.mkv").write_bytes(b"x" * 100)
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = ssd / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=1.0),
+    ])
+
+    coord._rclone_move = AsyncMock(
+        side_effect=RcloneTimeoutError("rclone timeout after 21600s"))
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(source_infohash="t" * 40, source_name="Show.S01E01",
+                      dest_infohash="t" * 40, save_path=str(ssd),
+                      classification_kind="episode", batches_total=0,
+                      state=State.MOVING)
+    coord.store.upsert(ts)
+
+    await coord._process_torrent(coord.store.get("t" * 40))
+
+    row = coord.store.get("t" * 40)
+    assert row.state == State.MOVING  # parked, not FAILED
+    assert "timed out" in (row.last_error or "")
+    # Source bytes untouched by the terminated child.
+    assert (ssd / "Show.S01E01.mkv").exists()
+
+
+@pytest.mark.anyio
+async def test_batch_loop_timeout_parks_downloading_without_retry_burn(tmp_path):
+    """A batch-move timeout parks at once; same-tick retries would each
+    block for the full timeout again."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.rclone_ops import RcloneTimeoutError
+    from racing_sync.state import TorrentState, State
+    from racing_sync.batcher import Batch
+    from racing_sync.classifier import Episode
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord._live = {}
+    coord.store = MagicMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+    coord.cfg = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord._get_batches_for_torrent = AsyncMock(return_value=[
+        Batch(episodes=[Episode("Show.S01E01.mkv", 1, 1, 100)]),
+        Batch(episodes=[Episode("Show.S01E02.mkv", 1, 2, 100)]),
+    ])
+    coord._wait_for_completion = AsyncMock()
+    coord._fuse_skipped = AsyncMock(return_value=set())
+    coord._move_and_clean_batch = AsyncMock(
+        side_effect=RcloneTimeoutError("rclone timeout after 21600s"))
+
+    ts = TorrentState(source_infohash="u" * 40, source_name="Show.S01",
+                      classification_kind="season", batches_total=2,
+                      batch_index=0, state=State.DOWNLOADING)
+
+    await coord._do_downloading(ts)
+
+    assert ts.state == State.DOWNLOADING
+    assert coord._move_and_clean_batch.await_count == 1  # no retry burn
+    assert "timed out" in (ts.last_error or "")
+    coord.transition.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_process_torrent_timeout_safety_net_parks(tmp_path):
+    """A timeout leaking from any future path still parks, never FAILs."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.coordinator import Coordinator
+    from racing_sync.rclone_ops import RcloneTimeoutError
+    from racing_sync.state import StateStore, TorrentState, State
+
+    coord = object.__new__(Coordinator)
+    coord._stop = False
+    coord.store = StateStore(tmp_path / "state.db")
+    coord._process_torrent_inner = AsyncMock(
+        side_effect=RcloneTimeoutError("rclone timeout after 21600s"))
+
+    ts = TorrentState(source_infohash="v" * 40, source_name="Show",
+                      state=State.DOWNLOADING)
+    coord.store.upsert(ts)
+
+    await coord._process_torrent(coord.store.get("v" * 40))
+
+    row = coord.store.get("v" * 40)
+    assert row.state == State.DOWNLOADING
+    assert "timed out" in (row.last_error or "")
