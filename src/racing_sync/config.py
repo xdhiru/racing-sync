@@ -520,39 +520,77 @@ class ProwlarrTrackerMap(BaseModel):
         return None
 
 
+class DownloadIndexerConfig(BaseModel):
+    """One SSD download-target indexer, in priority order (first = tried first).
+
+    TOML shape — repeat the table per indexer:
+
+        [[prowlarr.download_indexers]]
+        name = "My Indexer (API)"
+        announce_substrings = ["my-indexer"]
+
+        [[prowlarr.download_indexers]]
+        name = "Other Indexer (API)"
+        announce_substrings = ["other"]
+
+    `name` must match the indexer's EXACT name in Prowlarr
+    (case-sensitive). `announce_substrings` identifies torrents that
+    already come from this indexer (announce URL substring match), so a
+    watch-dir drop from it is used directly instead of being
+    re-searched (sacrificial-copy detection).
+    """
+
+    name: str = ""
+    announce_substrings: list[str] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def _name_non_empty(cls, v: str) -> str:
+        if not str(v).strip():
+            raise ValueError(
+                "prowlarr download indexer entry has an empty name "
+                "(must match the indexer name in Prowlarr exactly)"
+            )
+        return str(v).strip()
+
+
 class ProwlarrConfig(BaseModel):
     """req #5 + #6: Prowlarr integration."""
 
     enabled: bool = False
     base_url: str = ""       # e.g. http://127.0.0.1:9696
     api_key: SecretStr = SecretStr("")
-    # req #6: the indexer used for SSD downloads + cross-seed searches.
-    # No default — you MUST set this when [prowlarr].enabled = true,
-    # because the name must match exactly what your Prowlarr instance
-    # calls the indexer (it's case-sensitive).
-    download_indexer: str = ""
+    # req #6: ordered SSD download-target indexers used for SSD downloads +
+    # cross-seed searches (first entry = highest priority; each is tried in
+    # turn until one returns the exact release). Configure via
+    # `[[prowlarr.download_indexers]]` tables (see DownloadIndexerConfig).
+    download_indexers: list[DownloadIndexerConfig] = Field(default_factory=list)
     # Timeout for HTTP calls to prowlarr
     timeout_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
     # How many results to consider from a search
     max_results: int = Field(default=20, ge=1, le=1000)
     # Tracker substring → indexer name map
     tracker_map: ProwlarrTrackerMap = ProwlarrTrackerMap()
-    # Announce URL substrings that identify torrents belonging to the download indexer
-    download_indexer_substrings: list[str] = Field(default_factory=list)
     # Substrings in torrent titles to skip querying Prowlarr for (case-insensitive)
     skip_query_substrings: list[str] = Field(default_factory=list)
     # Network family for the Prowlarr session. False (default) forces IPv4:
     # intentional — see [source].use_ipv6.
     use_ipv6: bool = False
 
+    @property
+    def download_indexer_names(self) -> list[str]:
+        """Configured download-target indexer names, in priority order."""
+        return [e.name for e in self.download_indexers]
+
     def is_download_indexer(self, announce_url: str) -> bool:
-        """Check if an announce URL matches the download indexer."""
+        """Check if an announce URL belongs to any download-target indexer."""
         if not announce_url:
             return False
         low = announce_url.lower()
-        for sub in self.download_indexer_substrings:
-            if sub and sub.lower() in low:
-                return True
+        for entry in self.download_indexers:
+            for sub in entry.announce_substrings:
+                if sub and sub.lower() in low:
+                    return True
         return False
 
     def should_skip_title(self, title: str) -> bool:
@@ -564,24 +602,42 @@ class ProwlarrConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "ProwlarrConfig":
+        entries = list(self.download_indexers or [])
+        seen: set[str] = set()
+        for entry in entries:
+            low = entry.name.lower()
+            if low in seen:
+                raise ValueError(
+                    f"prowlarr download indexer {entry.name!r} is listed twice "
+                    "(names must be unique, case-insensitive)"
+                )
+            seen.add(low)
+            for sub in entry.announce_substrings:
+                if not str(sub).strip():
+                    raise ValueError(
+                        f"prowlarr download indexer {entry.name!r} has a blank "
+                        "announce_substrings entry (blank matches every URL)"
+                    )
+        self.download_indexers = entries
         if self.enabled:
             if not self.base_url.startswith(("http://", "https://")):
                 raise ValueError("prowlarr.base_url must start with http(s)://")
             key = self.api_key.get_secret_value().strip() if isinstance(self.api_key, SecretStr) else str(self.api_key).strip()
             if not key or key.upper() in ("CHANGE_ME", "YOUR_PROWLARR_API_KEY"):
                 raise ValueError("prowlarr.api_key required and cannot be a placeholder when enabled")
-            if not self.download_indexer:
+            if not entries:
                 raise ValueError(
-                    "prowlarr.download_indexer required when enabled. "
-                    "Set it to the exact name of the indexer in your "
-                    "Prowlarr instance (case-sensitive)."
+                    "prowlarr enabled but no download-target indexer is configured. "
+                    "Add at least one [[prowlarr.download_indexers]] table with "
+                    "the exact indexer name from your Prowlarr instance "
+                    "(case-sensitive)."
                 )
-            if not self.download_indexer_substrings:
+            if not any(e.announce_substrings for e in entries):
                 import logging as _logging
                 _logging.getLogger(__name__).warning(
-                    "prowlarr enabled but download_indexer_substrings is empty — "
-                    "is_download_indexer() will always return False and "
-                    "sacrificial detection is disabled",
+                    "prowlarr enabled but no download indexer has "
+                    "announce_substrings — is_download_indexer() will always "
+                    "return False and sacrificial-copy detection is disabled",
                 )
         return self
 
@@ -595,25 +651,17 @@ class CrossSeedConfig(BaseModel):
     # create duplicates). If false, the original public torrent from VPS1 is
     # exported via SFTP if available, else queried via prowlarr.
     refetch_public_via_prowlarr: bool = False
-    # req #2 follow-up: if the configured download_indexer returns no hit
+    # req #2 follow-up: if no download-target indexer returns a hit
     # (release too new), retry the query every
     # `prowlarr_retry_interval_seconds`. Give up after
     # `prowlarr_max_age_seconds` since the FIRST query attempt and mark
     # the torrent FAILED for manual handling.
     #
-    # The names use "prowlarr_" because the search runs through Prowlarr,
-    # but the *indexer* being queried is whatever the user configured
-    # under [prowlarr].download_indexer (default "Seedpool (API)").
+    # The names use "prowlarr_" because the search runs through Prowlarr;
+    # the *indexers* queried are whatever the user configured under
+    # [[prowlarr.download_indexers]], tried in priority order.
     prowlarr_retry_interval_seconds: int = Field(default=1800, ge=60)  # 30 min
     prowlarr_max_age_seconds: int = Field(default=86400, ge=3600)       # 24 h
-
-    @property
-    def seedpool_retry_interval_seconds(self) -> int:
-        return self.prowlarr_retry_interval_seconds
-
-    @property
-    def seedpool_max_age_seconds(self) -> int:
-        return self.prowlarr_max_age_seconds
 
     # Strategy flags --------------------------------------------------
     #
@@ -630,8 +678,8 @@ class CrossSeedConfig(BaseModel):
     #
     # `allow_prowlarr_cross_seed` (default true):
     #   When true, and the racing client has no public torrent for the
-    #   content (or the user prefers a Seedpool cross-seed), we query
-    #   Prowlarr on the configured download_indexer to obtain a .torrent
+    #   content, we query Prowlarr on the configured download-target
+    #   indexers (in priority order) to obtain a .torrent
     #   for SSD download. Disable this if you want VPS2 to always leech
     #   from the racing client's own torrents (e.g. via SFTP export from
     #   Deluge / qBittorrent state).
@@ -656,7 +704,7 @@ class CrossSeedConfig(BaseModel):
             raise ValueError(
                 "cross_seed: allow_prowlarr_cross_seed=false + allow_ssh_export=false "
                 "leaves no SSD-source strategy for private torrents "
-                "(every torrent would park in WAITING_SEEDPOOL until FAILED). "
+                "(every torrent would park in WAITING_INDEXER until FAILED). "
                 "Enable at least one unless this is a public-only deployment."
             )
         return self

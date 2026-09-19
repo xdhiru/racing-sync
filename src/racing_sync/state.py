@@ -31,8 +31,8 @@ class State(str, enum.Enum):
     SSD download + rclone move + fuse re-add has these stages:
 
       NEW                 we noticed the torrent on VPS1, need to make decisions
-      QUERYING            asking Seedpool for a cross-seed torrent (req #1,#2,#3)
-      WAITING_SEEDPOOL    Seedpool returned no hit; we park and retry later
+      QUERYING            asking the download-target indexers for a cross-seed torrent (req #1,#2,#3)
+      WAITING_INDEXER     no download-target indexer returned a hit yet; we park and retry later
       WAITING_DISK        waiting for SSD to have room (cap in use)
       QUEUED              ready to add to qBittorrent on VPS2
       DOWNLOADING         qBittorrent is downloading on VPS2 SSD
@@ -44,7 +44,7 @@ class State(str, enum.Enum):
 
     NEW = "new"
     QUERYING = "querying"
-    WAITING_SEEDPOOL = "waiting_seedpool"
+    WAITING_INDEXER = "waiting_indexer"
     WAITING_DISK = "waiting_disk"
     QUEUED = "queued"
     DOWNLOADING = "downloading"
@@ -56,12 +56,12 @@ class State(str, enum.Enum):
 
 # Allowed transitions (everything else raises ValueError).
 ALLOWED: dict[State, set[State]] = {
-    State.NEW: {State.QUERYING, State.WAITING_SEEDPOOL, State.WAITING_DISK,
+    State.NEW: {State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK,
                 State.QUEUED, State.DOWNLOADING, State.MOVING, State.RE_ADDING,
                 State.FAILED},
-    State.QUERYING: {State.WAITING_SEEDPOOL, State.WAITING_DISK, State.QUEUED,
+    State.QUERYING: {State.WAITING_INDEXER, State.WAITING_DISK, State.QUEUED,
                 State.DOWNLOADING, State.FAILED},
-    State.WAITING_SEEDPOOL: {State.QUERYING, State.WAITING_DISK,
+    State.WAITING_INDEXER: {State.QUERYING, State.WAITING_DISK,
                 State.QUEUED, State.FAILED},
     State.WAITING_DISK: {State.QUEUED, State.DOWNLOADING, State.FAILED},
     State.QUEUED: {State.DOWNLOADING, State.MOVING, State.WAITING_DISK,
@@ -121,10 +121,10 @@ class TorrentState:
     # when only the racing torrents survived.
     cross_seed_blob: bytes = b""
     injected_private_hashes: str = ""  # CSV of private hashes re-added to fuse
-    # Seedpool retry policy
-    seedpool_first_queried_at: dt.datetime | None = None
-    seedpool_next_retry_at: dt.datetime | None = None
-    seedpool_attempts: int = 0
+    # Download-target indexer retry policy
+    indexer_first_queried_at: dt.datetime | None = None
+    indexer_next_retry_at: dt.datetime | None = None
+    indexer_attempts: int = 0
     # Re-add retry policy
     readd_first_attempted_at: dt.datetime | None = None
     readd_next_retry_at: dt.datetime | None = None
@@ -170,13 +170,13 @@ class TorrentState:
             "cross_seed_source": self.cross_seed_source,
             "cross_seed_blob": self.cross_seed_blob,
             "injected_private_hashes": self.injected_private_hashes,
-            "seedpool_first_queried_at":
-                self.seedpool_first_queried_at.isoformat()
-                if self.seedpool_first_queried_at else "",
-            "seedpool_next_retry_at":
-                self.seedpool_next_retry_at.isoformat()
-                if self.seedpool_next_retry_at else "",
-            "seedpool_attempts": self.seedpool_attempts,
+            "indexer_first_queried_at":
+                self.indexer_first_queried_at.isoformat()
+                if self.indexer_first_queried_at else "",
+            "indexer_next_retry_at":
+                self.indexer_next_retry_at.isoformat()
+                if self.indexer_next_retry_at else "",
+            "indexer_attempts": self.indexer_attempts,
             "readd_first_attempted_at": (
                 self.readd_first_attempted_at.isoformat()
                 if self.readd_first_attempted_at else ""
@@ -219,9 +219,9 @@ CREATE TABLE IF NOT EXISTS torrent_state (
     cross_seed_source        TEXT NOT NULL DEFAULT '',
     cross_seed_blob          BLOB NOT NULL DEFAULT '',
     injected_private_hashes  TEXT NOT NULL DEFAULT '',
-    seedpool_first_queried_at TEXT NOT NULL DEFAULT '',
-    seedpool_next_retry_at    TEXT NOT NULL DEFAULT '',
-    seedpool_attempts         INTEGER NOT NULL DEFAULT 0,
+    indexer_first_queried_at TEXT NOT NULL DEFAULT '',
+    indexer_next_retry_at    TEXT NOT NULL DEFAULT '',
+    indexer_attempts         INTEGER NOT NULL DEFAULT 0,
     readd_first_attempted_at  TEXT NOT NULL DEFAULT '',
     readd_next_retry_at       TEXT NOT NULL DEFAULT '',
     readd_attempts            INTEGER NOT NULL DEFAULT 0,
@@ -261,8 +261,8 @@ CREATE TABLE IF NOT EXISTS ignored_torrents (
 
 SCHEMA_INDEXES = """
 CREATE INDEX IF NOT EXISTS ix_state ON torrent_state(state);
-CREATE INDEX IF NOT EXISTS ix_seedpool_retry
-    ON torrent_state(state, seedpool_next_retry_at);
+CREATE INDEX IF NOT EXISTS ix_indexer_retry
+    ON torrent_state(state, indexer_next_retry_at);
 CREATE INDEX IF NOT EXISTS ix_source_name ON torrent_state(source_name);
 """
 
@@ -272,8 +272,8 @@ SCHEMA = SCHEMA_TABLES + SCHEMA_INDEXES
 _TORRENT_STATE_COLUMNS_NO_BLOB = (
     "source_infohash, dest_infohash, source_name, source_tracker, source_announce_url, "
     "classification_kind, total_bytes, save_path, cross_seed_infohash, cross_seed_source, "
-    "'' AS cross_seed_blob, injected_private_hashes, seedpool_first_queried_at, "
-    "seedpool_next_retry_at, seedpool_attempts, readd_first_attempted_at, "
+    "'' AS cross_seed_blob, injected_private_hashes, indexer_first_queried_at, "
+    "indexer_next_retry_at, indexer_attempts, readd_first_attempted_at, "
     "readd_next_retry_at, readd_attempts, failed_retries, completed_at, "
     "vps1_last_activity_at, state, batch_index, batches_total, batch_cap_bytes, readd_cycles, "
     "last_error, created_at, updated_at, telegram_message_id"
@@ -313,7 +313,6 @@ class StateStore:
         except Exception:
             pass
         self._conn.executescript(SCHEMA_TABLES)
-        self._migrate()
         self._conn.executescript(SCHEMA_INDEXES)
 
     def _ensure_open(self) -> None:
@@ -334,54 +333,6 @@ class StateStore:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
-
-    # ---- migrations ----
-
-    def _migrate(self) -> None:
-        """Idempotent column additions for older state DBs.
-
-        SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so we
-        inspect `PRAGMA table_info` and add missing columns manually.
-        """
-        cols = {row["name"] for row in self._conn.execute(
-            "PRAGMA table_info(torrent_state)"
-        ).fetchall()}
-        EXPECTED_COLUMNS = {
-            "dest_infohash": "TEXT NOT NULL DEFAULT ''",
-            "source_name": "TEXT NOT NULL DEFAULT ''",
-            "source_tracker": "TEXT NOT NULL DEFAULT ''",
-            "source_announce_url": "TEXT NOT NULL DEFAULT ''",
-            "classification_kind": "TEXT NOT NULL DEFAULT 'unknown'",
-            "total_bytes": "INTEGER NOT NULL DEFAULT 0",
-            "save_path": "TEXT NOT NULL DEFAULT ''",
-            "cross_seed_infohash": "TEXT NOT NULL DEFAULT ''",
-            "cross_seed_source": "TEXT NOT NULL DEFAULT ''",
-            "cross_seed_blob": "BLOB NOT NULL DEFAULT ''",
-            "injected_private_hashes": "TEXT NOT NULL DEFAULT ''",
-            "seedpool_first_queried_at": "TEXT NOT NULL DEFAULT ''",
-            "seedpool_next_retry_at": "TEXT NOT NULL DEFAULT ''",
-            "seedpool_attempts": "INTEGER NOT NULL DEFAULT 0",
-            "readd_first_attempted_at": "TEXT NOT NULL DEFAULT ''",
-            "readd_next_retry_at": "TEXT NOT NULL DEFAULT ''",
-            "readd_attempts": "INTEGER NOT NULL DEFAULT 0",
-            "failed_retries": "INTEGER NOT NULL DEFAULT 0",
-            "completed_at": "TEXT NOT NULL DEFAULT ''",
-            "vps1_last_activity_at": "TEXT NOT NULL DEFAULT ''",
-            "state": "TEXT NOT NULL DEFAULT 'new'",
-            "batch_index": "INTEGER NOT NULL DEFAULT 0",
-            "batches_total": "INTEGER NOT NULL DEFAULT 0",
-            "batch_cap_bytes": "INTEGER NOT NULL DEFAULT 0",
-            "readd_cycles": "INTEGER NOT NULL DEFAULT 0",
-            "last_error": "TEXT NOT NULL DEFAULT ''",
-            "telegram_message_id": "INTEGER NOT NULL DEFAULT 0",
-            "created_at": "TEXT NOT NULL DEFAULT ''",
-            "updated_at": "TEXT NOT NULL DEFAULT ''",
-        }
-        for col, col_def in EXPECTED_COLUMNS.items():
-            if col not in cols:
-                self._conn.execute(
-                    f"ALTER TABLE torrent_state ADD COLUMN {col} {col_def}"
-                )
 
     # ---- CRUD ----
 
@@ -441,18 +392,18 @@ class StateStore:
             ).fetchall()
             return [_row_to_state(r) for r in rows]
 
-    def list_seedpool_ready(self, now: dt.datetime | None = None) -> list[TorrentState]:
-        """Rows in WAITING_SEEDPOOL whose retry timer has elapsed.
+    def list_indexer_ready(self, now: dt.datetime | None = None) -> list[TorrentState]:
+        """Rows in WAITING_INDEXER whose retry timer has elapsed.
 
         Used by the coordinator tick to decide which rows to wake up and
-        re-query Seedpool.
+        re-query the download-target indexers.
         """
         now = now or dt.datetime.now(dt.timezone.utc)
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state = 'waiting_seedpool' "
-                "AND seedpool_next_retry_at != '' "
-                "AND seedpool_next_retry_at <= ? ORDER BY seedpool_next_retry_at",
+                f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state = 'waiting_indexer' "
+                "AND indexer_next_retry_at != '' "
+                "AND indexer_next_retry_at <= ? ORDER BY indexer_next_retry_at",
                 (now.isoformat(),),
             ).fetchall()
             return [_row_to_state(r) for r in rows]
@@ -670,8 +621,8 @@ class StateStore:
         # locked) must leave the in-memory object identical to the DB row.
         _snapshot = (
             ts.state, ts.last_error,
-            ts.seedpool_first_queried_at, ts.seedpool_next_retry_at,
-            ts.seedpool_attempts, ts.readd_first_attempted_at,
+            ts.indexer_first_queried_at, ts.indexer_next_retry_at,
+            ts.indexer_attempts, ts.readd_first_attempted_at,
             ts.readd_next_retry_at, ts.readd_attempts, ts.failed_retries,
             ts.completed_at, ts.batch_index, ts.readd_cycles,
         )
@@ -679,9 +630,9 @@ class StateStore:
             ts.state = dst
             ts.last_error = error
             if dst in (State.NEW, State.QUEUED):
-                ts.seedpool_first_queried_at = None
-                ts.seedpool_next_retry_at = None
-                ts.seedpool_attempts = 0
+                ts.indexer_first_queried_at = None
+                ts.indexer_next_retry_at = None
+                ts.indexer_attempts = 0
                 ts.readd_first_attempted_at = None
                 ts.readd_next_retry_at = None
                 ts.readd_attempts = 0
@@ -734,8 +685,8 @@ class StateStore:
             self.upsert(ts)
         except Exception:
             (ts.state, ts.last_error,
-             ts.seedpool_first_queried_at, ts.seedpool_next_retry_at,
-             ts.seedpool_attempts, ts.readd_first_attempted_at,
+             ts.indexer_first_queried_at, ts.indexer_next_retry_at,
+             ts.indexer_attempts, ts.readd_first_attempted_at,
              ts.readd_next_retry_at, ts.readd_attempts, ts.failed_retries,
              ts.completed_at, ts.batch_index, ts.readd_cycles) = _snapshot
             raise
@@ -846,8 +797,9 @@ def _safe_dt(value: object) -> dt.datetime | None:
 
 def _row_to_state(row: sqlite3.Row) -> TorrentState:
     keys = row.keys()
-    sp_first = row["seedpool_first_queried_at"] if "seedpool_first_queried_at" in keys else ""
-    sp_next = row["seedpool_next_retry_at"] if "seedpool_next_retry_at" in keys else ""
+    idx_first = row["indexer_first_queried_at"] if "indexer_first_queried_at" in keys else ""
+    idx_next = row["indexer_next_retry_at"] if "indexer_next_retry_at" in keys else ""
+    idx_attempts = row["indexer_attempts"] if "indexer_attempts" in keys else 0
     ra_first = row["readd_first_attempted_at"] if "readd_first_attempted_at" in keys else ""
     ra_next = row["readd_next_retry_at"] if "readd_next_retry_at" in keys else ""
     ra_attempts = row["readd_attempts"] if "readd_attempts" in keys else 0
@@ -878,9 +830,9 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         cross_seed_source=row["cross_seed_source"] if "cross_seed_source" in keys else "",
         cross_seed_blob=blob_bytes,
         injected_private_hashes=row["injected_private_hashes"] if "injected_private_hashes" in keys else "",
-        seedpool_first_queried_at=_safe_dt(sp_first),
-        seedpool_next_retry_at=_safe_dt(sp_next),
-        seedpool_attempts=_safe_int(row["seedpool_attempts"]) if "seedpool_attempts" in keys else 0,
+        indexer_first_queried_at=_safe_dt(idx_first),
+        indexer_next_retry_at=_safe_dt(idx_next),
+        indexer_attempts=_safe_int(idx_attempts),
         readd_first_attempted_at=_safe_dt(ra_first),
         readd_next_retry_at=_safe_dt(ra_next),
         readd_attempts=_safe_int(ra_attempts),

@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 from pathlib import Path
 
-from racing_sync.config import ProwlarrConfig, AppConfig
+from racing_sync.config import AppConfig, DownloadIndexerConfig, ProwlarrConfig
 from racing_sync.prowlarr import ProwlarrClient, Indexer, TorrentHit
 from racing_sync.coordinator import pick_ssd_source_for_racing, Coordinator
 from racing_sync.state import StateStore, TorrentState, State
@@ -24,7 +24,7 @@ def test_prowlarr_config_should_skip_title():
         enabled=True,
         base_url="http://localhost:9696",
         api_key="secret",
-        download_indexer="Seedpool (API)",
+        download_indexers=[DownloadIndexerConfig(name="Test Indexer (API)", announce_substrings=["test-indexer"])],
         skip_query_substrings=["subsplease", "erasergroups"],
     )
     assert cfg.should_skip_title("[SubsPlease] One Piece - 1100 (1080p)") is True
@@ -40,11 +40,11 @@ async def test_prowlarr_client_skips_search():
         enabled=True,
         base_url="http://localhost:9696",
         api_key="secret",
-        download_indexer="Seedpool (API)",
+        download_indexers=[DownloadIndexerConfig(name="Test Indexer (API)", announce_substrings=["test-indexer"])],
         skip_query_substrings=["subsplease"],
     )
     client = ProwlarrClient(cfg)
-    idx = Indexer(1, "Seedpool (API)", "torrent", True, [])
+    idx = Indexer(1, "Test Indexer (API)", "torrent", True, [])
 
     # search_indexer
     hits = await client.search_indexer(idx, "[SubsPlease] Naruto - 01")
@@ -297,7 +297,7 @@ def test_parse_newznab_extracts_namespaced_magnet_url():
 async def test_download_torrent_validates_scheme():
     from racing_sync.prowlarr import ProwlarrClient, ProwlarrError, TorrentHit
 
-    cfg = ProwlarrConfig(enabled=True, base_url="http://localhost:9696", api_key="secret", download_indexer="idx")
+    cfg = ProwlarrConfig(enabled=True, base_url="http://localhost:9696", api_key="secret", download_indexers=[DownloadIndexerConfig(name="idx")])
     client = ProwlarrClient(cfg)
     client._session = MagicMock()
 
@@ -332,16 +332,16 @@ async def test_prowlarr_best_match_ranking():
         enabled=True,
         base_url="http://127.0.0.1:9696",
         api_key="secret",
-        download_indexer="Seedpool (API)",
+        download_indexers=[DownloadIndexerConfig(name="Test Indexer (API)", announce_substrings=["test-indexer"])],
     )
     client = ProwlarrClient(cfg)
-    idx = Indexer(1, "Seedpool (API)", "torrent", True, [])
-    client.get_download_indexer = MagicMock(return_value=idx)
+    idx = Indexer(1, "Test Indexer (API)", "torrent", True, [])
+    client._indexers_by_name = {"test indexer (api)": idx}
 
     h_partial_large = TorrentHit(
         title="Movie.2024.Extended.1080p",
         guid="1",
-        indexer="Seedpool",
+        indexer="Test Indexer (API)",
         indexer_id=1,
         size_bytes=10_000_000_000,
         download_url="http://prowlarr/1",
@@ -352,7 +352,7 @@ async def test_prowlarr_best_match_ranking():
     h_exact_small = TorrentHit(
         title="Movie.2024.1080p",
         guid="2",
-        indexer="Seedpool",
+        indexer="Test Indexer (API)",
         indexer_id=1,
         size_bytes=5_000_000_000,
         download_url="http://prowlarr/2",
@@ -363,7 +363,7 @@ async def test_prowlarr_best_match_ranking():
     h_exact_large = TorrentHit(
         title="Movie.2024.1080p",
         guid="3",
-        indexer="Seedpool",
+        indexer="Test Indexer (API)",
         indexer_id=1,
         size_bytes=8_000_000_000,
         download_url="http://prowlarr/3",
@@ -384,23 +384,23 @@ async def test_prowlarr_best_match_ranking():
 
 def _hit(title: str, size: int, guid: str = "g") -> TorrentHit:
     return TorrentHit(
-        title=title, guid=guid, indexer="Seedpool", indexer_id=1,
+        title=title, guid=guid, indexer="Test Indexer (API)", indexer_id=1,
         size_bytes=size, download_url="http://prowlarr/dl",
         magnet_url="", info_url="", publish_date="",
     )
 
 
-def _seedpool_client() -> ProwlarrClient:
+def _download_client() -> ProwlarrClient:
     from racing_sync.prowlarr import Indexer
     cfg = ProwlarrConfig(
         enabled=True,
         base_url="http://127.0.0.1:9696",
         api_key="secret",
-        download_indexer="Seedpool (API)",
+        download_indexers=[DownloadIndexerConfig(name="Test Indexer (API)", announce_substrings=["test-indexer"])],
     )
     client = ProwlarrClient(cfg)
-    idx = Indexer(1, "Seedpool (API)", "torrent", True, [])
-    client.get_download_indexer = MagicMock(return_value=idx)
+    idx = Indexer(1, "Test Indexer (API)", "torrent", True, [])
+    client._indexers_by_name = {"test indexer (api)": idx}
     return client
 
 
@@ -409,7 +409,7 @@ async def test_best_match_rejects_different_release_group():
     """Same episode, different group (Kitsune vs playWEB) must never match,
     even when sizes agree within tolerance — pointing racing torrents at
     foreign bytes corrupts the seed."""
-    client = _seedpool_client()
+    client = _download_client()
     query = "Star.Trek.Strange.New.Worlds.S04E08.Orders.of.Magnitude.1080p.AMZN.WEB-DL.DDP5.1.H.264-Kitsune.mkv"
     wrong_group = (
         "Star.Trek.Strange.New.Worlds.S04E08.Orders.of.Magnitude.1080p.AMZN.WEB-DL.DDP5.1.H.264-playWEB.mkv"
@@ -422,7 +422,7 @@ async def test_best_match_rejects_different_release_group():
 
 @pytest.mark.anyio
 async def test_best_match_accepts_punctuation_variants_and_strips_tags():
-    client = _seedpool_client()
+    client = _download_client()
     size = 1_450_000_000
     # Dots vs spaces must not split the same release...
     client.search_indexer = AsyncMock(return_value=[
@@ -445,7 +445,7 @@ async def test_best_match_accepts_punctuation_variants_and_strips_tags():
 async def test_best_match_size_gate_needs_target_size():
     """Same normalized title but wildly different size: gated only when the
     caller passes target_size (best_match can't know it otherwise)."""
-    client = _seedpool_client()
+    client = _download_client()
     title = "Show.S01E01.1080p-GRP"
     client.search_indexer = AsyncMock(return_value=[_hit(title, 10_000_000_000)])
     # No target size -> title match alone suffices (legacy callers).
@@ -465,7 +465,7 @@ async def test_prowlarr_headers_not_leaked_to_external_hosts():
         enabled=True,
         base_url="http://prowlarr.local:9696",
         api_key="super_secret_prowlarr_key",
-        download_indexer="indexer1",
+        download_indexers=[DownloadIndexerConfig(name="indexer1")],
     )
     client = ProwlarrClient(cfg)
     client._session = MagicMock()
@@ -525,7 +525,7 @@ async def test_prowlarr_download_url_scrubbed_in_exceptions():
         enabled=True,
         base_url="http://prowlarr.local:9696",
         api_key="prowlarr_key",
-        download_indexer="indexer1",
+        download_indexers=[DownloadIndexerConfig(name="indexer1")],
     )
     client = ProwlarrClient(cfg)
     client._session = MagicMock()
@@ -625,7 +625,7 @@ async def test_pick_ssd_source_public_failure_does_not_fall_through():
         source_client=source_client,
         attempt_prowlarr=True,
     )
-    # Must return None and NEVER call Prowlarr (no fallthrough to private seedpool logic)
+    # Must return None and NEVER call Prowlarr (no fallthrough to private indexer logic)
     assert dec is None
     prowlarr.best_match.assert_not_called()
 
@@ -674,11 +674,11 @@ async def test_pick_ssd_source_extracts_announce_url():
     cfg = MagicMock()
     cfg.prowlarr.enabled = True
     cfg.prowlarr.should_skip_title.return_value = False
-    cfg.prowlarr.download_indexer = "Seedpool (API)"
+    cfg.prowlarr.download_indexer_names = ["Test Indexer (API)"]
     cfg.cross_seed.allow_prowlarr_cross_seed = True
 
     blob = _bencode({
-        b"announce": b"http://tracker.seedpool.org/announce",
+        b"announce": b"http://tracker.test-indexer.example/announce",
         b"info": {
             b"name": b"Private.Release",
             b"length": 5000,
@@ -691,7 +691,11 @@ async def test_pick_ssd_source_extracts_announce_url():
         size_bytes=5000,
         download_url="http://prowlarr.local/api/v1/download?apikey=secret",
     )
+    hit.indexer = "Test Indexer (API)"
     prowlarr = AsyncMock()
+    prowlarr.get_download_indexers = MagicMock(
+        return_value=[Indexer(7, "Test Indexer (API)", "torrent", True, [])]
+    )
     prowlarr.best_match.return_value = hit
     prowlarr.download_torrent.return_value = blob
 
@@ -717,7 +721,7 @@ async def test_pick_ssd_source_extracts_announce_url():
     )
     assert dec is not None
     # Announce URL must be extracted from bencoded torrent, NOT the Prowlarr download_url API endpoint
-    assert dec.announce_url == "http://tracker.seedpool.org/announce"
+    assert dec.announce_url == "http://tracker.test-indexer.example/announce"
     assert "apikey=secret" not in dec.announce_url
 
 
@@ -765,7 +769,7 @@ async def test_pick_rejects_hit_whose_payload_is_another_release():
     playweb = "Star.Trek.Strange.New.Worlds.S04E08.Orders.of.Magnitude.1080p.AMZN.WEB-DL.DDP5.1.H.264-playWEB.mkv"
     size = 1_450_000_000
     playweb_blob = _bencode({
-        b"announce": b"http://tracker.seedpool.org/announce",
+        b"announce": b"http://tracker.test-indexer.example/announce",
         b"info": {
             b"name": playweb.encode(),
             b"length": size,
@@ -776,13 +780,16 @@ async def test_pick_rejects_hit_whose_payload_is_another_release():
 
     cfg = MagicMock()
     cfg.prowlarr.should_skip_title.return_value = False
-    cfg.prowlarr.download_indexer = "Seedpool (API)"
+    cfg.prowlarr.download_indexer_names = ["Test Indexer (API)"]
     cfg.cross_seed.allow_prowlarr_cross_seed = True
     cfg.cross_seed.allow_ssh_export = False
 
     prowlarr = AsyncMock()
+    prowlarr.get_download_indexers = MagicMock(
+        return_value=[Indexer(9, "Test Indexer (API)", "torrent", True, [])]
+    )
     prowlarr.best_match.return_value = TorrentHit(
-        title=playweb, guid="9", indexer="Seedpool (API)", indexer_id=1,
+        title=playweb, guid="9", indexer="Test Indexer (API)", indexer_id=1,
         size_bytes=size, download_url="http://prowlarr/9",
         magnet_url="", info_url="", publish_date="",
     )
@@ -812,7 +819,7 @@ def test_fetchable_url_allows_own_prowlarr_refuses_metadata():
     """Prowlarr on localhost/LAN must fetch; metadata/link-local must not.
 
     Regression: the SSRF guard once refused 127.0.0.1 and failed every
-    Seedpool enclosure download (6 worker tracebacks in one run).
+    download-target indexer enclosure download (6 worker tracebacks in one run).
     """
     from racing_sync.prowlarr import _is_fetchable_http_url
 
@@ -840,3 +847,154 @@ def test_fetchable_url_allows_own_prowlarr_refuses_metadata():
     ]
     for url in refused:
         assert not _is_fetchable_http_url(url), url
+
+
+def test_prowlarr_requires_a_download_target_indexer_when_enabled():
+    with pytest.raises(Exception, match="no download-target indexer"):
+        ProwlarrConfig(enabled=True, base_url="http://localhost:9696", api_key="secret")
+
+
+def test_duplicate_download_indexer_names_rejected():
+    with pytest.raises(Exception, match="listed twice"):
+        ProwlarrConfig(
+            enabled=True,
+            base_url="http://localhost:9696",
+            api_key="secret",
+            download_indexers=[
+                DownloadIndexerConfig(name="Same (API)"),
+                DownloadIndexerConfig(name="same (api)"),
+            ],
+        )
+
+
+def _multi_client() -> ProwlarrClient:
+    cfg = ProwlarrConfig(
+        enabled=True,
+        base_url="http://127.0.0.1:9696",
+        api_key="secret",
+        download_indexers=[
+            DownloadIndexerConfig(name="First (API)", announce_substrings=["first"]),
+            DownloadIndexerConfig(name="Second (API)", announce_substrings=["second"]),
+        ],
+    )
+    client = ProwlarrClient(cfg)
+    client._indexers_by_name = {
+        "first (api)": Indexer(1, "First (API)", "torrent", True, []),
+        "second (api)": Indexer(2, "Second (API)", "torrent", True, []),
+    }
+    return client
+
+
+def test_get_download_indexers_preserves_priority_order():
+    assert [i.name for i in _multi_client().get_download_indexers()] == [
+        "First (API)", "Second (API)",
+    ]
+
+
+def test_get_download_indexers_skips_unusable_and_raises_when_none():
+    from racing_sync.prowlarr import ProwlarrError
+    client = _multi_client()
+    client._indexers_by_name = {
+        "second (api)": Indexer(2, "Second (API)", "torrent", False, []),
+    }
+    # First unknown + second disabled = nothing usable -> fail fast.
+    with pytest.raises(ProwlarrError, match="none of the configured download-target indexers"):
+        client.get_download_indexers()
+    client._indexers_by_name["second (api)"].enable = True
+    assert [i.name for i in client.get_download_indexers()] == ["Second (API)"]
+
+
+@pytest.mark.anyio
+async def test_best_match_falls_through_to_second_indexer():
+    """First indexer has only a wrong-group hit; the second has the exact
+    release -> second wins (priority-ordered fan-out)."""
+    client = _multi_client()
+    query = "Show.S01E01.1080p-GRP"
+    size = 1_000_000_000
+
+    def _mk(title, idx_name, idx_id):
+        return TorrentHit(
+            title=title, guid=str(idx_id), indexer=idx_name, indexer_id=idx_id,
+            size_bytes=size, download_url=f"http://prowlarr/{idx_id}",
+            magnet_url="", info_url="", publish_date="",
+        )
+
+    async def _search(idx, query_text, *, limit=None):
+        if idx.name == "First (API)":
+            return [_mk("Something.Else.1080p-OTHER", idx.name, idx.id)]
+        return [_mk(query, idx.name, idx.id)]
+
+    client.search_indexer = _search
+    best = await client.best_match(query, target_size=size)
+    assert best is not None
+    assert best.indexer == "Second (API)"
+
+
+@pytest.mark.anyio
+async def test_best_match_prefers_first_indexer_on_tie():
+    """Both indexers have the exact release -> highest priority wins."""
+    client = _multi_client()
+    query = "Show.S01E01.1080p-GRP"
+    size = 1_000_000_000
+
+    async def _search(idx, query_text, *, limit=None):
+        return [TorrentHit(
+            title=query, guid=str(idx.id), indexer=idx.name, indexer_id=idx.id,
+            size_bytes=size, download_url=f"http://prowlarr/{idx.id}",
+            magnet_url="", info_url="", publish_date="",
+        )]
+
+    client.search_indexer = _search
+    best = await client.best_match(query, target_size=size)
+    assert best is not None
+    assert best.indexer == "First (API)"
+
+
+@pytest.mark.anyio
+async def test_pick_ssd_source_labels_indexer_slug():
+    """The SSD source label records WHICH download-target indexer supplied
+    the bytes (slugified), not a hardcoded name."""
+    from racing_sync.clients.abstract import Torrent
+
+    cfg = MagicMock()
+    cfg.prowlarr.enabled = True
+    cfg.prowlarr.should_skip_title.return_value = False
+    cfg.prowlarr.download_indexer_names = ["Second Indexer (API)"]
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+
+    blob = _bencode({
+        b"announce": b"http://tracker.second.example/announce",
+        b"info": {
+            b"name": b"Private.Release",
+            b"length": 5000,
+            b"piece length": 16384,
+            b"pieces": b"12345678901234567890",
+        },
+    })
+    prowlarr = AsyncMock()
+    prowlarr.get_download_indexers = MagicMock(
+        return_value=[Indexer(7, "Second Indexer (API)", "torrent", True, [])]
+    )
+    prowlarr.best_match.return_value = TorrentHit(
+        title="Private.Release", guid="7", indexer="Second Indexer (API)",
+        indexer_id=7, size_bytes=5000,
+        download_url="http://prowlarr.local/dl/7",
+        magnet_url="", info_url="", publish_date="",
+    )
+    prowlarr.download_torrent.return_value = blob
+
+    dec = await pick_ssd_source_for_racing(
+        cfg=cfg,
+        source_torrent=Torrent(
+            hash="privhash999", name="Private.Release", category="racing",
+            save_path="", size_bytes=5000, state="racing", progress=1.0,
+            trackers=["https://aither.cc/announce"],
+        ),
+        other_source_torrents=[],
+        prowlarr=prowlarr,
+        sftp=None,
+        source_client=AsyncMock(),
+        attempt_prowlarr=True,
+    )
+    assert dec is not None
+    assert dec.source_label == "second-indexer-api-cross-seed"

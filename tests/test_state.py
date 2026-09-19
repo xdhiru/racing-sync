@@ -52,20 +52,20 @@ def test_moving_to_done_is_illegal():
         check_transition(State.MOVING, State.DONE)
 
 
-def test_seedpool_park_and_retry():
-    check_transition(State.NEW, State.WAITING_SEEDPOOL)
-    check_transition(State.QUERYING, State.WAITING_SEEDPOOL)
-    check_transition(State.WAITING_SEEDPOOL, State.QUERYING)
-    check_transition(State.WAITING_SEEDPOOL, State.QUEUED)
-    check_transition(State.WAITING_SEEDPOOL, State.FAILED)
+def test_indexer_park_and_retry():
+    check_transition(State.NEW, State.WAITING_INDEXER)
+    check_transition(State.QUERYING, State.WAITING_INDEXER)
+    check_transition(State.WAITING_INDEXER, State.QUERYING)
+    check_transition(State.WAITING_INDEXER, State.QUEUED)
+    check_transition(State.WAITING_INDEXER, State.FAILED)
 
 
-def test_seedpool_no_self_transition():
+def test_indexer_no_self_transition():
     # Re-parking bumps fields but should not go through transition().
-    # The state machine still treats WAITING_SEEDPOOL -> WAITING_SEEDPOOL
+    # The state machine still treats WAITING_INDEXER -> WAITING_INDEXER
     # as illegal; callers must upsert() instead.
     with pytest.raises(ValueError):
-        check_transition(State.WAITING_SEEDPOOL, State.WAITING_SEEDPOOL)
+        check_transition(State.WAITING_INDEXER, State.WAITING_INDEXER)
 
 
 def test_queued_to_done_is_allowed():
@@ -86,7 +86,7 @@ def test_find_by_name_extension_matching(tmp_path):
     db_path = tmp_path / "test.db"
     store = StateStore(db_path)
 
-    # Stored without .mkv (as Seedpool or VPS2 client might report)
+    # Stored without .mkv (as a download-target indexer or VPS2 client might report)
     ts = TorrentState(
         source_infohash="hash123",
         source_name="Game.Day.Murders.S01E06.1080p-Kitsune",
@@ -317,13 +317,13 @@ def test_transition_resets_retry_timers(tmp_path: Path):
         ts = TorrentState(
             source_infohash="2" * 40,
             state=State.FAILED,
-            seedpool_next_retry_at=past,
-            seedpool_attempts=5,
+            indexer_next_retry_at=past,
+            indexer_attempts=5,
         )
         store.upsert(ts)
         store.transition(ts, State.NEW)
-        assert ts.seedpool_next_retry_at is None
-        assert ts.seedpool_attempts == 0
+        assert ts.indexer_next_retry_at is None
+        assert ts.indexer_attempts == 0
     finally:
         store.close()
 
@@ -348,48 +348,6 @@ def test_transition_to_done_sets_completed_at(tmp_path: Path):
         reloaded.vps1_last_activity_at = stamp
         store.upsert(reloaded)
         assert store.get("4" * 40).vps1_last_activity_at == stamp
-    finally:
-        store.close()
-
-
-def test_migrate_handles_old_schema_without_telegram_or_seedpool(tmp_path: Path):
-    import sqlite3
-    db_path = tmp_path / "old.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("""
-        CREATE TABLE torrent_state (
-            source_infohash TEXT PRIMARY KEY,
-            dest_infohash TEXT NOT NULL DEFAULT '',
-            source_name TEXT NOT NULL DEFAULT '',
-            source_tracker TEXT NOT NULL DEFAULT '',
-            source_announce_url TEXT NOT NULL DEFAULT '',
-            classification_kind TEXT NOT NULL DEFAULT 'unknown',
-            total_bytes INTEGER NOT NULL DEFAULT 0,
-            save_path TEXT NOT NULL DEFAULT '',
-            cross_seed_infohash TEXT NOT NULL DEFAULT '',
-            cross_seed_source TEXT NOT NULL DEFAULT '',
-            state TEXT NOT NULL DEFAULT 'new',
-            batch_index INTEGER NOT NULL DEFAULT 0,
-            batches_total INTEGER NOT NULL DEFAULT 0,
-            last_error TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        INSERT INTO torrent_state (source_infohash, created_at, updated_at)
-        VALUES ('3333333333333333333333333333333333333333', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')
-    """)
-    conn.commit()
-    conn.close()
-
-    # Opening StateStore on existing legacy DB runs _migrate()
-    store = StateStore(db_path)
-    try:
-        row = store.get("3333333333333333333333333333333333333333")
-        assert row is not None
-        assert row.telegram_message_id == 0
-        assert row.seedpool_attempts == 0
     finally:
         store.close()
 

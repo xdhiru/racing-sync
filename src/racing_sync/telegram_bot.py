@@ -5,7 +5,7 @@ stays clean:
 
   1. **Per-torrent detail message** — one Telegram message per source_infohash.
      Created when the torrent first leaves NEW. Edited in place as it advances
-     through states (NEW → QUERYING → WAITING_SEEDPOOL → ... → DONE). The
+     through states (NEW → QUERYING → WAITING_INDEXER → ... → DONE). The
      final DONE message stays in the chat as a clean history record.
      The message_id is persisted in torrent_state.telegram_message_id.
 
@@ -50,7 +50,7 @@ log = logging.getLogger(__name__)
 _STATE_ICON = {
     State.NEW: "🆕 NEW",
     State.QUERYING: "🔍 QUERY",
-    State.WAITING_SEEDPOOL: "⏳ WAIT-SP",
+    State.WAITING_INDEXER: "⏳ WAIT-IDX",
     State.WAITING_DISK: "💾 WAIT-SSD",
     State.QUEUED: "📋 QUEUED",
     State.DOWNLOADING: "⬇️ DOWNLOADING",
@@ -220,11 +220,11 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     lines.append(" · ".join(meta_parts))
 
     # State-specific extras
-    if ts.state == State.WAITING_SEEDPOOL and ts.seedpool_next_retry_at:
-        _when = _as_aware_utc(ts.seedpool_next_retry_at)
+    if ts.state == State.WAITING_INDEXER and ts.indexer_next_retry_at:
+        _when = _as_aware_utc(ts.indexer_next_retry_at)
         when = _when.astimezone().strftime("%H:%M:%S") if _when else "?"
         lines.append(
-            f"Seedpool miss #{ts.seedpool_attempts}; next retry at {when}"
+            f"Indexer miss #{ts.indexer_attempts}; next retry at {when}"
         )
     elif ts.state == State.WAITING_DISK:
         lines.append("Waiting for SSD cap to free up")
@@ -352,8 +352,8 @@ def render_active(
                 state_text = "🔄 Re-adding"
         elif ts.state == State.QUERYING:
             state_text = "🔍 Querying"
-        elif ts.state == State.WAITING_SEEDPOOL:
-            state_text = f"⏳ Waiting for Seedpool (#{ts.seedpool_attempts})"
+        elif ts.state == State.WAITING_INDEXER:
+            state_text = f"⏳ Waiting for download indexer (#{ts.indexer_attempts})"
         elif ts.state == State.WAITING_DISK:
             state_text = "💾 Waiting for SSD space"
         elif ts.state == State.DONE:

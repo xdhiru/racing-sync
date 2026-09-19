@@ -7,7 +7,7 @@ calls, rclone invocations, and prowlarr lookups. The flow per torrent:
   2. Pick the SSD-source torrent:
        - if VPS1 has multiple, prefer public (req #1) via prowlarr or SFTP
        - if VPS1 has only private, query prowlarr by tracker map (req #2)
-       - if from watch_dir, prefer prowlarr hit on Seedpool (req #3)
+       - if from watch_dir, prefer prowlarr hit on a download-target indexer (req #3)
   3. Add to VPS2 qBittorrent at SSD save_path, paused, skip_check=False
   4. Resume; poll until complete (with batched file priorities for seasons)
   5. rclone move SSD -> remote (with --include for seasons)
@@ -480,7 +480,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         seconds before sync starts (e.g. to allow cross-seeds to be added).
 
         Cached for 10 seconds to prevent redundant RPC calls to VPS1 when
-        multiple tasks (e.g. _tick, _do_new, _do_waiting_seedpool) query
+        multiple tasks (e.g. _tick, _do_new, _do_waiting_indexer) query
         the source client within the same cycle.
         """
         now_mono = time.monotonic()
@@ -726,7 +726,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
             # Elect ONE primary torrent for SSD download:
             # 1. Prefer public torrent if available (req #1)
-            # 2. Otherwise pick first private torrent to query Seedpool (req #2)
+            # 2. Otherwise pick first private torrent to query the download-target indexers (req #2)
             primary = next((t for t in group if _looks_public(t.trackers)), group[0])
             is_pub = _looks_public(primary.trackers)
 
@@ -760,8 +760,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             except Exception:
                 pass
 
-        # 3. Wake up WAITING_SEEDPOOL rows whose retry timer has elapsed.
-        # Seedpool wakeups still respect worker capacity: an unbounded timer
+        # 3. Wake up WAITING_INDEXER rows whose retry timer has elapsed.
+        # Indexer wakeups still respect worker capacity: an unbounded timer
         # burst must not spawn unbounded workers.
         try:
             _max_workers = max(
@@ -770,8 +770,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             )
         except (TypeError, ValueError):
             _max_workers = 0
-        ready_seedpool = self.store.list_seedpool_ready()
-        for ts in ready_seedpool:
+        ready_indexer = self.store.list_indexer_ready()
+        for ts in ready_indexer:
             if _max_workers and max(0, _max_workers - len(self._tasks)) <= 0:
                 break
             _key = (ts.source_infohash or "").lower()
@@ -783,22 +783,22 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 fresh = self.store.get(ts.source_infohash)
             except Exception:
                 fresh = None
-            if fresh is None or fresh.state != State.WAITING_SEEDPOOL:
+            if fresh is None or fresh.state != State.WAITING_INDEXER:
                 continue
             ts = fresh
             log.info(
-                "seedpool retry timer fired for %s (attempt #%d)",
-                ts.source_name[:40], ts.seedpool_attempts,
+                "download-indexer retry timer fired for %s (attempt #%d)",
+                ts.source_name[:40], ts.indexer_attempts,
             )
             self.transition(ts, State.QUERYING)
             h = (ts.source_infohash or "").lower()
             self._running_infohashes.add(h)
             task = asyncio.create_task(self._process_torrent(ts))
             self._tasks.add(task)
-            def _done_cb_seedpool(t: asyncio.Task, infohash: str = h) -> None:
+            def _done_cb_indexer(t: asyncio.Task, infohash: str = h) -> None:
                 self._tasks.discard(t)
                 self._running_infohashes.discard(infohash)
-            task.add_done_callback(_done_cb_seedpool)
+            task.add_done_callback(_done_cb_indexer)
 
         # 4. Schedule workers for active states that have no live task.
         # WAITING_DISK rows sort last so real QUEUED/DOWNLOADING/MOVING work
@@ -833,9 +833,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if _tkey in self._running_infohashes:
                 continue
 
-            # Skip WAITING_SEEDPOOL rows: they are parked and woken up exclusively
-            # by Step 3 when their seedpool_next_retry_at timer elapses.
-            if ts.state == State.WAITING_SEEDPOOL:
+            # Skip WAITING_INDEXER rows: they are parked and woken up exclusively
+            # by Step 3 when their indexer_next_retry_at timer elapses.
+            if ts.state == State.WAITING_INDEXER:
                 continue
 
             # Quiet-wait for SSD-full parking: re-check at most once per
@@ -1134,7 +1134,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if ts.state == State.NEW:
             await self._do_new(ts)
         if ts.state == State.QUERYING:
-            await self._do_waiting_seedpool(ts)
+            await self._do_waiting_indexer(ts)
         if ts.state == State.WAITING_DISK:
             await self._wait_disk_then_queue(ts)
         if ts.state == State.QUEUED:
@@ -1200,15 +1200,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         )
         if decision is None:
             # No SSD source right now → park and retry. Label honestly: a
-            # public group never touched Seedpool (its .torrent export
-            # failed), so "seedpool miss" would send operators hunting the
-            # wrong subsystem.
+            # public group never touched the download-target indexers (its
+            # .torrent export failed), so "indexer miss" would send
+            # operators hunting the wrong subsystem.
             reason = (
                 "source export miss"
                 if any(_looks_public(t.trackers) for t in [st, *others])
-                else "seedpool miss"
+                else "indexer miss"
             )
-            self._park_for_seedpool_retry(ts, reason=reason)
+            self._park_for_indexer_retry(ts, reason=reason)
             return
 
         ts.cross_seed_infohash = decision.infohash.lower()
@@ -1295,16 +1295,19 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             )
         elif self.cfg.prowlarr.enabled and self.prowlarr is not None:
             indexers_to_query = []
-            download_idx = None
+            # Download-target indexer names (lowercase), in priority order —
+            # the sacrificial pick below tries them in this order.
+            download_idx_names: list[str] = []
             if needs_sacrificial_copy and prefer_prowlarr:
                 try:
-                    download_idx = self.prowlarr.get_download_indexer()
-                    indexers_to_query.append(download_idx)
+                    for dl_idx in self.prowlarr.get_download_indexers():
+                        download_idx_names.append(dl_idx.name.lower())
+                        indexers_to_query.append(dl_idx)
                 except Exception as e:  # noqa: BLE001
-                    log.warning("could not get download indexer: %s", e)
+                    log.warning("could not get download-target indexers: %s", e)
 
             # Add all private indexers from tracker_map
-            seen_names = {download_idx.name.lower()} if download_idx else set()
+            seen_names = set(download_idx_names)
             for name in self.cfg.prowlarr.tracker_map.entries.values():
                 idx = self.prowlarr.get_indexer_by_name(name)
                 if idx and idx.name.lower() not in seen_names and idx.enable:
@@ -1321,20 +1324,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     log.warning("watch-dir: prowlarr search failed for %s: %s", ts.source_name, e)
                     hits_by_indexer = {}
 
-            # 1. Check for sacrificial download torrent on download_indexer
-            if prefer_prowlarr and download_idx and download_idx.name.lower() in hits_by_indexer:
-                dl_hits = hits_by_indexer[download_idx.name.lower()]
-                matching_dl = [
-                    h for h in dl_hits
-                    if _matches_release(h.title, h.size_bytes, ts.source_name, ts.total_bytes)
-                ]
-                matching_dl.sort(
-                    key=lambda h: (
-                        normalize_content_name(h.title) != normalize_content_name(ts.source_name),
-                        abs(h.size_bytes - ts.total_bytes),
+            # 1. Sacrificial download torrent from the download-target
+            # indexers, in priority order — first exact match wins.
+            if prefer_prowlarr and download_idx_names:
+                for dl_name in download_idx_names:
+                    dl_hits = hits_by_indexer.get(dl_name, [])
+                    matching_dl = [
+                        h for h in dl_hits
+                        if _matches_release(h.title, h.size_bytes, ts.source_name, ts.total_bytes)
+                    ]
+                    matching_dl.sort(
+                        key=lambda h: (
+                            normalize_content_name(h.title) != normalize_content_name(ts.source_name),
+                            abs(h.size_bytes - ts.total_bytes),
+                        )
                     )
-                )
-                if matching_dl:
+                    if not matching_dl:
+                        continue
                     best_dl = matching_dl[0]
                     try:
                         dl_blob = await self.prowlarr.download_torrent(best_dl)
@@ -1352,10 +1358,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         log.warning(
                             "failed to fetch download indexer torrent: %s; using dropped file", e
                         )
+                    break
 
             # 2. Collect other private tracker cross-seeds to inject onto FUSE
             for idx_name, hits in hits_by_indexer.items():
-                if download_idx and idx_name == download_idx.name.lower():
+                if idx_name in download_idx_names:
                     continue
                 for hit in hits:
                     if _matches_release(hit.title, hit.size_bytes, ts.source_name, ts.total_bytes):
@@ -1410,40 +1417,41 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 await self._ssd_release(ts.source_infohash)
                 raise
 
-    def _park_for_seedpool_retry(self, ts: TorrentState, *, reason: str = "seedpool miss") -> None:
-        """Park into WAITING_SEEDPOOL with an escalating retry timer.
+    def _park_for_indexer_retry(self, ts: TorrentState, *, reason: str = "indexer miss") -> None:
+        """Park into WAITING_INDEXER with an escalating retry timer.
 
-        The first attempt: retry after seedpool_retry_interval_seconds.
+        The first attempt: retry after prowlarr_retry_interval_seconds.
         Subsequent attempts: same interval (fixed, not exponential — we
-        expect Seedpool to catch up shortly for racing releases).
-        Hard cap: seedpool_max_age_seconds since the FIRST attempt. If
+        expect the download-target indexers to catch up shortly for racing
+        releases).
+        Hard cap: prowlarr_max_age_seconds since the FIRST attempt. If
         that ceiling is reached, mark FAILED for manual handling.
         """
         now = dt.datetime.now(dt.timezone.utc)
-        if ts.seedpool_first_queried_at is None:
-            ts.seedpool_first_queried_at = now
-        ts.seedpool_attempts += 1
+        if ts.indexer_first_queried_at is None:
+            ts.indexer_first_queried_at = now
+        ts.indexer_attempts += 1
         next_retry = now + dt.timedelta(
-            seconds=self.cfg.cross_seed.seedpool_retry_interval_seconds
+            seconds=self.cfg.cross_seed.prowlarr_retry_interval_seconds
         )
-        ts.seedpool_next_retry_at = next_retry
+        ts.indexer_next_retry_at = next_retry
         max_age = dt.timedelta(seconds=self.cfg.cross_seed.prowlarr_max_age_seconds)
-        elapsed = now - ts.seedpool_first_queried_at
+        elapsed = now - ts.indexer_first_queried_at
 
         log.info(
             "%s #%d for %s; next retry at %s (elapsed=%ds, max=%ds)",
-            reason, ts.seedpool_attempts, ts.source_name,
+            reason, ts.indexer_attempts, ts.source_name,
             next_retry.isoformat(timespec="seconds"),
             int(elapsed.total_seconds()), int(max_age.total_seconds()),
         )
 
         if elapsed >= max_age:
             log.error(
-                "seedpool giving up on %s after %d attempts (%ds > %ds max)",
-                ts.source_name, ts.seedpool_attempts,
+                "download-target indexers giving up on %s after %d attempts (%ds > %ds max)",
+                ts.source_name, ts.indexer_attempts,
                 int(elapsed.total_seconds()), int(max_age.total_seconds()),
             )
-            # From WAITING_SEEDPOOL → FAILED is legal (see ALLOWED).
+            # From WAITING_INDEXER → FAILED is legal (see ALLOWED).
             self.transition(
                 ts, State.FAILED,
                 error=(f"Prowlarr cross-seed not found within "
@@ -1453,19 +1461,19 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
         # If we're being called from _do_new (state is NEW), the
         # transition is legal. If we're being re-called from
-        # _do_waiting_seedpool, the state is already WAITING_SEEDPOOL
+        # _do_waiting_indexer, the state is already WAITING_INDEXER
         # and we just need to bump the retry timestamp.
-        if ts.state != State.WAITING_SEEDPOOL:
-            self.transition(ts, State.WAITING_SEEDPOOL)
+        if ts.state != State.WAITING_INDEXER:
+            self.transition(ts, State.WAITING_INDEXER)
         else:
             self.store.upsert(ts)
             # No transition() fired, so push the updated timer manually.
             self._schedule_telegram_update(ts)
 
-    async def _do_waiting_seedpool(self, ts: TorrentState) -> None:
-        """Wake up from WAITING_SEEDPOOL and re-pick the SSD source.
+    async def _do_waiting_indexer(self, ts: TorrentState) -> None:
+        """Wake up from WAITING_INDEXER and re-pick the SSD source.
 
-        Called by _tick when the row's seedpool_next_retry_at has elapsed.
+        Called by _tick when the row's indexer_next_retry_at has elapsed.
         """
         # Pull fresh data from VPS1 in case the torrent name changed.
         st = await self.source_client.get_torrent(ts.source_infohash)
@@ -1496,7 +1504,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if decision is None:
             # Still no hit — re-park, escalating the failure to FAILED
             # when the max_age window is exceeded.
-            self._park_for_seedpool_retry(ts)
+            self._park_for_indexer_retry(ts)
             return
 
         ts.cross_seed_infohash = decision.infohash.lower()

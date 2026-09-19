@@ -1,7 +1,7 @@
-"""Tests for the seedpool retry policy math.
+"""Tests for the download-target indexer retry policy math.
 
 We don't run the full coordinator here (it needs live qBittorrent +
-Prowlarr). Instead we verify the timing rules that _park_for_seedpool_retry
+Prowlarr). Instead we verify the timing rules that _park_for_indexer_retry
 applies.
 """
 
@@ -28,42 +28,42 @@ def _cfg() -> AppConfig:
 def test_first_attempt_sets_first_queried_at():
     cfg = _cfg()
     ts = TorrentState(source_infohash="a" * 40, state=State.NEW)
-    assert ts.seedpool_first_queried_at is None
-    assert ts.seedpool_attempts == 0
+    assert ts.indexer_first_queried_at is None
+    assert ts.indexer_attempts == 0
 
     now = dt.datetime.now(dt.timezone.utc)
-    interval = cfg.cross_seed.seedpool_retry_interval_seconds
-    ts.seedpool_first_queried_at = now
-    ts.seedpool_attempts = 1
-    ts.seedpool_next_retry_at = now + dt.timedelta(seconds=interval)
+    interval = cfg.cross_seed.prowlarr_retry_interval_seconds
+    ts.indexer_first_queried_at = now
+    ts.indexer_attempts = 1
+    ts.indexer_next_retry_at = now + dt.timedelta(seconds=interval)
 
-    assert ts.seedpool_first_queried_at == now
-    assert ts.seedpool_next_retry_at is not None
-    diff = (ts.seedpool_next_retry_at - now).total_seconds()
+    assert ts.indexer_first_queried_at == now
+    assert ts.indexer_next_retry_at is not None
+    diff = (ts.indexer_next_retry_at - now).total_seconds()
     assert abs(diff - interval) < 1
 
 
 def test_retry_window_is_24_hours():
     cfg = _cfg()
-    assert cfg.cross_seed.seedpool_max_age_seconds == 86400
-    assert cfg.cross_seed.seedpool_retry_interval_seconds == 1800
+    assert cfg.cross_seed.prowlarr_max_age_seconds == 86400
+    assert cfg.cross_seed.prowlarr_retry_interval_seconds == 1800
 
 
 def test_expired_max_age_marks_failed():
     """If the first attempt was > 24 h ago, the next park should escalate
-    to FAILED. We simulate by backdating seedpool_first_queried_at."""
+    to FAILED. We simulate by backdating indexer_first_queried_at."""
     cfg = _cfg()
     ts = TorrentState(
         source_infohash="a" * 40,
-        state=State.WAITING_SEEDPOOL,
-        seedpool_first_queried_at=dt.datetime.now(dt.timezone.utc)
-        - dt.timedelta(seconds=cfg.cross_seed.seedpool_max_age_seconds + 1),
-        seedpool_next_retry_at=dt.datetime.now(dt.timezone.utc),
-        seedpool_attempts=10,
+        state=State.WAITING_INDEXER,
+        indexer_first_queried_at=dt.datetime.now(dt.timezone.utc)
+        - dt.timedelta(seconds=cfg.cross_seed.prowlarr_max_age_seconds + 1),
+        indexer_next_retry_at=dt.datetime.now(dt.timezone.utc),
+        indexer_attempts=10,
     )
     now = dt.datetime.now(dt.timezone.utc)
-    elapsed = now - ts.seedpool_first_queried_at
-    assert elapsed > dt.timedelta(seconds=cfg.cross_seed.seedpool_max_age_seconds)
+    elapsed = now - ts.indexer_first_queried_at
+    assert elapsed > dt.timedelta(seconds=cfg.cross_seed.prowlarr_max_age_seconds)
 
 
 @pytest.mark.anyio
@@ -72,13 +72,13 @@ async def test_process_torrent_inner_dispatches_querying_state():
     from racing_sync.coordinator import Coordinator
 
     coord = object.__new__(Coordinator)
-    coord._do_waiting_seedpool = AsyncMock()
+    coord._do_waiting_indexer = AsyncMock()
 
     ts = TorrentState("hash1", state=State.QUERYING)
     await coord._process_torrent_inner(ts)
 
-    # Must dispatch to _do_waiting_seedpool when in QUERYING state
-    coord._do_waiting_seedpool.assert_awaited_once_with(ts)
+    # Must dispatch to _do_waiting_indexer when in QUERYING state
+    coord._do_waiting_indexer.assert_awaited_once_with(ts)
 
 
 @pytest.mark.anyio
@@ -133,7 +133,7 @@ async def test_do_new_transitions_failed_when_source_vanished():
 
 
 @pytest.mark.anyio
-async def test_do_waiting_seedpool_transitions_failed_when_source_vanished():
+async def test_do_waiting_indexer_transitions_failed_when_source_vanished():
     from unittest.mock import AsyncMock, MagicMock
     from racing_sync.coordinator import Coordinator
 
@@ -143,7 +143,7 @@ async def test_do_waiting_seedpool_transitions_failed_when_source_vanished():
     coord.transition = MagicMock()
 
     ts = TorrentState(source_infohash="vanished_hash_67890", state=State.QUERYING)
-    await coord._do_waiting_seedpool(ts)
+    await coord._do_waiting_indexer(ts)
 
     coord.transition.assert_called_once_with(
         ts, State.FAILED, error="source torrent vanished from client: vanished_h"
@@ -221,19 +221,19 @@ def test_should_notify_telegram_policy():
     assert _should_notify_telegram(State.MOVING, State.RE_ADDING)
     assert _should_notify_telegram(State.RE_ADDING, State.DONE)
     assert _should_notify_telegram(State.RE_ADDING, State.FAILED)
-    assert _should_notify_telegram(State.NEW, State.WAITING_SEEDPOOL)
+    assert _should_notify_telegram(State.NEW, State.WAITING_INDEXER)
 
 
 @pytest.mark.anyio
-async def test_process_torrent_inner_does_not_fallthrough_to_waiting_seedpool_from_new():
+async def test_process_torrent_inner_does_not_fallthrough_to_waiting_indexer_from_new():
     from unittest.mock import AsyncMock
     from racing_sync.coordinator import Coordinator
 
     coord = object.__new__(Coordinator)
-    coord._do_waiting_seedpool = AsyncMock()
+    coord._do_waiting_indexer = AsyncMock()
 
     async def fake_do_new(ts: TorrentState) -> None:
-        ts.state = State.WAITING_SEEDPOOL
+        ts.state = State.WAITING_INDEXER
 
     coord._do_new = AsyncMock(side_effect=fake_do_new)
 
@@ -241,11 +241,11 @@ async def test_process_torrent_inner_does_not_fallthrough_to_waiting_seedpool_fr
     await coord._process_torrent_inner(ts)
 
     coord._do_new.assert_awaited_once_with(ts)
-    coord._do_waiting_seedpool.assert_not_called()
+    coord._do_waiting_indexer.assert_not_called()
 
 
 @pytest.mark.anyio
-async def test_tick_skips_waiting_seedpool_in_step_4():
+async def test_tick_skips_waiting_indexer_in_step_4():
     import asyncio
     from unittest.mock import AsyncMock, MagicMock
     from racing_sync.coordinator import Coordinator
@@ -260,13 +260,13 @@ async def test_tick_skips_waiting_seedpool_in_step_4():
     coord._check_and_inject_late_cross_seeds = AsyncMock()
     coord.watch = None
     coord.store = MagicMock()
-    coord.store.list_seedpool_ready.return_value = []
+    coord.store.list_indexer_ready.return_value = []
     coord._list_source_torrents = AsyncMock(return_value=[])
 
     ts_waiting = TorrentState(
-        source_infohash="waiting_seedpool",
-        source_name="Waiting.Seedpool.Release",
-        state=State.WAITING_SEEDPOOL,
+        source_infohash="waiting_indexer",
+        source_name="Waiting.Indexer.Release",
+        state=State.WAITING_INDEXER,
     )
     ts_queued = TorrentState(
         source_infohash="queued_ready",
@@ -285,7 +285,7 @@ async def test_tick_skips_waiting_seedpool_in_step_4():
     await coord._tick()
     await asyncio.sleep(0.01)
 
-    assert "waiting_seedpool" not in scheduled
+    assert "waiting_indexer" not in scheduled
     assert "queued_ready" in scheduled
 
 
@@ -381,7 +381,7 @@ async def test_public_sftp_timeout_retried_once_then_succeeds(caplog):
 @pytest.mark.anyio
 async def test_public_export_failure_parks_as_source_export_miss(caplog):
     """A public group whose .torrent export keeps failing must park with an
-    honest reason — never a 'seedpool miss' (Seedpool was never involved)."""
+    honest reason — never an 'indexer miss' (no indexer was ever queried)."""
     import logging
     from unittest.mock import AsyncMock, MagicMock
     from racing_sync.clients.abstract import Torrent
@@ -391,7 +391,7 @@ async def test_public_export_failure_parks_as_source_export_miss(caplog):
     cfg.cross_seed.allow_ssh_export = True
     cfg.cross_seed.refetch_public_via_prowlarr = False
     cfg.cross_seed.allow_prowlarr_cross_seed = True
-    cfg.cross_seed.seedpool_retry_interval_seconds = 1800
+    cfg.cross_seed.prowlarr_retry_interval_seconds = 1800
     cfg.cross_seed.prowlarr_max_age_seconds = 86400
     cfg.dest.save_path = "/ssd"
 
@@ -419,6 +419,6 @@ async def test_public_export_failure_parks_as_source_export_miss(caplog):
     with caplog.at_level(logging.INFO, logger="racing_sync.coordinator"):
         await coord._do_new(ts)
 
-    assert ts.state == State.WAITING_SEEDPOOL
+    assert ts.state == State.WAITING_INDEXER
     assert any("source export miss #1" in r.message for r in caplog.records)
-    assert not any("seedpool miss" in r.message for r in caplog.records)
+    assert not any("indexer miss" in r.message for r in caplog.records)

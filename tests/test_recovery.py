@@ -674,7 +674,7 @@ async def test_fix_orphan_glob_escape_matches_special_characters(tmp_path: Path)
 
 
 @pytest.mark.anyio
-async def test_reconcile_preserves_parked_waiting_seedpool(tmp_path: Path):
+async def test_reconcile_preserves_parked_waiting_indexer(tmp_path: Path):
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
@@ -683,10 +683,10 @@ async def test_reconcile_preserves_parked_waiting_seedpool(tmp_path: Path):
     cfg.rclone.fuse.mount_unsorted = Path("/mnt/fuse/unsorted")
 
     ts = TorrentState(
-        source_infohash="seedpool_parked_hash",
+        source_infohash="indexer_parked_hash",
         source_name="Parked.Torrent.Release",
-        state=State.WAITING_SEEDPOOL,
-        seedpool_attempts=2,
+        state=State.WAITING_INDEXER,
+        indexer_attempts=2,
     )
     store.upsert(ts)
 
@@ -696,14 +696,14 @@ async def test_reconcile_preserves_parked_waiting_seedpool(tmp_path: Path):
     report = await reconcile(cfg, dest=dest, store=store)
 
     # Must be considered safely resumed, NOT an orphan
-    assert "seedpool_parked_hash" in report.resumed
-    assert "seedpool_parked_hash" not in report.orphans
+    assert "indexer_parked_hash" in report.resumed
+    assert "indexer_parked_hash" not in report.orphans
     assert len(report.orphans) == 0
 
-    reloaded = store.get("seedpool_parked_hash")
+    reloaded = store.get("indexer_parked_hash")
     assert reloaded is not None
-    assert reloaded.state == State.WAITING_SEEDPOOL
-    assert reloaded.seedpool_attempts == 2
+    assert reloaded.state == State.WAITING_INDEXER
+    assert reloaded.indexer_attempts == 2
     dest.add_torrent.assert_not_called()
 
 
