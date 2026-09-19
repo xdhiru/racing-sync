@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from conftest import make_coordinator
 from unittest.mock import AsyncMock, MagicMock
 from pathlib import Path
 
@@ -174,12 +175,10 @@ async def test_fix_orphan_already_downloading(tmp_path: Path):
 @pytest.mark.anyio
 async def test_do_re_add_fails_if_add_torrent_rejected():
     from unittest.mock import AsyncMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import AddResult
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.fuse_reinject_delay_seconds = 0
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
     coord.dest_client = AsyncMock()
@@ -207,7 +206,6 @@ async def test_do_re_add_fails_if_add_torrent_rejected():
 @pytest.mark.anyio
 async def test_check_and_inject_late_cross_seeds(tmp_path: Path):
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import AddResult, Torrent
     from racing_sync.watchdir import _bencode
@@ -227,8 +225,7 @@ async def test_check_and_inject_late_cross_seeds(tmp_path: Path):
         },
     })
 
-    coord = object.__new__(Coordinator)
-    coord.store = MagicMock()
+    coord = make_coordinator()
     coord.dest_client = AsyncMock()
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord._save_path_points_at_target = MagicMock(return_value=True)
@@ -263,7 +260,6 @@ async def test_check_and_inject_late_cross_seeds(tmp_path: Path):
 @pytest.mark.anyio
 async def test_check_and_inject_late_cross_seeds_recognizes_existing_torrent(tmp_path: Path):
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import AddResult, Torrent
     from racing_sync.watchdir import _bencode
@@ -283,8 +279,7 @@ async def test_check_and_inject_late_cross_seeds_recognizes_existing_torrent(tmp
         },
     })
 
-    coord = object.__new__(Coordinator)
-    coord.store = MagicMock()
+    coord = make_coordinator()
     coord.dest_client = AsyncMock()
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
@@ -732,7 +727,6 @@ async def test_reconcile_fuse_mount_prefix_no_false_positive(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_auto_retry_failed_caps_retries(tmp_path: Path):
-    from racing_sync.coordinator import Coordinator
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
@@ -753,7 +747,7 @@ async def test_auto_retry_failed_caps_retries(tmp_path: Path):
     store.upsert(ts1)
     store.upsert(ts2)
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.store = store
     coord.cfg = MagicMock()
     coord.cfg.recovery.run_on_startup = False
@@ -781,11 +775,10 @@ async def test_auto_retry_failed_caps_retries(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_queued_existing_torrent_resumes(tmp_path: Path):
-    from racing_sync.coordinator import Coordinator
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.store = store
     coord.cfg = MagicMock()
     coord.cfg.rclone.fuse.mount = Path("/mnt/fuse")
@@ -881,16 +874,13 @@ async def test_do_downloading_fresh_row_prioritizes_batch_zero(tmp_path: Path):
     downloading a stale batch selection while the loop waits on batch 0.
     """
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.clients.abstract import TorrentFile
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord._live = {}
     coord._tg = None
-    coord.store = MagicMock()
     coord.transition = MagicMock(side_effect=lambda t, s, **kw: setattr(t, "state", s))
     coord.cfg = MagicMock()
     coord.cfg.dest.save_path = ssd

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
+from conftest import make_coordinator
 
 from racing_sync.batcher import make_batches
 from racing_sync.classifier import Episode
@@ -111,12 +112,10 @@ def test_make_batches_empty_input():
 @pytest.mark.anyio
 async def test_moving_empty_episodes_raises_and_prevents_wipe(tmp_path):
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.classifier import Classification
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.ssd.path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 100_000_000
     coord.cfg.general.disk_safety_margin_bytes = 1000
@@ -126,7 +125,6 @@ async def test_moving_empty_episodes_raises_and_prevents_wipe(tmp_path):
     coord.dest_client = AsyncMock()
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
     coord._season_folder_for = MagicMock(return_value=None)
-    coord.store = MagicMock()
     coord.transition = MagicMock()
 
     ts = TorrentState(
@@ -152,13 +150,10 @@ async def test_moving_empty_episodes_raises_and_prevents_wipe(tmp_path):
 @pytest.mark.anyio
 async def test_do_downloading_iterates_batches():
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord._live = {}
-    coord.store = MagicMock()
     coord._wait_for_completion = AsyncMock()
     coord._prepare_next_batch = AsyncMock()
     coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
@@ -187,16 +182,13 @@ async def test_do_downloading_iterates_batches():
 @pytest.mark.anyio
 async def test_batch_interleaved_download_move_and_clean(tmp_path):
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
     from racing_sync.batcher import Batch
     from racing_sync.classifier import Episode
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord._live = {}
-    coord.store = MagicMock()
     coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
     coord._wait_for_completion = AsyncMock()
     coord._prepare_next_batch = AsyncMock()
@@ -262,10 +254,9 @@ async def test_batch_interleaved_download_move_and_clean(tmp_path):
 @pytest.mark.anyio
 async def test_coordinator_gate_uses_min_total_and_batch_cap():
     from unittest.mock import MagicMock, patch
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
     coord.cfg = MagicMock()
@@ -299,13 +290,11 @@ async def test_coordinator_gate_uses_min_total_and_batch_cap():
 @pytest.mark.anyio
 async def test_wait_for_completion_resolves_when_expected_files_complete(tmp_path):
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState
     from racing_sync.clients.abstract import TorrentFile, Torrent
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord._live = {}
     coord.cfg = MagicMock()
     coord.cfg.general.dest_poll_interval = 0.01
     coord.cfg.general.download_stall_timeout_seconds = 0
@@ -340,13 +329,11 @@ async def test_wait_for_completion_resolves_when_expected_files_complete(tmp_pat
 async def test_wait_for_completion_waits_when_bytes_missing_on_disk(tmp_path):
     """Client-complete but short on SSD keeps polling (desynced piece map)."""
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState
     from racing_sync.clients.abstract import TorrentFile, Torrent
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord._live = {}
     coord.cfg = MagicMock()
     coord.cfg.general.dest_poll_interval = 0.01
     coord.cfg.general.download_stall_timeout_seconds = 0
@@ -387,7 +374,6 @@ async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
     for the folder wipe, and still finish RE_ADDING.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import StateStore, TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
 
@@ -407,7 +393,7 @@ async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
         TorrentFile(name="Big.Show.S01/cover.jpg", size_bytes=6, progress=1.0),
     ]
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
     coord.cfg = MagicMock()
@@ -469,7 +455,7 @@ async def test_move_and_clean_batch_raises_when_files_remain(tmp_path):
     never reached the remote, silently losing data while the batch was
     marked complete.
     """
-    from racing_sync.coordinator import BatchMoveIncompleteError, Coordinator
+    from racing_sync.coordinator import BatchMoveIncompleteError
     from racing_sync.state import TorrentState, State
     from racing_sync.batcher import Batch
     from racing_sync.classifier import Episode
@@ -479,8 +465,7 @@ async def test_move_and_clean_batch_raises_when_files_remain(tmp_path):
     top.mkdir(parents=True)
     (top / "a.mkv").write_bytes(b"data")
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = ssd
     coord.cfg.rclone.remote.default = "remote:media"
     coord.cfg.rclone.remote.unsorted = "remote:unsorted"
@@ -505,7 +490,6 @@ async def test_move_and_clean_batch_raises_when_files_remain(tmp_path):
 @pytest.mark.anyio
 async def test_move_and_clean_batch_passes_when_rclone_moved_files(tmp_path):
     """When rclone really moved the files (gone locally), no error."""
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.batcher import Batch
     from racing_sync.classifier import Episode
@@ -513,8 +497,7 @@ async def test_move_and_clean_batch_passes_when_rclone_moved_files(tmp_path):
     ssd = tmp_path / "ssd"
     (ssd / "Pack").mkdir(parents=True)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = ssd
     coord.cfg.rclone.remote.default = "remote:media"
     coord.cfg.rclone.remote.unsorted = "remote:unsorted"
@@ -542,7 +525,6 @@ async def test_move_and_clean_batch_passes_when_rclone_moved_files(tmp_path):
 @pytest.mark.anyio
 async def test_do_moving_sweep_stays_moving_when_leftovers_stuck(tmp_path):
     """Sweep 0-transfer must not proceed to the folder wipe (data loss)."""
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import StateStore, TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
 
@@ -556,7 +538,7 @@ async def test_do_moving_sweep_stays_moving_when_leftovers_stuck(tmp_path):
         TorrentFile(name="Big.Show.S01/cover.jpg", size_bytes=6, progress=1.0),
     ]
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
     coord.cfg = MagicMock()
@@ -601,7 +583,6 @@ async def test_do_moving_sweep_stays_moving_when_leftovers_stuck(tmp_path):
 async def test_do_moving_skips_move_when_no_verified_leftovers(tmp_path):
     """All-remaining-are-partials: no rclone call at all, still RE_ADDING."""
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import StateStore, TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
 
@@ -615,7 +596,7 @@ async def test_do_moving_skips_move_when_no_verified_leftovers(tmp_path):
         TorrentFile(name="Big.Show.S01/Big.Show.S01E04.mkv", size_bytes=500, progress=0.4),
     ]
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
     coord.cfg = MagicMock()
@@ -683,11 +664,10 @@ def test_make_batches_huge_season_many_small_nested_episodes():
 @pytest.mark.anyio
 async def test_do_moving_skips_move_when_already_batched(tmp_path):
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
     coord.cfg = MagicMock()
@@ -724,11 +704,10 @@ async def test_do_moving_skips_move_when_already_batched(tmp_path):
 @pytest.mark.anyio
 async def test_do_moving_purges_only_own_temp_files_when_no_season_folder(tmp_path):
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
     coord.cfg = MagicMock()
@@ -788,14 +767,11 @@ async def test_do_moving_purges_only_own_temp_files_when_no_season_folder(tmp_pa
 @pytest.mark.anyio
 async def test_do_downloading_falls_back_to_full_move_when_batch_unresolvable():
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord._live = {}
     coord._tg = None
-    coord.store = MagicMock()
     coord.dest_client = MagicMock()
     coord._get_batches_for_torrent = AsyncMock(return_value=[])
     coord._wait_for_completion = AsyncMock()
@@ -822,13 +798,11 @@ async def test_do_downloading_falls_back_to_full_move_when_batch_unresolvable():
 @pytest.mark.anyio
 async def test_wait_for_completion_fails_fast_on_missing_expected_files():
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import Torrent, TorrentFile
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord._live = {}
     coord.dest_client = MagicMock()
     coord.dest_client.get_torrent = AsyncMock(
         return_value=Torrent(
@@ -857,11 +831,10 @@ async def test_wait_for_completion_fails_fast_on_missing_expected_files():
 @pytest.mark.anyio
 async def test_do_moving_moves_remaining_files_when_batches_incomplete(tmp_path):
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
     coord.cfg = MagicMock()
@@ -925,11 +898,10 @@ async def test_do_moving_preserves_top_folder_on_remote(tmp_path):
     Moving verified per-file names from src_dir preserves it.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
     coord.cfg = MagicMock()
@@ -1001,11 +973,10 @@ async def test_do_moving_fallback_never_bare_moves_folder(tmp_path):
     from src_dir instead.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
     coord.cfg = MagicMock()
@@ -1071,9 +1042,7 @@ async def test_do_moving_fallback_never_bare_moves_folder(tmp_path):
 
 @pytest.mark.anyio
 async def test_batch_cap_bytes_single_helper():
-    from racing_sync.coordinator import Coordinator
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.ssd.max_inflight_bytes = 50_000_000_000
     coord.cfg.general.disk_safety_margin_bytes = 0
 
@@ -1084,10 +1053,9 @@ async def test_batch_cap_bytes_single_helper():
 @pytest.mark.anyio
 async def test_frozen_batch_cap_stable_across_free_space_changes():
     """Batch cap must freeze per row so boundaries never shift mid-download."""
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._batch_cap_cache = {}
     coord._batch_cap_bytes = MagicMock(return_value=10_000_000_000)
     ts = TorrentState(source_infohash="frozen_cap_hash")
@@ -1101,12 +1069,10 @@ async def test_frozen_batch_cap_stable_across_free_space_changes():
 @pytest.mark.anyio
 async def test_get_batches_respects_custom_episode_regex():
     import re
-    from racing_sync.coordinator import Coordinator
     from racing_sync.clients.abstract import TorrentFile
     from racing_sync.state import TorrentState
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     # Custom episode regex for e.g. "Show - 01.mkv" (no 'S01E' prefix)
     coord.cfg.classifier._episode_re = re.compile(r"Show\s+-\s+(\d+)")
     coord._batch_cap_bytes = MagicMock(return_value=10_000_000_000)
@@ -1128,15 +1094,13 @@ async def test_get_batches_respects_custom_episode_regex():
 @pytest.mark.anyio
 async def test_fuse_skipped_matches_size_only(tmp_path):
     """Only size-verified fuse files are skipped; missing/short ones download."""
-    from racing_sync.coordinator import Coordinator
 
     fuse = tmp_path / "fuse"
     (fuse / "Pack").mkdir(parents=True)
     (fuse / "Pack" / "a.mkv").write_bytes(b"x" * 100)
     (fuse / "Pack" / "b.mkv").write_bytes(b"short")
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.rclone.fuse.mount = fuse
     coord.cfg.rclone.fuse.mount_unsorted = fuse / "unsorted"
     coord.cfg.dest.save_path = tmp_path / "ssd"
@@ -1154,12 +1118,10 @@ async def test_fuse_skipped_matches_size_only(tmp_path):
 async def test_wait_for_completion_empty_expected_returns_immediately():
     """A fully-skipped batch waits on nothing (and fetches nothing)."""
     from unittest.mock import AsyncMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord._live = {}
     coord.cfg = MagicMock()
     coord.dest_client = AsyncMock()
 
@@ -1172,7 +1134,6 @@ async def test_wait_for_completion_empty_expected_returns_immediately():
 @pytest.mark.anyio
 async def test_move_and_clean_batch_honors_skip(tmp_path):
     """Already-remote batch members are neither moved nor verified."""
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.batcher import Batch
     from racing_sync.classifier import Episode
@@ -1181,8 +1142,7 @@ async def test_move_and_clean_batch_honors_skip(tmp_path):
     (ssd / "Pack").mkdir(parents=True)
     (ssd / "Pack" / "b.mkv").write_bytes(b"data")
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = ssd
     coord.cfg.rclone.remote.default = "remote:media"
     coord.cfg.rclone.remote.unsorted = "remote:unsorted"
@@ -1218,21 +1178,18 @@ async def test_move_and_clean_batch_honors_skip(tmp_path):
 async def test_setup_queued_download_skips_remote_batch0(tmp_path):
     """Batch-0 members already on the remote stay deselected from the start."""
     from racing_sync.clients.abstract import AddResult, TorrentFile
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
 
     fuse = tmp_path / "fuse"
     (fuse / "Pack").mkdir(parents=True)
     (fuse / "Pack" / "a.bin").write_bytes(b"x" * 4000)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path
     coord.cfg.ssd.max_inflight_bytes = 10_000
     coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
     coord.cfg.rclone.fuse.mount = fuse
     coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-unsorted"
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     coord.dest_client.list_torrents = AsyncMock(return_value=[])
     coord.dest_client.add_torrent = AsyncMock(
@@ -1267,7 +1224,6 @@ async def test_setup_queued_download_skips_remote_batch0(tmp_path):
 @pytest.mark.anyio
 async def test_setup_queued_download_single_on_fuse_goes_moving(tmp_path):
     """A single file already archived needs no SSD download at all."""
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
 
@@ -1275,13 +1231,11 @@ async def test_setup_queued_download_single_on_fuse_goes_moving(tmp_path):
     fuse.mkdir()
     (fuse / "Movie.mkv").write_bytes(b"x" * 100)
 
-    coord = object.__new__(Coordinator)
-    coord.cfg = MagicMock()
+    coord = make_coordinator()
     coord.cfg.dest.save_path = tmp_path
     coord.cfg.ssd.skip_movie_larger_than_bytes = 50
     coord.cfg.rclone.fuse.mount = fuse
     coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-unsorted"
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     coord.dest_client.get_torrent_files = AsyncMock(
         return_value=[TorrentFile(name="Movie.mkv", size_bytes=100, progress=0.0)]
@@ -1306,7 +1260,6 @@ async def test_setup_queued_download_single_on_fuse_goes_moving(tmp_path):
 @pytest.mark.anyio
 async def test_do_moving_mixed_skips_remote_episode(tmp_path):
     """Mixed redo: the already-archived episode is not moved again."""
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
 
@@ -1316,7 +1269,7 @@ async def test_do_moving_mixed_skips_remote_episode(tmp_path):
     for name in ("Show.S01E01.mkv", "Show.S01E02.mkv", "Extra1.mp4", "Extra2.mp4"):
         (tmp_path / name).write_bytes(b"x" * 1000)
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
     coord.cfg = MagicMock()
@@ -1328,7 +1281,6 @@ async def test_do_moving_mixed_skips_remote_episode(tmp_path):
     coord.cfg.rclone.fuse.mount = tmp_path / "fuse"
     coord.cfg.rclone.fuse.mount_unsorted = fuse_unsorted
     coord.cfg.rclone.batch_move_extra_flags = []
-    coord.store = MagicMock()
     coord.dest_client = AsyncMock()
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[
         TorrentFile("Show.S01E01.mkv", 1000, progress=1.0),
@@ -1366,12 +1318,11 @@ async def test_do_moving_mixed_skips_remote_episode(tmp_path):
 
 @pytest.mark.anyio
 async def test_move_and_clean_batch_all_skipped_skips_rclone(tmp_path):
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.batcher import Batch
     from racing_sync.classifier import Episode
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     ssd = tmp_path / "ssd"
     ssd.mkdir()
     coord.cfg = MagicMock()
@@ -1397,15 +1348,13 @@ async def test_move_and_clean_batch_all_skipped_skips_rclone(tmp_path):
 @pytest.mark.anyio
 async def test_isolated_reset_deletes_with_files_and_reads_next_batch(tmp_path):
     """Fresh delete+re-add isolates batches so only complete files move."""
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import AddResult, TorrentFile
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord.store = MagicMock()
     coord.cfg = MagicMock()
     coord.cfg.dest.save_path = ssd
     coord.cfg.rclone.fuse.mount = tmp_path / "fuse"
@@ -1457,11 +1406,9 @@ async def test_isolated_reset_deletes_with_files_and_reads_next_batch(tmp_path):
 
 @pytest.mark.anyio
 async def test_isolated_reset_missing_blob_parks_without_delete():
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
 
-    coord = object.__new__(Coordinator)
-    coord.store = MagicMock()
+    coord = make_coordinator()
     coord.store.get_blob = MagicMock(return_value=b"")
     coord.cfg = MagicMock()
     coord.dest_client = AsyncMock()
@@ -1492,10 +1439,9 @@ async def test_park_moving_records_reason_and_escalates(tmp_path, caplog):
     and escalate to ERROR after consecutive parks.
     """
     import logging
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import StateStore, TorrentState, State
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.store = StateStore(tmp_path / "state.db")
     ts = TorrentState(source_infohash="e" * 40, source_name="Stalled.Show",
@@ -1533,7 +1479,6 @@ async def test_do_moving_branches_on_pinned_kind_despite_flip(tmp_path):
     """
     from unittest.mock import AsyncMock, MagicMock, patch
     from pathlib import Path
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import StateStore, TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
 
@@ -1548,7 +1493,7 @@ async def test_do_moving_branches_on_pinned_kind_despite_flip(tmp_path):
     cls_files = [TorrentFile(name=f"Pack/{n}", size_bytes=100, progress=1.0)
                  for n in names]
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
     coord.cfg = MagicMock()
@@ -1599,7 +1544,6 @@ async def test_do_moving_timeout_parks_instead_of_failing(tmp_path):
     never injected. Timeouts now park for retry with the reason recorded.
     """
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.rclone_ops import RcloneTimeoutError
     from racing_sync.state import StateStore, TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
@@ -1608,7 +1552,7 @@ async def test_do_moving_timeout_parks_instead_of_failing(tmp_path):
     ssd.mkdir()
     (ssd / "Show.S01E01.mkv").write_bytes(b"x" * 100)
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.store = StateStore(tmp_path / "state.db")
     coord.cfg = MagicMock()
@@ -1648,16 +1592,13 @@ async def test_batch_loop_timeout_parks_downloading_without_retry_burn(tmp_path)
     """A batch-move timeout parks at once; same-tick retries would each
     block for the full timeout again."""
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.rclone_ops import RcloneTimeoutError
     from racing_sync.state import TorrentState, State
     from racing_sync.batcher import Batch
     from racing_sync.classifier import Episode
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord._live = {}
-    coord.store = MagicMock()
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
     coord.cfg = MagicMock()
     coord.dest_client = AsyncMock()
@@ -1686,11 +1627,10 @@ async def test_batch_loop_timeout_parks_downloading_without_retry_burn(tmp_path)
 async def test_process_torrent_timeout_safety_net_parks(tmp_path):
     """A timeout leaking from any future path still parks, never FAILs."""
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.rclone_ops import RcloneTimeoutError
     from racing_sync.state import StateStore, TorrentState, State
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord.store = StateStore(tmp_path / "state.db")
     coord._process_torrent_inner = AsyncMock(
@@ -1716,7 +1656,6 @@ async def test_queued_burst_respects_download_cap(tmp_path):
     parked rows proceed without re-adding once slots free.
     """
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import StateStore, TorrentState, State
     from racing_sync.clients.abstract import TorrentFile, AddResult
 
@@ -1725,7 +1664,7 @@ async def test_queued_burst_respects_download_cap(tmp_path):
     fuse = tmp_path / "fuse"
     fuse.mkdir()
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
     coord._running_infohashes = set()  # tick-managed live set, mirrored here
     coord.store = StateStore(tmp_path / "state.db")
@@ -1808,7 +1747,6 @@ async def test_queued_burst_respects_download_cap(tmp_path):
 async def test_queued_existing_entry_parks_when_full(tmp_path):
     """The resume path for already-added entries obeys the cap too."""
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.clients.abstract import Torrent
     from racing_sync.state import StateStore, TorrentState, State
 
@@ -1817,9 +1755,8 @@ async def test_queued_existing_entry_parks_when_full(tmp_path):
     fuse = tmp_path / "fuse"
     fuse.mkdir()
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord._running_infohashes = set()
     coord.store = StateStore(tmp_path / "state.db")
     coord.cfg = MagicMock()
     coord.cfg.dest.save_path = ssd
@@ -1864,11 +1801,9 @@ async def test_queued_existing_entry_parks_when_full(tmp_path):
 def test_queued_gate_ignores_non_int_configs():
     """MagicMock test doubles must never report a full cap."""
     from unittest.mock import MagicMock
-    from racing_sync.coordinator import Coordinator
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord.cfg = MagicMock()  # max_active_downloads is a MagicMock
-    coord.store = MagicMock()
     assert coord._try_admit_download(MagicMock()) is True
     assert coord._park_queued_for_download_slot(MagicMock()) is False
 
@@ -1881,7 +1816,6 @@ async def test_setup_footprint_excludes_remote_skipped_bytes(tmp_path):
     footprint now subtracts fuse-present bytes.
     """
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
 
@@ -1893,9 +1827,8 @@ async def test_setup_footprint_excludes_remote_skipped_bytes(tmp_path):
     (fuse / "Show.S01E01.mkv").write_bytes(b"x" * 100)
     (fuse / "Show.S01E02.mkv").write_bytes(b"x" * 100)
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord.store = MagicMock()
     coord.cfg = MagicMock()
     coord.cfg.dest.save_path = ssd
     coord.cfg.ssd.path = ssd
@@ -1932,7 +1865,6 @@ async def test_setup_footprint_excludes_remote_skipped_bytes(tmp_path):
 async def test_setup_footprint_zero_when_fully_remote(tmp_path):
     """Everything already moved -> hold nothing, still finish to MOVING."""
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
 
@@ -1943,9 +1875,8 @@ async def test_setup_footprint_zero_when_fully_remote(tmp_path):
     (fuse / "Show.S01E01.mkv").write_bytes(b"x" * 100)
     (fuse / "Show.S01E02.mkv").write_bytes(b"x" * 100)
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord.store = MagicMock()
     coord.cfg = MagicMock()
     coord.cfg.dest.save_path = ssd
     coord.cfg.ssd.path = ssd
@@ -1985,15 +1916,12 @@ async def test_download_loop_tightens_reservation_per_batch(tmp_path):
     still downloading.
     """
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.coordinator import Coordinator
     from racing_sync.state import TorrentState, State
     from racing_sync.batcher import Batch
     from racing_sync.classifier import Episode
 
-    coord = object.__new__(Coordinator)
+    coord = make_coordinator()
     coord._stop = False
-    coord._live = {}
-    coord.store = MagicMock()
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
     coord.cfg = MagicMock()
     coord.dest_client = AsyncMock()
