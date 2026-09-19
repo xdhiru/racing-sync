@@ -268,6 +268,43 @@ def test_classify_with_custom_episode_regex():
     assert cls_custom.episodes[0].season == 1 and cls_custom.episodes[0].episode == 1
 
 
+def test_default_episode_regex_fansub_dashform_and_wide_digits():
+    """Fansub ' - NN (1080p)' singles parse as episodes (S1E_NN);
+    SxxEyy accepts 1-3 digits per side; batch packs stay out."""
+    from racing_sync.classifier import parse_episode
+    from racing_sync.config import ClassifierConfig
+
+    rx = ClassifierConfig()._episode_re
+    assert parse_episode(
+        "[DummySub] Harbor Innkeepers of the Silent Tide - 10 (1080p) [F47ACD54].mkv",
+        rx) == (1, 10)
+    assert parse_episode("[DummySub] Hollow Sky Chronicles S3 - 10 (1080p) [6DBC1189].mkv", rx) == (1, 10)
+    assert parse_episode(
+        "[DummySub] Wandering Cartographer Guild S4 - 21 (1080p) [9057F2E5].mkv",
+        rx) == (1, 21)
+    assert parse_episode("Show.S012E012.mkv", rx) == (12, 12)
+    assert parse_episode("Show.S123E123.mkv", rx) == (123, 123)
+    for pack in (
+        "[DummySub] River of Glass (1080p)",
+        "[DummySub] Clockwork Sparrows (01-13) (1080p) [Batch]",
+        "[DummySub] Starlight Relay Finale S2 (01-13) (1080p) [Batch]",
+        "Some.Movie.2024.1080p.mkv",
+        "Movie - 2019 (2024).mkv",
+    ):
+        assert parse_episode(pack, rx) is None, pack
+
+
+def test_classify_fansub_dashform_single_as_episode():
+    """A fansub dash-form single-file drop classifies episode (routes unsorted)."""
+    cfg = _cfg()
+    files = [TorrentFile(
+        "[DummySub] Hollow Sky Chronicles S3 - 10 (1080p) [6DBC1189].mkv", 500_000_000)]
+    cls = classify(files, cfg)
+    assert cls.kind == "episode"
+    assert len(cls.episodes) == 1
+    assert cls.episodes[0].season == 1 and cls.episodes[0].episode == 10
+
+
 def test_season_folder_for_security(tmp_path):
 
     cfg = _cfg()

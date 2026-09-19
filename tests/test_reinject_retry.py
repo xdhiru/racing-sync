@@ -674,7 +674,7 @@ async def test_do_queued_fuse_fast_track_persists_classification(tmp_path: Path)
 
     Without this the row keeps kind="unknown" (-> unsorted mount) while its
     bytes live at the default mount, so every later RE_ADDING/late-seed fuse
-    gate checks the wrong directory and parks forever (Chad/Harbor.Lights case).
+    gate checks the wrong directory and parks forever.
     """
     from racing_sync.clients.abstract import TorrentFile
 

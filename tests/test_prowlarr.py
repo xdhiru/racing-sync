@@ -758,13 +758,13 @@ async def test_pick_rejects_hit_whose_payload_is_another_release():
     decoded payload check must refuse it (park, never download onward)."""
     from racing_sync.clients.abstract import Torrent
 
-    raccoon = "Galaxy.Rangers.Nebula.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-Raccoon.mkv"
-    webrip = "Galaxy.Rangers.Nebula.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-WebRip.mkv"
+    src_show = "Galaxy.Rangers.Nebula.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-Raccoon.mkv"
+    hit_show = "Galaxy.Rangers.Nebula.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-WebRip.mkv"
     size = 1_450_000_000
-    webrip_blob = _bencode({
+    hit_blob = _bencode({
         b"announce": b"http://tracker.test-indexer.example/announce",
         b"info": {
-            b"name": webrip.encode(),
+            b"name": hit_show.encode(),
             b"length": size,
             b"piece length": 262144,
             b"pieces": b"12345678901234567890",
@@ -782,16 +782,16 @@ async def test_pick_rejects_hit_whose_payload_is_another_release():
         return_value=[Indexer(9, "Test Indexer (API)", "torrent", True, [])]
     )
     prowlarr.best_match.return_value = TorrentHit(
-        title=webrip, guid="9", indexer="Test Indexer (API)", indexer_id=1,
+        title=hit_show, guid="9", indexer="Test Indexer (API)", indexer_id=1,
         size_bytes=size, download_url="http://prowlarr/9",
         magnet_url="", info_url="", publish_date="",
     )
-    prowlarr.download_torrent.return_value = webrip_blob
+    prowlarr.download_torrent.return_value = hit_blob
 
     dec = await pick_ssd_source_for_racing(
         cfg=cfg,
         source_torrent=Torrent(
-            hash="raccoonhash", name=raccoon, category="racing",
+            hash="srchash", name=src_show, category="racing",
             save_path="", size_bytes=size, state="seeding", progress=1.0,
             trackers=["https://alpha.cc/announce"],
         ),
