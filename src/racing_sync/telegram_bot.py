@@ -163,6 +163,16 @@ def _tracker_domain(url: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _is_parse_error(e: BaseException) -> bool:
+    """True iff a Telegram error is a Markdown parse/entity failure.
+
+    Those (and only those) are retried as plain text; every other error
+    keeps its own handling at each call site.
+    """
+    msg = str(e).lower()
+    return "can't parse" in msg or "entity" in msg
+
+
 def _as_aware_utc(value: object) -> dt.datetime | None:
     """Coerce to aware UTC; naive legacy rows are treated as UTC, not local."""
     if not isinstance(value, dt.datetime):
@@ -187,12 +197,24 @@ def _retry_in_future_seconds(value: object) -> float | None:
         return None
 
 
+def _row_text_bits(ts: TorrentState) -> tuple[str, str, str]:
+    """Sanitized (name, human size, lowercase hash) shared by both renderers."""
+    name = (ts.source_name or "").replace("`", "'").replace("\n", " ").replace("\r", " ").rstrip("\\")
+    return name, _bytes_human(ts.total_bytes), (ts.source_infohash or "").lower()
+
+
+def _retry_minutes(ts: TorrentState) -> int | None:
+    """Whole minutes until the re-add retry, or None when no timer is set."""
+    _retry_s = _retry_in_future_seconds(ts.readd_next_retry_at)
+    if _retry_s is None:
+        return None
+    return max(1, round(_retry_s / 60))
+
+
 def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     """Per-torrent detail message (edited in place as state advances)."""
     icon = _STATE_ICON.get(ts.state, ts.state.value.upper())
-    name = ts.source_name.replace("`", "'").replace("\n", " ").replace("\r", " ").rstrip("\\")
-    size = _bytes_human(ts.total_bytes)
-    full_hash = (ts.source_infohash or "").lower()
+    name, size, full_hash = _row_text_bits(ts)
 
     lines: list[str] = []
     # 1. Title line: state badge + full name copiable by click
@@ -227,10 +249,9 @@ def render_detail(ts: TorrentState, progress: float | None = None) -> str:
     elif ts.state == State.MOVING:
         lines.append("rclone moving to remote…")
     elif ts.state == State.RE_ADDING:
-        _retry_s = _retry_in_future_seconds(ts.readd_next_retry_at)
-        if _retry_s is not None:
-            mins = max(1, round(_retry_s / 60))
-            lines.append(f"Re-adding on fuse mount (WebUI busy, retrying in {mins}m)")
+        _mins = _retry_minutes(ts)
+        if _mins is not None:
+            lines.append(f"Re-adding on fuse mount (WebUI busy, retrying in {_mins}m)")
         else:
             lines.append("Re-adding on fuse mount")
     elif ts.state == State.DONE:
@@ -308,9 +329,7 @@ def render_active(
 
     for i, (ts, progress) in enumerate(page_items):
         item_num = start_idx + i + 1
-        name = (ts.source_name or "").replace("`", "'").replace("\n", " ").replace("\r", " ").rstrip("\\")
-        size = _bytes_human(ts.total_bytes)
-        full_hash = (ts.source_infohash or "").lower()
+        name, size, full_hash = _row_text_bits(ts)
 
         # 1. Full name of the torrent, copiable by click (in backticks, no escape chars)
         lines.append(f"*{item_num}.* `{name}`")
@@ -329,10 +348,9 @@ def render_active(
         elif ts.state == State.MOVING:
             state_text = "📦 Moving"
         elif ts.state == State.RE_ADDING:
-            _retry_s = _retry_in_future_seconds(ts.readd_next_retry_at)
-            if _retry_s is not None:
-                mins = max(1, round(_retry_s / 60))
-                state_text = f"🔄 Re-adding (retry in {mins}m)"
+            _mins = _retry_minutes(ts)
+            if _mins is not None:
+                state_text = f"🔄 Re-adding (retry in {_mins}m)"
             else:
                 state_text = "🔄 Re-adding"
         elif ts.state == State.QUERYING:
@@ -614,8 +632,7 @@ class TelegramBot:
                         parse_mode=ParseMode.MARKDOWN,
                     )
                 except TelegramError as e:
-                    msg = str(e).lower()
-                    if "can't parse" in msg or "entity" in msg:
+                    if _is_parse_error(e):
                         sent = await self._bot.send_message(
                             self._cfg.chat_id, text,
                         )
@@ -647,8 +664,7 @@ class TelegramBot:
                                 parse_mode=ParseMode.MARKDOWN,
                             )
                         except TelegramError as e2:
-                            msg2 = str(e2).lower()
-                            if "can't parse" in msg2 or "entity" in msg2:
+                            if _is_parse_error(e2):
                                 sent = await self._bot.send_message(
                                     self._cfg.chat_id, text,
                                 )
@@ -660,7 +676,7 @@ class TelegramBot:
                             self._store.set_telegram_message_id,
                             infohash, sent.message_id,
                         )
-                    elif "can't parse" in msg or "entity" in msg:
+                    elif _is_parse_error(e):
                         await self._bot.edit_message_text(
                             text,
                             chat_id=self._cfg.chat_id,
@@ -1033,8 +1049,7 @@ class TelegramBot:
             except (TimedOut, NetworkError) as e:
                 log.warning("active-tasks send timed out (%s); will retry next interval", e)
             except TelegramError as e:
-                msg = str(e).lower()
-                if "can't parse" in msg or "entity" in msg:
+                if _is_parse_error(e):
                     try:
                         sent = await self._bot.send_message(
                             self._cfg.chat_id, text,
@@ -1072,7 +1087,7 @@ class TelegramBot:
                     self._last_active_cache = cache_key
                     return
 
-                if "can't parse" in msg or "entity" in msg:
+                if _is_parse_error(e):
                     try:
                         await self._bot.edit_message_text(
                             text,
@@ -1199,8 +1214,7 @@ class TelegramBot:
                     disable_notification=True,
                 )
             except TelegramError as e:
-                msg = str(e).lower()
-                if "can't parse" in msg or "entity" in msg:
+                if _is_parse_error(e):
                     sent = await self._bot.send_message(
                         self._cfg.chat_id, text,
                         reply_markup=keyboard,
