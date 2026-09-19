@@ -14,11 +14,6 @@ from racing_sync.rclone_ops import (
 from racing_sync.config import AppConfig
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 def test_validate_safe_delete_path_refuses_root(tmp_path: Path):
     root = Path(tmp_path.resolve().anchor)
     with pytest.raises(ValueError, match="refusing to delete filesystem root"):
@@ -235,7 +230,6 @@ async def test_run_rclone_timeout_redacts_command(monkeypatch):
         err_msg = str(exc_info.value)
         assert "supersecret123" not in err_msg
         assert "--password ******" in err_msg
-
 
 
 @pytest.mark.anyio

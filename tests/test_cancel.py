@@ -9,12 +9,6 @@ import pytest
 from racing_sync.clients.abstract import Torrent, TorrentFile
 from racing_sync.state import State, StateStore, TorrentState
 
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 # ---------------------------------------------------------------------------
 # ignore list (state.py)
 # ---------------------------------------------------------------------------

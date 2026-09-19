@@ -12,13 +12,6 @@ from racing_sync.clients.abstract import Torrent
 from racing_sync.watchdir import _bencode, _bencoded_info_hash
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-
-
 def test_prowlarr_config_should_skip_title():
     cfg = ProwlarrConfig(
         enabled=True,
@@ -810,9 +803,6 @@ async def test_pick_rejects_hit_whose_payload_is_another_release():
     )
     # Treated exactly like "no hit": park for retry, never a decision.
     assert dec is None
-
-
-
 
 
 def test_fetchable_url_allows_own_prowlarr_refuses_metadata():

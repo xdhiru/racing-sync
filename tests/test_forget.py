@@ -10,11 +10,6 @@ from racing_sync.forget import forget_torrent, resolve_row
 from racing_sync.state import State, StateStore, TorrentState
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 @pytest.mark.anyio
 async def test_candidate_local_paths_dedups_top_dir(tmp_path: Path):
     """Two files under the same top dir must yield one local path."""

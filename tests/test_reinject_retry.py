@@ -15,11 +15,6 @@ from racing_sync.state import State, StateStore, TorrentState
 from racing_sync.telegram_bot import render_active, render_detail
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 @pytest.mark.anyio
 async def test_fetch_retries_sftp_timeout_once():
     """A single SFTP stall is retried; a clean miss is not."""

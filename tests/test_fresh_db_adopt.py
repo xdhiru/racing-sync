@@ -270,11 +270,6 @@ def _make_coord(ssd: Path, fuse: Path, store: StateStore, src, dest) -> Coordina
     return coord
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 @pytest.mark.anyio
 async def test_fresh_db_ssd_public_moves_before_injecting(tmp_path: Path):
     ssd = tmp_path / "ssd"

@@ -7,12 +7,6 @@ from racing_sync.batcher import make_batches
 from racing_sync.classifier import Episode
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-
 def test_batches_fit_under_cap():
     eps = [
         Episode(f"S01E{i:02d}.mkv", 1, i, 2_000_000_000)
@@ -153,8 +147,6 @@ async def test_moving_empty_episodes_raises_and_prevents_wipe(tmp_path):
     # Client delete and wipe must not be called
     coord.dest_client.delete.assert_not_called()
     coord.transition.assert_not_called()
-
-
 
 
 @pytest.mark.anyio

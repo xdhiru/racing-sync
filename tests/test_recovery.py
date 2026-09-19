@@ -10,12 +10,6 @@ from racing_sync.state import State, StateStore, TorrentState
 from racing_sync.clients.abstract import Torrent
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-
 @pytest.mark.anyio
 async def test_reconcile_adopts_fuse_and_completed_torrents(tmp_path: Path):
     db_path = tmp_path / "state.db"
@@ -935,6 +929,5 @@ async def test_do_downloading_fresh_row_prioritizes_batch_zero(tmp_path: Path):
     assert first_map["Pack/c.bin"] == 0
     coord.dest_client.resume.assert_called()
     assert ts.state == State.MOVING
-
 
 
