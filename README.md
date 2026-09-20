@@ -117,7 +117,9 @@ From Telegram, copy-paste the `Cancel: /cancel_<hash>` line under any
 torrent — forgotten + ignored immediately, no confirmation. Torrents still
 waiting on the indexer show `Fetch original: /fetch_<hash>` instead: use
 the VPS1 original right away rather than waiting out Prowlarr retries
-(counts toward private-tracker ratio). The same fallback can trigger
+(counts toward private-tracker ratio). Rows holding for a preferred copy
+show `Prefer this copy now: /prefer_<hash>`: start their SSD download
+immediately; waiting siblings then seed from fuse/remote after. The same fallback can trigger
 automatically at the deadline with
 `cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout` (default off).
 

@@ -701,3 +701,55 @@ async def test_notify_falls_back_to_plain_text_on_parse_error():
     assert "parse_mode" not in second_call[1]
 
 
+@pytest.mark.anyio
+async def test_detail_card_offers_prefer_for_grace_note():
+    """Grace-held detail cards carry a copy-paste /prefer_ line."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    bot = object.__new__(TelegramBot)
+    bot._bot = MagicMock()
+    bot._bot.send_message = AsyncMock(
+        return_value=MagicMock(message_id=99))
+    bot._store = MagicMock()
+    bot._coord = MagicMock()
+    bot._coord._watch_wait_note = MagicMock(
+        return_value="Waiting for preferred copy · 42s left")
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
+    bot._detail_cache = {}
+    bot._note_outbound = MagicMock()
+    bot._mark_detail_sent = MagicMock()
+    bot._store.get_telegram_message_id = MagicMock(return_value=None)
+    h = "e" * 40
+    bot._store.get.return_value = TorrentState(
+        source_infohash=h, source_name="Grace.Hold", state=State.NEW,
+        total_bytes=1000, source_announce_url="https://alpha.cc/announce/xyz")
+    await bot._send_one_detail(h, None)
+    sent_text = bot._bot.send_message.call_args[0][1]
+    assert "Prefer this copy now:" in sent_text
+    assert f"/prefer_{h[:10]}" in sent_text
+
+
+def test_render_active_offers_prefer_for_grace_note():
+    """The active-tasks list carries the /prefer_ line for grace-held rows."""
+    h = "e" * 40
+    ts = TorrentState(source_infohash=h, source_name="Grace.Hold",
+                      state=State.NEW, total_bytes=1000,
+                      source_announce_url="https://alpha.cc/announce/xyz")
+    text, _, _ = render_active(
+        [(ts, None)], page=0, page_size=5,
+        notes={h: "Waiting for preferred copy ?? 42s left"})
+    assert "Prefer this copy now:" in text
+    assert f"/prefer_{h[:10]}" in text
+    # Other notes (owner-deferred) and other states get no prefer line.
+    text2, _, _ = render_active(
+        [(ts, None)], page=0, page_size=5,
+        notes={h: "Waiting turn ?? example.net copy first"})
+    assert "Prefer this copy" not in text2
+    ts_q = TorrentState(source_infohash=h, source_name="Grace.Hold",
+                        state=State.QUEUED, total_bytes=1000)
+    text3, _, _ = render_active(
+        [(ts_q, None)], page=0, page_size=5,
+        notes={h: "Waiting for preferred copy ?? 42s left"})
+    assert "Prefer this copy" not in text3
+
+

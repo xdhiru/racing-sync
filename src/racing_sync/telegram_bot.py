@@ -332,6 +332,10 @@ CANCEL_CMD_RE = re.compile(r"^/cancel_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 #: download of a WAITING_INDEXER row instead of waiting for Prowlarr.
 FETCH_CMD_RE = re.compile(r"^/fetch_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
+#: `/prefer_<hex>` — same shape: start a grace-held watch row's SSD
+#: download now instead of waiting out its preferred-copy grace.
+PREFER_CMD_RE = re.compile(r"^/prefer_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
 
 def _cancel_command(infohash: str) -> str:
     """Copy-pasteable cancel command for one task (short hash)."""
@@ -339,8 +343,13 @@ def _cancel_command(infohash: str) -> str:
 
 
 def _fetch_command(infohash: str) -> str:
-    """Copy-pasteable fetch-original command for one task (short hash)."""
+    """Copy-pasteable fetch command for one task (short hash)."""
     return f"/fetch_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+def _prefer_command(infohash: str) -> str:
+    """Copy-pasteable prefer command for one task (short hash)."""
+    return f"/prefer_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 def _flood_wait_seconds(e: BaseException, default: int = 5) -> int | None:
@@ -484,6 +493,15 @@ def render_active(
         lines.append(f"  Cancel: `{_cancel_command(full_hash)}`")
         if ts.state == State.WAITING_INDEXER:
             lines.append(f"  Fetch original: `{_fetch_command(full_hash)}`")
+        # Grace-held rows are actionable: same override as the detail card.
+        # Gated on NEW (only NEW rows can be preferred) as well as the note,
+        # so a stale note on another state never advertises a no-op.
+        try:
+            _is_grace_note = bool(note) and note.startswith("Waiting for preferred copy")
+        except Exception:
+            _is_grace_note = False
+        if ts.state == State.NEW and _is_grace_note:
+            lines.append(f"  Prefer this copy now: `{_prefer_command(full_hash)}`")
         lines.append("")
 
     rendered = _safe_truncate_markdown("\n".join(lines).strip())
@@ -764,6 +782,13 @@ class TelegramBot:
         except Exception:
             note = ""
         text = render_detail(ts, progress, note)
+        # Grace-held rows are actionable: offer the override inline so the
+        # operator doesn't have to remember the command shape.
+        try:
+            if note.startswith("Waiting for preferred copy"):
+                text += f"\nPrefer this copy now: `{_prefer_command(infohash)}`"
+        except Exception:
+            pass
         try:
             state_value = ts.state.value
         except Exception:
@@ -1091,9 +1116,10 @@ class TelegramBot:
             cfg_chat = str(self._cfg.chat_id)
             if str(chat_id) != cfg_chat and str(user_id) != cfg_chat:
                 return
-            # Same 0.5s debounce as callbacks: a double-sent /cancel_ or
-            # /fetch_ must not resolve+act twice (double forget/double
-            # re-inject). Namespaced apart from callback keys.
+            # Same 0.5s debounce as callbacks: a double-sent /cancel_,
+            # /fetch_ or /prefer_ must not resolve+act twice (double
+            # forget/double re-inject/double prefer). Namespaced apart
+            # from callback keys.
             try:
                 _ckey = f"cmd:{chat_id}" if chat_id is not None else f"cmd:{user_id}"
             except Exception:
@@ -1107,8 +1133,9 @@ class TelegramBot:
             )
             text = str(text or "").strip()
             m_fetch = FETCH_CMD_RE.match(text)
+            m_prefer = PREFER_CMD_RE.match(text)
             m_cancel = CANCEL_CMD_RE.match(text)
-            if not m_fetch and not m_cancel:
+            if not m_fetch and not m_prefer and not m_cancel:
                 return
             if m_fetch:
                 short = m_fetch.group(1)
@@ -1120,6 +1147,13 @@ class TelegramBot:
                     await self._reply(str(e)[:300], reply_to=message)
                     return
                 result = await self._fetch_torrent(full_hash)
+                await self._reply(result[:300], reply_to=message)
+                self._last_active_cache = None
+                await self._refresh_active_message()
+                return
+            if m_prefer:
+                short = m_prefer.group(1)
+                result = await self._prefer_torrent(short)
                 await self._reply(result[:300], reply_to=message)
                 self._last_active_cache = None
                 await self._refresh_active_message()
@@ -1307,6 +1341,43 @@ class TelegramBot:
             return f"Fetch failed: {e}"
         except Exception as e:  # noqa: BLE001
             return f"Fetch failed: {e}"
+        return outcome
+
+    async def _prefer_torrent(self, short: str) -> str:
+        """Start a grace-held watch row's SSD download now (operator override).
+
+        The coordinator validates (NEW watch row, rank-2, in grace, no
+        owner), records a one-shot exemption and returns the row to wake;
+        the worker is spawned here (running loop) with next-tick pickup
+        as the backstop. Never raises: all outcomes arrive as reply text.
+        """
+        try:
+            from .api import _hold_ops_lock
+        except Exception:
+            _hold_ops_lock = None  # type: ignore[assignment]
+        coord = getattr(self, "_coord", None)
+        if coord is None:
+            return "Prefer failed: bot not attached"
+        prefer = getattr(coord, "prefer_grace_row", None)
+        if not callable(prefer):
+            return "Prefer failed: coordinator too old"
+        try:
+            if _hold_ops_lock is not None:
+                async with _hold_ops_lock(coord):
+                    row, outcome = await asyncio.to_thread(prefer, short)
+            else:
+                row, outcome = await asyncio.to_thread(prefer, short)
+        except LookupError as e:
+            return f"Prefer failed: {e}"
+        except Exception as e:  # noqa: BLE001
+            return f"Prefer failed: {e}"
+        if row is not None:
+            try:
+                spawn = getattr(coord, "_spawn_worker", None)
+                if callable(spawn):
+                    spawn(row)
+            except Exception as e:  # noqa: BLE001
+                log.debug("prefer wake failed (%s); next tick picks it up", e)
         return outcome
 
     async def _mark_detail_cancelled(

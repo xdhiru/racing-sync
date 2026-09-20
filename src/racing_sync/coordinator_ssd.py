@@ -209,8 +209,6 @@ class SSDLedgerMixin:
                         State.QUEUED, State.DOWNLOADING, State.MOVING,
                     ):
                         d.pop(h, None)
-            # Quiet-wait hints / MOVING-park counters for rows that left
-            # (or lost) those states without a transition pop.
             # Quiet-wait hints / MOVING-park counters / prefer exemptions /
             # grace-search timestamps for rows that left (or lost) those
             # states without a transition pop.

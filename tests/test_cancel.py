@@ -872,3 +872,42 @@ async def test_chat_command_double_tap_debounced(tmp_path: Path):
         bot._bot.send_message.assert_awaited_once()
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_chat_message_prefer_starts_grace_held_row(tmp_path: Path):
+    """`/prefer_<hash>` exempts a grace-held drop and wakes a worker."""
+    from conftest import make_coordinator
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord.cfg.general.preferred_copy_grace_seconds = 3600
+        coord.cfg.prowlarr.enabled = True
+        coord.cfg.prowlarr.download_indexers = [MagicMock()]
+        coord.cfg.prowlarr.is_download_indexer = lambda url: False
+        coord._spawn_worker = MagicMock()
+        ts = TorrentState(source_infohash="e" * 40, source_name="Prefer.Me",
+                          source_announce_url="https://alpha.cc/announce/xyz",
+                          source_tracker="https://alpha.cc/announce/xyz",
+                          cross_seed_blob=b"d8:announce...",
+                          cross_seed_source="watch-dir", state=State.NEW)
+        ts._blob = b"d8:announce..."
+        store.upsert(ts)
+        bot = _bot()
+        bot._coord = coord
+        bot._store = store
+        await bot._handle_chat_message(_message(text=f"/prefer_{'e' * 40}"))
+        bot._bot.send_message.assert_awaited_once()
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Preferred")
+        coord._spawn_worker.assert_called_once()
+        assert "e" * 40 in (coord._grace_exempt or {})
+        # Unknown hashes get an explanatory reply, not a crash.
+        # (Clear the debounce so the second command is processed.)
+        bot._callback_times.clear()
+        bot._bot.send_message.reset_mock()
+        await bot._handle_chat_message(_message(text="/prefer_dddddddddd"))
+        bot._bot.send_message.assert_awaited_once()
+    finally:
+        store.close()
