@@ -259,7 +259,8 @@ advances) plus one active-tasks list message, refreshed every
 task renders a `Cancel: /cancel_<short-hash>` line (10-char prefix in
 backticks so mobile offers tap-to-copy; full hashes accepted too).
 `WAITING_INDEXER` rows additionally render
-`Fetch original: /fetch_<short-hash>`. The updates poller also watches
+`Fetch original: /fetch_<short-hash>`, and grace-held NEW watch rows
+render `Prefer this copy now: /prefer_<short-hash>`. The updates poller also watches
 chat messages: a `/cancel_<...>` line from the configured chat/user
 resolves the prefix against tracked rows and runs forget+ignore
 immediately (row, dest entries, SSD data, blob cache) with no
@@ -270,8 +271,12 @@ cancelling a waiter leaves the rest alone. A `/fetch_<...>` line flags
 a waiting row (`force_direct`)
 and wakes it (WAITING_INDEXER → QUERYING) so the racing torrent's own
 bytes feed the SSD download at once; non-waiting targets get an
-explanatory reply. Unknown/ambiguous prefixes get an explanatory
-reply. Callback debounce stays pagination-only. Cancelled releases live
+explanatory reply. A `/prefer_<...>` line exempts a grace-held watch row
+(one-shot) and wakes it so its SSD download starts at once; later
+same-content rows defer to it via the existing election, no follower
+update needed. Unknown/ambiguous prefixes get an explanatory
+reply. Command and callback handling share a 0.5s per-chat debounce
+(double-sent commands resolve+act once). Cancelled releases live
 in `ignored_torrents` (in state.db, so `--reset` clears them) and are
 skipped at discovery, recovery adoption, re-injection and late-seed
 time. Flood control (including plain-text "Flood control exceeded" errors,

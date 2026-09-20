@@ -1746,6 +1746,22 @@ def _grace_pair(store: StateStore):
     return a, b
 
 
+def _prefer_pair(store: StateStore):
+    """Two same-content NEW watch drops (priv tracker) with distinct hashes.
+
+    The first is backdated seconds so it deterministically wins ties
+    (both stay inside the grace window).
+    """
+    import datetime as dt
+
+    a = _watch_drop(store, "Prefer.Pair.1080p", 5000, _PRIV_ANNOUNCE, 16384)
+    b = _watch_drop(store, "Prefer.Pair.1080p", 5000, _PRIV_ANNOUNCE, 32768)
+    assert a.source_infohash != b.source_infohash
+    a.created_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=10)
+    store.upsert(a)
+    return a, b
+
+
 def test_watch_election_skips_grace_held_peers(tmp_path: Path):
     """No phantom owners: a grace-held peer blocks nobody.
 
@@ -1793,6 +1809,88 @@ async def test_watch_sacrificial_hit_skips_hold(tmp_path: Path):
         store.close()
 
 
+def test_prefer_grace_row_starts_held_row(tmp_path: Path):
+    """Operator pick exempts a grace-held row; siblings counted."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        a, _b = _prefer_pair(store)
+        row, msg = coord.prefer_grace_row(a.source_infohash)
+        assert row is not None and row.source_infohash == a.source_infohash
+        assert msg.startswith("Preferred")
+        assert "1 waiting sibling(s)" in msg
+        assert (a.source_infohash.lower() in (coord._grace_exempt or {})) is True
+    finally:
+        store.close()
+
+
+def test_prefer_grace_row_unknown_and_ambiguous(tmp_path: Path):
+    """Unknown hashes and ambiguous prefixes raise LookupError."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        with pytest.raises(LookupError):
+            coord.prefer_grace_row("d" * 40)
+        with pytest.raises(LookupError, match="not a torrent hash"):
+            coord.prefer_grace_row("zzz")
+        # Two rows sharing a first hex char -> ambiguous prefix.
+        seen: dict[str, object] = {}
+        pair = None
+        for pl in range(16384, 16424):
+            r = _watch_drop(store, "Prefer.Ambi.1080p", 5000, _PRIV_ANNOUNCE, pl)
+            c = (r.source_infohash or "")[:1]
+            if c in seen:
+                pair = c
+                break
+            seen[c] = r
+        assert pair is not None
+        with pytest.raises(LookupError, match="matches 2"):
+            coord.prefer_grace_row(pair)
+    finally:
+        store.close()
+
+
+def test_prefer_grace_row_refusals(tmp_path: Path):
+    """Rank-1, owned, and non-NEW rows get explanations, not exemptions."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        first = _watch_drop(store, "Prefer.Rank1.1080p", 5000,
+                            "https://dl-indexer.example.net/announce/xyz", 16384)
+        row, msg = coord.prefer_grace_row(first.source_infohash)
+        assert row is None and "already first" in msg
+        owner = _watch_drop(store, "Prefer.Owned.1080p", 5000, _PRIV_ANNOUNCE, 16384)
+        waiter = _watch_drop(store, "Prefer.Owned.1080p", 5000, _PRIV_ANNOUNCE, 32768)
+        owner.state = State.DOWNLOADING
+        store.upsert(owner)
+        row2, msg2 = coord.prefer_grace_row(waiter.source_infohash)
+        assert row2 is None and "waits on" in msg2
+        locked = _watch_drop(store, "Prefer.Locked.1080p", 5000, _PRIV_ANNOUNCE, 16385)
+        locked.state = State.QUEUED
+        store.upsert(locked)
+        row3, msg3 = coord.prefer_grace_row(locked.source_infohash)
+        assert row3 is None and "is queued" in msg3
+        assert getattr(coord, "_grace_exempt", {}) == {}
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_prefer_exemption_consumed_by_worker(tmp_path: Path):
+    """An exempted row proceeds past grace on its next run."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        a, _b = _prefer_pair(store)
+        row, _msg = coord.prefer_grace_row(a.source_infohash)
+        assert row is not None
+        await coord._do_new_watch_dir(a)
+        assert coord.transitioned == [State.WAITING_DISK]
+        assert (a.source_infohash.lower() in (coord._grace_exempt or {})) is False
+    finally:
+        store.close()
+
+
 @pytest.mark.anyio
 async def test_watch_grace_search_throttled_while_holding(tmp_path: Path):
     """Repeat evaluations inside the window don't re-query per tick."""
@@ -1809,5 +1907,51 @@ async def test_watch_grace_search_throttled_while_holding(tmp_path: Path):
         await coord._do_new_watch_dir(ts)
         assert coord.prowlarr.search_indexers_parallel.await_count == 1
         assert coord.transitioned == []
+    finally:
+        store.close()
+
+
+def test_prefer_exemption_pruned_with_row(tmp_path: Path):
+    """Exemptions for gone/non-NEW rows are reaped by the prune."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord.cfg = MagicMock()
+        coord._grace_exempt = {"z" * 40: 1.0}
+        coord._ssd_reserved = {}
+        coord._waiting_disk_next_check = {}
+        coord._moving_parks = {}
+        coord._ssd_prune_stale()
+        assert coord._grace_exempt == {}
+    finally:
+        store.close()
+
+
+def test_prefer_succeeds_despite_grace_held_peer(tmp_path: Path):
+    """Preferring the later drop while the earlier grace-held peer exists
+    must exempt, not refuse with 'waits on'."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        _a, b = _grace_pair(store)
+        row, msg = coord.prefer_grace_row(b.source_infohash)
+        assert row is not None and row.source_infohash == b.source_infohash
+        assert msg.startswith("Preferred")
+        assert "1 waiting sibling(s)" in msg
+    finally:
+        store.close()
+
+
+def test_exempt_peer_blocks_election(tmp_path: Path):
+    """A /prefer_'d row leads: fellow waiters defer to it automatically."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        a, b = _grace_pair(store)
+        row, _msg = coord.prefer_grace_row(a.source_infohash)
+        assert row is not None
+        ok, owner = coord._watch_election(b)
+        assert ok is False
+        assert owner is not None and owner.source_infohash == a.source_infohash
     finally:
         store.close()
