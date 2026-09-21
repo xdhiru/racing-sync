@@ -792,6 +792,76 @@ def _grace_st(infohash: str, tracker: str):
                    progress=1.0, trackers=[tracker])
 
 
+def _grace_racing_coord():
+    """Real store + prefer grace configured (MagicMock cfg)."""
+    from conftest import make_coordinator
+
+    coord = make_coordinator()
+    coord.cfg.general.preferred_copy_grace_seconds = 3600
+    coord.cfg.prowlarr.enabled = True
+    coord.cfg.prowlarr.download_indexers = [MagicMock()]
+    coord.cfg.prowlarr.is_download_indexer = lambda url: "dl-indexer" in (url or "")
+    return coord
+
+
+def test_prefer_racing_row_starts_held_row(tmp_path):
+    """A held VPS1 racing row can be preferred like a watch drop."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_racing_coord()
+        coord.store = store
+        ts = TorrentState(source_infohash="f" * 40, source_name="Grace.Show",
+                          source_announce_url="https://unknown.example/announce",
+                          source_tracker="https://unknown.example/announce",
+                          state=State.NEW)
+        store.upsert(ts)
+        row, msg = coord.prefer_grace_row("f" * 40)
+        assert row is not None and row.source_infohash == "f" * 40
+        assert msg.startswith("Preferred")
+        assert "f" * 40 in (coord._grace_exempt or {})
+    finally:
+        store.close()
+
+
+def test_prefer_racing_row_refusals(tmp_path):
+    """Preferred/public/stale racing rows get explanations, not exemptions."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_racing_coord()
+        coord.store = store
+        pref = TorrentState(
+            source_infohash="a" * 40, source_name="Pref.Show",
+            source_announce_url="https://dl-indexer.example.net/announce",
+            state=State.NEW)
+        store.upsert(pref)
+        row, msg = coord.prefer_grace_row("a" * 40)
+        assert row is None and "already from a download indexer" in msg
+        pub = TorrentState(
+            source_infohash="b" * 40, source_name="Pub.Show",
+            source_announce_url="udp://tracker.opentrackr.org:1337/announce",
+            state=State.NEW)
+        store.upsert(pub)
+        row2, msg2 = coord.prefer_grace_row("b" * 40)
+        assert row2 is None and "is public" in msg2
+        old = TorrentState(
+            source_infohash="c" * 40, source_name="Old.Show",
+            source_announce_url="https://unknown.example/announce",
+            state=State.NEW)
+        import datetime as dt
+
+        old.created_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)
+        store.upsert(old)
+        row3, msg3 = coord.prefer_grace_row("c" * 40)
+        assert row3 is None and "past its grace" in msg3
+        assert getattr(coord, "_grace_exempt", {}) == {}
+    finally:
+        store.close()
+
+
 @pytest.mark.anyio
 async def test_pick_and_admit_holds_nonpreferred_direct():
     """A direct commit to a non-preferred swarm holds in grace (not parks)."""
