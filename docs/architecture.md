@@ -271,9 +271,9 @@ cancelling a waiter leaves the rest alone. A `/fetch_<...>` line flags
 a waiting row (`force_direct`)
 and wakes it (WAITING_INDEXER → QUERYING) so the racing torrent's own
 bytes feed the SSD download at once; non-waiting targets get an
-explanatory reply. A `/prefer_<...>` line exempts a grace-held watch row
-(one-shot) and wakes it so its SSD download starts at once; later
-same-content rows defer to it via the existing election, no follower
+explanatory reply. A `/prefer_<...>` line exempts a grace-held row
+(watch drop or racing row, one-shot) and wakes it so its SSD download
+starts at once; later same-content rows defer to it via the existing election, no follower
 update needed. Unknown/ambiguous prefixes get an explanatory
 reply. Command and callback handling share a 0.5s per-chat debounce
 (double-sent commands resolve+act once). Cancelled releases live

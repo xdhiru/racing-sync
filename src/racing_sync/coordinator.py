@@ -1996,18 +1996,36 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             return True, None
         return False, winner
 
-    def prefer_grace_row(self, target: str) -> tuple[TorrentState | None, str]:
-        """Operator override: start a grace-held watch row's SSD download now.
+    def _exempt_grace_hash(self, h: str) -> None:
+        """Record a one-shot /prefer_ exemption (bounded, pruned with rows)."""
+        try:
+            if not h:
+                return
+            d = getattr(self, "_grace_exempt", None)
+            if not isinstance(d, dict):
+                d = {}
+                self._grace_exempt = d  # type: ignore[attr-defined]
+            d[h] = time.monotonic()
+            if len(d) > 5000:
+                for k in list(d.keys())[: len(d) - 5000]:
+                    d.pop(k, None)
+        except Exception:
+            pass
 
-        Returns (row to wake or None, reply message). The caller spawns the
-        worker (needs a running loop); the one-shot exemption alone already
-        guarantees pickup on the next tick. Waiting siblings need no
-        update: once this row locks (QUEUED+), the existing election defers
-        them automatically and the wait-note names it as owner.
+    def prefer_grace_row(self, target: str) -> tuple[TorrentState | None, str]:
+        """Operator override: start a grace-held row's SSD download now.
+
+        Works for watch-dir drops and VPS1 racing rows held in the
+        preferred-copy grace. Returns (row to wake or None, reply message).
+        The caller spawns the worker (needs a running loop); the one-shot
+        exemption alone already guarantees pickup on the next tick. Waiting
+        watch siblings need no update: once this row locks (QUEUED+), the
+        existing election defers them automatically and the wait-note names
+        it as owner; racing duplicates collapse via discovery as usual.
         Shapes follow _resolve_cancel_target (hex validation, exact-first,
-        ambiguity errors). Refuses when overriding would duplicate work
-        (an owner already exists) or is meaningless (not NEW / already
-        first / grace expired).
+        ambiguity errors). Refuses when overriding is meaningless (not NEW
+        / already preferred / grace expired) or would duplicate work (a
+        watch owner already exists).
         """
         try:
             norm = (target or "").strip().lower()
@@ -2020,13 +2038,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             rows = store.all() if store is not None and hasattr(store, "all") else []
         except Exception:
             rows = []
-        try:
-            watch_rows = [r for r in (rows or []) if self._is_watch_row(r)]
-        except Exception:
-            watch_rows = []
         ts = None
         if len(norm) == 40:
-            for r in watch_rows:
+            for r in rows or []:
                 try:
                     if (r.source_infohash or "").lower() == norm:
                         ts = r
@@ -2035,11 +2049,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     continue
             if ts is None:
                 raise LookupError(
-                    f"no tracked watch-dir torrent is {norm} "
+                    f"no tracked torrent is {norm} "
                     "(it may already be done/cancelled)")
         else:
             cands = []
-            for r in watch_rows:
+            for r in rows or []:
                 try:
                     if ((r.state == State.NEW)
                             and (r.source_infohash or "").lower().startswith(norm)):
@@ -2055,13 +2069,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     f"{preview}; send /prefer_<full 40-char hash>")
             if not cands:
                 raise LookupError(
-                    f"no waiting NEW watch-dir torrent starts with {norm!r} "
+                    f"no waiting NEW torrent starts with {norm!r} "
                     "(it may already be running/done)")
             ts = cands[0]
         name = (ts.source_name or (ts.source_infohash or "")[:10])[:50]
         if ts.state != State.NEW:
             return None, (f"{name} is {ts.state.value} — nothing to prefer "
                           "(only NEW rows waiting in grace can be started)")
+        if self._is_watch_row(ts):
+            return self._prefer_watch_row(ts, name, rows)
+        return self._prefer_racing_row(ts, name)
+
+    def _prefer_watch_row(self, ts: TorrentState, name: str,
+                          rows: list[TorrentState]) -> tuple[TorrentState | None, str]:
+        """Prefer branch for a NEW watch-dir drop (rank/owner/grace checks)."""
         try:
             rank = self._watch_rank(ts)
         except Exception:
@@ -2085,17 +2106,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if not self._in_preferred_grace(ts):
             return None, (f"{name} is past its grace wait — proceeding on its own")
         h = (ts.source_infohash or "").lower()
-        try:
-            d = getattr(self, "_grace_exempt", None)
-            if not isinstance(d, dict):
-                d = {}
-                self._grace_exempt = d  # type: ignore[attr-defined]
-            d[h] = time.monotonic()
-            if len(d) > 5000:
-                for k in list(d.keys())[: len(d) - 5000]:
-                    d.pop(k, None)
-        except Exception:
-            pass
+        self._exempt_grace_hash(h)
         sibs = 0
         try:
             want = normalize_content_name(ts.source_name or "")
@@ -2122,6 +2133,40 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                  ts.source_name[:60], h[:10], sibs)
         return ts, (f"Preferred {name} — starting SSD download now; "
                     f"{sibs} waiting sibling(s) will seed from fuse/remote after.")
+
+    def _prefer_racing_row(self, ts: TorrentState, name: str) -> tuple[TorrentState | None, str]:
+        """Prefer branch for a NEW VPS1 racing row (source-preference checks)."""
+        try:
+            entries = getattr(getattr(self.cfg, "prowlarr", None),
+                              "download_indexers", None)
+        except Exception:
+            entries = None
+        if not entries:
+            return None, (f"{name} is proceeding on its own "
+                          "(no download indexers configured — nothing to wait for)")
+        try:
+            urls = [u for u in (ts.source_announce_url or "").split(",") if u] or (
+                [ts.source_tracker] if ts.source_tracker else [])
+        except Exception:
+            urls = []
+        try:
+            if _looks_public(urls):
+                return None, (f"{name} is public — proceeding on its own")
+        except Exception:
+            pass
+        try:
+            if any(self.cfg.prowlarr.is_download_indexer(u) for u in urls):
+                return None, (f"{name} is already from a download indexer — "
+                              "proceeding on its own")
+        except Exception:
+            pass
+        if not self._in_preferred_grace(ts):
+            return None, (f"{name} is past its grace wait — proceeding on its own")
+        h = (ts.source_infohash or "").lower()
+        self._exempt_grace_hash(h)
+        log.info("prefer: operator started racing row %s (%s)",
+                 ts.source_name[:60], h[:10])
+        return ts, (f"Preferred {name} — grace skipped, starting now.")
 
     def _watch_wait_note(self, ts: TorrentState) -> str:
         """Short human reason a watch row is deferred, or "" when it may proceed.
