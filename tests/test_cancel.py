@@ -512,9 +512,11 @@ def test_render_active_has_cancel_command_per_task():
     ts2 = TorrentState(source_infohash="b" * 40, source_name="Show2",
                        state=State.QUEUED, total_bytes=2000)
     text, _, _ = render_active([(ts, 0.5), (ts2, None)], page=0, page_size=5)
-    # One copy-pasteable command per task, short hash in backticks.
-    assert "`/cancel_aaaaaaaaaa`" in text
-    assert "`/cancel_bbbbbbbbbb`" in text
+    # One copy-pasteable command per task as plain text (Markdown-escaped
+    # underscore, no labels, no backticks).
+    assert "/cancel\\_aaaaaaaaaa" in text
+    assert "/cancel\\_bbbbbbbbbb" in text
+    assert "Cancel:" not in text
     # No inline-button artefacts in the text itself.
     assert "✅" not in text
 
@@ -691,10 +693,10 @@ def test_render_active_shows_fetch_only_for_waiting_indexer():
                                state=State.DOWNLOADING, total_bytes=2000)
     text, _, _ = render_active([(waiting, None), (downloading, 0.5)],
                                page=0, page_size=5)
-    assert "`/fetch_aaaaaaaaaa`" in text
-    assert text.count("Fetch original:") == 1
-    assert "`/cancel_aaaaaaaaaa`" in text
-    assert "`/cancel_bbbbbbbbbb`" in text
+    assert "/fetch\\_aaaaaaaaaa" in text
+    assert "Fetch original:" not in text
+    assert "/cancel\\_aaaaaaaaaa" in text
+    assert "/cancel\\_bbbbbbbbbb" in text
 
 
 def test_render_detail_shows_fetch_hint_for_waiting_indexer():

@@ -35,48 +35,49 @@ def test_render_active_pagination_and_numbering():
     text0, p0, total0 = render_active(tasks, page=0, page_size=5)
     assert p0 == 0
     assert total0 == 3
-    assert "*Page 1/3*" in text0
+    assert "*Active Tasks (12)* · *Page 1/3*" in text0
 
     # 1. Full name is visible in backticks, and NO backslash escapes for brackets
-    assert "*1.* `[DummySub] Release Title - 01 (1080p) [ABCD0000].mkv`" in text0
+    assert "1. `[DummySub] Release Title - 01 (1080p) [ABCD0000].mkv`" in text0
     assert "\\[" not in text0
     assert "\\]" not in text0
 
     # 2. No ↳ symbol anywhere
     assert "↳" not in text0
 
-    # 3. Size in plain text, followed by dot and SHORT hash in backticks
-    # (full hash lives in the per-torrent detail card).
-    assert "  1.0 GB · `hash00abcd`" in text0
-
-    # 4. Next line shows state, batch (1-based), and tracker domain at the end without backticks
-    assert "  ⬇️ Downloading · 45.0% · Batch 1/2 · nyaa.tracker.wf" in text0
-    assert "  📋 Queued · Batch 1/2 · nyaa.tracker.wf" in text0
+    # 3. Own tracker on the next line (full host), then compact size +
+    # state; short hash lives inside the plain /cancel_ command
+    # (no separate hash line, no labels).
+    assert "  Source: nyaa.tracker.wf" in text0
+    assert "  1.0G · ⬇️ Downloading · 45.0% · Batch 1/2" in text0
+    assert "  2.0G · 📋 Queued · Batch 1/2" in text0
+    assert "/cancel\\_hash00abcd" in text0
+    assert "Cancel:" not in text0
 
     # Page 1 (items 6..10)
     text1, p1, total1 = render_active(tasks, page=1, page_size=5)
     assert p1 == 1
     assert total1 == 3
-    assert "*Page 2/3*" in text1
-    assert "*6.* `[DummySub] Release Title - 06 (1080p) [ABCD0005].mkv`" in text1
-    assert "*10.* `[DummySub] Release Title - 10 (1080p) [ABCD0009].mkv`" in text1
-    assert "*1.*" not in text1
-    assert "*11.*" not in text1
+    assert "*Active Tasks (12)* · *Page 2/3*" in text1
+    assert "6. `[DummySub] Release Title - 06 (1080p) [ABCD0005].mkv`" in text1
+    assert "10. `[DummySub] Release Title - 10 (1080p) [ABCD0009].mkv`" in text1
+    assert "\n1. `" not in text1
+    assert "11. `" not in text1
 
     # Page 2 (items 11..12)
     text2, p2, total2 = render_active(tasks, page=2, page_size=5)
     assert p2 == 2
     assert total2 == 3
-    assert "*Page 3/3*" in text2
-    assert "*11.* `[DummySub] Release Title - 11 (1080p) [ABCD0010].mkv`" in text2
-    assert "*12.* `[DummySub] Release Title - 12 (1080p) [ABCD0011].mkv`" in text2
-    assert "*13.*" not in text2
+    assert "*Active Tasks (12)* · *Page 3/3*" in text2
+    assert "11. `[DummySub] Release Title - 11 (1080p) [ABCD0010].mkv`" in text2
+    assert "12. `[DummySub] Release Title - 12 (1080p) [ABCD0011].mkv`" in text2
+    assert "13. `" not in text2
 
     # Clamping out-of-bounds page
     text_clamp, p_clamp, total_clamp = render_active(tasks, page=99, page_size=5)
     assert p_clamp == 2
     assert total_clamp == 3
-    assert "*Page 3/3*" in text_clamp
+    assert "*Active Tasks (12)* · *Page 3/3*" in text_clamp
 
 
 def test_keyboard_builder():
@@ -374,7 +375,11 @@ def test_render_active_shows_wait_note_for_deferred_rows():
     notes = {"e" * 40: "Waiting turn · dl-indexer.example.net copy first"}
     text, _, _ = render_active([(waiter, None), (fresh, None)],
                                page=0, page_size=5, notes=notes)
-    assert "  ⏳ Waiting turn · dl-indexer.example.net copy first · alpha.cc" in text
+    # Compact wait form with the short winning-tracker label; own full
+    # tracker rides on the Source line below the title.
+    assert "1. `Twin.Show.S01E01`" in text
+    assert "  Source: alpha.cc" in text
+    assert "⏳ Wait dl-indexer first" in text
     # Row without a note keeps the plain NEW badge.
     assert "🆕 New" in text
     # Notes never leak onto other states.
@@ -430,7 +435,7 @@ async def test_refresh_attaches_watch_wait_notes():
     ]
     await bot._refresh_active_message_inner()
     sent_text = bot._bot.send_message.call_args[0][1]
-    assert "⏳ Waiting turn · dl-indexer.example.net copy first" in sent_text
+    assert "⏳ Wait dl-indexer first" in sent_text
     bot._coord._watch_wait_note.assert_called_once()
 
 
@@ -738,18 +743,19 @@ def test_render_active_offers_prefer_for_grace_note():
     text, _, _ = render_active(
         [(ts, None)], page=0, page_size=5,
         notes={h: "Waiting for preferred copy ?? 42s left"})
-    assert "Prefer this copy now:" in text
-    assert f"/prefer_{h[:10]}" in text
-    # Other notes (owner-deferred) and other states get no prefer line.
+    assert "/prefer\\_" in text
+    assert f"{h[:10]}" in text
+    assert "Prefer this copy now:" not in text
+    # Other notes (owner-deferred) and other states get no prefer command.
     text2, _, _ = render_active(
         [(ts, None)], page=0, page_size=5,
         notes={h: "Waiting turn ?? example.net copy first"})
-    assert "Prefer this copy" not in text2
+    assert "/prefer" not in text2
     ts_q = TorrentState(source_infohash=h, source_name="Grace.Hold",
                         state=State.QUEUED, total_bytes=1000)
     text3, _, _ = render_active(
         [(ts_q, None)], page=0, page_size=5,
         notes={h: "Waiting for preferred copy ?? 42s left"})
-    assert "Prefer this copy" not in text3
+    assert "/prefer" not in text3
 
 

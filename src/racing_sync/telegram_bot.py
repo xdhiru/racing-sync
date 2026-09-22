@@ -158,6 +158,93 @@ def _tracker_domain(url: str) -> str:
         return ""
 
 
+def _short_tracker_label(domain: str) -> str:
+    """Compress a tracker domain to its short label for the active list.
+
+    Generic rule only (no tracker names hardcoded — just infrastructure
+    words like ``tracker``/``www``): ``somewhere.example`` style hosts
+    collapse to their registrable label, e.g. ``tracker.example.com``
+    -> ``example`` and ``nyaa.tracker.wf`` -> ``nyaa``. Multi-part
+    public suffixes (e.g. ``example.co.uk``) resolve to the registrable
+    label. Used for both the title suffix and the wait-turn note's
+    embedded domain so the two stay consistent.
+    """
+    if not domain:
+        return ""
+    try:
+        d = (domain or "").strip().lower().strip(".")
+        if ":" in d and not d.startswith("["):
+            d = d.split(":")[0]
+        parts = [p for p in d.split(".") if p]
+        if not parts:
+            return ""
+        # Drop generic infrastructure labels (never actual tracker names).
+        _generic = {"tracker", "trackers", "www", "www2", "api", "announce",
+                    "bt", "ipv6"}
+        kept = [p for p in parts if p not in _generic]
+        if not kept:
+            kept = parts
+        if len(kept) == 1:
+            return kept[0]
+        if len(kept) == 2:
+            # Possible ccTLD pair (example.co.uk already collapsed to 2
+            # only when nothing was dropped) — first label is the owner.
+            return kept[0]
+        # 3+ labels left: generic ccTLD guard (host.example.co.uk).
+        if len(kept[-1]) == 2 and len(kept[-2]) <= 3:
+            return kept[-3]
+        return kept[0]
+    except Exception:
+        return ""
+
+
+def _size_compact(n: int) -> str:
+    """Compact size for the active list: ``5.7 GB`` -> ``5.7G``."""
+    try:
+        s = _bytes_human(n)
+    except Exception:
+        return ""
+    for long, short in ((" PB", "P"), (" TB", "T"), (" GB", "G"),
+                        (" MB", "M"), (" KB", "K")):
+        if s.endswith(long):
+            return s[: -len(long)] + short
+    return s
+
+
+def _compact_wait_note(note: str) -> str | None:
+    """Compact a watch-deferral note for the active list, or None.
+
+    - ``Waiting for preferred copy · 1800s left`` -> ``Wait pref-copy 30m``
+    - ``Waiting turn · <domain> copy first`` -> ``Wait <short> first``
+      (``<short>`` via :func:`_short_tracker_label` when it looks like a
+      domain; plain words like ``public``/``tracker``/``sibling`` kept).
+    Returns None when the note is unrecognized (caller falls back to raw).
+    """
+    if not note:
+        return None
+    try:
+        if note.startswith("Waiting for preferred copy"):
+            m = re.search(r"(\d+)\s*s\s*left", note)
+            if m:
+                secs = int(m.group(1))
+                mins = max(1, round(secs / 60))
+                return f"Wait pref-copy {mins}m"
+            return "Wait pref-copy"
+        if note.startswith("Waiting turn"):
+            m = re.search(r"Waiting turn\s*[·?]+\s*(.+?)\s*copy first", note)
+            if not m:
+                m = re.search(r"Waiting turn\s*[?]+\s*(.+?)\s*copy first", note)
+            if m:
+                who = (m.group(1) or "").strip()
+                if "." in who:
+                    who = _short_tracker_label(who) or who
+                return f"Wait {who} first" if who else "Wait turn"
+            return "Wait turn"
+    except Exception:
+        return None
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Message renderers
 # --------------------------------------------------------------------------- #
@@ -244,7 +331,8 @@ def render_detail(ts: TorrentState, progress: float | None = None,
     lines.append(f"{icon} `{name}`")
 
     # 2. Hash & size line: full hash copiable by click + size in plain text
-    # (detail card keeps the FULL hash; the Active Tasks list shows short).
+    # (detail card keeps the FULL hash; the Active Tasks list carries the
+    # short hash inside its /cancel_ · /fetch_ · /prefer_ commands).
     meta_parts = [f"`{full_hash}`", size]
     _bd = _batch_display(ts)
     if _bd:
@@ -396,8 +484,17 @@ def render_active(
 ) -> tuple[str, int, int]:
     """Render paginated list of active tasks with numbered items.
 
+    Compact mobile layout (detail cards stay fully detailed):
+
+    1. ``1. `Name.mkv``` (bare title so it wraps less)
+    2. ``  Source: <full-domain>`` (own tracker, host only)
+    3. ``  5.7G · <status>`` (size + stage; long waits shortened)
+    4. ``  /cancel_<hash>`` + one line each for ``/fetch_`` / ``/prefer_``
+       when present (plain commands, no labels; the hash lives in the
+       commands so no separate hash line).
+
     `notes` maps source_infohash -> one-line extra (e.g. why a NEW row is
-    waiting); a present note replaces the state line with `⏳ <note>`.
+    waiting); a present note replaces the state line's status part.
     """
     try:
         page_size = int(page_size)
@@ -410,7 +507,7 @@ def render_active(
 
     if not active:
         return (
-            "*Active Tasks*\n\n_No active tasks in flight._",
+            "📌 *Active Tasks*\n\n_No active tasks in flight._",
             0,
             1,
         )
@@ -420,31 +517,36 @@ def render_active(
     page_items = active[start_idx:end_idx]
 
     lines = [
-        f"*Active Tasks* · *Page {cur_page + 1}/{total_pages}* ({total_items} in flight)",
+        f"📌 *Active Tasks ({total_items})* · *Page {cur_page + 1}/{total_pages}*",
         "",
     ]
 
     for i, (ts, progress) in enumerate(page_items):
         item_num = start_idx + i + 1
-        name, size, full_hash = _row_text_bits(ts)
-        short_hash = (full_hash or "")[:CANCEL_SHORT_LEN]
+        name, _size_long, full_hash = _row_text_bits(ts)
+        size = _size_compact(ts.total_bytes)
         try:
             note = (notes or {}).get(ts.source_infohash or "") or ""
         except Exception:
             note = ""
 
-        # 1. Full name of the torrent, copiable by click (in backticks, no escape chars)
-        lines.append(f"*{item_num}.* `{name}`")
+        domain_full = _tracker_domain(ts.source_announce_url) or _tracker_domain(ts.source_tracker)
 
-        # 2. Size below the name, separator dot with space, and SHORT hash
-        # copiable by click (detail card keeps the full 40-char hash).
-        lines.append(f"  {size} · `{short_hash}`")
+        # 1. Bare title in backticks (nothing appended so it wraps less).
+        lines.append(f"{item_num}. `{name}`")
 
-        # 3. State line — or the deferral note, which already names why
-        # the row is waiting (shares the Cancel/tracker tail below).
+        # 2. Own tracker source line (full host only, no URL/keys).
+        if domain_full:
+            lines.append(f"  Source: {_esc(domain_full)}")
+
+        # 2. Size + stage. Long waits use the compact `Wait <reason>`
+        # form; short states stay verbatim. No tracker suffix here (it
+        # moved to the title line) and no separate hash line (the hash
+        # lives inside the commands on line 3).
         _bd = _batch_display(ts)
         if note and ts.state in (State.NEW, State.WAITING_DISK):
-            state_text = f"⏳ {note}"
+            _compact = _compact_wait_note(note)
+            state_text = f"⏳ {_compact}" if _compact else f"⏳ {_esc(note)}"
         elif ts.state == State.DOWNLOADING:
             if progress is not None:
                 state_text = f"⬇️ Downloading · {progress * 100:.1f}%"
@@ -468,9 +570,9 @@ def render_active(
         elif ts.state == State.QUERYING:
             state_text = "🔍 Querying"
         elif ts.state == State.WAITING_INDEXER:
-            state_text = f"⏳ Waiting for download indexer (#{ts.indexer_attempts})"
+            state_text = f"⏳ Wait indexer miss #{ts.indexer_attempts}"
         elif ts.state == State.WAITING_DISK:
-            state_text = "💾 Waiting for SSD space"
+            state_text = "⏳ Wait SSD space"
         elif ts.state == State.DONE:
             state_text = "✅ Done"
         elif ts.state == State.FAILED:
@@ -481,18 +583,10 @@ def render_active(
         if _bd and ts.state != State.MOVING:
             state_text += f" · {_bd}"
 
-        domain = _tracker_domain(ts.source_announce_url) or _tracker_domain(ts.source_tracker)
-        if domain:
-            state_text += f" · {_esc(domain)}"
-
-        lines.append(f"  {state_text}")
-        # Per-task copy-paste cancel command (no buttons, no confirm —
-        # the user's sent message is final). In backticks so the
-        # underscore in `/cancel_...` can't break Markdown parsing and
-        # mobile clients offer tap-to-copy.
-        lines.append(f"  Cancel: `{_cancel_command(full_hash)}`")
-        if ts.state == State.WAITING_INDEXER:
-            lines.append(f"  Fetch original: `{_fetch_command(full_hash)}`")
+        lines.append(f"  {size} · {state_text}")
+        # 4. Per-task commands, one per line as plain text (no labels, no
+        # backticks — the underscore is escaped so Markdown parsing stays
+        # intact; clients render `/cancel_...` tappable).
         # Grace-held rows are actionable: same override as the detail card.
         # Gated on NEW (only NEW rows can be preferred) as well as the note,
         # so a stale note on another state never advertises a no-op.
@@ -500,8 +594,11 @@ def render_active(
             _is_grace_note = bool(note) and note.startswith("Waiting for preferred copy")
         except Exception:
             _is_grace_note = False
+        lines.append(f"  {_esc(_cancel_command(full_hash))}")
+        if ts.state == State.WAITING_INDEXER:
+            lines.append(f"  {_esc(_fetch_command(full_hash))}")
         if ts.state == State.NEW and _is_grace_note:
-            lines.append(f"  Prefer this copy now: `{_prefer_command(full_hash)}`")
+            lines.append(f"  {_esc(_prefer_command(full_hash))}")
         lines.append("")
 
     rendered = _safe_truncate_markdown("\n".join(lines).strip())
