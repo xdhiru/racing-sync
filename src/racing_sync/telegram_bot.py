@@ -481,6 +481,7 @@ def render_active(
     page: int = 0,
     page_size: int = 5,
     notes: dict[str, str] | None = None,
+    footer: str = "",
 ) -> tuple[str, int, int]:
     """Render paginated list of active tasks with numbered items.
 
@@ -495,6 +496,9 @@ def render_active(
 
     `notes` maps source_infohash -> one-line extra (e.g. why a NEW row is
     waiting); a present note replaces the state line's status part.
+
+    `footer` is an optional trailing line (e.g. storage stats) appended
+    directly after (single newline, no blank gap); "" disables it.
     """
     try:
         page_size = int(page_size)
@@ -506,8 +510,11 @@ def render_active(
     cur_page = max(0, min(page, total_pages - 1))
 
     if not active:
+        text = "📌 *Active Tasks*\n\n_No active tasks in flight._"
+        if footer:
+            text += f"\n{footer}"
         return (
-            "📌 *Active Tasks*\n\n_No active tasks in flight._",
+            _safe_truncate_markdown(text),
             0,
             1,
         )
@@ -601,8 +608,17 @@ def render_active(
             lines.append(f"  {_esc(_prefer_command(full_hash))}")
         lines.append("")
 
-    rendered = _safe_truncate_markdown("\n".join(lines).strip())
+    text = "\n".join(lines).strip()
+    if footer:
+        text += f"\n{footer}"
+    rendered = _safe_truncate_markdown(text.strip())
     return rendered, cur_page, total_pages
+
+
+#: How long a VPS1 free-space probe stays valid for the active-tasks
+#: footer. Refresh ticks every status_update_interval (45s default); a
+#: probe per tick would chatter the SFTP channel for a footer line.
+_VPS1_FREE_TTL_S = 300.0
 
 
 # --------------------------------------------------------------------------- #
@@ -650,6 +666,10 @@ class TelegramBot:
         # Serializes periodic active-message refresh vs callback-triggered
         # refresh so they can't interleave edits / race the dedup cache.
         self._active_lock = asyncio.Lock()
+        # VPS1 free-space probe cache (monotonic timestamp, bytes|None):
+        # the footer refreshes every status tick but the SFTP probe is
+        # reused for _VPS1_FREE_TTL_S so we don't chatter the channel.
+        self._vps1_free_cache: tuple[float, int | None] | None = None
 
     # ---- lifecycle ----
 
@@ -1527,6 +1547,91 @@ class TelegramBot:
         async with lock:
             await self._refresh_active_message_inner()
 
+    def _valid_byte_count(self, value: object) -> int | None:
+        """int byte count, or None when missing/nonsense. Never raises."""
+        try:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, float):
+                value = int(value)
+            if isinstance(value, int) and value >= 0:
+                return value
+        except Exception:
+            pass
+        return None
+
+    async def _active_footer(self) -> str:
+        """Storage footer for the active-tasks message.
+
+        ``______________________`` divider on top, then::
+
+            ·  VPS1 Free: 64.5G
+            ·  SSD Free: 44.0G  ·  rsv 2.9G
+
+        VPS1 unknown (SFTP probe failed/unavailable) renders as
+        ``·  VPS1 Free: ?``; segments with no data are omitted.
+        Best effort — returns "" when nothing is known. Never raises,
+        so a failing probe can never break the refresh. No warning
+        flags: low space stays the cleanup janitor's job.
+        """
+        try:
+            coord = getattr(self, "_coord", None)
+            cfg = getattr(coord, "cfg", None)
+            if coord is None or cfg is None:
+                return ""
+            # VPS2 SSD free: cheap local syscall, probed every refresh.
+            ssd_free: int | None = None
+            try:
+                from .rclone_ops import ssd_free_bytes as _ssd_free
+                ssd_free = self._valid_byte_count(
+                    await asyncio.to_thread(_ssd_free, cfg))
+            except Exception:
+                ssd_free = None
+            # SSD reservation ledger: in-memory, no I/O.
+            reserved: int | None = None
+            try:
+                _fn = getattr(coord, "_ssd_reserved_total", None)
+                reserved = self._valid_byte_count(_fn() if callable(_fn) else None)
+            except Exception:
+                reserved = None
+            # VPS1 free over SFTP: cached, so the 45s refresh tick doesn't
+            # chatter the channel for a footer line.
+            vps1_free: int | None = None
+            try:
+                _now = time.monotonic()
+                _cached = getattr(self, "_vps1_free_cache", None)
+                if (_cached is not None and len(_cached) == 2
+                        and _now - float(_cached[0]) < _VPS1_FREE_TTL_S):
+                    vps1_free = self._valid_byte_count(_cached[1])
+                else:
+                    _probe = getattr(coord, "_source_free_bytes", None)
+                    if callable(_probe):
+                        vps1_free = self._valid_byte_count(await _probe())
+                        self._vps1_free_cache = (_now, vps1_free)
+            except Exception:
+                vps1_free = None
+            if ssd_free is None and vps1_free is None and not reserved:
+                return ""
+            # 22 raw "_" would parse as empty italic entities in legacy
+            # Markdown and render invisible (that's why dashes showed but
+            # underscores didn't) — escape so Telegram shows literal ____.
+            _lines = [_esc("_" * 35)]
+            if vps1_free is not None:
+                _lines.append(f"·  VPS1 Free: {_size_compact(vps1_free)}")
+            else:
+                # SFTP probe failed / unavailable — explicit unknown.
+                _lines.append("·  VPS1 Free: ?")
+            if ssd_free is not None:
+                _ssd_seg = f"·  SSD Free: {_size_compact(ssd_free)}"
+                if reserved:
+                    _ssd_seg += f"  ·  rsv {_size_compact(reserved)}"
+                _lines.append(_ssd_seg)
+            elif reserved:
+                _lines.append(f"·  SSD Free: ?  ·  rsv {_size_compact(reserved)}")
+            return "\n".join(_lines)
+        except Exception:
+            return ""
+
     async def _refresh_active_message_inner(self) -> None:
         assert self._bot is not None
         # Sentinel -1 means "stop trying to edit" (e.g. chat permission issue)
@@ -1573,9 +1678,10 @@ class TelegramBot:
                         continue
         except Exception:
             notes = {}
+        footer = await self._active_footer()
         text, cur_page, total_pages = render_active(
             items, page=self._current_page, page_size=self._cfg.page_size,
-            notes=notes,
+            notes=notes, footer=footer,
         )
         if len(text) > 4096:
             text = _safe_truncate_markdown(text)
