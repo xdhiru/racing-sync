@@ -759,3 +759,106 @@ def test_render_active_offers_prefer_for_grace_note():
     assert "/prefer" not in text3
 
 
+def test_short_tracker_label_generic_rule():
+    from racing_sync.telegram_bot import _short_tracker_label
+    assert _short_tracker_label("tracker.example.com") == "example"
+    assert _short_tracker_label("nyaa.tracker.wf") == "nyaa"
+    assert _short_tracker_label("example.cc") == "example"
+    assert _short_tracker_label("host.example.co.uk") == "example"
+    assert _short_tracker_label("") == ""
+
+
+def test_size_compact():
+    from racing_sync.telegram_bot import _size_compact
+    assert _size_compact(int(3.1 * 1024 ** 3)) == "3.1G"
+    assert _size_compact(1000) == "1000 B"
+
+
+def test_compact_wait_note():
+    from racing_sync.telegram_bot import _compact_wait_note
+    assert _compact_wait_note("Waiting for preferred copy · 1908s left") == "Wait pref-copy 32m"
+    assert _compact_wait_note("Waiting turn · tracker.example.com copy first") == "Wait example first"
+    assert _compact_wait_note("Waiting turn · public copy first") == "Wait public first"
+    assert _compact_wait_note("something else") is None
+
+
+def test_render_active_appends_footer():
+    ts = TorrentState(source_infohash="a" * 40, source_name="Show",
+                      state=State.QUEUED, total_bytes=1000)
+    footer = "______________________\n·  VPS1 Free: 10G\n·  SSD Free: 5G"
+    text, _, _ = render_active([(ts, None)], page=0, page_size=5,
+                               footer=footer)
+    assert text.endswith(footer)
+    # No footer by default — message ends with the command line.
+    text2, _, _ = render_active([(ts, None)], page=0, page_size=5)
+    assert "VPS1 Free" not in text2
+    # Empty list carries the footer too.
+    text3, _, _ = render_active([], footer=footer)
+    assert "No active tasks" in text3
+    assert text3.endswith(footer)
+
+
+@pytest.mark.anyio
+async def test_active_footer_without_coord_is_empty():
+    bot = object.__new__(TelegramBot)
+    bot._coord = None
+    assert await bot._active_footer() == ""
+
+
+@pytest.mark.anyio
+async def test_active_footer_formats_storage(tmp_path):
+    from types import SimpleNamespace
+
+    async def _vps1_free():
+        return 120 * 1024 ** 3
+
+    coord = SimpleNamespace(
+        cfg=SimpleNamespace(
+            ssd=SimpleNamespace(path=tmp_path),
+            cleanup=SimpleNamespace(
+                low_watermark_free_bytes=200 * 1024 ** 3,
+                critical_watermark_free_bytes=8 * 1024 ** 3,
+            ),
+        ),
+        _ssd_reserved_total=lambda: 30 * 1024 ** 3,
+        _source_free_bytes=_vps1_free,
+    )
+    bot = object.__new__(TelegramBot)
+    bot._coord = coord
+    bot._vps1_free_cache = None
+    footer = await bot._active_footer()
+    assert footer.splitlines()[0] == "\\_" * 35  # escaped: raw ___ parses as italic and goes invisible
+    assert footer.splitlines()[1] == "·  VPS1 Free: 120.0G"
+    assert footer.splitlines()[2].startswith("·  SSD Free: ")
+    assert footer.splitlines()[2].endswith("·  rsv 30.0G")
+    # No warning flags even under the low watermark — the cleanup
+    # janitor owns low space.
+    assert "⚠️" not in footer
+    # Second call reuses the cached VPS1 probe.
+    coord._source_free_bytes = None
+    assert await bot._active_footer() == footer
+
+
+@pytest.mark.anyio
+async def test_active_footer_unknown_vps1(tmp_path):
+    from types import SimpleNamespace
+
+    async def _boom():
+        raise OSError("sftp down")
+
+    coord = SimpleNamespace(
+        cfg=SimpleNamespace(
+            ssd=SimpleNamespace(path=tmp_path),
+            cleanup=SimpleNamespace(),
+        ),
+        _ssd_reserved_total=lambda: 0,
+        _source_free_bytes=_boom,
+    )
+    bot = object.__new__(TelegramBot)
+    bot._coord = coord
+    bot._vps1_free_cache = None
+    footer = await bot._active_footer()
+    assert footer.splitlines()[1] == "·  VPS1 Free: ?"
+    assert "SSD Free: " in footer
+
+
