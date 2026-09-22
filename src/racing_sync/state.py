@@ -893,7 +893,7 @@ def _safe_int(value: object, default: int = 0) -> int:
             return int(str(value).strip())
         except (TypeError, ValueError):
             return int(float(value))  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 

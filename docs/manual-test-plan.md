@@ -37,7 +37,8 @@ to it in the daemon logs. The HTTP client handles this automatically.
 
 ```bash
 racing-sync run --config config.toml &
-# Ctrl-C after a few seconds
+# Ctrl-C after a few seconds (use your configured general.state_db,
+# default /var/lib/racing-sync/state.db)
 sqlite3 /var/lib/racing-sync/state.db ".schema"
 sqlite3 /var/lib/racing-sync/state.db "select count(*) from torrent_state"
 ```
@@ -52,9 +53,9 @@ On VPS1 racing client, add a small movie (1–2 GB public). Watch category
 
 Expected behaviour on VPS2 within ~5 minutes:
 
-1. `state.db` row appears with `state=new`.
-2. Cross-seed picker logs `picked public-prowlarr` (or `public-sftp`).
-3. Transition `new -> queued -> downloading`.
+1. `state.db` row appears with `state=new` (DB values are lowercase; enum names are uppercase).
+2. Cross-seed picker logs `picked public-prowlarr` (`cross_seed_source: prowlarr|sftp|self`).
+3. Transition `new -> querying -> waiting_indexer|waiting_disk -> queued -> downloading`.
 4. After finish, log `rclone ok in Ns`.
 5. Transition `downloading -> moving -> re_adding -> done`.
 6. VPS2 qB has the movie on `fuse.mount`, status "seeding", `skip_check=true`.

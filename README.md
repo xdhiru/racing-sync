@@ -48,7 +48,9 @@ mid-pipeline. Public torrents land paused by default (see
 
 ## Quickstart
 
-Requires Python 3.11+. Install into a virtualenv — system-wide `pip install`
+Requires Python 3.11+, plus system `rclone` binary (absolute path, probed by
+`check-config`) and `sqlite3` CLI for manual DB inspection. Install into a
+virtualenv — system-wide `pip install`
 fails on modern distros (`externally-managed-environment`, don't bypass it
 with `--break-system-packages`):
 
@@ -111,7 +113,8 @@ python3 run.py forget --config config.toml <infohash|name> --apply --ignore
 (ambiguous names show candidates instead of guessing). Forgetting an SSD
 download also forgets the watch-dir rows waiting on it; `--ignore` blocks
 it from ever coming back while listed on VPS1 (undo with `unignore`).
-Same thing via API: `POST /api/forget/{hash}?ignore=true`.
+Same thing via API: `POST /api/forget/{hash}?ignore=true&delete_files=false`
+(full 40-char hash required, always applies; `delete_files=false` = `--keep-files`).
 
 From Telegram, copy-paste the `Cancel: /cancel_<hash>` line under any
 torrent — forgotten + ignored immediately, no confirmation. Torrents still
@@ -134,7 +137,7 @@ Same virtualenv as above, then use the installed entrypoint instead of
 pip install -e ".[api,test]"
 cp config.example.toml config.toml
 # edit config.toml
-racing-sync --config config.toml run
+racing-sync run --config config.toml
 ```
 
 Editable installs also track `git pull` (restart only). Avoid plain
