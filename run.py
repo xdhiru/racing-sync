@@ -2,7 +2,8 @@
 
 Usage:
     python3 run.py run --config config.toml
-    python3 run.py run --config config.toml --reset [--full]
+    python3 run.py run --config config.toml --reset
+    python3 run.py run --config config.toml --full --yes (implies --reset)
     python3 run.py check-config --config config.toml
     python3 run.py forget --config config.toml <infohash|name> [--apply] [--keep-files] [--ignore]
     python3 run.py unignore --config config.toml [--list|<infohash|name>]
@@ -13,7 +14,7 @@ Usage:
 log directory from the loaded config, then starts normally. Bookkeeping
 only — torrents on the clients/SSD are re-adopted by recovery and resume;
 use 'forget' to abandon one entirely (dry-run by default, --apply deletes).
---reset --full additionally drops dest racing entries (with files), wipes
+--full (requires --yes, implies --reset) additionally drops dest racing entries (with files), wipes
 SSD data and the cached .torrent blobs: a true clean slate for testing
 (fuse/remote copies are never touched).
 

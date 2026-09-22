@@ -4,7 +4,7 @@
 
 ```
 src/racing_sync/
-  __main__.py         CLI (run [--reset/--full] / forget [--ignore] / unignore / check-config)
+  __main__.py         CLI (run [--reset | --full --yes] / forget [--apply] [--keep-files] [--ignore] / unignore [--list] / check-config)
   config.py           Pydantic schema, cross-validates everything
   logging_setup.py    Rotating files + JSONL + ring buffer + optional HTTP sink
   state.py            SQLite state machine (State, ALLOWED, StateStore)
@@ -253,7 +253,7 @@ memoized 30 minutes when healthy (new arrivals wait at most one window).
 
 ## Telegram
 
-One message per torrent (detail card, edited in place as the state
+One-shot `racing-sync online` message on startup, then one message per torrent (detail card, edited in place as the state
 advances) plus one active-tasks list message, refreshed every
 `status_update_interval` seconds with pagination buttons. Each active
 task renders a `Cancel: /cancel_<short-hash>` line (10-char prefix in
@@ -289,10 +289,12 @@ card freezes at a dead state forever.
 
 `GET /api/state` (paginated) · `GET /api/active` (bounded) ·
 `GET /api/logs` · `GET /api/ssd` · `POST /api/recover` ·
-`POST /api/retry/{hash}` · `POST /api/forget/{hash}?ignore=true`
-(always applies; `ignore` records the cancellation) ·
+`POST /api/retry/{hash}` · `POST /api/forget/{hash}?ignore=true&delete_files=false`
+(always applies, full 40-char hash required; `ignore` records the cancellation,
+`delete_files=false` keeps local data like CLI `--keep-files`) ·
 `POST /api/scan-watch`. Useful when the Telegram bot isn't enough. Auth via
-nginx-injected `X-Authenticated-User` header or a static token.
+static token in `X-API-Token` header, or nginx-injected `X-Authenticated-User`
+from `trusted_proxies` (token also supports 429 throttle, 422/404/409 on bad/unknown/conflicting hashes).
 
 ## Cross-seed tracker map
 
