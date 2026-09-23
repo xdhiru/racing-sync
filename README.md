@@ -117,7 +117,10 @@ Same thing via API: `POST /api/forget/{hash}?ignore=true&delete_files=false`
 (full 40-char hash required, always applies; `delete_files=false` = `--keep-files`).
 
 From Telegram, copy-paste the `Cancel: /cancel_<hash>` line under any
-torrent — forgotten + ignored immediately, no confirmation. Torrents still
+torrent — forgotten + ignored immediately, no confirmation. Use the `Keep:`
+`/keep_<hash>` line instead when the data must stay (manual move, pre-seeded
+bytes): untracked + ignored with files left in place, same as CLI
+`--keep-files`. Torrents still
 waiting on the indexer show `Fetch original: /fetch_<hash>` instead: use
 the VPS1 original right away rather than waiting out Prowlarr retries
 (counts toward private-tracker ratio). Rows holding for a preferred copy

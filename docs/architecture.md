@@ -260,7 +260,9 @@ One-shot `racing-sync online` message on startup, then one message per torrent (
 advances) plus one active-tasks list message, refreshed every
 `status_update_interval` seconds with pagination buttons. Each active
 task renders a `Cancel: /cancel_<short-hash>` line (10-char prefix in
-backticks so mobile offers tap-to-copy; full hashes accepted too).
+backticks so mobile offers tap-to-copy; full hashes accepted too) plus a
+`Keep: /keep_<short-hash>` line (forget + ignore without touching files —
+CLI `--keep-files` equivalent, for manually-added torrents).
 `WAITING_INDEXER` rows additionally render
 `Fetch original: /fetch_<short-hash>`, and grace-held NEW watch rows
 render `Prefer this copy now: /prefer_<short-hash>`. The updates poller also watches
@@ -268,7 +270,8 @@ chat messages: a `/cancel_<...>` line from the configured chat/user
 resolves the prefix against tracked rows and runs forget+ignore
 immediately (row, dest entries, SSD data, blob cache) with no
 confirmation, then replies with the outcome and frees the SSD
-reservation. Cancelling an SSD owner also forgets the watch rows
+reservation. `/keep_` works the same except files are left alone
+(`delete_files=False`). Cancelling an SSD owner also forgets the watch rows
 currently deferred on it (same election winner), reported in the reply;
 cancelling a waiter leaves the rest alone. A `/fetch_<...>` line flags
 a waiting row (`force_direct`)
