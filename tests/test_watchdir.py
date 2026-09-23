@@ -1955,3 +1955,114 @@ def test_exempt_peer_blocks_election(tmp_path: Path):
         assert owner is not None and owner.source_infohash == a.source_infohash
     finally:
         store.close()
+
+
+def _on_ssd_coord(tmp_path: Path, store, *, complete: bool):
+    """Watch harness with a dest entry for the dropped hash (manual seed)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from racing_sync.config import ClassifierConfig
+
+    coord = make_coordinator()
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 1  # budget exhausted for everything
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.classifier = ClassifierConfig()
+    coord.cfg.rclone.fuse.mount = tmp_path / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-u"
+    coord.cfg.general.state_db = tmp_path / "state.db"
+    coord.cfg.general.disk_safety_margin_bytes = 1000
+    coord.cfg.prowlarr.enabled = False
+    coord.prowlarr = None
+    coord.store = store
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+    return coord
+
+
+@pytest.mark.anyio
+async def test_do_new_watch_dir_on_ssd_complete_skips_budget(tmp_path: Path):
+    """Same hash already complete on dest: QUEUED with no SSD reservation."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    raw = _create_sample_torrent_data(
+        "Seeded.Movie.1080p.mkv", 2000, "https://alpha.cc/announce/xyz")
+    infohash, name, total, announce = _bencoded_info_hash(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = _on_ssd_coord(tmp_path, store, complete=True)
+    entry = MagicMock(hash=infohash, save_path=str(tmp_path / "downloads"))
+    entry.is_complete = MagicMock(return_value=True)
+    coord.dest_client = MagicMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[entry])
+    coord._ssd_try_reserve = AsyncMock(return_value=False)
+
+    ts = TorrentState(
+        source_infohash=infohash, source_name=name, total_bytes=total,
+        source_announce_url=announce, cross_seed_blob=raw,
+        cross_seed_source="watch-dir", state=State.NEW,
+    )
+    ts._blob = raw
+    try:
+        await coord._do_new_watch_dir(ts)
+        assert ts.state == State.QUEUED
+        coord._ssd_try_reserve.assert_not_called()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_do_new_watch_dir_on_ssd_partial_still_parks(tmp_path: Path):
+    """Same hash present but partial: normal budget queue, no over-skip."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    raw = _create_sample_torrent_data(
+        "Partial.Movie.1080p.mkv", 2000, "https://alpha.cc/announce/xyz")
+    infohash, name, total, announce = _bencoded_info_hash(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = _on_ssd_coord(tmp_path, store, complete=False)
+    entry = MagicMock(hash=infohash, save_path=str(tmp_path / "downloads"))
+    entry.is_complete = MagicMock(return_value=False)
+    coord.dest_client = MagicMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[entry])
+    coord._ssd_try_reserve = AsyncMock(return_value=False)
+
+    ts = TorrentState(
+        source_infohash=infohash, source_name=name, total_bytes=total,
+        source_announce_url=announce, cross_seed_blob=raw,
+        cross_seed_source="watch-dir", state=State.NEW,
+    )
+    ts._blob = raw
+    try:
+        await coord._do_new_watch_dir(ts)
+        assert ts.state == State.WAITING_DISK
+        coord._ssd_try_reserve.assert_awaited_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_wait_disk_promotes_when_complete_lands_on_dest(tmp_path: Path):
+    """PARKED row whose bytes finish on dest skips the budget on re-check."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    store = StateStore(tmp_path / "state.db")
+    coord = _on_ssd_coord(tmp_path, store, complete=True)
+    coord._stop = False
+    coord._waiting_disk_next_check = {}
+    coord._watch_election = MagicMock(return_value=(True, None))
+    entry = MagicMock(hash="c" * 40, save_path=str(tmp_path / "downloads"))
+    entry.is_complete = MagicMock(return_value=True)
+    coord.dest_client = MagicMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[entry])
+    coord._ssd_try_reserve = AsyncMock(return_value=False)
+
+    ts = TorrentState(source_infohash="c" * 40, source_name="LateComplete",
+                      total_bytes=16_000, state=State.WAITING_DISK)
+    try:
+        await coord._wait_disk_then_queue(ts)
+        assert ts.state == State.QUEUED
+        coord._ssd_try_reserve.assert_not_called()
+    finally:
+        store.close()

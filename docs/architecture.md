@@ -219,7 +219,10 @@ download — not a per-torrent cap:
 - Admission reserves `min(total, max_inflight_bytes)`; over budget parks in
   `WAITING_DISK` (quiet, ≤1 re-check/minute; download-slot checked too).
   Content already fully verified on fuse skips reservation entirely (no
-  budget queued for bytes that will never download).
+  budget queued for bytes that will never download). Same-hash content
+  already complete on the dest client (e.g. manually added and seeding
+  from SSD) also skips reservation — `_do_queued` adopts + resumes it,
+  so parking it behind a full ledger would only delay its rclone move.
 - Post-classify refinement: max *remaining* batch (fuse-present bytes
   excluded — a 32 GB season with 20 GB already moved holds ~12 GB, not
   32 GB), full total for singles; singles that no longer fit roll back

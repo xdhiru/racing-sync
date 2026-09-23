@@ -2527,6 +2527,28 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 raise
             return
 
+        # Admit-time on-SSD shortcut: the same hash already complete on
+        # the dest client (e.g. added manually earlier and seeding from
+        # the SSD save path) needs no SSD budget even though the rclone
+        # move is still ahead — _do_queued adopts + resumes it instead
+        # of adding a second entry. Without this a full ledger parks
+        # the row in WAITING_DISK for bytes that will never download.
+        # Fail-open: any doubt reserves normally.
+        try:
+            _pre = await self._dest_complete_entry(
+                [ts.source_infohash, ts.cross_seed_infohash])
+        except Exception:
+            _pre = None
+        if _pre is not None:
+            log.info("watch-dir: %s already complete on dest; skipping SSD budget",
+                     ts.source_name[:60])
+            try:
+                self.transition(ts, State.QUEUED)
+            except Exception:
+                await self._ssd_release(ts.source_infohash)
+                raise
+            return
+
         needed = self._ssd_estimate_for_new(chosen_size)
         if not await self._ssd_try_reserve(ts.source_infohash, needed):
             log.info(
@@ -2727,6 +2749,27 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 except Exception:
                     pass
                 return
+        # Parked-row on-SSD shortcut (mirrors the admit-time one above):
+        # a complete dest entry may have appeared — or been added
+        # manually — while parked. It needs no budget, so skip straight
+        # to QUEUED instead of waiting out a full ledger for bytes that
+        # will never download. Fail-open: any doubt reserves normally.
+        try:
+            _pre = await self._dest_complete_entry(
+                [ts.source_infohash, getattr(ts, "cross_seed_infohash", None)])
+        except Exception:
+            _pre = None
+        if _pre is not None:
+            log.info("watch-dir: %s already complete on dest; skipping SSD budget",
+                     ts.source_name[:60])
+            try:
+                _wd = getattr(self, "_waiting_disk_next_check", None)
+                if isinstance(_wd, dict):
+                    _wd.pop((ts.source_infohash or "").lower(), None)
+            except Exception:
+                pass
+            self.transition(ts, State.QUEUED)
+            return
         needed = self._ssd_estimate_for_new(ts.total_bytes)
         admitted = await self._ssd_try_reserve(ts.source_infohash, needed)
         if not admitted:
@@ -3115,6 +3158,38 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 )
                 best = max(best, rem)
             return best
+        except Exception:
+            return None
+
+    async def _dest_complete_entry(self, hashes: list[str] | None):
+        """Existing complete dest-client entry for one of `hashes`, else None.
+
+        Admit-time shortcut (mirrors `_blob_fully_remote`): content
+        already complete on the VPS2 client needs no SSD budget even
+        when its rclone move is still ahead — `_do_queued` adopts and
+        resumes it instead of adding a second entry. Three-valued like
+        its sibling: an entry object = skip the budget; None = reserve
+        normally (no client, RPC error, or only partials present).
+        Fail-open by construction: a wrong None just parks in
+        WAITING_DISK as today; callers re-verify downstream.
+        """
+        try:
+            want = {(h or "").strip().lower() for h in (hashes or [])
+                    if (h or "").strip()}
+            if not want:
+                return None
+            dest = getattr(self, "dest_client", None)
+            if dest is None:
+                return None
+            found = await dest.list_torrents(hashes=sorted(want))
+            for t in found or []:
+                try:
+                    if ((getattr(t, "hash", "") or "").lower() in want
+                            and bool(t.is_complete())):
+                        return t
+                except Exception:
+                    continue
+            return None
         except Exception:
             return None
 
