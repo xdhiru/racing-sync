@@ -65,7 +65,7 @@ async def test_cancel_edits_detail_card_from_cache(tmp_path: Path):
     bot, store = _setup(tmp_path, h)
     bot._detail_cache[h] = 777
     try:
-        msg = await bot._cancel_torrent(h)
+        msg = await bot._execute_cancel_one(h, delete_files=True)
         assert msg.startswith("Cancelled")
         assert store.get(h) is None
         bot._bot.edit_message_text.assert_awaited_once()
@@ -83,7 +83,7 @@ async def test_cancel_edits_detail_card_from_db(tmp_path: Path):
     h = "b" * 40
     bot, store = _setup(tmp_path, h, db_msg_id=555)
     try:
-        msg = await bot._cancel_torrent(h)
+        msg = await bot._execute_cancel_one(h, delete_files=True)
         assert msg.startswith("Cancelled")
         bot._bot.edit_message_text.assert_awaited_once()
         _, kwargs = bot._bot.edit_message_text.call_args
@@ -97,7 +97,7 @@ async def test_cancel_without_card_still_replies(tmp_path: Path):
     h = "c" * 40
     bot, store = _setup(tmp_path, h)
     try:
-        msg = await bot._cancel_torrent(h)
+        msg = await bot._execute_cancel_one(h, delete_files=True)
         assert msg.startswith("Cancelled")
         bot._bot.edit_message_text.assert_not_called()
     finally:
@@ -110,7 +110,7 @@ async def test_cancel_card_edit_failure_does_not_fail_cancel(tmp_path: Path):
     bot, store = _setup(tmp_path, h, db_msg_id=999)
     bot._bot.edit_message_text = AsyncMock(side_effect=Exception("message not found"))
     try:
-        msg = await bot._cancel_torrent(h)
+        msg = await bot._execute_cancel_one(h, delete_files=True)
         assert msg.startswith("Cancelled")
         assert store.get(h) is None
         assert store.is_ignored(h) is True

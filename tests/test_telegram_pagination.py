@@ -38,20 +38,18 @@ def test_render_active_pagination_and_numbering():
     assert "*Active Tasks (12)* · *Page 1/3*" in text0
 
     # 1. Full name is visible in backticks, and NO backslash escapes for brackets
-    assert "1. `[DummySub] Release Title - 01 (1080p) [ABCD0000].mkv`" in text0
+    assert "1. `[DummySub] Release Title - 01 (1080p) [ABCD0000].mkv` · 1.0G" in text0
     assert "\\[" not in text0
     assert "\\]" not in text0
 
     # 2. No ↳ symbol anywhere
     assert "↳" not in text0
 
-    # 3. Own tracker on the next line (full host), then compact size +
-    # state; short hash lives inside the plain /cancel_ command
-    # (no separate hash line, no labels).
-    assert "  Source: nyaa.tracker.wf" in text0
-    assert "  1.0G · ⬇️ Downloading · 45.0% · Batch 1/2" in text0
-    assert "  2.0G · 📋 Queued · Batch 1/2" in text0
-    assert "/cancel\\_hash00abcd" in text0
+    # 3. Tracker + stage share one display-only ▸ line (no separate
+    # Source:/size lines); positional group commands, never hashes.
+    assert "▸ nyaa.tracker.wf ⬇️ Downloading · 45.0% · Batch 1/2" in text0
+    assert "▸ nyaa.tracker.wf 📋 Queued · Batch 1/2" in text0
+    assert "/cancel\\_1" in text0
     assert "Cancel:" not in text0
 
     # Page 1 (items 6..10)
@@ -375,11 +373,10 @@ def test_render_active_shows_wait_note_for_deferred_rows():
     notes = {"e" * 40: "Waiting turn · dl-indexer.example.net copy first"}
     text, _, _ = render_active([(waiter, None), (fresh, None)],
                                page=0, page_size=5, notes=notes)
-    # Compact wait form with the short winning-tracker label; own full
-    # tracker rides on the Source line below the title.
+    # Compact wait form with the short winning-tracker label on the
+    # tracker's ▸ line (no separate Source: line).
     assert "1. `Twin.Show.S01E01`" in text
-    assert "  Source: alpha.cc" in text
-    assert "⏳ Wait dl-indexer first" in text
+    assert "▸ alpha.cc ⏳ Wait dl-indexer first" in text
     # Row without a note keeps the plain NEW badge.
     assert "🆕 New" in text
     # Notes never leak onto other states.
@@ -391,6 +388,104 @@ def test_render_active_shows_wait_note_for_deferred_rows():
                                 notes=notes)
     assert "Waiting turn" not in text2
     assert "⬇️ Downloading · 50.0%" in text2
+
+
+def test_render_active_groups_same_file_trackers():
+    """Same file from two trackers: one heading, two lines, gid commands."""
+    from racing_sync.telegram_bot import pick_snapshot
+
+    lead = TorrentState(
+        source_infohash="a" * 40, source_name="Twin.Show.S01E01",
+        state=State.WAITING_INDEXER, total_bytes=1000, indexer_attempts=3,
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
+    sib = TorrentState(
+        source_infohash="b" * 40, source_name="Twin.Show.S01E01",
+        state=State.DOWNLOADING, total_bytes=1000,
+        source_announce_url="https://bte.example/announce",
+    )
+    other = TorrentState(
+        source_infohash="c" * 40, source_name="Other.Show.S01E01",
+        state=State.QUEUED, total_bytes=2000,
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
+    text, cur, total = render_active(
+        [(lead, None), (sib, 0.5), (other, None)], page=0, page_size=5)
+    assert cur == 0 and total == 1
+    # Copies vs titles in the header; pages count groups.
+    assert "*Active Tasks (3 copies · 2 titles)* · *Page 1/1*" in text
+    # One heading per file, size once: the shared name appears exactly once.
+    assert text.count("Twin.Show.S01E01") == 1
+    assert "1. `Twin.Show.S01E01`" in text
+    assert "2. `Other.Show.S01E01`" in text
+    # Display-only tracker lines, no per-tracker commands.
+    assert "▸ alpha.cc ⏳ Wait indexer miss #3" in text
+    assert "▸ bte.example ⬇️ Downloading · 50.0%" in text
+    assert "Source:" not in text
+    # Positional group commands on ONE line (never hashes).
+    assert "/cancel\\_1 /fetch\\_1" in text
+    assert "/cancel\\_aaaaaaaaaa" not in text
+    assert "/fetch\\_aaaaaaaaaa" not in text
+    assert "/keep" not in text and "/prefer" not in text
+    # Sibling choice rides on pick snapshots (hash, label) pairs.
+    from racing_sync.telegram_bot import pick_snapshot
+    members = [(lead, None), (sib, 0.5)]
+    snap = pick_snapshot(members, "fetch")
+    assert snap == [("a" * 40, "alpha")]
+    snap_cancel = pick_snapshot(members, "cancel")
+    assert [h for (h, _) in snap_cancel] == ["a" * 40, "b" * 40]
+    assert snap_cancel[1] == ("b" * 40, "bte")
+    assert pick_snapshot(members, "prefer") == []
+
+
+def test_render_active_sibling_prefer_uses_own_hash():
+    """Prefer renders a group command; the snapshot carries each hash."""
+    from racing_sync.telegram_bot import pick_snapshot
+
+    lead = TorrentState(
+        source_infohash="a" * 40, source_name="Twin.Show.S01E01",
+        state=State.QUEUED, total_bytes=1000,
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
+    sib = TorrentState(
+        source_infohash="b" * 40, source_name="Twin.Show.S01E01",
+        state=State.NEW, total_bytes=1000,
+        source_announce_url="https://bte.example/announce",
+    )
+    notes = {"b" * 40: "Waiting for preferred copy (grace 12m left)"}
+    text, _, _ = render_active([(lead, None), (sib, None)],
+                               page=0, page_size=5, notes=notes)
+    # One group, one heading; group commands on one line (no hashes).
+    assert text.count("Twin.Show.S01E01") == 1
+    assert "/cancel\\_1 /prefer\\_1" in text
+    assert "/cancel\\_aaaaaaaaaa" not in text
+    assert "/prefer\\_bbbbbbbbbb" not in text
+    assert "/fetch" not in text
+    # The grace-held sibling snapshots with its own hash.
+    snap = pick_snapshot([(lead, None), (sib, None)], "prefer", notes)
+    assert snap == [("b" * 40, "bte")]
+
+
+def test_pick_snapshot_skips_malformed_and_disambiguates():
+    """Bad hashes never snapshot; repeat labels gain the short hash."""
+    from racing_sync.telegram_bot import pick_snapshot
+
+    mk = lambda h, st, dom, name="Show.X": TorrentState(
+        source_infohash=h, source_name=name,
+        state=st, total_bytes=1000,
+        source_announce_url=f"https://{dom}/announce")
+    a = mk("a" * 40, State.WAITING_INDEXER, "alpha.cc", "Show.One.S01E01")
+    bad = mk("zzz-not-hex", State.WAITING_INDEXER, "evil.example", "Show.One.S01E01")
+    assert pick_snapshot([(a, None), (bad, None)], "fetch") == [
+        ("a" * 40, "alpha")]
+
+    b = mk("b" * 40, State.WAITING_INDEXER, "alpha.cc", "Show.Two.S01E01")
+    assert pick_snapshot([(b, None)], "fetch") == [("b" * 40, "alpha")]
+    # Same label twice inside one group: second gains the short hash.
+    c = mk("c" * 40, State.WAITING_INDEXER, "alpha.cc", "Dupe.Show.S01E01")
+    d = mk("d" * 40, State.WAITING_INDEXER, "alpha.cc", "Dupe.Show.S01E01")
+    assert pick_snapshot([(c, None), (d, None)], "fetch") == [
+        ("c" * 40, "alpha"), ("d" * 40, f"alpha {'d' * 6}")]
 
 
 def test_render_detail_shows_wait_note():
@@ -437,6 +532,80 @@ async def test_refresh_attaches_watch_wait_notes():
     sent_text = bot._bot.send_message.call_args[0][1]
     assert "⏳ Wait dl-indexer first" in sent_text
     bot._coord._watch_wait_note.assert_called_once()
+
+
+def test_inflight_note_for_shapes():
+    from unittest.mock import MagicMock
+    from racing_sync.telegram_bot import _inflight_note_for
+
+    ts = TorrentState(source_infohash="a" * 40, source_name="Show",
+                      state=State.WAITING_INDEXER)
+    leader = TorrentState(
+        source_infohash="b" * 40, source_name="Show",
+        state=State.DOWNLOADING, total_bytes=1000,
+        source_announce_url="https://bte.example/announce")
+    assert _inflight_note_for(ts, leader) == (
+        "Waiting for bte copy · downloading")
+    assert _inflight_note_for(ts, None) == ""
+    # Test doubles answer truthy to everything: never a note.
+    assert _inflight_note_for(ts, MagicMock()) == ""
+    assert _inflight_note_for(ts, "not-a-row") == ""
+
+
+def test_render_active_waiting_indexer_shows_deferral_note():
+    h = "a" * 40
+    ts = TorrentState(source_infohash=h, source_name="Twin.Show",
+                      state=State.WAITING_INDEXER, total_bytes=1000,
+                      indexer_attempts=13,
+                      source_announce_url="https://alpha.cc/announce/xyz")
+    text, _, _ = render_active(
+        [(ts, None)], page=0, page_size=5,
+        notes={h: "Waiting for bte copy · downloading"})
+    assert "⏳ Waiting for bte copy · downloading" in text
+    assert "miss #13" not in text
+    # No note: the miss count stays.
+    text2, _, _ = render_active([(ts, None)], page=0, page_size=5)
+    assert "⏳ Wait indexer miss #13" in text2
+
+
+@pytest.mark.anyio
+async def test_refresh_attaches_inflight_deferral_note():
+    """WAITING_INDEXER rows deferred to a leader explain themselves."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    bot = object.__new__(TelegramBot)
+    bot._bot = MagicMock()
+    bot._bot.edit_message_text = AsyncMock()
+    bot._bot.send_message = AsyncMock(
+        return_value=MagicMock(message_id=99))
+    bot._store = MagicMock()
+    bot._coord = MagicMock()
+    bot._coord.live_progress_map.return_value = {}
+    bot._coord._watch_wait_note = MagicMock(return_value="")
+    bot._coord._inflight_same_content = MagicMock(return_value=TorrentState(
+        source_infohash="b" * 40, source_name="Twin.Show",
+        state=State.DOWNLOADING, total_bytes=1000,
+        source_announce_url="https://bte.example/announce"))
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
+    bot._current_page = 0
+    bot._active_msg_id = None
+    bot._prev_active_msg_id = None
+    bot._last_active_cache = None
+    bot._detail_cache = {}
+    bot._detail_queue = asyncio.Queue()
+    bot._detail_sent_state = {}
+    h = "a" * 40
+    bot._store.list_active_inflight.return_value = [
+        TorrentState(source_infohash=h, source_name="Twin.Show",
+                     state=State.WAITING_INDEXER, total_bytes=1000,
+                     indexer_attempts=13,
+                     source_announce_url="https://alpha.cc/announce/xyz"),
+    ]
+    await bot._refresh_active_message_inner()
+    sent_text = bot._bot.send_message.call_args[0][1]
+    assert "⏳ Waiting for bte copy · downloading" in sent_text
+    assert "miss #13" not in sent_text
 
 
 def test_render_active_deterministic_cache_key():
@@ -613,6 +782,170 @@ async def test_callback_authentication_and_throttling():
     bot._refresh_active_message.assert_not_called()
 
 
+def _action_query(data, chat="12345", user="12345"):
+    from unittest.mock import AsyncMock, MagicMock
+    q = MagicMock()
+    q.message.chat.id = int(chat)
+    q.from_user.id = int(user)
+    q.data = data
+    q.answer = AsyncMock()
+    return q
+
+
+def _action_bot(**kw):
+    from unittest.mock import AsyncMock
+    bot = object.__new__(TelegramBot)
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
+    bot._callback_times = {}
+    bot._refresh_active_message = AsyncMock()
+    bot._last_active_cache = None
+    for k, v in kw.items():
+        setattr(bot, k, v)
+    return bot
+
+
+@pytest.mark.anyio
+async def test_callback_pick_prefer_runs_prefer_and_refreshes():
+    """Tapping a member button executes prefer for that snapshot hash."""
+    from unittest.mock import AsyncMock
+    bot = _action_bot()
+    bot._pending_pick = {
+        "kind": "pick", "seq": "7", "cmd": "prefer", "title": "Twin.Show",
+        "members": [("a" * 40, "alpha"), ("b" * 40, "bte")],
+        "expires": 9999999999.0,
+    }
+    bot._prefer_torrent = AsyncMock(return_value="Preferred X")
+    bot._reply = AsyncMock()
+    await bot._handle_callback(_action_query("pick:7:1"))
+    bot._prefer_torrent.assert_awaited_once_with("b" * 40)
+    bot._reply.assert_awaited_once()
+    assert bot._reply.call_args[0][0].startswith("Preferred")
+    bot._refresh_active_message.assert_awaited_once()
+    assert bot._pending_pick is None  # consumed: double-tap expires
+
+
+@pytest.mark.anyio
+async def test_callback_pick_cancel_advances_to_keep_question():
+    """Tapping a member for cancel arms keepq (nothing deleted yet)."""
+    from unittest.mock import AsyncMock
+    bot = _action_bot()
+    bot._pending_pick = {
+        "kind": "pick", "seq": "7", "cmd": "cancel", "title": "Twin.Show",
+        "members": [("a" * 40, "alpha"), ("b" * 40, "bte")],
+        "expires": 9999999999.0,
+    }
+    bot._reply = AsyncMock()
+    bot._refresh_active_message = AsyncMock()
+    await bot._handle_callback(_action_query("pick:7:1"))
+    _p = bot._pending_live()
+    assert _p["kind"] == "keepq"
+    assert _p["hashes"] == ["b" * 40]
+    assert _p["scope"] == "bte copy"
+    bot._refresh_active_message.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_callback_pick_all_arms_whole_group():
+    from unittest.mock import AsyncMock
+    bot = _action_bot()
+    bot._pending_pick = {
+        "kind": "pick", "seq": "7", "cmd": "cancel", "title": "Twin.Show",
+        "members": [("a" * 40, "alpha"), ("b" * 40, "bte")],
+        "expires": 9999999999.0,
+    }
+    bot._reply = AsyncMock()
+    bot._refresh_active_message = AsyncMock()
+    await bot._handle_callback(_action_query("pick:7:all"))
+    _p = bot._pending_live()
+    assert _p["kind"] == "keepq"
+    assert sorted(_p["hashes"]) == ["a" * 40, "b" * 40]
+    assert _p["scope"] == "all 2 copies"
+
+
+@pytest.mark.anyio
+async def test_callback_keep_yes_no_execute():
+    """Yes keeps files; No deletes; both consume the pending."""
+    from unittest.mock import AsyncMock
+
+    async def _run(which):
+        bot = _action_bot()
+        bot._pending_pick = {
+            "kind": "keepq", "seq": "9", "title": "Show", "scope": "",
+            "hashes": ["a" * 40], "expires": 9999999999.0,
+        }
+        executed = {}
+
+        async def _fake_snapshot_cancel(hashes, title, *, delete_files):
+            executed["args"] = (list(hashes), title, delete_files)
+            return "done"
+
+        bot._execute_snapshot_cancel = _fake_snapshot_cancel
+        bot._reply = AsyncMock()
+        bot._refresh_active_message = AsyncMock()
+        q = _action_query(f"keep:9:{which}")
+        await bot._on_action_button(q, f"keep:9:{which}")
+        return executed, bot
+
+    executed, bot = await _run("yes")
+    assert executed["args"] == (["a" * 40], "Show", False)
+    assert bot._pending_pick is None
+    executed, _ = await _run("no")
+    assert executed["args"] == (["a" * 40], "Show", True)
+
+
+@pytest.mark.anyio
+async def test_callback_abort_drops_flow():
+    from unittest.mock import AsyncMock
+    bot = _action_bot()
+    bot._pending_pick = {
+        "kind": "pick", "seq": "7", "cmd": "cancel", "title": "Twin.Show",
+        "members": [("a" * 40, "alpha")], "expires": 9999999999.0,
+    }
+    bot._prefer_torrent = AsyncMock()
+    bot._reply = AsyncMock()
+    bot._refresh_active_message = AsyncMock()
+    await bot._handle_callback(_action_query("abort:7"))
+    assert bot._pending_live() is None
+    bot._prefer_torrent.assert_not_called()
+    bot._reply.assert_awaited_once()
+    assert "cancelled" in bot._reply.call_args[0][0].lower()
+    bot._refresh_active_message.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_callback_stale_seq_replies_expired():
+    from unittest.mock import AsyncMock
+    bot = _action_bot()
+    bot._prefer_torrent = AsyncMock()
+    bot._fetch_torrent = AsyncMock()
+    bot._reply = AsyncMock()
+    # No pending at all (or wrong seq): nothing acts.
+    await bot._handle_callback(_action_query("pick:99:0"))
+    bot._prefer_torrent.assert_not_called()
+    bot._fetch_torrent.assert_not_called()
+    bot._reply.assert_awaited_once()
+    assert "Expired" in bot._reply.call_args[0][0]
+    bot._refresh_active_message.assert_not_called()
+
+
+def test_keyboard_includes_pending_rows():
+    bot = object.__new__(TelegramBot)
+    kb = bot._build_keyboard(
+        0, 1,
+        [[("aither", "pick:3:0"), ("bte", "pick:3:1"),
+          ("All (2)", "pick:3:all")],
+         [("Keep files", "keep:4:yes"), ("Delete files", "keep:4:no")],
+         [("Cancel", "abort:4")]])
+    rows = kb.inline_keyboard
+    assert rows[0][0].text == "🔄 Refresh"
+    assert [b.text for b in rows[1]] == ["aither", "bte", "All (2)"]
+    assert rows[1][0].callback_data == "pick:3:0"
+    assert rows[2][0].text == "Keep files"
+    assert rows[3][0].text == "Cancel"
+    assert all(len(b.callback_data) <= 64 for r in rows for b in r
+               if (b.callback_data or "").startswith(("pick:", "keep:", "abort:")))
+
+
 @pytest.mark.anyio
 async def test_detail_queue_overflow_evicts_oldest():
     import asyncio
@@ -735,28 +1068,27 @@ async def test_detail_card_offers_prefer_for_grace_note():
 
 
 def test_render_active_offers_prefer_for_grace_note():
-    """The active-tasks list carries the /prefer_ line for grace-held rows."""
+    """Grace-held rows get a positional prefer command + snapshot pick."""
+    from racing_sync.telegram_bot import pick_snapshot
+
     h = "e" * 40
     ts = TorrentState(source_infohash=h, source_name="Grace.Hold",
                       state=State.NEW, total_bytes=1000,
                       source_announce_url="https://alpha.cc/announce/xyz")
+    notes = {h: "Waiting for preferred copy ?? 42s left"}
     text, _, _ = render_active(
-        [(ts, None)], page=0, page_size=5,
-        notes={h: "Waiting for preferred copy ?? 42s left"})
-    assert "/prefer\\_" in text
-    assert f"{h[:10]}" in text
+        [(ts, None)], page=0, page_size=5, notes=notes)
+    assert "/cancel\\_1 /prefer\\_1" in text
+    assert f"{h[:10]}" not in text  # no torrent hash in the message
     assert "Prefer this copy now:" not in text
-    # Other notes (owner-deferred) and other states get no prefer command.
-    text2, _, _ = render_active(
-        [(ts, None)], page=0, page_size=5,
-        notes={h: "Waiting turn ?? example.net copy first"})
-    assert "/prefer" not in text2
+    assert pick_snapshot([(ts, None)], "prefer", notes) == [(h, "alpha")]
+    # Other notes (owner-deferred) and other states get no prefer.
+    assert pick_snapshot(
+        [(ts, None)], "prefer",
+        {h: "Waiting turn ?? example.net copy first"}) == []
     ts_q = TorrentState(source_infohash=h, source_name="Grace.Hold",
                         state=State.QUEUED, total_bytes=1000)
-    text3, _, _ = render_active(
-        [(ts_q, None)], page=0, page_size=5,
-        notes={h: "Waiting for preferred copy ?? 42s left"})
-    assert "/prefer" not in text3
+    assert pick_snapshot([(ts_q, None)], "prefer", notes) == []
 
 
 def test_short_tracker_label_generic_rule():
