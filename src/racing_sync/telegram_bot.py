@@ -27,6 +27,7 @@ import datetime as dt
 import hashlib
 import logging
 import re
+import secrets
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -285,9 +286,21 @@ def _retry_in_future_seconds(value: object) -> float | None:
         return None
 
 
+def _safe_display_name(name: str) -> str:
+    """Operator-controlled torrent name made safe for a Markdown code span.
+
+    Backticks would close the span early (then `_`/`[` outside it break
+    parsing or inject links); newlines would split the message. Replace
+    backticks with a quote and flatten newlines — matches the renderer
+    convention so headings and questions display identically.
+    """
+    return ((name or "").replace("`", "'").replace("\n", " ")
+            .replace("\r", " ").rstrip("\\"))
+
+
 def _row_text_bits(ts: TorrentState) -> tuple[str, str, str]:
     """Sanitized (name, human size, lowercase hash) shared by both renderers."""
-    name = (ts.source_name or "").replace("`", "'").replace("\n", " ").replace("\r", " ").rstrip("\\")
+    name = _safe_display_name(ts.source_name or "")
     return name, _bytes_human(ts.total_bytes), (ts.source_infohash or "").lower()
 
 
@@ -744,8 +757,8 @@ def render_pending_question(pending: dict | None) -> str:
         if not isinstance(pending, dict):
             return ""
         kind = str(pending.get("kind") or "")
-        title = str(pending.get("title") or "")[:80]
-        scope = str(pending.get("scope") or "")
+        title = _safe_display_name(str(pending.get("title") or "")[:80])
+        scope = _esc(str(pending.get("scope") or ""))
         try:
             _size = _size_compact(pending.get("size"))
         except Exception:
@@ -984,9 +997,33 @@ class TelegramBot:
             self._detail_worker_loop(), name="rs-telegram-detail",
         )
         try:
-            # Send initial "online" message (separate from active-tasks)
-            sent_online = await self._bot.send_message(self._cfg.chat_id, "racing-sync online")
-            self._note_outbound(getattr(sent_online, "message_id", None))
+            # Debounced "online" ping: a crash-loop restart must not spam
+            # the chat — skip when the last ping is under 10 minutes old.
+            _ping_at = None
+            try:
+                _get_meta = getattr(self._store, "get_meta", None)
+                if callable(_get_meta):
+                    _ping_at = await asyncio.to_thread(
+                        _get_meta, "telegram_online_ping_at")
+            except Exception:
+                _ping_at = None
+            _recent = False
+            try:
+                _recent = (time.time() - float(_ping_at or 0)) < 600
+            except (TypeError, ValueError):
+                _recent = False
+            if not _recent:
+                # Send initial "online" message (separate from active-tasks)
+                sent_online = await self._bot.send_message(self._cfg.chat_id, "racing-sync online")
+                self._note_outbound(getattr(sent_online, "message_id", None))
+                try:
+                    _set_meta = getattr(self._store, "set_meta", None)
+                    if callable(_set_meta):
+                        await asyncio.to_thread(
+                            _set_meta, "telegram_online_ping_at",
+                            str(time.time()))
+                except Exception:
+                    pass
         except TelegramError as e:
             log.warning("telegram probe failed: %s", e)
         self._task = asyncio.create_task(self._loop(), name="rs-telegram")
@@ -1363,16 +1400,26 @@ class TelegramBot:
             return None
 
     def _next_seq(self) -> str:
-        """Next pending-flow sequence number (stale-tap guard)."""
+        """Next pending-flow sequence token (stale-tap guard).
+
+        Unpredictable (not 1,2,3…): callback data is only obscure, so a
+        sequential id lets anyone in the authorized chat forge taps into
+        another operator's pending flow. Single pending per bot is
+        intentional (single-operator chat); the token still binds each
+        question to its own buttons until it expires.
+        """
         try:
-            _n = int(getattr(self, "_pending_seq", 0) or 0) + 1
-        except (TypeError, ValueError):
-            _n = 1
-        try:
-            self._pending_seq = _n
+            return secrets.token_hex(4)
         except Exception:
-            pass
-        return str(_n)
+            try:
+                _n = int(getattr(self, "_pending_seq", 0) or 0) + 1
+            except (TypeError, ValueError):
+                _n = 1
+            try:
+                self._pending_seq = _n
+            except Exception:
+                pass
+            return str(_n)
 
     def _set_pending_pick(self, cmd: str, title: str, size_bytes: object,
                           members: list[tuple[str, str]]) -> dict:
@@ -1576,6 +1623,13 @@ class TelegramBot:
         norm = (short or "").strip().lower()
         if not norm or any(c not in "0123456789abcdef" for c in norm):
             raise LookupError(f"not a torrent hash: {short!r}")
+        if len(norm) < 4 and len(norm) != 40:
+            # 1-3 char prefixes always match-or-error over a full table
+            # scan; group numbers never reach here (digits route first).
+            raise LookupError(
+                f"/{cmd}_{norm} is too short — send at least 4 hex chars "
+                f"or the full 40-char hash"
+            )
         try:
             if len(norm) == 40:
                 row = self._store.get(norm)
@@ -1894,7 +1948,8 @@ class TelegramBot:
         """Display title for a group (lead row's name, truncated)."""
         try:
             if members:
-                return str(getattr(members[0], "source_name", "") or "")[:60]
+                return _safe_display_name(
+                    str(getattr(members[0], "source_name", "") or "")[:60])
         except Exception:
             pass
         return "?"
@@ -2424,17 +2479,15 @@ class TelegramBot:
 
         # Skip the API call if page, total_pages, text and pending rows
         # are identical — unless a keep-at-bottom repost is due (position
-        # refreshes even when the content is unchanged).
+        # refreshes even when the content is unchanged). Button digests
+        # stay in the key: a button-only change must re-send, otherwise
+        # taps desync from the frozen snapshot.
         try:
             cache_key = (cur_page, total_pages, text,
                          tuple(_d for _r in qrows for _, _d in _r))
         except Exception:
             cache_key = (cur_page, total_pages, text)
 
-        # Skip the API call if page, total_pages, and text are identical —
-        # unless a keep-at-bottom repost is due (position refreshes even
-        # when the content is unchanged).
-        cache_key = (cur_page, total_pages, text)
         repost_due = self._repost_due()
         if cache_key == self._last_active_cache and self._active_msg_id is not None and not repost_due:
             return
