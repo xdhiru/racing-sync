@@ -1718,6 +1718,53 @@ async def test_watch_rank1_proceeds_despite_grace(tmp_path: Path):
         store.close()
 
 
+def _racing_inflight(store: StateStore, name: str, size: int = 5000):
+    """Same-content racing row past admission (invisible to watch election)."""
+    ts = TorrentState(
+        source_infohash="f" * 39 + "1", source_name=name, total_bytes=size,
+        source_announce_url="https://ops.example/announce/xyz",
+        source_tracker="https://ops.example/announce/xyz",
+        cross_seed_source="prowlarr", state=State.QUEUED)
+    store.upsert(ts)
+    return ts
+
+
+@pytest.mark.anyio
+async def test_watch_new_defers_to_inflight_racing_copy(tmp_path: Path):
+    """Grace hold yields: an in-flight racing copy owns the content."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        _racing_inflight(store, "Grace.Flyer.1080p")
+        ts = _watch_drop(store, "Grace.Flyer.1080p", 5000, _PRIV_ANNOUNCE, 16384)
+        await coord._do_new_watch_dir(ts)
+        # Deferred as a waiter, not grace-held and not admitted.
+        assert coord.transitioned == []
+        assert store.get(ts.source_infohash, include_blob=False).state == State.NEW
+        note = coord._watch_wait_note(ts)
+        assert note.startswith("Waiting turn")
+        assert "ops.example" in note
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_watch_prefer_override_beats_inflight_deferral(tmp_path: Path):
+    """Operator /prefer_ still wins over the cross-path deferral."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        _racing_inflight(store, "Grace.Flyer.1080p")
+        ts = _watch_drop(store, "Grace.Flyer.1080p", 5000, _PRIV_ANNOUNCE, 16384)
+        coord._grace_exempt = {ts.source_infohash: 1.0}
+        await coord._do_new_watch_dir(ts)
+        # Exemption consumed and the row admitted past the deferral.
+        assert coord._grace_exempt == {}
+        assert coord.transitioned != []
+    finally:
+        store.close()
+
+
 def test_watch_wait_note_preferred_grace(tmp_path: Path):
     """Grace-held rows get a card note instead of looking stuck."""
     store = StateStore(tmp_path / "state.db")

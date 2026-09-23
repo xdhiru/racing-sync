@@ -93,6 +93,16 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
       No tracker_map hit → query the `[[prowlarr.download_indexers]]`
       download-target indexers in priority order; first exact release wins.
       Park in `WAITING_INDEXER` + retry per `prowlarr_retry_*` if no hit yet.
+      A retry window is skipped (quiet park, no attempt burned) while
+      another row for the same content is already QUEUED/DOWNLOADING/
+      MOVING/RE_ADDING — its bytes are on the way, so searching Prowlarr
+      again would only duplicate them; a stalled/failed sibling hands
+      back control on a later window. While deferred the row shows
+      `Waiting for <tracker> copy · <stage>` instead of the miss count.
+      The same rule covers watch drops: a NEW drop defers to an in-flight
+      same-content row of any origin (the watch election can't see racing
+      rows) instead of grace-holding and then downloading a duplicate —
+      operator `/prefer_` still overrides.
       Past `prowlarr_max_age_seconds` the row fails — unless
       `cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout` is set,
       in which case it uses the racing torrent's own bytes instead (with a
