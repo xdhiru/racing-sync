@@ -118,8 +118,13 @@ async def test_do_new_transitions_failed_when_source_vanished():
     coord.transition = MagicMock()
 
     ts = TorrentState(source_infohash="vanished_hash_12345", state=State.NEW)
+    # Transient vanish (client restart, registration lag) must not fail
+    # the row: only the third consecutive miss is terminal.
     await coord._do_new(ts)
+    await coord._do_new(ts)
+    coord.transition.assert_not_called()
 
+    await coord._do_new(ts)
     coord.transition.assert_called_once_with(
         ts, State.FAILED, error="source torrent vanished from client: vanished_h"
     )
@@ -136,7 +141,10 @@ async def test_do_waiting_indexer_transitions_failed_when_source_vanished():
 
     ts = TorrentState(source_infohash="vanished_hash_67890", state=State.QUERYING)
     await coord._do_waiting_indexer(ts)
+    await coord._do_waiting_indexer(ts)
+    coord.transition.assert_not_called()
 
+    await coord._do_waiting_indexer(ts)
     coord.transition.assert_called_once_with(
         ts, State.FAILED, error="source torrent vanished from client: vanished_h"
     )

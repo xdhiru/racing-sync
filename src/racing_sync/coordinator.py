@@ -207,6 +207,22 @@ def _group_is_ignored(group: list[Torrent], store) -> bool:
     return False
 
 
+def _log_api_task_done(task: "asyncio.Task") -> None:
+    """Done-callback for the API serve task: a dead API must be loud.
+
+    Without this, `OSError: port in use` (or a missing uvicorn) kills the
+    task silently and the daemon runs headless believing the API is up.
+    """
+    try:
+        if task.cancelled():
+            return
+        exc = task.exception()
+    except Exception:
+        return
+    if exc is not None:
+        log.error("API server task died: %s", exc)
+
+
 @dataclass
 class LiveItem:
     source_infohash: str
@@ -481,6 +497,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 self._api_task = asyncio.create_task(
                     serve(self), name="rs-api"
                 )
+                try:
+                    self._api_task.add_done_callback(_log_api_task_done)
+                except Exception:
+                    pass
 
             self._coordinator_started = True
         except BaseException:
@@ -905,8 +925,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 12,
                 self.cfg.max_active_downloads * 2 + self.cfg.max_concurrent_moves * 2,
             )
-        except (TypeError, ValueError):
-            _max_workers = 0
+        except (TypeError, ValueError, AttributeError):
+            # Broken config must fail closed to a bounded burst, never to
+            # unbounded worker spawn (0 is falsy = cap disabled below).
+            _max_workers = 12
         ready_indexer = self.store.list_indexer_ready()
         for ts in ready_indexer:
             if _max_workers and max(0, _max_workers - len(self._tasks)) <= 0:
@@ -933,10 +955,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         )
         scheduled = 0
         scheduled_waiting_disk = 0
-        max_concurrent_workers = max(
-            12,
-            self.cfg.max_active_downloads * 2 + self.cfg.max_concurrent_moves * 2,
-        )
+        try:
+            max_concurrent_workers = max(
+                12,
+                self.cfg.max_active_downloads * 2 + self.cfg.max_concurrent_moves * 2,
+            )
+        except (TypeError, ValueError, AttributeError):
+            max_concurrent_workers = 12
         available_slots = max(0, max_concurrent_workers - len(self._tasks))
 
         active_downloads = sum(
@@ -1414,13 +1439,46 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     # (batch caps + SSD ledger live in coordinator_ssd.SSDLedgerMixin)
 
     async def _fetch_source_or_fail(self, ts: TorrentState):
-        """Fresh VPS1 metadata, or None (row already moved to FAILED)."""
+        """Fresh VPS1 metadata, or None (row already moved to FAILED).
+
+        A single poll miss (client restart, registration lag) must not
+        fail the row: only the third consecutive miss is terminal. Misses
+        are tracked in-memory per infohash (a restart resets the count,
+        which is safe — worst case one extra grace window).
+        """
         st = await self.source_client.get_torrent(ts.source_infohash)
         if st is None:
+            try:
+                _misses = getattr(self, "_source_miss_counts", None)
+                if not isinstance(_misses, dict):
+                    _misses = {}
+                    self._source_miss_counts = _misses  # type: ignore[attr-defined]
+                _key = (ts.source_infohash or "").lower()
+                _misses[_key] = int(_misses.get(_key, 0) or 0) + 1
+                if len(_misses) > 5000:
+                    for _k in list(_misses.keys())[: len(_misses) - 5000]:
+                        _misses.pop(_k, None)
+                _n = _misses[_key]
+            except Exception:
+                _n = 3
+            if _n < 3:
+                log.warning("source torrent %s unseen (miss %d/3); keeping row",
+                            (ts.source_infohash or "")[:10], _n)
+                return None
+            try:
+                _misses.pop(_key, None)
+            except Exception:
+                pass
             err = f"source torrent vanished from client: {ts.source_infohash[:10]}"
             log.warning(err)
             self.transition(ts, State.FAILED, error=err)
             return None
+        try:
+            _misses = getattr(self, "_source_miss_counts", None)
+            if isinstance(_misses, dict):
+                _misses.pop((ts.source_infohash or "").lower(), None)
+        except Exception:
+            pass
         return st
 
     def _same_content_torrents(self, all_source: list, st) -> list:
@@ -4065,6 +4123,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if hasattr(self, "cfg") and hasattr(self.cfg, "general")
             else 2
         )
+        try:
+            # A 0/negative poll (test double, corrupt config) would
+            # sleep(0)-spin and hammer the client; clamp to 1s.
+            poll_interval = max(1.0, float(poll_interval))
+        except (TypeError, ValueError):
+            poll_interval = 2.0
 
         if expected_files is not None and not expected_files:
             # Whole batch already on the remote: nothing to wait for.

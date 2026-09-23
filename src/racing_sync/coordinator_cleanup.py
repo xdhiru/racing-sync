@@ -241,6 +241,13 @@ class CleanupMixin:
             thresh = int(getattr(cfg, "activity_upspeed_bps", 65536) or 0)
         except (TypeError, ValueError):
             thresh = 65536
+        if thresh <= 0:
+            # 0 disables the upspeed gate (matches the 0 = disabled
+            # convention elsewhere): only attached leechers count.
+            try:
+                return int(t.num_leechers or 0) > 0
+            except (TypeError, ValueError):
+                return False
         try:
             return int(t.upspeed_bps or 0) >= thresh or int(t.num_leechers or 0) > 0
         except (TypeError, ValueError):

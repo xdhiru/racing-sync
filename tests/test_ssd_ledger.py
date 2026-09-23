@@ -56,6 +56,17 @@ async def test_global_budget_blocks_second_torrent(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_unknown_size_reserves_full_cap(tmp_path):
+    """Unknown-size rows must not reserve 0 (admits on a full disk)."""
+    cap = 40_000
+    coord = _coord_with_cap(tmp_path, cap)
+
+    assert coord._ssd_estimate_for_new(0) == cap
+    assert await coord._ssd_try_reserve("u" * 40, coord._ssd_estimate_for_new(0)) is True
+    assert coord._ssd_reserved_total() == cap
+
+
+@pytest.mark.anyio
 async def test_varying_batch_footprint_refines_down(tmp_path):
     """Season with uneven episodes + game pack refine to max batch, freeing budget."""
     cap = 10_000
