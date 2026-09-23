@@ -58,10 +58,11 @@ from .coordinator_content import WATCH_ORIGIN_LABELS
 from .coordinator_content import WATCH_ELECTION_WAITER_STATES
 from .coordinator_errors import (
     _NOT_VISIBLE_DETAIL,
-    _WEBUI_RETRY_ERRORS,
     AbandonedError,
     BatchMoveIncompleteError,
     WebUIUnresponsiveError,
+    is_fatal_os_error,
+    is_retryable_client_error,
 )
 from .coordinator_paths import _safe_ssd_join, _watch_cross_seed_dir
 from .coordinator_picker import pick_ssd_source_for_racing
@@ -3194,7 +3195,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         # overwrite) decides the injection set.
                         try:
                             await self._re_inject_watch_dir_torrents(ts)
-                        except _WEBUI_RETRY_ERRORS as e:
+                        except Exception as e:  # noqa: BLE001
+                            if not is_retryable_client_error(e):
+                                # Fatal disk/permission errors (ENOSPC,
+                                # EACCES, â€¦) must fail loudly, never park.
+                                raise
                             log.warning(
                                 "watch re-inject hit transient dest error for %s (%s); staying queued",
                                 ts.source_name[:60], e,
@@ -4032,7 +4037,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         # via _fuse_skipped next tick.
                         try:
                             reset_pos = await self._reset_torrent_for_next_batch(ts, next_index)
-                        except _WEBUI_RETRY_ERRORS as e:
+                        except Exception as e:  # noqa: BLE001
+                            if not is_retryable_client_error(e):
+                                raise
                             log.warning(
                                 "isolated batch reset hit transient dest error for %s (%s); retry next tick",
                                 ts.source_name, e,
@@ -4336,13 +4343,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 paused=True,
                 skip_check=False,
             )
-        except _WEBUI_RETRY_ERRORS as e:
-            log.warning(
-                "isolated batch: re-add for %s hit transient dest error (%s); retry next tick",
-                ts.source_name, e,
-            )
-            return False
         except Exception as e:  # noqa: BLE001
+            if is_fatal_os_error(e):
+                # Disk-full/permission errors must fail loudly via the
+                # worker wrapper, never spin a retry loop.
+                raise
             log.warning(
                 "isolated batch: re-add for %s failed (%s); retry next tick",
                 ts.source_name, e,
@@ -4586,7 +4591,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         h = ts.dest_infohash or ts.source_infohash
         try:
             cls_files = await self.dest_client.get_torrent_files(h)
-        except _WEBUI_RETRY_ERRORS as e:
+        except Exception as e:  # noqa: BLE001
+            if not is_retryable_client_error(e):
+                # Fatal disk/permission errors must fail loudly, never
+                # park a fully-downloaded row on an unhealing error.
+                raise
             # Every other phase parks on transient client trouble; a single
             # qB timeout here must not fail a fully-downloaded row.
             self._park_moving(
@@ -5355,7 +5364,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     self.transition(ts, State.DONE)
                 return
 
-            except _WEBUI_RETRY_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
+                if not is_retryable_client_error(e):
+                    # Fatal disk/permission errors (and unexpected
+                    # failures) fail loudly via the worker wrapper
+                    # instead of riding the retry clock.
+                    raise
                 now_curr = dt.datetime.now(dt.timezone.utc)
                 elapsed_curr = now_curr - ts.readd_first_attempted_at
                 if elapsed_curr >= max_age:
