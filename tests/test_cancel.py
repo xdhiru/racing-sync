@@ -596,9 +596,9 @@ def test_resolve_cancel_target(tmp_path: Path):
         assert bot._resolve_cancel_target("b" * 40).source_name == "Show.Three"
         # Unique short prefix resolves.
         assert bot._resolve_cancel_target("b" * 10).source_name == "Show.Three"
-        # Ambiguous prefix raises.
+        # Ambiguous prefix raises (minimum 4 chars for a prefix scan).
         with pytest.raises(LookupError, match="matches 2"):
-            bot._resolve_cancel_target("a")
+            bot._resolve_cancel_target("a" * 4)
         # Unknown prefix raises.
         with pytest.raises(LookupError, match="no tracked torrent"):
             bot._resolve_cancel_target("d" * 10)
@@ -893,6 +893,34 @@ def test_pending_question_shows_size_or_omits():
         "kind": "keepq", "title": "Big.Show", "scope": "",
         "hashes": [], "seq": "1", "expires": 9999999999.0})
     assert "Big.Show" in _q and "·" not in _q.split("—")[0]
+
+
+def test_pending_seq_unpredictable_and_prefix_min_length():
+    """Seq tokens are random hex (no 1,2,3… forgery); <4-char prefixes rejected."""
+    from racing_sync.telegram_bot import TelegramBot
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot._pending_seq = 0
+    seen = {bot._next_seq() for _ in range(10)}
+    assert len(seen) == 10  # no repeats in a short run
+    assert all(len(s) == 8 and all(c in "0123456789abcdef" for c in s)
+               for s in seen)
+
+    bot._store = None
+    with pytest.raises(LookupError, match="too short"):
+        bot._resolve_cancel_target("a", cmd="cancel")
+    with pytest.raises(LookupError, match="too short"):
+        bot._resolve_cancel_target("ab", cmd="fetch")
+
+
+def test_pending_question_sanitizes_backtick_title():
+    from racing_sync.telegram_bot import render_pending_question
+
+    _q = render_pending_question({
+        "kind": "pick", "cmd": "cancel", "title": "Evil` — `x",
+        "members": [], "seq": "1", "expires": 9999999999.0})
+    assert "`" not in _q.replace("`Evil' — 'x`", "")  # span stays closed
+    assert "Evil' — 'x" in _q
 
 
 @pytest.mark.anyio
