@@ -268,20 +268,28 @@ memoized 30 minutes when healthy (new arrivals wait at most one window).
 
 One-shot `racing-sync online` message on startup, then one message per torrent (detail card, edited in place as the state
 advances) plus one active-tasks list message, refreshed every
-`status_update_interval` seconds with pagination buttons. Each active
-task renders a `Cancel: /cancel_<short-hash>` line (10-char prefix in
-backticks so mobile offers tap-to-copy; full hashes accepted too) plus a
-`Keep: /keep_<short-hash>` line (forget + ignore without touching files —
-CLI `--keep-files` equivalent, for manually-added torrents).
-`WAITING_INDEXER` rows additionally render
-`Fetch original: /fetch_<short-hash>`, and grace-held NEW watch rows
-render `Prefer this copy now: /prefer_<short-hash>`. The updates poller also watches
-chat messages: a `/cancel_<...>` line from the configured chat/user
-resolves the prefix against tracked rows and runs forget+ignore
-immediately (row, dest entries, SSD data, blob cache) with no
-confirmation, then replies with the outcome and frees the SSD
-reservation. `/keep_` works the same except files are left alone
-(`delete_files=False`). Cancelling an SSD owner also forgets the watch rows
+`status_update_interval` seconds with pagination buttons. The list groups
+same-file copies (normalized name + size, the election identity) under one
+numbered heading with the size once; each tracker gets a display-only
+`▸ <domain> <stage>` line; short positional commands on one line
+(`/cancel_3` plus `/fetch_3` / `/prefer_3` while a member qualifies —
+group numbers, never torrent hashes, so cancel + fetch fit one row on
+narrow screens) open member-choice buttons below the list
+(3 across, tracker shortnames; the tap freezes a member snapshot, so
+later renumbering cannot misroute, and every flow has a Cancel button).
+Tapping a group cancel asks a keep/delete question under the footer
+(Yes = untrack + ignore with files kept, No = wiped); cancelling `All`
+drops every copy, a single copy drops just it (leader-tap cascades to
+deferred pairs as before). The pending question always names the locked
+group title so a shifted list is verifiable; stale taps expire after
+5 minutes. Full hashes and legacy hash prefixes still
+work when typed; detail cards keep their per-torrent text commands.
+`WAITING_INDEXER` detail cards additionally render
+`Fetch original: /fetch_<short-hash>`, and grace-held NEW watch rows'
+cards render `Prefer this copy now: /prefer_<short-hash>`. The updates poller also watches
+chat messages: a group/hash command from the configured chat/user
+resolves and runs the two-step flow above, then replies with the outcome
+and frees the SSD reservation. Cancelling an SSD owner also forgets the watch rows
 currently deferred on it (same election winner), reported in the reply;
 cancelling a waiter leaves the rest alone. A `/fetch_<...>` line flags
 a waiting row (`force_direct`)

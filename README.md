@@ -118,15 +118,20 @@ re-dropped files reprocess immediately).
 Same thing via API: `POST /api/forget/{hash}?ignore=true&delete_files=false`
 (full 40-char hash required, always applies; `delete_files=false` = `--keep-files`).
 
-From Telegram, copy-paste the `Cancel: /cancel_<hash>` line under any
-torrent — forgotten + ignored immediately, no confirmation. Use the `Keep:`
-`/keep_<hash>` line instead when the data must stay (manual move, pre-seeded
-bytes): untracked + ignored with files left in place, same as CLI
-`--keep-files`. Torrents still
-waiting on the indexer show `Fetch original: /fetch_<hash>` instead: use
+From Telegram, tap the `/cancel_3` line under a file group (groups are
+numbered; same-file copies share one heading), then pick which copy
+(tracker buttons, 3 across — or `All`) and answer the keep question that
+appears under the list: `Keep files` untracks + ignores with data left in
+place (same as CLI `--keep-files`), `Delete files` wipes it. The number is
+resolved once at tap into a locked copy list, so renumbering mid-flow can't
+misroute — the question names the group, and every picker has a Cancel
+button. Nothing is deleted without that explicit choice. `Fetch:`/`Prefer:`
+lines appear only while a copy qualifies, and also open tracker buttons.
+Torrents still
+waiting on the indexer show `Fetch original: /fetch_<id>` instead: use
 the VPS1 original right away rather than waiting out Prowlarr retries
 (counts toward private-tracker ratio). Rows holding for a preferred copy
-show `Prefer this copy now: /prefer_<hash>`: start their SSD download
+show `Prefer now: /prefer_<id>`: start their SSD download
 immediately; waiting siblings then seed from fuse/remote after. The same fallback can trigger
 automatically at the deadline with
 `cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout` (default off).

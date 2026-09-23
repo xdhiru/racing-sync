@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import logging
 import re
 import time
@@ -424,11 +425,6 @@ FETCH_CMD_RE = re.compile(r"^/fetch_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 #: download now instead of waiting out its preferred-copy grace.
 PREFER_CMD_RE = re.compile(r"^/prefer_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
-#: `/keep_<hex>` — same shape: forget + ignore like `/cancel_` but keep
-#: the data files (CLI `--keep-files` / API `delete_files=false`).
-#: For manually-added torrents you want to untrack without wiping bytes.
-KEEP_CMD_RE = re.compile(r"^/keep_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
-
 
 def _cancel_command(infohash: str) -> str:
     """Copy-pasteable cancel command for one task (short hash)."""
@@ -443,11 +439,6 @@ def _fetch_command(infohash: str) -> str:
 def _prefer_command(infohash: str) -> str:
     """Copy-pasteable prefer command for one task (short hash)."""
     return f"/prefer_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
-
-
-def _keep_command(infohash: str) -> str:
-    """Copy-pasteable keep-files cancel command for one task (short hash)."""
-    return f"/keep_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 def _flood_wait_seconds(e: BaseException, default: int = 5) -> int | None:
@@ -486,6 +477,300 @@ def _flood_wait_seconds(e: BaseException, default: int = 5) -> int | None:
     return default
 
 
+def _active_group_key(name: str, size_bytes: object) -> tuple[str, int]:
+    """Grouping key for the active-tasks list: normalized name + size.
+
+    Same identity the watch election uses (one file, any tracker), so
+    copies of a release render under one heading. Fail-open: anything
+    unparsable groups by raw name.
+    """
+    try:
+        from .coordinator_content import normalize_content_name
+        norm = normalize_content_name(name or "")
+    except Exception:
+        norm = (name or "").strip().lower()
+    try:
+        size = int(size_bytes or 0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        size = 0
+    return (norm or (name or "").strip().lower(), size)
+
+
+def _active_note(ts: TorrentState, notes: dict[str, str] | None) -> str:
+    """One-line extra for a row (e.g. why a NEW row is waiting)."""
+    try:
+        return (notes or {}).get(ts.source_infohash or "") or ""
+    except Exception:
+        return ""
+
+
+def _active_state_text(ts: TorrentState, progress: float | None, note: str) -> str:
+    """One-line stage text for an active-tasks tracker row."""
+    _bd = _batch_display(ts)
+    if note and ts.state in (State.NEW, State.WAITING_DISK):
+        _compact = _compact_wait_note(note)
+        state_text = f"⏳ {_compact}" if _compact else f"⏳ {_esc(note)}"
+    elif ts.state == State.DOWNLOADING:
+        if progress is not None:
+            state_text = f"⬇️ Downloading · {progress * 100:.1f}%"
+        else:
+            state_text = "⬇️ Downloading"
+    elif ts.state == State.QUEUED:
+        state_text = "📋 Queued"
+    elif ts.state == State.MOVING:
+        if _bd:
+            state_text = f"📦 Moving leftovers · {_bd}"
+        else:
+            state_text = "📦 Moving"
+        if (ts.last_error or "").strip():
+            state_text += " · retrying"
+    elif ts.state == State.RE_ADDING:
+        _mins = _retry_minutes(ts)
+        if _mins is not None:
+            state_text = f"🔄 Re-adding (retry in {_mins}m)"
+        else:
+            state_text = "🔄 Re-adding"
+    elif ts.state == State.QUERYING:
+        state_text = "🔍 Querying"
+    elif ts.state == State.WAITING_INDEXER:
+        # A same-content deferral note (waiting on the in-flight copy)
+        # replaces the stale miss count while it holds.
+        state_text = (f"⏳ {_esc(note)}" if note
+                      else f"⏳ Wait indexer miss #{ts.indexer_attempts}")
+    elif ts.state == State.WAITING_DISK:
+        state_text = "⏳ Wait SSD space"
+    elif ts.state == State.DONE:
+        state_text = "✅ Done"
+    elif ts.state == State.FAILED:
+        state_text = "❌ Failed"
+    else:
+        state_text = f"🆕 {ts.state.value.capitalize()}"
+
+    if _bd and ts.state != State.MOVING:
+        state_text += f" · {_bd}"
+    return state_text
+
+
+def _group_active_items(
+    active: list[tuple[TorrentState, float | None]],
+) -> list[tuple[tuple[str, int], list[tuple[TorrentState, float | None]]]]:
+    """Group same-file copies (election identity) in first-seen order.
+
+    Returns ``(key, members)`` pairs — the key feeds the stable group id
+    used by group commands and pick-button callbacks.
+    """
+    by_key: dict[tuple[str, int], list[tuple[TorrentState, float | None]]] = {}
+    order: list[tuple[str, int]] = []
+    for _ts, _progress in active or []:
+        try:
+            _name0, _, _ = _row_text_bits(_ts)
+        except Exception:
+            _name0 = getattr(_ts, "source_name", "") or ""
+        _key = _active_group_key(
+            _name0, getattr(_ts, "total_bytes", 0))
+        if _key not in by_key:
+            by_key[_key] = []
+            order.append(_key)
+        by_key[_key].append((_ts, _progress))
+    return [(_k, by_key[_k]) for _k in order]
+
+
+def _live_group_by_gid(
+    rows: list[TorrentState],
+    gid: str,
+) -> tuple[tuple[str, int], list[TorrentState]] | None:
+    """Find the live group matching a group id (first match wins).
+
+    Keys derive exactly like the renderer (`_row_text_bits` name +
+    size), so the id a command was displayed with resolves back.
+    """
+    try:
+        gid = (gid or "").strip().lower()
+        if not gid:
+            return None
+        for (_key, _members) in _group_active_items(
+                [(_r, None) for _r in rows or []]):
+            if _key and _group_gid(_key) == gid:
+                return _key, [_ts for (_ts, _) in _members]
+        return None
+    except Exception:
+        return None
+
+
+def _member_hash(ts: TorrentState) -> str:
+    """Full lowercase infohash of a row, "" when unusable."""
+    try:
+        _h = _row_text_bits(ts)[2]
+    except Exception:
+        return ""
+    _h = (_h or "").strip().lower()
+    if len(_h) != 40 or any(_c not in "0123456789abcdef" for _c in _h):
+        return ""
+    return _h
+
+
+def _member_domain(ts: TorrentState) -> str:
+    """Full tracker host for labels, "" when unknown."""
+    try:
+        return (_tracker_domain(ts.source_announce_url)
+                or _tracker_domain(ts.source_tracker) or "")
+    except Exception:
+        return ""
+
+
+def _is_grace_note_for_prefer(note: object) -> bool:
+    """True when a wait note marks a prefer-eligible NEW row."""
+    try:
+        return bool(note) and str(note).startswith("Waiting for preferred copy")
+    except Exception:
+        return False
+
+
+def _inflight_note_for(ts: TorrentState, leader: object) -> str:
+    """Deferral note for a row waiting on an in-flight same-content row.
+
+    ``Waiting for <label> copy · <stage>`` (short tracker label, same
+    convention as the wait notes) or "" when there is no usable leader.
+    Strict shape validation: coordinator test doubles answer truthy to
+    everything, and must never produce notes.
+    """
+    try:
+        if leader is None:
+            return ""
+        if not isinstance(getattr(leader, "state", None), State):
+            return ""
+        _lh = getattr(leader, "source_infohash", None)
+        if not isinstance(_lh, str) or not _lh.strip():
+            return ""
+        try:
+            _dom = _member_domain(leader)  # type: ignore[arg-type]
+        except Exception:
+            _dom = ""
+        try:
+            _short = _short_tracker_label(_dom) or _lh.strip().lower()[:10]
+        except Exception:
+            _short = _lh.strip().lower()[:10]
+        return f"Waiting for {_short} copy · {leader.state.value}"
+    except Exception:
+        return ""
+
+
+def _group_gid(key: tuple[str, int]) -> str:
+    """Stable 6-hex id for an active-tasks group (content token).
+
+    Only used to resolve group commands typed from older messages;
+    the list itself addresses groups by position number. Collisions
+    are accepted (16M space, a handful of groups) — resolution takes
+    the first live match.
+    """
+    try:
+        raw = f"{key[0]}|{int(key[1])}"
+    except Exception:
+        try:
+            raw = f"{key[0]}|0"
+        except Exception:
+            return ""
+    try:
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:6]
+    except Exception:
+        return ""
+
+
+def _pick_member_label(ts: TorrentState, short_fallback: str = "") -> str:
+    """Short tracker label for a member-choice button."""
+    try:
+        return (_short_tracker_label(_member_domain(ts))
+                or short_fallback or "?")
+    except Exception:
+        return short_fallback or "?"
+
+
+def pick_snapshot(
+    members: list[tuple[TorrentState, float | None]],
+    cmd: str,
+    notes: dict[str, str] | None = None,
+) -> list[tuple[str, str]]:
+    """Frozen member list for a group command: ``[(hash, label)]``.
+
+    ``cmd`` cancel snapshots every member; fetch/prefer snapshot only
+    eligible members. Labels are short tracker names (hash-qualified on
+    repeats). The snapshot is taken once, at command-tap time — later
+    buttons address members by index, so list renumbering mid-flow
+    cannot misroute. Fail-open: [].
+    """
+    try:
+        if cmd not in ("cancel", "fetch", "prefer"):
+            return []
+        rows: list[tuple[TorrentState, str]] = []
+        for (ts, _progress) in members or []:
+            _h = _member_hash(ts)
+            if not _h:
+                continue
+            if cmd == "fetch" and ts.state != State.WAITING_INDEXER:
+                continue
+            if cmd == "prefer" and not (
+                    ts.state == State.NEW and _is_grace_note_for_prefer(
+                        _active_note(ts, notes))):
+                continue
+            rows.append((ts, _h))
+        if not rows:
+            return []
+        out: list[tuple[str, str]] = []
+        seen: dict[str, int] = {}
+        for (ts, _h) in rows:
+            _base = _pick_member_label(ts, _h[:10])
+            _n = seen.get(_base, 0)
+            seen[_base] = _n + 1
+            _label = _base if _n == 0 else f"{_base} {_h[:6]}"
+            out.append((_h, _label))
+        return out
+    except Exception:
+        return []
+
+
+#: Pending group-action lifetime: buttons referencing regrouped lists go
+#: stale, so picks expire fast (re-tap the command for a fresh set).
+_PENDING_TTL_S = 300.0
+
+
+def render_pending_question(pending: dict | None) -> str:
+    """Question section appended below the footer while a pick is pending.
+
+    Pure (testable): ``pending`` carries kind/title/scope (+ frozen
+    members/hashes) as set by the pick step. "" when nothing is pending.
+    The title lets the user verify the locked group before tapping.
+    """
+    try:
+        if not isinstance(pending, dict):
+            return ""
+        kind = str(pending.get("kind") or "")
+        title = str(pending.get("title") or "")[:80]
+        scope = str(pending.get("scope") or "")
+        try:
+            _size = _size_compact(pending.get("size"))
+        except Exception:
+            _size = ""
+        _tspec = f"`{title}`" + (f" · {_size}" if _size else "")
+        if kind == "pick":
+            cmd = str(pending.get("cmd") or "")
+            verb = {"cancel": "Cancel", "fetch": "Fetch original for",
+                    "prefer": "Prefer"}.get(cmd, "Act on")
+            if scope == "all":
+                what = "every copy"
+            elif scope:
+                what = f"the {scope} copy"
+            else:
+                what = "which copy"
+            return (f"{verb} {_tspec} — {what}?\n"
+                    f"Pick below (tracker names).")
+        if kind == "keepq":
+            return (f"Cancel {_tspec}{(' · ' + scope) if scope else ''} — "
+                    f"keep downloaded files?")
+        return ""
+    except Exception:
+        return ""
+
+
 def render_active(
     active: list[tuple[TorrentState, float | None]],
     page: int = 0,
@@ -493,20 +778,21 @@ def render_active(
     notes: dict[str, str] | None = None,
     footer: str = "",
 ) -> tuple[str, int, int]:
-    """Render paginated list of active tasks with numbered items.
+    """Render paginated active tasks, grouped by file for mobile width.
 
-    Compact mobile layout (detail cards stay fully detailed):
+    Same-content copies (one release, many trackers) share one numbered
+    heading ``N. `Name` · size``; each tracker gets a display-only line
+    ``▸ <domain> <stage>``. Commands address the group by its number
+    (``/cancel_3`` …) and open member-choice buttons below the list —
+    the number is resolved once, at tap time, into a frozen member
+    snapshot, so later renumbering cannot misroute the flow. Cancel
+    always ends at a keep/delete question; fetch/prefer appear only
+    while a member qualifies. Detail cards keep per-torrent text
+    commands (full-hash cancel). Pages count groups; numbers are global
+    across pages.
 
-    1. ``1. `Name.mkv``` (bare title so it wraps less)
-    2. ``  Source: <full-domain>`` (own tracker, host only)
-    3. ``  5.7G · <status>`` (size + stage; long waits shortened)
-    4. ``  /cancel_<hash>`` + ``  /keep_<hash>`` (untrack without
-       wiping files) + one line each for ``/fetch_`` / ``/prefer_``
-       when present (plain commands, no labels; the hash lives in the
-       commands so no separate hash line).
-
-    `notes` maps source_infohash -> one-line extra (e.g. why a NEW row is
-    waiting); a present note replaces the state line's status part.
+    Compact mobile layout (detail cards stay fully detailed). `notes`
+    maps source_infohash -> one-line extra shown on that tracker's line.
 
     `footer` is an optional trailing line (e.g. storage stats) appended
     directly after (single newline, no blank gap); "" disables it.
@@ -517,8 +803,6 @@ def render_active(
         page_size = 5
     page_size = max(1, min(page_size, 50))
     total_items = len(active)
-    total_pages = max(1, (total_items + page_size - 1) // page_size)
-    cur_page = max(0, min(page, total_pages - 1))
 
     if not active:
         text = "📌 *Active Tasks*\n\n_No active tasks in flight._"
@@ -530,94 +814,70 @@ def render_active(
             1,
         )
 
-    start_idx = cur_page * page_size
-    end_idx = min(start_idx + page_size, total_items)
-    page_items = active[start_idx:end_idx]
+    # Group same-file copies (election identity) in first-seen order;
+    # numbering below is global across pages.
+    groups = _group_active_items(active)
+    total_groups = len(groups)
+    total_pages = max(1, (total_groups + page_size - 1) // page_size)
+    cur_page = max(0, min(page, total_pages - 1))
 
-    lines = [
-        f"📌 *Active Tasks ({total_items})* · *Page {cur_page + 1}/{total_pages}*",
-        "",
-    ]
+    start_grp = cur_page * page_size
+    end_grp = min(start_grp + page_size, total_groups)
+    page_groups = groups[start_grp:end_grp]
 
-    for i, (ts, progress) in enumerate(page_items):
-        item_num = start_idx + i + 1
-        name, _size_long, full_hash = _row_text_bits(ts)
-        size = _size_compact(ts.total_bytes)
-        try:
-            note = (notes or {}).get(ts.source_infohash or "") or ""
-        except Exception:
-            note = ""
+    if total_groups == total_items:
+        lines = [
+            f"📌 *Active Tasks ({total_items})* · *Page {cur_page + 1}/{total_pages}*",
+            "",
+        ]
+    else:
+        lines = [
+            f"📌 *Active Tasks ({total_items} copies · {total_groups} titles)*"
+            f" · *Page {cur_page + 1}/{total_pages}*",
+            "",
+        ]
 
-        domain_full = _tracker_domain(ts.source_announce_url) or _tracker_domain(ts.source_tracker)
+    for gi, (_gkey, members) in enumerate(page_groups):
+        group_num = start_grp + gi + 1
+        lead, _ = members[0]
+        name, _size_long, _lead_hash = _row_text_bits(lead)
+        size = _size_compact(lead.total_bytes)
 
-        # 1. Bare title in backticks (nothing appended so it wraps less).
-        lines.append(f"{item_num}. `{name}`")
+        # 1. One heading per file (bare title so it wraps less).
+        lines.append(f"{group_num}. `{name}` · {size}")
 
-        # 2. Own tracker source line (full host only, no URL/keys).
-        if domain_full:
-            lines.append(f"  Source: {_esc(domain_full)}")
-
-        # 2. Size + stage. Long waits use the compact `Wait <reason>`
-        # form; short states stay verbatim. No tracker suffix here (it
-        # moved to the title line) and no separate hash line (the hash
-        # lives inside the commands on line 3).
-        _bd = _batch_display(ts)
-        if note and ts.state in (State.NEW, State.WAITING_DISK):
-            _compact = _compact_wait_note(note)
-            state_text = f"⏳ {_compact}" if _compact else f"⏳ {_esc(note)}"
-        elif ts.state == State.DOWNLOADING:
-            if progress is not None:
-                state_text = f"⬇️ Downloading · {progress * 100:.1f}%"
+        # 2. Display-only tracker lines, no indent: the ▸ glyph plus the
+        # blank line between groups already carries the hierarchy, and
+        # leading spaces only push long statuses into a wrap.
+        _has_fetch = False
+        _has_prefer = False
+        for (ts, progress) in members:
+            domain_full = (_tracker_domain(ts.source_announce_url)
+                           or _tracker_domain(ts.source_tracker))
+            _note = _active_note(ts, notes)
+            state_text = _active_state_text(ts, progress, _note)
+            if domain_full:
+                lines.append(f"▸ {_esc(domain_full)} {state_text}")
             else:
-                state_text = "⬇️ Downloading"
-        elif ts.state == State.QUEUED:
-            state_text = "📋 Queued"
-        elif ts.state == State.MOVING:
-            if _bd:
-                state_text = f"📦 Moving leftovers · {_bd}"
-            else:
-                state_text = "📦 Moving"
-            if (ts.last_error or "").strip():
-                state_text += " · retrying"
-        elif ts.state == State.RE_ADDING:
-            _mins = _retry_minutes(ts)
-            if _mins is not None:
-                state_text = f"🔄 Re-adding (retry in {_mins}m)"
-            else:
-                state_text = "🔄 Re-adding"
-        elif ts.state == State.QUERYING:
-            state_text = "🔍 Querying"
-        elif ts.state == State.WAITING_INDEXER:
-            state_text = f"⏳ Wait indexer miss #{ts.indexer_attempts}"
-        elif ts.state == State.WAITING_DISK:
-            state_text = "⏳ Wait SSD space"
-        elif ts.state == State.DONE:
-            state_text = "✅ Done"
-        elif ts.state == State.FAILED:
-            state_text = "❌ Failed"
-        else:
-            state_text = f"🆕 {ts.state.value.capitalize()}"
+                lines.append(f"▸ {state_text}")
+            if ts.state == State.WAITING_INDEXER:
+                _has_fetch = True
+            if (ts.state == State.NEW
+                    and _is_grace_note_for_prefer(_note)):
+                _has_prefer = True
 
-        if _bd and ts.state != State.MOVING:
-            state_text += f" · {_bd}"
-
-        lines.append(f"  {size} · {state_text}")
-        # 4. Per-task commands, one per line as plain text (no labels, no
-        # backticks — the underscore is escaped so Markdown parsing stays
-        # intact; clients render `/cancel_...` tappable).
-        # Grace-held rows are actionable: same override as the detail card.
-        # Gated on NEW (only NEW rows can be preferred) as well as the note,
-        # so a stale note on another state never advertises a no-op.
-        try:
-            _is_grace_note = bool(note) and note.startswith("Waiting for preferred copy")
-        except Exception:
-            _is_grace_note = False
-        lines.append(f"  {_esc(_cancel_command(full_hash))}")
-        lines.append(f"  {_esc(_keep_command(full_hash))}")
-        if ts.state == State.WAITING_INDEXER:
-            lines.append(f"  {_esc(_fetch_command(full_hash))}")
-        if ts.state == State.NEW and _is_grace_note:
-            lines.append(f"  {_esc(_prefer_command(full_hash))}")
+        # 3. Short group commands on ONE line with no indent (the `/`
+        # prefix marks them; every column counts against the wrap limit).
+        # Positional group number — resolved once at tap time into a
+        # frozen snapshot, so later renumbering cannot misroute.
+        # Cancel always; fetch/prefer only when a member qualifies
+        # right now.
+        _cmds = [f"/cancel_{group_num}"]
+        if _has_fetch:
+            _cmds.append(f"/fetch_{group_num}")
+        if _has_prefer:
+            _cmds.append(f"/prefer_{group_num}")
+        lines.append(" ".join(_esc(_c) for _c in _cmds))
         lines.append("")
 
     text = "\n".join(lines).strip()
@@ -662,8 +922,9 @@ class TelegramBot:
         # net re-queues rows whose card drifted (e.g. an edit lost to a
         # flood ban) so no card freezes at a dead state forever.
         self._detail_sent_state: dict[str, str] = {}
-        # Cached "last active-tasks (page, total_pages, text)" so we skip identical edits.
-        self._last_active_cache: tuple[int, int, str] | None = None
+        # Cached "last active-tasks (page, total_pages, text, buttons)" so
+        # we skip identical edits.
+        self._last_active_cache: tuple | None = None
         # Per-chat debounce (monotonic timestamps by chat/user key): one
         # chat's burst must not starve pagination for everyone else.
         self._callback_times: dict[str, float] = {}
@@ -682,6 +943,9 @@ class TelegramBot:
         # the footer refreshes every status tick but the SFTP probe is
         # reused for _VPS1_FREE_TTL_S so we don't chatter the channel.
         self._vps1_free_cache: tuple[float, int | None] | None = None
+        # Pending group action (member pick or keep/delete question) for
+        # the two-step flows; armed by group commands, expires quickly.
+        self._pending_pick: dict | None = None
 
     # ---- lifecycle ----
 
@@ -1032,25 +1296,153 @@ class TelegramBot:
         self,
         current_page: int,
         total_pages: int,
+        extra_rows: list[list[tuple[str, str]]] | tuple = (),
     ) -> InlineKeyboardMarkup | None:
-        """Pagination nav buttons (cancel is via `/cancel_` chat commands)."""
+        """Pagination nav buttons plus pending-action rows.
+
+        Extra rows are ``(label, callback_data)`` pairs (member-choice
+        pick buttons or keep Yes/No), already chunked by the caller —
+        stale/oversize entries are skipped defensively. Cancel/keep stay
+        as chat commands (destructive = keep the copy-paste friction).
+        """
         if total_pages <= 1:
             buttons = [
                 [InlineKeyboardButton("🔄 Refresh", callback_data="page:refresh")]
             ]
-            return InlineKeyboardMarkup(buttons)
-
-        buttons = [
-            [
-                InlineKeyboardButton("◀️ Prev", callback_data="page:prev"),
-                InlineKeyboardButton(f"{current_page + 1} / {total_pages}", callback_data="page:refresh"),
-                InlineKeyboardButton("Next ▶️", callback_data="page:next"),
-            ],
-            [
-                InlineKeyboardButton("🔄 Refresh", callback_data="page:refresh"),
-            ],
-        ]
+        else:
+            buttons = [
+                [
+                    InlineKeyboardButton("◀️ Prev", callback_data="page:prev"),
+                    InlineKeyboardButton(f"{current_page + 1} / {total_pages}", callback_data="page:refresh"),
+                    InlineKeyboardButton("Next ▶️", callback_data="page:next"),
+                ],
+                [
+                    InlineKeyboardButton("🔄 Refresh", callback_data="page:refresh"),
+                ],
+            ]
+        try:
+            for _row in extra_rows or ():
+                _btns = []
+                for (_label, _data) in _row or ():
+                    if not _label or not _data or len(_data) > 64:
+                        continue
+                    _btns.append(InlineKeyboardButton(
+                        str(_label)[:60], callback_data=_data))
+                if _btns:
+                    buttons.append(_btns)
+        except Exception:
+            pass
         return InlineKeyboardMarkup(buttons)
+
+    # ---- pending group actions (two-step pickers) ----
+
+    def _pending_live(self) -> dict | None:
+        """Live pending pick, else None (expired picks are purged)."""
+        try:
+            _p = getattr(self, "_pending_pick", None)
+            if not isinstance(_p, dict):
+                return None
+            try:
+                _exp = float(_p.get("expires", 0) or 0)
+            except (TypeError, ValueError):
+                return None
+            if _exp and time.monotonic() > _exp:
+                try:
+                    self._pending_pick = None
+                except Exception:
+                    pass
+                return None
+            if not _p.get("kind") or not isinstance(
+                    _p.get("members"), list):
+                # keepq carries hashes instead of members.
+                if not (_p.get("kind") == "keepq"
+                        and isinstance(_p.get("hashes"), list)):
+                    return None
+            return _p
+        except Exception:
+            return None
+
+    def _next_seq(self) -> str:
+        """Next pending-flow sequence number (stale-tap guard)."""
+        try:
+            _n = int(getattr(self, "_pending_seq", 0) or 0) + 1
+        except (TypeError, ValueError):
+            _n = 1
+        try:
+            self._pending_seq = _n
+        except Exception:
+            pass
+        return str(_n)
+
+    def _set_pending_pick(self, cmd: str, title: str, size_bytes: object,
+                          members: list[tuple[str, str]]) -> dict:
+        """Arm a member-choice pick; members are frozen (hash, label)."""
+        _p = {
+            "kind": "pick", "seq": self._next_seq(), "cmd": cmd,
+            "title": (title or "")[:80], "size": size_bytes,
+            "members": [(h, label) for (h, label) in members or []],
+            "expires": time.monotonic() + _PENDING_TTL_S,
+        }
+        try:
+            self._pending_pick = _p
+        except Exception:
+            pass
+        try:
+            self._last_active_cache = None
+        except Exception:
+            pass
+        return _p
+
+    def _set_pending_keepq(self, title: str, scope: str,
+                           hashes: list[str], size_bytes: object = None) -> dict:
+        """Arm the keep/delete question over frozen hashes."""
+        _p = {
+            "kind": "keepq", "seq": self._next_seq(),
+            "title": (title or "")[:80], "scope": scope or "",
+            "size": size_bytes,
+            "hashes": [h for h in hashes or [] if h],
+            "expires": time.monotonic() + _PENDING_TTL_S,
+        }
+        try:
+            self._pending_pick = _p
+        except Exception:
+            pass
+        try:
+            self._last_active_cache = None
+        except Exception:
+            pass
+        return _p
+
+    def _pending_section(self) -> tuple[str, list[list[tuple[str, str]]]]:
+        """Question text + keyboard rows for the live pending pick.
+
+        Renders purely from the frozen snapshot — later renumbering or
+        regrouping cannot shift what the buttons mean. Stale member
+        hashes fail safe at execution (liveness re-checked).
+        """
+        try:
+            _p = self._pending_live()
+            if _p is None:
+                return "", []
+            _seq = str(_p.get("seq") or "")
+            if _p.get("kind") == "keepq":
+                return (
+                    render_pending_question(_p),
+                    [[("Keep files", f"keep:{_seq}:yes"),
+                      ("Delete files", f"keep:{_seq}:no")],
+                     [("Cancel", f"abort:{_seq}")]],
+                )
+            _btns = []
+            _mems = _p.get("members") or []
+            if str(_p.get("cmd") or "") == "cancel" and len(_mems) > 1:
+                _btns.append((f"All ({len(_mems)})", f"pick:{_seq}:all"))
+            for _i, (_h, _label) in enumerate(_mems):
+                _btns.append((_label, f"pick:{_seq}:{_i}"))
+            _rows = [_btns[i:i + 3] for i in range(0, len(_btns), 3)]
+            _rows.append([("Cancel", f"abort:{_seq}")])
+            return render_pending_question(_p), _rows
+        except Exception:
+            return "", []
 
     async def _callback_loop(self) -> None:
         """Poll get_updates for pagination clicks and `/cancel_` commands."""
@@ -1145,6 +1537,10 @@ class TelegramBot:
             pass
 
         data = str(getattr(query, "data", "") or "")
+        if (data.startswith("pick:") or data.startswith("keep:")
+                or data.startswith("abort:")):
+            await self._on_action_button(query, data)
+            return
         if not data.startswith("page:"):
             return
 
@@ -1229,14 +1625,13 @@ class TelegramBot:
         return row
 
     async def _handle_chat_message(self, message: Any) -> None:
-        """Execute `/cancel_` / `/keep_` / `/fetch_` commands in the chat.
+        """Execute `/cancel_` / `/fetch_` / `/prefer_` commands in the chat.
 
-        All are no-confirm: the user's sent message is final. Cancel
-        forgets+ignores the release (wiping its data); keep forgets+ignores
-        without touching files (for manually-added torrents); fetch flags
-        a WAITING_INDEXER row to use the VPS1 original for the SSD
-        download instead of waiting for Prowlarr. Anything else is
-        ignored. Only the configured chat/user may send commands.
+        Group commands (stable content ids from the active list) open
+        member-choice buttons; full hashes and legacy hash prefixes act
+        directly. Cancel always ends at a keep/delete question — nothing
+        is wiped without an explicit choice. Anything else is ignored.
+        Only the configured chat/user may send commands.
         """
         try:
             chat = getattr(message, "chat", None)
@@ -1246,10 +1641,9 @@ class TelegramBot:
             cfg_chat = str(self._cfg.chat_id)
             if str(chat_id) != cfg_chat and str(user_id) != cfg_chat:
                 return
-            # Same 0.5s debounce as callbacks: a double-sent /cancel_,
-            # /keep_, /fetch_ or /prefer_ must not resolve+act twice (double
-            # forget/double re-inject/double prefer). Namespaced apart
-            # from callback keys.
+            # Same 0.5s debounce as callbacks: a double-sent command must
+            # not resolve+act twice (double forget/double prefer).
+            # Namespaced apart from callback keys.
             try:
                 _ckey = f"cmd:{chat_id}" if chat_id is not None else f"cmd:{user_id}"
             except Exception:
@@ -1264,57 +1658,19 @@ class TelegramBot:
             text = str(text or "").strip()
             m_fetch = FETCH_CMD_RE.match(text)
             m_prefer = PREFER_CMD_RE.match(text)
-            m_keep = KEEP_CMD_RE.match(text)
             m_cancel = CANCEL_CMD_RE.match(text)
-            if not m_fetch and not m_prefer and not m_keep and not m_cancel:
+            if not m_fetch and not m_prefer and not m_cancel:
                 return
             if m_fetch:
-                short = m_fetch.group(1)
-                try:
-                    target = await asyncio.to_thread(
-                        self._resolve_fetch_target, short)
-                    full_hash = target.source_infohash
-                except LookupError as e:
-                    await self._reply(str(e)[:300], reply_to=message)
-                    return
-                result = await self._fetch_torrent(full_hash)
-                await self._reply(result[:300], reply_to=message)
-                self._last_active_cache = None
-                await self._refresh_active_message()
+                await self._start_group_command(
+                    "fetch", m_fetch.group(1), message)
                 return
             if m_prefer:
-                short = m_prefer.group(1)
-                result = await self._prefer_torrent(short)
-                await self._reply(result[:300], reply_to=message)
-                self._last_active_cache = None
-                await self._refresh_active_message()
+                await self._start_group_command(
+                    "prefer", m_prefer.group(1), message)
                 return
-            if m_keep:
-                short = m_keep.group(1)
-                try:
-                    target = await asyncio.to_thread(
-                        self._resolve_cancel_target, short, cmd="keep")
-                    full_hash = target.source_infohash
-                except LookupError as e:
-                    await self._reply(str(e)[:300], reply_to=message)
-                    return
-                result = await self._keep_torrent(full_hash)
-                await self._reply(result[:300], reply_to=message)
-                self._last_active_cache = None
-                await self._refresh_active_message()
-                return
-            short = m_cancel.group(1)
-            try:
-                target = await asyncio.to_thread(
-                    self._resolve_cancel_target, short)
-                full_hash = target.source_infohash
-            except LookupError as e:
-                await self._reply(str(e)[:300], reply_to=message)
-                return
-            result = await self._cancel_torrent(full_hash)
-            await self._reply(result[:300], reply_to=message)
-            self._last_active_cache = None
-            await self._refresh_active_message()
+            await self._start_group_command(
+                "cancel", m_cancel.group(1), message)
         except Exception as e:  # noqa: BLE001
             log.debug("chat command handling failed: %s", e)
 
@@ -1336,8 +1692,11 @@ class TelegramBot:
         except Exception as e:  # noqa: BLE001
             log.debug("cancel reply failed: %s", e)
 
-    async def _cancel_torrent(self, infohash: str) -> str:
-        """Forget + ignore one release (row, dest entries, SSD data)."""
+    async def _execute_cancel_one(self, infohash: str, *, delete_files: bool) -> str:
+        """Forget + ignore one release; files kept iff not `delete_files`."""
+        _verb = "Cancelled" if delete_files else "Kept files for"
+        _done = "(removed + ignored)" if delete_files else (
+            "untracked + ignored, data left in place")
         try:
             from .api import _hold_ops_lock
         except Exception:
@@ -1345,15 +1704,15 @@ class TelegramBot:
         try:
             from .forget import forget_torrent
         except Exception as e:  # noqa: BLE001
-            return f"Cancel failed: {e}"
+            return f"Action failed: {e}"
         coord = getattr(self, "_coord", None)
         store = getattr(self, "_store", None)
         if coord is None or store is None:
-            return "Cancel failed: bot not attached"
+            return "Action failed: bot not attached"
         dest = getattr(coord, "dest_client", None)
         cfg = getattr(coord, "cfg", None)
         if dest is None or cfg is None:
-            return "Cancel failed: coordinator not ready"
+            return "Action failed: coordinator not ready"
         # Snapshot the detail card before forget deletes the row (the
         # telegram_message_id lives on the row): on success the card is
         # edited to CANCELLED so it doesn't freeze at its last live state.
@@ -1374,7 +1733,7 @@ class TelegramBot:
                 async with _hold_ops_lock(coord):
                     result = await forget_torrent(
                         cfg, dest=dest, store=store, target=infohash,
-                        apply=True, delete_files=True, ignore=True,
+                        apply=True, delete_files=delete_files, ignore=True,
                     )
                     try:
                         await coord._ssd_release(
@@ -1384,7 +1743,7 @@ class TelegramBot:
             else:
                 result = await forget_torrent(
                     cfg, dest=dest, store=store, target=infohash,
-                    apply=True, delete_files=True, ignore=True,
+                    apply=True, delete_files=delete_files, ignore=True,
                 )
                 try:
                     await coord._ssd_release(
@@ -1394,7 +1753,7 @@ class TelegramBot:
         except LookupError:
             return "Already gone from tracking"
         except Exception as e:  # noqa: BLE001
-            return f"Cancel failed: {e}"
+            return f"Action failed: {e}"
         name = str(result.get("source_name") or infohash[:10])[:50]
         # The row (and its telegram_message_id) is gone: mark its detail
         # card cancelled (best-effort) and drop the cached id so a future
@@ -1431,105 +1790,339 @@ class TelegramBot:
                 pair_note += f" (+{len(pairs) - 3} more)"
         errs = result.get("errors") or []
         if errs:
-            return f"Cancelled {name}{pair_note} with {len(errs)} error(s); check logs"
-        return f"Cancelled {name}{pair_note} (removed + ignored)"
+            return f"{_verb} {name}{pair_note} with {len(errs)} error(s); check logs"
+        return f"{_verb} {name}{pair_note} {_done}"
 
-    async def _keep_torrent(self, infohash: str) -> str:
-        """Forget + ignore one release but keep its data files.
-
-        Same as `_cancel_torrent` except `delete_files=False` (CLI
-        `--keep-files`): the dest entries are removed without files and
-        local SSD data is left in place — for manually-added torrents
-        you want to untrack (e.g. to move by hand) without wiping bytes.
-        """
+    async def _execute_snapshot_cancel(self, hashes: list[str], title: str,
+                                         *, delete_files: bool) -> str:
+        """Forget frozen snapshot hashes (liveness re-checked each)."""
         try:
-            from .api import _hold_ops_lock
-        except Exception:
-            _hold_ops_lock = None  # type: ignore[assignment]
-        try:
-            from .forget import forget_torrent
+            live = []
+            for h in hashes or []:
+                try:
+                    row = await asyncio.to_thread(self._store.get, h)
+                except Exception:
+                    row = None
+                if row is not None:
+                    live.append(h)
+            if not live:
+                return "Already gone from tracking"
+            outs = []
+            for h in live:
+                try:
+                    outs.append(await self._execute_cancel_one(
+                        h, delete_files=delete_files))
+                except Exception as e:  # noqa: BLE001
+                    outs.append(f"Action failed: {e}")
+            if len(outs) == 1:
+                return outs[0]
+            ok = sum(1 for o in outs
+                     if o.startswith(("Cancelled", "Kept files")))
+            verb = "Cancelled" if delete_files else "Kept files for"
+            suffix = "" if delete_files else " (data left in place)"
+            return f"{verb} {title} ({ok}/{len(outs)} copies){suffix}"
         except Exception as e:  # noqa: BLE001
-            return f"Keep failed: {e}"
-        coord = getattr(self, "_coord", None)
-        store = getattr(self, "_store", None)
-        if coord is None or store is None:
-            return "Keep failed: bot not attached"
-        dest = getattr(coord, "dest_client", None)
-        cfg = getattr(coord, "cfg", None)
-        if dest is None or cfg is None:
-            return "Keep failed: coordinator not ready"
-        detail_msg_id: int | None = None
+            return f"Action failed: {e}"
+
+    def _live_notes_for(self, members: list) -> dict[str, str]:
+        """Wait-note map for prefer eligibility (best-effort, str-only)."""
+        notes: dict[str, str] = {}
         try:
-            cached = getattr(self, "_detail_cache", None)
-            if isinstance(cached, dict):
-                cached_id = cached.get(infohash)
-                if isinstance(cached_id, int) and cached_id > 0:
-                    detail_msg_id = cached_id
-            if detail_msg_id is None:
-                detail_msg_id = await asyncio.to_thread(
-                    store.get_telegram_message_id, infohash)
+            fn = getattr(getattr(self, "_coord", None),
+                         "_watch_wait_note", None)
+            if not callable(fn):
+                return notes
+            for m in members or []:
+                try:
+                    if m.state not in (State.NEW, State.WAITING_DISK):
+                        continue
+                    n = fn(m)
+                    if isinstance(n, str) and n:
+                        notes[(m.source_infohash or "")] = n
+                except Exception:
+                    continue
         except Exception:
-            detail_msg_id = None
+            pass
+        return notes
+
+    async def _start_single_command(self, kind: str, full_hash: str, message: Any) -> None:
+        """Typed full-hash command: keepq for cancel, direct for fetch/prefer."""
         try:
-            if _hold_ops_lock is not None:
-                async with _hold_ops_lock(coord):
-                    result = await forget_torrent(
-                        cfg, dest=dest, store=store, target=infohash,
-                        apply=True, delete_files=False, ignore=True,
-                    )
+            row = await asyncio.to_thread(self._store.get, full_hash)
+        except Exception:
+            row = None
+        if row is None:
+            try:
+                await self._reply("Already gone from tracking", reply_to=message)
+            except Exception:
+                pass
+            return
+        title = str(getattr(row, "source_name", "") or full_hash[:10])[:60]
+        if kind == "cancel":
+            self._set_pending_keepq(
+                title, "", [full_hash],
+                getattr(row, "total_bytes", 0))
+            try:
+                await self._refresh_active_message()
+            except Exception:
+                pass
+            try:
+                await self._reply(
+                    f"Cancel {title} — keep downloaded files? Choose below.",
+                    reply_to=message)
+            except Exception:
+                pass
+            return
+        try:
+            if kind == "fetch":
+                result = await self._fetch_torrent(full_hash)
+            else:
+                result = await self._prefer_torrent(full_hash)
+        except Exception as e:  # noqa: BLE001
+            result = f"Action failed: {e}"
+        try:
+            await self._reply(result[:300], reply_to=message)
+        except Exception:
+            pass
+        try:
+            self._last_active_cache = None
+            await self._refresh_active_message()
+        except Exception:
+            pass
+
+    def _group_title(self, members: list) -> str:
+        """Display title for a group (lead row's name, truncated)."""
+        try:
+            if members:
+                return str(getattr(members[0], "source_name", "") or "")[:60]
+        except Exception:
+            pass
+        return "?"
+
+    async def _start_group_command(self, kind: str, token: str, message: Any) -> None:
+        """Typed command: positional number, gid, or legacy hash prefix.
+
+        Positional numbers (what the list shows) and group ids resolve
+        against the LIVE list right now and freeze into a member
+        snapshot — everything after (buttons, question, execution)
+        references the snapshot, so renumbering mid-flow cannot
+        misroute. Full hashes and legacy prefixes act on one row.
+        """
+        token = (token or "").strip().lower()
+        if len(token) == 40 and all(
+                c in "0123456789abcdef" for c in token):
+            await self._start_single_command(kind, token, message)
+            return
+        try:
+            rows = await asyncio.to_thread(self._store.list_active_inflight)
+        except Exception as e:  # noqa: BLE001
+            try:
+                await self._reply(f"Action failed: {e}", reply_to=message)
+            except Exception:
+                pass
+            return
+        try:
+            groups = _group_active_items([(_r, None) for _r in rows or []])
+        except Exception:
+            groups = []
+        found: tuple | None = None
+        if token.isdigit():
+            try:
+                _n = int(token)
+            except (TypeError, ValueError):
+                _n = 0
+            if 1 <= _n <= len(groups):
+                _gk, _mem = groups[_n - 1]
+                found = (_gk, [t for (t, _) in _mem])
+        if found is None:
+            # Group id (older messages) or legacy torrent prefix.
+            _by_gid = _live_group_by_gid(list(rows or []), token)
+            if _by_gid is not None:
+                _gk, _mem = _by_gid
+                found = (_gk, list(_mem))
+        if found is None:
+            try:
+                target = await asyncio.to_thread(
+                    self._resolve_cancel_target, token, cmd=kind)
+                full_hash = target.source_infohash
+            except LookupError as e:
+                try:
+                    await self._reply(str(e)[:300], reply_to=message)
+                except Exception:
+                    pass
+                return
+            except Exception as e:  # noqa: BLE001
+                try:
+                    await self._reply(f"Action failed: {e}", reply_to=message)
+                except Exception:
+                    pass
+                return
+            await self._start_single_command(kind, full_hash, message)
+            return
+        _gkey, members = found
+        title = self._group_title(members)
+        try:
+            _gsize = getattr(members[0], "total_bytes", 0) if members else 0
+        except Exception:
+            _gsize = 0
+        _trip = [(_m, None) for _m in members]
+        if kind == "cancel":
+            snap = pick_snapshot(_trip, "cancel")
+            if len(snap) <= 1:
+                _hashes = [h for (h, _) in snap]
+                if not _hashes:
                     try:
-                        await coord._ssd_release(
-                            result.get("source_infohash") or infohash)
+                        await self._reply("Already gone from tracking",
+                                          reply_to=message)
                     except Exception:
                         pass
+                    return
+                _lbl = snap[0][1]
+                self._set_pending_keepq(
+                    title, f"{_lbl} copy", _hashes, _gsize)
+                reply = (f"Cancel {title} — keep downloaded files? "
+                         f"Choose below.")
             else:
-                result = await forget_torrent(
-                    cfg, dest=dest, store=store, target=infohash,
-                    apply=True, delete_files=False, ignore=True,
-                )
+                self._set_pending_pick("cancel", title, _gsize, snap)
+                reply = (f"Cancel {title} ({len(snap)} copies): "
+                         f"pick below.")
+            try:
+                await self._refresh_active_message()
+            except Exception:
+                pass
+            try:
+                await self._reply(reply, reply_to=message)
+            except Exception:
+                pass
+            return
+        # fetch/prefer: snapshot eligible members into a titled pick —
+        # even a single candidate goes through the buttons, so the group
+        # name is always on screen (with a Cancel row) before anything
+        # acts. Empty set replies inline.
+        snap = pick_snapshot(
+            _trip, kind, self._live_notes_for(members))
+        if not snap:
+            try:
+                await self._reply(
+                    f"Nothing to {kind} right now (states changed).",
+                    reply_to=message)
+            except Exception:
+                pass
+            return
+        self._set_pending_pick(kind, title, _gsize, snap)
+        try:
+            await self._refresh_active_message()
+        except Exception:
+            pass
+        try:
+            await self._reply(
+                f"{kind.capitalize()} {title}: pick a copy below.",
+                reply_to=message)
+        except Exception:
+            pass
+
+    async def _on_action_button(self, query: Any, data: str) -> None:
+        """Route pick:/keep:/abort: taps (initial ack already sent).
+
+        Buttons address snapshot indices/sequences, never live
+        positions or hashes — renumbering mid-flow cannot misroute.
+        Short replies go back to the chat; the list refreshes after.
+        """
+        async def _say(text: str) -> None:
+            try:
+                await self._reply(text[:300],
+                                  reply_to=getattr(query, "message", None))
+            except Exception:
+                pass
+
+        async def _refresh() -> None:
+            try:
+                self._last_active_cache = None
+                await self._refresh_active_message()
+            except Exception:
+                pass
+
+        try:
+            parts = (data or "").split(":")
+            if parts[0] == "abort" and len(parts) == 2:
+                p = self._pending_live()
+                if p is None or str(p.get("seq") or "") != parts[1]:
+                    await _say("Expired — tap the command again")
+                    return
                 try:
-                    await coord._ssd_release(
-                        result.get("source_infohash") or infohash)
+                    self._pending_pick = None
                 except Exception:
                     pass
-        except LookupError:
-            return "Already gone from tracking"
+                await _say("Picker cancelled — nothing acted on.")
+                await _refresh()
+                return
+            if parts[0] == "keep" and len(parts) == 3:
+                _, seq, which = parts
+                p = self._pending_live()
+                if (p is None or p.get("kind") != "keepq"
+                        or str(p.get("seq") or "") != seq):
+                    await _say("Expired — tap the command again")
+                    return
+                _hashes = [h for h in (p.get("hashes") or []) if h]
+                _title = str(p.get("title") or "")
+                try:
+                    self._pending_pick = None
+                except Exception:
+                    pass
+                result = await self._execute_snapshot_cancel(
+                    _hashes, _title, delete_files=(which != "yes"))
+                await _say(result)
+                await _refresh()
+                return
+            if parts[0] == "pick" and len(parts) == 3:
+                _, seq, idx = parts
+                p = self._pending_live()
+                if (p is None or p.get("kind") != "pick"
+                        or str(p.get("seq") or "") != seq):
+                    await _say("Expired — tap the command again")
+                    return
+                _mems = list(p.get("members") or [])
+                _cmd = str(p.get("cmd") or "")
+                _title = str(p.get("title") or "")
+                if idx == "all" and _cmd == "cancel" and len(_mems) > 1:
+                    self._set_pending_keepq(
+                        _title, f"all {len(_mems)} copies",
+                        [h for (h, _) in _mems], p.get("size"))
+                    await _refresh()
+                    await _say("Keep downloaded files or delete them? Choose below.")
+                    return
+                try:
+                    _i = int(idx)
+                    _h, _lbl = _mems[_i]
+                except (TypeError, ValueError, IndexError):
+                    await _say("Expired — tap the command again")
+                    return
+                except Exception:
+                    await _say("Expired — tap the command again")
+                    return
+                if _cmd == "cancel":
+                    self._set_pending_keepq(
+                        _title, f"{_lbl} copy", [_h], p.get("size"))
+                    await _refresh()
+                    await _say("Keep downloaded files or delete them? Choose below.")
+                    return
+                try:
+                    self._pending_pick = None
+                except Exception:
+                    pass
+                try:
+                    if _cmd == "fetch":
+                        result = await self._fetch_torrent(_h)
+                    else:
+                        result = await self._prefer_torrent(_h)
+                except Exception as e:  # noqa: BLE001
+                    result = f"Action failed: {e}"
+                await _say(result)
+                await _refresh()
+                return
+            await _say("Stale button — refresh the list")
         except Exception as e:  # noqa: BLE001
-            return f"Keep failed: {e}"
-        name = str(result.get("source_name") or infohash[:10])[:50]
-        try:
-            cached = getattr(self, "_detail_cache", None)
-            if isinstance(cached, dict):
-                cached.pop(infohash, None)
-            sent_map = getattr(self, "_detail_sent_state", None)
-            if isinstance(sent_map, dict):
-                sent_map.pop(infohash, None)
-        except Exception:
-            pass
-        if detail_msg_id:
-            await self._mark_detail_cancelled(detail_msg_id, name, infohash)
-        try:
-            for pair in result.get("paired_cancelled") or []:
-                try:
-                    await coord._ssd_release(pair.get("source_infohash") or "")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        pairs = result.get("paired_cancelled") or []
-        pair_note = ""
-        if pairs:
-            pair_note = " + {} waiting pair{}: {}".format(
-                len(pairs), "" if len(pairs) == 1 else "s",
-                ", ".join(str(p.get("source_name") or p.get("source_infohash", "")[:10])[:40]
-                          for p in pairs[:3]),
-            )
-            if len(pairs) > 3:
-                pair_note += f" (+{len(pairs) - 3} more)"
-        errs = result.get("errors") or []
-        if errs:
-            return f"Kept files for {name}{pair_note} with {len(errs)} error(s); check logs"
-        return f"Kept files for {name}{pair_note} (untracked + ignored, data left in place)"
+            log.debug("action button handling failed: %s", e)
 
     async def _fetch_torrent(self, infohash: str) -> str:
         """Flag a WAITING_INDEXER row to use the VPS1 original now.
@@ -1786,21 +2379,29 @@ class TelegramBot:
                     continue
         except Exception:
             pass
-        # Deferral notes for waiting watch rows (e.g. "Waiting turn ·
-        # <domain> copy first") so the list explains itself. Best-effort:
-        # never break the refresh over a note.
+        # Deferral notes for waiting rows (watch election notes plus
+        # same-content in-flight deferrals) so the list explains itself.
+        # Best-effort: never break the refresh over a note.
         notes: dict[str, str] = {}
         try:
-            _wait_note = getattr(getattr(self, "_coord", None), "_watch_wait_note", None)
-            if callable(_wait_note):
-                for _ts, _ in items:
-                    try:
-                        if _ts.state in (State.NEW, State.WAITING_DISK):
+            _coord = getattr(self, "_coord", None)
+            _wait_note = getattr(_coord, "_watch_wait_note", None)
+            _inflight_of = getattr(_coord, "_inflight_same_content", None)
+            for _ts, _ in items:
+                try:
+                    if _ts.state in (State.NEW, State.WAITING_DISK):
+                        if callable(_wait_note):
                             _n = _wait_note(_ts) or ""
                             if _n:
                                 notes[_ts.source_infohash or ""] = _n
-                    except Exception:
-                        continue
+                    elif (_ts.state == State.WAITING_INDEXER
+                            and callable(_inflight_of)):
+                        _n = _inflight_note_for(
+                            _ts, _inflight_of(_ts)) or ""
+                        if _n:
+                            notes[_ts.source_infohash or ""] = _n
+                except Exception:
+                    continue
         except Exception:
             notes = {}
         footer = await self._active_footer()
@@ -1811,7 +2412,24 @@ class TelegramBot:
         if len(text) > 4096:
             text = _safe_truncate_markdown(text)
         self._current_page = cur_page
-        keyboard = self._build_keyboard(cur_page, total_pages)
+        # Pending two-step pick (member choice or keep/delete question):
+        # question section under the footer, choice rows in the keyboard.
+        try:
+            qtext, qrows = self._pending_section()
+        except Exception:
+            qtext, qrows = "", []
+        if qtext:
+            text += f"\n{_esc('_' * 35)}\n{qtext}"
+        keyboard = self._build_keyboard(cur_page, total_pages, qrows)
+
+        # Skip the API call if page, total_pages, text and pending rows
+        # are identical — unless a keep-at-bottom repost is due (position
+        # refreshes even when the content is unchanged).
+        try:
+            cache_key = (cur_page, total_pages, text,
+                         tuple(_d for _r in qrows for _, _d in _r))
+        except Exception:
+            cache_key = (cur_page, total_pages, text)
 
         # Skip the API call if page, total_pages, and text are identical —
         # unless a keep-at-bottom repost is due (position refreshes even
