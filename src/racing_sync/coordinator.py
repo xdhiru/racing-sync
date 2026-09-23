@@ -2177,6 +2177,18 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         """
         try:
             proceed, owner = self._watch_election(ts)
+            if (proceed or owner is None):
+                # Cross-path leader invisible to the watch election: defer
+                # to an in-flight same-content row of any origin like an
+                # election owner (grace-holding here would duplicate its
+                # download post-grace).
+                try:
+                    _flyer = self._inflight_same_content(ts)
+                except Exception:
+                    _flyer = None
+                if _flyer is not None:
+                    owner = _flyer
+                    proceed = False
             if proceed or owner is None:
                 # No owner — but a sacrificial row inside its preferred-copy
                 # grace is still deliberately held: say so on the card.
@@ -2272,6 +2284,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         # preferred source found automatically releases the hold.
         _found_preferred = False
         _h = (ts.source_infohash or "").lower()
+
+        # Cross-path in-flight deferral: a same-content row of ANY origin
+        # already past admission (e.g. a racing row the watch election
+        # cannot see) owns this content — stay NEW and ride the remote
+        # fast paths after it finishes instead of grace-holding and then
+        # downloading a duplicate. Operator /prefer_ still overrides
+        # (exempted rows skip this gate like the hold below).
+        if not _exempted:
+            try:
+                _flyer = self._inflight_same_content(ts)
+            except Exception:
+                _flyer = None
+            if _flyer is not None:
+                log.info(
+                    "watch-dir: deferring %s — same content %s already %s",
+                    ts.source_name[:60], (_flyer.source_infohash or "")[:10],
+                    _flyer.state.value)
+                return
 
         ts.save_path = str(self.cfg.dest.save_path)
         tracker_list = [u for u in ts.source_announce_url.split(",") if u] or ([ts.source_tracker] if ts.source_tracker else [])
@@ -2642,6 +2672,46 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # No transition() fired, so push the updated timer manually.
             self._schedule_telegram_update(ts)
 
+    def _inflight_same_content(self, ts: TorrentState):
+        """Live same-content row already past admission, else None.
+
+        Covers QUEUED/DOWNLOADING/MOVING/RE_ADDING in any origin (watch
+        or racing): either way its bytes are on (or heading to) the SSD,
+        so a fresh Prowlarr search here would only duplicate them. DONE
+        is excluded on purpose — a finished sibling no longer holds SSD
+        work, and the normal pick (with its all-remote shortcut) is the
+        right path then. Fail-open None: any doubt runs the normal pick.
+        """
+        try:
+            want_norm = normalize_content_name(ts.source_name or "")
+            try:
+                want_size = int(ts.total_bytes or 0)
+            except (TypeError, ValueError):
+                want_size = 0
+            me = (ts.source_infohash or "").lower()
+            rows = self.store.all_active()
+        except Exception:
+            return None
+        try:
+            for r in rows or []:
+                try:
+                    if ((r.source_infohash or "").lower() == me
+                            or r.state not in (State.QUEUED, State.DOWNLOADING,
+                                               State.MOVING, State.RE_ADDING)):
+                        continue
+                    try:
+                        r_size = int(r.total_bytes or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if (r_size == want_size and normalize_content_name(
+                            r.source_name or "") == want_norm):
+                        return r
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
     async def _do_waiting_indexer(self, ts: TorrentState) -> None:
         """Wake up from WAITING_INDEXER and re-pick the SSD source.
 
@@ -2661,6 +2731,39 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 return
         except Exception:
             pass
+
+        # Same-content in-flight deferral: another row for this release is
+        # already QUEUED/DOWNLOADING/MOVING/RE_ADDING (e.g. a watch-dropped
+        # copy racing the Prowlarr search) — skip this window's search and
+        # stay parked instead of polling Prowlarr for duplicate bytes. The
+        # existing retry timer is pushed one quiet interval (attempts and
+        # the max-age clock untouched), so a stalled/failed sibling hands
+        # back control on a later window. Fail-open: any doubt picks.
+        try:
+            _leader = self._inflight_same_content(ts)
+        except Exception:
+            _leader = None
+        if _leader is not None:
+            try:
+                _interval = max(60.0, float(self.cfg.cross_seed.prowlarr_retry_interval_seconds))
+            except (TypeError, ValueError):
+                _interval = 1800.0
+            log.info(
+                "deferring Prowlarr retry for %s — same content %s already %s",
+                ts.source_name[:60], (_leader.source_infohash or "")[:10],
+                _leader.state.value,
+            )
+            try:
+                if self._abandoned(ts):
+                    raise AbandonedError(
+                        f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}")
+                ts.indexer_next_retry_at = (
+                    dt.datetime.now(dt.timezone.utc)
+                    + dt.timedelta(seconds=_interval))
+                self.store.upsert(ts)
+            except Exception:
+                pass
+            return
 
         all_source = await self._list_source_torrents()
         await self._pick_and_admit(

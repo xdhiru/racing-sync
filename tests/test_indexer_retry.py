@@ -941,3 +941,79 @@ async def test_picker_direct_fallback_prefers_download_indexer_copy():
         cfg=cfg, source_torrent=st, other_source_torrents=[],
         prowlarr=None, sftp=sftp2, source_client=MagicMock())
     assert dec2.infohash == "a" * 40
+
+
+def _waiting_pair(tmp_path, *, leader_state, same_content=True):
+    """WAITING_INDEXER waiter + a same/other-content leader row."""
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    now = dt.datetime.now(dt.timezone.utc)
+    waiter = TorrentState(
+        source_infohash="w" * 40, source_name="Twin.Show",
+        total_bytes=1000, state=State.WAITING_INDEXER,
+        indexer_attempts=3,
+        indexer_first_queried_at=now - dt.timedelta(seconds=100),
+        indexer_next_retry_at=now - dt.timedelta(seconds=1))
+    leader = TorrentState(
+        source_infohash="l" * 40,
+        source_name="Twin.Show" if same_content else "Other.Show",
+        total_bytes=1000, state=leader_state)
+    store.upsert(waiter)
+    store.upsert(leader)
+    coord = make_coordinator()
+    coord.cfg = _cfg()
+    coord.store = store
+    st = Torrent(hash="w" * 40, name="Twin.Show", category="",
+                 save_path="", size_bytes=1000, state="seeding",
+                 progress=1.0, trackers=[])
+    coord.source_client = AsyncMock()
+    coord.source_client.get_torrent = AsyncMock(return_value=st)
+    coord._adopt_manual_fuse_if_present = AsyncMock(return_value=False)
+    coord._pick_and_admit = AsyncMock()
+    coord.transition = MagicMock(
+        side_effect=lambda t, s, **k: setattr(t, "state", s))
+    return coord, store, waiter
+
+
+@pytest.mark.anyio
+async def test_waiting_indexer_defers_to_inflight_same_content(tmp_path):
+    """Sibling DOWNLOADING: skip the Prowlarr search, park quietly."""
+    coord, store, waiter = _waiting_pair(
+        tmp_path, leader_state=State.DOWNLOADING)
+    before = waiter.indexer_next_retry_at
+    try:
+        await coord._do_waiting_indexer(waiter)
+        assert waiter.state == State.WAITING_INDEXER
+        assert waiter.indexer_attempts == 3  # no attempt burned
+        assert waiter.indexer_next_retry_at > before  # timer pushed
+        coord._pick_and_admit.assert_not_called()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_waiting_indexer_proceeds_when_leader_settled(tmp_path):
+    """DONE/FAILED siblings hold no SSD work: pick runs as before."""
+    from racing_sync.state import State as _S
+    for settled in (_S.DONE, _S.FAILED):
+        coord, store, waiter = _waiting_pair(
+            tmp_path, leader_state=settled)
+        try:
+            await coord._do_waiting_indexer(waiter)
+            coord._pick_and_admit.assert_awaited_once()
+        finally:
+            store.close()
+
+
+@pytest.mark.anyio
+async def test_waiting_indexer_ignores_other_content(tmp_path):
+    """In-flight rows for other releases never gate the retry."""
+    coord, store, waiter = _waiting_pair(
+        tmp_path, leader_state=State.DOWNLOADING, same_content=False)
+    try:
+        await coord._do_waiting_indexer(waiter)
+        coord._pick_and_admit.assert_awaited_once()
+    finally:
+        store.close()
