@@ -89,7 +89,7 @@ of hand-deleting files. Torrents on the clients/SSD are picked back up by
 recovery and resume where they left off, so torrent data is never deleted:
 
 ```bash
-python3 run.py run --config config.toml --reset
+python3 run.py run --config config.toml --reset --yes
 # Full wipe for mid-testing (also drops dest entries with files,
 # SSD data and cached .torrent blobs; fuse/remote copies stay untouched):
 python3 run.py run --config config.toml --full --yes

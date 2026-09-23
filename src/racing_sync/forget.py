@@ -90,8 +90,17 @@ def resolve_row(store, target: str):
 def _ssd_bases(cfg) -> list[Path]:
     bases: list[Path] = []
     for raw in (getattr(cfg.ssd, "path", None), getattr(cfg.dest, "save_path", None)):
-        if isinstance(raw, Path) and raw not in bases:
-            bases.append(raw)
+        if isinstance(raw, Path):
+            p: Path | None = raw
+        elif isinstance(raw, str) and raw.strip():
+            try:
+                p = Path(raw)
+            except Exception:
+                p = None
+        else:
+            p = None
+        if p is not None and p not in bases:
+            bases.append(p)
     return bases
 
 
@@ -268,6 +277,7 @@ async def _forget_one(
     """Forget a single already-resolved row (no cascade)."""
     known = sorted(_row_hashes(row))
     entries: dict[str, object] = {}
+    discover_ok = True
     if known:
         try:
             for t in await dest.list_torrents(hashes=known) or []:
@@ -275,6 +285,7 @@ async def _forget_one(
                 if h:
                     entries[h] = t
         except Exception as e:  # noqa: BLE001
+            discover_ok = False
             log.warning("forget: cannot list dest entries for %s: %s",
                         row.source_infohash[:10], e)
     local_paths, skipped = await _candidate_local_paths(
@@ -304,6 +315,7 @@ async def _forget_one(
     if not apply:
         return result
     still: set[str] = set()
+    verify_ok = True
     for h in sorted(entries):
         try:
             entry = entries[h]
@@ -323,6 +335,7 @@ async def _forget_one(
         # is re-adopted by recovery (or re-attached by a same-hash row)
         # and looks exactly like "cancel didn't remove it". Retry once,
         # then report instead of claiming success.
+        verify_ok = True
         try:
             remaining_entries = {
                 (getattr(t, "hash", "") or "").lower(): t
@@ -331,6 +344,7 @@ async def _forget_one(
             }
         except Exception as e:  # noqa: BLE001
             remaining_entries = {}
+            verify_ok = False
             log.warning("forget: cannot verify dest deletes for %s: %s",
                         row.source_infohash[:10], e)
         for h in sorted(remaining_entries):
@@ -360,6 +374,24 @@ async def _forget_one(
             log.warning("forget: %d dest entr%s still present for %s after delete",
                         len(still), "y" if len(still) == 1 else "ies",
                         row.source_infohash[:10])
+    if not verify_ok or still or not discover_ok:
+        # Dest entries survived deletion (or the deletes are unverifiable):
+        # wiping SSD data now would orphan bytes a surviving entry still
+        # references, and dropping the row lets recovery re-adopt the
+        # survivor as a fresh row (resurrecting the cancel). Keep the row
+        # so the operator can retry the forget.
+        if not discover_ok:
+            result["errors"].append(
+                "could not list dest entries; keeping db row")
+        elif not verify_ok and not still:
+            result["errors"].append(
+                "could not verify dest deletes; keeping db row")
+        else:
+            result["errors"].append(
+                f"kept db row: {len(still)} dest entr"
+                f"{'y' if len(still) == 1 else 'ies'} still present")
+        result["ignored"] = False
+        return result
     if delete_files:
         bases = _ssd_bases(cfg)
         try:
@@ -372,6 +404,12 @@ async def _forget_one(
                     # Blob cache: guarded by the state.db parent, not SSD bases.
                     if state_parent is None:
                         raise ValueError("state.db parent unknown; refusing blob cache delete")
+                    try:
+                        if state_parent.resolve() == Path(state_parent.anchor):
+                            raise ValueError(
+                                "state.db at filesystem root; refusing blob cache delete")
+                    except OSError as e:
+                        raise ValueError(f"cannot resolve state.db parent: {e}")
                     validate_safe_delete_path(Path(p), base_dir=state_parent)
                     if Path(p).is_symlink():
                         await asyncio.to_thread(Path(p).unlink)
@@ -389,16 +427,8 @@ async def _forget_one(
         except Exception as e:  # noqa: BLE001
             result["errors"].append(f"ignore list: {e}")
             result["ignored"] = False
-    if still:
-        # Dest entries survived deletion: dropping the row would let
-        # recovery re-adopt the survivor as a fresh row (resurrecting the
-        # cancel). Keep the row so the operator can retry the forget.
-        log.warning("forget: keeping row for %s (%d dest entries survive)",
-                    row.source_infohash[:10], len(still))
-        result["errors"].append(
-            f"kept db row: {len(still)} dest entr"
-            f"{'y' if len(still) == 1 else 'ies'} still present")
-        return result
+    # `still`/unverifiable deletes return early above (row kept for retry),
+    # so reaching here means every dest entry is gone: safe to tombstone.
     try:
         # Tombstone, not hard-delete: in-flight workers, retries and
         # re-discovery refuse tombstoned hashes instead of resurrecting

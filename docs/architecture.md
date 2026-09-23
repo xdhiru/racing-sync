@@ -4,7 +4,7 @@
 
 ```
 src/racing_sync/
-  __main__.py         CLI (run [--reset | --full --yes] / forget [--apply] [--keep-files] [--ignore] / unignore [--list] / check-config)
+  __main__.py         CLI (run [--reset --yes | --full --yes] / forget [--apply] [--keep-files] [--ignore] / unignore [--list] / check-config)
   config.py           Pydantic schema, cross-validates everything
   logging_setup.py    Rotating files + JSONL + ring buffer + optional HTTP sink
   state.py            SQLite state machine (State, ALLOWED, StateStore)
