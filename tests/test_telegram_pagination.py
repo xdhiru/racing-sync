@@ -975,6 +975,7 @@ async def test_detail_queue_overflow_evicts_oldest():
 @pytest.mark.anyio
 async def test_active_msg_id_restored_from_store():
     from unittest.mock import AsyncMock, MagicMock, patch
+    import unittest.mock
     bot = object.__new__(TelegramBot)
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
     bot._store = MagicMock()
@@ -992,7 +993,36 @@ async def test_active_msg_id_restored_from_store():
 
     assert bot._active_msg_id == 778899
     assert bot._prev_active_msg_id == 778899
-    bot._store.get_meta.assert_called_with("telegram_active_msg_id")
+    bot._store.get_meta.assert_any_call("telegram_active_msg_id")
+    # Stale online ping (>10m) → ping re-sent and timestamp recorded.
+    bot._store.set_meta.assert_called_with(
+        "telegram_online_ping_at", unittest.mock.ANY)
+
+
+@pytest.mark.anyio
+async def test_online_ping_debounced_when_recent():
+    from unittest.mock import AsyncMock, MagicMock, patch
+    import time as _time
+    bot = object.__new__(TelegramBot)
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
+    bot._store = MagicMock()
+    bot._store.all.return_value = []
+    bot._store.get_meta.side_effect = lambda k: (
+        str(_time.time()) if k == "telegram_online_ping_at" else None)
+    bot._detail_cache = {}
+    bot._active_msg_id = None
+    bot._prev_active_msg_id = None
+    bot._newest_outbound_id = None
+
+    with patch("racing_sync.telegram_bot.Bot") as mock_bot_cls:
+        mock_bot = MagicMock()
+        mock_bot.send_message = AsyncMock()
+        mock_bot_cls.return_value = mock_bot
+
+        with patch("asyncio.create_task", return_value=MagicMock()):
+            await bot.start()
+
+    mock_bot.send_message.assert_not_called()
 
 
 def test_safe_truncate_markdown_balances_tags():

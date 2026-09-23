@@ -382,9 +382,9 @@ class TelegramConfig(BaseModel):
     # requests/sec across all chats. We self-throttle to `outbound_rate`
     # per second so a burst of state transitions (e.g. first run on a
     # racing client with 60+ torrents) doesn't trigger HTTP 429.
-    outbound_rate: int = Field(default=5, ge=1)
+    outbound_rate: int = Field(default=5, ge=1, le=30)
     # Number of active tasks displayed per page in the status message (default: 5)
-    page_size: int = Field(default=5, ge=1)
+    page_size: int = Field(default=5, ge=1, le=50)
     # Re-post (delete + resend, silent) the active-tasks message when our
     # own newer traffic has buried it, at most every N seconds, so it
     # returns to newest-message position. Never fires while already last.
