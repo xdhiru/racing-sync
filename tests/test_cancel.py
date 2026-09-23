@@ -913,3 +913,51 @@ async def test_chat_message_prefer_starts_grace_held_row(tmp_path: Path):
         bot._bot.send_message.assert_awaited_once()
     finally:
         store.close()
+
+
+def test_render_active_has_keep_command_per_task():
+    from racing_sync.telegram_bot import render_active
+
+    ts = TorrentState(source_infohash="a" * 40, source_name="Show",
+                      state=State.DOWNLOADING, total_bytes=1000)
+    text, _, _ = render_active([(ts, 0.5)], page=0, page_size=5)
+    # Keep-files variant rendered next to cancel (escaped underscore).
+    assert "/keep\\_aaaaaaaaaa" in text
+    assert "/cancel\\_aaaaaaaaaa" in text
+
+
+@pytest.mark.anyio
+async def test_chat_message_keep_keeps_files(tmp_path: Path):
+    """/keep_ forgets+ignores like cancel but leaves data files in place."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show",
+                              save_path=str(ssd), state=State.MOVING))
+    coord = MagicMock()
+    cfg = MagicMock()
+    cfg.ssd.path = ssd
+    cfg.dest.save_path = ssd
+    cfg.general.state_db = tmp_path / "state.db"
+    coord.cfg = cfg
+    entry = MagicMock(hash="a" * 40, save_path=str(ssd / "Show"))
+    coord.dest_client = AsyncMock()
+    # Present for the initial list, gone after the delete (else forget
+    # keeps the row as "entries survive").
+    coord.dest_client.list_torrents = AsyncMock(side_effect=[[entry], [], []])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
+    coord.dest_client.get_torrent = AsyncMock(return_value=None)
+    bot = _bot()
+    bot._coord = coord
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/keep_aaaaaaaaaa"))
+        assert store.get("a" * 40) is None
+        assert store.is_ignored("a" * 40) is True
+        coord.dest_client.delete.assert_awaited_once_with(
+            "a" * 40, delete_files=False)
+        bot._bot.send_message.assert_awaited_once()
+        sent_text = bot._bot.send_message.call_args[0][1]
+        assert sent_text.startswith("Kept files")
+    finally:
+        store.close()

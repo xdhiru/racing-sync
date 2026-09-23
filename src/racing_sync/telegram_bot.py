@@ -424,6 +424,11 @@ FETCH_CMD_RE = re.compile(r"^/fetch_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 #: download now instead of waiting out its preferred-copy grace.
 PREFER_CMD_RE = re.compile(r"^/prefer_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
+#: `/keep_<hex>` — same shape: forget + ignore like `/cancel_` but keep
+#: the data files (CLI `--keep-files` / API `delete_files=false`).
+#: For manually-added torrents you want to untrack without wiping bytes.
+KEEP_CMD_RE = re.compile(r"^/keep_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
 
 def _cancel_command(infohash: str) -> str:
     """Copy-pasteable cancel command for one task (short hash)."""
@@ -438,6 +443,11 @@ def _fetch_command(infohash: str) -> str:
 def _prefer_command(infohash: str) -> str:
     """Copy-pasteable prefer command for one task (short hash)."""
     return f"/prefer_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+def _keep_command(infohash: str) -> str:
+    """Copy-pasteable keep-files cancel command for one task (short hash)."""
+    return f"/keep_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 def _flood_wait_seconds(e: BaseException, default: int = 5) -> int | None:
@@ -490,7 +500,8 @@ def render_active(
     1. ``1. `Name.mkv``` (bare title so it wraps less)
     2. ``  Source: <full-domain>`` (own tracker, host only)
     3. ``  5.7G · <status>`` (size + stage; long waits shortened)
-    4. ``  /cancel_<hash>`` + one line each for ``/fetch_`` / ``/prefer_``
+    4. ``  /cancel_<hash>`` + ``  /keep_<hash>`` (untrack without
+       wiping files) + one line each for ``/fetch_`` / ``/prefer_``
        when present (plain commands, no labels; the hash lives in the
        commands so no separate hash line).
 
@@ -602,6 +613,7 @@ def render_active(
         except Exception:
             _is_grace_note = False
         lines.append(f"  {_esc(_cancel_command(full_hash))}")
+        lines.append(f"  {_esc(_keep_command(full_hash))}")
         if ts.state == State.WAITING_INDEXER:
             lines.append(f"  {_esc(_fetch_command(full_hash))}")
         if ts.state == State.NEW and _is_grace_note:
@@ -1217,13 +1229,14 @@ class TelegramBot:
         return row
 
     async def _handle_chat_message(self, message: Any) -> None:
-        """Execute `/cancel_<hash>` / `/fetch_<hash>` commands in the chat.
+        """Execute `/cancel_` / `/keep_` / `/fetch_` commands in the chat.
 
-        Both are no-confirm: the user's sent message is final. Cancel
-        forgets+ignores the release; fetch flags a WAITING_INDEXER row to
-        use the VPS1 original for the SSD download instead of waiting for
-        Prowlarr. Anything else is ignored. Only the configured chat/user
-        may send commands.
+        All are no-confirm: the user's sent message is final. Cancel
+        forgets+ignores the release (wiping its data); keep forgets+ignores
+        without touching files (for manually-added torrents); fetch flags
+        a WAITING_INDEXER row to use the VPS1 original for the SSD
+        download instead of waiting for Prowlarr. Anything else is
+        ignored. Only the configured chat/user may send commands.
         """
         try:
             chat = getattr(message, "chat", None)
@@ -1234,7 +1247,7 @@ class TelegramBot:
             if str(chat_id) != cfg_chat and str(user_id) != cfg_chat:
                 return
             # Same 0.5s debounce as callbacks: a double-sent /cancel_,
-            # /fetch_ or /prefer_ must not resolve+act twice (double
+            # /keep_, /fetch_ or /prefer_ must not resolve+act twice (double
             # forget/double re-inject/double prefer). Namespaced apart
             # from callback keys.
             try:
@@ -1251,8 +1264,9 @@ class TelegramBot:
             text = str(text or "").strip()
             m_fetch = FETCH_CMD_RE.match(text)
             m_prefer = PREFER_CMD_RE.match(text)
+            m_keep = KEEP_CMD_RE.match(text)
             m_cancel = CANCEL_CMD_RE.match(text)
-            if not m_fetch and not m_prefer and not m_cancel:
+            if not m_fetch and not m_prefer and not m_keep and not m_cancel:
                 return
             if m_fetch:
                 short = m_fetch.group(1)
@@ -1271,6 +1285,20 @@ class TelegramBot:
             if m_prefer:
                 short = m_prefer.group(1)
                 result = await self._prefer_torrent(short)
+                await self._reply(result[:300], reply_to=message)
+                self._last_active_cache = None
+                await self._refresh_active_message()
+                return
+            if m_keep:
+                short = m_keep.group(1)
+                try:
+                    target = await asyncio.to_thread(
+                        self._resolve_cancel_target, short, cmd="keep")
+                    full_hash = target.source_infohash
+                except LookupError as e:
+                    await self._reply(str(e)[:300], reply_to=message)
+                    return
+                result = await self._keep_torrent(full_hash)
                 await self._reply(result[:300], reply_to=message)
                 self._last_active_cache = None
                 await self._refresh_active_message()
@@ -1405,6 +1433,103 @@ class TelegramBot:
         if errs:
             return f"Cancelled {name}{pair_note} with {len(errs)} error(s); check logs"
         return f"Cancelled {name}{pair_note} (removed + ignored)"
+
+    async def _keep_torrent(self, infohash: str) -> str:
+        """Forget + ignore one release but keep its data files.
+
+        Same as `_cancel_torrent` except `delete_files=False` (CLI
+        `--keep-files`): the dest entries are removed without files and
+        local SSD data is left in place — for manually-added torrents
+        you want to untrack (e.g. to move by hand) without wiping bytes.
+        """
+        try:
+            from .api import _hold_ops_lock
+        except Exception:
+            _hold_ops_lock = None  # type: ignore[assignment]
+        try:
+            from .forget import forget_torrent
+        except Exception as e:  # noqa: BLE001
+            return f"Keep failed: {e}"
+        coord = getattr(self, "_coord", None)
+        store = getattr(self, "_store", None)
+        if coord is None or store is None:
+            return "Keep failed: bot not attached"
+        dest = getattr(coord, "dest_client", None)
+        cfg = getattr(coord, "cfg", None)
+        if dest is None or cfg is None:
+            return "Keep failed: coordinator not ready"
+        detail_msg_id: int | None = None
+        try:
+            cached = getattr(self, "_detail_cache", None)
+            if isinstance(cached, dict):
+                cached_id = cached.get(infohash)
+                if isinstance(cached_id, int) and cached_id > 0:
+                    detail_msg_id = cached_id
+            if detail_msg_id is None:
+                detail_msg_id = await asyncio.to_thread(
+                    store.get_telegram_message_id, infohash)
+        except Exception:
+            detail_msg_id = None
+        try:
+            if _hold_ops_lock is not None:
+                async with _hold_ops_lock(coord):
+                    result = await forget_torrent(
+                        cfg, dest=dest, store=store, target=infohash,
+                        apply=True, delete_files=False, ignore=True,
+                    )
+                    try:
+                        await coord._ssd_release(
+                            result.get("source_infohash") or infohash)
+                    except Exception:
+                        pass
+            else:
+                result = await forget_torrent(
+                    cfg, dest=dest, store=store, target=infohash,
+                    apply=True, delete_files=False, ignore=True,
+                )
+                try:
+                    await coord._ssd_release(
+                        result.get("source_infohash") or infohash)
+                except Exception:
+                    pass
+        except LookupError:
+            return "Already gone from tracking"
+        except Exception as e:  # noqa: BLE001
+            return f"Keep failed: {e}"
+        name = str(result.get("source_name") or infohash[:10])[:50]
+        try:
+            cached = getattr(self, "_detail_cache", None)
+            if isinstance(cached, dict):
+                cached.pop(infohash, None)
+            sent_map = getattr(self, "_detail_sent_state", None)
+            if isinstance(sent_map, dict):
+                sent_map.pop(infohash, None)
+        except Exception:
+            pass
+        if detail_msg_id:
+            await self._mark_detail_cancelled(detail_msg_id, name, infohash)
+        try:
+            for pair in result.get("paired_cancelled") or []:
+                try:
+                    await coord._ssd_release(pair.get("source_infohash") or "")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        pairs = result.get("paired_cancelled") or []
+        pair_note = ""
+        if pairs:
+            pair_note = " + {} waiting pair{}: {}".format(
+                len(pairs), "" if len(pairs) == 1 else "s",
+                ", ".join(str(p.get("source_name") or p.get("source_infohash", "")[:10])[:40]
+                          for p in pairs[:3]),
+            )
+            if len(pairs) > 3:
+                pair_note += f" (+{len(pairs) - 3} more)"
+        errs = result.get("errors") or []
+        if errs:
+            return f"Kept files for {name}{pair_note} with {len(errs)} error(s); check logs"
+        return f"Kept files for {name}{pair_note} (untracked + ignored, data left in place)"
 
     async def _fetch_torrent(self, infohash: str) -> str:
         """Flag a WAITING_INDEXER row to use the VPS1 original now.
