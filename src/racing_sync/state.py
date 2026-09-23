@@ -131,6 +131,21 @@ class TorrentState:
     indexer_first_queried_at: dt.datetime | None = None
     indexer_next_retry_at: dt.datetime | None = None
     indexer_attempts: int = 0
+    # VPS1 public-torrent export retry policy (separate from the
+    # download-target indexer schedule above): a transient export glitch
+    # must retry indefinitely on its own timer instead of sharing the
+    # indexer's max-age clock (which would FAILED a row whose source
+    # torrent still exists on VPS1).
+    public_export_first_attempted_at: dt.datetime | None = None
+    public_export_next_retry_at: dt.datetime | None = None
+    public_export_attempts: int = 0
+    # Fuse Adoption verification: 1 once the row's bytes have actually been
+    # observed on the fuse mount (not merely claimed complete by a
+    # skip_check client). The janitor only clears the VPS1 copy for
+    # fuse-verified DONE rows; unverified rows are re-probed (blob
+    # re-export + live byte check) until they verify or the operator
+    # intervenes. Never 1 on trust alone.
+    fuse_verified: int = 0
     # Re-add retry policy
     readd_first_attempted_at: dt.datetime | None = None
     readd_next_retry_at: dt.datetime | None = None
@@ -192,6 +207,16 @@ class TorrentState:
                 self.indexer_next_retry_at.isoformat()
                 if self.indexer_next_retry_at else "",
             "indexer_attempts": self.indexer_attempts,
+            "public_export_first_attempted_at": (
+                self.public_export_first_attempted_at.isoformat()
+                if self.public_export_first_attempted_at else ""
+            ),
+            "public_export_next_retry_at": (
+                self.public_export_next_retry_at.isoformat()
+                if self.public_export_next_retry_at else ""
+            ),
+            "public_export_attempts": self.public_export_attempts,
+            "fuse_verified": int(self.fuse_verified or 0),
             "force_direct": int(self.force_direct or 0),
             "readd_first_attempted_at": (
                 self.readd_first_attempted_at.isoformat()
@@ -241,6 +266,10 @@ CREATE TABLE IF NOT EXISTS torrent_state (
     indexer_first_queried_at TEXT NOT NULL DEFAULT '',
     indexer_next_retry_at    TEXT NOT NULL DEFAULT '',
     indexer_attempts         INTEGER NOT NULL DEFAULT 0,
+    public_export_first_attempted_at TEXT NOT NULL DEFAULT '',
+    public_export_next_retry_at      TEXT NOT NULL DEFAULT '',
+    public_export_attempts           INTEGER NOT NULL DEFAULT 0,
+    fuse_verified            INTEGER NOT NULL DEFAULT 0,
     force_direct             INTEGER NOT NULL DEFAULT 0,
     readd_first_attempted_at  TEXT NOT NULL DEFAULT '',
     readd_next_retry_at       TEXT NOT NULL DEFAULT '',
@@ -285,6 +314,8 @@ CREATE INDEX IF NOT EXISTS ix_state ON torrent_state(state);
 CREATE INDEX IF NOT EXISTS ix_updated_at ON torrent_state(updated_at);
 CREATE INDEX IF NOT EXISTS ix_indexer_retry
     ON torrent_state(state, indexer_next_retry_at);
+CREATE INDEX IF NOT EXISTS ix_public_export_retry
+    ON torrent_state(state, public_export_next_retry_at);
 CREATE INDEX IF NOT EXISTS ix_source_name ON torrent_state(source_name);
 """
 
@@ -297,7 +328,8 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = (
     "'' AS cross_seed_blob, injected_private_hashes, indexer_first_queried_at, "
     "indexer_next_retry_at, indexer_attempts, force_direct, readd_first_attempted_at, "
     "readd_next_retry_at, readd_attempts, failed_retries, completed_at, "
-    "vps1_last_activity_at, state, batch_index, batches_total, batch_cap_bytes, readd_cycles, "
+    "vps1_last_activity_at, fuse_verified, public_export_first_attempted_at, "
+    "public_export_next_retry_at, public_export_attempts, state, batch_index, batches_total, batch_cap_bytes, readd_cycles, "
     "last_error, created_at, updated_at, telegram_message_id, deleted_at"
 )
 
@@ -357,6 +389,10 @@ class StateStore:
             "ADD COLUMN readd_cycles INTEGER NOT NULL DEFAULT 0",
             "ADD COLUMN telegram_message_id INTEGER NOT NULL DEFAULT 0",
             "ADD COLUMN deleted_at TEXT NOT NULL DEFAULT ''",
+            "ADD COLUMN fuse_verified INTEGER NOT NULL DEFAULT 0",
+            "ADD COLUMN public_export_first_attempted_at TEXT NOT NULL DEFAULT ''",
+            "ADD COLUMN public_export_next_retry_at TEXT NOT NULL DEFAULT ''",
+            "ADD COLUMN public_export_attempts INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 self._conn.execute(f"ALTER TABLE torrent_state {_ddl}")
@@ -914,6 +950,66 @@ class StateStore:
                 (key, value),
             )
 
+    # ---- narrow single-column updates (no whole-row overwrite) ----
+
+    def set_fuse_verified(self, source_infohash: str, verified: bool = True) -> bool:
+        """Stamp/clear the fuse-verified flag; True when a row was updated.
+
+        Narrow UPDATE so a verification probe never clobbers concurrent
+        worker mutations to the rest of the row.
+        """
+        self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
+        if not norm:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE torrent_state SET fuse_verified = ?, updated_at = ? "
+                "WHERE source_infohash = ? AND deleted_at = ''",
+                (1 if verified else 0,
+                 dt.datetime.now(dt.timezone.utc).isoformat(), norm),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def set_blob(self, source_infohash: str, blob: bytes) -> bool:
+        """Persist fetched .torrent bytes; True when a row was updated.
+
+        Refuses empty blobs (never wipe a good cached copy with nothing).
+        """
+        self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
+        if not norm or not blob:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE torrent_state SET cross_seed_blob = ?, updated_at = ? "
+                "WHERE source_infohash = ? AND deleted_at = ''",
+                (bytes(blob), dt.datetime.now(dt.timezone.utc).isoformat(),
+                 norm),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def list_public_retry_ready(
+        self, now: dt.datetime | None = None
+    ) -> list[TorrentState]:
+        """Rows in WAITING_INDEXER whose public-export timer has elapsed.
+
+        The public-export schedule is independent of the download-target
+        indexer schedule: these rows retry the VPS1 export indefinitely
+        instead of sharing the indexer's max-age clock.
+        """
+        self._ensure_open()
+        now = now or dt.datetime.now(dt.timezone.utc)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state = 'waiting_indexer' "
+                "AND deleted_at = '' "
+                "AND public_export_next_retry_at != '' "
+                "AND public_export_next_retry_at <= ? ORDER BY public_export_next_retry_at",
+                (now.isoformat(),),
+            ).fetchall()
+            return [_row_to_state(r) for r in rows]
+
 
 
 def _safe_state(value: object) -> State:
@@ -1002,6 +1098,26 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         indexer_first_queried_at=_safe_dt(idx_first),
         indexer_next_retry_at=_safe_dt(idx_next),
         indexer_attempts=_safe_int(idx_attempts),
+        public_export_first_attempted_at=(
+            _safe_dt(row["public_export_first_attempted_at"])
+            if ("public_export_first_attempted_at" in keys
+                and row["public_export_first_attempted_at"])
+            else None
+        ),
+        public_export_next_retry_at=(
+            _safe_dt(row["public_export_next_retry_at"])
+            if ("public_export_next_retry_at" in keys
+                and row["public_export_next_retry_at"])
+            else None
+        ),
+        public_export_attempts=(
+            _safe_int(row["public_export_attempts"])
+            if "public_export_attempts" in keys else 0
+        ),
+        fuse_verified=(
+            _safe_int(row["fuse_verified"])
+            if "fuse_verified" in keys else 0
+        ),
         force_direct=_safe_int(row["force_direct"]) if "force_direct" in keys else 0,
         readd_first_attempted_at=_safe_dt(ra_first),
         readd_next_retry_at=_safe_dt(ra_next),
