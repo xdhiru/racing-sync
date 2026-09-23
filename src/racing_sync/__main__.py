@@ -220,6 +220,39 @@ def _db_sidecar_paths(db: Path) -> list[Path]:
     return [db, Path(str(db) + "-wal"), Path(str(db) + "-shm")]
 
 
+def _fuse_roots(cfg: AppConfig) -> list[Path]:
+    """Configured rclone fuse mounts (never touched by any reset/wipe)."""
+    roots: list[Path] = []
+    try:
+        for raw in (getattr(cfg.rclone.fuse, "mount", None),
+                    getattr(cfg.rclone.fuse, "mount_unsorted", None)):
+            if isinstance(raw, (str, Path)) and str(raw).strip():
+                roots.append(Path(str(raw)))
+    except Exception:
+        return []
+    return roots
+
+
+def _overlaps_fuse(path: Path, fuse_roots: list[Path]) -> bool:
+    """True when `path` is, contains, or sits inside a fuse mount."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    for f in fuse_roots or []:
+        try:
+            if not f.exists():
+                continue
+            fres = f.resolve()
+        except OSError:
+            continue
+        # Exact, nested either way: dir inside fuse wipes remote,
+        # fuse inside dir wipes the mount via the clear.
+        if resolved == fres or resolved.is_relative_to(fres) or fres.is_relative_to(resolved):
+            return True
+    return False
+
+
 def _do_reset(cfg: AppConfig) -> list[str]:
     """Fresh start: delete state.db (+WAL/SHM) and clear the log directory.
 
@@ -250,6 +283,9 @@ def _do_reset(cfg: AppConfig) -> list[str]:
         log_dir = None
     if log_dir is not None:
         refusal = _is_safe_dir_to_clear(log_dir, "log dir")
+        if refusal is None and _overlaps_fuse(log_dir, _fuse_roots(cfg)):
+            # log_dir on/under a fuse mount would delete remote data.
+            refusal = f"refusing to clear log dir (overlaps fuse mount): {log_dir}"
         if refusal is not None:
             removed.append(refusal)
         elif log_dir.is_dir():
@@ -350,14 +386,7 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
             ssd_roots.append(p)
         # Fuse mounts are never touched: refuse an SSD root that *is* a
         # fuse mount (misconfiguration would delete remote data).
-        fuse_roots: list[Path] = []
-        try:
-            for raw in (getattr(cfg.rclone.fuse, "mount", None),
-                        getattr(cfg.rclone.fuse, "mount_unsorted", None)):
-                if isinstance(raw, (str, Path)) and str(raw).strip():
-                    fuse_roots.append(Path(str(raw)))
-        except Exception:
-            fuse_roots = []
+        fuse_roots = _fuse_roots(cfg)
         for root in ssd_roots:
             try:
                 if root.is_symlink():
@@ -368,19 +397,7 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
                 done.append(f"full reset: cannot resolve SSD dir {root}: {e}")
                 continue
             try:
-                overlap = False
-                for f in fuse_roots:
-                    try:
-                        if not f.exists():
-                            continue
-                        fres = f.resolve()
-                    except OSError:
-                        continue
-                    # Exact, nested either way: SSD inside fuse wipes remote,
-                    # fuse inside SSD wipes the mount via the SSD clear.
-                    if resolved == fres or resolved.is_relative_to(fres) or fres.is_relative_to(resolved):
-                        overlap = True
-                        break
+                overlap = _overlaps_fuse(resolved, fuse_roots)
                 if overlap:
                     done.append(f"full reset: refusing to wipe SSD dir (overlaps fuse mount): {root}")
                     continue
@@ -662,7 +679,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Fresh start: delete state.db (+WAL/SHM) and clear the log "
              "directory before starting. Bookkeeping only — torrents on the "
              "clients/SSD are re-adopted by recovery and resume; use "
-             "'forget' to abandon a torrent entirely.",
+             "'forget' to abandon a torrent entirely. Requires --yes.",
     )
     p_run.add_argument(
         "--full",
@@ -675,7 +692,7 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument(
         "--yes",
         action="store_true",
-        help="Confirm the destructive --full wipe (no prompt otherwise).",
+        help="Confirm the destructive --reset / --full wipe (no prompt otherwise).",
     )
 
     p_forget = sub.add_parser(
@@ -763,6 +780,14 @@ def main(argv: list[str] | None = None) -> int:
                 "refusing --full without --yes: this drops dest racing "
                 "entries (with files), wipes SSD data and the cached "
                 ".torrent blobs. Re-run with 'run --full --yes' to confirm.",
+                file=sys.stderr,
+            )
+            return 2
+        if getattr(args, "reset", False) and not getattr(args, "yes", False):
+            print(
+                "refusing --reset without --yes: this deletes state.db "
+                "(+WAL/SHM) and clears the log directory. Re-run with "
+                "'run --reset --yes' to confirm.",
                 file=sys.stderr,
             )
             return 2
