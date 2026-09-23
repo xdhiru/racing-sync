@@ -50,6 +50,35 @@ FNAME = "Show.S01E01.mkv"
 FSIZE = 700
 
 
+def _single_file_blob(name: str = FNAME, size: int = FSIZE) -> bytes:
+    """Minimal single-file .torrent bytes the fuse-health check can decode."""
+    nb = name.encode()
+    info = (b"d6:lengthi" + str(size).encode() + b"e4:name" +
+            str(len(nb)).encode() + b":" + nb +
+            b"12:piece lengthi16384e6:pieces20:" + b"\x00" * 20 + b"e")
+    return (b"d8:announce4:test4:info" + info + b"e")
+
+
+def _healthy_fuse(tmp_path: Path, store: StateStore, hashes: list[str],
+                  cfg) -> None:
+    """Give rows verifiable fuse bytes: blob + real file under both mounts.
+
+    Under the fail-closed janitor, entries alone no longer suffice — rows
+    need a decodable blob and the bytes present at the fuse target.
+    """
+    fuse = tmp_path / "fuse"
+    fuse_u = tmp_path / "fuse_u"
+    fuse.mkdir(exist_ok=True)
+    fuse_u.mkdir(exist_ok=True)
+    cfg.rclone.fuse.mount = fuse
+    cfg.rclone.fuse.mount_unsorted = fuse_u
+    blob = _single_file_blob()
+    for d in (fuse, fuse_u):
+        (d / FNAME).write_bytes(b"\x00" * FSIZE)
+    for h in hashes:
+        assert store.set_blob(h, blob) is True
+
+
 def _member(h: str, upspeed: int = 0, leechers: int = 0, ratio: float = 2.0,
             added_on: int = 0) -> Torrent:
     return Torrent(
@@ -176,7 +205,9 @@ async def test_done_idle_and_old_gets_deleted(tmp_path: Path):
          injected=f"{p1},{p2}")
     src = _FakeSource([_member(pub), _member(p1), _member(p2)])
     dest = _FakeDest([pub, p1, p2])
-    coord = _make_coord(tmp_path, store, src, dest, _base_cfg(tmp_path))
+    cfg = _base_cfg(tmp_path)
+    _healthy_fuse(tmp_path, store, [pub], cfg)
+    coord = _make_coord(tmp_path, store, src, dest, cfg)
 
     await coord._maybe_cleanup_source()
 
@@ -236,6 +267,47 @@ async def test_done_missing_fuse_entry_is_kept(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_done_blobless_is_kept_fail_closed(tmp_path: Path):
+    """Entries alone never clear VPS1: no bytes ⇒ no delete (C2)."""
+    pub = "a" * 40
+    store = StateStore(tmp_path / "s.db")
+    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0,
+         injected="")
+    src = _FakeSource([_member(pub)])
+    dest = _FakeDest([pub])
+    coord = _make_coord(tmp_path, store, src, dest, _base_cfg(tmp_path))
+
+    await coord._maybe_cleanup_source()
+
+    assert src.deleted == []
+
+
+@pytest.mark.anyio
+async def test_done_blob_heals_via_export_then_deletes(tmp_path: Path):
+    """A blobless row whose dest entry exports bytes verifies next run."""
+    pub = "a" * 40
+    store = StateStore(tmp_path / "s.db")
+    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0,
+         injected="")
+    src = _FakeSource([_member(pub)])
+    dest = _FakeDest([pub])
+    cfg = _base_cfg(tmp_path)
+    cfg.rclone.fuse.mount = tmp_path / "fuse"
+    cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse_u"
+    cfg.rclone.fuse.mount.mkdir(exist_ok=True)
+    cfg.rclone.fuse.mount_unsorted.mkdir(exist_ok=True)
+    for d in (cfg.rclone.fuse.mount, cfg.rclone.fuse.mount_unsorted):
+        (Path(d) / FNAME).write_bytes(b"\x00" * FSIZE)
+    dest.export_torrent = AsyncMock(return_value=_single_file_blob())
+    coord = _make_coord(tmp_path, store, src, dest, cfg)
+
+    await coord._maybe_cleanup_source()
+
+    assert [h for h, _ in src.deleted] == [pub]
+    assert store.get_blob(pub) == _single_file_blob()
+
+
+@pytest.mark.anyio
 async def test_done_protected_pattern_is_kept(tmp_path: Path):
     pub = "a" * 40
     store = StateStore(tmp_path / "s.db")
@@ -287,7 +359,9 @@ async def test_done_old_quiet_no_stamp_uses_added_on_fallback(tmp_path: Path):
          injected="")
     src = _FakeSource([_member(pub, added_on=added)])
     dest = _FakeDest([pub])
-    coord = _make_coord(tmp_path, store, src, dest, _base_cfg(tmp_path))
+    cfg = _base_cfg(tmp_path)
+    _healthy_fuse(tmp_path, store, [pub], cfg)
+    coord = _make_coord(tmp_path, store, src, dest, cfg)
 
     await coord._maybe_cleanup_source()
 
