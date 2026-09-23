@@ -386,22 +386,24 @@ class StateStore:
 
     def get(self, source_infohash: str, include_blob: bool = True) -> TorrentState | None:
         self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
         cols = "*" if include_blob else _TORRENT_STATE_COLUMNS_NO_BLOB
         with self._lock:
             row = self._conn.execute(
                 f"SELECT {cols} FROM torrent_state WHERE source_infohash = ? "
                 "AND deleted_at = ''",
-                (source_infohash,),
+                (norm,),
             ).fetchone()
             return _row_to_state(row) if row else None
 
     def get_blob(self, source_infohash: str) -> bytes:
         self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
         with self._lock:
             row = self._conn.execute(
                 "SELECT cross_seed_blob FROM torrent_state WHERE source_infohash = ? "
                 "AND deleted_at = ''",
-                (source_infohash,),
+                (norm,),
             ).fetchone()
             if row and row["cross_seed_blob"]:
                 return bytes(row["cross_seed_blob"])
@@ -415,10 +417,11 @@ class StateStore:
         re-check bounds the race anyway.
         """
         try:
+            norm = (source_infohash or "").strip().lower()
             with self._lock:
                 row = self._conn.execute(
                     "SELECT deleted_at FROM torrent_state WHERE source_infohash = ?",
-                    (source_infohash,),
+                    (norm,),
                 ).fetchone()
             return bool(row and row["deleted_at"])
         except Exception:
@@ -426,6 +429,11 @@ class StateStore:
 
     def upsert(self, ts: TorrentState) -> None:
         self._ensure_open()
+        norm = (ts.source_infohash or "").strip().lower()
+        if norm:
+            # Canonical key: hashes are hex, case-insensitive. Normalizing
+            # on write keeps get/tombstone/clear lookups consistent.
+            ts.source_infohash = norm
         if self._is_tombstoned(ts.source_infohash):
             # Forget tombstone: the operator abandoned this torrent — drop
             # the write instead of resurrecting it. Applies to creates too
@@ -438,7 +446,10 @@ class StateStore:
             placeholders = ", ".join(["?"] * len(row))
             updates = []
             for k in row:
-                if k in ("source_infohash", "created_at"):
+                if k in ("source_infohash", "created_at", "deleted_at"):
+                    # deleted_at excluded: a stale in-memory row upserted
+                    # after forget()/tombstone() must never clear the
+                    # stamp via ON CONFLICT (only clear_tombstone lifts).
                     continue
                 if k == "cross_seed_blob":
                     updates.append(
@@ -568,7 +579,10 @@ class StateStore:
 
     def find_by_name(self, source_name: str) -> list[TorrentState]:
         self._ensure_open()
-        clean_name = source_name.strip()
+        clean_name = (source_name or "").strip()
+        if not clean_name:
+            # Empty pattern would degrade to LIKE '%' (match everything).
+            return []
         for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v", ".torrent"):
             if clean_name.lower().endswith(ext):
                 clean_name = clean_name[:-len(ext)].strip()
@@ -598,9 +612,10 @@ class StateStore:
 
     def delete(self, source_infohash: str) -> None:
         self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
         with self._lock:
             self._conn.execute(
-                "DELETE FROM torrent_state WHERE source_infohash = ?", (source_infohash,)
+                "DELETE FROM torrent_state WHERE source_infohash = ?", (norm,)
             )
 
     def tombstone(self, source_infohash: str) -> bool:
@@ -612,14 +627,26 @@ class StateStore:
         it. Idempotent: re-stamping refreshes the stamp.
         """
         self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
+        if not norm:
+            return False
         now = dt.datetime.now(dt.timezone.utc).isoformat()
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE torrent_state SET deleted_at = ?, updated_at = ? "
                 "WHERE source_infohash = ? AND deleted_at = ''",
-                (now, now, source_infohash),
+                (now, now, norm),
             )
-            return (cur.rowcount or 0) > 0
+            if (cur.rowcount or 0) > 0:
+                return True
+            # Already tombstoned: refresh the stamp (extends the TTL) but
+            # report False — no live row was stamped by this call.
+            self._conn.execute(
+                "UPDATE torrent_state SET deleted_at = ?, updated_at = ? "
+                "WHERE source_infohash = ?",
+                (now, now, norm),
+            )
+            return False
 
     def clear_tombstone(self, source_infohash: str) -> bool:
         """Lift a forget tombstone early; True when one was cleared.
