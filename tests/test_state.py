@@ -448,3 +448,28 @@ def test_tombstone_hides_and_refuses_writes(tmp_path: Path):
         assert store.gc_tombstones() == 1
     finally:
         store.close()
+
+
+def test_tombstone_case_insensitive_and_restamp_refreshes(tmp_path: Path):
+    """Uppercase forget stamps the canonical row; re-stamp refreshes TTL."""
+    from racing_sync.state import _TOMBSTONE_TTL_SECONDS
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        ts = TorrentState(source_infohash="ab" * 20, source_name="Case",
+                          state=State.NEW)
+        store.upsert(ts)
+        assert store.tombstone("AB" * 20) is True
+        assert store.get("ab" * 20) is None
+        # Re-stamp reports False (no live row) but refreshes the stamp.
+        store._conn.execute(
+            "UPDATE torrent_state SET deleted_at = '2000-01-01T00:00:00+00:00' "
+            "WHERE source_infohash = ?", ("ab" * 20,))
+        assert store.tombstone("ab" * 20) is False
+        assert store.gc_tombstones(ttl_seconds=_TOMBSTONE_TTL_SECONDS) == 0
+        # Lowercase clear lifts an uppercase-stamped tombstone.
+        assert store.clear_tombstone("AB" * 20) is True
+        # None names never crash the lookup.
+        assert store.find_by_name(None) == []
+    finally:
+        store.close()
