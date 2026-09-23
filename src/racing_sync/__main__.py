@@ -475,12 +475,27 @@ def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
         print(f"forget failed: {e}", file=sys.stderr)
         return 1
     try:
-        if getattr(args, "list", False) or not getattr(args, "target", None):
+        if getattr(args, "list", False) or (not getattr(args, "target", None)
+                                            and not getattr(args, "all", False)):
             rows = store.list_ignored()
             if not rows:
                 print("ignore list is empty")
             for r in rows:
                 print(f"  {(r['source_name'] or '?')[:60]} ({(r['source_infohash'] or '')[:10]})")
+            return 0
+        if getattr(args, "all", False):
+            rows = store.list_ignored()
+            if not rows:
+                print("ignore list is empty")
+                return 0
+            n = 0
+            for r in rows:
+                h = r["source_infohash"] or ""
+                if store.unignore_torrent(h):
+                    n += 1
+                store.clear_tombstone(h)
+                print(f"  unignored: {(r['source_name'] or '?')[:60]} ({h[:10]})")
+            print(f"unignored {n} release(s); re-drop their .torrent files to reprocess")
             return 0
         try:
             found = store.find_ignored(args.target)
@@ -491,6 +506,8 @@ def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
             print(f"unignored: {(found['source_name'] or '?')[:60]} ({found['source_infohash'][:10]})")
         else:
             print("unignore: entry already gone")
+        if store.clear_tombstone(found["source_infohash"]):
+            print("tombstone lifted: re-dropped files will reprocess immediately")
         return 0
     finally:
         try:
@@ -696,11 +713,17 @@ def main(argv: list[str] | None = None) -> int:
     p_unignore.add_argument("--config", type=Path, required=True)
     p_unignore.add_argument(
         "target", nargs="?",
-        help="40-char infohash or unique name substring. Omit with --list.",
+        help="40-char infohash or unique name substring. Omit with --list/--all.",
     )
     p_unignore.add_argument(
         "--list", action="store_true",
         help="List cancelled releases instead of removing one.",
+    )
+    p_unignore.add_argument(
+        "--all", action="store_true",
+        help="Unignore every entry and lift their forget tombstones, so "
+             "re-dropped files reprocess immediately (single-target unignore "
+             "lifts that entry's tombstone too).",
     )
 
     p_check = sub.add_parser("check-config", help="Validate config and exit")
