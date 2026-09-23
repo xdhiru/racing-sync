@@ -404,6 +404,11 @@ class CleanupMixin:
         the fuse target whenever the torrent bytes are available. Entries
         alone are not proof (a skip_check entry reports complete with zero
         bytes). Any doubt fails closed: keep VPS1.
+
+        A row whose bytes verify live is stamped fuse-verified (narrow
+        update, no whole-row overwrite). Rows without bytes get one
+        blob re-export attempt per janitor run — a healed blob verifies
+        normally next time instead of pinning VPS1 forever.
         """
         hashes = {
             h.lower() for h in (
@@ -435,11 +440,21 @@ class CleanupMixin:
                 blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
             except Exception:
                 blob = None
+        if not blob:
+            # No bytes to verify against: entries existing is NOT enough
+            # (skip_check ghosts). Try healing the blob from the live
+            # dest entry; until that succeeds the VPS1 copy stays.
+            if await self._cleanup_heal_blob(ts, hashes):
+                try:
+                    blob = await asyncio.to_thread(
+                        self.store.get_blob, ts.source_infohash)
+                except Exception:
+                    blob = None
         expected = self._expected_fuse_files(blob)
         if not expected:
-            # No bytes to verify against (e.g. adopted rows predate blob
-            # persistence): entries existing is the best available signal.
-            return True
+            log.warning("cleanup: no verifiable fuse bytes for %s; keeping VPS1",
+                        ts.source_name[:60])
+            return False
         try:
             target = self._target_mount_for_blob(blob, self._target_mount_for(ts))
         except Exception:  # noqa: BLE001
@@ -452,7 +467,45 @@ class CleanupMixin:
             log.warning("cleanup: %d fuse file(s) missing for %s at %s; keeping VPS1",
                         len(file_missing), ts.source_name[:60], target)
             return False
+        if not ts.fuse_verified and getattr(self, "store", None) is not None:
+            try:
+                await asyncio.to_thread(
+                    self.store.set_fuse_verified, ts.source_infohash, True)
+                ts.fuse_verified = 1
+            except Exception:
+                pass
         return True
+
+    async def _cleanup_heal_blob(self, ts: TorrentState, hashes: set[str]) -> bool:
+        """Re-export .torrent bytes for a blobless row; True when healed.
+
+        One best-effort export per janitor run from the live dest entry
+        (persisted via narrow update). Failures keep the old blobless
+        behavior — the VPS1 copy stays until bytes are verifiable.
+        """
+        try:
+            export = getattr(self.dest_client, "export_torrent", None)
+            if not callable(export):
+                return False
+            for h in sorted(hashes):
+                try:
+                    blob = await export(h)
+                except Exception:
+                    continue
+                if isinstance(blob, (bytes, bytearray)) and blob:
+                    try:
+                        await asyncio.to_thread(
+                            self.store.set_blob, ts.source_infohash,
+                            bytes(blob))
+                    except Exception:
+                        return False
+                    ts.cross_seed_blob = bytes(blob)
+                    log.info("cleanup: healed missing blob for %s from %s",
+                             ts.source_name[:60], h[:10])
+                    return True
+            return False
+        except Exception:
+            return False
 
     async def _cleanup_ssd_bytes_present(self, ts: TorrentState) -> bool:
         """Confirm the MOVING row's bytes are still on the VPS2 SSD.
