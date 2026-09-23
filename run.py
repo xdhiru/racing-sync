@@ -6,7 +6,7 @@ Usage:
     python3 run.py run --config config.toml --full --yes (implies --reset)
     python3 run.py check-config --config config.toml
     python3 run.py forget --config config.toml <infohash|name> [--apply] [--keep-files] [--ignore]
-    python3 run.py unignore --config config.toml [--list|<infohash|name>]
+    python3 run.py unignore --config config.toml [--list|<infohash|name>|--all]
     python3 run.py --help
     python3 run.py run --help
 

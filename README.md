@@ -112,7 +112,9 @@ python3 run.py forget --config config.toml <infohash|name> --apply --ignore
 `<infohash|name>` is a 40-char infohash or a unique name fragment
 (ambiguous names show candidates instead of guessing). Forgetting an SSD
 download also forgets the watch-dir rows waiting on it; `--ignore` blocks
-it from ever coming back while listed on VPS1 (undo with `unignore`).
+it from ever coming back while listed on VPS1 (undo with `unignore`,
+`--all` to undo every entry at once — both also lift the forget block so
+re-dropped files reprocess immediately).
 Same thing via API: `POST /api/forget/{hash}?ignore=true&delete_files=false`
 (full 40-char hash required, always applies; `delete_files=false` = `--keep-files`).
 

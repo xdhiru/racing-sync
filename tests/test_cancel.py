@@ -353,6 +353,65 @@ def test_unignore_cli(tmp_path: Path, capsys):
     assert main(["unignore", "--config", str(cfg_file), "nope"]) == 1
 
 
+def test_unignore_lifts_tombstone_so_redrop_reprocesses(tmp_path: Path, capsys):
+    """Single unignore clears the ignore entry AND the forget tombstone."""
+    from racing_sync.__main__ import main
+    from racing_sync.state import StateStore as _Store
+
+    cfg_file = _cli_config(tmp_path)
+    store = _Store(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="c" * 40, source_name="Kept.Show",
+                              save_path=str(tmp_path / "ssd"), state=State.MOVING))
+    assert store.tombstone("c" * 40) is True
+    store.ignore_torrent("c" * 40, "Kept.Show")
+    store.close()
+
+    assert main(["unignore", "--config", str(cfg_file), "kept.show"]) == 0
+    out = capsys.readouterr().out
+    assert "tombstone lifted" in out
+
+    store = _Store(tmp_path / "state.db")
+    try:
+        assert store.is_ignored("c" * 40) is False
+        # Re-dropped file re-ingests: the write lands instead of dropping.
+        store.upsert(TorrentState(source_infohash="c" * 40, source_name="Kept.Show",
+                                  save_path=str(tmp_path / "ssd"), state=State.NEW))
+        assert store.get("c" * 40) is not None
+    finally:
+        store.close()
+
+
+def test_unignore_all_clears_every_entry_and_tombstone(tmp_path: Path, capsys):
+    from racing_sync.__main__ import main
+    from racing_sync.state import StateStore as _Store
+
+    cfg_file = _cli_config(tmp_path)
+    store = _Store(tmp_path / "state.db")
+    for h, name in (("a" * 40, "Show.One"), ("b" * 40, "Show.Two")):
+        store.upsert(TorrentState(source_infohash=h, source_name=name,
+                                  save_path=str(tmp_path / "ssd"), state=State.MOVING))
+        assert store.tombstone(h) is True
+        store.ignore_torrent(h, name)
+    store.close()
+
+    assert main(["unignore", "--config", str(cfg_file), "--all"]) == 0
+    out = capsys.readouterr().out
+    assert "unignored 2 release(s)" in out
+
+    store = _Store(tmp_path / "state.db")
+    try:
+        assert store.list_ignored() == []
+        for h in ("a" * 40, "b" * 40):
+            store.upsert(TorrentState(source_infohash=h, source_name="X",
+                                      save_path=str(tmp_path / "ssd"), state=State.NEW))
+            assert store.get(h) is not None
+    finally:
+        store.close()
+
+    assert main(["unignore", "--config", str(cfg_file), "--all"]) == 0
+    assert "ignore list is empty" in capsys.readouterr().out
+
+
 def test_full_reset_clears_client_and_blobs(tmp_path: Path, monkeypatch, capsys):
     from racing_sync.__main__ import _do_full_reset
 

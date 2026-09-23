@@ -621,6 +621,26 @@ class StateStore:
             )
             return (cur.rowcount or 0) > 0
 
+    def clear_tombstone(self, source_infohash: str) -> bool:
+        """Lift a forget tombstone early; True when one was cleared.
+
+        Explicit operator override for `unignore`: the hash becomes
+        re-ingestible immediately instead of waiting out the TTL.
+        In-flight workers may still hold a stale in-memory row, but the
+        coordinator-level `_abandoned()` re-check bounds that race.
+        """
+        self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
+        if not norm:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE torrent_state SET deleted_at = '', updated_at = ? "
+                "WHERE source_infohash = ? AND deleted_at != ''",
+                (dt.datetime.now(dt.timezone.utc).isoformat(), norm),
+            )
+            return (cur.rowcount or 0) > 0
+
     def gc_tombstones(self, ttl_seconds: int = _TOMBSTONE_TTL_SECONDS) -> int:
         """Hard-delete tombstones older than the TTL. Returns rows removed."""
         self._ensure_open()
