@@ -389,18 +389,30 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         data = aiohttp.FormData()
         data.add_field("hashes", torrent_hash)
         data.add_field("deleteFiles", "true" if delete_files else "false")
-        async with await self.request(
-            "POST", "/api/v2/torrents/delete", data=data
-        ) as r:
-            await r.read()
+        try:
+            async with await self.request(
+                "POST", "/api/v2/torrents/delete", data=data
+            ) as r:
+                await r.read()
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404:
+                # Already gone: delete is idempotent, not an error.
+                return
+            raise
 
     async def recheck(self, torrent_hash: str) -> None:
         data = aiohttp.FormData()
         data.add_field("hashes", torrent_hash)
-        async with await self.request(
-            "POST", "/api/v2/torrents/recheck", data=data
-        ) as r:
-            await r.read()
+        try:
+            async with await self.request(
+                "POST", "/api/v2/torrents/recheck", data=data
+            ) as r:
+                await r.read()
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404:
+                # Already gone: nothing to recheck.
+                return
+            raise
 
     # ---- qB-specific helpers used by the coordinator ----
 

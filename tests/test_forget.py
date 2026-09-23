@@ -364,6 +364,8 @@ async def test_forget_verify_after_delete_reports_survivors(tmp_path: Path):
     """An entry surviving delete is an error, not silent success."""
     ssd = tmp_path / "ssd"
     ssd.mkdir()
+    (ssd / "Pack.One").mkdir()
+    (ssd / "Pack.One" / "a.mkv").write_bytes(b"x" * 10)
     store = StateStore(tmp_path / "state.db")
     store.upsert(_row(save_path=str(ssd)))
 
@@ -384,6 +386,75 @@ async def test_forget_verify_after_delete_reports_survivors(tmp_path: Path):
     # The row is kept (not resurrected later) so the operator can retry.
     assert store.get("a" * 40) is not None
     assert any("kept db row" in e for e in result["errors"])
+    # Survivor bytes are NOT wiped while the entry still references them.
+    assert (ssd / "Pack.One" / "a.mkv").exists()
+
+
+@pytest.mark.anyio
+async def test_forget_unverifiable_deletes_keep_row(tmp_path: Path):
+    """A verify RPC failure must not fail open to tombstone."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    (ssd / "Pack.One").mkdir()
+    (ssd / "Pack.One" / "a.mkv").write_bytes(b"x" * 10)
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(_row(save_path=str(ssd)))
+
+    class BlindDest(FakeDest):
+        async def delete(self, h: str, *, delete_files: bool = False):
+            self.delete_calls.append((h.lower(), delete_files))
+            self.entries.pop(h.lower(), None)
+
+        async def list_torrents(self, *, category=None, hashes=None):
+            raise RuntimeError("client down")
+
+    dest = BlindDest()
+    dest.seed("a" * 40, str(ssd), [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
+
+    result = await forget_torrent(
+        _cfg(ssd), dest=dest, store=store, target="a" * 40,
+        apply=True, delete_files=True,
+    )
+
+    assert any("could not list dest entries" in e for e in result["errors"])
+    assert store.get("a" * 40) is not None
+    assert (ssd / "Pack.One" / "a.mkv").exists()
+
+
+@pytest.mark.anyio
+async def test_forget_verify_failure_keeps_row(tmp_path: Path):
+    """Deletes land but the verify RPC fails: keep the row, don't tombstone."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    (ssd / "Pack.One").mkdir()
+    (ssd / "Pack.One" / "a.mkv").write_bytes(b"x" * 10)
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(_row(save_path=str(ssd)))
+
+    class FlakyDest(FakeDest):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def list_torrents(self, *, category=None, hashes=None):
+            self.calls += 1
+            if self.calls == 1:
+                return await super().list_torrents(category=category, hashes=hashes)
+            raise RuntimeError("client down")
+
+    dest = FlakyDest()
+    dest.seed("a" * 40, str(ssd), [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
+
+    # delete_files=False: the entry goes, bytes stay — only the local-path
+    # wipe (which the keep-row return must skip) could remove them.
+    result = await forget_torrent(
+        _cfg(ssd), dest=dest, store=store, target="a" * 40,
+        apply=True, delete_files=False,
+    )
+
+    assert any("could not verify" in e for e in result["errors"])
+    assert store.get("a" * 40) is not None
+    assert (ssd / "Pack.One" / "a.mkv").exists()
 
 
 @pytest.mark.anyio

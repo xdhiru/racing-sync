@@ -148,13 +148,42 @@ def test_main_run_reset_clears_state_db_and_logs(tmp_path: Path):
         mock_coord.shutdown.side_effect = fake_shutdown
         mock_coord_cls.return_value = mock_coord
 
-        rc = main(["run", "--config", str(cfg_file), "--reset"])
+        rc = main(["run", "--config", str(cfg_file), "--reset", "--yes"])
         assert rc == 0
 
     assert not state_db.exists()
     assert not (tmp_path / "state.db-wal").exists()
     assert log_dir.is_dir()
     assert list(log_dir.iterdir()) == []
+
+
+def test_run_reset_requires_yes(tmp_path: Path):
+    """--reset without --yes refuses (destructive bookkeeping wipe)."""
+    from racing_sync.__main__ import main
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+    rc = main(["run", "--config", str(cfg_file), "--reset"])
+    assert rc == 2
+
+
+def test_do_reset_refuses_fuse_overlap_log_dir(tmp_path: Path):
+    """A log dir on/under a fuse mount is never cleared."""
+    from racing_sync.__main__ import _do_reset
+    from racing_sync.config import AppConfig
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+    cfg = AppConfig.from_toml(cfg_file)
+    cfg.general.state_db = tmp_path / "state.db"
+    fuse = tmp_path / "mnt-remote"
+    fuse.mkdir()
+    (fuse / "l.log").write_text("x")
+    cfg.general.log_dir = fuse
+    cfg.rclone.fuse.mount = fuse
+    lines = _do_reset(cfg)
+    assert any("overlaps fuse mount" in ln for ln in lines)
+    assert (fuse / "l.log").exists()
 
 
 def test_do_reset_refuses_system_log_dir(tmp_path: Path):
