@@ -147,7 +147,11 @@ class SSDLedgerMixin:
         cap = self._ssd_global_cap()
         if cap is None:
             return total
-        return min(total, cap) if total > 0 else 0
+        if total <= 0:
+            # Unknown size must not reserve 0 (admits on a full disk):
+            # hold a full cap slot until classify refines the footprint.
+            return cap
+        return min(total, cap)
 
     def _ssd_reserved_total(self) -> int:
         try:
