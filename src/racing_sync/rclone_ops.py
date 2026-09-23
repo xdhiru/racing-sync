@@ -407,22 +407,7 @@ async def move_local_to_remote(
                 log.warning("could not delete rclone file list %s: %s", list_path, e)
 
 
-def validate_safe_delete_path(
-    path: Path, base_dir: Path | Iterable[Path] | None = None
-) -> None:
-    resolved = path.resolve()
-    if resolved == Path(resolved.anchor) or str(resolved) in ("/", "\\"):
-        raise ValueError(f"refusing to delete filesystem root: {path}")
-    if base_dir is not None:
-        bases = [base_dir] if isinstance(base_dir, Path) else list(base_dir)
-        bases_resolved = [b.resolve() for b in bases]
-        for br in bases_resolved:
-            if resolved == br:
-                raise ValueError(f"refusing to delete base directory: {path}")
-        if not any(resolved.is_relative_to(br) for br in bases_resolved):
-            raise ValueError(
-                f"path {path} is not within allowed base directories: {bases}"
-            )
+from .safety import validate_safe_delete_path  # noqa: F401 (re-exported)
 
 
 async def wipe_local_tree(

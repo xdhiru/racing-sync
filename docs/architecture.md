@@ -11,6 +11,7 @@ src/racing_sync/
   classifier.py       movie / episode / season
   batcher.py          SSD-aware episode batching
   rclone_ops.py       rclone subprocess wrapper
+  safety.py           Central destructive-path guards (delete validation, fuse overlap, reset refusals)
   sftp_source.py      paramiko-based .torrent export (pooled)
   prowlarr.py         Prowlarr client (indexers, search, download)
   watchdir.py         Watch-dir scanner with bencoded torrent parser
