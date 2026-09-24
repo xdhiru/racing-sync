@@ -7,6 +7,10 @@
 source_poll_interval = 60
 # Polling interval (seconds) for destination client (VPS2)
 dest_poll_interval = 30
+# Per-RPC timeout budget (seconds) for client calls (qB/Deluge, Prowlarr,
+# SFTP): a hung peer degrades one operation into park-and-retry instead of
+# wedging a worker or the tick.
+client_rpc_timeout_seconds = 30
 # SQLite state DB path
 state_db = "/var/lib/racing-sync/state.db"
 # Log directory (rotating files)
