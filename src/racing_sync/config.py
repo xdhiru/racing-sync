@@ -375,6 +375,13 @@ class TelegramConfig(BaseModel):
     enabled: bool = False
     bot_token: SecretStr = SecretStr("")
     chat_id: str = ""
+    # Destructive-command allowlist (Telegram user ids). Empty (default)
+    # preserves today's behavior: anyone in the authorized chat may run
+    # /cancel_//fetch_//prefer_ and tap the buttons. Non-empty restricts
+    # commands AND button taps to these users; other chat members get a
+    # "not authorized" reply. Pending flows additionally bind to the
+    # commanding user, so one operator cannot tap another's picker.
+    admin_user_ids: list[int] = Field(default_factory=list)
     status_update_interval: int = Field(default=45, ge=5)
     pin_status_message: bool = False
     # Outbound rate limit for per-torrent detail messages (and

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -492,6 +493,76 @@ def _message(chat="1", user="9", text="/cancel_aaaaaaaaaa"):
     m.caption = None
     m.message_id = 42
     return m
+
+
+def _query(data, user="9", chat="1"):
+    q = MagicMock()
+    q.data = data
+    q.message.chat.id = chat
+    q.from_user.id = user
+    q.answer = AsyncMock()
+    q.message.message_id = 43
+    return q
+
+
+@pytest.mark.anyio
+async def test_admin_allowlist_refuses_stranger_command(tmp_path: Path):
+    """With admin_user_ids set, other chat members cannot start flows."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    bot = _bot()
+    bot._store = store
+    bot._cfg = SimpleNamespace(chat_id="1", page_size=5,
+                               admin_user_ids=[4242])
+    try:
+        store.upsert(TorrentState(source_infohash="a" * 40,
+                                  source_name="Show", state=State.MOVING))
+        await bot._handle_chat_message(_message(user="9", text="/cancel_1"))
+        assert bot._pending_live() is None
+        sent = [c.args[1] for c in
+                bot._bot.send_message.await_args_list]
+        assert any("Not authorized" in str(t) for t in sent)
+        # Listed admin proceeds normally.
+        bot._bot.send_message.reset_mock()
+        bot._callback_times.clear()
+        await bot._handle_chat_message(
+            _message(user="4242", text="/cancel_1"))
+        assert bot._pending_live() is not None
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_pending_flow_bound_to_commanding_user(tmp_path: Path):
+    """A different known user cannot tap another operator's picker."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    bot = _bot()
+    bot._store = store
+    bot._coord = MagicMock()
+    bot._refresh_active_message = AsyncMock()
+    try:
+        store.upsert(TorrentState(source_infohash="a" * 40,
+                                  source_name="Show", state=State.MOVING))
+        store.upsert(TorrentState(source_infohash="b" * 40,
+                                  source_name="Show", state=State.QUEUED))
+        await bot._handle_chat_message(
+            _message(user="4242", text="/cancel_1"))
+        p = bot._pending_live()
+        assert p is not None and p["user_id"] == "4242"
+        # Foreign tap refused, flow intact.
+        q = _query(f"pick:{p['seq']}:0", user="777")
+        await bot._on_action_button(q, q.data)
+        assert bot._pending_live() is not None
+        # Owner tap advances.
+        q2 = _query(f"pick:{p['seq']}:0", user="4242")
+        await bot._on_action_button(q2, q2.data)
+        p2 = bot._pending_live()
+        assert p2 is not None and p2["kind"] == "keepq"
+    finally:
+        store.close()
 
 
 @pytest.mark.anyio
