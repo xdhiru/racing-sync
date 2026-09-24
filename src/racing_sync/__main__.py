@@ -64,193 +64,16 @@ async def _runner(coord: Coordinator) -> int:
             log.warning("shutdown timed out after 30s; exiting anyway")
 
 
-def _is_safe_dir_to_clear(path: Path, label: str = "log dir") -> str | None:
-    """Return None when `path` is safe to clear children of, else a reason.
-
-    `--reset` / `--full` delete every child of the configured dir. A
-    misconfigured path (filesystem root, /var/log, home dir, symlink to
-    elsewhere) would wipe data outside racing-sync. Fail closed.
-    """
-    log_dir = path
-    try:
-        # Never follow a symlink to an unexpected target.
-        if log_dir.is_symlink():
-            return f"refusing to clear {label} (is a symlink): {log_dir}"
-        resolved = log_dir.resolve()
-    except OSError as e:
-        return f"refusing to clear {label} (cannot resolve {log_dir}): {e}"
-    anchor = Path(resolved.anchor)
-    if resolved == anchor or str(resolved) in ("/", "\\"):
-        return f"refusing to clear filesystem root: {log_dir}"
-    # Never wipe the current working directory (e.g. log_dir="." on a repo
-    # checkout would delete every child of the project).
-    try:
-        if resolved == Path.cwd().resolve():
-            return f"refusing to clear current working directory: {log_dir}"
-    except OSError:
-        pass
-    # Never wipe a directory that looks like a source checkout: wiping it
-    # would delete code, .git history, and the DB alongside logs.
-    try:
-        markers = ("pyproject.toml", ".git", "src", "run.py")
-        if any((resolved / m).exists() for m in markers):
-            return f"refusing to clear directory containing project files: {log_dir}"
-    except OSError:
-        pass
-    # Well-known system/profile roots: clearing them would destroy data
-    # far beyond racing-sync logs. Compare both Path and posix forms so
-    # POSIX-style config values are caught on Windows test hosts too.
-    denied = {
-        Path("/var"), Path("/var/log"), Path("/etc"), Path("/usr"),
-        Path("/bin"), Path("/sbin"), Path("/home"), Path("/root"),
-        Path("/tmp"), Path("/var/tmp"),
-    }
-    denied_posix = {p.as_posix() for p in denied} | {
-        "/var", "/var/log", "/etc", "/usr", "/bin", "/sbin",
-        "/home", "/root", "/tmp", "/var/tmp", "/",
-    }
-    try:
-        home = Path.home().resolve()
-        denied.add(home)
-        denied_posix.add(home.as_posix())
-    except Exception:
-        pass
-    if resolved in denied or resolved.as_posix() in denied_posix:
-        return f"refusing to clear system directory: {log_dir}"
-    # Also match the raw configured value: on Windows Path("/var/log")
-    # resolves to C:/var/log, hiding the POSIX system path.
-    try:
-        raw_posix = log_dir.as_posix()
-    except Exception:
-        raw_posix = str(log_dir)
-    if raw_posix in denied_posix or raw_posix.rstrip("/") in denied_posix:
-        return f"refusing to clear system directory: {log_dir}"
-    # Shallow paths (e.g. /data, C:\\logs) are one typo away from a system
-    # dir; require at least 3 parts (anchor + 2 levels) to clear.
-    if len(resolved.parts) < 3 and resolved.parent in (anchor, resolved):
-        # e.g. "/x" or "C:\\x" — allow only when it already looks like an
-        # app dir? Fail closed: refuse bare top-level dirs.
-        return f"refusing to clear top-level directory: {log_dir}"
-    return None
+from .safety import (
+    clear_dir_children as _clear_dir_children,
+    db_sidecar_paths as _db_sidecar_paths,
+    fuse_roots as _fuse_roots,
+    is_safe_dir_to_clear as _is_safe_dir_to_clear,
+    overlaps_fuse as _overlaps_fuse,
+    state_db_parent_refusal as _state_db_parent_refusal,
+)
 
 
-def _state_db_parent_refusal(cfg: AppConfig) -> str | None:
-    """Refuse destructive reset steps when state.db lives somewhere unsafe.
-
-    A fat-fingered state_db (system path, symlink, filesystem root, repo
-    checkout) plus --reset/--full must never delete outside racing-sync
-    data. Narrower than _is_safe_dir_to_clear (which guards clearing
-    directory CHILDREN): home/CWD parents are fine for unlinking three
-    bookkeeping files, but system dirs, roots and checkouts are not.
-    """
-    try:
-        db = Path(str(cfg.general.state_db))
-    except Exception:
-        return "cannot resolve state_db path"
-    try:
-        if db.is_symlink():
-            return f"refusing reset: state_db is a symlink: {db}"
-    except OSError:
-        pass
-    try:
-        resolved = db.resolve()
-        parent = resolved.parent
-        anchor = Path(resolved.anchor)
-    except OSError as e:
-        return f"refusing reset: cannot resolve state_db {db}: {e}"
-    if parent == anchor or str(parent) in ("/", "\\"):
-        return f"refusing reset: state_db at filesystem root: {db}"
-    try:
-        markers = ("pyproject.toml", ".git", "src", "run.py")
-        if any((parent / m).exists() for m in markers):
-            return f"refusing reset: state_db inside project checkout: {db}"
-    except OSError:
-        pass
-    denied_posix = {
-        "/var", "/var/log", "/etc", "/usr", "/bin", "/sbin",
-        "/home", "/root", "/tmp", "/var/tmp", "/",
-    }
-    if parent.as_posix() in denied_posix or str(parent) in denied_posix:
-        return f"refusing reset: state_db inside system directory: {db}"
-    try:
-        raw_posix = db.as_posix()
-    except Exception:
-        raw_posix = str(db)
-    if raw_posix in denied_posix or raw_posix.rstrip("/") in denied_posix:
-        return f"refusing reset: state_db inside system directory: {db}"
-    return None
-
-
-def _clear_dir_children(root: Path, *, base_desc: str) -> list[str]:
-    """Delete every child of `root` (never `root` itself). Returns log lines."""
-    from .rclone_ops import validate_safe_delete_path
-
-    lines: list[str] = []
-    try:
-        children = sorted(root.iterdir())
-    except OSError as e:
-        return [f"could not list {base_desc} {root}: {e}"]
-    for child in children:
-        try:
-            validate_safe_delete_path(child, base_dir=root)
-            if child.is_dir() and not child.is_symlink():
-                shutil.rmtree(child)
-            elif child.is_file() or child.is_symlink():
-                child.unlink()
-            else:
-                try:
-                    child.unlink()
-                except OSError as e:
-                    lines.append(f"could not delete {base_desc} entry {child}: {e}")
-                    continue
-            lines.append(f"deleted {base_desc} entry: {child}")
-        except Exception as e:  # noqa: BLE001
-            lines.append(f"could not delete {base_desc} entry {child}: {e}")
-    if not lines:
-        lines.append(f"{base_desc} already empty: {root}")
-    return lines
-
-
-def _db_sidecar_paths(db: Path) -> list[Path]:
-    """Return state.db plus its WAL/SHM sidecars without with_suffix crashes.
-
-    `Path.with_suffix("-wal")` raises on suffix-less names (e.g. "state"),
-    so build sidecars by string suffix instead.
-    """
-    return [db, Path(str(db) + "-wal"), Path(str(db) + "-shm")]
-
-
-def _fuse_roots(cfg: AppConfig) -> list[Path]:
-    """Configured rclone fuse mounts (never touched by any reset/wipe)."""
-    roots: list[Path] = []
-    try:
-        for raw in (getattr(cfg.rclone.fuse, "mount", None),
-                    getattr(cfg.rclone.fuse, "mount_unsorted", None)):
-            if isinstance(raw, (str, Path)) and str(raw).strip():
-                roots.append(Path(str(raw)))
-    except Exception:
-        return []
-    return roots
-
-
-def _overlaps_fuse(path: Path, fuse_roots: list[Path]) -> bool:
-    """True when `path` is, contains, or sits inside a fuse mount."""
-    try:
-        resolved = path.resolve()
-    except OSError:
-        return False
-    for f in fuse_roots or []:
-        try:
-            if not f.exists():
-                continue
-            fres = f.resolve()
-        except OSError:
-            continue
-        # Exact, nested either way: dir inside fuse wipes remote,
-        # fuse inside dir wipes the mount via the clear.
-        if resolved == fres or resolved.is_relative_to(fres) or fres.is_relative_to(resolved):
-            return True
-    return False
 
 
 def _do_reset(cfg: AppConfig) -> list[str]:
@@ -310,7 +133,7 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
     are reported, never raised (leftovers are re-adopted and resume).
     """
     from .clients.qbittorrent import QBittorrentClient
-    from .rclone_ops import validate_safe_delete_path
+    from .safety import validate_safe_delete_path
 
     done: list[str] = []
     dest = QBittorrentClient(cfg.dest, label="dest-reset")
