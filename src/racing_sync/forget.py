@@ -117,37 +117,11 @@ def _watch_cross_seeds_dir(cfg, source_infohash: str) -> Path | None:
     return _watch_cross_seed_dir(db, source_infohash)
 
 
-async def _candidate_local_paths(cfg, dest, row, entry_hashes: list[str]) -> tuple[list[Path], list[str]]:
-    """Local SSD paths owned by this torrent (validated) + skipped reasons."""
-    bases = _ssd_bases(cfg)
-    if not bases:
-        return [], ["no SSD base directories configured"]
-    # Discover the on-disk layout from the client before deleting entries.
-    files: list = []
-    base_dir: Path | None = None
-    for h in entry_hashes:
-        try:
-            found = await dest.get_torrent_files(h)
-        except Exception as e:  # noqa: BLE001
-            log.warning("forget: cannot list files for %s: %s", h[:10], e)
-            continue
-        if found:
-            files = list(found)
-            try:
-                entry = await dest.get_torrent(h)
-                sp = (getattr(entry, "save_path", "") or "") if entry else ""
-            except Exception:  # noqa: BLE001
-                sp = ""
-            base_dir = Path(sp) if sp else None
-            break
-    if base_dir is None:
-        sp = getattr(row, "save_path", "") or ""
-        base_dir = Path(sp) if sp else None
-    if base_dir is None:
-        return [], ["torrent save path unknown; skipping local cleanup"]
+def _tops_from_files(files: list) -> list[str]:
+    """Top-level names owned by one entry's file list (sanitized, deduped)."""
     tops: list[str] = []
-    seen_tops: set[str] = set()
-    for f in files:
+    seen: set[str] = set()
+    for f in files or []:
         raw = (getattr(f, "name", "") or "").replace("\\", "/").strip("/")
         if not raw or "\n" in raw or "\r" in raw or "\0" in raw:
             continue
@@ -157,21 +131,66 @@ async def _candidate_local_paths(cfg, dest, row, entry_hashes: list[str]) -> tup
         top = parts[0]
         if top.startswith("/") or (len(top) >= 2 and top[1] == ":" and top[0].isalpha()):
             continue
-        if not top or top in seen_tops:
+        if not top or top in seen:
             continue
-        seen_tops.add(top)
+        seen.add(top)
         tops.append(top)
-    if not tops:
+    return tops
+
+
+async def _candidate_local_paths(cfg, dest, row, entry_hashes: list[str]) -> tuple[list[Path], list[str]]:
+    """Local SSD paths owned by this torrent (validated) + skipped reasons.
+
+    Unions tops across ALL dest entries with their own save_path base:
+    multi-entry rows (repacks, injected private hashes) otherwise orphan
+    every entry past the first on the SSD while the DB row is gone.
+    """
+    bases = _ssd_bases(cfg)
+    if not bases:
+        return [], ["no SSD base directories configured"]
+    # Discover the on-disk layout from the client before deleting entries.
+    # Per-entry (base, tops): entries may point at different save_paths.
+    owned: list[tuple[Path, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for h in entry_hashes:
+        try:
+            found = await dest.get_torrent_files(h)
+        except Exception as e:  # noqa: BLE001
+            log.warning("forget: cannot list files for %s: %s", h[:10], e)
+            continue
+        if not found:
+            continue
+        try:
+            entry = await dest.get_torrent(h)
+            sp = (getattr(entry, "save_path", "") or "") if entry else ""
+        except Exception:  # noqa: BLE001
+            sp = ""
+        base = Path(sp) if sp else None
+        if base is None:
+            rsp = getattr(row, "save_path", "") or ""
+            base = Path(rsp) if rsp else None
+        if base is None:
+            continue
+        for top in _tops_from_files(list(found)):
+            key = (str(base), top)
+            if key not in seen_pairs:
+                seen_pairs.add(key)
+                owned.append((base, top))
+    if not owned:
         return [], ["no file list available; skipping local cleanup"]
     ok: list[Path] = []
     skipped: list[str] = []
-    for top in tops:
-        cand = base_dir / top
+    seen_paths: set[str] = set()
+    for base, top in owned:
+        cand = base / top
+        if str(cand) in seen_paths:
+            continue
         try:
             validate_safe_delete_path(cand, base_dir=bases)
         except ValueError as e:
             skipped.append(f"{cand}: {e}")
             continue
+        seen_paths.add(str(cand))
         ok.append(cand)
     return ok, skipped
 
