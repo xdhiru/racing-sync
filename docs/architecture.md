@@ -17,7 +17,7 @@ src/racing_sync/
   watchdir.py         Watch-dir scanner with bencoded torrent parser
   recovery.py         Startup reconciler
   forget.py           Abandon-torrent off-switch (row + entries + SSD data + blob cache + optional ignore)
-  coordinator.py      Main async loop + per-torrent workers (tick, dispatch)
+  coordinator.py      Main async loops + per-torrent workers (poll, schedule, janitor)
   coordinator_ssd.py  SSD batch caps + global reservation ledger
   coordinator_picker.py  Cross-seed SSD-source picker (req #1/#2)
   coordinator_cleanup.py VPS1 cleanup janitor
