@@ -318,7 +318,22 @@ class ProwlarrClient:
                                 f"prowlarr feed from {indexer.name!r} undecodable: {e}"
                             ) from e
                     else:
-                        text = await r.text()
+                        # read() unavailable (test doubles / odd transports):
+                        # still cap — stream the body in chunks instead of
+                        # one uncapped text() that OOMs on a bloated feed.
+                        chunks: list[bytes] = []
+                        try:
+                            async for chunk in r.content.iter_chunked(65536):
+                                chunks.append(bytes(chunk))
+                                if sum(map(len, chunks)) > _MAX_FEED_BYTES:
+                                    raise ProwlarrError(
+                                        f"prowlarr feed from {indexer.name!r} exceeds "
+                                        f"{_MAX_FEED_BYTES} bytes; refusing")
+                            text = b"".join(chunks).decode("utf-8", errors="replace")
+                        except ProwlarrError:
+                            raise
+                        except Exception:
+                            text = await r.text()
                 break
             except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
                 last_exc = e
@@ -349,7 +364,19 @@ class ProwlarrClient:
             raise ProwlarrError(f"refusing non-routable download_url: {safe_url!r}")
         headers = None
         try:
-            if parsed.netloc.lower() == urlsplit(self._cfg.base_url).netloc.lower():
+            # Compare origin as (scheme, host, effective port): a bare
+            # "host" vs "host:8080" (or userinfo/query/fragment smuggled
+            # into base_url) must not confuse the same-host key decision.
+            _base = urlsplit(self._cfg.base_url)
+            def _origin(p):
+                try:
+                    port = p.port
+                except Exception:
+                    port = None
+                if port is None:
+                    port = 443 if p.scheme == "https" else 80
+                return (p.scheme.lower(), (p.hostname or "").lower(), port)
+            if _origin(parsed) == _origin(_base):
                 headers = self._auth_headers
         except Exception:
             headers = None
@@ -593,7 +620,7 @@ def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
     # EntitiesForbidden instead when one slips through.
     try:
         import re as _re
-        if _re.search(r"<!\s*(DOCTYPE|ENTITY)", xml_text, _re.IGNORECASE):
+        if _re.search(r"<!\s*(DOCTYPE|ENTITY|ELEMENT|ATTLIST)", xml_text, _re.IGNORECASE):
             raise ProwlarrError("untrusted XML contains DTD or entity declaration")
     except ProwlarrError:
         raise
@@ -631,7 +658,7 @@ def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
             attrs = enclosure.attrib if enclosure is not None else {}
             try:
                 size = int(float((attrs.get("length") or "0").replace(",", "").strip() or 0))
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 size = 0
             raw_url = (attrs.get("url") or "").strip()
             magnet_url = _first_attr(item, "torznab:attr", name="magneturl")

@@ -101,10 +101,20 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     else:
                         login_data = await r.json()
                 break
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError,
+                    aiohttp.ClientPayloadError, aiohttp.ClientOSError) as e:
                 if attempt == 2:
                     raise AuthError(
                         f"deluge login unreachable at {self._cfg.host}: {e}"
+                    ) from e
+                await asyncio.sleep(0.5 * (2 ** attempt))
+            except aiohttp.ContentTypeError as e:
+                # Non-JSON login body (proxy error page, captive portal):
+                # retry like a transport blip, but say what it was.
+                if attempt == 2:
+                    raise AuthError(
+                        f"deluge login at {self._cfg.host} returned "
+                        f"non-JSON body: {e}"
                     ) from e
                 await asyncio.sleep(0.5 * (2 ** attempt))
         if login_status >= 400:
@@ -590,7 +600,20 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 )
                 results.append(res)
         elif urls:
+            from urllib.parse import urlsplit as _us
             for u in urls:
+                try:
+                    _p = _us(u)
+                except Exception:
+                    raise ValueError(f"deluge add_torrent_url refusing unparsable URL: {u!r}")
+                if _p.scheme not in ("http", "https", "magnet"):
+                    raise ValueError(
+                        f"deluge add_torrent_url refusing scheme "
+                        f"{_p.scheme!r} (file:// etc. would hand daemon-local "
+                        f"paths to the VPS1 daemon)")
+                if _p.scheme in ("http", "https") and not _p.hostname:
+                    raise ValueError(
+                        f"deluge add_torrent_url refusing URL without host: {u!r}")
                 res = await self._rpc("core.add_torrent_url", [u, opts])
                 results.append(res)
         else:
@@ -644,24 +667,46 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             log.warning("deluge set_torrent_file_priorities failed for %s: %s", torrent_hash, e)
             raise RuntimeError(f"deluge set_file_priorities failed for {torrent_hash}: {e}") from e
 
+    async def _not_found_is_gone(self, op: str, torrent_hash: str, coro) -> None:
+        """Idempotent ops: an already-gone torrent is success (qB 404 parity).
+
+        forget.py records errors and retries on already-gone rows; without
+        this every double-delete/pause of a vanished torrent is a loud
+        error instead of a no-op.
+        """
+        try:
+            await coro
+        except Exception as e:
+            _msg = f"{e}".lower()
+            if "no such torrent" in _msg or "unknown torrent" in _msg or "invalid torrent" in _msg:
+                log.info("deluge %s %s already gone; treating as success",
+                         op, torrent_hash[:10])
+                return
+            raise
+
     async def pause(self, torrent_hash: str) -> None:
         self._invalidate_scan_cache()
-        await self._rpc("core.pause_torrent", [torrent_hash])
+        await self._not_found_is_gone(
+            "pause", torrent_hash,
+            self._rpc("core.pause_torrent", [torrent_hash]))
 
     async def resume(self, torrent_hash: str) -> None:
         self._invalidate_scan_cache()
-        await self._rpc("core.resume_torrent", [torrent_hash])
+        await self._not_found_is_gone(
+            "resume", torrent_hash,
+            self._rpc("core.resume_torrent", [torrent_hash]))
 
     async def delete(self, torrent_hash: str, *, delete_files: bool = False) -> None:
         self._invalidate_scan_cache()
-        await self._rpc(
-            "core.remove_torrent",
-            [torrent_hash, bool(delete_files)],
-        )
+        await self._not_found_is_gone(
+            "delete", torrent_hash,
+            self._rpc("core.remove_torrent", [torrent_hash, bool(delete_files)]))
 
     async def recheck(self, torrent_hash: str) -> None:
         self._invalidate_scan_cache()
-        await self._rpc("core.force_recheck", [torrent_hash])
+        await self._not_found_is_gone(
+            "recheck", torrent_hash,
+            self._rpc("core.force_recheck", [torrent_hash]))
 
     # ---- deluge-specific ----
 

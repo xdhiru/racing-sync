@@ -125,6 +125,10 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 chunk_params["hashes"] = "|".join(chunk)
                 data = await self._request_json(
                     "GET", "/api/v2/torrents/info", params=chunk_params)
+                if isinstance(data, dict):
+                    # Error envelope, not a list: no rows to yield.
+                    log.warning("qB list_torrents unexpected dict payload; skipping chunk")
+                    continue
                 for row in data:
                     try:
                         out.append(_torrent_from_qb(row))
@@ -137,6 +141,9 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         data = await self._request_json(
             "GET", "/api/v2/torrents/info", params=params)
         torrents: list[Torrent] = []
+        if isinstance(data, dict):
+            log.warning("qB list_torrents unexpected dict payload; returning empty")
+            return []
         for row in data:
             try:
                 torrents.append(_torrent_from_qb(row))
@@ -238,6 +245,13 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             data.add_field("urls", "\n".join(urls))
         if torrent_files:
             for idx, blob in enumerate(torrent_files):
+                try:
+                    _n = len(blob or b"")
+                except Exception:
+                    _n = 0
+                if _n > 20 * 1024 * 1024:
+                    raise ValueError(
+                        "torrent payload exceeds 20 MiB; refusing")
                 fname = f"torrent_{idx}.torrent"
                 data.add_field(
                     "torrents",
@@ -366,8 +380,9 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             prio_to_ids.setdefault(prio, []).append(str(idx))
 
         if not prio_to_ids:
-            log.warning("set_file_priorities: no valid files to update for %s", torrent_hash)
-            return
+            raise ValueError(
+                f"set_file_priorities: no valid files to update for {torrent_hash} "
+                "(caller would otherwise download unfiltered and blow the SSD budget)")
 
         for prio, ids in prio_to_ids.items():
             data = aiohttp.FormData()
@@ -524,13 +539,13 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
     def _num(value: object, default: int = 0) -> int:
         try:
             return int(float(value or 0))  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return default
 
     def _fnum(value: object, default: float = 0.0) -> float:
         try:
             return float(value or 0.0)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return default
 
     return Torrent(
