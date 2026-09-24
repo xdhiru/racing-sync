@@ -958,3 +958,148 @@ async def test_reconcile_adoption_carries_exported_blob(tmp_path: Path):
     dest.export_torrent.assert_called_with("adopted_hash")
 
 
+@pytest.mark.anyio
+async def test_snapshot_adopts_without_per_row_rpcs(tmp_path: Path):
+    """Snapshot-only adoption is RPC-free per row (fast serve path)."""
+    from racing_sync.recovery import _reconcile_snapshot
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    (fuse_dir / "Snap.Movie.2026.mkv").write_bytes(b"s" * 100)
+    ssd_dir = tmp_path / "ssd"
+    ssd_dir.mkdir()
+
+    store = StateStore(tmp_path / "test.db")
+    cfg = MagicMock()
+    cfg.dest.save_path = ssd_dir
+    cfg.ssd.path = ssd_dir
+    cfg.rclone.fuse.mount = fuse_dir
+    cfg.rclone.fuse.mount_unsorted = fuse_dir / "unsorted"
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [
+        Torrent(
+            hash="snap_hash",
+            name="Snap.Movie.2026",
+            size_bytes=100,
+            save_path=str(fuse_dir),
+            category="racing",
+            progress=1.0,
+            state="seeding",
+        ),
+    ]
+
+    try:
+        rpt = await _reconcile_snapshot(cfg, dest=dest, store=store,
+                                        verify=False)
+        assert "snap_hash" in rpt.adopted
+        t = store.get("snap_hash")
+        assert t is not None
+        assert t.state == State.DONE
+        # Optimistic: unverified, unknown kind, no blob — and no per-row
+        # RPCs were spent deciding that.
+        assert t.fuse_verified == 0
+        assert t.classification_kind == "unknown"
+        assert t.cross_seed_blob == b""
+        assert dest.get_torrent_files.await_count == 0
+        dest.export_torrent.assert_not_called()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_verify_pass_verifies_snapshot_adoption(tmp_path: Path):
+    """Background verify stamps fuse-verified and heals kind/blob."""
+    from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.recovery import _reconcile_snapshot, reconcile_verify
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    (fuse_dir / "Good.Movie.2026.mkv").write_bytes(b"g" * 100)
+    ssd_dir = tmp_path / "ssd"
+    ssd_dir.mkdir()
+
+    store = StateStore(tmp_path / "test.db")
+    cfg = MagicMock()
+    cfg.dest.save_path = ssd_dir
+    cfg.ssd.path = ssd_dir
+    cfg.rclone.fuse.mount = fuse_dir
+    cfg.rclone.fuse.mount_unsorted = fuse_dir / "unsorted"
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [
+        Torrent(
+            hash="good_hash",
+            name="Good.Movie.2026",
+            size_bytes=100,
+            save_path=str(fuse_dir),
+            category="racing",
+            progress=1.0,
+            state="seeding",
+        ),
+    ]
+    dest.get_torrent_files.return_value = [
+        TorrentFile(name="Good.Movie.2026.mkv", size_bytes=100, progress=1.0),
+    ]
+    dest.export_torrent = AsyncMock(return_value=b"d4:infod4:name4:goodee")
+
+    try:
+        await _reconcile_snapshot(cfg, dest=dest, store=store, verify=False)
+        assert store.get("good_hash").fuse_verified == 0
+        counts = await reconcile_verify(cfg, dest=dest, store=store)
+        assert counts["verified"] == 1
+        t = store.get("good_hash")
+        assert t.fuse_verified == 1
+        assert t.cross_seed_blob == b"d4:infod4:name4:goodee"
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_verify_pass_demotes_ssd_backed_ghost(tmp_path: Path):
+    """Fuse-claimed ghost with bytes on SSD demotes to MOVING in background."""
+    from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.recovery import _reconcile_snapshot, reconcile_verify
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    ssd_dir = tmp_path / "ssd"
+    ssd_dir.mkdir()
+    (ssd_dir / "Stranded.Movie.2026.mkv").write_bytes(b"s" * 100)
+
+    store = StateStore(tmp_path / "test.db")
+    cfg = MagicMock()
+    cfg.dest.save_path = ssd_dir
+    cfg.ssd.path = ssd_dir
+    cfg.rclone.fuse.mount = fuse_dir
+    cfg.rclone.fuse.mount_unsorted = fuse_dir / "unsorted"
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [
+        Torrent(
+            hash="stranded_hash",
+            name="Stranded.Movie.2026",
+            size_bytes=100,
+            save_path=str(fuse_dir),
+            category="racing",
+            progress=1.0,
+            state="seeding",
+        ),
+    ]
+    dest.get_torrent_files.return_value = [
+        TorrentFile(name="Stranded.Movie.2026.mkv", size_bytes=100, progress=1.0),
+    ]
+
+    try:
+        await _reconcile_snapshot(cfg, dest=dest, store=store, verify=False)
+        t = store.get("stranded_hash")
+        assert t is not None and t.state == State.DONE
+        counts = await reconcile_verify(cfg, dest=dest, store=store)
+        assert counts["demoted"] == 1
+        t = store.get("stranded_hash")
+        assert t.state == State.MOVING
+        assert t.save_path == str(ssd_dir)
+    finally:
+        store.close()
+
+
