@@ -24,7 +24,8 @@ import shutil
 from pathlib import Path
 
 from .coordinator_content import watch_election_winner
-from .rclone_ops import validate_safe_delete_path, wipe_local_tree
+from .rclone_ops import wipe_local_tree
+from .safety import state_db_parent_refusal, validate_safe_delete_path
 from .state import State
 
 log = logging.getLogger(__name__)
@@ -420,15 +421,12 @@ async def _forget_one(
         for p in local_paths:
             try:
                 if blob_dir is not None and Path(p) == blob_dir:
-                    # Blob cache: guarded by the state.db parent, not SSD bases.
-                    if state_parent is None:
-                        raise ValueError("state.db parent unknown; refusing blob cache delete")
-                    try:
-                        if state_parent.resolve() == Path(state_parent.anchor):
-                            raise ValueError(
-                                "state.db at filesystem root; refusing blob cache delete")
-                    except OSError as e:
-                        raise ValueError(f"cannot resolve state.db parent: {e}")
+                    # Blob cache: guarded by the state.db parent via the
+                    # central refusal (root/system/checkout state_db can
+                    # never launder a cache wipe through forget).
+                    _refusal = state_db_parent_refusal(cfg)
+                    if _refusal is not None:
+                        raise ValueError(f"{_refusal}; refusing blob cache delete")
                     validate_safe_delete_path(Path(p), base_dir=state_parent)
                     if Path(p).is_symlink():
                         await asyncio.to_thread(Path(p).unlink)
