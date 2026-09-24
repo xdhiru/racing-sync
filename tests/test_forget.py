@@ -34,6 +34,83 @@ async def test_candidate_local_paths_dedups_top_dir(tmp_path: Path):
     assert skipped == []
 
 
+@pytest.mark.anyio
+async def test_candidate_local_paths_unions_all_entries(tmp_path: Path):
+    """Multi-entry rows (repacks, injected hashes) must not orphan tops."""
+    from racing_sync.forget import _candidate_local_paths
+
+    ssd = tmp_path / "ssd"
+    (ssd / "Pack.One").mkdir(parents=True)
+    (ssd / "Pack.Two").mkdir(parents=True)
+    dest = FakeDest()
+    dest.seed("a" * 40, str(ssd),
+              [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
+    dest.seed("b" * 40, str(ssd),
+              [TorrentFile(name="Pack.Two/b.mkv", size_bytes=10)])
+    cfg = MagicMock()
+    cfg.ssd.path = ssd
+    cfg.dest.save_path = ssd
+    row = MagicMock()
+    row.save_path = str(ssd)
+
+    paths, skipped = await _candidate_local_paths(
+        cfg, dest, row, ["a" * 40, "b" * 40])
+    assert [str(p) for p in paths] == [
+        str(ssd / "Pack.One"), str(ssd / "Pack.Two")]
+    assert skipped == []
+
+
+@pytest.mark.anyio
+async def test_candidate_local_paths_per_entry_save_path(tmp_path: Path):
+    """Entries with different save_paths resolve tops against their own."""
+    from racing_sync.forget import _candidate_local_paths
+
+    ssd = tmp_path / "ssd"
+    alt = tmp_path / "alt"
+    (ssd / "Pack.One").mkdir(parents=True)
+    (alt / "Pack.Alt").mkdir(parents=True)
+    dest = FakeDest()
+    dest.seed("a" * 40, str(ssd),
+              [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
+    dest.seed("b" * 40, str(alt),
+              [TorrentFile(name="Pack.Alt/b.mkv", size_bytes=10)])
+    cfg = MagicMock()
+    cfg.ssd.path = ssd
+    cfg.dest.save_path = ssd
+    row = MagicMock()
+    row.save_path = str(ssd)
+
+    # alt is outside the SSD bases → its top is skipped, never wiped.
+    paths, skipped = await _candidate_local_paths(
+        cfg, dest, row, ["a" * 40, "b" * 40])
+    assert [str(p) for p in paths] == [str(ssd / "Pack.One")]
+    assert len(skipped) == 1 and "Pack.Alt" in skipped[0]
+
+
+@pytest.mark.anyio
+async def test_candidate_local_paths_dedups_shared_top(tmp_path: Path):
+    """Two entries sharing one top yield one path (single wipe)."""
+    from racing_sync.forget import _candidate_local_paths
+
+    ssd = tmp_path / "ssd"
+    (ssd / "Show").mkdir(parents=True)
+    dest = FakeDest()
+    dest.seed("a" * 40, str(ssd),
+              [TorrentFile(name="Show/ep1.mkv", size_bytes=10)])
+    dest.seed("b" * 40, str(ssd),
+              [TorrentFile(name="Show/ep2.mkv", size_bytes=10)])
+    cfg = MagicMock()
+    cfg.ssd.path = ssd
+    cfg.dest.save_path = ssd
+    row = MagicMock()
+    row.save_path = str(ssd)
+
+    paths, skipped = await _candidate_local_paths(
+        cfg, dest, row, ["a" * 40, "b" * 40])
+    assert [str(p) for p in paths] == [str(ssd / "Show")]
+    assert skipped == []
+
+
 class FakeDest:
     """Minimal dest client double backed by real tmp-dir files."""
 
