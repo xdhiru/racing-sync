@@ -239,7 +239,8 @@ async def test_grow_beyond_physical_disk_fails(tmp_path):
     assert coord._ssd_reserved["p" * 40] == 12_000
 
 
-def test_prune_stale_reaps_forgotten_wait_and_park_keys(tmp_path):
+@pytest.mark.anyio
+async def test_prune_stale_reaps_forgotten_wait_and_park_keys(tmp_path):
     """Forget bypasses transition pops: the prune reaps orphaned hints."""
     store = StateStore(tmp_path / "s.db")
     try:
@@ -250,7 +251,7 @@ def test_prune_stale_reaps_forgotten_wait_and_park_keys(tmp_path):
         coord._waiting_disk_next_check = {"q" * 40: 1.0, "z" * 40: 2.0}
         coord._moving_parks = {"q" * 40: 3}
         coord._ssd_reserved = {}
-        coord._ssd_prune_stale()
+        await coord._ssd_prune_stale()
         # Live WAITING_DISK row keeps its hint; gone rows and wrong-state
         # counters are reaped.
         assert coord._waiting_disk_next_check == {"q" * 40: 1.0}
