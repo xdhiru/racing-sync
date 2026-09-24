@@ -922,6 +922,10 @@ class APIConfig(BaseModel):
 class GeneralConfig(BaseModel):
     source_poll_interval: int = Field(default=30, ge=5)
     dest_poll_interval: int = Field(default=15, ge=5)
+    # Per-RPC timeout budget (seconds) for client calls (qB/Deluge/fuse
+    # stat, Prowlarr, SFTP): a hung peer degrades one operation into a
+    # park-and-retry instead of wedging a worker or the tick forever.
+    client_rpc_timeout_seconds: int = Field(default=30, ge=5, le=300)
     state_db: Path = Path("/var/lib/racing-sync/state.db")
     log_dir: Path = Path("/var/log/racing-sync")
     log_retention_days: int = Field(default=14, ge=1)
