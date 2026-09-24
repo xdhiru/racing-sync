@@ -509,6 +509,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     pass
 
             self._coordinator_started = True
+            try:
+                self._started_at = time.monotonic()
+            except Exception:
+                pass
         except BaseException:
             # Roll back any sessions that were already opened, so we
             # don't leak aiohttp "Unclosed client session" warnings.
@@ -617,11 +621,26 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             await tg.stop()
         api_task = getattr(self, "_api_task", None)
         if api_task is not None:
-            api_task.cancel()
+            # Graceful first: let in-flight requests drain via should_exit
+            # (a bare cancel kills them and lingers sockets).
             try:
-                await api_task
-            except (asyncio.CancelledError, Exception):
+                _srv = getattr(self, "_api_server", None)
+                if _srv is not None:
+                    _srv.should_exit = True
+            except Exception:
                 pass
+            try:
+                await asyncio.wait_for(api_task, timeout=10.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                try:
+                    if not api_task.done():
+                        api_task.cancel()
+                except Exception:
+                    pass
+                try:
+                    await api_task
+                except (asyncio.CancelledError, Exception):
+                    pass
         if self.prowlarr is not None:
             try:
                 await self.prowlarr.close()

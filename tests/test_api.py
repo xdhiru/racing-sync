@@ -343,3 +343,162 @@ def test_auth_brute_force_throttled_and_logged():
     api_mod._AUTH_FAILURES.clear()
 
 
+def _api_coord(**kw):
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(enabled=True, api_token="secret", trust_nginx_header=False)
+    coord = MagicMock()
+    coord.cfg = cfg
+    coord.store.all_active.return_value = []
+    coord.source_client = MagicMock()
+    coord.dest_client = MagicMock()
+    for k, v in kw.items():
+        setattr(coord, k, v)
+    return coord, cfg
+
+
+def test_healthz_needs_no_auth():
+    coord, _cfg = _api_coord()
+    app = build_app(coord)
+    client = TestClient(app)
+    resp = client.get("/healthz")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
+def test_readyz_reports_checks_when_authed():
+    coord, _cfg = _api_coord()
+    app = build_app(coord)
+    client = TestClient(app)
+    resp = client.get("/readyz", headers={"X-Api-Token": "secret"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ready"] is True
+    assert data["checks"]["state_db"] is True
+    assert client.get("/readyz").status_code == 401
+
+
+def test_metrics_exposes_state_counts():
+    from racing_sync.state import State, TorrentState
+
+    coord, _cfg = _api_coord()
+    coord.store.all_active.return_value = [
+        TorrentState(source_infohash="a" * 40, state=State.MOVING),
+        TorrentState(source_infohash="b" * 40, state=State.MOVING),
+        TorrentState(source_infohash="c" * 40, state=State.QUEUED),
+    ]
+    coord._tasks = set()
+    coord._started_at = 0.0
+    app = build_app(coord)
+    client = TestClient(app)
+    resp = client.get("/metrics", headers={"X-Api-Token": "secret"})
+    assert resp.status_code == 200
+    body = resp.text
+    assert "racing_sync_uptime_seconds" in body
+    assert 'racing_sync_rows{state="moving"} 2' in body
+    assert 'racing_sync_rows{state="queued"} 1' in body
+    assert client.get("/metrics").status_code == 401
+
+
+def test_api_tls_validator_requires_pair_and_files(tmp_path):
+    import pydantic
+
+    cert = tmp_path / "c.pem"
+    cert.write_text("x")
+    # Key without cert rejected.
+    with pytest.raises(pydantic.ValidationError):
+        APIConfig(enabled=True, api_token="secret", tls_keyfile=str(cert))
+    # Missing files rejected when enabled.
+    with pytest.raises(pydantic.ValidationError):
+        APIConfig(enabled=True, api_token="secret",
+                  tls_certfile=str(cert), tls_keyfile=str(tmp_path / "nope.pem"))
+    # Disabled: not validated (placeholder-friendly).
+    APIConfig(enabled=False, tls_keyfile=str(tmp_path / "nope.pem"))
+
+
+def test_serve_passes_tls_opts_to_uvicorn():
+    import sys
+    from unittest.mock import MagicMock as MM
+
+    from racing_sync import api as api_mod
+
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(enabled=False, tls_certfile="/c.pem", tls_keyfile="/k.pem")
+    coord = MM()
+    coord.cfg = cfg
+    seen = {}
+
+    class FakeConfig:
+        def __init__(self, app, **kw):
+            seen.update(kw)
+
+    class FakeServer:
+        def __init__(self, config):
+            seen["server_config"] = config
+
+        async def serve(self):
+            return None
+
+    fake_uvicorn = MM()
+    fake_uvicorn.Config = FakeConfig
+    fake_uvicorn.Server = FakeServer
+    _real_uvicorn = sys.modules.get("uvicorn")
+    sys.modules["uvicorn"] = fake_uvicorn
+    try:
+        import asyncio
+        asyncio.run(api_mod.serve(coord))
+    finally:
+        if _real_uvicorn is not None:
+            sys.modules["uvicorn"] = _real_uvicorn
+        else:
+            sys.modules.pop("uvicorn", None)
+    assert seen.get("ssl_certfile") == "/c.pem"
+    assert seen.get("ssl_keyfile") == "/k.pem"
+    assert getattr(coord, "_api_server", None) is not None
+
+
+@pytest.mark.anyio
+async def test_shutdown_prefers_graceful_exit():
+    import asyncio
+
+    from conftest import make_coordinator
+
+    coord = make_coordinator()
+    coord._shutdown_done = False
+    coord._coordinator_started = False
+    coord.prowlarr = None
+    coord.sftp = None
+    coord._tg = None
+    server = MagicMock()
+    coord._api_server = server
+
+    done = asyncio.Event()
+
+    async def _serve():
+        await done.wait()
+        return "drained"
+
+    task = asyncio.ensure_future(_serve())
+    coord._api_task = task
+    # Simulate the server draining right after should_exit.
+    async def _drain():
+        await asyncio.sleep(0.05)
+        server.should_exit = True
+        done.set()
+    asyncio.ensure_future(_drain())
+    await coord.shutdown()
+    assert task.done() and not task.cancelled()
+    assert task.result() == "drained"
+
+    # Hung server: falls back to cancel instead of hanging shutdown.
+    coord._shutdown_done = False
+
+    async def _hang():
+        await asyncio.sleep(30)
+
+    task2 = asyncio.ensure_future(_hang())
+    coord._api_task = task2
+    with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
+        await coord.shutdown()
+    assert task2.cancelled() or task2.done()
+
+

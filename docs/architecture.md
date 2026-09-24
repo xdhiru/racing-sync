@@ -25,7 +25,7 @@ src/racing_sync/
   coordinator_errors.py  Retryable WebUI / batch-move error contract
   coordinator_content.py  Stateless helpers (normalize, grace, notify filter)
   telegram_bot.py     Per-torrent detail cards + active-tasks list
-  api.py              Optional FastAPI control plane
+  api.py              Optional FastAPI control plane (/healthz + authed /readyz, /metrics, state ops)
   clients/
     abstract.py       TorrentClient ABC + dataclasses
     http_base.py      aiohttp + nginx auth helper
