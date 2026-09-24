@@ -1005,6 +1005,70 @@ async def test_qbittorrent_add_torrent_handles_duplicates_and_hex_validation():
     assert res_hex.accepted is True
 
 
+@pytest.mark.anyio
+async def test_qbittorrent_add_magnet_hash_resolution():
+    """Magnet btih decoding: hex-first 32-char, v2 64-char v1 fallback."""
+    import base64
+
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+
+    class DummyResponseContext:
+        def __init__(self, text):
+            self.text = text
+
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.text = AsyncMock(return_value=self.text)
+            return resp
+
+        async def __aexit__(self, *args):
+            pass
+
+    # 1. 32-char all-hex magnet must NOT be base32-misdecoded.
+    client.request = AsyncMock(return_value=DummyResponseContext("Fails."))
+    seen = []
+
+    async def fake_get(h):
+        seen.append(h)
+        t = MagicMock()
+        return t
+
+    client.get_torrent = fake_get
+    hex32 = "ab12cd34ef56ab12cd34ef56ab12cd34ef56"[:32]
+    res = await client.add_torrent(
+        urls=[f"magnet:?xt=urn:btih:{hex32}"], save_path="/downloads")
+    assert res.accepted is True
+    assert res.hash == hex32.lower()
+    assert seen == [hex32.lower()]
+
+    # 2. Genuine 32-char base32 still decodes to 20 bytes.
+    raw20 = bytes(range(20))
+    b32 = base64.b32encode(raw20).decode().rstrip("=")
+    assert len(b32) == 32 and not all(
+        c in "0123456789ABCDEF" for c in b32)
+    seen.clear()
+    res = await client.add_torrent(
+        urls=[f"magnet:?xt=urn:btih:{b32}"], save_path="/downloads")
+    assert res.accepted is True
+    assert res.hash == raw20.hex()
+
+    # 3. 64-char v2 hash: full lookup first, v1-prefix fallback on miss.
+    v2 = "c" * 64
+    calls = []
+
+    async def fake_get2(h):
+        calls.append(h)
+        return MagicMock() if h == v2[:40] else None
+
+    client.get_torrent = fake_get2
+    res = await client.add_torrent(
+        urls=[f"magnet:?xt=urn:btih:{v2}"], save_path="/downloads")
+    assert res.accepted is True
+    assert res.hash == v2[:40]
+    assert calls == [v2, v2[:40]]
+
+
 def _deluge_client():
     cfg = SourceConfig(
         type="deluge",

@@ -232,6 +232,70 @@ def test_parse_newznab_blocks_dtd_entity_expansion():
         _parse_newznab(malicious_xml, idx)
 
 
+def test_parse_newznab_blocks_obfuscated_doctype():
+    """Case/whitespace-obfuscated DTD must still be rejected."""
+    from racing_sync.prowlarr import _parse_newznab, ProwlarrError, Indexer
+
+    idx = Indexer(1, "Indexer", "torrent", True, [])
+    for variant in (
+        "<!DocType x>",
+        "<!  DOCTYPE x>",
+        "<!ENTITY x 'y'>",
+        "<!  entity x 'y'>",
+    ):
+        xml = f'<?xml version="1.0"?>{variant}<rss><channel/></rss>'
+        with pytest.raises(ProwlarrError, match="DTD or entity"):
+            _parse_newznab(xml, idx)
+
+
+@pytest.mark.anyio
+async def test_search_indexer_refuses_oversize_feed():
+    """A bloated feed is refused before decode, not OOMed."""
+    from unittest.mock import MagicMock
+    from racing_sync.prowlarr import (
+        Indexer, ProwlarrClient, ProwlarrError, _MAX_FEED_BYTES)
+
+    cfg = MagicMock()
+    cfg.base_url = "http://localhost:9696"
+    cfg.api_key = "k"
+    cfg.timeout_seconds = 30.0
+    cfg.max_results = 100
+    cfg.should_skip_title = MagicMock(return_value=False)
+    client = ProwlarrClient(cfg)
+
+    class Ctx:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+            self.status = 200
+            self.headers = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        @property
+        def content(self):
+            outer = self
+
+            class Reader:
+                async def read(self, n=-1):
+                    return outer._payload
+
+            return Reader()
+
+    big = b"x" * (_MAX_FEED_BYTES + 16)
+    session = MagicMock()
+    session.get = MagicMock(return_value=Ctx(big))
+    client._session = session
+    with pytest.raises(ProwlarrError, match="exceeds"):
+        await client.search_indexer(Indexer(1, "X", "t", True, []), "q")
+
+
 def test_parse_newznab_sanitizes_unsafe_download_url():
     from racing_sync.prowlarr import _parse_newznab, Indexer
 

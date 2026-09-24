@@ -73,6 +73,10 @@ def _scrub_url(url: str) -> str:
 
 log = logging.getLogger(__name__)
 
+# Upper bound for one Newznab feed payload (10 MiB): a bloated or
+# malicious indexer must not OOM the daemon via an uncapped r.text().
+_MAX_FEED_BYTES = 10 * 1024 * 1024
+
 
 @dataclass(slots=True)
 class Indexer:
@@ -295,7 +299,26 @@ class ProwlarrClient:
             try:
                 async with self._session.get(path, params=params, headers=self._auth_headers) as r:
                     r.raise_for_status()
-                    text = await r.text()
+                    # Size-cap the feed before decoding: a bloated or
+                    # malicious indexer must not OOM the daemon. Non-byte
+                    # yields (test doubles) fall back to text().
+                    try:
+                        raw = await r.content.read(_MAX_FEED_BYTES + 1)
+                    except Exception:
+                        raw = None
+                    if isinstance(raw, (bytes, bytearray)):
+                        if len(raw) > _MAX_FEED_BYTES:
+                            raise ProwlarrError(
+                                f"prowlarr feed from {indexer.name!r} exceeds "
+                                f"{_MAX_FEED_BYTES} bytes; refusing")
+                        try:
+                            text = bytes(raw).decode("utf-8", errors="replace")
+                        except Exception as e:
+                            raise ProwlarrError(
+                                f"prowlarr feed from {indexer.name!r} undecodable: {e}"
+                            ) from e
+                    else:
+                        text = await r.text()
                 break
             except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
                 last_exc = e
@@ -556,18 +579,31 @@ def _findtext_ns(item: Any, name: str) -> str:
 
 
 def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
-    """Tiny newznab XML parser. Avoids extra deps; prowlarr responses are simple."""
-    import xml.etree.ElementTree as ET
+    """Tiny newznab XML parser (defusedxml when available, stdlib fallback)."""
+    try:
+        from defusedxml.ElementTree import fromstring as _fromstring
+    except ImportError:
+        import xml.etree.ElementTree as _ET
 
-    # Guard against XXE and entity expansion attacks
-    lowered = xml_text.lower()
-    if "<!doctype" in lowered or "<!entity" in lowered:
-        raise ProwlarrError("untrusted XML contains DTD or entity declaration")
+        _fromstring = _ET.fromstring
+
+    # Reject DTD/entity declarations before parsing: stdlib ElementTree
+    # expands internal entities without limits (billion-laughs), and the
+    # old substring check was case/whitespace-fragile. defusedxml raises
+    # EntitiesForbidden instead when one slips through.
+    try:
+        import re as _re
+        if _re.search(r"<!\s*(DOCTYPE|ENTITY)", xml_text, _re.IGNORECASE):
+            raise ProwlarrError("untrusted XML contains DTD or entity declaration")
+    except ProwlarrError:
+        raise
+    except Exception:
+        pass
 
     hits: list[TorrentHit] = []
     try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError as e:
+        root = _fromstring(xml_text)
+    except Exception as e:  # noqa: BLE001 (ParseError or EntitiesForbidden)
         raise ProwlarrError(f"invalid newznab response: {e}") from e
 
     channel = root.find("channel")

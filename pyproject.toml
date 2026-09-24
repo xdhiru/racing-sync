@@ -15,6 +15,7 @@ dependencies = [
     "pydantic>=2.5",
     "python-telegram-bot>=22.0",
     "paramiko>=3.4",
+    "defusedxml>=0.7",
 ]
 
 [project.optional-dependencies]
