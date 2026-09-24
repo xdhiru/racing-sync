@@ -7,7 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from racing_sync.safety import (
+    DaemonLock,
+    backup_db,
     clear_dir_children,
+    daemon_lock_path,
     fuse_roots,
     is_safe_dir_to_clear,
     overlaps_fuse,
@@ -91,3 +94,52 @@ def test_clear_dir_children_never_root_itself(tmp_path: Path):
     assert root.is_dir()
     assert list(root.iterdir()) == []
     assert any("deleted log entry" in ln for ln in lines)
+
+
+def test_daemon_lock_exclusive_and_released(tmp_path: Path):
+    from racing_sync.state import StateStore
+
+    cfg = _cfg(state_db=str(tmp_path / "state.db"))
+    lock_path = daemon_lock_path(cfg)
+    assert lock_path is not None and lock_path.parent == tmp_path
+
+    first, second = DaemonLock(lock_path), DaemonLock(lock_path)
+    assert first.acquire() is True
+    assert first.acquire() is True  # idempotent
+    # Second holder (a CLI in another process) is refused while held.
+    assert second.acquire() is False
+    first.release()
+    assert second.acquire() is True
+    second.release()
+    # Releasing twice is safe.
+    second.release()
+
+
+def test_backup_db_snapshot_and_prune(tmp_path: Path):
+    from racing_sync.state import StateStore
+
+    db = tmp_path / "state.db"
+    store = StateStore(db)
+    try:
+        store.set_meta("k", "v")
+    finally:
+        store.close()
+    cfg = _cfg(state_db=str(db))
+
+    first = backup_db(cfg, tag="pre-reset")
+    assert first is not None and Path(first).is_file()
+    # A snapshot taken through WAL reads back the data.
+    from racing_sync.state import StateStore as S2
+    probe = S2(Path(first))
+    try:
+        assert probe.get_meta("k") == "v"
+    finally:
+        probe.close()
+    # Missing DB → None (nothing to back up).
+    assert backup_db(_cfg(state_db=str(tmp_path / "nope.db"))) is None
+    # Prune keeps the newest 7.
+    for i in range(9):
+        p = backup_db(cfg, tag=f"t{i}")
+        assert p is not None
+    survivors = sorted(db.parent.glob("state.db.*.bak"))
+    assert len(survivors) == 7

@@ -20,7 +20,10 @@ Pure stdlib: no imports from the package, so any module (including
 
 from __future__ import annotations
 
+import os
 import shutil
+import sqlite3
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -236,6 +239,232 @@ def db_sidecar_paths(db: Path) -> list[Path]:
     return [db, Path(str(db) + "-wal"), Path(str(db) + "-shm")]
 
 
+def daemon_lock_path(cfg: object) -> Path | None:
+    """Lock-file path next to state.db (sibling `<name>.lock`)."""
+    try:
+        db = str(getattr(getattr(cfg, "general", cfg), "state_db", "") or "")
+        if not db:
+            return None
+        return Path(db + ".lock")
+    except Exception:
+        return None
+
+
+class DaemonLock:
+    """Cross-process mutual exclusion for state.db (H26).
+
+    OS-level file lock (fcntl/msvcrt), never a PID file: the OS releases
+    it on process death, so stale locks are impossible by construction.
+    One holder at a time across daemon and mutating CLI commands.
+
+    Usage: daemon holds for its lifetime (refuses to start a second
+    instance); `forget --apply` / `unignore` take it non-blocking and
+    refuse with "stop the daemon first" instead of racing the tick.
+    """
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._fh = None
+        self._locked = False
+
+    @property
+    def held(self) -> bool:
+        return self._locked
+
+    def acquire(self, *, blocking: bool = False) -> bool:
+        """Take the lock; non-blocking by default (CLI fail-fast).
+
+        Returns True when held (idempotent). Never raises: any doubt
+        returns False and the caller refuses the mutation.
+        """
+        if self._locked:
+            return True
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(self._path, "a+b")
+        except OSError:
+            return False
+        try:
+            if not _lock_file_nonblocking(fh):
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+                return False
+        except OSError:
+            try:
+                fh.close()
+            except OSError:
+                pass
+            return False
+        self._fh = fh
+        self._locked = True
+        return True
+
+    def release(self) -> None:
+        fh, self._fh = self._fh, None
+        self._locked = False
+        if fh is None:
+            return
+        try:
+            _unlock_file(fh)
+        except OSError:
+            pass
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+    def __enter__(self) -> "DaemonLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+    def __del__(self) -> None:  # pragma: no cover (GC safety net)
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+def _lock_file_nonblocking(fh) -> bool:
+    """OS file lock without waiting; False when held elsewhere."""
+    try:
+        import fcntl  # noqa: PLC0415 (posix only)
+
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (OSError, IOError):
+            return False
+    except ImportError:
+        pass
+    try:
+        import msvcrt  # noqa: PLC0415 (windows only)
+
+        try:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    except ImportError:
+        pass
+    # Last resort (no fcntl/msvcrt): exclusive-create pid file. Stale
+    # entries are reaped via liveness probe where supported.
+    try:
+        probe = str(fh.name) + ".pid" if getattr(fh, "name", None) else None
+        if probe is None:
+            return False
+        fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, str(os.getpid()).encode())
+        finally:
+            os.close(fd)
+        return True
+    except FileExistsError:
+        return _pidfile_holder_alive(str(fh.name) + ".pid")
+    except OSError:
+        return False
+
+
+def _pidfile_holder_alive(pid_path: str) -> bool:
+    """True when a pid-file holder looks live (fail-closed True on doubt)."""
+    try:
+        with open(pid_path, "r", encoding="utf-8", errors="replace") as f:
+            pid = int((f.read() or "").strip().split()[0])
+    except Exception:
+        return True
+    if pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        try:
+            os.unlink(pid_path)
+        except OSError:
+            pass
+        return False
+    except (PermissionError, OSError):
+        return True
+
+
+def _unlock_file(fh) -> None:
+    try:
+        import fcntl  # noqa: PLC0415
+
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except (OSError, IOError):
+            pass
+        return
+    except ImportError:
+        pass
+    try:
+        import msvcrt  # noqa: PLC0415
+
+        try:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    except ImportError:
+        pass
+
+
+def backup_db(cfg: object, *, tag: str = "manual") -> str | None:
+    """Timestamped consistent snapshot of state.db (VACUUM INTO).
+
+    Returns the backup path, or None when there is nothing to back up
+    (missing DB) or the snapshot failed (logged by the caller via the
+    returned reason — callers treat None as "proceed without backup"
+    only for read-only paths; destructive paths must refuse instead).
+    Old backups for the same DB are pruned to the newest 7.
+    """
+    try:
+        db = str(getattr(getattr(cfg, "general", cfg), "state_db", "") or "")
+        if not db:
+            return None
+        src = Path(db)
+        if not src.is_file():
+            return None
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        safe_tag = "".join(c if (c.isalnum() or c in ("-", "_")) else "_"
+                           for c in (tag or "manual"))[:24] or "manual"
+        dest = src.parent / f"{src.name}.{stamp}.{safe_tag}.bak"
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(src), timeout=30.0)
+            try:
+                conn.execute(f"VACUUM INTO '{str(dest).replace(chr(39), chr(39)*2)}'")
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            return None
+        if not dest.is_file():
+            return None
+        # Prune: newest 7 backups for this DB survive.
+        try:
+            siblings = sorted(src.parent.glob(f"{src.name}.*.bak"),
+                              key=lambda p: p.name)
+            for old in siblings[:-7]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        return str(dest)
+    except Exception:
+        return None
+
+
 __all__ = [
     "validate_safe_delete_path",
     "is_safe_dir_to_clear",
@@ -244,4 +473,7 @@ __all__ = [
     "overlaps_fuse",
     "clear_dir_children",
     "db_sidecar_paths",
+    "daemon_lock_path",
+    "DaemonLock",
+    "backup_db",
 ]

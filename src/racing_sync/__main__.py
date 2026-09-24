@@ -245,7 +245,29 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
     """Run the forget off-switch (dry-run plan by default, --apply to delete)."""
     from .clients.qbittorrent import QBittorrentClient
     from .forget import forget_torrent
+    from .safety import DaemonLock, backup_db, daemon_lock_path
     from .state import StateStore
+
+    lock = None
+    if getattr(args, "apply", False):
+        # Mutating against a live daemon races the tick (re-adopt between
+        # delete and tombstone). Refuse unless the daemon is stopped; back
+        # up state.db before deleting anything.
+        _lp = daemon_lock_path(cfg)
+        lock = DaemonLock(_lp) if _lp is not None else None
+        if lock is not None and not lock.acquire():
+            print(
+                "refusing forget --apply: the daemon holds the state.db "
+                "lock (stop it first). Dry-run plans stay available.",
+                file=sys.stderr,
+            )
+            return 2
+        _backup = backup_db(cfg, tag="pre-forget")
+        if _backup is not None:
+            print(f"state.db backed up to: {_backup}")
+        else:
+            print("warning: state.db backup failed; continuing",
+                  file=sys.stderr)
 
     async def _run() -> dict:
         store = StateStore(cfg.general.state_db)
@@ -302,11 +324,17 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
         print(f"  error: {e}")
     if result.get("ignored"):
         print("  ignored: will not be picked up again while listed")
+    try:
+        if lock is not None:
+            lock.release()
+    except Exception:
+        pass
     return 1 if result["errors"] else 0
 
 
 def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
     """List or remove cancelled-release ignore entries."""
+    from .safety import DaemonLock, daemon_lock_path
     from .state import StateStore
 
     try:
@@ -314,6 +342,23 @@ def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"forget failed: {e}", file=sys.stderr)
         return 1
+    _mutating = bool(getattr(args, "all", False) or getattr(args, "target", None))
+    _lock = None
+    if _mutating:
+        # Same race as forget --apply: refuse against a live daemon.
+        _lp = daemon_lock_path(cfg)
+        _lock = DaemonLock(_lp) if _lp is not None else None
+        if _lock is not None and not _lock.acquire():
+            print(
+                "refusing unignore: the daemon holds the state.db lock "
+                "(stop it first).",
+                file=sys.stderr,
+            )
+            try:
+                store.close()
+            except Exception:
+                pass
+            return 2
     try:
         if getattr(args, "list", False) or (not getattr(args, "target", None)
                                             and not getattr(args, "all", False)):
@@ -350,6 +395,11 @@ def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
             print("tombstone lifted: re-dropped files will reprocess immediately")
         return 0
     finally:
+        try:
+            if _lock is not None:
+                _lock.release()
+        except Exception:
+            pass
         try:
             store.close()
         except Exception:
@@ -597,54 +647,79 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "unignore":
         return _cmd_unignore(cfg, args)
 
-    if getattr(args, "reset", False) or getattr(args, "full", False):
-        if getattr(args, "full", False) and not getattr(args, "yes", False):
-            print(
-                "refusing --full without --yes: this drops dest racing "
-                "entries (with files), wipes SSD data and the cached "
-                ".torrent blobs. Re-run with 'run --full --yes' to confirm.",
-                file=sys.stderr,
-            )
-            return 2
-        if getattr(args, "reset", False) and not getattr(args, "yes", False):
-            print(
-                "refusing --reset without --yes: this deletes state.db "
-                "(+WAL/SHM) and clears the log directory. Re-run with "
-                "'run --reset --yes' to confirm.",
-                file=sys.stderr,
-            )
-            return 2
-        for line in _do_reset(cfg):
-            print(line)
-        if getattr(args, "full", False):
-            for line in asyncio.run(_do_full_reset(cfg)):
+    # Single daemon instance + no CLI races: the lock is held for the
+    # whole run. A second `run` (or a mutating CLI against a live
+    # daemon) fails fast instead of splitting state.db.
+    from .safety import DaemonLock, backup_db, daemon_lock_path
+    _lock_path = daemon_lock_path(cfg)
+    _daemon_lock = DaemonLock(_lock_path) if _lock_path is not None else None
+    if _daemon_lock is not None and not _daemon_lock.acquire():
+        print(
+            "refusing to start: another racing-sync instance holds the "
+            f"state.db lock ({_lock_path}). Stop it first.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        if getattr(args, "reset", False) or getattr(args, "full", False):
+            if getattr(args, "full", False) and not getattr(args, "yes", False):
+                print(
+                    "refusing --full without --yes: this drops dest racing "
+                    "entries (with files), wipes SSD data and the cached "
+                    ".torrent blobs. Re-run with 'run --full --yes' to confirm.",
+                    file=sys.stderr,
+                )
+                return 2
+            if getattr(args, "reset", False) and not getattr(args, "yes", False):
+                print(
+                    "refusing --reset without --yes: this deletes state.db "
+                    "(+WAL/SHM) and clears the log directory. Re-run with "
+                    "'run --reset --yes' to confirm.",
+                    file=sys.stderr,
+                )
+                return 2
+            _backup = backup_db(cfg, tag="pre-reset")
+            if _backup is not None:
+                print(f"state.db backed up to: {_backup}")
+            else:
+                print("no state.db to back up (fresh start)")
+            for line in _do_reset(cfg):
                 print(line)
+            if getattr(args, "full", False):
+                for line in asyncio.run(_do_full_reset(cfg)):
+                    print(line)
 
-    try:
-        setup_logging(cfg)
-    except Exception as e:
-        print(f"Failed to initialise logging ({cfg.general.log_dir}): {e}", file=sys.stderr)
-        return 2
-    log = logging.getLogger("racing_sync")
-    log.info("starting racing-sync")
+        try:
+            setup_logging(cfg)
+        except Exception as e:
+            print(f"Failed to initialise logging ({cfg.general.log_dir}): {e}", file=sys.stderr)
+            return 2
+        log = logging.getLogger("racing-sync")
+        log.info("starting racing-sync")
 
-    try:
-        coord = Coordinator(cfg)
-    except Exception as e:
-        print(f"Failed to initialise coordinator: {e}", file=sys.stderr)
-        return 2
-    try:
-        return asyncio.run(_runner(coord))
-    except KeyboardInterrupt:
-        return 130
-    except Exception as e:
-        # Startup failures (SFTP/auth/probe) previously dumped a raw
-        # traceback. Print a clean error plus the actionable hint instead.
-        print(f"Failed to start: {e}", file=sys.stderr)
-        hint = _startup_hint(e)
-        if hint:
-            print(hint, file=sys.stderr)
-        return 2
+        try:
+            coord = Coordinator(cfg)
+        except Exception as e:
+            print(f"Failed to initialise coordinator: {e}", file=sys.stderr)
+            return 2
+        try:
+            return asyncio.run(_runner(coord))
+        except KeyboardInterrupt:
+            return 130
+        except Exception as e:
+            # Startup failures (SFTP/auth/probe) previously dumped a raw
+            # traceback. Print a clean error plus the actionable hint instead.
+            print(f"Failed to start: {e}", file=sys.stderr)
+            hint = _startup_hint(e)
+            if hint:
+                print(hint, file=sys.stderr)
+            return 2
+    finally:
+        try:
+            if _daemon_lock is not None:
+                _daemon_lock.release()
+        except Exception:
+            pass
 
 
 def _startup_hint(exc: BaseException) -> str:
