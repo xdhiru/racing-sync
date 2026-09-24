@@ -918,9 +918,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         except Exception as e:  # noqa: BLE001
             log.warning("manual fuse sweep failed: %s", e)
 
-        # 3. Wake up WAITING_INDEXER rows whose retry timer has elapsed.
-        # Indexer wakeups still respect worker capacity: an unbounded timer
-        # burst must not spawn unbounded workers.
+        # 3. Wake up WAITING_INDEXER rows whose retry timer has elapsed —
+        # both the download-target indexer schedule and the independent
+        # public-export schedule. Indexer wakeups still respect worker
+        # capacity: an unbounded timer burst must not spawn unbounded
+        # workers.
         try:
             _max_workers = max(
                 12,
@@ -931,7 +933,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # unbounded worker spawn (0 is falsy = cap disabled below).
             _max_workers = 12
         ready_indexer = self.store.list_indexer_ready()
-        for ts in ready_indexer:
+        try:
+            ready_public = self.store.list_public_retry_ready()
+        except Exception:
+            ready_public = []
+        for ts in list(ready_indexer or []) + list(ready_public or []):
             if _max_workers and max(0, _max_workers - len(self._tasks)) <= 0:
                 break
             try:
@@ -1428,9 +1434,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if fresh is None or fresh.state != State.WAITING_INDEXER:
             return
         ts = fresh
+        try:
+            _public_mode = bool(
+                ts.public_export_next_retry_at
+                and not ts.indexer_next_retry_at)
+        except Exception:
+            _public_mode = False
         log.info(
-            "download-indexer retry timer fired for %s (attempt #%d)",
-            ts.source_name[:40], ts.indexer_attempts,
+            "%s retry timer fired for %s (attempt #%d)",
+            "public-export" if _public_mode else "download-indexer",
+            ts.source_name[:40],
+            ts.public_export_attempts if _public_mode else ts.indexer_attempts,
         )
         self.transition(ts, State.QUERYING)
         self._spawn_worker(ts)
@@ -2682,7 +2696,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         releases).
         Hard cap: prowlarr_max_age_seconds since the FIRST attempt. If
         that ceiling is reached, mark FAILED for manual handling.
+
+        A "source export miss" (public racing torrent whose .torrent
+        can't be exported right now) never queries the download-target
+        indexers, so it parks on the separate public-export schedule
+        with no max-age clock instead — see _park_for_public_retry.
         """
+        if reason == "source export miss":
+            self._park_for_public_retry(ts)
+            return
         now = dt.datetime.now(dt.timezone.utc)
         if ts.indexer_first_queried_at is None:
             ts.indexer_first_queried_at = now
@@ -2729,6 +2751,43 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 )
             self.store.upsert(ts)
             # No transition() fired, so push the updated timer manually.
+            self._schedule_telegram_update(ts)
+
+    def _park_for_public_retry(self, ts: TorrentState) -> None:
+        """Park a public-export miss on its own indefinite schedule.
+
+        Same WAITING_INDEXER state (the Telegram row keeps offering
+        Fetch), but the retry runs on public_export_retry_interval_seconds
+        with no max-age FAILED: a transient VPS1 export glitch heals on a
+        later window, and the source torrent's continued presence is the
+        liveness proof. A vanished source still fails via the consecutive
+        source-miss guard in _fetch_source_or_fail, so a dead torrent
+        cannot spin here forever. Attempts are counted for observability.
+        """
+        try:
+            interval = max(60.0, float(
+                self.cfg.cross_seed.public_export_retry_interval_seconds))
+        except (TypeError, ValueError, AttributeError):
+            interval = 1800.0
+        now = dt.datetime.now(dt.timezone.utc)
+        if ts.public_export_first_attempted_at is None:
+            ts.public_export_first_attempted_at = now
+        ts.public_export_attempts += 1
+        ts.public_export_next_retry_at = now + dt.timedelta(seconds=interval)
+        log.info(
+            "source export miss #%d for %s; next retry at %s",
+            ts.public_export_attempts, ts.source_name,
+            ts.public_export_next_retry_at.isoformat(timespec="seconds"),
+        )
+        if ts.state != State.WAITING_INDEXER:
+            self.transition(ts, State.WAITING_INDEXER)
+        else:
+            if self._abandoned(ts):
+                raise AbandonedError(
+                    f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}; "
+                    "not refreshing public-export park"
+                )
+            self.store.upsert(ts)
             self._schedule_telegram_update(ts)
 
     def _inflight_same_content(self, ts: TorrentState):
@@ -2807,6 +2866,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 _interval = max(60.0, float(self.cfg.cross_seed.prowlarr_retry_interval_seconds))
             except (TypeError, ValueError):
                 _interval = 1800.0
+            try:
+                _public_interval = max(60.0, float(
+                    self.cfg.cross_seed.public_export_retry_interval_seconds))
+            except (TypeError, ValueError, AttributeError):
+                _public_interval = 1800.0
             log.info(
                 "deferring Prowlarr retry for %s — same content %s already %s",
                 ts.source_name[:60], (_leader.source_infohash or "")[:10],
@@ -2816,9 +2880,19 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 if self._abandoned(ts):
                     raise AbandonedError(
                         f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}")
-                ts.indexer_next_retry_at = (
-                    dt.datetime.now(dt.timezone.utc)
-                    + dt.timedelta(seconds=_interval))
+                # Push the schedule this row is actually parked on: a
+                # public-export row must not gain an indexer timer (it
+                # would wake on the wrong schedule and confuse the
+                # max-age accounting).
+                if (ts.public_export_next_retry_at
+                        and not ts.indexer_next_retry_at):
+                    ts.public_export_next_retry_at = (
+                        dt.datetime.now(dt.timezone.utc)
+                        + dt.timedelta(seconds=_public_interval))
+                else:
+                    ts.indexer_next_retry_at = (
+                        dt.datetime.now(dt.timezone.utc)
+                        + dt.timedelta(seconds=_interval))
                 self.store.upsert(ts)
             except Exception:
                 pass
@@ -3198,7 +3272,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         except Exception as e:  # noqa: BLE001
                             if not is_retryable_client_error(e):
                                 # Fatal disk/permission errors (ENOSPC,
-                                # EACCES, â€¦) must fail loudly, never park.
+                                # EACCES, …) must fail loudly, never park.
                                 raise
                             log.warning(
                                 "watch re-inject hit transient dest error for %s (%s); staying queued",

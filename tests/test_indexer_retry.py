@@ -408,6 +408,72 @@ async def test_public_export_failure_parks_as_source_export_miss(caplog):
     assert not any("indexer miss" in r.message for r in caplog.records)
 
 
+@pytest.mark.anyio
+async def test_public_export_miss_never_hits_max_age_failed(tmp_path: Path):
+    """Public-export misses retry indefinitely: an ancient first attempt
+    must re-park (not FAILED), on the public schedule only."""
+    import datetime as dt
+    from unittest.mock import MagicMock
+
+    from racing_sync.state import StateStore
+
+    coord = make_coordinator()
+    coord.transition = MagicMock(
+        side_effect=lambda t, s, **k: setattr(t, "state", s))
+    store = StateStore(tmp_path / "s.db")
+    coord.store = store
+    try:
+        ts = TorrentState(source_infohash="p" * 40, source_name="Public.Show",
+                          state=State.NEW,
+                          public_export_first_attempted_at=(
+                              dt.datetime.now(dt.timezone.utc)
+                              - dt.timedelta(days=30)),
+                          public_export_attempts=100)
+        coord._park_for_indexer_retry(ts, reason="source export miss")
+
+        assert ts.state == State.WAITING_INDEXER
+        assert ts.public_export_attempts == 101
+        assert ts.public_export_next_retry_at is not None
+        # The indexer clock is untouched: no max-age FAILED can fire.
+        assert ts.indexer_first_queried_at is None
+        assert ts.indexer_next_retry_at is None
+        coord.transition.assert_called_once_with(ts, State.WAITING_INDEXER)
+        # The parked fields round-trip through the store (timer survives
+        # restarts — the whole point of the persisted schedule).
+        store.upsert(ts)
+        fresh = store.get("p" * 40, include_blob=False)
+        assert fresh is not None and fresh.state == State.WAITING_INDEXER
+        assert fresh.public_export_attempts == 101
+        assert fresh.public_export_next_retry_at is not None
+        assert fresh.public_export_first_attempted_at is not None
+    finally:
+        store.close()
+
+
+def test_list_public_retry_ready_only_elapsed(tmp_path: Path):
+    import datetime as dt
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        now = dt.datetime.now(dt.timezone.utc)
+        old = TorrentState(
+            source_infohash="o" * 40, state=State.WAITING_INDEXER,
+            public_export_next_retry_at=now - dt.timedelta(seconds=1))
+        future = TorrentState(
+            source_infohash="f" * 40, state=State.WAITING_INDEXER,
+            public_export_next_retry_at=now + dt.timedelta(hours=1))
+        indexed = TorrentState(
+            source_infohash="i" * 40, state=State.WAITING_INDEXER,
+            indexer_next_retry_at=now - dt.timedelta(seconds=1))
+        for ts in (old, future, indexed):
+            store.upsert(ts)
+        ready = store.list_public_retry_ready()
+        assert [r.source_infohash for r in ready] == ["o" * 40]
+    finally:
+        store.close()
+
+
 # ---- racing-torrent fallback (force_direct) ----
 
 def _pick_coord(**cross_seed_over):

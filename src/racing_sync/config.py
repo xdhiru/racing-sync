@@ -692,6 +692,13 @@ class CrossSeedConfig(BaseModel):
     # [[prowlarr.download_indexers]], tried in priority order.
     prowlarr_retry_interval_seconds: int = Field(default=1800, ge=60)  # 30 min
     prowlarr_max_age_seconds: int = Field(default=86400, ge=3600)       # 24 h
+    # VPS1 public-torrent export retry cadence: a public racing torrent
+    # whose .torrent can't be exported (transient SFTP/export glitch)
+    # retries on its own schedule with NO max-age clock — the source
+    # torrent still exists on VPS1, so giving up after 24h would kill a
+    # recoverable row. A vanished source still fails via the consecutive
+    # source-miss guard, so this cannot spin forever on a dead torrent.
+    public_export_retry_interval_seconds: int = Field(default=1800, ge=60)  # 30 min
 
     # Strategy flags --------------------------------------------------
     #
