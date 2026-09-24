@@ -207,6 +207,9 @@ class HTTPClientBase:
         self._session: aiohttp.ClientSession | None = None
         self._auth_lock = asyncio.Lock()
         self._authed = False
+        # Single-flight re-auth: concurrent 401/403s share one login
+        # instead of each worker logging in sequentially (N×3 logins).
+        self._auth_future: asyncio.Future | None = None
 
     async def start(self) -> None:
         if self._session and not self._session.closed:
@@ -318,6 +321,112 @@ class HTTPClientBase:
     async def _do_client_auth(self) -> None:
         raise NotImplementedError
 
+    async def _login_singleflight(self, *, force: bool = False) -> bool:
+        """One shared login for initial auth and concurrent 401/403s.
+
+        The first caller becomes the leader and performs the login
+        OUTSIDE the lock (no head-of-line blocking); concurrent callers
+        wait on one future instead of each logging in sequentially.
+        With force=True the cached flag is ignored (re-auth after a
+        401/403). The leader retries transient failures (auth refused,
+        network blips) with backoff; only a persistent failure returns
+        False.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        for _round in range(2):
+            async with self._auth_lock:
+                if self._authed and not force:
+                    return True
+                fut = self._auth_future
+                if fut is None or fut.done():
+                    try:
+                        fut = loop.create_future()
+                    except Exception:
+                        return False
+                    self._auth_future = fut
+                    owner = True
+                else:
+                    owner = False
+            if not owner:
+                try:
+                    await fut
+                except AuthError:
+                    return False
+                except (asyncio.CancelledError, Exception):
+                    return bool(self._authed)
+                if bool(self._authed):
+                    return True
+                # Spurious wakeup: the leader's own retry invalidated the
+                # flag again before we ran (or a racing login landed and
+                # died). Rejoin the election once instead of failing the
+                # request over an ordering artifact.
+                force = False
+                continue
+            break
+        else:
+            return False
+        # Leader: full login+request sequence retried a few times with
+        # backoff. The WebUI can transiently refuse auth during startup,
+        # after a settings change, or while a session cookie rotates; a
+        # single retry is often not enough. Network blips during re-auth
+        # retry like auth refusals instead of escaping as connection
+        # errors. Only persistent failure escapes (as False).
+        try:
+            for attempt in range(3):
+                self._authed = False
+                try:
+                    await self._auth(force=True)
+                except AuthError as e:
+                    log.warning(
+                        "[%s] re-auth attempt %d/3 refused (%s)",
+                        self._label, attempt + 1, e,
+                    )
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    continue
+                except (aiohttp.ClientError, asyncio.TimeoutError,
+                        OSError) as e:
+                    log.warning(
+                        "[%s] re-auth attempt %d/3 hit transient error (%s)",
+                        self._label, attempt + 1, e,
+                    )
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    continue
+                # No exception: the login stands (real _auth() sets the
+                # flag itself; test doubles may not — normalize here).
+                self._authed = True
+                if not fut.done():
+                    fut.set_result(True)
+                return True
+            if not fut.done():
+                fut.set_exception(AuthError(
+                    f"[{self._label}] re-auth failed after 3 attempts"))
+            return False
+        except asyncio.CancelledError:
+            if not fut.done():
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+            raise
+        except Exception as e:  # noqa: BLE001
+            if not fut.done():
+                try:
+                    fut.set_exception(
+                        e if isinstance(e, AuthError) else AuthError(str(e)))
+                except Exception:
+                    pass
+            return False
+        finally:
+            try:
+                async with self._auth_lock:
+                    if self._auth_future is fut:
+                        self._auth_future = None
+            except Exception:
+                pass
+
     async def request(
         self,
         method: str,
@@ -331,7 +440,17 @@ class HTTPClientBase:
         retry_auth: bool = True,
     ) -> aiohttp.ClientResponse:
         if not self._authed:
-            await self._auth()
+            # Initial login also goes through single-flight: workers
+            # starting while another task re-authenticates must join it
+            # instead of each running a direct login (N× logins storm).
+            try:
+                _ok = await self._login_singleflight()
+            except AuthError as e:
+                raise e
+            if not _ok:
+                raise AuthError(
+                    f"[{self._label}] initial authentication failed for {path}"
+                )
 
         def _get_request_data() -> Any:
             if files is not None:
@@ -400,18 +519,22 @@ class HTTPClientBase:
             )
             await r.read()
             r.close()
-            # Retry the full login+request sequence a few times with
-            # backoff. The WebUI can transiently refuse auth during
-            # startup, after a settings change, or while a session
-            # cookie is being rotated; a single retry is often not
-            # enough. Only AuthError (or persistent 401) escapes.
+            # Single-flight re-auth (forced: the 401/403 proves the cached
+            # flag stale): concurrent workers share one login instead of
+            # each logging in sequentially. Only a persistent failure (or
+            # persistent 401) escapes as AuthError.
             last_exc: AuthError | None = None
-            for attempt in range(3):
-                self._authed = False
+            for attempt in range(2):
                 try:
-                    await self._auth(force=True)
+                    _ok = await self._login_singleflight(force=True)
                 except AuthError as e:
                     last_exc = e
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    continue
+                if not _ok:
+                    last_exc = AuthError(
+                        f"[{self._label}] re-auth failed for {path}"
+                    )
                     await asyncio.sleep(0.5 * (2 ** attempt))
                     continue
                 r2 = await _do()
@@ -420,6 +543,9 @@ class HTTPClientBase:
                         await r2.read()
                     finally:
                         r2.close()
+                    # Session rotated again under us: invalidate so the
+                    # next round really re-logs in, then retry once more.
+                    self._authed = False
                     last_exc = AuthError(
                         f"[{self._label}] auth failed: HTTP 401 on {path}"
                     )
