@@ -7,6 +7,7 @@ explicitly enumerated so we can audit them in tests.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import enum
 import logging
@@ -173,6 +174,11 @@ class TorrentState:
     # the re-add max-age guard; reset by long healthy DONE periods and fresh
     # pipeline entries).
     readd_cycles: int = 0
+    # Optimistic-locking revision, bumped on every write. transition()
+    # re-reads inside its transaction and refuses to overwrite a state
+    # that moved underneath a stale in-memory row (the second writer
+    # loses loudly instead of clobbering silently).
+    version: int = 0
     last_error: str = ""
     created_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc))
     updated_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc))
@@ -239,6 +245,7 @@ class TorrentState:
             "batches_total": self.batches_total,
             "batch_cap_bytes": self.batch_cap_bytes,
             "readd_cycles": self.readd_cycles,
+            "version": int(self.version or 0),
             "last_error": self.last_error,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -282,6 +289,7 @@ CREATE TABLE IF NOT EXISTS torrent_state (
     batches_total            INTEGER NOT NULL DEFAULT 0,
     batch_cap_bytes          INTEGER NOT NULL DEFAULT 0,
     readd_cycles             INTEGER NOT NULL DEFAULT 0,
+    version                  INTEGER NOT NULL DEFAULT 0,
     last_error               TEXT NOT NULL DEFAULT '',
     telegram_message_id      INTEGER NOT NULL DEFAULT 0,
     created_at               TEXT NOT NULL,
@@ -329,7 +337,7 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = (
     "indexer_next_retry_at, indexer_attempts, force_direct, readd_first_attempted_at, "
     "readd_next_retry_at, readd_attempts, failed_retries, completed_at, "
     "vps1_last_activity_at, fuse_verified, public_export_first_attempted_at, "
-    "public_export_next_retry_at, public_export_attempts, state, batch_index, batches_total, batch_cap_bytes, readd_cycles, "
+    "public_export_next_retry_at, public_export_attempts, state, batch_index, batches_total, batch_cap_bytes, readd_cycles, version, "
     "last_error, created_at, updated_at, telegram_message_id, deleted_at"
 )
 
@@ -389,6 +397,7 @@ class StateStore:
             "ADD COLUMN readd_cycles INTEGER NOT NULL DEFAULT 0",
             "ADD COLUMN telegram_message_id INTEGER NOT NULL DEFAULT 0",
             "ADD COLUMN deleted_at TEXT NOT NULL DEFAULT ''",
+            "ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
             "ADD COLUMN fuse_verified INTEGER NOT NULL DEFAULT 0",
             "ADD COLUMN public_export_first_attempted_at TEXT NOT NULL DEFAULT ''",
             "ADD COLUMN public_export_next_retry_at TEXT NOT NULL DEFAULT ''",
@@ -402,6 +411,42 @@ class StateStore:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("StateStore is closed")
+
+    @contextlib.contextmanager
+    def _write_tx(self):
+        """Atomic write transaction (BEGIN IMMEDIATE … COMMIT).
+
+        Holds the store RLock for the whole sequence so a check-then-write
+        (tombstone probe → write, version read → guarded update) cannot
+        interleave with another thread, while IMMEDIATE reserves the DB
+        against other connections. Re-entrant on the same thread (the RLock
+        is held; nested sequences join the outer transaction) so public
+        methods compose (transition → upsert) without deadlock.
+        """
+        self._ensure_open()
+        with self._lock:
+            depth = getattr(self, "_tx_depth", 0) or 0
+            if depth:
+                yield
+                return
+            self._tx_depth = 1
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+            except Exception:
+                self._tx_depth = 0
+                raise
+            try:
+                yield
+            except Exception:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            else:
+                self._conn.execute("COMMIT")
+            finally:
+                self._tx_depth = 0
 
     def close(self) -> None:
         with self._lock:
@@ -470,12 +515,12 @@ class StateStore:
             # Canonical key: hashes are hex, case-insensitive. Normalizing
             # on write keeps get/tombstone/clear lookups consistent.
             ts.source_infohash = norm
-        if self._is_tombstoned(ts.source_infohash):
-            # Forget tombstone: the operator abandoned this torrent — drop
-            # the write instead of resurrecting it. Applies to creates too
-            # (re-discovery while tombstoned stays away until GC expiry).
-            return
-        with self._lock:
+        with self._write_tx():
+            if self._is_tombstoned(ts.source_infohash):
+                # Forget tombstone: the operator abandoned this torrent — drop
+                # the write instead of resurrecting it. Applies to creates too
+                # (re-discovery while tombstoned stays away until GC expiry).
+                return
             ts.updated_at = dt.datetime.now(dt.timezone.utc)
             row = ts.to_row()
             cols = ", ".join(row.keys())
@@ -487,7 +532,11 @@ class StateStore:
                     # after forget()/tombstone() must never clear the
                     # stamp via ON CONFLICT (only clear_tombstone lifts).
                     continue
-                if k == "cross_seed_blob":
+                if k == "version":
+                    # Monotonic revision: concurrent writers bump past each
+                    # other instead of resetting (transition() guards on it).
+                    updates.append("version = torrent_state.version + 1")
+                elif k == "cross_seed_blob":
                     updates.append(
                         f"{k} = CASE WHEN length(excluded.{k}) > 0 THEN excluded.{k} ELSE torrent_state.{k} END"
                     )
@@ -667,9 +716,10 @@ class StateStore:
         if not norm:
             return False
         now = dt.datetime.now(dt.timezone.utc).isoformat()
-        with self._lock:
+        with self._write_tx():
             cur = self._conn.execute(
-                "UPDATE torrent_state SET deleted_at = ?, updated_at = ? "
+                "UPDATE torrent_state SET deleted_at = ?, updated_at = ?, "
+                "version = version + 1 "
                 "WHERE source_infohash = ? AND deleted_at = ''",
                 (now, now, norm),
             )
@@ -678,7 +728,8 @@ class StateStore:
             # Already tombstoned: refresh the stamp (extends the TTL) but
             # report False — no live row was stamped by this call.
             self._conn.execute(
-                "UPDATE torrent_state SET deleted_at = ?, updated_at = ? "
+                "UPDATE torrent_state SET deleted_at = ?, updated_at = ?, "
+                "version = version + 1 "
                 "WHERE source_infohash = ?",
                 (now, now, norm),
             )
@@ -698,7 +749,8 @@ class StateStore:
             return False
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE torrent_state SET deleted_at = '', updated_at = ? "
+                "UPDATE torrent_state SET deleted_at = '', updated_at = ?, "
+                "version = version + 1 "
                 "WHERE source_infohash = ? AND deleted_at != ''",
                 (dt.datetime.now(dt.timezone.utc).isoformat(), norm),
             )
@@ -814,6 +866,16 @@ class StateStore:
 
     def transition(self, ts: TorrentState, dst: State,
                    *, error: str = "", batch_index: int | None = None) -> None:
+        """Move a row to `dst`, refusing concurrent-move clobbers.
+
+        The whole check-act sequence runs in one IMMEDIATE transaction:
+        the DB state is re-read and must still equal the in-memory source
+        state, otherwise another writer (API retry, recovery, a second
+        worker) moved the row and this transition raises AbandonedError
+        instead of silently overwriting its state. Callers holding only
+        stale snapshots therefore fail loudly (worker wrapper unwinds
+        quietly; API maps to 409).
+        """
         if self._is_tombstoned(ts.source_infohash):
             # Forget won this row: transitioning would upsert-resurrect it.
             raise AbandonedError(
@@ -830,60 +892,80 @@ class StateStore:
             ts.indexer_first_queried_at, ts.indexer_next_retry_at,
             ts.indexer_attempts, ts.readd_first_attempted_at,
             ts.readd_next_retry_at, ts.readd_attempts, ts.failed_retries,
-            ts.completed_at, ts.batch_index, ts.readd_cycles,
+            ts.completed_at, ts.batch_index, ts.readd_cycles, ts.version,
         )
         try:
-            ts.state = dst
-            ts.last_error = error
-            if dst in (State.NEW, State.QUEUED):
-                ts.indexer_first_queried_at = None
-                ts.indexer_next_retry_at = None
-                ts.indexer_attempts = 0
-                ts.readd_first_attempted_at = None
-                ts.readd_next_retry_at = None
-                ts.readd_attempts = 0
-                ts.readd_cycles = 0
-                # NOTE: failed_retries is intentionally preserved here (lifetime
-                # cap for auto_retry_failed). Callers requesting a fresh retry
-                # (e.g. POST /api/retry) reset it explicitly before transition.
-            elif dst == State.DONE:
-                ts.failed_retries = 0
-                ts.readd_first_attempted_at = None
-                ts.readd_next_retry_at = None
-                ts.readd_attempts = 0
-                # Grace anchor for the VPS1 cleanup janitor ([cleanup]): every
-                # entry into DONE restarts the clock (e.g. after a lost-fuse
-                # re-add cycle finishes seeding again).
-                ts.completed_at = now
-            elif dst in (State.RE_ADDING, State.MOVING) and src == State.DONE:
-                # Demotion of a DONE row back into the pipeline:
-                #  - DONE -> RE_ADDING: lost fuse torrent (recovery) or late
-                #    cross-seed repair; stale timers from the previous cycle
-                #    must not instantly trip the max-age guard in _do_re_add.
-                #  - DONE -> MOVING: self-heal for falsely adopted DONE (SSD
-                #    bytes never moved); start a fresh move cycle.
-                # A demotion long after DONE is a new incident (reset the
-                # flap count); a rapid one keeps accumulating toward FAILED.
-                ts.readd_first_attempted_at = None
-                ts.readd_next_retry_at = None
-                ts.readd_attempts = 0
-                try:
-                    rapid = (
-                        ts.completed_at is not None
-                        and (now - ts.completed_at).total_seconds() < _FLAP_WINDOW_SECONDS
-                    )
-                except Exception:
-                    rapid = True
-                ts.readd_cycles = (ts.readd_cycles + 1) if rapid else 0
-            if batch_index is not None:
-                ts.batch_index = batch_index
-            self.upsert(ts)
+            with self._write_tx():
+                _cur = self._conn.execute(
+                    "SELECT state, version FROM torrent_state "
+                    "WHERE source_infohash = ? AND deleted_at = ''",
+                    ((ts.source_infohash or "").strip().lower(),),
+                ).fetchone()
+                if _cur is not None:
+                    _db_state = str(_cur["state"] or "")
+                    if _db_state != src.value:
+                        raise AbandonedError(
+                            f"row moved concurrently for "
+                            f"{(ts.source_infohash or '')[:10]} "
+                            f"(expected {src.value}, found {_db_state}); "
+                            f"refusing {src.value} -> {dst.value}"
+                        )
+                    try:
+                        ts.version = int(_cur["version"] or 0)
+                    except (TypeError, ValueError):
+                        ts.version = 0
+                ts.state = dst
+                ts.last_error = error
+                if dst in (State.NEW, State.QUEUED):
+                    ts.indexer_first_queried_at = None
+                    ts.indexer_next_retry_at = None
+                    ts.indexer_attempts = 0
+                    ts.readd_first_attempted_at = None
+                    ts.readd_next_retry_at = None
+                    ts.readd_attempts = 0
+                    ts.readd_cycles = 0
+                    # NOTE: failed_retries is intentionally preserved here (lifetime
+                    # cap for auto_retry_failed). Callers requesting a fresh retry
+                    # (e.g. POST /api/retry) reset it explicitly before transition.
+                elif dst == State.DONE:
+                    ts.failed_retries = 0
+                    ts.readd_first_attempted_at = None
+                    ts.readd_next_retry_at = None
+                    ts.readd_attempts = 0
+                    # Grace anchor for the VPS1 cleanup janitor ([cleanup]): every
+                    # entry into DONE restarts the clock (e.g. after a lost-fuse
+                    # re-add cycle finishes seeding again).
+                    ts.completed_at = now
+                elif dst in (State.RE_ADDING, State.MOVING) and src == State.DONE:
+                    # Demotion of a DONE row back into the pipeline:
+                    #  - DONE -> RE_ADDING: lost fuse torrent (recovery) or late
+                    #    cross-seed repair; stale timers from the previous cycle
+                    #    must not instantly trip the max-age guard in _do_re_add.
+                    #  - DONE -> MOVING: self-heal for falsely adopted DONE (SSD
+                    #    bytes never moved); start a fresh move cycle.
+                    # A demotion long after DONE is a new incident (reset the
+                    # flap count); a rapid one keeps accumulating toward FAILED.
+                    ts.readd_first_attempted_at = None
+                    ts.readd_next_retry_at = None
+                    ts.readd_attempts = 0
+                    try:
+                        rapid = (
+                            ts.completed_at is not None
+                            and (now - ts.completed_at).total_seconds() < _FLAP_WINDOW_SECONDS
+                        )
+                    except Exception:
+                        rapid = True
+                    ts.readd_cycles = (ts.readd_cycles + 1) if rapid else 0
+                if batch_index is not None:
+                    ts.batch_index = batch_index
+                self.upsert(ts)
         except Exception:
             (ts.state, ts.last_error,
              ts.indexer_first_queried_at, ts.indexer_next_retry_at,
              ts.indexer_attempts, ts.readd_first_attempted_at,
              ts.readd_next_retry_at, ts.readd_attempts, ts.failed_retries,
-             ts.completed_at, ts.batch_index, ts.readd_cycles) = _snapshot
+             ts.completed_at, ts.batch_index, ts.readd_cycles,
+             ts.version) = _snapshot
             raise
         log.info("state %s -> %s for %s", ts.source_infohash[:8], dst.value, ts.source_name)
 
@@ -964,7 +1046,8 @@ class StateStore:
             return False
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE torrent_state SET fuse_verified = ?, updated_at = ? "
+                "UPDATE torrent_state SET fuse_verified = ?, updated_at = ?, "
+                "version = version + 1 "
                 "WHERE source_infohash = ? AND deleted_at = ''",
                 (1 if verified else 0,
                  dt.datetime.now(dt.timezone.utc).isoformat(), norm),
@@ -982,10 +1065,35 @@ class StateStore:
             return False
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE torrent_state SET cross_seed_blob = ?, updated_at = ? "
+                "UPDATE torrent_state SET cross_seed_blob = ?, updated_at = ?, "
+                "version = version + 1 "
                 "WHERE source_infohash = ? AND deleted_at = ''",
                 (bytes(blob), dt.datetime.now(dt.timezone.utc).isoformat(),
                  norm),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def set_vps1_activity(self, source_infohash: str,
+                          when: dt.datetime | None = None) -> bool:
+        """Stamp swarm-activity observation; True when a row was updated.
+
+        Narrow UPDATE so the janitor's activity bump never clobbers
+        concurrent worker mutations to the rest of the row.
+        """
+        self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
+        if not norm:
+            return False
+        try:
+            stamp = (when or dt.datetime.now(dt.timezone.utc)).isoformat()
+        except Exception:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE torrent_state SET vps1_last_activity_at = ?, "
+                "updated_at = ?, version = version + 1 "
+                "WHERE source_infohash = ? AND deleted_at = ''",
+                (stamp, dt.datetime.now(dt.timezone.utc).isoformat(), norm),
             )
             return (cur.rowcount or 0) > 0
 
@@ -1138,6 +1246,7 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         batches_total=_safe_int(row["batches_total"]) if "batches_total" in keys else 0,
         batch_cap_bytes=_safe_int(row["batch_cap_bytes"]) if "batch_cap_bytes" in keys else 0,
         readd_cycles=_safe_int(row["readd_cycles"]) if "readd_cycles" in keys else 0,
+        version=_safe_int(row["version"]) if "version" in keys else 0,
         last_error=row["last_error"] if "last_error" in keys else "",
         created_at=(
             _safe_dt(row["created_at"])

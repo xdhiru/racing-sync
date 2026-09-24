@@ -307,9 +307,12 @@ class CleanupMixin:
         lively = [m for m in group if self._cleanup_member_active(m, cfg)]
         if lively:
             if not dry_run:
-                ts.vps1_last_activity_at = now_utc
+                # Narrow stamp (no whole-row overwrite): worker fields
+                # must survive the janitor's observation.
                 try:
-                    self.store.upsert(ts)
+                    await asyncio.to_thread(
+                        self.store.set_vps1_activity,
+                        ts.source_infohash, now_utc)
                 except Exception:
                     pass
             log.debug("cleanup: %s still active on VPS1 (%d/%d racing); keeping",
