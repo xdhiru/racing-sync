@@ -974,7 +974,7 @@ def test_pending_seq_unpredictable_and_prefix_min_length():
     bot._pending_seq = 0
     seen = {bot._next_seq() for _ in range(10)}
     assert len(seen) == 10  # no repeats in a short run
-    assert all(len(s) == 8 and all(c in "0123456789abcdef" for c in s)
+    assert all(len(s) == 16 and all(c in "0123456789abcdef" for c in s)
                for s in seen)
 
     bot._store = None

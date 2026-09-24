@@ -227,10 +227,18 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         raise RuntimeError("unreachable")  # pragma: no cover
 
     async def _reauth_once(self) -> bool:
-        """Re-login after a detected expiry; True when the retry may proceed."""
+        """Re-login after a detected expiry; True when the retry may proceed.
+
+        Goes through the single-flight election so concurrent expiries
+        share one login instead of thundering-herding the WebUI.
+        """
         try:
-            await self._auth(force=True)
-            return True
+            from .http_base import AuthError as _AE
+            try:
+                return bool(await self._login_singleflight(force=True))
+            except _AE as e:
+                log.warning("deluge re-login after expiry failed: %s", e)
+                return False
         except Exception as e:  # noqa: BLE001
             log.warning("deluge re-login after expiry failed: %s", e)
             return False
@@ -509,16 +517,29 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             # Multi-file mode: RPC `files[].path` values include the top-level
             # directory (e.g. `Show/ep1.mkv`), while .torrent paths are
             # relative to it — prefix so set_file_priorities keys match.
+            # Sanitize like watchdir._safe_part: .torrent paths are
+            # daemon-side data, never trusted for joins.
             out: list[TorrentFile] = []
             for f in files:
-                rel = b"/".join(f.get(b"path", [])).decode("utf-8", "replace")
-                if not rel:
+                try:
+                    _parts = [p.decode("utf-8", "replace") for p in (f.get(b"path", []) or [])]
+                except Exception:
                     continue
-                full = f"{top_name}/{rel}" if top_name else rel
+                _parts = [p for p in _parts
+                          if p and p not in (".", "..") and "/" not in p and "\\" not in p
+                          and "\n" not in p and "\r" not in p and "\0" not in p]
+                if not _parts:
+                    continue
+                rel = "/".join(_parts)
+                _top = (top_name or "").replace("/", "").replace("\\", "").strip()
+                if not _top or _top in (".", ".."):
+                    full = rel
+                else:
+                    full = f"{_top}/{rel}"
                 length_raw = f.get(b"length", 0)
                 try:
                     length = int(length_raw or 0)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     length = 0
                 out.append(TorrentFile(
                     name=full,
@@ -528,10 +549,10 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 ))
             return out
         # Single-file mode
-        name = top_name
+        name = (top_name or "").replace("\n", " ").replace("\r", " ")
         try:
             length = int(info.get(b"length", 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             length = 0
         return [TorrentFile(
             name=name,

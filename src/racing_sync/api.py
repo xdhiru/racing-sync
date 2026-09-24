@@ -63,8 +63,20 @@ def _note_auth_failure(ip: str) -> bool:
             fails.pop(0)
         fails.append(now)
         if len(_AUTH_FAILURES) > 1000:
-            for k in list(_AUTH_FAILURES.keys())[:500]:
-                _AUTH_FAILURES.pop(k, None)
+            # Evict expired/idle entries first (a many-IP spray must not
+            # flush real throttles); fall back to oldest-half on flood.
+            try:
+                for k, v in list(_AUTH_FAILURES.items()):
+                    try:
+                        if not v or all(t < cutoff for t in v):
+                            _AUTH_FAILURES.pop(k, None)
+                    except Exception:
+                        _AUTH_FAILURES.pop(k, None)
+            except Exception:
+                pass
+            if len(_AUTH_FAILURES) > 1000:
+                for k in list(_AUTH_FAILURES.keys())[:500]:
+                    _AUTH_FAILURES.pop(k, None)
         return len(fails) > _AUTH_MAX_FAILURES
     except Exception:
         return False
@@ -76,20 +88,42 @@ def _host_is_trusted(client_host: str, trusted_proxies: set[str]) -> bool:
     `request.client.host` is an IP literal (never the string "localhost")
     and may arrive as IPv6-mapped IPv4 (`::ffff:127.0.0.1`) behind dual-stack
     servers; "localhost" in config means loopback (127.0.0.1/::1).
+    Entries may be plain IPs, "localhost", or CIDR ranges
+    ("10.0.0.0/8", "::1/128") for reverse-proxy subnets.
     """
+    import ipaddress as _ip
     host = (client_host or "").strip().lower()
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
     if host.startswith("::ffff:"):
         host = host[7:]
+    try:
+        host_ip = _ip.ip_address(host)
+    except ValueError:
+        host_ip = None
     expanded: set[str] = set()
+    networks: list = []
     for entry in trusted_proxies:
         e = (entry or "").strip().lower().strip("[]")
         if e == "localhost":
             expanded.update({"127.0.0.1", "::1"})
+        elif "/" in e:
+            try:
+                networks.append(_ip.ip_network(e, strict=False))
+            except ValueError:
+                continue
         elif e:
             expanded.add(e)
-    return host in expanded
+    if host in expanded:
+        return True
+    if host_ip is not None:
+        for net in networks:
+            try:
+                if host_ip in net:
+                    return True
+            except Exception:
+                continue
+    return False
 
 
 @asynccontextmanager
@@ -201,6 +235,16 @@ def build_app(coord: Coordinator) -> FastAPI:
     async def metrics() -> Any:
         """Minimal Prometheus metrics (authed): no Telegram spam for ops."""
         from fastapi.responses import PlainTextResponse
+        # 10s TTL: scrapes every 15s must not each pay a full table scan
+        # + SSD stat on an SSD-constrained host.
+        try:
+            _cache = getattr(metrics, "_cache", None)
+            if (_cache is not None and isinstance(_cache, dict)
+                    and time.monotonic() - float(_cache.get("at", 0.0)) < 10.0
+                    and isinstance(_cache.get("body"), str)):
+                return PlainTextResponse(_cache["body"])
+        except Exception:
+            _cache = None
         lines: list[str] = []
         try:
             started = float(getattr(coord, "_started_at", 0.0) or 0.0)
@@ -231,7 +275,12 @@ def build_app(coord: Coordinator) -> FastAPI:
             lines.append(f"racing_sync_worker_tasks {len(tasks or [])}")
         except Exception:
             pass
-        return PlainTextResponse("\n".join(lines) + "\n")
+        body = "\n".join(lines) + "\n"
+        try:
+            metrics._cache = {"at": time.monotonic(), "body": body}  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return PlainTextResponse(body)
 
     @app.get("/api/state", dependencies=[Depends(auth)])
     async def state(
@@ -321,10 +370,20 @@ def build_app(coord: Coordinator) -> FastAPI:
         source_infohash: str,
         delete_files: bool = Query(default=True),
         ignore: bool = Query(default=False),
+        confirm: bool = Query(default=False,
+                              description="must be true: forget is destructive"),
     ) -> ForgetResult:
         normalized = (source_infohash or "").strip().lower()
         if not _INFOHASH_RE.fullmatch(normalized):
             raise HTTPException(422, "must be 40-char hex infohash")
+        if not confirm:
+            raise HTTPException(
+                400, "forget is destructive; re-issue with ?confirm=true")
+        try:
+            log.warning("api forget %s by %s (delete_files=%s, ignore=%s)",
+                        normalized[:10], "token", delete_files, ignore)
+        except Exception:
+            pass
         async with _hold_ops_lock(coord):
             try:
                 result = await forget_torrent(

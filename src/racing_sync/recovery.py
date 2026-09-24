@@ -559,6 +559,10 @@ async def _reconcile_snapshot(
             if attempt < 3:
                 await asyncio.sleep(2 * attempt)
     if last_err is not None:
+        # Fail-closed boot: an empty dest view would read every DONE row as
+        # "lost" and mass-demote to RE_ADDING below. Aborting startup on a
+        # wedged VPS2 is correct — steady-state loops tolerate the same
+        # outage once running, but reconcile must never act on blindness.
         raise RuntimeError(f"reconcile: cannot list dest torrents after 3 attempts: {last_err}") from last_err
     actual_by_hash: dict[str, object] = {}
     for t in actual:
@@ -687,14 +691,10 @@ async def _reconcile_snapshot(
                     # One bad orphan must never kill startup — park it FAILED.
                     log.error("reconcile: fix_orphan failed for %s: %s", h[:10], e)
                     try:
-                        store.transition(ts, State.FAILED, error=f"recovery failed: {e}")
+                        _force_state(store, ts, State.FAILED,
+                                     error=f"recovery failed: {e}")
                     except Exception:
-                        try:
-                            ts.state = State.FAILED
-                            ts.last_error = f"recovery failed: {e}"
-                            store.upsert(ts)
-                        except Exception:
-                            pass
+                        pass
 
     # 3. Anything on VPS2 not in the DB?
     # If it is already seeding from the fuse mount, adopt it as DONE.

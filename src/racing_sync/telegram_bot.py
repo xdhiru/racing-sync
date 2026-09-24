@@ -111,7 +111,8 @@ def _tg_actor_allowed(cfg: Any, user_id: object) -> bool:
         want = {str(int(a)) for a in allowed}
         return str(user_id) in want or str(int(str(user_id))) in want
     except Exception:
-        return True
+        # Fail closed: a broken allowlist must not open destructive flows.
+        return False
 
 
 def _tg_pending_owner_ok(pending: dict, user_id: object) -> bool:
@@ -130,7 +131,7 @@ def _tg_pending_owner_ok(pending: dict, user_id: object) -> bool:
             return True
         return str(owner) == str(user_id)
     except Exception:
-        return True
+        return False
 
 
 def _strip_code_spans(text: str) -> str:
@@ -1111,6 +1112,45 @@ class TelegramBot:
                 await self._task
             except (asyncio.CancelledError, Exception):
                 pass
+        # Close the Bot HTTP session: without this every restart leaks an
+        # "Unclosed client session" (connector/DNS/sockets). PTB Bot
+        # versions differ (shutdown/request/session), so try each closer
+        # defensively with a budget.
+        try:
+            _bot = getattr(self, "_bot", None)
+            if _bot is not None:
+                _closers: list = []
+                for _attr in ("shutdown", "close"):
+                    try:
+                        _fn = getattr(_bot, _attr, None)
+                    except Exception:
+                        _fn = None
+                    if callable(_fn):
+                        _closers.append((_attr, _fn))
+                try:
+                    _req = getattr(_bot, "request", None)
+                    for _attr in ("shutdown", "close"):
+                        try:
+                            _fn = getattr(_req, _attr, None)
+                        except Exception:
+                            _fn = None
+                        if callable(_fn):
+                            _closers.append((f"request.{_attr}", _fn))
+                except Exception:
+                    pass
+                for _name, _fn in _closers:
+                    try:
+                        _r = _fn()
+                        if asyncio.isfuture(_r) or asyncio.iscoroutine(_r):
+                            await asyncio.wait_for(_r, timeout=5.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        raise
+                    except Exception:
+                        continue
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            raise
+        except Exception:
+            pass
 
     # ---- main loop ----
 
@@ -1469,17 +1509,9 @@ class TelegramBot:
         question to its own buttons until it expires.
         """
         try:
-            return secrets.token_hex(4)
+            return secrets.token_hex(8)
         except Exception:
-            try:
-                _n = int(getattr(self, "_pending_seq", 0) or 0) + 1
-            except (TypeError, ValueError):
-                _n = 1
-            try:
-                self._pending_seq = _n
-            except Exception:
-                pass
-            return str(_n)
+            raise RuntimeError("no entropy for pending-flow token")
 
     def _set_pending_pick(self, cmd: str, title: str, size_bytes: object,
                            members: list[tuple[str, str]],
@@ -1637,10 +1669,12 @@ class TelegramBot:
                 pass
             return
 
-        # Throttle callback handling (0.5s debounce per chat/user — a
-        # global throttle lets one spammer block pagination for all chats).
+        # Throttle callback handling (2s debounce per chat+user, destructive
+        # taps bucketed harder below — a per-chat key lets one spammer
+        # block pagination for all chats sharing it).
         try:
-            _debounce_key = str(chat_id) if chat_id is not None else str(user_id)
+            _debounce_key = (f"{chat_id}:{user_id}"
+                             if chat_id is not None else str(user_id))
         except Exception:
             _debounce_key = ""
         if self._debounced(_debounce_key):
@@ -1721,12 +1755,8 @@ class TelegramBot:
         if len(candidates) == 1:
             return candidates[0]
         if len(candidates) > 1:
-            preview = ", ".join(
-                f"{(ts.source_name or '?')[:30]} ({(ts.source_infohash or '')[:10]})"
-                for ts in candidates[:5]
-            )
             raise LookupError(
-                f"/{cmd}_{norm} matches {len(candidates)} torrents: {preview}; "
+                f"/{cmd}_{norm} matches {len(candidates)} torrents; "
                 f"send /{cmd}_<full 40-char hash>"
             )
         raise LookupError(
@@ -1767,14 +1797,16 @@ class TelegramBot:
             cfg_chat = str(self._cfg.chat_id)
             if str(chat_id) != cfg_chat and str(user_id) != cfg_chat:
                 return
-            # Same 0.5s debounce as callbacks: a double-sent command must
+            # Same debounce as callbacks: a double-sent command must
             # not resolve+act twice (double forget/double prefer).
-            # Namespaced apart from callback keys.
+            # Namespaced apart from callback keys, keyed chat+user so one
+            # spammer cannot block other operators.
             try:
-                _ckey = f"cmd:{chat_id}" if chat_id is not None else f"cmd:{user_id}"
+                _ckey = (f"cmd:{chat_id}:{user_id}"
+                         if chat_id is not None else f"cmd:{user_id}")
             except Exception:
                 _ckey = ""
-            if _ckey and self._debounced(_ckey):
+            if _ckey and self._debounced(_ckey, window=2.0):
                 return
             text = (
                 getattr(message, "text", None)
@@ -2225,7 +2257,7 @@ class TelegramBot:
                 except Exception:
                     pass
                 result = await self._execute_snapshot_cancel(
-                    _hashes, _title, delete_files=(which != "yes"))
+                    _hashes, _title, delete_files=(which == "no"))
                 await _say(result)
                 await _refresh()
                 return

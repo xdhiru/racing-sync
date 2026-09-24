@@ -326,12 +326,20 @@ class RcloneConfig(BaseModel):
             # `---config` and `--password_command` cannot slip past an
             # exact-match blocklist.
             norm = low.split("=", 1)[0].lstrip("-").replace("_", "-")
-            if norm in ("config", "password-command", "ask-password"):
+            if norm in ("config", "password-command", "ask-password",
+                        "config-file", "c",
+                        "log-file", "log-file-max-size", "syslog", "syslog-facility",
+                        "s3-access-key-id", "s3-secret-access-key",
+                        "files-from", "files-from-raw", "files-from-encoding",
+                        "filter-from", "exclude-file", "include-file"):
                 bad.append(str(item))
         if bad:
             raise ValueError(
-                "rclone move flags must not include config/credential hijack "
-                f"flags (--config, --password-command, --ask-password), got: {bad!r}"
+                "rclone move flags must not include config/credential/filter-hijack "
+                "flags (--config[-file], --password-command, --ask-password, "
+                "--log-file, --syslog, --s3-access-key-id, --files-from*, "
+                "--filter-from, --exclude/include-file), got: "
+                f"{bad!r}"
             )
         return v
 
@@ -348,6 +356,8 @@ class ClassifierConfig(BaseModel):
     @field_validator("episode_regex")
     @classmethod
     def _valid_regex(cls, v: str) -> str:
+        if len(v) > 500:
+            raise ValueError("episode_regex exceeds 500 chars (ReDoS guard)")
         re.compile(v)  # raises if invalid
         return v
 
@@ -1005,6 +1015,20 @@ class AppConfig(BaseModel):
         with open(path, "rb") as f:
             data = tomllib.load(f)
         _warn_unknown_keys(cls, data)
+        # Secrets at rest: the file holds passwords/api keys/bot tokens —
+        # warn when group/other can read it (0600 recommended).
+        try:
+            import os as _os
+            _mode = _os.stat(path).st_mode & 0o077
+            if _mode:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "config file %s is readable by group/other (mode %o); "
+                    "consider chmod 600 — it holds secrets",
+                    path, _os.stat(path).st_mode & 0o777,
+                )
+        except Exception:
+            pass
         return cls.model_validate(data)
 
     @property

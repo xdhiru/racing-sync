@@ -202,7 +202,10 @@ class _SFTPConnection:
                 self._client.connect(**kwargs)
                 self._sftp = self._client.open_sftp()
                 log.info("sftp connected to %s:%d", self._cfg.ssh_host, self._cfg.ssh_port)
-            except Exception:
+            except BaseException:
+                # BaseException on purpose: CancelledError/KeyboardInterrupt
+                # must also close the half-open socket/transport instead of
+                # leaking it while the task unwinds.
                 if sock is not None:
                     try:
                         sock.close()

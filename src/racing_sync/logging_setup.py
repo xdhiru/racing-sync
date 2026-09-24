@@ -34,7 +34,13 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 SENSITIVE_KEY_WORDS = ("passkey", "api_key", "apikey", "token", "auth", "secret", "password")
 
 _SENSITIVE_PARAM_RE = re.compile(
-    r"((?:passkey|passwd|pwd|pass[_-]?key|api[_-]?key|auth[_-]?key|secret[_-]?key|token|secret|password|auth)\s*[:=]\s*[\"']?)([^&\s\"'},;]+)",
+    r"((?:passkey|passwd|pwd|pass[_-]?key|api[_-]?key|auth[_-]?key|secret[_-]?key|token|secret|password|auth|torrent[_-]?pass)\s*[:=]\s*[\"']?)([^&\s\"'},;]+)",
+    re.IGNORECASE,
+)
+# JSON bodies: {"password": "x"} / {'api_key':'y'} — the param pattern
+# above misses the closing-quote/space variants; catch them explicitly.
+_SENSITIVE_JSON_RE = re.compile(
+    r"([\"'](?:passkey|passwd|pwd|pass[_-]?key|api[_-]?key|auth[_-]?key|secret[_-]?key|token|secret|password|auth|torrent[_-]?pass)[\"']\s*:\s*[\"'])([^\"']+)",
     re.IGNORECASE,
 )
 _BEARER_TOKEN_RE = re.compile(
@@ -101,17 +107,21 @@ class ENOSPCSafeTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandl
 def sanitize_log_text(text: str) -> str:
     """Scrub sensitive credentials, tokens, and passkeys from log messages."""
     text = _SENSITIVE_PARAM_RE.sub(r"\1***", text)
+    text = _SENSITIVE_JSON_RE.sub(r"\1***", text)
     text = _BEARER_TOKEN_RE.sub(r"\1***", text)
     text = _ANNOUNCE_URL_RE.sub(r"\1...", text)
     return text
 
 
-def is_sensitive_key(key: str) -> bool:
+def is_sensitive_key(key: object) -> bool:
     """Check if a dictionary key indicates sensitive credentials."""
-    k_lower = key.lower()
+    try:
+        k_lower = str(key).lower()
+    except Exception:
+        return False
     if k_lower in _SENSITIVE_HEADER_KEYS:
         return True
-    return bool(_SENSITIVE_KEY_RE.search(key))
+    return bool(_SENSITIVE_KEY_RE.search(k_lower))
 
 
 class SanitizingFormatter(logging.Formatter):
@@ -210,7 +220,7 @@ def _scrub_value(v: object, depth: int = 0) -> object:
         out: dict[object, object] = {}
         for dk, dv in v.items():
             try:
-                if isinstance(dk, str) and is_sensitive_key(dk):
+                if is_sensitive_key(dk):
                     out[dk] = "***"
                 else:
                     out[dk] = _scrub_value(dv, depth + 1)

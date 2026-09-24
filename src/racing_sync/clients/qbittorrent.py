@@ -65,6 +65,12 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         "<html", "<!doctype", "<form", "login", "password", "username",
         "sign in", "unauthorized",
     )
+    # Bare words ("login", "password", "username") also appear in torrent
+    # names/JSON — they only count with an HTML hint in the probe.
+    _LOGIN_PAGE_STRONG_MARKERS = (
+        "<html", "<!doctype", "<form", "sign in", "unauthorized",
+    )
+    _LOGIN_PAGE_WEAK_MARKERS = ("login", "password", "username")
 
     async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
         """Request + JSON-decode with re-auth on login-page responses.
@@ -77,21 +83,38 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         looks like a login page. Genuine corrupt JSON re-raises
         immediately without a wasteful login.
         """
+        _need_reauth = False
         try:
             async with await self.request(method, path, **kwargs) as r:
-                return await r.json()
-        except (aiohttp.ContentTypeError, ValueError) as e:
-            try:
-                _body = await r.text()
-            except Exception:
-                _body = ""
-            _probe = f"{_body or ''} {getattr(e, 'doc', '') or ''}".lower()
-            if not any(m in _probe for m in self._LOGIN_PAGE_MARKERS):
-                raise
-            log.warning(
-                "[%s] %s %s returned login page (expired session?); re-authenticating",
-                self._label, method, path,
-            )
+                try:
+                    return await r.json()
+                except (aiohttp.ContentTypeError, ValueError) as e:
+                    # Read the body INSIDE the context: after exit the
+                    # response is released and text() goes empty (login
+                    # detection miss) or raises.
+                    try:
+                        _body = await r.text()
+                    except Exception:
+                        _body = ""
+                    _probe = f"{_body or ''} {getattr(e, 'doc', '') or ''}".lower()
+                    if not any(m in _probe for m in self._LOGIN_PAGE_STRONG_MARKERS):
+                        if ("<" not in _probe or not any(
+                                m in _probe for m in self._LOGIN_PAGE_WEAK_MARKERS)):
+                            raise
+                    log.warning(
+                        "[%s] %s %s returned login page (expired session?); re-authenticating",
+                        self._label, method, path,
+                    )
+                    _need_reauth = True
+        except AuthError:
+            raise
+        except (aiohttp.ContentTypeError, ValueError):
+            # Genuine corrupt JSON (not a login page): re-raised inside.
+            raise
+        if not _need_reauth:
+            # Transport errors from request() propagate untouched — only a
+            # login-page payload earns a re-login + retry.
+            raise RuntimeError("unreachable: request raised without decode path")
         try:
             self._authed = False
         except Exception:
