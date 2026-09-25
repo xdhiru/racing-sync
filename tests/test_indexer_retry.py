@@ -311,17 +311,48 @@ async def test_coordinator_run_stops_immediately_when_stop_requested():
 
     tick_called = False
 
-    async def fake_tick():
+    async def fake_poller():
         nonlocal tick_called
         tick_called = True
         coord.request_stop()
 
-    coord._tick = fake_tick
+    # run() supervises the three loops (not a single _tick): the poller
+    # fires once and stops everything; the other lanes stay quiet.
+    coord._poller_loop = fake_poller
+    coord._scheduler_loop = AsyncMock()
+    coord._janitor_loop = AsyncMock()
 
     exit_code = await coord.run()
     assert exit_code == 0
     assert tick_called is True
     coord.shutdown.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_loops_run_their_own_step_and_stop():
+    """Poller/scheduler/janitor loops run once and honor _stop."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    for loop_name, step_name in (
+        ("_poller_loop", "_poll_source_step"),
+        ("_scheduler_loop", "_schedule_step"),
+        ("_janitor_loop", "_janitor_step"),
+    ):
+        coord = make_coordinator()
+        coord._stop = False
+        coord.cfg = MagicMock()
+        coord.cfg.general.source_poll_interval = 9999
+        coord.cfg.general.dest_poll_interval = 9999
+        coord.cfg.cleanup.janitor_interval_seconds = 9999
+        calls = []
+
+        async def fake_step():
+            calls.append(1)
+            coord.request_stop()
+
+        setattr(coord, step_name, fake_step)
+        await getattr(coord, loop_name)()
+        assert calls == [1], loop_name
 
 @pytest.mark.anyio
 async def test_wait_disk_then_queue_transitions_to_queued_under_download_sem():

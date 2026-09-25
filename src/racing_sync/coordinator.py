@@ -263,6 +263,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     # Serializes the periodic tick against API-triggered ops (recover /
     # scan-watch / retry) so they can't double-schedule or clobber rows.
     _ops_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    # Worker-scheduler loop lock: the scheduler runs concurrently with the
+    # source poller, so it serializes only with itself. Scheduler/worker
+    # races are closed by re-get guards, not by sharing the poller lock —
+    # a wedged poll must never stall admissions, and vice versa.
+    _schedule_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    # Janitor loop lock: hourly VPS1 cleanup + tombstone GC must never
+    # stall source discovery, scheduling, or API ops behind one lock.
+    _janitor_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    # Supervised loop tasks (poller/scheduler/janitor), cancelled on shutdown.
+    _loop_tasks: set[asyncio.Task] = field(default_factory=set, init=False)
     # Frozen per-torrent batch cap (bug 5): batch boundaries must not shift
     # when free space changes mid-download, or batch_index points at
     # different episodes (skip/repeat). Frozen at first use, reused for the
@@ -668,40 +678,76 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     # ---- main loop ----
 
     async def run(self) -> int:
+        """Supervise the poller, scheduler and janitor loops.
+
+        Three independent loops with separate locks and clocks (a wedged
+        source poll, wedged scheduler, or slow janitor degrades only its
+        own lane). Each loop guards its own iterations and never raises;
+        the supervisor just waits for stop and cancels them on shutdown.
+        `_tick()` remains the single-pass equivalent for tests.
+        """
         await self.start()
         try:
+            loop_tasks = getattr(self, "_loop_tasks", None)
+            if not isinstance(loop_tasks, set):
+                loop_tasks = set()
+                try:
+                    self._loop_tasks = loop_tasks
+                except Exception:
+                    pass
+            factories = (self._poller_loop, self._scheduler_loop,
+                         self._janitor_loop)
+            owned: dict[asyncio.Task, object] = {}
+            for factory in factories:
+                try:
+                    task = asyncio.create_task(factory())
+                except RuntimeError:
+                    break
+                try:
+                    loop_tasks.add(task)
+                    owned[task] = factory
+                except Exception:
+                    pass
             while not self._stop:
                 try:
-                    await self._tick()
-                except AuthError as e:
-                    # WebUI auth still failing after the retry loop
-                    # in HTTPClientBase.request() — log loudly, back
-                    # off, and let the next tick try again instead
-                    # of crashing the whole coordinator.
-                    log.error(
-                        "auth still failing after retries; "
-                        "backing off for one poll interval: %s", e,
-                    )
-                except TimeoutError as e:
-                    log.warning(
-                        "poll tick timed out (remote client connection dropped/slow); "
-                        "backing off for one poll interval: %s", e,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    log.error(
-                        "unexpected error in coordinator tick; "
-                        "backing off for one poll interval: %s", e, exc_info=True,
-                    )
-                if self._stop:
-                    break
-                # Cancellable sleep so SIGINT/SIGTERM break out quickly.
-                try:
-                    await asyncio.sleep(
-                        self.cfg.general.source_poll_interval
-                    )
+                    await asyncio.sleep(1.0)
                 except asyncio.CancelledError:
                     break
+                # A dead loop is a bug: respawn it loudly instead of
+                # silently losing a lane (or crashing the coordinator).
+                try:
+                    for task in list(loop_tasks):
+                        if task.done() and not task.cancelled():
+                            factory = owned.pop(task, None)
+                            try:
+                                loop_tasks.discard(task)
+                            except Exception:
+                                pass
+                            try:
+                                task.result()
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception as e:  # noqa: BLE001
+                                log.error("loop task died; respawning: %s", e,
+                                          exc_info=True)
+                            if factory is not None and not self._stop:
+                                try:
+                                    new_task = asyncio.create_task(factory())
+                                    loop_tasks.add(new_task)
+                                    owned[new_task] = factory
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
         finally:
+            try:
+                for task in list(getattr(self, "_loop_tasks", None) or []):
+                    try:
+                        task.cancel()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             await self.shutdown()
         return 0
 
@@ -915,9 +961,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         except Exception:
             pass
 
-    async def _tick_inner(self) -> None:
-        """One iteration: poll sources, schedule work."""
-        log.debug("tick: enter")
+    async def _poll_source_step(self) -> None:
+        """Source-poller pass: watch scan, source ingest, fuse sweep.
+
+        Runs on the poller loop under `_ops_lock` (serialized vs API
+        ops), and inside `_tick_inner` for single-pass callers. Every
+        sub-step is isolated: a poisoned drop must not skip the source
+        poll, and a wedged source must not wedge scheduling — the other
+        loops run on their own locks and clocks.
+        """
+        log.debug("poller: enter")
         # 1. Watch dir (req #3). Isolated like every tick step: a poisoned
         # drop must not skip the source poll, workers or janitor below.
         try:
@@ -954,6 +1007,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         except Exception as e:  # noqa: BLE001
             log.warning("manual fuse sweep failed: %s", e)
 
+    async def _schedule_step(self) -> None:
+        """Scheduler pass: indexer wakeups, worker scheduling, live refresh.
+
+        Runs on the scheduler loop under `_schedule_lock`, and inside
+        `_tick_inner` for single-pass callers. Snapshots are re-validated
+        at worker start (re-get guards), so interleaving with the poller
+        loop or API ops cannot double-schedule or clobber rows.
+        """
+        log.debug("scheduler: enter")
         # 3. Wake up WAITING_INDEXER rows whose retry timer has elapsed —
         # both the download-target indexer schedule and the independent
         # public-export schedule. Indexer wakeups still respect worker
@@ -1102,6 +1164,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         except Exception as e:  # noqa: BLE001
             log.warning("live status refresh failed; continuing tick: %s", e)
 
+    async def _janitor_step(self) -> None:
+        """Janitor pass: VPS1 cleanup + tombstone GC.
+
+        Runs on the janitor loop under `_janitor_lock` (hourly cadence,
+        self-gated), and inside `_tick_inner` for single-pass callers.
+        Isolating it means a slow/dead fuse or qB can no longer stall
+        source discovery, scheduling, or API ops behind one lock.
+        """
+        log.debug("janitor: enter")
         # 5. VPS1 cleanup janitor (hourly no-op unless [cleanup].enabled).
         # Must never break the tick: all failures are caught and logged.
         try:
@@ -1125,6 +1196,119 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     log.info("tombstone GC removed %d expired forget row(s)", _n)
         except Exception as e:  # noqa: BLE001
             log.warning("tombstone GC failed: %s", e)
+
+    async def _tick_inner(self) -> None:
+        """One full pass: poll sources, schedule work, run janitor.
+
+        Compatibility path for single-pass callers (tests, manual ticks):
+        the production `run()` loop instead runs the three steps on
+        independent loops with separate locks and clocks (see
+        `_poller_loop` / `_scheduler_loop` / `_janitor_loop`).
+        """
+        await self._poll_source_step()
+        await self._schedule_step()
+        await self._janitor_step()
+
+    def _loop_lock(self, name: str) -> asyncio.Lock:
+        """Per-loop lock, lazily created (tolerates bare test doubles)."""
+        try:
+            lock = getattr(self, name, None)
+            if lock is not None and hasattr(lock, "__aenter__"):
+                return lock
+        except Exception:
+            pass
+        try:
+            lock = asyncio.Lock()
+        except Exception:
+            lock = None
+        try:
+            setattr(self, name, lock)
+        except Exception:
+            pass
+        return lock
+
+    async def _poller_loop(self) -> None:
+        """Source-poller loop: watch + source ingest + fuse sweep."""
+        while not self._stop:
+            try:
+                lock = self._loop_lock("_ops_lock")
+                if lock is not None:
+                    async with lock:
+                        await self._poll_source_step()
+                else:
+                    await self._poll_source_step()
+            except asyncio.CancelledError:
+                break
+            except AuthError as e:
+                log.error("poller: auth still failing; backing off: %s", e)
+            except TimeoutError as e:
+                log.warning("poller: timed out; backing off: %s", e)
+            except Exception as e:  # noqa: BLE001
+                log.error("poller: unexpected error; backing off: %s",
+                          e, exc_info=True)
+            if self._stop:
+                break
+            try:
+                await asyncio.sleep(
+                    self.cfg.general.source_poll_interval)
+            except asyncio.CancelledError:
+                break
+
+    async def _scheduler_loop(self) -> None:
+        """Worker-scheduler loop: wakeups, admissions, live refresh."""
+        while not self._stop:
+            try:
+                lock = self._loop_lock("_schedule_lock")
+                if lock is not None:
+                    async with lock:
+                        await self._schedule_step()
+                else:
+                    await self._schedule_step()
+            except asyncio.CancelledError:
+                break
+            except AuthError as e:
+                log.error("scheduler: auth still failing; backing off: %s", e)
+            except TimeoutError as e:
+                log.warning("scheduler: timed out; backing off: %s", e)
+            except Exception as e:  # noqa: BLE001
+                log.error("scheduler: unexpected error; backing off: %s",
+                          e, exc_info=True)
+            if self._stop:
+                break
+            try:
+                await asyncio.sleep(
+                    self.cfg.general.dest_poll_interval)
+            except asyncio.CancelledError:
+                break
+
+    async def _janitor_loop(self) -> None:
+        """Janitor loop: VPS1 cleanup + tombstone GC (self-gated cadence)."""
+        # The step self-gates on janitor_interval_seconds, so the loop
+        # wakes often enough to stay responsive without busy work.
+        while not self._stop:
+            try:
+                lock = self._loop_lock("_janitor_lock")
+                if lock is not None:
+                    async with lock:
+                        await self._janitor_step()
+                else:
+                    await self._janitor_step()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:  # noqa: BLE001
+                log.error("janitor: unexpected error; backing off: %s",
+                          e, exc_info=True)
+            if self._stop:
+                break
+            try:
+                await asyncio.sleep(
+                    max(300, int(getattr(
+                        getattr(self.cfg, "cleanup", None),
+                        "janitor_interval_seconds", 3600) or 3600)))
+            except (TypeError, ValueError):
+                await asyncio.sleep(300)
+            except asyncio.CancelledError:
+                break
 
     async def _refresh_live_status(self) -> None:
         """Re-query VPS2 progress and update the live map."""
