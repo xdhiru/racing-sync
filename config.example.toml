@@ -319,6 +319,12 @@ active_repost_interval_seconds = 15
 # Outbound rate limit (messages/second) for per-torrent detail messages.
 # Prevents Telegram HTTP 429 on bursts (e.g. first run with many torrents).
 outbound_rate = 5
+# Destructive-command allowlist (Telegram user ids). Empty (default):
+# anyone in the authorized chat may run /cancel_//fetch_//prefer_ and tap
+# the buttons. Non-empty: only these users; others get "not authorized".
+# Pending pickers additionally bind to the commanding user.
+# Example: admin_user_ids = [123456789]
+admin_user_ids = []
 
 # ============================================================
 # Centralized logging (HTTP sink)
