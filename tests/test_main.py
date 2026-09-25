@@ -167,6 +167,29 @@ def test_run_reset_requires_yes(tmp_path: Path):
     assert rc == 2
 
 
+def test_run_refuses_when_daemon_lock_held(tmp_path: Path, capsys):
+    """A second `run` fails fast while another instance holds the lock."""
+    from racing_sync.__main__ import main
+    from racing_sync.config import AppConfig
+    from racing_sync.safety import DaemonLock, daemon_lock_path
+
+    cfg_text = MINIMAL_CONFIG.replace(
+        "dest_poll_interval = 15",
+        f"dest_poll_interval = 15\nstate_db = {str(tmp_path / 'state.db')!r}",
+    )
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(cfg_text)
+    cfg = AppConfig.from_toml(cfg_file)
+    holder = DaemonLock(daemon_lock_path(cfg))
+    assert holder.acquire() is True
+    try:
+        rc = main(["run", "--config", str(cfg_file)])
+        assert rc == 2
+        assert "another racing-sync instance" in capsys.readouterr().err
+    finally:
+        holder.release()
+
+
 def test_do_reset_refuses_fuse_overlap_log_dir(tmp_path: Path):
     """A log dir on/under a fuse mount is never cleared."""
     from racing_sync.__main__ import _do_reset
