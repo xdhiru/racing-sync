@@ -19,6 +19,7 @@ from .coordinator_content import (
     _verified_cross_seed_blob,
     indexer_slug,
 )
+from .io_bounds import bounded
 from .prowlarr import ProwlarrClient
 from .sftp_source import SFTPExporter
 
@@ -235,9 +236,18 @@ async def pick_ssd_source_for_racing(
             source_torrent.name,
         )
         try:
-            hit = await prowlarr.best_match(
-                source_torrent.name, target_size=source_torrent.size_bytes,
-                indexers=prowlarr.get_download_indexers(),
+            try:
+                _pq_timeout = float(
+                    getattr(getattr(cfg, "prowlarr", None),
+                            "timeout_seconds", 30.0) or 30.0)
+            except (TypeError, ValueError):
+                _pq_timeout = 30.0
+            hit = await bounded(
+                prowlarr.best_match(
+                    source_torrent.name, target_size=source_torrent.size_bytes,
+                    indexers=prowlarr.get_download_indexers(),
+                ),
+                timeout=_pq_timeout, label="prowlarr best_match",
             )
         except Exception as e:  # noqa: BLE001
             log.warning("download-indexer search failed for %s: %s",
@@ -252,7 +262,10 @@ async def pick_ssd_source_for_racing(
                 hit.title, hit.size_bytes, hit.indexer,
             )
             try:
-                blob = await prowlarr.download_torrent(hit)
+                blob = await bounded(
+                    prowlarr.download_torrent(hit),
+                    timeout=_pq_timeout, label="prowlarr download_torrent",
+                )
             except Exception as e:  # noqa: BLE001
                 # Same transient class as a search failure: park and retry
                 # instead of failing a row over one bad fetch.

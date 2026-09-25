@@ -109,6 +109,25 @@ async def test_list_source_torrents_caches_within_ttl():
 
 
 @pytest.mark.anyio
+async def test_source_timeout_degrades_to_retry_not_failed():
+    """A wedged VPS1 lookup parks/retries — never a terminal FAILED."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    coord = make_coordinator()
+    coord.source_client = AsyncMock()
+    coord.source_client.get_torrent.side_effect = TimeoutError("wedged")
+    coord.transition = MagicMock()
+
+    ts = TorrentState(source_infohash="timeout_hash_12345", state=State.NEW)
+    assert await coord._fetch_source_or_fail(ts) is None
+    coord.transition.assert_not_called()
+
+    # Source poll timeout serves an empty view, not an exception.
+    coord.source_client.list_torrents.side_effect = TimeoutError("wedged")
+    assert await coord._list_source_torrents(force_refresh=True) == []
+
+
+@pytest.mark.anyio
 async def test_do_new_transitions_failed_when_source_vanished():
     from unittest.mock import AsyncMock, MagicMock
 

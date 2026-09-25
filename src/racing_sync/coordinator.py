@@ -67,6 +67,7 @@ from .coordinator_errors import (
 from .coordinator_paths import _safe_ssd_join, _watch_cross_seed_dir
 from .coordinator_picker import pick_ssd_source_for_racing
 from .coordinator_ssd import SSDLedgerMixin
+from .io_bounds import chunked, offload, rpc
 from .prowlarr import ProwlarrClient, TorrentHit
 from .rclone_ops import (
     RcloneTimeoutError,
@@ -441,8 +442,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # new code. This is the common path after the user upgrades
             # and re-runs.
             if self.cfg.recovery.auto_retry_failed:
+                try:
+                    _all_rows = await offload(self.store.all)
+                except Exception:
+                    _all_rows = []
                 failed_rows = [
-                    ts for ts in self.store.all()
+                    ts for ts in (_all_rows or [])
                     if ts.state == State.FAILED
                 ]
                 max_retries = getattr(self.cfg.recovery, "max_failed_retries", 3)
@@ -558,9 +563,21 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if not force_refresh and (now_mono - self._source_torrents_cached_at) < 10.0:
             return list(self._source_torrents_cache)
 
-        all_torrents = await self.source_client.list_torrents(
-            category=self.cfg.source.category
-        )
+        try:
+            all_torrents = await rpc(
+                self.source_client.list_torrents(
+                    category=self.cfg.source.category
+                ),
+                getattr(self, "cfg", None), "source list_torrents",
+            )
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            # Wedged VPS1 poll: serve the stale cache when there is one,
+            # else an empty view — a timeout must degrade the poll, never
+            # fail rows or abort the tick from any caller.
+            _stale = getattr(self, "_source_torrents_cache", None) or []
+            log.warning("source poll timed out; using %s view: %s",
+                        "stale cache" if _stale else "empty", e)
+            return list(_stale)
         min_age = self.cfg.source.min_age_seconds
         if min_age <= 0:
             filtered = all_torrents
@@ -932,9 +949,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # Broken config must fail closed to a bounded burst, never to
             # unbounded worker spawn (0 is falsy = cap disabled below).
             _max_workers = 12
-        ready_indexer = self.store.list_indexer_ready()
         try:
-            ready_public = self.store.list_public_retry_ready()
+            ready_indexer = await offload(self.store.list_indexer_ready)
+        except Exception:
+            ready_indexer = []
+        try:
+            ready_public = await offload(self.store.list_public_retry_ready)
         except Exception:
             ready_public = []
         for ts in list(ready_indexer or []) + list(ready_public or []):
@@ -956,8 +976,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         # RE_ADDING rows indefinitely (live incident: 135s-delayed re-adds
         # never re-ran while 40+ NEW rows cycled). WAITING_DISK still sorts
         # last so parked rows never starve real work either.
+        try:
+            _all_active = await offload(self.store.all_active)
+        except Exception:
+            _all_active = []
         active = sorted(
-            self.store.all_active(),
+            _all_active or [],
             key=_sched_priority,
         )
         scheduled = 0
@@ -1087,8 +1111,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         """Re-query VPS2 progress and update the live map."""
         if not self._live:
             return
+        rows: list = []
         try:
-            rows = await self.dest_client.list_torrents(hashes=list(self._live.keys()))
+            for _chunk in chunked(list(self._live.keys())):
+                rows.extend(await rpc(
+                    self.dest_client.list_torrents(hashes=_chunk),
+                    getattr(self, "cfg", None), "dest live list_torrents",
+                ) or [])
         except Exception as e:  # noqa: BLE001
             log.warning("list_torrents for live status failed: %s", e)
             return
@@ -1461,7 +1490,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         are tracked in-memory per infohash (a restart resets the count,
         which is safe — worst case one extra grace window).
         """
-        st = await self.source_client.get_torrent(ts.source_infohash)
+        try:
+            st = await rpc(
+                self.source_client.get_torrent(ts.source_infohash),
+                getattr(self, "cfg", None), "source get_torrent",
+            )
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            # Hung VPS1 lookup degrades to a quiet retry next tick —
+            # never a terminal FAILED over one wedged poll.
+            log.warning("source lookup timed out for %s (%s); retry next tick",
+                        (ts.source_infohash or "")[:10], e)
+            return None
         if st is None:
             try:
                 _misses = getattr(self, "_source_miss_counts", None)
@@ -1820,8 +1859,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if dest_client is None or store is None:
                 return
             try:
-                pre_ssd = store.list_by_state(
-                    State.NEW, State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK
+                pre_ssd = await offload(
+                    store.list_by_state,
+                    State.NEW, State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK,
                 )
             except Exception:
                 return
@@ -2799,6 +2839,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         is excluded on purpose — a finished sibling no longer holds SSD
         work, and the normal pick (with its all-remote shortcut) is the
         right path then. Fail-open None: any doubt runs the normal pick.
+
+        Stays synchronous: the Telegram refresh loop calls this (via
+        _watch_wait_note) inline, and it is one indexed SELECT — the
+        heavy list scans live on offloaded paths instead.
         """
         try:
             want_norm = normalize_content_name(ts.source_name or "")
@@ -3041,7 +3085,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 _max_dl = int(_max_dl_raw or 0)
             if _max_dl > 0:
                 try:
-                    _active_dl = len(self.store.list_by_state(State.QUEUED, State.DOWNLOADING))
+                    _active_dl = len(await offload(
+                        self.store.list_by_state,
+                        State.QUEUED, State.DOWNLOADING))
                 except Exception:
                     _active_dl = 0
                 if _active_dl >= _max_dl:
@@ -3163,7 +3209,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
         # Re-check that the torrent isn't already present on VPS2.
         check_hashes = [h for h in (ts.source_infohash, ts.cross_seed_infohash, ts.dest_infohash) if h]
-        existing = await self.dest_client.list_torrents(hashes=check_hashes)
+        existing = await rpc(
+            self.dest_client.list_torrents(hashes=check_hashes),
+            getattr(self, "cfg", None), "dest queued list_torrents",
+        )
         if existing:
             ext = existing[0]
             fuse_mounts = [
@@ -3179,7 +3228,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 # and must never FAILED either (a warming/dead mount also
                 # shows nothing, and FAILED would trigger re-downloads).
                 try:
-                    fuse_files = await self.dest_client.get_torrent_files(ext.hash)
+                    fuse_files = await rpc(
+                        self.dest_client.get_torrent_files(ext.hash),
+                        getattr(self, "cfg", None), "dest fuse get_torrent_files",
+                    )
                     fuse_list_failed = False
                 except Exception as e:  # noqa: BLE001
                     log.warning(
@@ -3863,9 +3915,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         err: Exception | None = None
         for attempt in range(3):
             try:
-                await self.dest_client.pause(h)
+                await rpc(self.dest_client.pause(h),
+                          getattr(self, "cfg", None), "dest pause")
                 try:
-                    cur = await self.dest_client.get_torrent(h)
+                    cur = await rpc(
+                        self.dest_client.get_torrent(h),
+                        getattr(self, "cfg", None), "dest get_torrent")
                     state = getattr(cur, "state", "") if cur is not None else ""
                     if cur is None or self._client_reports_paused(state):
                         return True, None
@@ -4216,7 +4271,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             return
 
         while not self._stop:
-            t = await self.dest_client.get_torrent(h)
+            t = await rpc(self.dest_client.get_torrent(h),
+                          getattr(self, "cfg", None), "dest poll get_torrent")
             if t is None:
                 # Vanished entry + vanished row = the operator abandoned
                 # this torrent mid-download (forget/cancel): unwind quietly
@@ -6126,7 +6182,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if not hashes:
             return None
         try:
-            present = await self.dest_client.list_torrents(hashes=list(hashes))
+            present: list = []
+            for _chunk in chunked(sorted(hashes)):
+                present.extend(await rpc(
+                    self.dest_client.list_torrents(hashes=_chunk),
+                    getattr(self, "cfg", None), "dest verify list_torrents",
+                ) or [])
         except Exception:  # noqa: BLE001
             return None
         have = {t.hash.lower() for t in (present or [])}
@@ -6556,7 +6617,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             "skip_check": True,
             "tags": ["racing", "fuse"],
         }
-        res = await self.dest_client.add_torrent(**add_kwargs)  # type: ignore[arg-type]
+        res = await rpc(self.dest_client.add_torrent(**add_kwargs),  # type: ignore[arg-type]
+                        getattr(self, "cfg", None), "dest fuse add_torrent")
         detail = res.detail if isinstance(res.detail, str) else ""
         if res.accepted and "already" not in detail.lower():
             # Verify the entry actually landed where asked: the fuse index
@@ -6565,7 +6627,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # the moved files. Same patience window as the replace path.
             for _ in range(4):
                 try:
-                    _st = await self.dest_client.get_torrent(h_low)
+                    _st = await rpc(
+                        self.dest_client.get_torrent(h_low),
+                        getattr(self, "cfg", None), "dest fuse get_torrent")
                 except Exception:
                     _st = None
                 if _st is not None and self._save_path_points_at_target(
@@ -6585,7 +6649,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             return False, detail
         # Possible duplicate: inspect what's actually there.
         try:
-            dest_st = await self.dest_client.get_torrent(h_low)
+            dest_st = await rpc(
+                self.dest_client.get_torrent(h_low),
+                getattr(self, "cfg", None), "dest fuse get_torrent")
         except Exception as e:  # noqa: BLE001
             log.debug("could not check dest client for %s: %s", h_low[:10], e)
             dest_st = None
@@ -6602,16 +6668,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 label, h_low[:10], getattr(dest_st, "save_path", "?"), target_mount,
             )
             try:
-                await self.dest_client.delete(h_low, delete_files=False)
+                await rpc(self.dest_client.delete(h_low, delete_files=False),
+                          getattr(self, "cfg", None), "dest fuse delete")
             except Exception as e:  # noqa: BLE001
                 return False, f"cannot remove non-fuse entry: {e}"
-            res2 = await self.dest_client.add_torrent(**add_kwargs)  # type: ignore[arg-type]
+            res2 = await rpc(self.dest_client.add_torrent(**add_kwargs),  # type: ignore[arg-type]
+                             getattr(self, "cfg", None), "dest fuse add_torrent")
             detail2 = res2.detail if isinstance(res2.detail, str) else ""
             if res2.accepted or detail2 == "Fails." or "already" in detail2.lower():
                 dest_st2 = None
                 for _ in range(4):
                     try:
-                        dest_st2 = await self.dest_client.get_torrent(h_low)
+                        dest_st2 = await rpc(
+                            self.dest_client.get_torrent(h_low),
+                            getattr(self, "cfg", None), "dest fuse get_torrent")
                     except Exception:
                         dest_st2 = None
                     if dest_st2 is not None:

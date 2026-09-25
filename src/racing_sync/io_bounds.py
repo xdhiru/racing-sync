@@ -71,6 +71,16 @@ async def offload(fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
+async def rpc(awaitable: Awaitable[T], cfg: object | None, label: str) -> T:
+    """Bound one client RPC with the configured budget and a log label.
+
+    Short call-site form of `bounded(..., timeout=rpc_timeout_seconds(cfg))`.
+    Timeouts propagate as TimeoutError (retryable: park-and-retry).
+    """
+    return await bounded(awaitable, timeout=rpc_timeout_seconds(cfg),
+                         label=label)
+
+
 def chunked(items: Iterable[T], size: int = DEFAULT_HASH_CHUNK) -> list[list[T]]:
     """Split into bounded chunks (hash-list URL limits)."""
     try:
@@ -87,5 +97,6 @@ __all__ = [
     "rpc_timeout_seconds",
     "bounded",
     "offload",
+    "rpc",
     "chunked",
 ]
