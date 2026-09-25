@@ -73,6 +73,66 @@ def _esc(text: str) -> str:
     )
 
 
+def _tg_actor_id(obj: Any) -> str | None:
+    """Telegram user id behind a message or callback query, if present.
+
+    Only numeric ids count: test doubles and channel posts without a
+    sender yield None (unknown), which fails open for owner-binding but
+    fails closed when an admin allowlist is configured.
+    """
+    try:
+        user = getattr(obj, "from_user", None)
+        uid = getattr(user, "id", None)
+        if uid is None or isinstance(uid, bool):
+            return None
+        return str(int(str(uid)))
+    except Exception:
+        return None
+
+
+def _tg_actor_allowed(cfg: Any, user_id: object) -> bool:
+    """Admin-allowlist gate for destructive commands and taps.
+
+    Empty `admin_user_ids` (default) preserves today's behavior: anyone
+    in the authorized chat may act. A non-empty list restricts destructive
+    flows to those users; a missing user id fails closed only when the
+    list is configured (channel posts without a sender cannot comply).
+    """
+    try:
+        allowed = getattr(cfg, "admin_user_ids", None) or []
+        if not isinstance(allowed, (list, tuple, set)):
+            # Unconfigured (or a test double): no restriction.
+            return True
+        allowed = [a for a in allowed]
+        if not allowed:
+            return True
+        if user_id is None:
+            return False
+        want = {str(int(a)) for a in allowed}
+        return str(user_id) in want or str(int(str(user_id))) in want
+    except Exception:
+        return True
+
+
+def _tg_pending_owner_ok(pending: dict, user_id: object) -> bool:
+    """A tap belongs to the pending flow when owners match (or unknown).
+
+    The pending records the commanding user at arm time; a different
+    known tapper is rejected so one operator cannot forge taps into
+    another's flow. Unknown either side fails open (single-operator
+    chats, channel posts) — the seq token remains the binding there.
+    """
+    try:
+        if not isinstance(pending, dict):
+            return True
+        owner = pending.get("user_id")
+        if not owner or user_id is None:
+            return True
+        return str(owner) == str(user_id)
+    except Exception:
+        return True
+
+
 def _strip_code_spans(text: str) -> str:
     """Remove `...` spans so delimiter balancing ignores literal * / _ inside code."""
     return re.sub(r"`[^`]*`", "", text)
@@ -1422,12 +1482,14 @@ class TelegramBot:
             return str(_n)
 
     def _set_pending_pick(self, cmd: str, title: str, size_bytes: object,
-                          members: list[tuple[str, str]]) -> dict:
+                           members: list[tuple[str, str]],
+                           user_id: object = None) -> dict:
         """Arm a member-choice pick; members are frozen (hash, label)."""
         _p = {
             "kind": "pick", "seq": self._next_seq(), "cmd": cmd,
             "title": (title or "")[:80], "size": size_bytes,
             "members": [(h, label) for (h, label) in members or []],
+            "user_id": str(user_id) if user_id is not None else None,
             "expires": time.monotonic() + _PENDING_TTL_S,
         }
         try:
@@ -1441,13 +1503,15 @@ class TelegramBot:
         return _p
 
     def _set_pending_keepq(self, title: str, scope: str,
-                           hashes: list[str], size_bytes: object = None) -> dict:
+                            hashes: list[str], size_bytes: object = None,
+                            user_id: object = None) -> dict:
         """Arm the keep/delete question over frozen hashes."""
         _p = {
             "kind": "keepq", "seq": self._next_seq(),
             "title": (title or "")[:80], "scope": scope or "",
             "size": size_bytes,
             "hashes": [h for h in hashes or [] if h],
+            "user_id": str(user_id) if user_id is not None else None,
             "expires": time.monotonic() + _PENDING_TTL_S,
         }
         try:
@@ -1561,6 +1625,14 @@ class TelegramBot:
             log.warning("unauthorized callback query from chat=%s user=%s", chat_id, user_id)
             try:
                 await query.answer("Unauthorized", show_alert=True)
+            except Exception:
+                pass
+            return
+        if not _tg_actor_allowed(self._cfg, user_id):
+            log.warning("callback from non-admin user=%s (allowlist set)", user_id)
+            try:
+                await query.answer("Not authorized for destructive actions",
+                                   show_alert=True)
             except Exception:
                 pass
             return
@@ -1714,6 +1786,13 @@ class TelegramBot:
             m_prefer = PREFER_CMD_RE.match(text)
             m_cancel = CANCEL_CMD_RE.match(text)
             if not m_fetch and not m_prefer and not m_cancel:
+                return
+            if not _tg_actor_allowed(self._cfg, user_id):
+                try:
+                    await self._reply("Not authorized for destructive actions.",
+                                      reply_to=message)
+                except Exception:
+                    pass
                 return
             if m_fetch:
                 await self._start_group_command(
@@ -1915,7 +1994,8 @@ class TelegramBot:
         if kind == "cancel":
             self._set_pending_keepq(
                 title, "", [full_hash],
-                getattr(row, "total_bytes", 0))
+                getattr(row, "total_bytes", 0),
+                user_id=_tg_actor_id(message))
             try:
                 await self._refresh_active_message()
             except Exception:
@@ -1964,6 +2044,7 @@ class TelegramBot:
         misroute. Full hashes and legacy prefixes act on one row.
         """
         token = (token or "").strip().lower()
+        _actor = _tg_actor_id(message)
         if len(token) == 40 and all(
                 c in "0123456789abcdef" for c in token):
             await self._start_single_command(kind, token, message)
@@ -2034,11 +2115,13 @@ class TelegramBot:
                     return
                 _lbl = snap[0][1]
                 self._set_pending_keepq(
-                    title, f"{_lbl} copy", _hashes, _gsize)
+                    title, f"{_lbl} copy", _hashes, _gsize,
+                    user_id=_actor)
                 reply = (f"Cancel {title} — keep downloaded files? "
                          f"Choose below.")
             else:
-                self._set_pending_pick("cancel", title, _gsize, snap)
+                self._set_pending_pick("cancel", title, _gsize, snap,
+                                       user_id=_actor)
                 reply = (f"Cancel {title} ({len(snap)} copies): "
                          f"pick below.")
             try:
@@ -2064,7 +2147,7 @@ class TelegramBot:
             except Exception:
                 pass
             return
-        self._set_pending_pick(kind, title, _gsize, snap)
+        self._set_pending_pick(kind, title, _gsize, snap, user_id=_actor)
         try:
             await self._refresh_active_message()
         except Exception:
@@ -2099,10 +2182,24 @@ class TelegramBot:
 
         try:
             parts = (data or "").split(":")
+            _tapper = _tg_actor_id(query)
+
+            def _owner_ok(p) -> bool:
+                if _tg_pending_owner_ok(p or {}, _tapper):
+                    return True
+                return False
+
+            async def _refuse_foreign() -> None:
+                await _say("That picker belongs to another operator — "
+                           "tap the command again for your own.")
+
             if parts[0] == "abort" and len(parts) == 2:
                 p = self._pending_live()
                 if p is None or str(p.get("seq") or "") != parts[1]:
                     await _say("Expired — tap the command again")
+                    return
+                if not _owner_ok(p):
+                    await _refuse_foreign()
                     return
                 try:
                     self._pending_pick = None
@@ -2117,6 +2214,9 @@ class TelegramBot:
                 if (p is None or p.get("kind") != "keepq"
                         or str(p.get("seq") or "") != seq):
                     await _say("Expired — tap the command again")
+                    return
+                if not _owner_ok(p):
+                    await _refuse_foreign()
                     return
                 _hashes = [h for h in (p.get("hashes") or []) if h]
                 _title = str(p.get("title") or "")
@@ -2136,13 +2236,17 @@ class TelegramBot:
                         or str(p.get("seq") or "") != seq):
                     await _say("Expired — tap the command again")
                     return
+                if not _owner_ok(p):
+                    await _refuse_foreign()
+                    return
                 _mems = list(p.get("members") or [])
                 _cmd = str(p.get("cmd") or "")
                 _title = str(p.get("title") or "")
                 if idx == "all" and _cmd == "cancel" and len(_mems) > 1:
                     self._set_pending_keepq(
                         _title, f"all {len(_mems)} copies",
-                        [h for (h, _) in _mems], p.get("size"))
+                        [h for (h, _) in _mems], p.get("size"),
+                        user_id=_tapper)
                     await _refresh()
                     await _say("Keep downloaded files or delete them? Choose below.")
                     return
@@ -2157,7 +2261,8 @@ class TelegramBot:
                     return
                 if _cmd == "cancel":
                     self._set_pending_keepq(
-                        _title, f"{_lbl} copy", [_h], p.get("size"))
+                        _title, f"{_lbl} copy", [_h], p.get("size"),
+                        user_id=_tapper)
                     await _refresh()
                     await _say("Keep downloaded files or delete them? Choose below.")
                     return
