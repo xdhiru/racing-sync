@@ -1958,7 +1958,8 @@ async def test_watch_grace_search_throttled_while_holding(tmp_path: Path):
         store.close()
 
 
-def test_prefer_exemption_pruned_with_row(tmp_path: Path):
+@pytest.mark.anyio
+async def test_prefer_exemption_pruned_with_row(tmp_path: Path):
     """Exemptions for gone/non-NEW rows are reaped by the prune."""
     store = StateStore(tmp_path / "state.db")
     try:
@@ -1968,7 +1969,7 @@ def test_prefer_exemption_pruned_with_row(tmp_path: Path):
         coord._ssd_reserved = {}
         coord._waiting_disk_next_check = {}
         coord._moving_parks = {}
-        coord._ssd_prune_stale()
+        await coord._ssd_prune_stale()
         assert coord._grace_exempt == {}
     finally:
         store.close()

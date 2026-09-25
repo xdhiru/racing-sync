@@ -181,25 +181,65 @@ class SSDLedgerMixin:
                 pass
         return lk
 
-    def _ssd_prune_stale(self) -> None:
+    async def _ssd_prune_stale(self) -> None:
         """Drop bookkeeping for rows no longer needing it (forget/crash drift).
 
         Covers the SSD ledger plus the quiet-wait and MOVING-park maps,
         whose transition-time pops are bypassed by forget/cancel (CLI or
         API). Runs on every admission attempt — cheap fast path when the
         maps are small.
+
+        DB reads run batched in one worker thread: per-entry sync gets on
+        the loop stall admissions under a slow disk/WAL lock.
         """
         try:
             store = getattr(self, "store", None)
             if store is None or not hasattr(store, "get"):
                 return
             d = getattr(self, "_ssd_reserved", None)
+            maps = [("_waiting_disk_next_check", State.WAITING_DISK),
+                    ("_moving_parks", State.MOVING),
+                    ("_grace_exempt", State.NEW),
+                    ("_last_grace_search", State.NEW)]
+            keys: set[str] = set()
             if isinstance(d, dict) and d:
-                for h in list(d.keys()):
+                keys.update(list(d.keys()))
+            live_maps: list[tuple[str, dict, object]] = []
+            for attr, want in maps:
+                try:
+                    m = getattr(self, attr, None)
+                    if isinstance(m, dict) and m:
+                        keys.update(list(m.keys()))
+                        live_maps.append((attr, m, want))
+                except Exception:
+                    continue
+            if not keys and not (isinstance(d, dict) and d):
+                return
+            get = getattr(store, "get", None)
+            if not callable(get):
+                return
+
+            def _fetch_all() -> dict[str, object]:
+                out: dict[str, object] = {}
+                for h in keys:
                     try:
-                        row = store.get(h, include_blob=False)
+                        out[h] = get(h, include_blob=False)
                     except Exception:
                         continue
+                return out
+
+            try:
+                from .io_bounds import offload as _offload
+                rows = await _offload(_fetch_all)
+            except Exception:
+                return
+            if not isinstance(rows, dict):
+                return
+            if isinstance(d, dict) and d:
+                for h in list(d.keys()):
+                    if h not in rows:
+                        continue
+                    row = rows[h]
                     # Deleted row → free. Known non-SSD states → free. Unknown
                     # doubles (MagicMock state) → keep (can't prove stale).
                     if row is None:
@@ -216,19 +256,12 @@ class SSDLedgerMixin:
             # Quiet-wait hints / MOVING-park counters / prefer exemptions /
             # grace-search timestamps for rows that left (or lost) those
             # states without a transition pop.
-            for attr, want in (("_waiting_disk_next_check", State.WAITING_DISK),
-                               ("_moving_parks", State.MOVING),
-                               ("_grace_exempt", State.NEW),
-                               ("_last_grace_search", State.NEW)):
+            for _attr, m, want in live_maps:
                 try:
-                    m = getattr(self, attr, None)
-                    if not isinstance(m, dict) or not m:
-                        continue
                     for h in list(m.keys()):
-                        try:
-                            row = store.get(h, include_blob=False)
-                        except Exception:
+                        if h not in rows:
                             continue
+                        row = rows[h]
                         if row is None:
                             m.pop(h, None)
                             continue
@@ -260,7 +293,7 @@ class SSDLedgerMixin:
         if lk is not None:
             await lk.acquire()
         try:
-            self._ssd_prune_stale()
+            await self._ssd_prune_stale()
             cap = self._ssd_global_cap()
             if cap is not None:
                 if self._ssd_reserved_total() + amount > cap:

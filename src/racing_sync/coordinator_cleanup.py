@@ -17,6 +17,7 @@ from pathlib import Path
 from .clients.abstract import Torrent
 from .coordinator_content import cleanup_grace_seconds, normalize_content_name
 from .coordinator_paths import _safe_ssd_join
+from .io_bounds import chunked, offload, rpc
 from .state import State, TorrentState
 
 # Keep the historic logger name so log output is unchanged by the split.
@@ -121,15 +122,19 @@ class CleanupMixin:
         )
 
         try:
-            rows = [ts for ts in self.store.all() if ts.state in (State.DONE, State.MOVING)]
+            rows = [ts for ts in await offload(self.store.all)
+                    if ts.state in (State.DONE, State.MOVING)]
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup: cannot list state rows: %s", e)
             return
         if not rows:
             return
         try:
-            src_torrents = await self.source_client.list_torrents(
-                category=self.cfg.source.category
+            src_torrents = await rpc(
+                self.source_client.list_torrents(
+                    category=self.cfg.source.category
+                ),
+                getattr(self, "cfg", None), "source cleanup list_torrents",
             )
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup: cannot list VPS1 torrents: %s", e)
@@ -422,7 +427,12 @@ class CleanupMixin:
                         ts.source_name[:60])
             return False
         try:
-            present = await self.dest_client.list_torrents(hashes=list(hashes))
+            present: list = []
+            for _chunk in chunked(sorted(hashes)):
+                present.extend(await rpc(
+                    self.dest_client.list_torrents(hashes=_chunk),
+                    getattr(self, "cfg", None), "dest cleanup list_torrents",
+                ) or [])
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup: dest lookup failed for %s: %s",
                         ts.source_infohash[:10], e)

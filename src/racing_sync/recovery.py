@@ -21,6 +21,7 @@ from pathlib import Path
 from .clients.abstract import TorrentClient, TorrentFile
 from .config import AppConfig
 from .coordinator_errors import AbandonedError
+from .io_bounds import bounded, offload, rpc
 from .rclone_ops import ssd_free_bytes
 from .state import State, StateStore, TorrentState
 
@@ -185,7 +186,8 @@ async def _classify_adopted(
 ) -> str:
     """Fetch dest files and classify; "unknown" on any failure."""
     try:
-        files = await dest.get_torrent_files(h)
+        files = await rpc(dest.get_torrent_files(h), cfg,
+                          "reconcile classify get_torrent_files")
     except Exception:
         return "unknown"
     try:
@@ -206,7 +208,8 @@ async def _adopt_blob(dest: TorrentClient, h: str) -> bytes:
         export = getattr(dest, "export_torrent", None)
         if not callable(export):
             return b""
-        blob = await export(h)
+        blob = await bounded(export(h), timeout=30.0,
+                             label="reconcile export_torrent")
         if isinstance(blob, (bytes, bytearray)) and blob:
             return bytes(blob)
         return b""
@@ -266,7 +269,8 @@ async def _verify_fuse_adopted(
     h = str(getattr(t, "hash", "") or "")
     name = str(getattr(t, "name", "") or h)
     try:
-        files = await dest.get_torrent_files(h)
+        files = await rpc(dest.get_torrent_files(h), cfg,
+                          "reconcile verify get_torrent_files")
     except Exception as e:  # noqa: BLE001
         log.warning("reconcile: cannot list files for %s; keeping DONE trust: %s",
                     h[:10], e)
@@ -323,11 +327,16 @@ async def reconcile(
     # 1. Snapshot reality — restrict to the racing category so we
     #    don't churn through 7000+ long-term seeds on every startup.
     # Retry transient WebUI hiccups so one timeout doesn't kill startup.
+    # Each attempt is deadline-bounded: a dead dest fails this step in
+    # seconds per attempt instead of wedging startup forever.
     actual: list = []
     last_err: Exception | None = None
     for attempt in range(1, 4):
         try:
-            actual = await dest.list_torrents(category="racing")
+            actual = await bounded(
+                dest.list_torrents(category="racing"),
+                timeout=30.0, label="reconcile list_torrents",
+            )
             last_err = None
             break
         except Exception as e:  # noqa: BLE001
@@ -343,9 +352,9 @@ async def reconcile(
         if h:
             actual_by_hash[h] = t
 
-    # 2. Snapshot DB
+    # 2. Snapshot DB (offloaded: a WAL-locked disk must not stall startup).
     try:
-        all_rows = store.all()
+        all_rows = await offload(store.all)
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"reconcile: cannot read state DB: {e}") from e
 
@@ -373,7 +382,10 @@ async def reconcile(
                     hit = next((k for k in known_hashes if k in actual_by_hash), None)
                     if hit is not None:
                         try:
-                            _files = await dest.get_torrent_files(hit)
+                            _files = await rpc(
+                                dest.get_torrent_files(hit), cfg,
+                                "reconcile heal get_torrent_files",
+                            )
                             _kind = _classify_kind_for_files(_files or [], cfg)
                         except Exception:
                             _kind = "unknown"
@@ -395,7 +407,10 @@ async def reconcile(
                     if _hit is not None:
                         _t = actual_by_hash[_hit]
                         _sp = str(getattr(_t, "save_path", "") or "")
-                        _fl = await dest.get_torrent_files(_hit)
+                        _fl = await rpc(
+                            dest.get_torrent_files(_hit), cfg,
+                            "reconcile ghost get_torrent_files",
+                        )
                         _exp = [
                             (str(f.name), int(f.size_bytes or 0))
                             for f in (_fl or []) if getattr(f, "name", "")
