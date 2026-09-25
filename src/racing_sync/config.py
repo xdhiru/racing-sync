@@ -903,6 +903,11 @@ class APIConfig(BaseModel):
     trust_nginx_header: bool = False
     trusted_proxies: list[str] = ["127.0.0.1", "::1", "localhost"]
     api_token: SecretStr = SecretStr("")
+    # Optional TLS termination (direct exposure). Both or neither; when
+    # set, uvicorn serves HTTPS. Prefer a reverse proxy for WAN and keep
+    # these empty — a token over plain HTTP on 0.0.0.0 is sniffable.
+    tls_certfile: str = ""
+    tls_keyfile: str = ""
 
     @model_validator(mode="after")
     def _validate(self) -> "APIConfig":
@@ -923,6 +928,13 @@ class APIConfig(BaseModel):
                 "GENERATE_A_RANDOM_TOKEN_HERE",
             ):
                 raise ValueError("api.api_token cannot be a placeholder when enabled")
+            cert, key = (self.tls_certfile or "").strip(), (self.tls_keyfile or "").strip()
+            if bool(cert) != bool(key):
+                raise ValueError("api.tls_certfile and api.tls_keyfile must be set together")
+            if self.enabled:
+                for label, raw in (("tls_certfile", cert), ("tls_keyfile", key)):
+                    if raw and not Path(raw).is_file():
+                        raise ValueError(f"api.{label} does not exist: {raw}")
         return self
 
 

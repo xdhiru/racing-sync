@@ -174,6 +174,64 @@ def build_app(coord: Coordinator) -> FastAPI:
         log.warning("api auth failure from %s", _fail_ip)
         raise HTTPException(401, "auth required")
 
+    @app.get("/healthz")
+    async def healthz() -> dict[str, Any]:
+        """Liveness probe (no auth): process is up and serving."""
+        return {"status": "ok"}
+
+    @app.get("/readyz", dependencies=[Depends(auth)])
+    async def readyz() -> dict[str, Any]:
+        """Readiness probe (authed): DB readable + clients present."""
+        checks: dict[str, bool] = {}
+        try:
+            await asyncio.to_thread(coord.store.all_active, False, 1)
+            checks["state_db"] = True
+        except Exception:
+            checks["state_db"] = False
+        for name in ("source_client", "dest_client"):
+            try:
+                checks[name] = getattr(coord, name, None) is not None
+            except Exception:
+                checks[name] = False
+        ready = all(checks.values())
+        return {"ready": ready, "checks": checks}
+
+    @app.get("/metrics", dependencies=[Depends(auth)])
+    async def metrics() -> Any:
+        """Minimal Prometheus metrics (authed): no Telegram spam for ops."""
+        from fastapi.responses import PlainTextResponse
+        lines: list[str] = []
+        try:
+            started = float(getattr(coord, "_started_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            started = 0.0
+        uptime = max(0.0, time.monotonic() - started) if started else 0.0
+        lines.append(f"racing_sync_uptime_seconds {uptime:.0f}")
+        try:
+            rows = await asyncio.to_thread(coord.store.all_active, False, 5000)
+        except Exception:
+            rows = []
+        counts: dict[str, int] = {}
+        for t in rows or []:
+            try:
+                st = t.state.value
+            except Exception:
+                st = "unknown"
+            counts[st] = counts.get(st, 0) + 1
+        for st in sorted(counts):
+            lines.append(f'racing_sync_rows{{state="{st}"}} {counts[st]}')
+        try:
+            free_bytes = await asyncio.to_thread(ssd_free_bytes, cfg)
+            lines.append(f"racing_sync_ssd_free_bytes {int(free_bytes)}")
+        except Exception:
+            pass
+        try:
+            tasks = getattr(coord, "_tasks", set())
+            lines.append(f"racing_sync_worker_tasks {len(tasks or [])}")
+        except Exception:
+            pass
+        return PlainTextResponse("\n".join(lines) + "\n")
+
     @app.get("/api/state", dependencies=[Depends(auth)])
     async def state(
         limit: int = Query(default=500, ge=1, le=5000),
@@ -359,8 +417,23 @@ async def serve(coord: Coordinator) -> None:
     import uvicorn
     cfg = coord.cfg.api
     app = build_app(coord)
+    kwargs: dict[str, Any] = {}
+    try:
+        cert = (getattr(cfg, "tls_certfile", "") or "").strip()
+        key = (getattr(cfg, "tls_keyfile", "") or "").strip()
+        if cert and key:
+            kwargs["ssl_certfile"] = cert
+            kwargs["ssl_keyfile"] = key
+    except Exception:
+        pass
     config = uvicorn.Config(
         app, host=cfg.host, port=cfg.port, log_level="info",
+        **kwargs,
     )
     server = uvicorn.Server(config)
+    # Stashed for graceful shutdown (should_exit instead of task-cancel).
+    try:
+        coord._api_server = server  # type: ignore[attr-defined]
+    except Exception:
+        pass
     await server.serve()

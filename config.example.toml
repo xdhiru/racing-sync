@@ -550,3 +550,8 @@ trust_nginx_header = false
 trusted_proxies = ["127.0.0.1", "::1", "localhost"]
 # API token for direct authentication (required if trust_nginx_header is false):
 api_token = "generate_a_random_token_here"
+# Optional TLS termination (both or neither; files must exist). Prefer a
+# reverse proxy for WAN and keep these empty — a token over plain HTTP on
+# 0.0.0.0 is sniffable.
+# tls_certfile = "/etc/racing-sync/api.pem"
+# tls_keyfile = "/etc/racing-sync/api.key"
