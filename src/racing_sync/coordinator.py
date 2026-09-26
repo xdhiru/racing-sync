@@ -1714,14 +1714,63 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
     # (batch caps + SSD ledger live in coordinator_ssd.SSDLedgerMixin)
 
+    def _cached_source_torrent(self, infohash: str):
+        """Source torrent from the poller snapshot (no RPC), else None.
+
+        The poller refreshes `_source_torrents_cache` every tick, so a
+        worker needing "fresh" VPS1 metadata usually finds ≤10s-old data
+        right here. Using it avoids one full client scan per row per tick
+        — on Deluge every `get_torrent` is a full `get_torrents_status`
+        scan, and N rows × full scans every 30s is what wedges the VPS1
+        WebUI for other programs. A cache miss falls back to RPC.
+
+        Deluge-only: its list rows already carry trackers/files-shape the
+        freshness path needs, while qB fills trackers via a separate RPC
+        (`get_torrent`) — serving qB rows from the snapshot would drop
+        tracker assignment and misroute public detection.
+        """
+        try:
+            if not isinstance(getattr(self, "source_client", None),
+                              DelugeClient):
+                return None
+            want = (infohash or "").lower()
+            if not want:
+                return None
+            cache = getattr(self, "_source_torrents_cache", None)
+            if not cache:
+                return None
+            for st in cache:
+                try:
+                    if (getattr(st, "infohash", "") or "").lower() == want:
+                        return st
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
     async def _fetch_source_or_fail(self, ts: TorrentState):
         """Fresh VPS1 metadata, or None (row already moved to FAILED).
 
-        A single poll miss (client restart, registration lag) must not
-        fail the row: only the third consecutive miss is terminal. Misses
-        are tracked in-memory per infohash (a restart resets the count,
-        which is safe — worst case one extra grace window).
+        Prefers the poller snapshot (no RPC); falls back to a live
+        lookup that also refreshes the snapshot entry. A single poll
+        miss (client restart, registration lag) must not fail the row:
+        only the third consecutive miss is terminal. Misses are tracked
+        in-memory per infohash (a restart resets the count, which is
+        safe — worst case one extra grace window).
         """
+        try:
+            st = self._cached_source_torrent(ts.source_infohash)
+            if st is not None:
+                try:
+                    _misses = getattr(self, "_source_miss_counts", None)
+                    if isinstance(_misses, dict):
+                        _misses.pop((ts.source_infohash or "").lower(), None)
+                except Exception:
+                    pass
+                return st
+        except Exception:
+            pass
         try:
             st = await rpc(
                 self.source_client.get_torrent(ts.source_infohash),

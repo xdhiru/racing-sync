@@ -128,6 +128,52 @@ async def test_source_timeout_degrades_to_retry_not_failed():
 
 
 @pytest.mark.anyio
+async def test_fetch_source_prefers_snapshot_on_deluge():
+    """Deluge freshness checks reuse the poller snapshot (no per-row scan).
+
+    Every Deluge get_torrent is a full get_torrents_status scan; serving
+    workers from the ≤10s-old snapshot avoids N scans per tick, which is
+    what wedges the VPS1 WebUI. Non-Deluge clients keep exact behavior.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.clients.deluge import DelugeClient
+
+    snap = Torrent(hash="d" * 40, name="Snap.Show", category="racing",
+                   save_path="/vps1", size_bytes=999, state="seeding",
+                   progress=1.0, trackers=["http://t/announce"])
+
+    # Deluge source: snapshot hit → zero RPC, miss counter cleared.
+    coord = make_coordinator()
+    coord.source_client = MagicMock(spec=DelugeClient)
+    coord.source_client.get_torrent = AsyncMock()
+    coord._source_torrents_cache = [snap]
+    coord._source_miss_counts = {"d" * 40: 2}
+    ts = TorrentState(source_infohash="d" * 40, state=State.NEW)
+    got = await coord._fetch_source_or_fail(ts)
+    assert got is snap
+    coord.source_client.get_torrent.assert_not_called()
+    assert coord._source_miss_counts == {}
+
+    # Cache miss on Deluge: falls back to RPC (registration lag covered).
+    coord.source_client.get_torrent = AsyncMock(return_value=None)
+    coord.transition = MagicMock()
+    ts2 = TorrentState(source_infohash="e" * 40, state=State.NEW)
+    assert await coord._fetch_source_or_fail(ts2) is None
+    coord.source_client.get_torrent.assert_awaited_once()
+    coord.transition.assert_not_called()  # first miss only counts
+
+    # Non-Deluge source: snapshot ignored, RPC as before.
+    coord2 = make_coordinator()
+    coord2.source_client = AsyncMock()
+    coord2.source_client.get_torrent = AsyncMock(return_value=snap)
+    coord2._source_torrents_cache = [snap]
+    ts3 = TorrentState(source_infohash="d" * 40, state=State.NEW)
+    assert await coord2._fetch_source_or_fail(ts3) is snap
+    coord2.source_client.get_torrent.assert_awaited_once()
+
+
+@pytest.mark.anyio
 async def test_do_new_transitions_failed_when_source_vanished():
     from unittest.mock import AsyncMock, MagicMock
 

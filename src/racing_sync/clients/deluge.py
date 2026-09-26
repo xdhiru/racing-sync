@@ -337,13 +337,13 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             pass
 
     async def _cached_scan(self, filt: dict[str, Any], status_keys: list[str]) -> dict:
-        """Full-scan with a 5s per-filter cache (hash filtering is client-side)."""
+        """Full-scan with a short per-filter cache (hash filtering is client-side)."""
         import time as _time
 
         try:
-            key = str(filt.get("label") or "")
+            key = (str(filt.get("label") or ""), tuple(status_keys or ()))
         except Exception:
-            key = ""
+            key = ("", ())
         try:
             cached = self._scan_cache.get(key)
             if cached and _time.monotonic() - cached[0] < 5.0 and isinstance(cached[1], dict):
