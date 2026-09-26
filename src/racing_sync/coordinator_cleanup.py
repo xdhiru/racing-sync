@@ -551,10 +551,12 @@ class CleanupMixin:
                 if not p.exists():
                     return False
                 # Size alone is not proof: qB pre-allocates deselected files
-                # at full size. Require client-verified progress when known.
-                if isinstance(progress, (int, float)) and want:
-                    if progress < 0.999:
-                        return False
+                # at full size. Require client-verified progress when known —
+                # and fail closed when unknown: a full-size preallocated
+                # partial must never pass as "complete".
+                if want and (not isinstance(progress, (int, float))
+                             or progress < 0.999):
+                    return False
                 if want and p.stat().st_size < want:
                     return False
             except OSError:
@@ -575,20 +577,28 @@ class CleanupMixin:
             delete_files = bool(getattr(cfg, "delete_files", True))
         except (TypeError, ValueError):
             delete_files = True
-        # Partitioned by (save_path, size): same-directory same-size
+        # Partitioned by (save_path, size, name): same-directory same-size
         # members are cross-seeds sharing files (deleted exactly once via
         # the first member); different sizes are different files even under
-        # one directory (0-size rows match on name alone) and each
-        # partition's files must go, or entries vanish while data leaks.
-        parts: dict[tuple[str, int], list[Torrent]] = {}
+        # one directory. Unknown-size (0) rows NEVER share a partition:
+        # lumping distinct releases by (path, 0) lets one delete_files=True
+        # wipe another release's data — each 0-size row is its own
+        # partition, matched conservatively (first deletes files, and a
+        # 0-size partition holds exactly one member so nothing else rides
+        # along).
+        parts: dict[tuple[str, int, str], list[Torrent]] = {}
         for m in group:
             try:
                 size_key = int(m.size_bytes or 0)
             except (TypeError, ValueError):
                 size_key = 0
-            parts.setdefault((m.save_path or "", size_key), []).append(m)
+            if size_key > 0:
+                parts.setdefault((m.save_path or "", size_key, ""), []).append(m)
+            else:
+                parts.setdefault((m.save_path or "", 0,
+                                  (m.infohash or "").lower()), []).append(m)
         ok = True
-        for (save_path, _size_key), members in parts.items():
+        for (save_path, _size_key, _name_key), members in parts.items():
             hashes = [m.infohash for m in members]
             # Members sharing a save_path hold the same on-disk files
             # (deleted exactly once via the first member), so the freed

@@ -73,9 +73,9 @@ ALLOWED: dict[State, set[State]] = {
     State.WAITING_DISK: {State.QUEUED, State.DOWNLOADING, State.DONE, State.FAILED},
     State.QUEUED: {State.DOWNLOADING, State.MOVING, State.WAITING_DISK,
                    State.RE_ADDING, State.DONE, State.FAILED},
-    State.DOWNLOADING: {State.MOVING, State.FAILED},
-    State.MOVING: {State.RE_ADDING, State.FAILED},
-    State.RE_ADDING: {State.DONE, State.FAILED},
+    State.DOWNLOADING: {State.MOVING, State.QUEUED, State.FAILED},
+    State.MOVING: {State.RE_ADDING, State.DOWNLOADING, State.FAILED},
+    State.RE_ADDING: {State.DONE, State.MOVING, State.FAILED},
     # DONE -> MOVING is the fresh-DB self-heal: recovery may have adopted an
     # SSD-complete torrent as DONE (e.g. stale DB, misclassified save_path);
     # the late cross-seed guard demotes it back to MOVING so the rclone move
