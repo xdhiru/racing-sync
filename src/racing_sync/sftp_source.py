@@ -490,7 +490,15 @@ class _SFTPConnection:
                 raise SFTPError(f"sftp listdir failed for {remote_dir}: {e}") from e
             except (paramiko.SSHException, EOFError) as e:
                 raise SFTPError(f"sftp listdir failed for {remote_dir}: {e}") from e
+            # Bound the backlog: a 100k-file state dir must not OOM the
+            # daemon — stop collecting past the cap (coordinator treats
+            # the rest as "not yet seen", retried next poll).
+            _LIST_CAP = 20000
             for entry in entries:
+                if len(out) >= _LIST_CAP:
+                    log.warning("sftp state dir exceeds %d entries; truncating list",
+                                _LIST_CAP)
+                    break
                 name = entry.filename
                 if name.endswith(".torrent"):
                     digest = name[: -len(".torrent")]
@@ -524,6 +532,7 @@ class SFTPExporter:
         self._pool_size = pool_size
         self._members: list[_SFTPConnection] = []
         self._pool_lock = threading.Lock()
+        self._shutdown = False
         self._rr = 0
 
     def __enter__(self) -> SFTPExporter:
@@ -548,6 +557,8 @@ class SFTPExporter:
     def _try_revive(self, m: _SFTPConnection) -> bool:
         """Best-effort re-dial of a closed member. True when usable."""
         try:
+            if getattr(self, "_shutdown", False):
+                return False
             if not getattr(m, "_closed", False):
                 return True
             m.connect()
@@ -572,6 +583,10 @@ class SFTPExporter:
         # Revive closed members before leasing: without this a burst of
         # transient failures closes every member and the pool stays dead
         # until restart (only connect() revived, called at startup).
+        # Never revive after close(): shutdown must stay shut (no
+        # use-after-close re-dial from a late worker).
+        if getattr(self, "_shutdown", False):
+            raise RuntimeError("sftp pool is closed")
         for i in range(len(members)):
             m = members[(start + i) % len(members)]
             try:
@@ -653,8 +668,12 @@ class SFTPExporter:
             raise
 
     def close(self) -> None:
-        with self._pool_lock:
-            members = list(self._members)
+        try:
+            with self._pool_lock:
+                self._shutdown = True
+                members = list(self._members)
+        except Exception:
+            members = list(getattr(self, "_members", None) or [])
         for m in members:
             try:
                 m.close()
