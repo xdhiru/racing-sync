@@ -321,6 +321,220 @@ async def reconcile(
     We filter VPS2's torrent list to the racing category because the
     state DB only tracks racing-originated torrents. The other long-
     term seeds on VPS2 are not ours to manage.
+
+    Full synchronous pass (snapshot + inline verification), used by the
+    API recover endpoint and existing callers. Startup uses the split
+    form instead: `_reconcile_snapshot(verify=False)` for a fast serve,
+    then `reconcile_verify()` in the background.
+    """
+    rpt = await _reconcile_snapshot(cfg, dest=dest, store=store, verify=True)
+    return rpt
+
+
+async def reconcile_verify(
+    cfg: AppConfig,
+    *,
+    dest: TorrentClient,
+    store: StateStore,
+    concurrency: int = 4,
+) -> dict[str, int]:
+    """Background verification for optimistically adopted rows.
+
+    Runs after startup serves: for DONE rows still fuse-unverified it
+    runs the byte verification (stamping verified, or demoting SSD-backed
+    ghosts to MOVING); for adopted rows with unknown kind it classifies;
+    for blobless rows it re-exports bytes; for orphaned in-flight rows it
+    runs fix_orphan. Bounded concurrency, per-row isolation (one bad row
+    never kills the pass), fail-closed throughout. CancelledError
+    propagates so shutdown stays prompt. Returns outcome counts.
+    """
+    counts = {"verified": 0, "demoted": 0, "classified": 0,
+              "blob_healed": 0, "orphans_fixed": 0, "skipped": 0,
+              "failed": 0}
+    try:
+        actual = await bounded(
+            dest.list_torrents(category="racing"),
+            timeout=30.0, label="verify list_torrents",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        log.warning("reconcile_verify: cannot list dest entries: %s", e)
+        return counts
+    actual_by_hash: dict[str, object] = {}
+    for t in actual or []:
+        try:
+            h = (getattr(t, "hash", "") or "").strip().lower()
+            if h:
+                actual_by_hash[h] = t
+        except Exception:
+            continue
+    try:
+        all_rows = await offload(store.all)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        log.warning("reconcile_verify: cannot read state DB: %s", e)
+        return counts
+    try:
+        sem = asyncio.Semaphore(max(1, int(concurrency or 4)))
+    except (TypeError, ValueError):
+        sem = asyncio.Semaphore(4)
+
+    async def _one(ts) -> None:
+        try:
+            async with sem:
+                await _verify_row(cfg, dest, store, ts, actual_by_hash,
+                                  counts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            counts["failed"] += 1
+            log.warning("reconcile_verify: row %s failed: %s",
+                        (getattr(ts, "source_infohash", "") or "")[:10], e)
+
+    await asyncio.gather(*[_one(ts) for ts in all_rows or []])
+    log.info("reconcile_verify: %s", ", ".join(
+        f"{k}={v}" for k, v in counts.items()))
+    return counts
+
+
+async def _verify_row(cfg, dest, store, ts, actual_by_hash, counts) -> None:
+    """Verify one row in the background pass (never raises fatally)."""
+    try:
+        h = (ts.source_infohash or "").lower()
+        if not h:
+            counts["skipped"] += 1
+            return
+        known = {h}
+        for k in (ts.dest_infohash, ts.cross_seed_infohash):
+            if k:
+                known.add(k.lower())
+        if ts.injected_private_hashes:
+            for iph in ts.injected_private_hashes.split(","):
+                if iph.strip():
+                    known.add(iph.strip().lower())
+        present = any(k in actual_by_hash for k in known)
+        hit = next((k for k in known if k in actual_by_hash), None)
+        # Orphaned in-flight row: run the orphan fix.
+        if not present and ts.state in (
+                State.QUEUED, State.DOWNLOADING, State.MOVING,
+                State.RE_ADDING):
+            try:
+                sftp_bytes = await offload(store.get_blob, h) or None
+            except Exception:
+                sftp_bytes = None
+            try:
+                await fix_orphan(ts, cfg, dest=dest, store=store,
+                                 sftp_bytes=sftp_bytes)
+                counts["orphans_fixed"] += 1
+            except Exception as e:  # noqa: BLE001
+                log.error("reconcile_verify: fix_orphan failed for %s: %s",
+                          h[:10], e)
+                counts["failed"] += 1
+            return
+        if not present:
+            counts["skipped"] += 1
+            return
+        # DONE but fuse-unverified: run the byte verification now.
+        if ts.state == State.DONE and not ts.fuse_verified:
+            try:
+                t = actual_by_hash.get(hit or h)
+                sp = ""
+                try:
+                    sp = str(getattr(t, "save_path", "") or "")
+                except Exception:
+                    pass
+                ok, use_path, kind, verified = await _verify_fuse_adopted(
+                    cfg, dest, t, sp)
+                if verified and ok:
+                    if kind and kind != "unknown":
+                        ts.classification_kind = kind
+                    try:
+                        blob = await _adopt_blob(dest, hit or h)
+                        if blob:
+                            try:
+                                await offload(store.set_blob, h, blob)
+                            except Exception:
+                                pass
+                            counts["blob_healed"] += 1
+                    except Exception:
+                        pass
+                    try:
+                        await offload(store.set_fuse_verified, h, True)
+                    except Exception:
+                        pass
+                    ts.fuse_verified = 1
+                    counts["verified"] += 1
+                elif not ok:
+                    # SSD-backed ghost: demote so the bytes really move.
+                    ts.save_path = use_path or ts.save_path
+                    try:
+                        await offload(_force_state, store, ts, State.MOVING)
+                    except Exception:
+                        pass
+                    counts["demoted"] += 1
+                else:
+                    counts["skipped"] += 1
+            except Exception as e:  # noqa: BLE001
+                log.warning("reconcile_verify: fuse verify failed for %s: %s",
+                            h[:10], e)
+                counts["failed"] += 1
+            return
+        # Adopted rows with unknown kind: classify + heal the blob.
+        if (ts.classification_kind or "unknown") == "unknown" and ts.state in (
+                State.DONE, State.MOVING, State.DOWNLOADING, State.RE_ADDING):
+            try:
+                kind = await _classify_adopted(cfg, dest, hit or h)
+                if kind and kind != "unknown":
+                    ts.classification_kind = kind
+                    try:
+                        store.upsert(ts)
+                    except Exception:
+                        pass
+                    counts["classified"] += 1
+                else:
+                    counts["skipped"] += 1
+            except Exception as e:  # noqa: BLE001
+                log.warning("reconcile_verify: classify failed for %s: %s",
+                            h[:10], e)
+                counts["failed"] += 1
+            try:
+                if not ts.cross_seed_blob:
+                    blob = await _adopt_blob(dest, hit or h)
+                    if blob:
+                        try:
+                            await offload(store.set_blob, h, blob)
+                        except Exception:
+                            pass
+                        counts["blob_healed"] += 1
+            except Exception:
+                pass
+            return
+        counts["skipped"] += 1
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        log.warning("reconcile_verify: row %s failed: %s",
+                    (getattr(ts, "source_infohash", "") or "")[:10], e)
+        counts["failed"] += 1
+
+
+async def _reconcile_snapshot(
+    cfg: AppConfig,
+    *,
+    dest: TorrentClient,
+    store: StateStore,
+    verify: bool,
+) -> RecoveryReport:
+    """Snapshot + reconcile without (verify=False) per-row RPC verification.
+
+    The optimistic form adopts entries as DONE (fuse-unverified),
+    MOVING/DOWNLOADING/RE_ADDING with kind unknown and no blob, and
+    leaves orphans and DONE ghost-checks for `reconcile_verify()`.
+    Fail-closed throughout: unverified rows keep their VPS1 copies
+    (janitor requires fuse_verified) and no state is trusted on RPC
+    failure. With verify=True this is today's full inline behavior.
     """
     rpt = RecoveryReport()
 
@@ -374,11 +588,12 @@ async def reconcile(
         present = any(k in actual_by_hash for k in known_hashes)
         if ts.state == State.DONE:
             if present:
-                if ts.classification_kind == "unknown":
+                if verify and ts.classification_kind == "unknown":
                     # Pre-fix rows fast-tracked QUEUED->DONE without
                     # classification gate every later check at unsorted even
                     # when the pack lives at the default mount. Heal once,
                     # best-effort, from the live dest file list.
+                    # (Snapshot-only mode defers this to reconcile_verify.)
                     hit = next((k for k in known_hashes if k in actual_by_hash), None)
                     if hit is not None:
                         try:
@@ -402,41 +617,43 @@ async def reconcile(
                 # Ghost check: a skip_check entry reports complete with zero
                 # bytes. Verify cheaply at startup; a warming mount keeps
                 # trust, SSD-resident bytes demote to MOVING for a real move.
-                try:
-                    _hit = next((k for k in known_hashes if k in actual_by_hash), None)
-                    if _hit is not None:
-                        _t = actual_by_hash[_hit]
-                        _sp = str(getattr(_t, "save_path", "") or "")
-                        _fl = await rpc(
-                            dest.get_torrent_files(_hit), cfg,
-                            "reconcile ghost get_torrent_files",
-                        )
-                        _exp = [
-                            (str(f.name), int(f.size_bytes or 0))
-                            for f in (_fl or []) if getattr(f, "name", "")
-                        ]
-                        if _exp and _sp:
-                            _miss = await _missing_under(Path(_sp), _exp)
-                            if _miss:
-                                _root = find_content_on_ssd(cfg, _exp)
-                                if _root is not None:
+                # (Snapshot-only mode defers this to reconcile_verify.)
+                if verify:
+                    try:
+                        _hit = next((k for k in known_hashes if k in actual_by_hash), None)
+                        if _hit is not None:
+                            _t = actual_by_hash[_hit]
+                            _sp = str(getattr(_t, "save_path", "") or "")
+                            _fl = await rpc(
+                                dest.get_torrent_files(_hit), cfg,
+                                "reconcile ghost get_torrent_files",
+                            )
+                            _exp = [
+                                (str(f.name), int(f.size_bytes or 0))
+                                for f in (_fl or []) if getattr(f, "name", "")
+                            ]
+                            if _exp and _sp:
+                                _miss = await _missing_under(Path(_sp), _exp)
+                                if _miss:
+                                    _root = find_content_on_ssd(cfg, _exp)
+                                    if _root is not None:
+                                        log.warning(
+                                            "reconcile: DONE %s missing %d/%d files at %s; "
+                                            "bytes on SSD at %s — demoting to MOVING",
+                                            ts.source_name[:60], len(_miss), len(_exp),
+                                            _sp, _root,
+                                        )
+                                        ts.save_path = str(_root)
+                                        store.transition(ts, State.MOVING)
+                                        rpt.resumed.append(h)
+                                        continue
                                     log.warning(
                                         "reconcile: DONE %s missing %d/%d files at %s; "
-                                        "bytes on SSD at %s — demoting to MOVING",
-                                        ts.source_name[:60], len(_miss), len(_exp),
-                                        _sp, _root,
+                                        "keeping DONE (mount may be warming)",
+                                        ts.source_name[:60], len(_miss), len(_exp), _sp,
                                     )
-                                    ts.save_path = str(_root)
-                                    store.transition(ts, State.MOVING)
-                                    rpt.resumed.append(h)
-                                    continue
-                                log.warning(
-                                    "reconcile: DONE %s missing %d/%d files at %s; "
-                                    "keeping DONE (mount may be warming)",
-                                    ts.source_name[:60], len(_miss), len(_exp), _sp,
-                                )
-                except Exception as e:  # noqa: BLE001
-                    log.warning("reconcile: ghost check failed for %s: %s", h[:10], e)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("reconcile: ghost check failed for %s: %s", h[:10], e)
                 rpt.kept.append(h)
             else:
                 # Lost — re-add pointing at fuse. The data is on remote.
@@ -454,6 +671,11 @@ async def reconcile(
                 rpt.resumed.append(h)
             else:
                 rpt.orphans.append(h)
+                if not verify:
+                    # Snapshot-only mode: the orphan stays in its in-flight
+                    # state; reconcile_verify() runs fix_orphan in the
+                    # background. Workers re-check presence before acting.
+                    continue
                 try:
                     sftp_bytes = await asyncio.to_thread(store.get_blob, ts.source_infohash) or None
                 except Exception as e:
@@ -573,21 +795,29 @@ async def reconcile(
                     # Unverifiable outcomes keep DONE (mount may be warming)
                     # but stay fuse-unverified so the janitor re-probes
                     # instead of clearing VPS1 on trust alone.
-                    ok, use_save_path, kind, fuse_verified = await _verify_fuse_adopted(cfg, dest, t, save_path)
-                    adopt_state = State.DONE if ok else State.MOVING
+                    # Snapshot-only mode adopts optimistically (DONE,
+                    # unverified, unknown kind/blob); reconcile_verify()
+                    # verifies in the background.
+                    if verify:
+                        ok, use_save_path, kind, fuse_verified = await _verify_fuse_adopted(cfg, dest, t, save_path)
+                        adopt_state = State.DONE if ok else State.MOVING
                 elif on_fuse and not is_done:
                     # Fuse-pointing but incomplete: the client itself says
                     # bytes are missing. Never DONE (would strand an
                     # unseedable entry as terminal). Park in RE_ADDING for
                     # the gated fuse retry instead.
-                    kind = await _classify_adopted(cfg, dest, h)
+                    if verify:
+                        kind = await _classify_adopted(cfg, dest, h)
                     adopt_state = State.RE_ADDING
                 else:
                     # SSD-complete (or fuse-incomplete) adoption: classify now
                     # so _target_mount_for() routes movies/seasons to the
                     # default mount instead of defaulting unknown->unsorted.
                     # Best-effort; a failed file listing keeps "unknown".
-                    kind = await _classify_adopted(cfg, dest, h)
+                    # Snapshot-only mode defers classification to
+                    # reconcile_verify (routing heals then).
+                    if verify:
+                        kind = await _classify_adopted(cfg, dest, h)
                 log.info(
                     "reconcile: adopting existing completed/fuse torrent on VPS2 as %s: %s (%s) "
                     "save_path=%s on_fuse=%s complete=%s kind=%s",
@@ -604,10 +834,11 @@ async def reconcile(
                     state=adopt_state,
                     fuse_verified=1 if fuse_verified else 0,
                 )
-                _adopted_blob = await _adopt_blob(dest, h)
-                if _adopted_blob:
-                    ts.cross_seed_blob = _adopted_blob
-                    ts._blob = _adopted_blob
+                if verify:
+                    _adopted_blob = await _adopt_blob(dest, h)
+                    if _adopted_blob:
+                        ts.cross_seed_blob = _adopted_blob
+                        ts._blob = _adopted_blob
                 store.upsert(ts)
                 rpt.kept.append(h)
                 rpt.adopted.append(h)
@@ -616,7 +847,12 @@ async def reconcile(
                 # batch cursors mid-download): resume it as DOWNLOADING instead
                 # of abandoning it as unknown. Batches re-resolve from the live
                 # file list and priorities restart at batch 0 downstream.
-                kind = await _classify_adopted(cfg, dest, h)
+                # Snapshot-only mode defers classification/blob to
+                # reconcile_verify.
+                if verify:
+                    kind = await _classify_adopted(cfg, dest, h)
+                else:
+                    kind = "unknown"
                 log.info(
                     "reconcile: adopting partial SSD torrent on VPS2 as downloading: %s (%s) "
                     "save_path=%s complete=%s kind=%s",
@@ -631,10 +867,11 @@ async def reconcile(
                     classification_kind=kind,
                     state=State.DOWNLOADING,
                 )
-                _adopted_blob = await _adopt_blob(dest, h)
-                if _adopted_blob:
-                    ts.cross_seed_blob = _adopted_blob
-                    ts._blob = _adopted_blob
+                if verify:
+                    _adopted_blob = await _adopt_blob(dest, h)
+                    if _adopted_blob:
+                        ts.cross_seed_blob = _adopted_blob
+                        ts._blob = _adopted_blob
                 store.upsert(ts)
                 rpt.resumed.append(h)
                 rpt.adopted.append(h)
