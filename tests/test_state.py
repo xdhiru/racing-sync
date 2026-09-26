@@ -473,3 +473,62 @@ def test_tombstone_case_insensitive_and_restamp_refreshes(tmp_path: Path):
         assert store.find_by_name(None) == []
     finally:
         store.close()
+
+
+def test_transition_refuses_concurrent_move(tmp_path: Path):
+    """A stale snapshot cannot clobber a state that moved underneath it."""
+    from racing_sync.coordinator_errors import AbandonedError
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="m" * 40, source_name="M",
+                                  state=State.NEW))
+        stale = store.get("m" * 40)
+        fresh = store.get("m" * 40)
+        assert stale.version == fresh.version == 0
+        store.transition(fresh, State.QUERYING)
+        assert store.get("m" * 40).version == 1
+        # Stale copy still thinks NEW: its transition must fail loudly,
+        # and the DB keeps the winner's state.
+        with pytest.raises(AbandonedError):
+            store.transition(stale, State.QUEUED)
+        assert store.get("m" * 40).state == State.QUERYING
+        # In-memory loser is untouched (snapshot restored).
+        assert stale.state == State.NEW
+    finally:
+        store.close()
+
+
+def test_upsert_bumps_version_and_preserves_it_on_read(tmp_path: Path):
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="v" * 40, source_name="V",
+                                  state=State.NEW))
+        assert store.get("v" * 40).version == 0
+        ts = store.get("v" * 40)
+        ts.source_name = "V2"
+        store.upsert(ts)
+        assert store.get("v" * 40).version == 1
+    finally:
+        store.close()
+
+
+def test_set_vps1_activity_is_narrow(tmp_path: Path):
+    """Activity stamp must not clobber concurrent worker fields."""
+    import datetime as dt
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="w" * 40, source_name="W",
+                                  state=State.DONE, last_error="boom",
+                                  total_bytes=1234))
+        when = dt.datetime.now(dt.timezone.utc)
+        assert store.set_vps1_activity("w" * 40, when) is True
+        row = store.get("w" * 40)
+        assert row.vps1_last_activity_at is not None
+        assert row.last_error == "boom"
+        assert row.total_bytes == 1234
+        assert row.state == State.DONE
+        assert store.set_vps1_activity("  ") is False
+    finally:
+        store.close()

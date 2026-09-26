@@ -33,6 +33,7 @@ except ImportError:
     FastAPI = Any  # type: ignore[assignment,misc]
 
 from .coordinator import Coordinator
+from .coordinator_errors import AbandonedError
 from .forget import forget_torrent
 from .rclone_ops import ssd_free_bytes
 from .recovery import reconcile
@@ -303,6 +304,9 @@ def build_app(coord: Coordinator) -> FastAPI:
             ts.failed_retries = 0
             try:
                 coord.store.transition(ts, State.QUEUED, error="")
+            except AbandonedError as e:
+                # Row moved (or was forgotten) concurrently.
+                raise HTTPException(409, f"state changed concurrently: {e}") from e
             except ValueError as e:
                 # Row moved concurrently (e.g. tick rescheduled it).
                 raise HTTPException(409, f"state changed concurrently: {e}") from e
