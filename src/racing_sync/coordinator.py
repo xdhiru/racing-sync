@@ -22,6 +22,7 @@ import copy
 import datetime as dt
 import logging
 import shutil
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,6 +61,7 @@ from .coordinator_errors import (
     _NOT_VISIBLE_DETAIL,
     AbandonedError,
     BatchMoveIncompleteError,
+    RcloneTransientError,
     WebUIUnresponsiveError,
     is_fatal_os_error,
     is_retryable_client_error,
@@ -89,6 +91,7 @@ __all__ = [
     "BatchMoveIncompleteError",
     "Coordinator",
     "LiveItem",
+    "RcloneTransientError",
     "SourceDecision",
     "WebUIUnresponsiveError",
     "_NOT_VISIBLE_DETAIL",
@@ -667,14 +670,33 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         for t in list(self._tasks):
             t.cancel()
         if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            # Bounded: a wedged worker (stuck fuse stat, dead SFTP) must
+            # not wedge SIGTERM forever.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._tasks, return_exceptions=True),
+                    timeout=15.0,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
         for t in list(getattr(self, "_tg_tasks", set())):
             t.cancel()
         if getattr(self, "_tg_tasks", None):
-            await asyncio.gather(*list(self._tg_tasks), return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*list(self._tg_tasks), return_exceptions=True),
+                    timeout=10.0,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
         tg = getattr(self, "_tg", None)
         if tg is not None:
-            await tg.stop()
+            try:
+                await asyncio.wait_for(tg.stop(), timeout=10.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            except Exception:  # noqa: BLE001
+                pass
         api_task = getattr(self, "_api_task", None)
         if api_task is not None:
             # Graceful first: let in-flight requests drain via should_exit
@@ -699,7 +721,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     pass
         if self.prowlarr is not None:
             try:
-                await self.prowlarr.close()
+                await asyncio.wait_for(self.prowlarr.close(), timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
             except Exception:  # noqa: BLE001
                 pass
         if self.sftp is not None:
@@ -709,11 +733,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 pass
         if self._coordinator_started:
             try:
-                await self.source_client.close()
+                await asyncio.wait_for(self.source_client.close(), timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
             except Exception:  # noqa: BLE001
                 pass
             try:
-                await self.dest_client.close()
+                await asyncio.wait_for(self.dest_client.close(), timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
             except Exception:  # noqa: BLE001
                 pass
         try:
@@ -792,6 +820,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         task.cancel()
                     except Exception:
                         pass
+                try:
+                    _lt = list(getattr(self, "_loop_tasks", None) or [])
+                    if _lt:
+                        await asyncio.wait_for(
+                            asyncio.gather(*_lt, return_exceptions=True),
+                            timeout=10.0,
+                        )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
             except Exception:
                 pass
             await self.shutdown()
@@ -1088,14 +1127,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # unbounded worker spawn (0 is falsy = cap disabled below).
             _max_workers = 12
         try:
-            ready_indexer = await offload(self.store.list_indexer_ready)
+            ready_waiting = await offload(self.store.list_waiting_ready)
         except Exception:
-            ready_indexer = []
-        try:
-            ready_public = await offload(self.store.list_public_retry_ready)
-        except Exception:
-            ready_public = []
-        for ts in list(ready_indexer or []) + list(ready_public or []):
+            try:
+                ready_waiting = await offload(self.store.list_indexer_ready)
+            except Exception:
+                ready_waiting = []
+        for ts in list(ready_waiting or []):
             if _max_workers and max(0, _max_workers - len(self._tasks)) <= 0:
                 break
             try:
@@ -1486,12 +1524,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             log.info("worker: %s abandoned (%s); stopping",
                      ts.source_infohash[:10], e)
             return
-        except RcloneTimeoutError as e:
-            # Last-resort net: a timed-out move from any path parks the row
-            # (source bytes intact) instead of failing it. The two expected
-            # sites handle this directly with better context; this only
-            # fires for future call paths.
-            log.error("rclone timed out for %s: %s (parking, not failing)",
+        except (RcloneTimeoutError, RcloneTransientError) as e:
+            # Last-resort net: a timed-out or transiently-failed move from
+            # any path parks the row (source bytes intact) instead of
+            # failing it. The two expected sites handle this directly with
+            # better context; this only fires for future call paths.
+            log.error("rclone move issue for %s: %s (parking, not failing)",
                       ts.source_infohash[:10], e)
             try:
                 if ts.state == State.MOVING:
@@ -3087,11 +3125,21 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if ts.indexer_first_queried_at is None:
             ts.indexer_first_queried_at = now
         ts.indexer_attempts += 1
-        next_retry = now + dt.timedelta(
-            seconds=self.cfg.cross_seed.prowlarr_retry_interval_seconds
-        )
+        try:
+            _retry_gap = float(getattr(
+                getattr(self.cfg, "cross_seed", None),
+                "prowlarr_retry_interval_seconds", 1800) or 1800)
+        except (TypeError, ValueError):
+            _retry_gap = 1800.0
+        try:
+            _max_age_s = float(getattr(
+                getattr(self.cfg, "cross_seed", None),
+                "prowlarr_max_age_seconds", 86400) or 86400)
+        except (TypeError, ValueError):
+            _max_age_s = 86400.0
+        next_retry = now + dt.timedelta(seconds=max(60.0, _retry_gap))
         ts.indexer_next_retry_at = next_retry
-        max_age = dt.timedelta(seconds=self.cfg.cross_seed.prowlarr_max_age_seconds)
+        max_age = dt.timedelta(seconds=max(60.0, _max_age_s))
         elapsed = now - ts.indexer_first_queried_at
 
         log.info(
@@ -3111,7 +3159,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             self.transition(
                 ts, State.FAILED,
                 error=(f"Prowlarr cross-seed not found within "
-                       f"{self.cfg.cross_seed.prowlarr_max_age_seconds}s"),
+                       f"{int(max_age.total_seconds())}s"),
             )
             return
 
@@ -3755,6 +3803,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         # FAILED) return normally inside the block and are unaffected.
         try:
             await self._setup_queued_download(ts, blob)
+        except ValueError as e:
+            # Deterministic poison (bad batching/classify, no valid files
+            # for priorities): retrying the same bytes parks QUEUED forever.
+            # Fail loudly so the operator sees it instead.
+            # (BatchMoveIncompleteError stays on the retry path below —
+            # its contract is "same batch retries".)
+            log.error("queued setup poisoned for %s: %s; failing",
+                      ts.source_infohash[:10], e)
+            try:
+                self.transition(ts, State.FAILED, error=str(e)[:500])
+            except (AbandonedError, ValueError):
+                try:
+                    ts.state = State.FAILED
+                    ts.last_error = str(e)[:500]
+                    self.store.upsert(ts)
+                except Exception:
+                    pass
+            return
         except Exception as e:  # noqa: BLE001
             log.warning("queued setup hit transient dest error for %s: %s; staying queued",
                         ts.source_infohash[:10], e)
@@ -5160,7 +5226,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # move either).
             if (f.progress or 0.0) >= 0.999:
                 try:
-                    _on_disk = file_path.stat().st_size if file_path.is_file() else -1
+                    # Single stat: is_file()+stat() doubles syscalls per
+                    # file on the hot move path.
+                    _st = file_path.stat()
+                    _on_disk = _st.st_size if stat.S_ISREG(_st.st_mode) else -1
                 except OSError:
                     _on_disk = -1
                 if _on_disk == (f.size_bytes or 0):
@@ -5283,7 +5352,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 # (escape + loop risk), so skip links, contain results to
                 # the folder, and cap the listing.
                 try:
-                    _scan = list(local_folder.rglob("*"))[:100000]
+                    # Iterate + early-break: a 100k-file folder must not
+                    # materialize 100k Paths before the cap applies.
+                    _scan_iter = local_folder.rglob("*")
+                    _scan: list = []
+                    for _p in _scan_iter:
+                        _scan.append(_p)
+                        if len(_scan) >= 100000:
+                            break
                     _folder_real = local_folder.resolve()
                 except OSError:
                     _scan = []
@@ -5695,6 +5771,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if not res.ok:
                 err = res.stderr.strip()
                 last_err = [ln.strip() for ln in err.splitlines() if ln.strip()][-1] if err else f"rc={res.returncode}"
+                if is_transient_rclone_stderr(err):
+                    raise RcloneTransientError(
+                        f"rclone transient failure (rc={res.returncode}): {last_err}")
                 raise RuntimeError(f"rclone failed (rc={res.returncode}): {last_err}")
 
     # ---- state: RE_ADDING ----
@@ -5784,9 +5863,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 store.upsert(ts)
             return
         if gate_expected is None:
-            # Blob present but undecodable/empty (e.g. unit-test doubles with
-            # fake bytes): keep legacy behavior and let downstream steps fail
-            # loudly instead of parking forever.
+            # Blob present but undecodable/empty: a real-sized blob is
+            # corrupt — park instead of injecting blind with skip_check=True
+            # (unseedable torrent). Tiny fakes (unit-test doubles) keep
+            # legacy behavior so tests don't park forever.
+            try:
+                _blob_len = len(gate_blob or b"")
+            except Exception:
+                _blob_len = 0
+            if _blob_len >= 128:
+                log.warning(
+                    "fuse gate cannot decode %d-byte blob for %s; parking re-add",
+                    _blob_len, ts.source_name[:50],
+                )
+                ts.readd_next_retry_at = now + dt.timedelta(seconds=retry_gap)
+                if store is not None:
+                    store.upsert(ts)
+                return
             log.warning(
                 "fuse gate cannot decode blob for %s; proceeding without gate",
                 ts.source_name[:50],

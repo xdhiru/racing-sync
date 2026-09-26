@@ -243,13 +243,17 @@ def test_api_forget_endpoint():
     headers = {"X-Api-Token": "secret"}
 
     # 422 (not a 40-char hex infohash)
-    resp_422 = client.post("/api/forget/not-a-hash", headers=headers)
+    resp_422 = client.post("/api/forget/not-a-hash?confirm=true", headers=headers)
     assert resp_422.status_code == 422
+
+    # 400 (destructive op without confirm)
+    resp_400 = client.post("/api/forget/" + "a" * 40, headers=headers)
+    assert resp_400.status_code == 400
 
     # 404 (unknown hash)
     with patch("racing_sync.api.forget_torrent", new_callable=AsyncMock) as mock_forget:
         mock_forget.side_effect = LookupError("no torrent matching 'aaaa'")
-        resp_404 = client.post("/api/forget/" + "a" * 40, headers=headers)
+        resp_404 = client.post("/api/forget/" + "a" * 40 + "?confirm=true", headers=headers)
         assert resp_404.status_code == 404
 
     # 200 (applied, delete_files default True)
@@ -267,7 +271,7 @@ def test_api_forget_endpoint():
     with patch("racing_sync.api.forget_torrent", new_callable=AsyncMock) as mock_forget:
         mock_forget.return_value = planned
         resp_200 = client.post(
-            "/api/forget/" + "B" * 40 + "?delete_files=false", headers=headers
+            "/api/forget/" + "B" * 40 + "?delete_files=false&confirm=true", headers=headers
         )
         assert resp_200.status_code == 200
         body = resp_200.json()

@@ -31,7 +31,8 @@ def normalize_content_name(name: str) -> str:
         prev = s
         s = re.sub(r"\.torrent$", "", s, flags=re.IGNORECASE).strip()
         s = re.sub(r"\s*\[[^\]]+\]\s*$", "", s).strip()
-        for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v"):
+        for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v",
+                    ".iso", ".m2ts", ".mts", ".wmv", ".mov", ".flv", ".webm"):
             if s.lower().endswith(ext):
                 s = s[:-len(ext)].strip()
                 break

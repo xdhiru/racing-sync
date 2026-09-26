@@ -344,6 +344,20 @@ class HTTPClientBase:
                 if fut is None or fut.done():
                     try:
                         fut = loop.create_future()
+                        # Mark future exceptions retrieved: with no
+                        # followers awaiting, an owner-crash exception would
+                        # otherwise surface as "exception never retrieved"
+                        # on the loop (followers awaiting still raise it).
+                        try:
+                            def _consume(_f, _log=log):
+                                try:
+                                    if not _f.cancelled():
+                                        _f.exception()
+                                except Exception:
+                                    pass
+                            fut.add_done_callback(_consume)
+                        except Exception:
+                            pass
                     except Exception:
                         return False
                     self._auth_future = fut
@@ -398,6 +412,17 @@ class HTTPClientBase:
                     )
                     await asyncio.sleep(0.5 * (2 ** attempt))
                     continue
+                except RuntimeError as e:
+                    # Programming/test state (session never started):
+                    # retrying is pointless — fail fast instead of
+                    # burning 3.5s of backoff then failing anyway.
+                    log.warning(
+                        "[%s] re-auth misconfigured (%s); not retrying",
+                        self._label, e,
+                    )
+                    if not fut.done():
+                        fut.set_exception(AuthError(str(e)))
+                    return False
                 # No exception: the login stands (real _auth() sets the
                 # flag itself; test doubles may not — normalize here).
                 self._authed = True
@@ -481,6 +506,8 @@ class HTTPClientBase:
                     )
                 except (
                     aiohttp.ClientConnectionError,
+                    aiohttp.ClientPayloadError,
+                    aiohttp.ClientOSError,
                     asyncio.TimeoutError,
                 ) as e:
                     if attempt == 2:
@@ -503,8 +530,19 @@ class HTTPClientBase:
             if retry_after:
                 try:
                     delay = min(5.0, float(retry_after))
-                except ValueError:
-                    pass
+                except (ValueError, TypeError, OverflowError):
+                    # HTTP-date form: honor it (capped), else keep backoff.
+                    try:
+                        from email.utils import parsedate_to_datetime as _p2d
+                        import datetime as _dt
+                        _dtv = _p2d(str(retry_after).strip())
+                        if _dtv is not None:
+                            if _dtv.tzinfo is None:
+                                _dtv = _dtv.replace(tzinfo=_dt.timezone.utc)
+                            _secs = (_dtv - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+                            delay = max(0.0, min(5.0, _secs))
+                    except Exception:
+                        pass
             log.warning(
                 "[%s] %s %s -> HTTP %d; retrying in %.1fs (attempt %d/3)",
                 self._label, method, path, r.status, delay, attempt + 1,
@@ -578,8 +616,18 @@ class HTTPClientBase:
             if retry_after:
                 try:
                     delay = min(5.0, float(retry_after))
-                except ValueError:
-                    pass
+                except (ValueError, TypeError, OverflowError):
+                    try:
+                        from email.utils import parsedate_to_datetime as _p2d
+                        import datetime as _dt
+                        _dtv = _p2d(str(retry_after).strip())
+                        if _dtv is not None:
+                            if _dtv.tzinfo is None:
+                                _dtv = _dtv.replace(tzinfo=_dt.timezone.utc)
+                            _secs = (_dtv - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+                            delay = max(0.0, min(5.0, _secs))
+                    except Exception:
+                        pass
             log.warning(
                 "[%s] %s %s -> HTTP %d after re-auth; retrying in %.1fs (attempt %d/3)",
                 self._label, method, path, r.status, delay, attempt + 1,
@@ -594,7 +642,21 @@ class HTTPClientBase:
         if r.status >= 400:
             try:
                 try:
-                    body = await r.text()
+                    # Cap the error body: a rogue proxy can stream MBs of
+                    # HTML here and OOM the daemon via one 401 page.
+                    _chunks: list[bytes] = []
+                    _total = 0
+                    async for _c in r.content.iter_chunked(16384):
+                        _total += len(_c)
+                        if _total > 65536:
+                            break
+                        _chunks.append(_c)
+                    try:
+                        body = b"".join(_chunks).decode("utf-8", errors="replace")
+                    except Exception:
+                        body = f"<undecodable body, status={r.status}>"
+                    if _total > 65536:
+                        body = body[:65536] + "…<truncated>"
                 except Exception:
                     # Binary error pages (or undecodable bytes) must not mask
                     # the original HTTP status.

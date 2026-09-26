@@ -306,8 +306,12 @@ async def _forget_one(
                     entries[h] = t
         except Exception as e:  # noqa: BLE001
             discover_ok = False
+            try:
+                _sh = (row.source_infohash or "")[:10]
+            except Exception:
+                _sh = "?"
             log.warning("forget: cannot list dest entries for %s: %s",
-                        row.source_infohash[:10], e)
+                        _sh, e)
     local_paths, skipped = await _candidate_local_paths(
         cfg, dest, row, [h for h in known if h in entries] or known[:1],
     )
@@ -365,8 +369,12 @@ async def _forget_one(
         except Exception as e:  # noqa: BLE001
             remaining_entries = {}
             verify_ok = False
+            try:
+                _sh2 = (row.source_infohash or "")[:10]
+            except Exception:
+                _sh2 = "?"
             log.warning("forget: cannot verify dest deletes for %s: %s",
-                        row.source_infohash[:10], e)
+                        _sh2, e)
         for h in sorted(remaining_entries):
             try:
                 entry_save = (getattr(remaining_entries[h], "save_path", "") or "")

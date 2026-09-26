@@ -567,15 +567,37 @@ class StateStore:
         Used by the coordinator tick to decide which rows to wake up and
         re-query the download-target indexers.
         """
+        return self.list_waiting_ready(now=now, which="indexer")
+
+    def list_waiting_ready(
+        self, now: dt.datetime | None = None, *, which: str = "both",
+    ) -> list[TorrentState]:
+        """WAITING_INDEXER rows whose indexer and/or public timer elapsed.
+
+        One scan instead of two per tick (the two schedules are
+        independent — a row may be due on either, both, or neither).
+        `which` is "indexer", "public", or "both" (default).
+        """
         self._ensure_open()
         now = now or dt.datetime.now(dt.timezone.utc)
+        clauses: list[str] = []
+        if which in ("indexer", "both"):
+            clauses.append(
+                "(indexer_next_retry_at != '' AND indexer_next_retry_at <= ?)")
+        if which in ("public", "both"):
+            clauses.append(
+                "(public_export_next_retry_at != '' "
+                "AND public_export_next_retry_at <= ?)")
+        if not clauses:
+            return []
+        where = " OR ".join(clauses)
+        params = tuple([now.isoformat()] * len(clauses))
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state = 'waiting_indexer' "
-                "AND deleted_at = '' "
-                "AND indexer_next_retry_at != '' "
-                "AND indexer_next_retry_at <= ? ORDER BY indexer_next_retry_at",
-                (now.isoformat(),),
+                f"AND deleted_at = '' AND ({where}) "
+                "ORDER BY indexer_next_retry_at, public_export_next_retry_at",
+                params,
             ).fetchall()
             return [_row_to_state(r) for r in rows]
 
@@ -596,11 +618,12 @@ class StateStore:
 
     def get_telegram_message_id(self, source_infohash: str) -> int | None:
         self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
         with self._lock:
             row = self._conn.execute(
                 "SELECT telegram_message_id FROM torrent_state WHERE source_infohash = ? "
                 "AND deleted_at = ''",
-                (source_infohash,),
+                (norm,),
             ).fetchone()
             if row is None or not row["telegram_message_id"]:
                 return None
@@ -608,12 +631,13 @@ class StateStore:
 
     def set_telegram_message_id(self, source_infohash: str, message_id: int) -> None:
         self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
         with self._lock:
             self._conn.execute(
                 "UPDATE torrent_state SET telegram_message_id = ?, "
                 "updated_at = ? WHERE source_infohash = ? AND deleted_at = ''",
                 (message_id, dt.datetime.now(dt.timezone.utc).isoformat(),
-                 source_infohash),
+                 norm),
             )
 
     def all_active(self, include_blob: bool = False, limit: int | None = None) -> list[TorrentState]:
@@ -698,6 +722,15 @@ class StateStore:
     def delete(self, source_infohash: str) -> None:
         self._ensure_open()
         norm = (source_infohash or "").strip().lower()
+        # Never hard-delete a live row: a later whole-row upsert would
+        # resurrect it as a zombie. Stamp a tombstone instead (invisible
+        # to reads, refusing writes, GC'd after TTL); hard-delete only
+        # when there is no live row to protect.
+        try:
+            if self.tombstone(norm):
+                return
+        except Exception:
+            pass
         with self._lock:
             self._conn.execute(
                 "DELETE FROM torrent_state WHERE source_infohash = ?", (norm,)
@@ -1106,17 +1139,7 @@ class StateStore:
         indexer schedule: these rows retry the VPS1 export indefinitely
         instead of sharing the indexer's max-age clock.
         """
-        self._ensure_open()
-        now = now or dt.datetime.now(dt.timezone.utc)
-        with self._lock:
-            rows = self._conn.execute(
-                f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state = 'waiting_indexer' "
-                "AND deleted_at = '' "
-                "AND public_export_next_retry_at != '' "
-                "AND public_export_next_retry_at <= ? ORDER BY public_export_next_retry_at",
-                (now.isoformat(),),
-            ).fetchall()
-            return [_row_to_state(r) for r in rows]
+        return self.list_waiting_ready(now=now, which="public")
 
 
 

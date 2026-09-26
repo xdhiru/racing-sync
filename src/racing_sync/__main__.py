@@ -266,7 +266,21 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
         if _backup is not None:
             print(f"state.db backed up to: {_backup}")
         else:
-            print("warning: state.db backup failed; continuing",
+            # Distinguish "no DB file yet" (nothing to lose) from a real
+            # snapshot failure (destructive op without a safety net):
+            # refuse the latter instead of warn-continuing.
+            try:
+                import os as _os
+                _db_exists = _os.path.exists(str(cfg.general.state_db))
+            except Exception:
+                _db_exists = True
+            if _db_exists:
+                print("refusing forget --apply: state.db backup failed "
+                      "(snapshot error, not a missing DB); fix the backup "
+                      "path before deleting anything.",
+                      file=sys.stderr)
+                return 2
+            print("warning: no state.db yet; continuing without backup",
                   file=sys.stderr)
 
     async def _run() -> dict:
@@ -552,7 +566,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Fresh start: delete state.db (+WAL/SHM) and clear the log "
              "directory before starting. Bookkeeping only — torrents on the "
              "clients/SSD are re-adopted by recovery and resume; use "
-             "'forget' to abandon a torrent entirely. Requires --yes.",
+             "'forget' to abandon a torrent entirely. Also clears the "
+             "ignored_torrents list (cancelled releases become eligible "
+             "again). Requires --yes.",
     )
     p_run.add_argument(
         "--full",
