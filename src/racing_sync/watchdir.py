@@ -125,13 +125,13 @@ def _bdecode(
     raise ValueError(f"bad bencode prefix {ch!r} at position {pos - 1}")
 
 
-def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
-    """Decode a bencoded .torrent and return (infohash, name, total_size, announce_url).
+def _decode_torrent_root(data: bytes) -> tuple[dict[bytes, object], bytes]:
+    """Shared bencode root walk: (root dict, raw info-dict bytes).
 
-    We avoid `bencodepy` / `torf` as a dep by writing a minimal decoder good
-    enough for top-level info extraction. The raw bytes of the info dict
-    are captured directly from the byte stream without re-encoding to preserve
-    the true SHA1 infohash even for torrents with non-standard key sorting.
+    Single implementation behind both `_bencoded_info_hash` (raising)
+    and `extract_torrent_files_from_bencoded` (fail-soft) so the walk,
+    size caps and item budgets cannot drift apart. Raises ValueError on
+    anything malformed or oversize; callers choose raise vs [].
     """
     if not data:
         raise ValueError("empty torrent data")
@@ -173,6 +173,20 @@ def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
     info = root.get(b"info")
     if not isinstance(info, dict) or raw_info_bytes is None:
         raise ValueError("torrent has no info dict")
+    return root, raw_info_bytes
+
+
+def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
+    """Decode a bencoded .torrent and return (infohash, name, total_size, announce_url).
+
+    We avoid `bencodepy` / `torf` as a dep by writing a minimal decoder good
+    enough for top-level info extraction. The raw bytes of the info dict
+    are captured directly from the byte stream without re-encoding to preserve
+    the true SHA1 infohash even for torrents with non-standard key sorting.
+    """
+    root, raw_info_bytes = _decode_torrent_root(data)
+    info = root[b"info"]
+    assert isinstance(info, dict)
 
     name = info.get(b"name", b"")
     if isinstance(name, bytes):
@@ -210,29 +224,21 @@ def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
 
 
 def extract_torrent_files_from_bencoded(data: bytes) -> list[Any]:
-    """Extract list of TorrentFile entries from a bencoded .torrent payload."""
+    """Extract list of TorrentFile entries from a bencoded .torrent payload.
+
+    Fail-soft (returns []): shares the strict root walk with
+    `_bencoded_info_hash`, converting its ValueError into [].
+    """
     from .clients.abstract import TorrentFile
 
     if not data or not data.startswith(b"d"):
         return []
     if len(data) > MAX_TORRENT_BYTES:
         return []
-    pos = 1
-    root: dict[bytes, object] = {}
-    _budget: list[int] = [0]
-    while True:
-        if pos >= len(data) or data[pos:pos + 1] == b"e":
-            break
-        pos, k = _bdecode(data, pos, depth=1, _items=_budget)
-        if not isinstance(k, (bytes, str)):
-            break
-        k_bytes = k if isinstance(k, bytes) else k.encode("utf-8")
-        pos, v = _bdecode(data, pos, depth=1, _items=_budget)
-        root[k_bytes] = v
-        _budget[0] += 1
-        if _budget[0] > MAX_BENCODE_ITEMS:
-            raise ValueError(f"bencode item limit exceeded ({MAX_BENCODE_ITEMS})")
-
+    try:
+        root, _ = _decode_torrent_root(data)
+    except ValueError:
+        return []
     info = root.get(b"info")
     if not isinstance(info, dict):
         return []
