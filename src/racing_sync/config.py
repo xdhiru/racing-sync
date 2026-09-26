@@ -659,6 +659,23 @@ class ProwlarrConfig(BaseModel):
         if self.enabled:
             if not self.base_url.startswith(("http://", "https://")):
                 raise ValueError("prowlarr.base_url must start with http(s)://")
+            try:
+                from urllib.parse import urlsplit as _us
+                _p = _us(self.base_url)
+                if _p.username or _p.password:
+                    raise ValueError(
+                        "prowlarr.base_url must not embed userinfo "
+                        "(creds would leak to logs)")
+                if _p.query or _p.fragment:
+                    raise ValueError(
+                        "prowlarr.base_url must be a bare origin "
+                        "(no query/fragment)")
+                if not _p.hostname:
+                    raise ValueError("prowlarr.base_url must include a host")
+            except ValueError:
+                raise
+            except Exception as e:
+                raise ValueError(f"prowlarr.base_url is not a valid URL: {e}")
             key = self.api_key.get_secret_value().strip() if isinstance(self.api_key, SecretStr) else str(self.api_key).strip()
             if not key or key.upper() in ("CHANGE_ME", "YOUR_PROWLARR_API_KEY"):
                 raise ValueError("prowlarr.api_key required and cannot be a placeholder when enabled")

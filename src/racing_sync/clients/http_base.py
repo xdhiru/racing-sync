@@ -355,7 +355,11 @@ class HTTPClientBase:
                     await fut
                 except AuthError:
                     return False
-                except (asyncio.CancelledError, Exception):
+                except asyncio.CancelledError:
+                    # Structured shutdown: never swallow cancellation as
+                    # "not authed" — propagate so SIGTERM actually stops.
+                    raise
+                except Exception:
                     return bool(self._authed)
                 if bool(self._authed):
                     return True

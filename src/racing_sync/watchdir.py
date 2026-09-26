@@ -325,10 +325,22 @@ def parse_torrent_file(path: Path) -> tuple[str, str, int, str, bytes]:
             raise ValueError("empty torrent file")
     except OSError as e:
         raise ValueError(f"cannot stat torrent file {path}: {e}") from e
-    data = path.read_bytes()
-    # Re-check after read (TOCTOU): file may have grown between stat and read.
+    # Bounded read: a file that grows between stat and read must not
+    # OOM the daemon — read at most MAX+1 and refuse when over cap.
+    try:
+        with open(path, "rb") as _fh:
+            data = _fh.read(MAX_TORRENT_BYTES + 1)
+    except OSError as e:
+        raise ValueError(f"cannot read torrent file {path}: {e}") from e
     if len(data) > MAX_TORRENT_BYTES:
         raise ValueError(f"torrent file exceeds maximum allowed size ({len(data)} > {MAX_TORRENT_BYTES})")
+    try:
+        if path.is_symlink():
+            raise ValueError(f"refusing symlink torrent: {path}")
+    except ValueError:
+        raise
+    except OSError:
+        pass
     infohash, name, total, announce = _bencoded_info_hash(data)
     return infohash, name, total, announce, data
 
@@ -360,6 +372,18 @@ class WatchDirScanner:
         patterns = [self._cfg.glob]
         if ".torrent" in self._cfg.glob and ".TORRENT" not in self._cfg.glob:
             patterns.append(self._cfg.glob.replace(".torrent", ".TORRENT"))
+            # Mixed-case drops (Show.Torrent) are missed by glob on Linux:
+            # sweep the directory once and match suffix case-insensitively.
+            try:
+                for _p in Path(self._cfg.path).iterdir():
+                    try:
+                        if (_p.is_file() and not _p.is_symlink()
+                                and _p.suffix.lower() == ".torrent"):
+                            entries.add(_p)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
         entries: set[Path] = set()
         for pattern in patterns:
             try:
@@ -395,11 +419,22 @@ class WatchDirScanner:
                         cached[2], cached[3], cached[4], cached[5]
                     )
                     # Bytes are never cached: re-read for emission (the file
-                    # is small — parse already size-checked it).
+                    # is small — parse already size-checked it). Re-lstat
+                    # first (symlink swapped in after the check) and cap
+                    # the read: a file that grew between stat and read
+                    # must not OOM the daemon.
                     try:
-                        data = entry.read_bytes()
+                        if entry.is_symlink():
+                            log.warning("watch-dir: skipping symlink %s", entry.name)
+                            continue
+                        with open(entry, "rb") as _fh:
+                            data = _fh.read(MAX_TORRENT_BYTES + 1)
                     except OSError as e:
                         log.warning("watch-dir: error accessing %s (%s)", entry.name, e)
+                        continue
+                    if len(data) > MAX_TORRENT_BYTES:
+                        log.warning("watch-dir: skipping %s (grew past cap)",
+                                    entry.name)
                         continue
                     if len(data) != fsize:
                         self._file_cache.pop(entry, None)

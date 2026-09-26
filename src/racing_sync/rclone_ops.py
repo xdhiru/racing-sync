@@ -121,9 +121,14 @@ def _reject_hijack_flags(flags: list[str] | None, where: str) -> None:
             norm = flag.lstrip("-").replace("_", "-")
         except Exception:
             continue
-        if norm in ("config", "password-command", "ask-password"):
+        if norm in ("config", "password-command", "ask-password",
+                      "config-file", "c",
+                      "log-file", "log-file-max-size", "syslog", "syslog-facility",
+                      "s3-access-key-id", "s3-secret-access-key",
+                      "files-from", "files-from-raw", "files-from-encoding",
+                      "filter-from", "exclude-file", "include-file"):
             raise RcloneError(
-                f"refusing rclone {where} flag that hijacks config/credentials: {item!r}"
+                f"refusing rclone {where} flag that hijacks config/credentials/filters: {item!r}"
             )
 
 
@@ -163,6 +168,7 @@ def build_move_cmd(cfg: AppConfig, source: Path, dest_remote: str,
 _SENSITIVE_FLAGS = {
     "--password",
     "--rc-pass",
+    "--s3-access-key-id",
     "--s3-secret-access-key",
     "--b2-account-key",
     "--drive-token",
@@ -253,6 +259,13 @@ async def run_rclone(
                     proc.kill()
                 except Exception:
                     pass
+                try:
+                    # Reap after kill too: without this the child lingers
+                    # as a zombie while the caller treats the move as
+                    # failed and a later tick may start a duplicate move.
+                    await asyncio.wait_for(proc.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    pass
         except Exception:
             pass
 
@@ -275,6 +288,10 @@ async def run_rclone(
                 try:
                     proc.kill()
                 except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
                     pass
         except Exception:
             pass
