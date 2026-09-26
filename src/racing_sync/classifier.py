@@ -186,13 +186,16 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
             eps.append(Episode(name, parsed[0], parsed[1], size))
     eps.sort(key=lambda e: (e.season, e.episode))
 
-    # Deduplicate eps per (season, episode), keeping the largest file
+    # Group eps per (season, episode), keeping EVERY file variant.
+    # An episode released in two containers (S01E01.mkv + S01E01.mp4)
+    # must move both: keeping only the largest leaves the loser
+    # unselected, and the later folder wipe deletes it (data loss).
     best_by_ep: dict[tuple[int, int], Episode] = {}
     for ep in eps:
         key = (ep.season, ep.episode)
         if key not in best_by_ep or ep.size_bytes > best_by_ep[key].size_bytes:
             best_by_ep[key] = ep
-    deduped_eps = sorted(best_by_ep.values(), key=lambda e: (e.season, e.episode))
+    deduped_eps = sorted(eps, key=lambda e: (e.season, e.episode))
 
     distinct_eps = {(e.season, e.episode) for e in deduped_eps}
 
@@ -201,7 +204,8 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
     # + Movie.mkv) must NOT be classified as a lone episode — fall through to
     # mixed/season logic below.
     if len(distinct_eps) == 1:
-        main_ep = deduped_eps[0]
+        sole_key = next(iter(distinct_eps))
+        main_ep = best_by_ep[sole_key]
         if len(eval_trip) == 1 or main_ep.size_bytes >= int(0.9 * total):
             return Classification(
                 kind="episode",

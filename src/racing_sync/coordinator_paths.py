@@ -49,7 +49,19 @@ def _watch_cross_seed_dir(state_db: Path | str, infohash: str) -> Path | None:
     if _INFOHASH_DIR_RE.fullmatch(h) is None:
         return None
     try:
-        return Path(state_db).parent / "watch_cross_seeds" / h
+        _parent = Path(state_db).parent
+    except Exception:
+        return None
+    # ":memory:" (or any bare filename) has parent "." — never litter
+    # the checkout/CWD with a blob dir; in-memory DBs keep no blobs.
+    try:
+        _name = getattr(Path(state_db), "name", "") or ""
+    except Exception:
+        _name = ""
+    if str(_parent) in (".", "") or _name == ":memory:":
+        return None
+    try:
+        return _parent / "watch_cross_seeds" / h
     except Exception:
         return None
 

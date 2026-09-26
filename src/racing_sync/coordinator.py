@@ -488,8 +488,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         )
                         continue
                     ts.failed_retries += 1
-                    self.store.upsert(ts)
-                    self.transition(ts, State.NEW)
+                    try:
+                        self.store.upsert(ts)
+                    except AbandonedError:
+                        log.info("auto-retry: row gone for %s; skipping",
+                                 (ts.source_infohash or "")[:10])
+                        continue
+                    except Exception:
+                        continue
+                    try:
+                        self.transition(ts, State.NEW)
+                    except (AbandonedError, ValueError) as e:
+                        log.info("auto-retry: cannot revive %s (%s); skipping",
+                                 (ts.source_infohash or "")[:10], e)
+                        continue
 
             # Optional Telegram bot (lazy import: python-telegram-bot is
             # only required when enabled).
@@ -603,12 +615,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 ),
                 getattr(self, "cfg", None), "source list_torrents",
             )
-        except (TimeoutError, asyncio.TimeoutError) as e:
-            # Wedged VPS1 poll: serve the stale cache when there is one,
-            # else an empty view — a timeout must degrade the poll, never
-            # fail rows or abort the tick from any caller.
+        except (TimeoutError, asyncio.TimeoutError, OSError,
+                AuthError, ValueError, RuntimeError) as e:
+            # Wedged/unreachable VPS1 poll: serve the stale cache when
+            # there is one, else an empty view — a source outage must
+            # degrade the poll, never fail rows or abort the tick from
+            # any caller. (AuthError still surfaces via the production
+            # poller loop's dedicated backoff; here we just don't starve
+            # the scheduler/janitor behind one bad poll.)
             _stale = getattr(self, "_source_torrents_cache", None) or []
-            log.warning("source poll timed out; using %s view: %s",
+            log.warning("source poll failed (%s); using %s view: %s",
+                        type(e).__name__,
                         "stale cache" if _stale else "empty", e)
             return list(_stale)
         min_age = self.cfg.source.min_age_seconds
@@ -786,7 +803,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             return []
         items = await self.watch.scan_once()
         for item in items:
-            item_hash = item.infohash.lower()
+            try:
+                item_hash = (item.infohash or "").lower()
+            except Exception:
+                continue
+            if not item_hash:
+                continue
             ingested = False
             if self.store.get(item_hash, include_blob=False) is None:
                 try:
@@ -855,7 +877,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if h in self._running_infohashes:
             return
         self._running_infohashes.add(h)
-        task = asyncio.create_task(self._process_torrent(ts))
+        try:
+            task = asyncio.create_task(self._process_torrent(ts))
+        except RuntimeError:
+            # Loop closed/shutting down: release the claim so the
+            # scheduler never skips this hash forever.
+            self._running_infohashes.discard(h)
+            raise
         self._tasks.add(task)
         def _done_cb(t: asyncio.Task, infohash: str = h) -> None:
             self._tasks.discard(t)
@@ -914,10 +942,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             )
             return
         # Check if any torrent in this release group is already tracked in state store
+        # (state.get normalizes case internally — one lookup suffices).
         existing_ts: TorrentState | None = None
         for t in group:
-            found_ts = (self.store.get(t.infohash.lower(), include_blob=False)
-                        or self.store.get(t.infohash, include_blob=False))
+            found_ts = self.store.get(t.infohash, include_blob=False)
             if found_ts is not None:
                 existing_ts = found_ts
                 break
@@ -1233,10 +1261,19 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         the production `run()` loop instead runs the three steps on
         independent loops with separate locks and clocks (see
         `_poller_loop` / `_scheduler_loop` / `_janitor_loop`).
+        Each step is isolated: one step throwing must not starve the
+        others (a source outage skips scheduling/janitor otherwise).
         """
-        await self._poll_source_step()
-        await self._schedule_step()
-        await self._janitor_step()
+        for _step in (self._poll_source_step,
+                      self._schedule_step,
+                      self._janitor_step):
+            try:
+                await _step()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("tick step %s failed; continuing: %s",
+                            getattr(_step, "__name__", "?"), e)
 
     def _loop_lock(self, name: str) -> asyncio.Lock:
         """Per-loop lock, lazily created (tolerates bare test doubles)."""
@@ -1279,7 +1316,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 break
             try:
                 await asyncio.sleep(
-                    self.cfg.general.source_poll_interval)
+                    max(1, int(float(self.cfg.general.source_poll_interval or 30))))
+            except (TypeError, ValueError):
+                await asyncio.sleep(30)
             except asyncio.CancelledError:
                 break
 
@@ -1306,7 +1345,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 break
             try:
                 await asyncio.sleep(
-                    self.cfg.general.dest_poll_interval)
+                    max(1, int(float(self.cfg.general.dest_poll_interval or 30))))
+            except (TypeError, ValueError):
+                await asyncio.sleep(30)
             except asyncio.CancelledError:
                 break
 
@@ -1457,6 +1498,19 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     self._park_moving(ts, f"rclone move timed out: {e}")
                 else:
                     try:
+                        _gone = (
+                            getattr(self, "store", None) is not None
+                            and hasattr(self.store, "get")
+                            and self.store.get(ts.source_infohash,
+                                               include_blob=False) is None
+                        )
+                    except Exception:
+                        _gone = False
+                    if _gone:
+                        log.info("worker: row gone for %s; dropping timeout (%s)",
+                                 ts.source_infohash[:10], e)
+                        return
+                    try:
                         ts.last_error = f"rclone timed out: {e}"[:500]
                     except Exception:
                         pass
@@ -1496,7 +1550,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     )
                     ts.last_error = str(e)[:500]
                     self.store.upsert(ts)
-            self.store.append_log("ERROR", str(e), ts.source_infohash)
+            try:
+                self.store.append_log("ERROR", str(e), ts.source_infohash)
+            except Exception:
+                pass
             await self._notify_telegram(ts)
 
     async def _notify_telegram(self, ts: TorrentState, progress: float | None = None) -> None:
@@ -3357,7 +3414,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # A WAITING_DISK promotion inside a worker bypasses the tick's
             # max_active_downloads gate (checked at schedule time) — re-check
             # here so parked bursts can't overshoot concurrent downloads.
-            # The SSD reservation is already held; release it if we stay parked.
+            # The SSD reservation is already held; release it if we stay parked
+            # or if the promotion itself is refused (abandoned row).
             # Non-int configs (test doubles) skip the count check.
             _max_dl_raw = getattr(self.cfg, "max_active_downloads", 0)
             if isinstance(_max_dl_raw, bool) or not isinstance(_max_dl_raw, (int, float)):
@@ -3390,7 +3448,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         _active_dl, _max_dl, ts.source_name[:60],
                     )
                     return
-            self.transition(ts, State.QUEUED)
+            try:
+                self.transition(ts, State.QUEUED)
+            except (AbandonedError, ValueError) as e:
+                # Row forgotten/failed concurrently after we reserved SSD:
+                # release the reservation instead of leaking it until prune.
+                try:
+                    await self._ssd_release(ts.source_infohash)
+                except Exception:
+                    pass
+                log.info("waiting_disk admit aborted for %s (%s)",
+                         (ts.source_infohash or "")[:10], e)
             return
         # Still full: stay parked quietly until the next interval instead of
         # hot-looping every tick while batch moves drain.
