@@ -603,13 +603,36 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         `min_age_seconds` ensures torrents have matured for at least N
         seconds before sync starts (e.g. to allow cross-seeds to be added).
 
-        Cached for 10 seconds to prevent redundant RPC calls to VPS1 when
-        multiple tasks (e.g. _tick, _do_new, _do_waiting_indexer) query
-        the source client within the same cycle.
+        Cached for 45 seconds and single-flighted: the split poller +
+        scheduler loops (plus per-row workers) would otherwise each fire
+        a full Deluge `get_torrents_status` scan every 15-30s, and a scan
+        slower than the RPC timeout would pile overlapping scans onto
+        deluged — starving autobrr's own injections. One scan serves all
+        callers; concurrent callers share the in-flight scan instead of
+        starting their own.
         """
         now_mono = time.monotonic()
-        if not force_refresh and (now_mono - self._source_torrents_cached_at) < 10.0:
+        if not force_refresh and (now_mono - self._source_torrents_cached_at) < 45.0:
             return list(self._source_torrents_cache)
+
+        lock = self._loop_lock("_source_list_lock")
+        if lock is not None:
+            async with lock:
+                # Re-check under the lock: a concurrent caller may have
+                # just refreshed while we queued.
+                now_mono = time.monotonic()
+                if not force_refresh and (now_mono - self._source_torrents_cached_at) < 45.0:
+                    return list(self._source_torrents_cache)
+                return await self._list_source_torrents_locked(
+                    force_refresh=force_refresh, now_mono=now_mono)
+        return await self._list_source_torrents_locked(
+            force_refresh=force_refresh, now_mono=now_mono)
+
+    async def _list_source_torrents_locked(
+        self, *, force_refresh: bool = False, now_mono: float = 0.0,
+    ) -> list:
+        """Source list body: caller holds `_source_list_lock` (or none)."""
+        now_mono = now_mono or time.monotonic()
 
         try:
             all_torrents = await rpc(

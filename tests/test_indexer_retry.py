@@ -1187,3 +1187,38 @@ async def test_waiting_indexer_ignores_other_content(tmp_path):
         coord._pick_and_admit.assert_awaited_once()
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_concurrent_source_lists_share_one_scan():
+    """Scheduler worker bursts must not each fire a full Deluge scan.
+
+    Five concurrent _list_source_torrents calls (expired cache) collapse
+    to a single source RPC via the single-flight lock; without it every
+    worker burst re-scans deluged and starves autobrr injections.
+    """
+    import asyncio
+    coord = make_coordinator()
+    coord.cfg.source.min_age_seconds = 0
+    _row = MagicMock()
+    _row.configure_mock(**{"infohash": "a" * 40, "name": "X"})
+    _row.size_bytes = 1
+    _row.added_on = 0
+
+    async def _slow_list(**kwargs):
+        await asyncio.sleep(0.05)
+        return [_row]
+
+    coord.source_client = AsyncMock()
+    coord.source_client.list_torrents = AsyncMock(side_effect=_slow_list)
+    coord._source_torrents_cache = []
+    coord._source_torrents_cached_at = 0.0
+    results = await asyncio.gather(
+        *[coord._list_source_torrents() for _ in range(5)])
+    assert coord.source_client.list_torrents.await_count == 1
+    assert all(len(r) == 1 for r in results)
+    # Fresh cache: no RPC at all.
+    results2 = await asyncio.gather(
+        *[coord._list_source_torrents() for _ in range(5)])
+    assert coord.source_client.list_torrents.await_count == 1
+    assert all(len(r) == 1 for r in results2)

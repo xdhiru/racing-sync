@@ -69,9 +69,14 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         # (e.g. standalone use in tests).
         self._shared_sftp = None
         # The daemon has no server-side hash filter: every lookup is a full
-        # get_torrents_status scan. Cache raw scans briefly (5s per label
-        # filter) so per-hash get_torrent bursts collapse to one RPC.
+        # get_torrents_status scan. Cache raw scans briefly (15s per label
+        # filter) so per-hash get_torrent bursts collapse to one RPC, and
+        # serialize scans behind a lock: a scan slower than the RPC timeout
+        # must never pile overlapping scans onto deluged (each one blocks
+        # the daemon's single-threaded loop and starves other programs
+        # like autobrr). Concurrent callers share the in-flight scan.
         self._scan_cache: dict[str, tuple[float, dict]] = {}
+        self._scan_lock: Any = None
 
     def set_sftp_exporter(self, exporter) -> None:
         """Reuse the coordinator's shared SFTP connection for .torrent fallback."""
@@ -355,7 +360,11 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             pass
 
     async def _cached_scan(self, filt: dict[str, Any], status_keys: list[str]) -> dict:
-        """Full-scan with a short per-filter cache (hash filtering is client-side)."""
+        """Full-scan with a short per-filter cache (hash filtering is client-side).
+
+        Serialized: concurrent callers share one in-flight scan instead of
+        each firing their own at deluged (see _scan_lock note in __init__).
+        """
         import time as _time
 
         try:
@@ -364,10 +373,32 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             key = ("", ())
         try:
             cached = self._scan_cache.get(key)
-            if cached and _time.monotonic() - cached[0] < 5.0 and isinstance(cached[1], dict):
+            if cached and _time.monotonic() - cached[0] < 15.0 and isinstance(cached[1], dict):
                 return cached[1]
         except Exception:
             pass
+        try:
+            _lock = getattr(self, "_scan_lock", None)
+            if _lock is None:
+                _lock = asyncio.Lock()
+                self._scan_lock = _lock
+        except Exception:
+            _lock = None
+        if _lock is None:
+            return await self._scan_uncached(filt, status_keys, key)
+        async with _lock:
+            try:
+                cached = self._scan_cache.get(key)
+                if cached and _time.monotonic() - cached[0] < 15.0 and isinstance(cached[1], dict):
+                    return cached[1]
+            except Exception:
+                pass
+            return await self._scan_uncached(filt, status_keys, key)
+
+    async def _scan_uncached(self, filt: dict[str, Any], status_keys: list[str], key) -> dict:
+        """One raw get_torrents_status scan + cache store. Caller holds the lock."""
+        import time as _time
+
         info = await self._rpc("core.get_torrents_status", [filt, status_keys])
         try:
             if isinstance(info, dict):
