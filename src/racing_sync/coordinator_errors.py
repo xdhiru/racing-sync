@@ -90,6 +90,41 @@ def is_retryable_client_error(exc: BaseException) -> bool:
 _NOT_VISIBLE_DETAIL = "added but entry not yet visible on dest client"
 
 
+class RcloneTransientError(RuntimeError):
+    """An rclone move failed with a transient-looking remote error.
+
+    Timeouts already surface as RcloneTimeoutError; this covers rc!=0 with
+    transport/remote markers (reset, refused, unreachable, 5xx, handshake).
+    Callers park the row for retry like a timeout — failing would loop
+    re-download/stall/fail on every remote blip. Persistent misconfig
+    (bad remote, auth) parks loudly with the rc+stderr in last_error and
+    escalates via the moving-park counter instead of failing silently.
+    """
+
+
+# Lowercase markers matched against rclone rc!=0 stderr to classify the
+# failure as transient (park) vs persistent (fail). Conservative: unknown
+# text fails like before.
+_RCLONE_TRANSIENT_MARKERS = (
+    "timeout", "timed out", "connection reset", "connection refused",
+    "connection aborted", "network unreachable", "network is unreachable",
+    "host unreachable", "no route to host", "broken pipe",
+    "temporary failure", "try again", "service unavailable",
+    "bad gateway", "gateway timeout", "internal error",
+    "tls handshake", "handshake failure", "connection closed",
+    "too many requests", "slow down", "socket", "eof",
+)
+
+
+def is_transient_rclone_stderr(stderr: str) -> bool:
+    """True when rclone stderr looks like a transient remote/transport blip."""
+    try:
+        low = (stderr or "").lower()
+    except Exception:
+        return False
+    return any(m in low for m in _RCLONE_TRANSIENT_MARKERS)
+
+
 class BatchMoveIncompleteError(RuntimeError):
     """A batch rclone move exited 0 but left batch files on local disk.
 
@@ -111,8 +146,10 @@ class AbandonedError(RuntimeError):
 __all__ = [
     "AbandonedError",
     "BatchMoveIncompleteError",
+    "RcloneTransientError",
     "WebUIUnresponsiveError",
     "_WEBUI_RETRY_ERRORS",
     "is_fatal_os_error",
     "is_retryable_client_error",
+    "is_transient_rclone_stderr",
 ]

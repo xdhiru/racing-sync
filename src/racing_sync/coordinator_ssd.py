@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from .state import State, TorrentState
 
@@ -382,22 +383,31 @@ class SSDLedgerMixin:
                 return False
             # Grow: admission's physical check covered only the old
             # (smaller) estimate — the delta must fit the live disk now.
-            # Best-effort: when free space is unmeasurable (unstatable
-            # path, test doubles) fail open with a warning — the global
-            # budget still binds and the download itself surfaces a broken
-            # path. Only an explicit out-of-room verdict fails the grow.
+            # Fail-closed like rclone_ops.disk_free_bytes_at: when free
+            # space is unmeasurable (unstatable path) refuse the grow —
+            # an SSD row that can't prove room must wait, not overcommit
+            # past ENOSPC. Test doubles opt out via ssd.path=None (which
+            # keeps the old permissive path). Offloaded: disk stat on a
+            # slow/dead mount must not stall the event loop.
             # (disk_free_bytes_at conflates unstatable with 0-free, so
             # probe statability directly first.)
             try:
-                import shutil as _shutil
+                _sp = getattr(getattr(self, "cfg", None), "ssd", None)
+                _sp = getattr(_sp, "path", None)
+                if _sp is None or not isinstance(_sp, (str, Path)):
+                    # Test doubles / unset path: no physical check possible.
+                    _room_ok = True
+                else:
+                    import shutil as _shutil
 
-                from . import coordinator as _c
+                    from . import coordinator as _c
+                    from .io_bounds import offload as _offload
 
-                _shutil.disk_usage(str(self.cfg.ssd.path))
-                _room_ok = _c.ssd_has_room(self.cfg, new_amount - old)
+                    await _offload(_shutil.disk_usage, str(_sp))
+                    _room_ok = _c.ssd_has_room(self.cfg, new_amount - old)
             except Exception as e:
-                log.warning("ssd grow physical check unavailable (%s); proceeding on global budget", e)
-                _room_ok = True
+                log.warning("ssd grow physical check unavailable (%s); refusing grow", e)
+                _room_ok = False
             if not _room_ok:
                 return False
             d[key] = new_amount

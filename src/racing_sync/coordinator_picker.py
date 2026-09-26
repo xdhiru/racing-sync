@@ -71,6 +71,11 @@ async def pick_ssd_source_for_racing(
     # can fall back to Prowlarr as a last resort).
     publics = [t for t in [source_torrent] + other_source_torrents
                if _looks_public(getattr(t, "trackers", None) or [])]
+    # Deterministic election: client list order is arbitrary, so sort by
+    # (size, name, hash) — same content elects the same copy every tick.
+    publics.sort(key=lambda t: ((getattr(t, "size_bytes", 0) or 0),
+                                (getattr(t, "name", "") or ""),
+                                (getattr(t, "infohash", "") or "").lower()))
 
     if publics:
         chosen = publics[0]
@@ -165,9 +170,20 @@ async def pick_ssd_source_for_racing(
                 chosen.name,
             )
             try:
-                hit = await prowlarr.best_match(
-                    chosen.name, target_size=chosen.size_bytes,
-                    indexers=prowlarr.get_download_indexers(),
+                from .io_bounds import bounded as _bounded
+                _pq_timeout = 30.0
+                try:
+                    _pq_timeout = float(getattr(
+                        getattr(cfg, "prowlarr", None), "timeout_seconds", 30.0) or 30.0)
+                except (TypeError, ValueError):
+                    _pq_timeout = 30.0
+                hit = await _bounded(
+                    prowlarr.best_match(
+                        chosen.name, target_size=chosen.size_bytes,
+                        indexers=prowlarr.get_download_indexers(),
+                    ),
+                    timeout=max(5.0, min(300.0, _pq_timeout)),
+                    label="prowlarr public-fallback search",
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("download-indexer search failed for %s: %s",
@@ -178,7 +194,12 @@ async def pick_ssd_source_for_racing(
             if hit:
                 hit_size = hit.size_bytes
                 try:
-                    blob = await prowlarr.download_torrent(hit)
+                    from .io_bounds import bounded as _bounded2
+                    blob = await _bounded2(
+                        prowlarr.download_torrent(hit),
+                        timeout=max(5.0, min(300.0, _pq_timeout)),
+                        label="prowlarr public-fallback download",
+                    )
                 except Exception as e:  # noqa: BLE001
                     # A 500/timeout fetching the payload is transient: fall
                     # through to the export fallback below, never FAILED.

@@ -90,11 +90,16 @@ def is_safe_dir_to_clear(path: Path, label: str = "log dir") -> str | None:
     denied = {
         Path("/var"), Path("/var/log"), Path("/etc"), Path("/usr"),
         Path("/bin"), Path("/sbin"), Path("/home"), Path("/root"),
-        Path("/tmp"), Path("/var/tmp"),
+        Path("/tmp"), Path("/var/tmp"), Path("/var/lib"),
     }
     denied_posix = {p.as_posix() for p in denied} | {
         "/var", "/var/log", "/etc", "/usr", "/bin", "/sbin",
-        "/home", "/root", "/tmp", "/var/tmp", "/",
+        "/home", "/root", "/tmp", "/var/tmp", "/var/lib", "/",
+        # Windows system/profile roots (exact + case variants compare
+        # lowercased below): a Windows host must not wipe these.
+        "c:/windows", "c:/windows/system32", "c:/program files",
+        "c:/program files (x86)", "c:/programdata",
+        "c:/users", "c:/users/administrator", "c:/users/public",
     }
     try:
         home = Path.home().resolve()
@@ -112,8 +117,15 @@ def is_safe_dir_to_clear(path: Path, label: str = "log dir") -> str | None:
         raw_posix = str(log_dir)
     if raw_posix in denied_posix or raw_posix.rstrip("/") in denied_posix:
         return f"refusing to clear system directory: {log_dir}"
-    # Shallow paths (e.g. /data, C:\\logs) are one typo away from a system
-    # dir; require at least 3 parts (anchor + 2 levels) to clear.
+    try:
+        # Windows compare is case-insensitive (C:\Windows vs c:\windows).
+        if raw_posix.lower() in denied_posix or raw_posix.lower().rstrip("/") in denied_posix:
+            return f"refusing to clear system directory: {log_dir}"
+    except Exception:
+        pass
+    # Shallow paths (e.g. /data, C:\logs) are one typo away from a system
+    # dir; require anchor + 2 levels. /var/lib (3 parts) is explicitly
+    # denied above — system state must never be clearable.
     if len(resolved.parts) < 3 and resolved.parent in (anchor, resolved):
         # e.g. "/x" or "C:\\x" — allow only when it already looks like an
         # app dir? Fail closed: refuse bare top-level dirs.
@@ -183,11 +195,15 @@ def fuse_roots(cfg: object) -> list[Path]:
 
 
 def overlaps_fuse(path: Path, fuse_mounts: list[Path]) -> bool:
-    """True when `path` is, contains, or sits inside a fuse mount."""
+    """True when `path` is, contains, or sits inside a fuse mount.
+
+    Fail-closed: an unresolvable path (OSError, missing mount) is treated
+    as overlapping — a wipe must never proceed on "cannot tell".
+    """
     try:
         resolved = path.resolve()
     except OSError:
-        return False
+        return True
     for f in fuse_mounts or []:
         try:
             if not f.exists():
