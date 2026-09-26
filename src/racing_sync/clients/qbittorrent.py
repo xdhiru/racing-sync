@@ -284,13 +284,18 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                     if m:
                         raw = m.group(1)
                         if len(raw) == 32:
-                            # 32 chars: base32 (v1) — but 32-char hex also
-                            # matches; try b32decode first, fall back to hex.
-                            try:
-                                import base64
-                                candidate_hash = base64.b32decode(raw.upper()).hex()
-                            except Exception:
+                            # Ambiguous: 32-char all-hex could be either.
+                            # A genuine base32 v1 hash is ~never all-hex
+                            # ((16/32)^32), so try hex first — a base32
+                            # mis-decode yields a confidently-wrong hash.
+                            if all(c in "0123456789abcdefABCDEF" for c in raw):
                                 candidate_hash = raw.lower()
+                            else:
+                                try:
+                                    import base64
+                                    candidate_hash = base64.b32decode(raw.upper()).hex()
+                                except Exception:
+                                    continue
                         elif len(raw) in (40, 64):
                             # v1 hex (40) or v2 hex (64)
                             if all(c in "0123456789abcdefABCDEF" for c in raw):
@@ -310,6 +315,13 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             if candidate_hash:
                 try:
                     existing = await self.get_torrent(candidate_hash.lower())
+                    if existing is None and len(candidate_hash) == 64:
+                        # v2/hybrid hash qB may index under the v1 prefix:
+                        # fall back to the first 40 hex chars (20 bytes).
+                        existing = await self.get_torrent(
+                            candidate_hash.lower()[:40])
+                        if existing is not None:
+                            candidate_hash = candidate_hash.lower()[:40]
                     if existing is not None:
                         log.info(
                             "qB add_torrent returned 'Fails.' but torrent %s already exists",
