@@ -349,6 +349,71 @@ async def test_http_client_files_param_handling():
 
 
 @pytest.mark.anyio
+async def test_deluge_web_connect_refusal_fails_fast():
+    """An explicit web.connect refusal raises AuthError (no silent RPC storm)."""
+    from racing_sync.clients.deluge import DelugeClient
+    from racing_sync.clients.http_base import AuthError
+    from racing_sync.config import SourceConfig
+
+    def client_with_posts(posts):
+        cfg = SourceConfig(
+            type="deluge", host="http://localhost:8112", password="secret",
+            deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1",
+                         "ssh_password": "pwd",
+                         "state_dir": "/var/lib/deluged/state"},
+        )
+        client = DelugeClient(cfg)
+
+        class Ctx:
+            def __init__(self, payload):
+                self._payload = payload
+
+            async def __aenter__(self):
+                r = MagicMock()
+                r.status = 200
+                r.json = AsyncMock(return_value=self._payload)
+                r.text = AsyncMock(return_value="{}")
+                r.read = AsyncMock(return_value=b"{}")
+                return r
+
+            async def __aexit__(self, *a):
+                return False
+
+        seq = list(posts)
+        session = MagicMock()
+        session.post = MagicMock(side_effect=lambda *a, **k: Ctx(seq.pop(0)))
+        client._session = session
+        return client
+
+    # Refused connect -> AuthError with actionable hint.
+    bad = client_with_posts([
+        {"result": True},                       # auth.login ok
+        {"result": False},                      # web.connected: no
+        {"result": [["host1", "h", 1, "on", ""]]},  # web.get_hosts
+        {"result": False},                      # web.connect refused
+    ])
+    with pytest.raises(AuthError, match="web.connect"):
+        await bad._do_client_auth()
+
+    # Accepted connect -> silent success.
+    good = client_with_posts([
+        {"result": True},
+        {"result": False},
+        {"result": [["host1", "h", 1, "on", ""]]},
+        {"result": True},
+    ])
+    await good._do_client_auth()
+
+    # Already connected -> no connect call at all.
+    idle = client_with_posts([
+        {"result": True},
+        {"result": True},
+    ])
+    await idle._do_client_auth()
+    assert idle._session.post.call_count == 2
+
+
+@pytest.mark.anyio
 async def test_deluge_list_torrents_progress_and_hash_filtering():
     cfg = SourceConfig(
         type="deluge",
@@ -1062,6 +1127,42 @@ async def test_qbittorrent_request_json_reauth_on_html():
     assert data == [{"hash": "x"}]
     assert calls["n"] == 2
     assert auth_calls["n"] == 1
+
+
+@pytest.mark.anyio
+async def test_qbittorrent_request_json_no_reauth_on_corrupt_json():
+    """Genuine corrupt JSON re-raises without a wasteful re-login."""
+    import json
+
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+
+    class DummyCtx:
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.json = AsyncMock(side_effect=json.JSONDecodeError(
+                "corrupt", '{"half": ', 0))
+            resp.text = AsyncMock(return_value='{"half": ')
+            return resp
+
+        async def __aexit__(self, *args):
+            pass
+
+    async def mock_request(method, endpoint, params=None, **kwargs):
+        return DummyCtx()
+
+    auth_calls = {"n": 0}
+
+    async def mock_auth(force=False):
+        auth_calls["n"] += 1
+        client._authed = True
+
+    client.request = mock_request
+    client._auth = mock_auth
+    client._authed = True
+    with pytest.raises(json.JSONDecodeError):
+        await client._request_json("GET", "/api/v2/torrents/info", params={})
+    assert auth_calls["n"] == 0
 
 
 @pytest.mark.anyio

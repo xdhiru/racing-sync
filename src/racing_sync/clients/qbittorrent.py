@@ -61,28 +61,44 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 f"addresses."
             )
 
+    _LOGIN_PAGE_MARKERS = (
+        "<html", "<!doctype", "<form", "login", "password", "username",
+        "sign in", "unauthorized",
+    )
+
     async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
         """Request + JSON-decode with re-auth on login-page responses.
 
         An expired session can surface as HTTP 200 + login HTML (proxies,
         older WebUI builds) instead of 401/403: r.json() then raises a
         decode error with _authed still True, and every later call fails
-        identically until restart. Treat a decode failure as a dead
-        session: re-login once and retry once before surfacing the error.
+        identically until restart. Re-login (single-flight, shared with
+        concurrent expiries) and retry once — but ONLY when the payload
+        looks like a login page. Genuine corrupt JSON re-raises
+        immediately without a wasteful login.
         """
         try:
             async with await self.request(method, path, **kwargs) as r:
                 return await r.json()
         except (aiohttp.ContentTypeError, ValueError) as e:
+            try:
+                _body = await r.text()
+            except Exception:
+                _body = ""
+            _probe = f"{_body or ''} {getattr(e, 'doc', '') or ''}".lower()
+            if not any(m in _probe for m in self._LOGIN_PAGE_MARKERS):
+                raise
             log.warning(
-                "[%s] %s %s returned non-JSON (expired session?); re-authenticating",
+                "[%s] %s %s returned login page (expired session?); re-authenticating",
                 self._label, method, path,
             )
         try:
             self._authed = False
         except Exception:
             pass
-        await self._auth(force=True)
+        if not await self._login_singleflight(force=True):
+            raise AuthError(
+                f"[{self._label}] re-auth failed for {path}")
         async with await self.request(method, path, **kwargs) as r:
             return await r.json()
 

@@ -53,8 +53,11 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         HTTPClientBase.__init__(self, HTTPClientConfig.from_source(cfg),
                                 label="source-deluge")
         self._req_id = 0
-        self._daemon_password: str | None = getattr(cfg, "deluge_password", None)
-        # If you need to set a daemon password, extend SourceConfig.
+        # NOTE: the Deluge web API's `web.connect` takes only the host id —
+        # the *daemon* password lives in the WebUI's stored host entry
+        # (WebUI Preferences → Daemon), not in this config. The *WebUI*
+        # password goes through `auth.login` from [source].password. There
+        # is intentionally no `deluge_password` knob here.
         # Keep a reference to the SFTP config so we can fall back to
         # reading .torrent files when the daemon RPC is unavailable.
         self._sftp_cfg = (
@@ -136,7 +139,27 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                                         "id": 4,
                                     }
                                     async with self.session.post("json", json=connect_payload) as cr:
-                                        await cr.read()
+                                        try:
+                                            cdata = await cr.json()
+                                        except Exception:
+                                            cdata = {}
+                                        if isinstance(cdata, dict) and cdata.get("error"):
+                                            raise AuthError(
+                                                f"deluge web.connect to {host_id} failed: "
+                                                f"{cdata['error']}"
+                                            )
+                                        if (isinstance(cdata, dict)
+                                                and "result" in cdata
+                                                and cdata.get("result") is False):
+                                            raise AuthError(
+                                                f"deluge web.connect to {host_id} refused "
+                                                f"(returned False). If the daemon needs a "
+                                                f"password, store it in the WebUI host entry "
+                                                f"(WebUI Preferences → Daemon)."
+                                            )
+                                        log.info("deluge auto-connected to daemon %s", host_id)
+        except AuthError:
+            raise
         except Exception as e:
             log.warning("deluge web.connect check failed: %s", e)
 
