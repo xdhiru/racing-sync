@@ -738,6 +738,94 @@ async def test_http_client_does_not_conflate_403_with_auth_error():
     assert exc_info.value.status == 403
 
 
+@pytest.mark.anyio
+async def test_http_client_concurrent_401s_share_one_login():
+    """N workers hitting 401 at once must trigger one login, not N."""
+    import asyncio
+    from racing_sync.clients.http_base import HTTPClientBase
+    from racing_sync.config import HTTPClientConfig
+
+    cfg = HTTPClientConfig(host="http://127.0.0.1:8080", nginx_mode="off")
+    client = HTTPClientBase(cfg)
+    client._authed = True
+    client._session = MagicMock()
+
+    logins = 0
+
+    async def fake_auth(force=False):
+        nonlocal logins
+        logins += 1
+        await asyncio.sleep(0.05)  # overlap window for followers
+        client._authed = True
+
+    client._auth = fake_auth
+
+    def resp(status):
+        r = MagicMock()
+        r.status = status
+        r.read = AsyncMock(return_value=b"x")
+        r.close = MagicMock()
+        return r
+
+    # Every worker first sees 401, then succeeds after the shared login.
+    # The yield models real network I/O (inline mocks complete without
+    # yielding, which scrambles task interleaving unrealistically).
+    calls = []
+
+    async def request_side_effect(*a, **k):
+        await asyncio.sleep(0)
+        calls.append(1)
+        if len(calls) <= 5:
+            return resp(401)
+        return resp(200)
+
+    client._session.request = AsyncMock(side_effect=request_side_effect)
+
+    results = await asyncio.gather(*[
+        client.request("GET", f"/w{i}", retry_auth=True) for i in range(5)
+    ])
+    assert all(r.status == 200 for r in results)
+    assert logins == 1
+
+
+@pytest.mark.anyio
+async def test_http_client_reauth_transient_error_retries_login():
+    """A network blip during re-auth retries instead of escaping."""
+    from racing_sync.clients.http_base import HTTPClientBase
+    from racing_sync.config import HTTPClientConfig
+    import aiohttp
+
+    cfg = HTTPClientConfig(host="http://127.0.0.1:8080", nginx_mode="off")
+    client = HTTPClientBase(cfg)
+    client._authed = True
+    client._session = MagicMock()
+
+    attempts = 0
+
+    async def flaky_auth(force=False):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise aiohttp.ClientConnectionError("blip")
+        client._authed = True
+
+    client._auth = flaky_auth
+
+    resp_401 = MagicMock()
+    resp_401.status = 401
+    resp_401.read = AsyncMock(return_value=b"Unauthorized")
+    resp_401.close = MagicMock()
+    resp_200 = MagicMock()
+    resp_200.status = 200
+    resp_200.read = AsyncMock(return_value=b"OK")
+    resp_200.close = MagicMock()
+    client._session.request = AsyncMock(side_effect=[resp_401, resp_200])
+
+    res = await client.request("GET", "/flaky", retry_auth=True)
+    assert res == resp_200
+    assert attempts == 2
+
+
 def test_torrent_from_qb_sanitizes_single_file_content_path():
     from racing_sync.clients.qbittorrent import _torrent_from_qb
 
