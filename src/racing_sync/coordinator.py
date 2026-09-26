@@ -76,7 +76,7 @@ from .rclone_ops import (
     ssd_max_inflight_bytes,  # noqa: F401  (runtime use via coordinator_ssd lazy lookup + compat)
     wipe_local_tree,
 )
-from .recovery import find_content_on_ssd, reconcile
+from .recovery import find_content_on_ssd
 from .sftp_source import SFTPExporter
 from .state import _MAX_READD_CYCLES, State, StateStore, TorrentState
 from .watchdir import WatchDirScanner, WatchItem
@@ -273,6 +273,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     _janitor_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     # Supervised loop tasks (poller/scheduler/janitor), cancelled on shutdown.
     _loop_tasks: set[asyncio.Task] = field(default_factory=set, init=False)
+    # Background recovery verification (post-startup), cancelled on shutdown.
+    _recovery_task: asyncio.Task | None = field(default=None, init=False)
     # Frozen per-torrent batch cap (bug 5): batch boundaries must not shift
     # when free space changes mid-download, or batch_index points at
     # different episodes (skip/repeat). Frozen at first use, reused for the
@@ -443,9 +445,26 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 self.watch = WatchDirScanner(self.cfg.watch_dir, self.prowlarr)
 
             if self.cfg.recovery.run_on_startup:
-                await reconcile(
-                    self.cfg, dest=self.dest_client, store=self.store
+                from .recovery import _reconcile_snapshot, reconcile_verify
+                # Fast snapshot first (no per-row RPC verification), so the
+                # daemon serves in seconds even with hundreds of DONE rows;
+                # expensive verification (byte checks, classification, blob
+                # export, orphan fixes) runs in the background. Unverified
+                # rows stay fail-closed (janitor requires fuse_verified).
+                await _reconcile_snapshot(
+                    self.cfg, dest=self.dest_client, store=self.store,
+                    verify=False,
                 )
+                try:
+                    self._recovery_task = asyncio.create_task(
+                        reconcile_verify(
+                            self.cfg, dest=self.dest_client,
+                            store=self.store,
+                        ),
+                        name="rs-recovery-verify",
+                    )
+                except RuntimeError:
+                    self._recovery_task = None
 
             # Auto-retry FAILED rows so a previous run's hard failures
             # (e.g. Deluge RPC unavailable) get another chance with the
@@ -618,6 +637,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             return
         self._shutdown_done = True
         log.info("coordinator shutting down")
+        try:
+            _rt = getattr(self, "_recovery_task", None)
+            if _rt is not None and not _rt.done():
+                _rt.cancel()
+                try:
+                    await _rt
+                except (asyncio.CancelledError, Exception):
+                    pass
+        except Exception:
+            pass
         for t in list(self._tasks):
             t.cancel()
         if self._tasks:

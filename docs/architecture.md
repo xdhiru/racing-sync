@@ -198,8 +198,17 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
 
 ## Recovery (req #4)
 
-On startup `reconcile()` audits active states against destination client
-torrents and the local/remote filesystem:
+On startup the reconciler audits active states against destination client
+torrents and the local/remote filesystem — in two phases, so serving
+never waits on per-row verification:
+
+- Phase 1 (blocking, fast): snapshots plus optimistic adoption — fuse
+  entries adopt as `DONE` fuse-*un*verified with unknown kind/blob,
+  orphans stay parked, ghost checks are skipped. No per-row RPCs.
+- Phase 2 (`reconcile_verify()`, background task): byte verification
+  (stamping `fuse_verified`, healing kind/blob, demoting SSD-backed
+  ghosts to `MOVING`) and orphan fixes, 4-wide with per-row isolation.
+  Unverified rows stay fail-closed (the janitor requires the flag).
 
 - `state=downloading` + missing on destination -> re-add torrent to continue download.
 - `state=moving` + missing on SSD -> verify if data arrived on remote; transition to `RE_ADDING` if complete.
