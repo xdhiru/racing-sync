@@ -742,7 +742,10 @@ async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
 
     cls_files = [
         TorrentFile(name=gone_locally, size_bytes=500, progress=1.0),
-        TorrentFile(name="Big.Show.S01/Big.Show.S01E04.mkv", size_bytes=500, progress=0.4),
+        # Deselected batch file (priority 0, as _prepare_next_batch leaves
+        # non-current-batch files): preallocated shell, wiped as today.
+        TorrentFile(name="Big.Show.S01/Big.Show.S01E04.mkv", size_bytes=500, progress=0.4,
+                    priority=0),
         TorrentFile(name="Big.Show.S01/cover.jpg", size_bytes=6, progress=1.0),
     ]
 
@@ -798,6 +801,96 @@ async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
     # The preallocated partial was neither moved nor individually deleted.
     assert partial.exists()
     assert not cover.exists()
+
+
+@pytest.mark.anyio
+async def test_do_moving_parks_on_lagging_selected_file(tmp_path):
+    """Per-file progress lag must park the move, never wipe real bytes.
+
+    Regression (President.Curtis): overall 100% with two episodes at
+    99.x% per-file progress (qB flush lag / rounding). The old code moved
+    the 8 verified files, then folder-wiped the 2 lagging-but-real ones —
+    bytes lost on both ends, fuse gate parking forever after. Now the row
+    stays MOVING (resumed, nothing wiped) until the files verify.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    top = ssd / "Lag.Season"
+    top.mkdir()
+    lagging = top / "Lag.Season.S01E03.mkv"
+    lagging.write_bytes(b"x" * 1000)  # full size on disk, progress lagging
+    e1 = top / "Lag.Season.S01E01.mkv"
+    e1.write_bytes(b"y" * 1000)
+    e2 = top / "Lag.Season.S01E02.mkv"
+    e2.write_bytes(b"z" * 1000)
+
+    cls_files = [
+        TorrentFile(name="Lag.Season/Lag.Season.S01E01.mkv", size_bytes=1000,
+                    progress=1.0, priority=1),
+        TorrentFile(name="Lag.Season/Lag.Season.S01E02.mkv", size_bytes=1000,
+                    progress=1.0, priority=1),
+        # Selected, full-size, 99.5%: real bytes mid-flush, NOT a
+        # preallocated shell — wiping it would destroy content.
+        TorrentFile(name="Lag.Season/Lag.Season.S01E03.mkv", size_bytes=1000,
+                    progress=0.995, priority=1),
+    ]
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = ssd / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+    coord.cfg.rclone.batch_move_extra_flags = []
+    coord.store = StateStore(tmp_path / "state.db")
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=cls_files)
+    coord.dest_client.export_torrent = AsyncMock(return_value=b"blob")
+
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
+        for name in files_from or []:
+            p = ssd / name
+            if p.is_file():
+                p.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
+
+    ts = TorrentState(
+        source_infohash="c" * 40,
+        source_name="Lag.Season",
+        dest_infohash="c" * 40,
+        save_path=str(ssd),
+        classification_kind="season",
+        batches_total=1,
+        batch_index=0,
+        state=State.MOVING,
+    )
+    coord.store.upsert(ts)
+
+    row = coord.store.get("c" * 40)
+    with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock) as mock_wipe:
+        await coord._do_moving(row)
+
+    # Parked in MOVING (not RE_ADDING): nothing wiped, resume requested so
+    # the lagging bytes finish and next tick moves them.
+    assert row.state == State.MOVING
+    assert "unverified" in (row.last_error or "")
+    mock_wipe.assert_not_awaited()
+    coord.dest_client.resume.assert_awaited()
+    # The verified files moved; the lagging file is still on SSD.
+    assert not e1.exists()
+    assert not e2.exists()
+    assert lagging.exists()
+    assert lagging.stat().st_size == 1000
 
 
 @pytest.mark.anyio
@@ -946,7 +1039,10 @@ async def test_do_moving_skips_move_when_no_verified_leftovers(tmp_path):
     (top / "Big.Show.S01E04.mkv").write_bytes(b"e" * 500)
 
     cls_files = [
-        TorrentFile(name="Big.Show.S01/Big.Show.S01E04.mkv", size_bytes=500, progress=0.4),
+        # Deselected leftover (priority 0: only the current batch stays
+        # selected in batch flow): preallocated shell, wiped as today.
+        TorrentFile(name="Big.Show.S01/Big.Show.S01E04.mkv", size_bytes=500, progress=0.4,
+                    priority=0),
     ]
 
     coord = make_coordinator()

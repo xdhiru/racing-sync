@@ -6069,6 +6069,64 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     )
                     return
 
+        # 5b. Uncertain-file guard: per-file client progress can lag overall
+        # completion (a rounded 100.0% overall with files at 99.x%, or a slow
+        # client flush), and those files were NOT moved above. Folder-wiping
+        # them destroys bytes that never reached the remote — the fuse gate
+        # then parks forever on files that can never appear (and the row
+        # eventually FAILEDs with data lost on both ends). Park in MOVING
+        # instead (no wipe, no advance); next tick re-verifies with a fresh
+        # file list, and resume lets lagging bytes finish. Only SELECTED
+        # (priority>0) files block: deselected preallocated shells in
+        # batch/mixed flows are wiped as today — their bytes were never had
+        # (their own batch owns them), while a selected-but-unverified file
+        # is real content mid-flush. Missing/None priority counts as
+        # selected (fail-closed direction).
+        _blockers = []
+        try:
+            for _uf in (uncertain_files or []):
+                try:
+                    _prio = getattr(_uf, "priority", None)
+                    _prio = 1 if _prio is None else _prio
+                    if isinstance(_prio, bool):
+                        _prio = 1 if _prio else 0
+                    _prio = int(_prio)
+                except (TypeError, ValueError):
+                    _prio = 1
+                if _prio > 0 and getattr(_uf, "name", ""):
+                    _blockers.append(_uf)
+        except Exception:
+            _blockers = []
+        if _blockers:
+            resumed = False
+            try:
+                await self.dest_client.resume(h)
+                resumed = True
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "could not resume %s with %d unverified file(s): %s",
+                    ts.source_name, len(_blockers), e,
+                )
+            _eg = ""
+            try:
+                _eg = str(_blockers[0].name or "")
+            except Exception:
+                pass
+            log.warning(
+                "folder %s for %s has %d unverified selected file(s) "
+                "(e.g. %s); %s staying in MOVING without wiping",
+                folder or src_dir, ts.source_name, len(_blockers), _eg,
+                "resumed to finish downloading," if resumed else "resume failed,",
+            )
+            self._park_moving(
+                ts,
+                f"folder {ts.source_name} has {len(_blockers)} unverified "
+                f"selected file(s) (e.g. {_eg}); "
+                f"{'resumed to finish, ' if resumed else ''}"
+                f"staying in MOVING without wiping",
+            )
+            return
+
         # 6. Persist the SSD torrent's bytes for RE_ADDING before the client
         # entry is deleted below. Rows adopted by recovery (fresh state.db)
         # carry no blob — without this, _re_add_cross_seed_torrent fails on
