@@ -39,6 +39,7 @@ class Torrent:
     # before deleting: quiet = upspeed ~0 AND no leechers.
     upspeed_bps: int = 0
     num_leechers: int = 0
+    num_seeds: int = 0
     total_uploaded_bytes: int = 0
     seeding_time_seconds: int = 0
 
@@ -90,6 +91,16 @@ class TorrentClient(ABC):
 
     @abstractmethod
     async def get_trackers(self, torrent_hash: str) -> list[str]: ...
+
+    @abstractmethod
+    async def get_tracker_messages(self, torrent_hash: str) -> list[str]:
+        """Per-tracker status messages (qB `msg` field), else [].
+
+        Used by the download watchdog to spot tracker-side deletions
+        ("Unregistered torrent") that would otherwise stall a download
+        slot forever. Best-effort: empty when the client exposes none.
+        """
+        ...
 
     @abstractmethod
     async def add_torrent(

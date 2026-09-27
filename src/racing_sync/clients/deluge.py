@@ -336,6 +336,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     added_on=_num(status.get("time_added", 0)),
                     upspeed_bps=_num(status.get("upload_payload_rate")),
                     num_leechers=max(0, peers - seeds),
+                    num_seeds=seeds,
                     total_uploaded_bytes=_num(status.get("total_uploaded")),
                     seeding_time_seconds=_num(status.get("seeding_time")),
                 )
@@ -597,6 +598,12 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         if not status:
             return []
         return _extract_tracker_urls(status.get("trackers", []))
+
+    async def get_tracker_messages(self, torrent_hash: str) -> list[str]:
+        # Deluge exposes no per-tracker message via the WebUI RPC used
+        # here — the download watchdog treats Deluge rows as "unknown",
+        # never as dead. (qB carries the unregistered signal.)
+        return []
 
     # ---- mutation ----
 

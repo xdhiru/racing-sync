@@ -774,6 +774,58 @@ async def test_auto_retry_failed_caps_retries(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_auto_retry_skips_tracker_deleted_rows(tmp_path: Path):
+    """A tracker-deleted FAILED row is never revived by auto-retry.
+
+    Drives the real start() auto-retry block (patched clients): the
+    unregistered row stays FAILED with retries untouched, while an
+    ordinary failure is revived to NEW.
+    """
+    from unittest.mock import patch
+    from racing_sync.coordinator_errors import TRACKER_UNREGISTERED_MARKER
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.upsert(TorrentState(
+        source_infohash="dead1", source_name="Dead Release",
+        state=State.FAILED, failed_retries=0,
+        last_error=f"{TRACKER_UNREGISTERED_MARKER} gone upstream",
+    ))
+    store.upsert(TorrentState(
+        source_infohash="plain1", source_name="Plain Failure",
+        state=State.FAILED, failed_retries=0,
+        last_error="boom",
+    ))
+
+    coord = make_coordinator()
+    coord.store = store
+    coord.cfg = MagicMock()
+    coord.cfg.source.type = "qbittorrent"
+    coord.cfg.prowlarr.enabled = False
+    coord.cfg.watch_dir = None
+    coord.cfg.recovery.run_on_startup = False
+    coord.cfg.recovery.auto_retry_failed = True
+    coord.cfg.recovery.max_failed_retries = 3
+    coord.cfg.telegram.enabled = False
+    coord.cfg.api.enabled = False
+    coord.cfg.max_active_downloads = 3
+    coord.cfg.max_concurrent_moves = 2
+
+    _client = AsyncMock()
+    _client.start = AsyncMock()
+    with patch("racing_sync.coordinator.QBittorrentClient",
+               return_value=_client):
+        await coord.start()
+
+    dead = store.get("dead1")
+    assert dead.state == State.FAILED
+    assert dead.failed_retries == 0
+    plain = store.get("plain1")
+    assert plain.state == State.NEW
+    assert plain.failed_retries == 1
+
+
+@pytest.mark.anyio
 async def test_queued_existing_torrent_resumes(tmp_path: Path):
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)

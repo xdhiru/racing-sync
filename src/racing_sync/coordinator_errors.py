@@ -143,12 +143,94 @@ class AbandonedError(RuntimeError):
     """
 
 
+class UnregisteredTorrentError(RuntimeError):
+    """The tracker reports the torrent as deleted/unregistered.
+
+    Downloading further is pointless (no seeds will ever come): callers
+    fail the row terminally instead of parking it. Never auto-retried —
+    a deleted release stays deleted.
+    """
+
+
+class DownloadStalledError(TimeoutError):
+    """A download made no progress for a full stall window.
+
+    Carries the progress fraction at timeout so callers can tell a
+    repeatedly-stalled (dead) row apart from one that advances between
+    windows: only consecutive no-progress parks escalate to FAILED.
+    """
+
+    def __init__(self, message: str, *, progress: float = 0.0):
+        super().__init__(message)
+        try:
+            self.progress = float(progress)
+        except (TypeError, ValueError):
+            self.progress = 0.0
+
+
+# Lowercase substrings of qB tracker `msg` values that mean "this release
+# is gone from the tracker — stop downloading". Matched loosely on purpose
+# (trackers word it many ways); passkey/auth failures are classified
+# separately below so the operator gets the right repair hint.
+_TRACKER_UNREGISTERED_MARKERS = (
+    "unregister",
+    "not register",
+    "unknown torrent",
+    "torrent not found",
+    "torrent unknown",
+    "no such torrent",
+    "deleted",
+    "removed",
+    "not exist",
+    "does not exist",
+    "invalid infohash",
+    "unknown infohash",
+)
+
+_TRACKER_AUTH_MARKERS = (
+    "passkey",
+    "not authorized",
+    "not authorised",
+    "unauthorized",
+    "unauthorised",
+    "invalid account",
+    "banned",
+)
+
+# Marker prefix stamped into last_error for terminal tracker failures.
+# auto_retry_failed() refuses rows carrying the unregistered marker.
+TRACKER_UNREGISTERED_MARKER = "tracker unregistered:"
+TRACKER_AUTH_MARKER = "tracker auth:"
+
+
+def classify_tracker_message(msg: object) -> str | None:
+    """'unregistered' / 'auth' / None for one tracker msg string."""
+    try:
+        low = str(msg or "").lower()
+    except Exception:
+        return None
+    if not low.strip():
+        return None
+    for m in _TRACKER_UNREGISTERED_MARKERS:
+        if m in low:
+            return "unregistered"
+    for m in _TRACKER_AUTH_MARKERS:
+        if m in low:
+            return "auth"
+    return None
+
+
 __all__ = [
     "AbandonedError",
     "BatchMoveIncompleteError",
+    "DownloadStalledError",
     "RcloneTransientError",
+    "TRACKER_AUTH_MARKER",
+    "TRACKER_UNREGISTERED_MARKER",
+    "UnregisteredTorrentError",
     "WebUIUnresponsiveError",
     "_WEBUI_RETRY_ERRORS",
+    "classify_tracker_message",
     "is_fatal_os_error",
     "is_retryable_client_error",
     "is_transient_rclone_stderr",
