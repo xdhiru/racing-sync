@@ -979,7 +979,14 @@ class GeneralConfig(BaseModel):
     # Optional overrides if specified under [general]
     max_active_downloads: int | None = Field(default=None, ge=1, le=100)
     max_concurrent_moves: int | None = Field(default=None, ge=1, le=100)
-    download_stall_timeout_seconds: int = Field(default=0, ge=0)
+    download_stall_timeout_seconds: int = Field(default=7200, ge=0)
+    # Consecutive no-progress stall windows before a DOWNLOADING row is
+    # failed terminally instead of parked again. A window with ANY byte of
+    # progress resets the count, so slow-but-alive swarms are never failed
+    # — only rows that never advance (tracker-deleted releases slip past
+    # the tracker-message check, dead swarms) release their slot. 0/1 =
+    # fail on the first stalled window; each window is stall_timeout long.
+    download_max_stall_parks: int = Field(default=3, ge=0, le=100)
     # Preferred-copy grace (seconds): a NEW row whose source is private
     # and NOT from a download-target indexer holds (stays NEW) this long
     # before locking the download, giving a download-indexer copy of the

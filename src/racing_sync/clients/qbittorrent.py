@@ -229,6 +229,33 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 urls.append(url)
         return urls
 
+    async def get_tracker_messages(self, torrent_hash: str) -> list[str]:
+        """Non-empty per-tracker `msg` strings (unregistered/passkey signals)."""
+        try:
+            data = await self._request_json(
+                "GET", "/api/v2/torrents/trackers", params={"hash": torrent_hash})
+        except Exception:
+            return []
+        msgs: list[str] = []
+        try:
+            rows = data if isinstance(data, list) else []
+        except Exception:
+            return []
+        for row in rows:
+            try:
+                if not isinstance(row, dict):
+                    continue
+                url = str(row.get("url", "") or "")
+                if url.startswith("**"):
+                    # DHT/PeX/LSD pseudo-rows: no tracker verdict here.
+                    continue
+                msg = str(row.get("msg", "") or "").strip()
+                if msg and msg not in msgs:
+                    msgs.append(msg)
+            except Exception:
+                continue
+        return msgs
+
     # ---- mutation ----
 
     async def add_torrent(
@@ -585,6 +612,7 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
         added_on=_num(d.get("added_on")),
         upspeed_bps=_num(d.get("upspeed")),
         num_leechers=_num(d.get("num_leechs")),
+        num_seeds=_num(d.get("num_seeds")),
         total_uploaded_bytes=_num(d.get("uploaded")),
         seeding_time_seconds=_num(d.get("seeding_time")),
     )

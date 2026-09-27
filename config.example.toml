@@ -28,9 +28,15 @@ disk_safety_margin_bytes = 1073741824
 # max_active_downloads = 3
 # max_concurrent_moves = 3
 # Stall timeout (seconds) for a VPS2 SSD download with zero progress.
-# 0 = disabled (default); set e.g. 3600 to park visibly-stuck downloads
-# back in DOWNLOADING for retry instead of failing them.
-# download_stall_timeout_seconds = 0
+# Default 7200: a download with no byte of progress for 2h parks back in
+# DOWNLOADING for retry; 0 = wait forever (a tracker-deleted release then
+# pins a download slot until manual intervention). Any progress resets
+# the window, so slow-but-alive swarms are never touched.
+# download_stall_timeout_seconds = 7200
+# Consecutive no-progress windows before the row fails terminally (frees
+# its slot + pages Telegram). A window with any progress resets the
+# count. Tracker-deleted releases fail fast via tracker messages anyway.
+# download_max_stall_parks = 3
 # Preferred-copy grace (seconds): a NEW row from a private non-download
 # indexer holds this long before locking its download, so a
 # download-indexer copy of the same content dropped/discovered moments

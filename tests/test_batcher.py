@@ -362,6 +362,359 @@ async def test_wait_for_completion_waits_when_bytes_missing_on_disk(tmp_path):
     assert calls["n"] == 2
 
 
+def test_classify_tracker_message():
+    """Tracker verdicts: deleted vs auth vs healthy."""
+    from racing_sync.coordinator_errors import classify_tracker_message
+    assert classify_tracker_message("Unregistered torrent") == "unregistered"
+    assert classify_tracker_message("Torrent has been DELETED") == "unregistered"
+    assert classify_tracker_message("unknown torrent in tracker") == "unregistered"
+    assert classify_tracker_message("truncated passkey error") == "auth"
+    assert classify_tracker_message("Not authorized") == "auth"
+    assert classify_tracker_message("Working") is None
+    assert classify_tracker_message("") is None
+    assert classify_tracker_message(None) is None
+
+
+@pytest.mark.anyio
+async def test_wait_for_completion_raises_on_unregistered_tracker(tmp_path):
+    """A tracker-deleted release aborts the wait instead of stalling."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.state import TorrentState
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.coordinator_errors import UnregisteredTorrentError
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.cfg = MagicMock()
+    coord.cfg.general.dest_poll_interval = 0.01
+    coord.cfg.general.download_stall_timeout_seconds = 0
+    coord.cfg.dest.save_path = tmp_path
+
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
+        hash="dead1", name="Dead.Show", size_bytes=1000, progress=0.1,
+        state="downloading", category="racing", save_path="/tmp"))
+    coord.dest_client.get_tracker_messages = AsyncMock(
+        return_value=["Unregistered torrent"])
+
+    ts = TorrentState(source_infohash="dead1", source_name="Dead.Show",
+                      save_path=str(tmp_path))
+    with pytest.raises(UnregisteredTorrentError, match="tracker unregistered"):
+        await coord._wait_for_completion(ts)
+    coord.dest_client.get_tracker_messages.assert_awaited()
+
+
+@pytest.mark.anyio
+async def test_wait_for_completion_raises_on_missing_files(tmp_path):
+    """SSD-wiped files fail fast instead of polling a hopeless torrent."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.state import TorrentState
+    from racing_sync.clients.abstract import Torrent
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.cfg = MagicMock()
+    coord.cfg.general.dest_poll_interval = 0.01
+    coord.cfg.general.download_stall_timeout_seconds = 0
+    coord.cfg.dest.save_path = tmp_path
+
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
+        hash="gone1", name="Gone.Show", size_bytes=1000, progress=0.4,
+        state="missingFiles", category="racing", save_path="/tmp"))
+
+    ts = TorrentState(source_infohash="gone1", source_name="Gone.Show",
+                      save_path=str(tmp_path))
+    with pytest.raises(RuntimeError, match="missingFiles"):
+        await coord._wait_for_completion(ts)
+
+
+def _downloading_pair(tmp_path):
+    """Coordinator with real store + one DOWNLOADING row (single flow)."""
+    from racing_sync.state import State, StateStore, TorrentState
+    store = StateStore(tmp_path / "state.db")
+    coord = make_coordinator()
+    coord.store = store
+    coord._stop = False
+    coord.cfg = MagicMock()
+    coord.cfg.general.dest_poll_interval = 0.01
+    coord.cfg.general.download_stall_timeout_seconds = 3600
+    coord.cfg.general.download_max_stall_parks = 3
+    coord.cfg.dest.save_path = tmp_path
+    ts = TorrentState(
+        source_infohash="dl1", source_name="DL Show",
+        dest_infohash="dl1", total_bytes=1000, state=State.DOWNLOADING,
+        batches_total=1, batch_index=0,
+    )
+    store.upsert(ts)
+    return coord, store, ts
+
+
+@pytest.mark.anyio
+async def test_do_downloading_fails_unregistered_row(tmp_path):
+    """Tracker-deleted DOWNLOADING row: FAILED + SSD freed + Telegram paged."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.state import State
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.coordinator_errors import TRACKER_UNREGISTERED_MARKER
+
+    coord, store, ts = _downloading_pair(tmp_path)
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
+        hash="dl1", name="DL Show", size_bytes=1000, progress=0.2,
+        state="downloading", category="racing", save_path="/tmp"))
+    coord.dest_client.get_tracker_messages = AsyncMock(
+        return_value=["Unregistered torrent"])
+    coord._ssd_release = AsyncMock()
+    coord._notify_telegram = AsyncMock()
+
+    await coord._do_downloading(ts)
+
+    row = store.get("dl1")
+    assert row.state == State.FAILED
+    assert TRACKER_UNREGISTERED_MARKER in (row.last_error or "")
+    coord._ssd_release.assert_awaited_once_with("dl1")
+    coord._notify_telegram.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_do_downloading_parks_then_fails_stalled_row(tmp_path):
+    """No-progress windows park; exceeding max parks fails the row."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.state import State
+    from racing_sync.clients.abstract import Torrent
+
+    coord, store, ts = _downloading_pair(tmp_path)
+    coord.cfg.general.download_stall_timeout_seconds = 0.05
+    coord.cfg.general.download_max_stall_parks = 1
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
+        hash="dl1", name="DL Show", size_bytes=1000, progress=0.2,
+        state="stalledDL", category="racing", save_path="/tmp"))
+    coord.dest_client.get_tracker_messages = AsyncMock(return_value=["Working"])
+    coord._ssd_release = AsyncMock()
+    coord._notify_telegram = AsyncMock()
+
+    await coord._do_downloading(ts)  # park 1/1
+    assert store.get("dl1").state == State.DOWNLOADING
+    await coord._do_downloading(store.get("dl1"))  # exceeds max -> FAILED
+    row = store.get("dl1")
+    assert row.state == State.FAILED
+    assert "no progress" in (row.last_error or "")
+    coord._notify_telegram.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_do_downloading_progress_resets_stall_parks(tmp_path):
+    """A trickling swarm never trips the terminal stall counter."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.state import State
+    from racing_sync.clients.abstract import Torrent
+
+    coord, store, ts = _downloading_pair(tmp_path)
+    coord.cfg.general.download_stall_timeout_seconds = 0.05
+    coord.cfg.general.download_max_stall_parks = 1
+    prog = {"v": 0.2}
+    coord.dest_client = MagicMock()
+
+    async def _trickle(_h):
+        return Torrent(
+            hash="dl1", name="DL Show", size_bytes=1000, progress=prog["v"],
+            state="downloading", category="racing", save_path="/tmp")
+
+    coord.dest_client.get_torrent = AsyncMock(side_effect=_trickle)
+    coord.dest_client.get_tracker_messages = AsyncMock(return_value=[])
+    coord._ssd_release = AsyncMock()
+    coord._notify_telegram = AsyncMock()
+
+    await coord._do_downloading(ts)  # park at 20%
+    assert store.get("dl1").state == State.DOWNLOADING
+    prog["v"] = 0.4  # bytes arrived between windows: counter resets
+    await coord._do_downloading(store.get("dl1"))  # parks again, not FAILED
+    assert store.get("dl1").state == State.DOWNLOADING
+    coord._notify_telegram.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_tracker_death_cascades_to_same_tracker_siblings(tmp_path):
+    """WAITING/QUEUED rows for the same tracker release fail together.
+
+    A same-name sibling from a DIFFERENT tracker keeps its swarm and is
+    spared; settled rows (DONE) are untouched; corpse dest entries are
+    removed with files.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.state import State
+    from racing_sync.clients.abstract import Torrent
+
+    coord, store, ts = _downloading_pair(tmp_path)
+    ts.source_name = "Dead.Show.S01E01"
+    ts.total_bytes = 1000
+    ts.source_tracker = "https://tracker-a.example/announce/KEY"
+    ts.source_announce_url = ts.source_tracker
+    store.upsert(ts)
+
+    def _row(h, name, state, tracker, size=1000):
+        from racing_sync.state import TorrentState
+        r = TorrentState(
+            source_infohash=h, source_name=name, total_bytes=size,
+            state=state, batches_total=1,
+            source_tracker=tracker, source_announce_url=tracker,
+        )
+        if state == State.QUEUED:
+            r.dest_infohash = h
+        store.upsert(r)
+        return r
+
+    _row("w1", "Dead.Show.S01E01", State.WAITING_INDEXER,
+         "https://tracker-a.example/announce/OTHERKEY")
+    _row("q1", "Dead.Show.S01E01", State.QUEUED,
+         "https://tracker-a.example/announce/KEY")
+    _row("b1", "Dead.Show.S01E01", State.WAITING_INDEXER,
+         "https://tracker-b.example/announce/KEY")  # other tracker: spared
+    _row("d1", "Dead.Show.S01E01", State.DONE,
+         "https://tracker-a.example/announce/KEY")  # settled: untouched
+    # Same tracker but a DIFFERENT release (file2): the tracker itself is
+    # fine, only file1's torrent entry was deleted — must never cascade.
+    _row("f2", "Other.Show.S01E01", State.WAITING_INDEXER,
+         "https://tracker-a.example/announce/KEY")
+    # Spared cross-tracker sibling sits on a far-future retry timer: the
+    # cascade must wake it early so it proceeds next tick.
+    import datetime as dt
+    _b1 = store.get("b1")
+    _b1.indexer_next_retry_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5)
+    store.upsert(_b1)
+
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
+        hash="dl1", name="Dead.Show.S01E01", size_bytes=1000, progress=0.2,
+        state="downloading", category="racing", save_path="/tmp"))
+    coord.dest_client.get_tracker_messages = AsyncMock(
+        return_value=["Unregistered torrent"])
+    coord.dest_client.delete = AsyncMock()
+    coord._ssd_release = AsyncMock()
+    coord._notify_telegram = AsyncMock()
+
+    await coord._do_downloading(store.get("dl1"))
+
+    assert store.get("dl1").state == State.FAILED
+    assert store.get("w1").state == State.FAILED
+    assert store.get("q1").state == State.FAILED
+    assert "tracker unregistered" in (store.get("w1").last_error or "")
+    # Different tracker + settled rows survive.
+    assert store.get("b1").state == State.WAITING_INDEXER
+    assert store.get("d1").state == State.DONE
+    # Same tracker, different release: untouched (tracker is healthy).
+    assert store.get("f2").state == State.WAITING_INDEXER
+    # ... but the spared sibling was woken early (timer pulled to now).
+    import datetime as dt
+    _b1t = store.get("b1").indexer_next_retry_at
+    assert _b1t is not None
+    assert (_b1t - dt.datetime.now(dt.timezone.utc)).total_seconds() < 60
+    # Corpse dest entries (leader + admitted QUEUED sibling) wiped with files.
+    deleted = {c.args[0] for c in coord.dest_client.delete.await_args_list}
+    assert {"dl1", "q1"} <= deleted
+    for c in coord.dest_client.delete.await_args_list:
+        assert c.kwargs.get("delete_files") is True
+
+
+@pytest.mark.anyio
+async def test_cascade_wakes_best_ranked_sibling_first(tmp_path):
+    """Succession prefers public over sacrificial copies.
+
+    Two surviving WAITING_INDEXER siblings (public nyaa + private): only
+    the public one is woken early. The sacrificial copy keeps its timer —
+    once the public copy admits, it defers via _inflight_same_content;
+    if the public copy can't proceed, the sacrificial one follows on its
+    own schedule. No ratio burned on the wrong swarm.
+    """
+    import datetime as dt
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.state import State
+    from racing_sync.clients.abstract import Torrent
+
+    coord, store, ts = _downloading_pair(tmp_path)
+    coord.cfg.prowlarr.enabled = False
+    ts.source_name = "Rank.Show.S01E01"
+    ts.total_bytes = 1000
+    ts.source_tracker = "https://tracker-a.example/announce/KEY"
+    ts.source_announce_url = ts.source_tracker
+    store.upsert(ts)
+
+    def _waiter(h, tracker):
+        from racing_sync.state import TorrentState
+        r = TorrentState(
+            source_infohash=h, source_name="Rank.Show.S01E01",
+            total_bytes=1000, state=State.WAITING_INDEXER,
+            source_tracker=tracker, source_announce_url=tracker,
+            indexer_next_retry_at=(
+                dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5)),
+        )
+        store.upsert(r)
+
+    _waiter("pub1", "https://nyaa.tracker.wf/announce")
+    _waiter("priv1", "https://tracker-c.example/announce/KEY")
+
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
+        hash="dl1", name="Rank.Show.S01E01", size_bytes=1000, progress=0.2,
+        state="downloading", category="racing", save_path="/tmp"))
+    coord.dest_client.get_tracker_messages = AsyncMock(
+        return_value=["Unregistered torrent"])
+    coord.dest_client.delete = AsyncMock()
+    coord._ssd_release = AsyncMock()
+    coord._notify_telegram = AsyncMock()
+
+    await coord._do_downloading(store.get("dl1"))
+
+    assert store.get("dl1").state == State.FAILED
+    _pubt = store.get("pub1").indexer_next_retry_at
+    assert _pubt is not None
+    assert (_pubt - dt.datetime.now(dt.timezone.utc)).total_seconds() < 60
+    _privt = store.get("priv1").indexer_next_retry_at
+    assert _privt is not None
+    assert (_privt - dt.datetime.now(dt.timezone.utc)).total_seconds() > 3600
+    for c in coord.dest_client.delete.await_args_list:
+        assert c.kwargs.get("delete_files") is True
+
+
+@pytest.mark.anyio
+async def test_tracker_auth_death_does_not_cascade(tmp_path):
+    """Revoked passkey fails only its own row (fixable account-side)."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.state import State, TorrentState
+    from racing_sync.clients.abstract import Torrent
+
+    coord, store, ts = _downloading_pair(tmp_path)
+    ts.source_name = "Auth.Show.S01E01"
+    ts.total_bytes = 1000
+    ts.source_tracker = "https://tracker-a.example/announce/KEY"
+    ts.source_announce_url = ts.source_tracker
+    store.upsert(ts)
+    store.upsert(TorrentState(
+        source_infohash="w2", source_name="Auth.Show.S01E01",
+        total_bytes=1000, state=State.WAITING_INDEXER,
+        source_tracker="https://tracker-a.example/announce/KEY",
+        source_announce_url="https://tracker-a.example/announce/KEY",
+    ))
+
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
+        hash="dl1", name="Auth.Show.S01E01", size_bytes=1000, progress=0.2,
+        state="downloading", category="racing", save_path="/tmp"))
+    coord.dest_client.get_tracker_messages = AsyncMock(
+        return_value=["truncated passkey error"])
+    coord.dest_client.delete = AsyncMock()
+    coord._ssd_release = AsyncMock()
+    coord._notify_telegram = AsyncMock()
+
+    await coord._do_downloading(store.get("dl1"))
+
+    assert store.get("dl1").state == State.FAILED
+    assert "tracker auth" in (store.get("dl1").last_error or "")
+    assert store.get("w2").state == State.WAITING_INDEXER
+
+
 @pytest.mark.anyio
 async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
     """Piece-boundary partials must never reach the remote via the sweep.
