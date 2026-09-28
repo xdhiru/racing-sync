@@ -358,7 +358,11 @@ def test_disk_free_bytes_falls_back_to_df_without_statvfs():
     exporter._sftp = mock_sftp
 
     assert exporter.disk_free_bytes("/home/user/.config/deluge/state") == 4000000 * 1024
-    mock_client.exec_command.assert_called_once()
+    # stat-first, df fallback: the df-shaped reply fails stat parsing, then
+    # the same reply parses as df.
+    assert mock_client.exec_command.call_count == 2
+    assert mock_client.exec_command.call_args_list[0].args[0].startswith("stat -f")
+    assert mock_client.exec_command.call_args_list[1].args[0].startswith("df -kP")
 
 
 def test_disk_free_bytes_none_on_unparsable_df():
@@ -529,5 +533,7 @@ def test_disk_free_via_df_wedge_returns_none():
     m._client.exec_command.return_value = (MagicMock(), stdout, MagicMock())
 
     assert m._disk_free_via_df("/data") is None
-    stdout.channel.settimeout.assert_called_once_with(10.0)
+    # stat attempt + df fallback attempt, each with a bounded channel read.
+    assert stdout.channel.settimeout.call_count == 2
+    stdout.channel.settimeout.assert_called_with(10.0)
 

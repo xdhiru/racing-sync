@@ -399,7 +399,7 @@ class _SFTPConnection:
                     try:
                         st = statvfs(path)
                     except Exception as e:
-                        log.warning("sftp statvfs %s failed: %s", path, e)
+                        log.warning("sftp statvfs %s failed: %r", path, e)
                         return self._disk_free_via_df(path)
                     return self._free_from_statvfs(st)
                 return self._disk_free_via_df(path)
@@ -421,12 +421,38 @@ class _SFTPConnection:
             return None
 
     def _disk_free_via_df(self, path: str) -> int | None:
-        """Parse `df -kP` (POSIX, 1K blocks) for free bytes. Caller holds the lock."""
+        """Free bytes for one path (POSIX). Caller holds the lock.
+
+        Prefers `stat -f` on the exact path: plain `df` walks every
+        mounted filesystem, so one wedged FUSE mount stalls ALL probes
+        (the regular 10s channel timeouts seen in production). Falls
+        back to `df -kP` parsing when stat is unavailable.
+        """
         import shlex
 
         client = self._client
         if client is None:
             return None
+        try:
+            _, stdout, _ = client.exec_command(
+                f"stat -f -c '%a %S' {shlex.quote(path)}")
+            try:
+                stdout.channel.settimeout(10.0)
+            except Exception:
+                pass
+            out = stdout.read()
+            if out is None:
+                return None
+            parts = out.decode("utf-8", errors="replace").split()
+            if len(parts) >= 2:
+                try:
+                    return int(parts[0]) * int(parts[1])
+                except (TypeError, ValueError):
+                    pass
+        except Exception as e:  # noqa: BLE001
+            # socket.timeout stringifies to "" — log the repr so the
+            # next diagnosis isn't another empty "failed: " line.
+            log.warning("ssh stat %s failed: %r", path, e)
         try:
             _, stdout, _ = client.exec_command(f"df -kP {shlex.quote(path)}")
             # Bound the read at the channel: a wedged transport must not
@@ -440,8 +466,8 @@ class _SFTPConnection:
             if out is None:
                 return None
             out = out.decode("utf-8", errors="replace")
-        except Exception as e:
-            log.warning("ssh df %s failed: %s", path, e)
+        except Exception as e:  # noqa: BLE001
+            log.warning("ssh df %s failed: %r", path, e)
             return None
         try:
             lines = [ln.split() for ln in out.splitlines() if ln.split()]
