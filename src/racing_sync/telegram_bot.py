@@ -978,6 +978,30 @@ _VPS1_FREE_TTL_S = 300.0
 # --------------------------------------------------------------------------- #
 
 
+def _make_bot(token: str) -> Bot:
+    """Bot with generous HTTP timeouts for slow routes to api.telegram.org.
+
+    PTB defaults (5s connect/read) turn a merely slow route into a storm
+    of `Timed out` edit/send failures — every 15s active refresh plus each
+    detail card. 30s reads comfortably cover 10s long-poll get_updates
+    and large edits; a truly dead route still fails fast enough for the
+    retry-next-interval paths. Falls back to a default Bot if the
+    request class is unavailable (older PTB).
+    """
+    try:
+        from telegram.request import HTTPXRequest
+        _req = HTTPXRequest(
+            connect_timeout=10.0,
+            read_timeout=30.0,
+            write_timeout=20.0,
+            pool_timeout=10.0,
+        )
+        return Bot(token=token, request=_req)
+    except Exception as e:  # noqa: BLE001
+        log.debug("telegram custom HTTP timeouts unavailable (%s); using defaults", e)
+        return Bot(token=token)
+
+
 class TelegramBot:
     def __init__(self, cfg: TelegramConfig, coord: Coordinator,
                  store: StateStore):
@@ -1034,7 +1058,7 @@ class TelegramBot:
             return
         self._stopped = False
         bot_token = self._cfg.bot_token.get_secret_value() if hasattr(self._cfg.bot_token, "get_secret_value") else str(self._cfg.bot_token)
-        self._bot = Bot(token=bot_token)
+        self._bot = _make_bot(bot_token)
         # Per-torrent message queue: bounded so a torrent flood doesn't
         # grow memory. 256 is well over what any operator needs.
         self._detail_queue = asyncio.Queue(maxsize=256)
