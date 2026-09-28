@@ -232,8 +232,10 @@ PUBLIC_TRACKER_HOSTS = (
 #: Every `cross_seed_source` value a watch-dir row can carry. The label is
 #: overwritten with the chosen SSD flavour past NEW, so origin checks must
 #: accept the whole set (plus the persisted blob dir), never one label.
+#: "telegram" rows are .torrent files received in chat via /add —
+#: same pipeline as a manual drop (label only records the origin).
 WATCH_ORIGIN_LABELS = frozenset({
-    "watch-dir", "public-watch-dir", "public-prowlarr",
+    "watch-dir", "public-watch-dir", "public-prowlarr", "telegram",
 })
 
 #: Watch rows holding SSD/client presence lock election ownership.

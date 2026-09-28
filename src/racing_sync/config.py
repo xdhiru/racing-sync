@@ -408,6 +408,13 @@ class TelegramConfig(BaseModel):
     # 0 = disabled (edit in place, today's behavior). Values 1-4 are
     # clamped to 5 to respect Telegram rate limits.
     active_repost_interval_seconds: int = Field(default=0, ge=0)
+    # Delete an ingested .torrent file message from chat once /add has
+    # consumed it (default true). .torrent files embed the sender's
+    # per-user tracker passkey — leaving them in chat history leaks it to
+    # every current and future chat member. Needs message-deletion rights
+    # (admin in groups); without them the bot warns and the operator
+    # removes the file by hand. False keeps the file message in place.
+    delete_processed_torrent: bool = True
     @model_validator(mode="after")
     def _validate(self) -> "TelegramConfig":
         if self.enabled:

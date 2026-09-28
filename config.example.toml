@@ -331,6 +331,12 @@ outbound_rate = 5
 # Pending pickers additionally bind to the commanding user.
 # Example: admin_user_ids = [123456789]
 admin_user_ids = []
+# Delete an ingested .torrent file message from chat once /add has
+# consumed it (default true). .torrent files embed your per-user tracker
+# passkey — leaving them in history leaks it to every chat member.
+# Needs message-deletion rights (admin in groups); without them the bot
+# warns and you remove the file by hand.
+delete_processed_torrent = true
 
 # ============================================================
 # Centralized logging (HTTP sink)
