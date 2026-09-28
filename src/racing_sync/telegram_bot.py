@@ -499,6 +499,12 @@ FETCH_CMD_RE = re.compile(r"^/fetch_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 #: download now instead of waiting out its preferred-copy grace.
 PREFER_CMD_RE = re.compile(r"^/prefer_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
+#: `/add` — ingest the .torrent file in the replied-to message (or in
+#: the same message when sent with /add as caption) as a Telegram
+#: origin drop, processed like a watch-dir file. Optional `@bot` suffix,
+#: extra trailing text ignored.
+ADD_CMD_RE = re.compile(r"^/add(?:@[\w_]+)?\b")
+
 
 def _cancel_command(infohash: str) -> str:
     """Copy-pasteable cancel command for one task (short hash)."""
@@ -1783,12 +1789,13 @@ class TelegramBot:
     async def _handle_chat_message(self, message: Any) -> None:
         """Execute `/cancel_` / `/fetch_` / `/prefer_` commands in the chat.
 
-        Group commands (stable content ids from the active list) open
-        member-choice buttons; full hashes and legacy hash prefixes act
-        directly. Cancel always ends at a keep/delete question — nothing
-        is wiped without an explicit choice. Anything else is ignored.
-        Only the configured chat/user may send commands.
-        """
+    Group commands (stable content ids from the active list) open
+    member-choice buttons; full hashes and legacy hash prefixes act
+    directly. Cancel always ends at a keep/delete question — nothing
+    is wiped without an explicit choice. `/add` ingests a replied-to
+    (or captioned) .torrent file as a Telegram-origin drop. Anything
+    else is ignored. Only the configured chat/user may send commands.
+    """
         try:
             chat = getattr(message, "chat", None)
             chat_id = getattr(chat, "id", None)
@@ -1817,7 +1824,8 @@ class TelegramBot:
             m_fetch = FETCH_CMD_RE.match(text)
             m_prefer = PREFER_CMD_RE.match(text)
             m_cancel = CANCEL_CMD_RE.match(text)
-            if not m_fetch and not m_prefer and not m_cancel:
+            m_add = ADD_CMD_RE.match(text)
+            if not m_fetch and not m_prefer and not m_cancel and not m_add:
                 return
             if not _tg_actor_allowed(self._cfg, user_id):
                 try:
@@ -1825,6 +1833,9 @@ class TelegramBot:
                                       reply_to=message)
                 except Exception:
                     pass
+                return
+            if m_add:
+                await self._process_document_command(message)
                 return
             if m_fetch:
                 await self._start_group_command(
@@ -1838,6 +1849,212 @@ class TelegramBot:
                 "cancel", m_cancel.group(1), message)
         except Exception as e:  # noqa: BLE001
             log.debug("chat command handling failed: %s", e)
+
+    async def _process_document_command(self, message: Any) -> None:
+        """Ingest a .torrent file from chat as a Telegram-origin drop.
+
+        Accepts `/add` replying to a document message, or a document
+        sent with `/add` as its caption. The bytes flow through the
+        same validation as watch-dir drops (suffix, size cap, bencode
+        parse) and become a NEW row with `cross_seed_source="telegram"`,
+        which the coordinator processes like a manual drop. After a
+        successful ingest (or a duplicate of one) the file message is
+        deleted best-effort: .torrent files embed the sender's tracker
+        passkey and must not linger in chat history.
+        """
+        try:
+            from .coordinator_content import announce_domain
+        except Exception:
+            announce_domain = lambda _u: ""  # noqa: E731
+        try:
+            from .watchdir import MAX_TORRENT_BYTES, _bencoded_info_hash
+        except Exception:
+            await self._reply("Action failed: torrent parser unavailable.",
+                              reply_to=message)
+            return
+        # Resolve the document: same-message caption case first, else the
+        # replied-to message.
+        doc = getattr(message, "document", None)
+        doc_msg = message
+        if doc is None:
+            try:
+                _replied = getattr(message, "reply_to_message", None)
+            except Exception:
+                _replied = None
+            if _replied is not None:
+                doc = getattr(_replied, "document", None)
+                if doc is not None:
+                    doc_msg = _replied
+        if doc is None:
+            await self._reply(
+                "Reply to a .torrent file with /add (or send the file "
+                "with /add as its caption).", reply_to=message)
+            return
+        try:
+            fname = str(getattr(doc, "file_name", "") or "")
+            fsize = getattr(doc, "file_size", None)
+            file_id = getattr(doc, "file_id", None)
+        except Exception:
+            fname, fsize, file_id = "", None, None
+        if not fname.lower().endswith(".torrent"):
+            await self._reply(
+                f"Not a .torrent file ({fname or 'unnamed'}); nothing ingested.",
+                reply_to=message)
+            return
+        try:
+            fsize_int = int(fsize) if fsize is not None else -1
+        except (TypeError, ValueError):
+            fsize_int = -1
+        if fsize_int < 0 or fsize_int > MAX_TORRENT_BYTES:
+            await self._reply(
+                f"Refusing {fname or 'file'} ({fsize_int} B; cap "
+                f"{MAX_TORRENT_BYTES} B).", reply_to=message)
+            return
+        if not file_id:
+            await self._reply(
+                "Could not read the file from Telegram; try re-sending it.",
+                reply_to=message)
+            return
+        bot = getattr(self, "_bot", None)
+        if bot is None:
+            await self._reply("Action failed: bot not attached.",
+                              reply_to=message)
+            return
+        try:
+            tg_file = await bot.get_file(file_id)
+        except Exception as e:  # noqa: BLE001
+            await self._reply(
+                f"Could not download the file from Telegram ({e}); "
+                "try re-sending it.", reply_to=message)
+            return
+        try:
+            _dl = tg_file.download_to_memory()
+            if asyncio.iscoroutine(_dl):
+                _dl = await _dl
+            data = bytes(_dl.getvalue() if hasattr(_dl, "getvalue") else _dl)
+        except Exception as e:  # noqa: BLE001
+            await self._reply(
+                f"Could not download the file from Telegram ({e}); "
+                "try re-sending it.", reply_to=message)
+            return
+        if not data or len(data) > MAX_TORRENT_BYTES + 1:
+            await self._reply(
+                "Refusing: file is empty or over the size cap.",
+                reply_to=message)
+            return
+        try:
+            infohash, name, size, announce = _bencoded_info_hash(data)
+        except Exception as e:  # noqa: BLE001
+            await self._reply(f"Not a valid .torrent file ({e}).",
+                              reply_to=message)
+            return
+        store = getattr(self, "_store", None)
+        if store is None:
+            await self._reply("Action failed: bot not attached.",
+                              reply_to=message)
+            return
+        try:
+            existing = store.get(infohash, include_blob=False)
+        except Exception:
+            existing = None
+        try:
+            _ignored = store.is_ignored(infohash) is True
+        except Exception:
+            _ignored = False
+        try:
+            _domain = announce_domain(announce)
+        except Exception:
+            _domain = ""
+        if existing is not None:
+            try:
+                _st = existing.state.value
+            except Exception:
+                _st = "tracked"
+            await self._reply(f"Already tracked: {name} ({_st}).",
+                              reply_to=message)
+            await self._delete_chat_file(message, doc_msg)
+            return
+        if _ignored:
+            await self._reply(
+                f"Ignored (previously cancelled): {name}. Nothing ingested.",
+                reply_to=message)
+            await self._delete_chat_file(message, doc_msg)
+            return
+        try:
+            ts = TorrentState(
+                source_infohash=infohash,
+                source_name=name,
+                total_bytes=size,
+                source_announce_url=announce or "",
+                source_tracker=announce or "",
+                cross_seed_blob=bytes(data),
+                cross_seed_source="telegram",
+                state=State.NEW,
+            )
+        except Exception as e:  # noqa: BLE001
+            await self._reply(f"Action failed: could not track {name} ({e}).",
+                              reply_to=message)
+            return
+        try:
+            ts._blob = bytes(data)
+        except Exception:
+            pass
+        try:
+            store.upsert(ts)
+        except Exception as e:  # noqa: BLE001
+            await self._reply(f"Action failed: could not track {name} ({e}).",
+                              reply_to=message)
+            return
+        try:
+            log.info("telegram ingest: %s (%s, %d bytes) announce=%s",
+                     name[:60], infohash[:10], size, _domain or "?")
+        except Exception:
+            pass
+        await self._reply(
+            f"Queued {name} ({_size_compact(size)}) via "
+            f"{_domain or 'unknown tracker'} — downloading on VPS2, "
+            "watch its card.", reply_to=message)
+        await self._delete_chat_file(message, doc_msg)
+
+    async def _delete_chat_file(self, cmd_msg: Any, doc_msg: Any) -> None:
+        """Delete the ingested .torrent message (passkey hygiene).
+
+        .torrent files embed the sender's per-user tracker passkey: once
+        the bytes are consumed the chat copy is pure liability. Best-effort
+        — the bot needs message-deletion rights (admin in groups); on
+        failure the operator is nudged to remove it by hand. Skipped
+        entirely when `telegram.delete_processed_torrent` is false.
+        """
+        try:
+            if not bool(getattr(getattr(self, "_cfg", None),
+                                "delete_processed_torrent", True)):
+                return
+        except Exception:
+            pass
+        try:
+            bot = getattr(self, "_bot", None)
+            _target = doc_msg if doc_msg is not None else cmd_msg
+            chat = getattr(_target, "chat", None)
+            chat_id = getattr(chat, "id", None)
+            if chat_id is None:
+                chat_id = getattr(getattr(self, "_cfg", None), "chat_id", None)
+            msg_id = getattr(_target, "message_id", None)
+            if bot is None or not isinstance(msg_id, int):
+                raise RuntimeError("cannot delete chat file")
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception as e:  # noqa: BLE001
+            try:
+                log.warning("telegram could not delete .torrent message: %s", e)
+            except Exception:
+                pass
+            try:
+                await self._reply(
+                    "Note: could not delete the .torrent from chat (the bot "
+                    "needs message-deletion rights) — please remove it by "
+                    "hand; it contains your tracker passkey.",
+                    reply_to=cmd_msg)
+            except Exception:
+                pass
 
     async def _reply(self, text: str, reply_to: Any = None) -> None:
         """Best-effort chat reply (plain text, no markdown to parse)."""
