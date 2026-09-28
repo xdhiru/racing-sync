@@ -69,7 +69,9 @@ class CleanupMixin:
                 timeout=15.0,
             )
         except Exception as e:  # noqa: BLE001
-            log.warning("cleanup: VPS1 free-space probe failed: %s", e)
+            # repr, not str: bare TimeoutError (the 15s budget above)
+            # stringifies to "" and hides the diagnosis.
+            log.warning("cleanup: VPS1 free-space probe failed: %r", e)
             return None
         return free if isinstance(free, int) and free >= 0 else None
 
