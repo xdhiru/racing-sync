@@ -5431,7 +5431,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         on advance, visible via API/DB meanwhile) and consecutive parks for
         the same row escalate from WARNING to ERROR so a gate that never
         passes (unverifiable pause, 0-transfer rclone, short bytes) can't
-        idle silently as plain "MOVING" forever. Raises AbandonedError when
+        idle silently as plain "MOVING" forever — but the ERROR repeats at
+        most every 20th park (first at 5) so an expected settle wait (slow
+        per-file progress flush) doesn't scream every 30s for hours.
+        Raises AbandonedError when
         the row was forgotten mid-flight (callers unwind quietly instead of
         resurrecting it via the park upsert).
         """
@@ -5461,9 +5464,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             self.store.upsert(ts)
         except Exception:  # noqa: BLE001
             pass
-        if n >= 5:
+        if n >= 5 and (n == 5 or (n - 5) % 20 == 0):
             log.error(
                 "MOVING stalled for %s: %s (parked %dx, still retrying)",
+                ts.source_name[:60], reason, n,
+            )
+        elif n >= 5:
+            log.debug(
+                "MOVING still parked for %s: %s (parked %dx)",
                 ts.source_name[:60], reason, n,
             )
         else:
@@ -5959,6 +5967,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     local_real = None
                 if local_real is None or local_real not in verified_paths:
                     detail = ""
+                    _full_on_disk = False
                     try:
                         for f in cls_files:
                             joined = _safe_ssd_join(src_dir, f.name or "")
@@ -5974,11 +5983,54 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                                         f" (file progress={(f.progress or 0.0) * 100:.1f}%, "
                                         f"on-disk {max(on_disk, 0)}/{f.size_bytes or 0} B)"
                                     )
+                                    try:
+                                        _full_on_disk = (
+                                            on_disk == (f.size_bytes or 0)
+                                            and (f.size_bytes or 0) > 0
+                                        )
+                                    except (TypeError, ValueError):
+                                        _full_on_disk = False
                                     break
                             except OSError:
                                 continue
                     except Exception:
                         detail = ""
+                    # Settle recheck (once per row): full bytes on disk with
+                    # 0/low client progress right after a fast download is
+                    # qB's per-file reporting lag, not missing data — a
+                    # force recheck flushes piece states so the file verifies
+                    # next tick instead of ~25 min later. Skipped when the
+                    # file is short (genuinely incomplete: resume path below).
+                    if _full_on_disk:
+                        try:
+                            _rc = getattr(self, "_settle_rechecked", None)
+                            if not isinstance(_rc, set):
+                                _rc = set()
+                                self._settle_rechecked = _rc  # type: ignore[attr-defined]
+                        except Exception:
+                            _rc = set()
+                        try:
+                            _rh = (ts.source_infohash or "").lower()
+                        except Exception:
+                            _rh = ""
+                        if _rh and _rh not in _rc:
+                            try:
+                                await self.dest_client.recheck(h)
+                                log.info(
+                                    "rechecking %s to flush lagging per-file progress",
+                                    ts.source_name[:60],
+                                )
+                            except Exception as e:  # noqa: BLE001
+                                log.debug(
+                                    "settle recheck failed for %s: %s",
+                                    ts.source_name[:60], e,
+                                )
+                            try:
+                                _rc.add(_rh)
+                                if len(_rc) > 5000:
+                                    _rc.clear()
+                            except Exception:
+                                pass
                     resumed = False
                     try:
                         await self.dest_client.resume(h)
@@ -5988,7 +6040,18 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                             "could not resume incomplete single file %s for %s: %s",
                             cls.single_file, ts.source_name, e,
                         )
-                    log.warning(
+                    try:
+                        _mp = getattr(self, "_moving_parks", None)
+                        _pn = int((_mp.get((ts.source_infohash or "").lower(), 0) or 0)) \
+                            if isinstance(_mp, dict) else 0
+                    except Exception:
+                        _pn = 0
+                    # This signature (full bytes, unverified) is an expected
+                    # settle wait, not an incident: warn the first handful of
+                    # parks, then debug — ERROR escalation stays in
+                    # _park_moving for genuinely stuck rows.
+                    _log = log.warning if _pn < 8 else log.debug
+                    _log(
                         "single file %s for %s is not client-verified complete%s; "
                         "%s staying in MOVING without moving",
                         cls.single_file, ts.source_name, detail,
