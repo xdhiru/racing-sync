@@ -978,6 +978,23 @@ _VPS1_FREE_TTL_S = 300.0
 # --------------------------------------------------------------------------- #
 
 
+def _is_transient_tg_error(e: BaseException) -> bool:
+    """True for timeout/network-class Telegram failures (worth a retry)."""
+    try:
+        if isinstance(e, (TimedOut, NetworkError)):
+            return True
+    except Exception:
+        pass
+    try:
+        m = str(e).lower()
+    except Exception:
+        return False
+    return any(s in m for s in (
+        "timed out", "timeout", "connection", "temporary",
+        "service unavailable", "bad gateway", "gateway timeout",
+    ))
+
+
 def _make_bot(token: str) -> Bot:
     """Bot with generous HTTP timeouts for slow routes to api.telegram.org.
 
@@ -1324,6 +1341,70 @@ class TelegramBot:
             self._sent_state_map()[infohash] = state_value
         except Exception:
             pass
+        # A delivered card clears both its failure streak and any
+        # terminal-retry record — future drift re-arms from zero.
+        try:
+            _streak = getattr(self, "_detail_fail_streak", None)
+            if isinstance(_streak, dict):
+                _streak.pop(infohash, None)
+        except Exception:
+            pass
+        try:
+            _tmap = getattr(self, "_detail_terminal_retry", None)
+            if isinstance(_tmap, dict):
+                _tmap.pop(infohash, None)
+        except Exception:
+            pass
+
+    def _detail_terminal_map(self) -> dict[str, int]:
+        """DONE/FAILED hashes whose final card update died transiently.
+
+        Settled rows leave the active list, so the per-refresh stale-card
+        net never sees them — without this map a single timeout on the
+        DONE edit freezes the card at MOVING/RE_ADDING forever. Values
+        are refresh-driven retry counts (bounded by the caller).
+        """
+        try:
+            m = getattr(self, "_detail_terminal_retry", None)
+            if not isinstance(m, dict):
+                m = {}
+                self._detail_terminal_retry = m
+            if len(m) > 50:
+                for k in list(m.keys())[: len(m) - 50]:
+                    m.pop(k, None)
+            return m
+        except Exception:
+            return {}
+
+    def _note_detail_transient_failure(
+        self, infohash: str, progress: float | None, state_value: str,
+    ) -> None:
+        """Requeue a transiently-failed card update (bounded fast retries).
+
+        Immediate requeues are capped per hash (streak of 5): on a dead
+        route the worker would otherwise hot-loop one card. Inflight rows
+        keep healing via the refresh stale-net; terminal rows via the
+        terminal map recorded here.
+        """
+        try:
+            streak = getattr(self, "_detail_fail_streak", None)
+            if not isinstance(streak, dict):
+                streak = {}
+                self._detail_fail_streak = streak
+            n = int(streak.get(infohash, 0) or 0) + 1
+            streak[infohash] = n
+            if len(streak) > 500:
+                for k in list(streak.keys())[: len(streak) - 500]:
+                    streak.pop(k, None)
+        except Exception:
+            n = 6
+        try:
+            if state_value in ("done", "failed"):
+                self._detail_terminal_map().setdefault(infohash, 0)
+        except Exception:
+            pass
+        if n <= 5:
+            self._enqueue_detail(infohash, progress)
 
     async def _send_one_detail(self, infohash: str,
                                progress: float | None) -> None:
@@ -1435,6 +1516,17 @@ class TelegramBot:
                         self._mark_detail_sent(infohash, state_value)
                     elif await _retry_rate_limited(e):
                         return
+                    elif _is_transient_tg_error(e):
+                        # Timeout on EDIT: the row may settle (DONE/FAILED)
+                        # right after, leaving the active list where the
+                        # stale net could retry it — record + requeue
+                        # bounded instead of dropping the update.
+                        log.warning(
+                            "telegram detail edit timed out for %s (%s); requeueing",
+                            infohash[:10], e,
+                        )
+                        self._note_detail_transient_failure(
+                            infohash, progress, state_value)
                     else:
                         log.warning(
                             "telegram detail edit failed for %s: %s",
@@ -1450,7 +1542,7 @@ class TelegramBot:
             self._enqueue_detail(infohash, progress)
         except (TimedOut, NetworkError) as e:
             log.warning("telegram detail send timed out (%s); will retry next interval", e)
-            self._enqueue_detail(infohash, progress)
+            self._note_detail_transient_failure(infohash, progress, state_value)
         except TelegramError as e:
             if await _retry_rate_limited(e):
                 return
@@ -2812,6 +2904,42 @@ class TelegramBot:
                     continue
         except Exception:
             pass
+        # Terminal-card net: DONE/FAILED rows leave the active list above,
+        # so a single timeout on the final update would freeze the card at
+        # MOVING/RE_ADDING forever. Retry recorded hashes a bounded number
+        # of refreshes (one enqueue per refresh — no hot loop).
+        try:
+            _tmap = self._detail_terminal_map()
+            _tstore = getattr(self, "_store", None)
+            if _tmap and _tstore is not None:
+                _sent2 = self._sent_state_map()
+                for _hh, _n in list(_tmap.items()):
+                    try:
+                        _rr = await asyncio.to_thread(_tstore.get, _hh)
+                    except Exception:
+                        _rr = None
+                    try:
+                        _rv = _rr.state.value if _rr is not None else ""
+                    except Exception:
+                        _rv = ""
+                    if (_rr is None or _rv not in ("done", "failed")
+                            or _sent2.get(_hh) == _rv):
+                        _tmap.pop(_hh, None)
+                        continue
+                    try:
+                        _ni = int(_n or 0)
+                    except (TypeError, ValueError):
+                        _ni = 0
+                    if _ni >= 15:
+                        _tmap.pop(_hh, None)
+                        log.debug(
+                            "terminal card retry budget spent for %s; "
+                            "leaving card as-is", _hh[:10])
+                        continue
+                    _tmap[_hh] = _ni + 1
+                    self._enqueue_detail(_hh, None)
+        except Exception:
+            pass
         # Deferral notes for waiting rows (watch election notes plus
         # same-content in-flight deferrals) so the list explains itself.
         # Best-effort: never break the refresh over a note.
@@ -2869,6 +2997,46 @@ class TelegramBot:
         repost_due = self._repost_due()
         if cache_key == self._last_active_cache and self._active_msg_id is not None and not repost_due:
             return
+        # Uncertain-send guard: a send that timed out may still have landed
+        # (lost response looks identical) — resending blindly next tick mints
+        # detached duplicates with unknowable ids that no cleanup can ever
+        # delete. While the text is unchanged, assume it landed and skip;
+        # any text change (or due repost) sends again. First-send-ever (no
+        # known id at all) keeps retrying: nothing could have landed before,
+        # and the chat needs its active message.
+        try:
+            _ukey = getattr(self, "_send_uncertain_key", None)
+        except Exception:
+            _ukey = None
+        if _ukey is not None and not repost_due:
+            try:
+                _same_key = (_ukey == cache_key)
+            except Exception:
+                _same_key = False
+            if _same_key:
+                try:
+                    _have_id = (self._active_msg_id is not None
+                                or (self._prev_active_msg_id or 0) > 0)
+                except Exception:
+                    _have_id = False
+                if _have_id:
+                    return
+                # No known message at all: the chat may genuinely lack the
+                # active message (first send truly failed). Retry throttled
+                # — every 4th tick — so a landed-but-unconfirmed send mints
+                # at most one duplicate per minute instead of one per
+                # interval, while a real failure still appears within
+                # minutes. Attempt branches below reset the counter.
+                try:
+                    _n = int(getattr(self, "_send_uncertain_skips", 0) or 0) + 1
+                except Exception:
+                    _n = 1
+                try:
+                    self._send_uncertain_skips = _n
+                except Exception:
+                    pass
+                if _n < 4:
+                    return
 
         if self._active_msg_id is None:
             # Clean up previously known message if any to prevent duplicate message spam
@@ -2882,6 +3050,9 @@ class TelegramBot:
                     pass
                 self._prev_active_msg_id = None
 
+            # New send attempt supersedes any uncertain earlier send.
+            self._send_uncertain_key = None
+            self._send_uncertain_skips = 0
             try:
                 sent = await self._bot.send_message(
                     self._cfg.chat_id, text,
@@ -2898,6 +3069,11 @@ class TelegramBot:
                 )
             except (TimedOut, NetworkError) as e:
                 log.warning("active-tasks send timed out (%s); will retry next interval", e)
+                # Assume landed (lost responses look identical) — the
+                # uncertain-send guard above skips blind resends while the
+                # text is unchanged, bounding detached duplicates.
+                self._last_active_cache = cache_key
+                self._send_uncertain_key = cache_key
             except TelegramError as e:
                 if _is_parse_error(e):
                     try:
@@ -2915,9 +3091,15 @@ class TelegramBot:
                         )
                     except Exception as e2:
                         log.warning("active-tasks plain send failed: %s", e2)
+                        if _is_transient_tg_error(e2):
+                            self._last_active_cache = cache_key
+                            self._send_uncertain_key = cache_key
                 else:
                     log.warning("active-tasks send failed: %s", e)
         else:
+            # New edit attempt supersedes any uncertain earlier send.
+            self._send_uncertain_key = None
+            self._send_uncertain_skips = 0
             if repost_due:
                 await self._repost_active_message(text, keyboard, cache_key)
                 return
@@ -3075,7 +3257,13 @@ class TelegramBot:
         except (RetryAfter, TimedOut, NetworkError) as e:
             log.warning("active-tasks repost skipped due to temporary network/rate-limit (%s); will retry next interval", e)
             self._active_msg_id = None
-            self._last_active_cache = None
+            # Assume the resend landed (lost responses look identical) so
+            # the uncertain-send guard skips blind resends while the text
+            # is unchanged. A previous id always existed here (repost only
+            # runs with a known id), so the first-send-ever exception in
+            # the guard never triggers from this path.
+            self._last_active_cache = cache_key
+            self._send_uncertain_key = cache_key
             await asyncio.to_thread(
                 self._store.set_meta, "telegram_active_msg_id", ""
             )
@@ -3083,7 +3271,12 @@ class TelegramBot:
         except TelegramError as e:
             log.warning("active-tasks repost failed (%s); will resend next interval", e)
             self._active_msg_id = None
-            self._last_active_cache = None
+            if _is_transient_tg_error(e):
+                self._last_active_cache = cache_key
+                self._send_uncertain_key = cache_key
+            else:
+                self._last_active_cache = None
+                self._send_uncertain_key = None
             await asyncio.to_thread(
                 self._store.set_meta, "telegram_active_msg_id", ""
             )
@@ -3093,6 +3286,7 @@ class TelegramBot:
         self._last_active_cache = cache_key
         self._last_repost_monotonic = time.monotonic()
         self._note_outbound(sent.message_id)
+        self._send_uncertain_key = None
         await asyncio.to_thread(
             self._store.set_meta, "telegram_active_msg_id", str(sent.message_id)
         )
