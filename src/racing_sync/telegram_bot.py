@@ -32,7 +32,7 @@ import time
 from typing import Any
 from urllib.parse import urlsplit
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 
@@ -995,6 +995,34 @@ def _is_transient_tg_error(e: BaseException) -> bool:
     ))
 
 
+def _bot_command_menu() -> list:
+    """Commands shown in the chat's `/` popup (Bot API menu).
+
+    Only `/add` takes no argument (it acts on the replied-to or captioned
+    .torrent); the pickers need IDs the operator won't know, so they stay
+    unlisted to keep the menu to the one actionable entry.
+    """
+    try:
+        return [BotCommand(
+            "add",
+            "Add a .torrent file — reply to it with /add, or send it with "
+            "/add as caption",
+        )]
+    except Exception:
+        return []
+
+
+async def _publish_bot_commands(bot: object) -> None:
+    """Best-effort setMyCommands: never break startup over the menu."""
+    try:
+        setter = getattr(bot, "set_my_commands", None)
+        if not callable(setter):
+            return
+        await setter(_bot_command_menu())
+    except Exception as e:  # noqa: BLE001
+        log.debug("telegram command menu publish failed: %s", e)
+
+
 def _make_bot(token: str) -> Bot:
     """Bot with generous HTTP timeouts for slow routes to api.telegram.org.
 
@@ -1076,6 +1104,12 @@ class TelegramBot:
         self._stopped = False
         bot_token = self._cfg.bot_token.get_secret_value() if hasattr(self._cfg.bot_token, "get_secret_value") else str(self._cfg.bot_token)
         self._bot = _make_bot(bot_token)
+        # Publish the / menu (best-effort): operators discover /add by
+        # typing `/` instead of remembering the exact shape.
+        try:
+            await _publish_bot_commands(self._bot)
+        except Exception:
+            pass
         # Per-torrent message queue: bounded so a torrent flood doesn't
         # grow memory. 256 is well over what any operator needs.
         self._detail_queue = asyncio.Queue(maxsize=256)

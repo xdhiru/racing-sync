@@ -325,3 +325,102 @@ async def test_process_delete_disabled_keeps_file(tmp_path):
         assert all("remove it by hand" not in t for t in texts)
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_bot_command_menu_lists_add(tmp_path):
+    """The `/` popup offers /add with a self-explaining description."""
+    from racing_sync.telegram_bot import _bot_command_menu
+
+    cmds = _bot_command_menu()
+    assert [(c.command, c.description) for c in cmds] == [(
+        "add",
+        "Add a .torrent file \u2014 reply to it with /add, or send it "
+        "with /add as caption",
+    )]
+
+
+@pytest.mark.anyio
+async def test_start_publishes_command_menu(tmp_path):
+    """Bot startup registers the `/` menu; publish is best-effort."""
+    import asyncio
+    from unittest.mock import MagicMock, patch
+    from racing_sync.telegram_bot import TelegramBot
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        bot = object.__new__(TelegramBot)
+        bot._cfg = SimpleNamespace(
+            chat_id="1", page_size=5, enabled=True,
+            bot_token="123:ABC", status_update_interval=15)
+        bot._store = store
+        bot._callback_times = {}
+        bot._current_page = 0
+        bot._detail_cache = {}
+        bot._detail_sent_state = {}
+        bot._active_msg_id = None
+        bot._prev_active_msg_id = None
+        bot._last_active_cache = None
+        bot._detail_queue = asyncio.Queue()
+        bot._coord = MagicMock()
+        bot._coord.live_progress_map = MagicMock(return_value={})
+        fake = SimpleNamespace(
+            send_message=AsyncMock(
+                return_value=SimpleNamespace(message_id=3)),
+            set_my_commands=AsyncMock(),
+            get_updates=AsyncMock(return_value=[]),
+        )
+        with patch("racing_sync.telegram_bot._make_bot",
+                   return_value=fake):
+            await bot.start()
+        try:
+            cmds = fake.set_my_commands.await_args.args[0]
+            assert [c.command for c in cmds] == ["add"]
+        finally:
+            try:
+                await bot.stop()
+            except Exception:
+                pass
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_start_survives_menu_publish_failure(tmp_path):
+    """No setMyCommands support (or API down): startup still succeeds."""
+    import asyncio
+    from unittest.mock import MagicMock, patch
+    from racing_sync.telegram_bot import TelegramBot
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        bot = object.__new__(TelegramBot)
+        bot._cfg = SimpleNamespace(
+            chat_id="1", page_size=5, enabled=True,
+            bot_token="123:ABC", status_update_interval=15)
+        bot._store = store
+        bot._callback_times = {}
+        bot._current_page = 0
+        bot._detail_cache = {}
+        bot._detail_sent_state = {}
+        bot._active_msg_id = None
+        bot._prev_active_msg_id = None
+        bot._last_active_cache = None
+        bot._detail_queue = asyncio.Queue()
+        bot._coord = MagicMock()
+        bot._coord.live_progress_map = MagicMock(return_value={})
+        fake = SimpleNamespace(
+            send_message=AsyncMock(
+                return_value=SimpleNamespace(message_id=3)),
+            get_updates=AsyncMock(return_value=[]),
+        )
+        with patch("racing_sync.telegram_bot._make_bot",
+                   return_value=fake):
+            await bot.start()  # must not raise
+        assert bot._bot is fake
+        try:
+            await bot.stop()
+        except Exception:
+            pass
+    finally:
+        store.close()
