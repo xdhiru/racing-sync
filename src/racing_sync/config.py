@@ -892,6 +892,11 @@ class CleanupConfig(BaseModel):
     delete_files: bool = True
     # Max content groups deleted per janitor run.
     per_run_cap: int = Field(default=10, ge=1)
+    # Settle pause (seconds) between real group deletions in one run.
+    # Back-to-back remove_torrent(+data) calls spike daemon teardown and
+    # disk unlinking, which has coincided with autobrr injection timeouts
+    # on the same Deluge daemon. 0 = delete back-to-back (old behavior).
+    delete_stagger_seconds: float = Field(default=25.0, ge=0)
     # Seconds between janitor runs.
     janitor_interval_seconds: int = Field(default=3600, ge=300)
 
