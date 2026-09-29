@@ -182,7 +182,14 @@ class CleanupMixin:
             candidates.sort(key=lambda c: (c[0], -c[1]))
 
         deleted = 0
-        for _, _, ts, group in candidates:
+        try:
+            _stagger = float(getattr(cfg, "delete_stagger_seconds", 25) or 0)
+        except (TypeError, ValueError):
+            _stagger = 25.0
+        if _stagger < 0:
+            _stagger = 0.0
+        _cands = list(candidates)
+        for _i, (_, _, ts, group) in enumerate(_cands):
             # The cap bounds real deletions; dry-run logs every candidate
             # so rehearsal output matches a live run instead of stopping
             # at phantom counts.
@@ -196,6 +203,19 @@ class CleanupMixin:
                 continue
             if ok:
                 deleted += 1
+                _more = (not dry_run and _i + 1 < len(_cands)
+                         and deleted < cap)
+                if _more and _stagger > 0:
+                    # Spread load: back-to-back remove_torrent(+data) calls
+                    # spike deluged teardown + disk unlinking, which has
+                    # coincided with autobrr injection timeouts on the same
+                    # daemon. A short settle pause between groups costs
+                    # nothing (hourly cadence) and keeps the daemon
+                    # responsive. Cancellation propagates (shutdown).
+                    try:
+                        await asyncio.sleep(_stagger)
+                    except asyncio.CancelledError:
+                        raise
         log.info("cleanup janitor: %s %d content group(s)%s",
                  "would delete" if dry_run else "deleted",
                  deleted, f" (cap {cap})" if deleted >= cap else "")
