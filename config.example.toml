@@ -3,10 +3,14 @@
 # ============================================================
 
 [general]
-# Polling interval (seconds) for source client (VPS1)
-source_poll_interval = 60
-# Polling interval (seconds) for destination client (VPS2)
-dest_poll_interval = 30
+# Polling interval (seconds) for source client (VPS1). Higher = fewer
+# full Deluge scans (kinder to autobrr sharing the daemon), at the cost
+# of later racing-release discovery.
+source_poll_interval = 75
+# Polling interval (seconds) for destination client (VPS2). Higher = less
+# worker-spawn churn and sparser progress polls; admissions, wakeups and
+# janitor run on their own schedules and are unaffected.
+dest_poll_interval = 60
 # Per-RPC timeout budget (seconds) for client calls (qB/Deluge, Prowlarr,
 # SFTP): a hung peer degrades one operation into park-and-retry instead of
 # wedging a worker or the tick.
@@ -478,7 +482,7 @@ pause_public_torrents_on_fuse = true
 #   end:    after max_age (counted from the first attempt, so the grace
 #           shifts the deadline by up to its own length), FAILED — or the
 #           racing-torrent fallback below when enabled.
-prowlarr_retry_interval_seconds = 1800   # 30 minutes
+prowlarr_retry_interval_seconds = 900    # 15 minutes
 prowlarr_max_age_seconds        = 86400  # 24 hours
 # When true, a private torrent with no Prowlarr hit after prowlarr_max_age_seconds
 # uses the racing client's own .torrent for the SSD download instead of FAILED.
@@ -549,7 +553,7 @@ protected_patterns = []
 delete_files = true
 # Max content groups deleted per janitor run + seconds between runs.
 per_run_cap = 10
-janitor_interval_seconds = 3600
+janitor_interval_seconds = 1800
 # Settle delay after (re)start before the first janitor run may delete.
 # A minutes-long reboot for an upgrade must not trigger an immediate run.
 # 0 disables (run as soon as the hourly cadence allows).
