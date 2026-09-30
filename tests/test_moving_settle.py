@@ -508,3 +508,67 @@ async def test_check_absolute_cap_despite_progress(tmp_path):
         assert "exceeded" in (row.last_error or "")
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_recheck_serialized_across_rows(tmp_path):
+    """One settle recheck in flight: the second row waits its turn."""
+    from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, StateStore, TorrentState
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    def _row(h, name):
+        ssd = tmp_path / "ssd"
+        ssd.mkdir(exist_ok=True)
+        (ssd / name).write_bytes(b"x" * 500)
+        files = [TorrentFile(name=name, size_bytes=500, progress=0.5,
+                             priority=1)]
+        coord = make_coordinator()
+        coord._stop = False
+        coord.cfg = MagicMock()
+        coord.cfg.dest.save_path = ssd
+        coord.cfg.ssd.path = ssd
+        coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+        coord.cfg.rclone.remote.default = "remote:media"
+        coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+        coord.cfg.rclone.fuse.mount = ssd / "fuse"
+        coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+        coord.cfg.rclone.batch_move_extra_flags = []
+        coord.store = store
+        coord.dest_client = AsyncMock()
+        coord.dest_client.get_torrent_files = AsyncMock(return_value=files)
+        coord._rclone_move = AsyncMock()
+        ts = TorrentState(
+            source_infohash=h, source_name=name.rsplit(".", 1)[0],
+            dest_infohash=h, save_path=str(ssd),
+            classification_kind="movie",
+            batches_total=1, batch_index=0, state=State.MOVING)
+        store.upsert(ts)
+        return coord
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _row("a" * 40, "A.mkv")
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock):
+            await coord._do_moving(store.get("a" * 40))
+        assert coord.dest_client.recheck.await_count == 1
+        assert coord._recheck_in_flight[0] == "a" * 40
+
+        # Second row, same tick window: defers, no second recheck storm.
+        coord2 = _row("b" * 40, "B.mkv")
+        coord2._recheck_in_flight = coord._recheck_in_flight
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock):
+            await coord2._do_moving(store.get("b" * 40))
+        assert store.get("b" * 40).state == State.MOVING
+        coord2.dest_client.recheck.assert_not_called()
+
+        # Stale holder (over 30 min old): takeover allowed.
+        coord2._recheck_in_flight[1] -= 2000.0
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock):
+            await coord2._do_moving(store.get("b" * 40))
+        assert coord2.dest_client.recheck.await_count == 1
+    finally:
+        store.close()

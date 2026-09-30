@@ -222,6 +222,15 @@ def _rclone_fake(ssd: Path, fuse: Path, calls: list):
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src_file, dst)
             src_file.unlink()
+            # A real move changes the world instantly; the shared fuse-stat
+            # cache (60s TTL) would otherwise serve the pre-move absence to
+            # the gate a millisecond later. Production moves take minutes
+            # (TTL expires naturally); instant fakes must invalidate.
+            try:
+                from racing_sync.coordinator_paths import fuse_stat_invalidate
+                fuse_stat_invalidate(dst)
+            except Exception:
+                pass
 
     return _move
 
