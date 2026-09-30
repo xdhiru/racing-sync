@@ -65,6 +65,7 @@ from .coordinator_errors import (
     RcloneTransientError,
     TRACKER_AUTH_MARKER,
     TRACKER_UNREGISTERED_MARKER,
+    TorrentCheckingError,
     UnregisteredTorrentError,
     WebUIUnresponsiveError,
     classify_tracker_message,
@@ -99,6 +100,7 @@ __all__ = [
     "LiveItem",
     "RcloneTransientError",
     "SourceDecision",
+    "TorrentCheckingError",
     "UnregisteredTorrentError",
     "WebUIUnresponsiveError",
     "_NOT_VISIBLE_DETAIL",
@@ -4369,7 +4371,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         Re-reads the entry after each pause RPC: without verification a
         resume in the gap (auto-manage, operator) leaves qB writing while
         rclone moves. A failed verification read still counts the pause
-        itself as success.
+        itself as success. A hash-checking entry short-circuits immediately
+        (no pause storm against an in-progress check): callers wait it out
+        via TorrentCheckingError instead of fighting it.
         """
         err: Exception | None = None
         for attempt in range(3):
@@ -4383,6 +4387,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     state = getattr(cur, "state", "") if cur is not None else ""
                     if cur is None or self._client_reports_paused(state):
                         return True, None
+                    try:
+                        _slow = str(state or "").lower().startswith("check")
+                    except Exception:
+                        _slow = False
+                    if _slow:
+                        # Hash check in flight (e.g. our settle recheck on
+                        # slow storage): pausing further can't help and the
+                        # move must wait for it — signal, don't retry.
+                        # Check-fraction rides along for the watchdog.
+                        try:
+                            _prog = float(getattr(cur, "progress", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            _prog = 0.0
+                        return False, TorrentCheckingError(
+                            f"client is hash-checking ({state}); waiting it out",
+                            client_state=str(state),
+                            progress=_prog,
+                        )
                     err = RuntimeError(f"client still reports state={state!r} after pause")
                 except Exception:
                     return True, None
@@ -4432,6 +4454,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         parking. Tolerates concurrent forget (abandoned row unwinds).
         """
         log.error("failing download for %s: %s", ts.source_name[:60], error[:200])
+        try:
+            _csd = getattr(self, "_checking_track", None)
+            if isinstance(_csd, dict):
+                _csd.pop((ts.source_infohash or "").lower(), None)
+        except Exception:
+            pass
         try:
             await self._ssd_release(ts.source_infohash)
         except Exception:
@@ -4858,6 +4886,21 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     if hasattr(self, "dest_client"):
                         paused_ok, pause_err = await self._pause_verified(h)
                         if not paused_ok:
+                            if isinstance(pause_err, TorrentCheckingError):
+                                # Hash check in flight: same wait-it-out as
+                                # the move path, but this worker is mid-batch
+                                # (DOWNLOADING) — park at once instead of
+                                # burning the 5-retry budget in ~25s against
+                                # a check that needs minutes.
+                                log.debug(
+                                    "batch move waiting out client hash check "
+                                    "for %s (%s); parking in DOWNLOADING",
+                                    ts.source_name[:60],
+                                    pause_err.client_state,
+                                )
+                                self.store.upsert(ts)
+                                self._live.pop(h.lower(), None)
+                                return
                             # Never move while qB is still writing — retry
                             # shortly instead of corrupting the remote.
                             # Bound per-tick retries so one wedged torrent
@@ -5423,7 +5466,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
     # ---- state: MOVING ----
 
-    def _park_moving(self, ts: TorrentState, reason: str) -> None:
+    def _park_moving(self, ts: TorrentState, reason: str, quiet: bool = False) -> None:
         """Stay in MOVING for retry next tick, recording WHY (stall diagnosis).
 
         Every _do_moving early return funnels here instead of a bare
@@ -5434,6 +5477,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         idle silently as plain "MOVING" forever — but the ERROR repeats at
         most every 20th park (first at 5) so an expected settle wait (slow
         per-file progress flush) doesn't scream every 30s for hours.
+        `quiet` skips even that (expected waits like an in-flight hash
+        check): debug-level only, counting/upsert identical.
         Raises AbandonedError when
         the row was forgotten mid-flight (callers unwind quietly instead of
         resurrecting it via the park upsert).
@@ -5456,6 +5501,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     parks.pop(_k, None)
         except Exception:
             n = 1
+        if not quiet:
+            # Any other park reason means the row did something besides
+            # checking — reset the check-wait clock (it measures
+            # *continuous* checking only).
+            try:
+                _csd = getattr(self, "_checking_track", None)
+                if isinstance(_csd, dict):
+                    _csd.pop(key, None)
+            except Exception:
+                pass
         try:
             ts.last_error = f"moving parked ({n}x): {reason}"[:500]
         except Exception:
@@ -5464,7 +5519,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             self.store.upsert(ts)
         except Exception:  # noqa: BLE001
             pass
-        if n >= 5 and (n == 5 or (n - 5) % 20 == 0):
+        if quiet:
+            log.debug(
+                "MOVING parked (quiet) for %s: %s (parked %dx)",
+                ts.source_name[:60], reason, n,
+            )
+        elif n >= 5 and (n == 5 or (n - 5) % 20 == 0):
             log.error(
                 "MOVING stalled for %s: %s (parked %dx, still retrying)",
                 ts.source_name[:60], reason, n,
@@ -5511,6 +5571,93 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         except OSError:
             return False
 
+    def _register_checking_park(self, ts: TorrentState,
+                                  progress: float = 0.0) -> str | None:
+        """Record a checking park against the check-progress watchdog.
+
+        A healthy hash check climbs steadily; a wedged one sits still —
+        elapsed time alone can't tell them apart on slow storage, so this
+        tracks the client-reported check fraction instead:
+        - progress advanced since last sighting → window restarts;
+        - progress went backwards → the check restarted → clock restarts;
+        - no advance for `download_check_stall_seconds` (1 hour default,
+          0 disables) → terminal error (caller fails the row);
+        - absolute `download_max_check_wait_seconds` backstops ultra-slow
+          crawls that technically advance.
+        Returns a terminal error string on trip, else None (recording the
+        sighting). Any non-checking park clears the record in _park_moving;
+        settle/fail paths pop it explicitly — a stale record can never nuke
+        a later re-download of the same hash. Shared by the pre-read and
+        pause-gate branches (both observe the same client state).
+        """
+        try:
+            _prog = float(progress or 0.0)
+        except (TypeError, ValueError):
+            _prog = 0.0
+        try:
+            _stall = float(getattr(
+                getattr(self.cfg, "general", None),
+                "download_check_stall_seconds", 1800) or 0)
+        except (TypeError, ValueError):
+            _stall = 1800.0
+        try:
+            _abscap = float(getattr(
+                getattr(self.cfg, "general", None),
+                "download_max_check_wait_seconds", 43200) or 0)
+        except (TypeError, ValueError):
+            _abscap = 43200.0
+        _ckey = (ts.source_infohash or "").lower()
+        _now_m = time.monotonic()
+        _rec = None
+        try:
+            _csd = getattr(self, "_checking_track", None)
+            if not isinstance(_csd, dict):
+                _csd = {}
+                self._checking_track = _csd  # type: ignore[attr-defined]
+            _raw = _csd.get(_ckey)
+            if (isinstance(_raw, (list, tuple)) and len(_raw) == 3
+                    and all(isinstance(v, (int, float))
+                            and not isinstance(v, bool) for v in _raw)):
+                _rec = [float(_raw[0]), float(_raw[1]), float(_raw[2])]
+        except Exception:
+            _csd, _rec = {}, None
+        if _rec is None:
+            try:
+                _csd[_ckey] = [_now_m, _prog, _now_m]
+            except Exception:
+                pass
+            return None
+        _first, _last_p, _last_a = _rec
+        if _prog > _last_p + 1e-9:
+            _rec = [_first, _prog, _now_m]
+        elif _last_p - _prog > 1e-9:
+            # Went backwards: the check restarted from zero — fresh clock.
+            _rec = [_now_m, _prog, _now_m]
+        if _stall > 0 and _now_m - _rec[2] > _stall:
+            try:
+                if isinstance(_csd, dict):
+                    _csd.pop(_ckey, None)
+            except Exception:
+                pass
+            return (f"client hash check made no progress for {int(_stall)}s; "
+                    f"failing for operator attention")
+        if _abscap > 0 and _now_m - _rec[0] > _abscap:
+            try:
+                if isinstance(_csd, dict):
+                    _csd.pop(_ckey, None)
+            except Exception:
+                pass
+            return (f"client hash check exceeded {int(_abscap)}s overall; "
+                    f"failing for operator attention")
+        try:
+            _csd[_ckey] = _rec
+            if isinstance(_csd, dict) and len(_csd) > 5000:
+                for _k in list(_csd.keys())[: len(_csd) - 5000]:
+                    _csd.pop(_k, None)
+        except Exception:
+            pass
+        return None
+
     async def _do_moving(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
         try:
@@ -5555,10 +5702,74 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         # (episodes/single_file/sizes) below.
         branch_kind = pinned_kind if pinned_kind not in ("", "unknown") else cls.kind
 
+        # 0b. Never disturb an in-progress hash check. Pausing aborts it and
+        # the resume below restarts it, which together livelock the check
+        # forever on slow storage (observed: alternating checking/quiet
+        # parks every tick, check never completing). A checking torrent
+        # isn't writing, so there is nothing to pause — park quietly and
+        # let it finish. One cheap state-only list (no files/trackers fan-out).
+        # Bounded by the shared check-wait clock (12h default): a check that
+        # never finishes fails loudly instead of waiting forever.
+        try:
+            _pre = await rpc(
+                self.dest_client.list_torrents(hashes=[h]),
+                getattr(self, "cfg", None), "dest pre-move state")
+            _pre_state = _pre[0].state if _pre else ""
+        except Exception:
+            _pre_state = ""
+        try:
+            _pre_checking = str(_pre_state or "").lower().startswith("check")
+        except Exception:
+            _pre_checking = False
+        if _pre_checking:
+            try:
+                _pre_prog = float(getattr(_pre[0], "progress", 0.0) or 0.0)
+            except (TypeError, ValueError, AttributeError):
+                _pre_prog = 0.0
+            _terminal = self._register_checking_park(ts, _pre_prog)
+            if _terminal is not None:
+                await self._fail_downloading_row(
+                    ts, h, f"{_terminal} ({_pre_state})")
+                return
+            self._park_moving(
+                ts,
+                f"client hash check running ({_pre_state}); "
+                f"waiting it out without touching it",
+                quiet=True,
+            )
+            return
+
         # 1. Pause torrent on VPS2 client BEFORE move begins to stop active seeding from SSD
         log.info("pausing torrent %s on VPS2 client before move", h[:10])
         paused, pause_err = await self._pause_verified(h)
         if not paused:
+            if isinstance(pause_err, TorrentCheckingError):
+                # Hash check in flight (slow storage can take a long while):
+                # the torrent isn't writing, but moving mid-check risks
+                # shipping bytes the check then fails — wait it out quietly
+                # (no pause storm, no recheck pile-on, no error escalation).
+                # The check flushes per-file progress when done and the next
+                # tick moves normally. Bounded by the shared check-wait
+                # clock: a check that never finishes fails loudly instead
+                # of waiting forever.
+                try:
+                    _pe_prog = float(
+                        getattr(pause_err, "progress", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    _pe_prog = 0.0
+                _terminal = self._register_checking_park(ts, _pe_prog)
+                if _terminal is not None:
+                    await self._fail_downloading_row(
+                        ts, h,
+                        f"{_terminal} ({pause_err.client_state})")
+                    return
+                self._park_moving(
+                    ts,
+                    f"client hash check running ({pause_err.client_state}); "
+                    f"waiting it out without moving",
+                    quiet=True,
+                )
+                return
             # Never move while the client is still writing, but don't fail
             # terminally on a transient WebUI hiccup — stay in MOVING so the
             # next tick retries (preserves downloaded bytes on SSD).
@@ -5995,13 +6206,50 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                                 continue
                     except Exception:
                         detail = ""
+                    # Fresh client state (see 0b above): a check started
+                    # since the tick began — or started pre-restart while
+                    # our once-set was wiped — must not be resumed (restarts
+                    # it from zero) or rechecked (resets it). Park quietly.
+                    _check_now = False
+                    _check_state_now = ""
+                    try:
+                        _cur = await rpc(
+                            self.dest_client.list_torrents(hashes=[h]),
+                            getattr(self, "cfg", None),
+                            "dest check-guard state")
+                        if _cur:
+                            _check_state_now = str(
+                                getattr(_cur[0], "state", "") or "")
+                            _check_now = _check_state_now.lower().startswith(
+                                "check")
+                    except Exception:
+                        _check_now = False
+                    if _check_now:
+                        self._park_moving(
+                            ts,
+                            f"client hash check running ({_check_state_now}); "
+                            f"waiting it out without touching it",
+                            quiet=True,
+                        )
+                        return
+                    try:
+                        _rh = (ts.source_infohash or "").lower()
+                    except Exception:
+                        _rh = ""
+                    try:
+                        _rc0 = getattr(self, "_settle_rechecked", None)
+                        _already_rechecked = bool(
+                            _rh and isinstance(_rc0, set) and _rh in _rc0)
+                    except Exception:
+                        _already_rechecked = False
+                    _rechecked_now = False
                     # Settle recheck (once per row): full bytes on disk with
                     # 0/low client progress right after a fast download is
                     # qB's per-file reporting lag, not missing data — a
                     # force recheck flushes piece states so the file verifies
                     # next tick instead of ~25 min later. Skipped when the
                     # file is short (genuinely incomplete: resume path below).
-                    if _full_on_disk:
+                    if _full_on_disk and not _already_rechecked:
                         try:
                             _rc = getattr(self, "_settle_rechecked", None)
                             if not isinstance(_rc, set):
@@ -6009,37 +6257,49 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                                 self._settle_rechecked = _rc  # type: ignore[attr-defined]
                         except Exception:
                             _rc = set()
+                        _recheck_ok = False
                         try:
-                            _rh = (ts.source_infohash or "").lower()
-                        except Exception:
-                            _rh = ""
-                        if _rh and _rh not in _rc:
-                            try:
-                                await self.dest_client.recheck(h)
-                                log.info(
-                                    "rechecking %s to flush lagging per-file progress",
-                                    ts.source_name[:60],
-                                )
-                            except Exception as e:  # noqa: BLE001
-                                log.debug(
-                                    "settle recheck failed for %s: %s",
-                                    ts.source_name[:60], e,
-                                )
+                            await self.dest_client.recheck(h)
+                            log.info(
+                                "rechecking %s to flush lagging per-file progress",
+                                ts.source_name[:60],
+                            )
+                            _recheck_ok = True
+                        except Exception as e:  # noqa: BLE001
+                            log.debug(
+                                "settle recheck failed for %s: %s",
+                                ts.source_name[:60], e,
+                            )
+                        if _recheck_ok:
+                            _rechecked_now = True
                             try:
                                 _rc.add(_rh)
                                 if len(_rc) > 5000:
                                     _rc.clear()
                             except Exception:
                                 pass
-                    resumed = False
-                    try:
-                        await self.dest_client.resume(h)
-                        resumed = True
-                    except Exception as e:  # noqa: BLE001
-                        log.warning(
-                            "could not resume incomplete single file %s for %s: %s",
-                            cls.single_file, ts.source_name, e,
-                        )
+                    if (not _full_on_disk) or (_full_on_disk and _already_rechecked):
+                        # Resume only when it can help: short files needing
+                        # bytes, or full files whose check already ran without
+                        # resolving (possible corruption: refetch). Never
+                        # right after issuing a recheck (it needs a tick to
+                        # start; resume would abort it) and never during one
+                        # (guarded above).
+                        resumed = False
+                        try:
+                            await self.dest_client.resume(h)
+                            resumed = True
+                        except Exception as e:  # noqa: BLE001
+                            log.warning(
+                                "could not resume incomplete single file %s for %s: %s",
+                                cls.single_file, ts.source_name, e,
+                            )
+                        _resume_note = ("resumed to finish downloading,"
+                                        if resumed else "resume failed,")
+                    else:
+                        resumed = False
+                        _resume_note = ("not resumed (bytes present; hash check "
+                                        "will verify),")
                     try:
                         _mp = getattr(self, "_moving_parks", None)
                         _pn = int((_mp.get((ts.source_infohash or "").lower(), 0) or 0)) \
@@ -6055,12 +6315,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         "single file %s for %s is not client-verified complete%s; "
                         "%s staying in MOVING without moving",
                         cls.single_file, ts.source_name, detail,
-                        "resumed to finish downloading," if resumed else "resume failed,",
+                        _resume_note,
                     )
                     self._park_moving(
                         ts,
                         f"single file {cls.single_file} not verified complete{detail}; "
-                        f"{'resumed to finish, ' if resumed else ''}"
+                        f"{_resume_note} "
                         f"staying in MOVING without moving",
                     )
                     return
@@ -6236,6 +6496,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 base_dir=[self.cfg.ssd.path, Path(self.cfg.dest.save_path)],
             )
 
+        try:
+            _csd = getattr(self, "_checking_track", None)
+            if isinstance(_csd, dict):
+                _csd.pop((ts.source_infohash or "").lower(), None)
+        except Exception:
+            pass
         self.transition(ts, State.RE_ADDING)
 
     async def _rclone_move(

@@ -168,6 +168,30 @@ class DownloadStalledError(TimeoutError):
             self.progress = 0.0
 
 
+class TorrentCheckingError(Exception):
+    """The client reports the torrent is hash-checking (checking* state).
+
+    A checking torrent is neither downloading nor paused-verifiable: moves
+    must wait it out (moving mid-check risks shipping bytes the check then
+    fails), pauses must not fight it, and rechecks must not pile on. The
+    client state rides along for log context, plus the check-fraction
+    progress (qB reports verification progress in the progress field) so
+    the watchdog can tell a crawling check from a wedged one.
+    """
+
+    def __init__(self, message: str, *, client_state: str = "",
+                 progress: float = 0.0):
+        super().__init__(message)
+        try:
+            self.client_state = str(client_state or "")
+        except Exception:
+            self.client_state = ""
+        try:
+            self.progress = float(progress or 0.0)
+        except (TypeError, ValueError):
+            self.progress = 0.0
+
+
 # Lowercase substrings of qB tracker `msg` values that mean "this release
 # is gone from the tracker — stop downloading". Matched loosely on purpose
 # (trackers word it many ways); passkey/auth failures are classified
@@ -227,6 +251,7 @@ __all__ = [
     "RcloneTransientError",
     "TRACKER_AUTH_MARKER",
     "TRACKER_UNREGISTERED_MARKER",
+    "TorrentCheckingError",
     "UnregisteredTorrentError",
     "WebUIUnresponsiveError",
     "_WEBUI_RETRY_ERRORS",

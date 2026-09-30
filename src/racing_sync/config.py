@@ -1004,6 +1004,16 @@ class GeneralConfig(BaseModel):
     # the tracker-message check, dead swarms) release their slot. 0/1 =
     # fail on the first stalled window; each window is stall_timeout long.
     download_max_stall_parks: int = Field(default=3, ge=0, le=100)
+    # Max continuous client hash-check wait per MOVING row (seconds) before
+    # failing terminally with a Telegram page. A check that never finishes
+    # (wedged client, stalled storage) would otherwise park the row — and
+    # its SSD bytes — forever. 0 = wait indefinitely (old behavior).
+    download_max_check_wait_seconds: int = Field(default=43200, ge=0)
+    # No-advance window inside a hash check (seconds): the client reports
+    # verification progress, so a healthy-but-slow check keeps resetting
+    # this while a wedged one trips it (default 1 hour, 0 disables, leaving
+    # only the absolute cap above).
+    download_check_stall_seconds: int = Field(default=3600, ge=0)
     # Preferred-copy grace (seconds): a NEW row whose source is private
     # and NOT from a download-target indexer holds (stays NEW) this long
     # before locking the download, giving a download-indexer copy of the

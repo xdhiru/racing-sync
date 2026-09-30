@@ -37,6 +37,13 @@ disk_safety_margin_bytes = 1073741824
 # its slot + pages Telegram). A window with any progress resets the
 # count. Tracker-deleted releases fail fast via tracker messages anyway.
 # download_max_stall_parks = 3
+# Max continuous client hash-check wait per MOVING row (seconds, default
+# 12h) before failing terminally with a Telegram page. 0 = wait forever.
+# download_max_check_wait_seconds = 43200
+# No-advance window inside a hash check (seconds, default 1 hour): a
+# wedged check (progress frozen) fails after this; a slow-but-climbing
+# one keeps resetting it. 0 disables, leaving only the absolute cap.
+# download_check_stall_seconds = 3600
 # Preferred-copy grace (seconds): a NEW row from a private non-download
 # indexer holds this long before locking its download, so a
 # download-indexer copy of the same content dropped/discovered moments
