@@ -2078,10 +2078,21 @@ class TelegramBot:
                 "try re-sending it.", reply_to=message)
             return
         try:
-            _dl = tg_file.download_to_memory()
+            # Pass the buffer explicitly: some PTB versions require the
+            # positional `out` argument (TypeError otherwise), others make
+            # it optional — explicit works on both. Accept bytes, a buffer,
+            # or None (filled buffer) back.
+            import io as _io
+            _buf = _io.BytesIO()
+            _dl = tg_file.download_to_memory(_buf)
             if asyncio.iscoroutine(_dl):
                 _dl = await _dl
-            data = bytes(_dl.getvalue() if hasattr(_dl, "getvalue") else _dl)
+            if isinstance(_dl, (bytes, bytearray)):
+                data = bytes(_dl)
+            elif hasattr(_dl, "getvalue"):
+                data = bytes(_dl.getvalue())
+            else:
+                data = bytes(_buf.getvalue())
         except Exception as e:  # noqa: BLE001
             await self._reply(
                 f"Could not download the file from Telegram ({e}); "
