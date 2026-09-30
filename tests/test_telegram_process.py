@@ -424,3 +424,31 @@ async def test_start_survives_menu_publish_failure(tmp_path):
             pass
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_process_old_ptb_file_shape(tmp_path):
+    """PTB versions with required download_to_memory(out) still ingest."""
+    import io as _io
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        blob = _torrent_bytes()
+        infohash, _, _, _ = _bencoded_info_hash(blob)
+
+        class _OldFile:
+            async def download_to_memory(self, out):
+                out.write(blob)
+                return out
+
+        bot = _bot(store)
+        bot._bot.get_file = AsyncMock(return_value=_OldFile())
+
+        await bot._handle_chat_message(_cmd(reply_to=_doc(mid=50)))
+
+        assert store.get(infohash) is not None
+        bot._bot.delete_message.assert_awaited_once_with(
+            chat_id="1", message_id=50)
+        assert any("Queued" in t for t in _sent_texts(bot))
+    finally:
+        store.close()
