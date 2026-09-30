@@ -938,8 +938,12 @@ def test_blob_fully_remote_three_valued(tmp_path: Path):
     # Present but short on fuse: real work remains.
     (fuse_dir / "Remote.Movie.1080p.mkv").write_bytes(b"m" * 1999)
     assert asyncio.run(_check(raw)) is False
-    # Full size: fully remote.
+    # Full size: fully remote (invalidate the 60s shared fuse-stat cache:
+    # production reads through rclone's even coarser dir-cache, but tests
+    # assert instantaneous visibility).
+    from racing_sync.coordinator_paths import fuse_stat_invalidate
     (fuse_dir / "Remote.Movie.1080p.mkv").write_bytes(b"m" * 2000)
+    fuse_stat_invalidate(fuse_dir / "Remote.Movie.1080p.mkv")
     assert asyncio.run(_check(raw)) is True
 
 

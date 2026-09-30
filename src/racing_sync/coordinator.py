@@ -72,7 +72,7 @@ from .coordinator_errors import (
     is_fatal_os_error,
     is_retryable_client_error,
 )
-from .coordinator_paths import _safe_ssd_join, _watch_cross_seed_dir
+from .coordinator_paths import _safe_ssd_join, _watch_cross_seed_dir, fuse_stat_cached
 from .coordinator_picker import pick_ssd_source_for_racing
 from .coordinator_ssd import SSDLedgerMixin
 from .io_bounds import chunked, offload, rpc
@@ -4004,8 +4004,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 if joined is None:
                     continue
                 try:
-                    actual = joined.stat().st_size
-                except OSError:
+                    exists, actual = fuse_stat_cached(joined)
+                except Exception:
+                    continue
+                if not exists:
                     continue
                 want = size or 0
                 if actual == want:
@@ -4458,6 +4460,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             _csd = getattr(self, "_checking_track", None)
             if isinstance(_csd, dict):
                 _csd.pop((ts.source_infohash or "").lower(), None)
+        except Exception:
+            pass
+        try:
+            _ri = getattr(self, "_recheck_in_flight", None)
+            if (isinstance(_ri, (list, tuple)) and len(_ri) == 2
+                    and _ri[0] == (ts.source_infohash or "").lower()):
+                self._recheck_in_flight = None
         except Exception:
             pass
         try:
@@ -6243,13 +6252,31 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     except Exception:
                         _already_rechecked = False
                     _rechecked_now = False
-                    # Settle recheck (once per row): full bytes on disk with
-                    # 0/low client progress right after a fast download is
-                    # qB's per-file reporting lag, not missing data — a
-                    # force recheck flushes piece states so the file verifies
-                    # next tick instead of ~25 min later. Skipped when the
-                    # file is short (genuinely incomplete: resume path below).
+                    # Settle recheck (once per row, one in flight globally):
+                    # full bytes on disk with 0/low client progress right
+                    # after a fast download is qB's per-file reporting lag,
+                    # not missing data — a force recheck flushes piece states
+                    # so the file verifies next tick instead of ~25 min
+                    # later. Skipped when the file is short (genuinely
+                    # incomplete: resume path below). Globally serialized:
+                    # concurrent rechecks pile onto the same starved disk
+                    # pool that the fuse seeders already saturate — a waiter
+                    # parks quietly and takes its turn (30-min stale holder
+                    # takeover bounds a wedged holder).
+                    _holder_blocked = False
                     if _full_on_disk and not _already_rechecked:
+                        try:
+                            _now_m2 = time.monotonic()
+                            _holder = getattr(self, "_recheck_in_flight", None)
+                            if (isinstance(_holder, (list, tuple))
+                                    and len(_holder) == 2
+                                    and _holder[0] and _holder[0] != _rh
+                                    and isinstance(_holder[1], (int, float))
+                                    and _now_m2 - float(_holder[1]) < 1800.0):
+                                _holder_blocked = True
+                        except Exception:
+                            _holder_blocked = False
+                    if _full_on_disk and not _already_rechecked and not _holder_blocked:
                         try:
                             _rc = getattr(self, "_settle_rechecked", None)
                             if not isinstance(_rc, set):
@@ -6278,7 +6305,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                                     _rc.clear()
                             except Exception:
                                 pass
-                    if (not _full_on_disk) or (_full_on_disk and _already_rechecked):
+                            try:
+                                self._recheck_in_flight = [  # type: ignore[attr-defined]
+                                    _rh, time.monotonic()]
+                            except Exception:
+                                pass
+                    if _holder_blocked:
+                        # Another row's check is running: issuing ours would
+                        # pile onto the same starved pool, and resuming
+                        # could abort theirs. Park quietly; the holder
+                        # clears on settle (or ages out after 30 min).
+                        resumed = False
+                        _resume_note = ("not resumed (another row's hash check "
+                                        "in flight; waiting turn),")
+                    elif (not _full_on_disk) or (_full_on_disk and _already_rechecked):
                         # Resume only when it can help: short files needing
                         # bytes, or full files whose check already ran without
                         # resolving (possible corruption: refetch). Never
@@ -6500,6 +6540,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             _csd = getattr(self, "_checking_track", None)
             if isinstance(_csd, dict):
                 _csd.pop((ts.source_infohash or "").lower(), None)
+        except Exception:
+            pass
+        try:
+            _ri = getattr(self, "_recheck_in_flight", None)
+            if (isinstance(_ri, (list, tuple)) and len(_ri) == 2
+                    and _ri[0] == (ts.source_infohash or "").lower()):
+                self._recheck_in_flight = None
         except Exception:
             pass
         self.transition(ts, State.RE_ADDING)
@@ -7632,9 +7679,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
         def _check() -> list[str]:
             try:
-                mount.stat()
-            except OSError as e:
-                return [f"<mount unavailable: {mount} ({e})>"]
+                mount_ok, _ = fuse_stat_cached(mount)
+            except Exception:
+                mount_ok = False
+            if not mount_ok:
+                return [f"<mount unavailable: {mount}>"]
             missing: list[str] = []
             for name, want in files:
                 target = _safe_ssd_join(mount, name or "")
@@ -7642,8 +7691,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     missing.append(name)
                     continue
                 try:
-                    actual = target.stat().st_size
-                except OSError:
+                    exists, actual = fuse_stat_cached(target)
+                except Exception:
+                    missing.append(name)
+                    continue
+                if not exists:
                     missing.append(name)
                     continue
                 if want and actual != want:
