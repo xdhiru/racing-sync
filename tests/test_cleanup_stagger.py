@@ -48,6 +48,9 @@ def _stagger_pair(tmp_path: Path, db_name: str = "s.db", **cleanup_over):
     base = dict(enabled=True, dry_run=False)
     base.update(cleanup_over)
     cfg.cleanup = CleanupConfig(**base)
+    # Gate timing is covered by dedicated tests; these drive deletion
+    # staggering, so opt out of the startup delay.
+    cfg.cleanup.janitor_startup_delay_seconds = 0.0
     coord = make_coordinator()
     coord.cfg = cfg
     coord.store = store
