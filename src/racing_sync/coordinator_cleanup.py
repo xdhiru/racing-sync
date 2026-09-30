@@ -75,23 +75,95 @@ class CleanupMixin:
             return None
         return free if isinstance(free, int) and free >= 0 else None
 
+    _CLEANUP_LAST_RUN_META_KEY = "cleanup_last_run"
+
+    def _cleanup_last_run_wall(self) -> float:
+        """Wall-clock epoch of the last janitor run (persisted across restarts).
+
+        Memory first, store_meta second (a restart wipes memory but keeps
+        the DB). Missing/corrupt reads as 0 (run). Legacy monotonic
+        `_cleanup_last_run` values are ignored (meaningless after reboot).
+        Never raises.
+        """
+        try:
+            mem = float(getattr(self, "_cleanup_last_run_wall_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            mem = 0.0
+        if mem > 0:
+            return mem
+        try:
+            store = getattr(self, "store", None)
+            get_meta = getattr(store, "get_meta", None)
+            if callable(get_meta):
+                raw = get_meta(self._CLEANUP_LAST_RUN_META_KEY)
+                if raw:
+                    return float(raw)
+        except (TypeError, ValueError):
+            pass
+        except Exception:
+            pass
+        return 0.0
+
+    def _remember_cleanup_run(self, now_wall: float) -> None:
+        """Stamp the janitor run in memory and in store_meta. Never raises."""
+        try:
+            self._cleanup_last_run_wall_ts = now_wall
+        except Exception:
+            pass
+        try:
+            # Keep the legacy monotonic attr moving for any external reader.
+            self._cleanup_last_run = time.monotonic()
+        except Exception:
+            pass
+        try:
+            store = getattr(self, "store", None)
+            set_meta = getattr(store, "set_meta", None)
+            if callable(set_meta):
+                set_meta(self._CLEANUP_LAST_RUN_META_KEY, str(now_wall))
+        except Exception:
+            pass
+
     async def _maybe_cleanup_source(self) -> None:
-        """Hourly gate for the VPS1 cleanup janitor; no-op unless enabled."""
+        """Hourly gate for the VPS1 cleanup janitor; no-op unless enabled.
+
+        The cadence clock persists in store_meta, so a restart resumes the
+        schedule instead of resetting it (a minutes-long reboot for an
+        upgrade must not trigger an immediate run). A startup settle delay
+        keeps the first minutes after boot delete-free while recovery and
+        polls settle. Both use wall-clock epoch (monotonic clocks don't
+        survive restarts). Times survive only as early as the oldest
+        reading: memory, then meta, else 0 (run).
+        """
         cfg = getattr(getattr(self, "cfg", None), "cleanup", None)
         if cfg is None or not getattr(cfg, "enabled", False):
             return
-        now_mono = time.monotonic()
-        try:
-            last = float(getattr(self, "_cleanup_last_run", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            last = 0.0
         try:
             interval = int(getattr(cfg, "janitor_interval_seconds", 3600) or 3600)
         except (TypeError, ValueError):
             interval = 3600
-        if now_mono - last < interval:
+        if interval < 60:
+            interval = 60
+        try:
+            startup_delay = float(
+                getattr(cfg, "janitor_startup_delay_seconds", 300) or 0)
+        except (TypeError, ValueError):
+            startup_delay = 300.0
+        if startup_delay < 0:
+            startup_delay = 0.0
+        now_mono = time.monotonic()
+        try:
+            gate_t0 = getattr(self, "_cleanup_gate_t0", None)
+            if not isinstance(gate_t0, float):
+                gate_t0 = now_mono
+                self._cleanup_gate_t0 = gate_t0
+        except Exception:
+            gate_t0 = now_mono
+        if startup_delay > 0 and now_mono - gate_t0 < startup_delay:
             return
-        self._cleanup_last_run = now_mono
+        now_wall = time.time()
+        if now_wall - self._cleanup_last_run_wall() < interval:
+            return
+        self._remember_cleanup_run(now_wall)
         await self._run_source_cleanup(cfg)
 
     async def _run_source_cleanup(self, cfg: object) -> None:
@@ -105,6 +177,26 @@ class CleanupMixin:
         now_utc = dt.datetime.now(dt.timezone.utc)
         arrivals = self._cleanup_arrivals_per_hour(time.monotonic())
         free_bytes = await self._source_free_bytes()
+        # Calm-and-roomy short-circuit: plenty of free space and a quiet
+        # intake mean no deletion could help anything — skip the scan and
+        # the deletes entirely (next hourly tick re-evaluates). Unknown
+        # free space never skips (fail-closed), and active H&R minimums
+        # still enforce regardless of pressure.
+        try:
+            _high = float(getattr(cfg, "high_watermark_free_bytes", 0) or 0)
+            _calm = float(getattr(cfg, "calm_arrivals_per_hour", 2.0) or 0.0)
+            _min_ratio = float(getattr(cfg, "min_ratio", 0.0) or 0.0)
+            _min_hours = float(getattr(cfg, "min_seed_hours", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            _high, _calm, _min_ratio, _min_hours = 0.0, 2.0, 0.0, 0.0
+        if (free_bytes is not None and _high > 0 and free_bytes >= _high
+                and arrivals <= _calm and _min_ratio <= 0 and _min_hours <= 0):
+            log.info(
+                "cleanup janitor: skipping run (VPS1 free=%d B >= high "
+                "watermark, arrivals=%.1f/h calm)",
+                free_bytes, arrivals,
+            )
+            return
         grace_s = cleanup_grace_seconds(cfg, free_bytes, arrivals)
         low_free = int(getattr(cfg, "low_watermark_free_bytes", 0) or 0)
         if free_bytes is not None:

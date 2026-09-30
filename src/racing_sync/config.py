@@ -899,6 +899,11 @@ class CleanupConfig(BaseModel):
     delete_stagger_seconds: float = Field(default=25.0, ge=0)
     # Seconds between janitor runs.
     janitor_interval_seconds: int = Field(default=3600, ge=300)
+    # Settle delay after (re)start before the first janitor run may delete.
+    # A minutes-long reboot for an upgrade must not trigger an immediate
+    # run: recovery, polls and SFTP settle first. 0 disables (run as soon
+    # as the hourly cadence allows).
+    janitor_startup_delay_seconds: float = Field(default=300.0, ge=0)
 
     @model_validator(mode="after")
     def _check_bounds(self) -> "CleanupConfig":

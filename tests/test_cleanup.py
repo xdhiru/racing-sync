@@ -22,7 +22,8 @@ GiB = 1024 ** 3
 
 
 def _cleanup_cfg(**over) -> CleanupConfig:
-    base = dict(enabled=True, dry_run=False)
+    base = dict(enabled=True, dry_run=False,
+                janitor_startup_delay_seconds=0.0)
     base.update(over)
     return CleanupConfig(**base)
 
