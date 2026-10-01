@@ -178,6 +178,12 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
       stat-able at the blob-derived target mount before anything is injected
       with `skip_check=True`. Missing blob parks; undecodable test blobs
       warn through.
+    - Sustained-missing heal: files absent on fuse AND on SSD for longer
+      than `[rclone.fuse].readd_heal_missing_after_seconds` (2h default,
+      `0` disables) are selectively re-downloaded (that file only, SSD
+      budget reserved) and moved, capped at 3 attempts — then the 24h
+      max-age `FAILED` (and boot auto-retry) takes over. Fresh absences
+      never heal (usually fuse/rclone index lag).
     - Delete the SSD torrent entry (`delete_files=False`; bytes already moved).
     - For each racing-client torrent for the content (+ the cross-seed):
       `add_torrent(save_path=fuse.mount, skip_check=True, paused=False)`.

@@ -279,6 +279,13 @@ reinject_backoff_seconds = 1800
 # Prevents dangling tasks while giving slow/overloaded servers ample time to recover.
 reinject_max_age_seconds = 86400
 
+# Sustained-missing window (seconds) before the RE_ADDING healer re-downloads
+# fuse-gated files (default: 7200 / 2h). Fresh absences are usually fuse/rclone
+# index lag, so only a stable missing set (same files, healthy mount, SSD bytes
+# also absent) older than this fires a selective re-download + move of just
+# those files. 0 disables (park until the 24h FAIL, then auto-retry).
+readd_heal_missing_after_seconds = 7200
+
 # ============================================================
 # Classifier (movie / episode / season)
 # ============================================================
