@@ -277,6 +277,15 @@ class FuseConfig(BaseModel):
     reinject_backoff_seconds: int = Field(default=1800, ge=1)
     # Maximum elapsed seconds since re-injection began before marking FAILED (default: 86400 / 24 hours)
     reinject_max_age_seconds: int = Field(default=86400, ge=60)
+    # Sustained-missing window (seconds) before the RE_ADDING healer
+    # re-downloads fuse-gated files (default: 7200 / 2h). The fuse gate
+    # parks on ANY absence, but rclone dir-cache (~5m) + app stat cache
+    # (60s) + mount indexing lag make fresh absences unreliable — only a
+    # *stable* missing set (same files, mount healthy, SSD bytes also
+    # absent) older than this triggers a selective re-download + move of
+    # just those files. 0 disables (park until the 24h max-age FAIL, then
+    # auto-retry does a full re-download).
+    readd_heal_missing_after_seconds: int = Field(default=7200, ge=0)
 
 
 class RcloneConfig(BaseModel):
@@ -1094,6 +1103,10 @@ class AppConfig(BaseModel):
     @property
     def fuse_reinject_max_age_seconds(self) -> int:
         return self.rclone.fuse.reinject_max_age_seconds
+
+    @property
+    def fuse_readd_heal_after_seconds(self) -> int:
+        return self.rclone.fuse.readd_heal_missing_after_seconds
 
     def is_episode(self, name: str) -> bool:
         return bool(self.classifier._episode_re.search(name))

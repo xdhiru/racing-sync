@@ -43,7 +43,7 @@ def test_first_attempt_sets_first_queried_at():
 def test_retry_window_is_24_hours():
     cfg = _cfg()
     assert cfg.cross_seed.prowlarr_max_age_seconds == 86400
-    assert cfg.cross_seed.prowlarr_retry_interval_seconds == 1800
+    assert cfg.cross_seed.prowlarr_retry_interval_seconds == 900
 
 
 def test_expired_max_age_marks_failed():
