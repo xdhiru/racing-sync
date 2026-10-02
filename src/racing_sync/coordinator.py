@@ -7453,6 +7453,349 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     ts.source_name[:60],
                 )
 
+    # ---- Telegram /injectfuse: operator-moved manual seeding ----
+
+    # Row states /injectfuse may drive into RE_ADDING (operator moved the
+    # bytes to the remote by hand; the fuse gate re-verifies before any
+    # skip_check inject). SSD-active rows are refused by injectfuse_apply
+    # (driving mid-download would orphan SSD bytes); DONE/RE_ADDING are
+    # no-ops.
+    _INJECTFUSE_DRIVABLE = frozenset({
+        State.NEW, State.QUERYING, State.WAITING_INDEXER,
+        State.WAITING_DISK, State.FAILED,
+    })
+    _INJECTFUSE_ACTIVE = frozenset({
+        State.QUEUED, State.DOWNLOADING, State.MOVING,
+    })
+
+    def _injectfuse_group_for(self, anchor, live: list) -> list:
+        """Live VPS1 torrents holding the anchor's content.
+
+        Same normalized release + matching total (0-size anchors match on
+        name alone). Mirrors _cleanup_group_for (which works on a by-hash
+        map) for a flat live list.
+        """
+        try:
+            want_norm = normalize_content_name(getattr(anchor, "name", "") or "")
+        except Exception:
+            return []
+        if not want_norm:
+            return []
+        try:
+            want_size = int(getattr(anchor, "size_bytes", 0) or 0)
+        except (TypeError, ValueError):
+            want_size = 0
+        out = []
+        for t in live or []:
+            try:
+                if normalize_content_name(getattr(t, "name", "") or "") != want_norm:
+                    continue
+                try:
+                    t_size = int(getattr(t, "size_bytes", 0) or 0)
+                except (TypeError, ValueError):
+                    t_size = 0
+                if want_size and t_size and t_size != want_size:
+                    continue
+                out.append(t)
+            except Exception:
+                continue
+        return out
+
+    def _injectfuse_find_row(self, members: list):
+        """Tracked row for any group member hash (or normalized name+size)."""
+        store = getattr(self, "store", None)
+        if store is None or not members:
+            return None
+        try:
+            get = getattr(store, "get", None)
+            if callable(get):
+                for t in members:
+                    try:
+                        h = (getattr(t, "infohash", "") or "").lower()
+                    except Exception:
+                        continue
+                    if not h:
+                        continue
+                    try:
+                        found = get(h, include_blob=False)
+                    except Exception:
+                        continue
+                    if found is not None:
+                        return found
+        except Exception:
+            pass
+        try:
+            anchor = members[0]
+            name = getattr(anchor, "name", "") or ""
+            size = int(getattr(anchor, "size_bytes", 0) or 0)
+            norm = normalize_content_name(name)
+            for m in (getattr(store, "find_by_name", lambda _n: [])(name) or []):
+                try:
+                    if normalize_content_name(getattr(m, "source_name", "") or "") != norm:
+                        continue
+                    try:
+                        m_size = int(getattr(m, "total_bytes", 0) or 0)
+                    except (TypeError, ValueError):
+                        m_size = 0
+                    if m_size and size and m_size != size:
+                        continue
+                    return m
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    async def injectfuse_resolve(self, infohash: str) -> dict:
+        """Resolve a VPS1 infohash to its content group + tracked row.
+
+        Category-agnostic (manual commands reach torrents the racing poll
+        never ingests). Raises LookupError when unknown/cancelled. No
+        state change.
+        """
+        norm = (infohash or "").strip().lower()
+        if len(norm) != 40 or not all(c in "0123456789abcdef" for c in norm):
+            raise ValueError("send /injectfuse <full 40-char hash> from VPS1")
+        try:
+            live = await rpc(
+                self.source_client.list_torrents(),
+                getattr(self, "cfg", None), "source injectfuse list")
+        except Exception as e:  # noqa: BLE001
+            raise LookupError(f"cannot list VPS1 torrents: {e}") from e
+        anchor = None
+        for t in live or []:
+            try:
+                if (getattr(t, "infohash", "") or "").lower() == norm:
+                    anchor = t
+                    break
+            except Exception:
+                continue
+        if anchor is None:
+            raise LookupError(
+                f"hash {norm[:10]} not on VPS1 (typo, or already removed)")
+        group = self._injectfuse_group_for(anchor, live)
+        if not group:
+            raise LookupError(f"hash {norm[:10]} not on VPS1")
+        try:
+            if _group_is_ignored(group, getattr(self, "store", None)):
+                raise LookupError(
+                    "cancelled release — unignore it first, then inject")
+        except LookupError:
+            raise
+        except Exception:
+            pass
+        primary = next(
+            (t for t in group if _looks_public(getattr(t, "trackers", None) or [])),
+            group[0],
+        )
+        return {
+            "primary": primary,
+            "members": group,
+            "row": self._injectfuse_find_row(group),
+            "title": (getattr(primary, "name", "") or norm[:10])[:60],
+            "size": int(getattr(primary, "size_bytes", 0) or 0),
+        }
+
+    async def injectfuse_verify(self, members: list) -> dict:
+        """All-or-nothing fuse readiness for a group. No state change.
+
+        Every member needs fetchable .torrent bytes AND zero missing /
+        size-mismatched files at its blob-derived target mount. Returns
+        {"ready", "blobs", "problems"} — problems lists "name: reason".
+        """
+        problems: list[str] = []
+        blobs: dict[str, bytes] = {}
+        ready = True
+        for t in members or []:
+            try:
+                h = (getattr(t, "infohash", "") or "").lower()
+                name = (getattr(t, "name", "") or h[:10])[:50]
+            except Exception:
+                continue
+            if not h:
+                continue
+            try:
+                blob = await self._fetch_racing_torrent_bytes(h)
+            except Exception as e:  # noqa: BLE001
+                blob = None
+                log.debug("injectfuse: fetch %s failed: %s", h[:10], e)
+            if not blob:
+                ready = False
+                problems.append(f"{name}: no .torrent bytes (retry later)")
+                continue
+            blobs[h] = bytes(blob)
+            try:
+                expected = self._expected_fuse_files(blob)
+            except Exception:
+                expected = None
+            if not expected:
+                ready = False
+                problems.append(f"{name}: undecodable .torrent")
+                continue
+            try:
+                kind = self._classify_blob_kind(blob)
+                try:
+                    fallback = Path(self.cfg.dest.save_path)
+                except Exception:
+                    fallback = Path(".")
+                target = self._target_mount_for_kind(kind, fallback)
+            except Exception:
+                ready = False
+                problems.append(f"{name}: no fuse target")
+                continue
+            try:
+                missing = await self._missing_fuse_files(target, expected)
+            except Exception as e:  # noqa: BLE001
+                ready = False
+                problems.append(f"{name}: fuse check failed ({e})")
+                continue
+            if missing:
+                ready = False
+                if len(missing) == 1 and not str(missing[0]).startswith("<"):
+                    problems.append(f"{name}: missing {missing[0]}")
+                else:
+                    shown = ", ".join(str(m)[:60] for m in missing[:3])
+                    if len(missing) > 3:
+                        shown += f" (+{len(missing) - 3} more)"
+                    problems.append(f"{name}: {len(missing)} missing at {target} (e.g. {shown})")
+        return {"ready": ready and bool(members), "blobs": blobs,
+                "problems": problems}
+
+    async def injectfuse_apply(self, resolved: dict, blobs: dict[str, bytes]) -> str:
+        """Drive a verified group into RE_ADDING (or create its row).
+
+        Callers must run injectfuse_verify first and pass its blobs: on
+        ANY problem the caller reports and changes nothing — this method
+        assumes verification passed. SSD-active rows raise LookupError;
+        DONE/RE_ADDING rows report no-op.
+        """
+        members = list(resolved.get("members") or [])
+        primary = resolved.get("primary")
+        title = str(resolved.get("title") or "group")[:60]
+        if not members or primary is None:
+            raise LookupError("empty group; nothing to inject")
+        # Re-resolve the row: the poller may have ingested it since resolve.
+        row = self._injectfuse_find_row(members)
+        if row is not None:
+            try:
+                fresh = self.store.get(row.source_infohash, include_blob=False)
+            except Exception:
+                fresh = row
+            if fresh is None:
+                raise LookupError("already gone from tracking")
+            row = fresh
+            if row.state in self._INJECTFUSE_ACTIVE:
+                raise LookupError(
+                    f"SSD {row.state.value} in progress for {title} — "
+                    "/cancel it first for the manual path")
+            if row.state in (State.DONE, State.RE_ADDING):
+                return (f"already {row.state.value}: {title} "
+                        "(fuse gate runs next tick)")
+            if row.state not in self._INJECTFUSE_DRIVABLE:
+                raise LookupError(
+                    f"{title} is {row.state.value}; manual inject needs "
+                    "a waiting/failed row")
+            self.transition(row, State.RE_ADDING)
+            return (f"injecting {len(members)} torrent(s) for {title} "
+                    "(fuse gate runs next tick)")
+        try:
+            p_hash = (getattr(primary, "infohash", "") or "").lower()
+            p_name = (getattr(primary, "name", "") or p_hash[:10])
+            try:
+                p_size = int(getattr(primary, "size_bytes", 0) or 0)
+            except (TypeError, ValueError):
+                p_size = 0
+            trackers = list(getattr(primary, "trackers", None) or [])
+        except Exception:
+            raise LookupError("group changed; run the command again")
+        blob = blobs.get(p_hash) if isinstance(blobs, dict) else None
+        if not blob:
+            raise LookupError("primary .torrent bytes missing; run again")
+        try:
+            base = str(self.cfg.dest.save_path)
+        except Exception:
+            base = ""
+        ts = TorrentState(
+            source_infohash=p_hash,
+            source_name=p_name,
+            total_bytes=p_size,
+            source_announce_url=trackers[0] if trackers else "",
+            source_tracker=trackers[0] if trackers else "",
+            cross_seed_infohash=p_hash,
+            cross_seed_source="injectfuse",
+            cross_seed_blob=bytes(blob),
+            classification_kind="unknown",
+            save_path=base,
+            state=State.RE_ADDING,
+        )
+        try:
+            ts._blob = bytes(blob)
+        except Exception:
+            pass
+        try:
+            self.store.upsert(ts)
+        except Exception as e:  # noqa: BLE001
+            raise LookupError(f"could not track group: {e}") from e
+        try:
+            self._drop_frozen_batch_cap(ts)
+        except Exception:
+            pass
+        log.info("injectfuse: adopted %s (%d torrent(s)) straight to re_adding",
+                 p_name[:60], len(members))
+        return (f"injecting {len(members)} torrent(s) for {p_name[:60]} "
+                "(adopted; fuse gate runs next tick)")
+
+    async def injectfuse_confirmed(self, hashes: list[str]) -> str:
+        """Execute a confirmed /injectfuse: resolve live, verify, drive.
+
+        All-or-nothing: any verification problem reports WITHOUT changing
+        state (tracked rows keep their prior state; untracked groups gain
+        no row). The live VPS1 group at confirm time governs (frozen
+        question hashes only seed the lookup). Short strings — Telegram
+        truncates for chat.
+        """
+        clean: list[str] = []
+        for h in hashes or []:
+            try:
+                n = (h or "").strip().lower()
+            except Exception:
+                continue
+            if (len(n) == 40
+                    and all(c in "0123456789abcdef" for c in n)
+                    and n not in clean):
+                clean.append(n)
+        if not clean:
+            return "Not injected — nothing to verify (expired?)."
+        try:
+            resolved = await self.injectfuse_resolve(clean[0])
+        except (LookupError, ValueError) as e:
+            return f"Not injected — {e}"
+        except Exception as e:  # noqa: BLE001
+            return f"Not injected — verify failed ({e})"
+        try:
+            verified = await self.injectfuse_verify(
+                resolved.get("members") or [])
+        except Exception as e:  # noqa: BLE001
+            return f"Not injected — verify failed ({e})"
+        if not verified.get("ready"):
+            suffix = ""
+            try:
+                row = resolved.get("row")
+                if row is not None and getattr(row, "state", None) is not None:
+                    suffix = f" — still {row.state.value}"
+            except Exception:
+                suffix = ""
+            probs = list(verified.get("problems") or ["unverifiable"])
+            extra = f" (+{len(probs) - 3} more)" if len(probs) > 3 else ""
+            return f"Not injected{suffix}: " + "; ".join(probs[:3]) + extra
+        try:
+            return await self.injectfuse_apply(
+                resolved, verified.get("blobs") or {})
+        except (LookupError, ValueError) as e:
+            return f"Not injected — {e}"
+        except Exception as e:  # noqa: BLE001
+            return f"Not injected — {e}"
+
     async def _check_and_inject_late_cross_seeds(
         self, ts: TorrentState, group: list[Torrent]
     ) -> None:
