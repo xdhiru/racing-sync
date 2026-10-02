@@ -473,3 +473,75 @@ async def test_foreign_tap_refused(tmp_path):
         assert bot._pending_pick is not None
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_dispatcher_routes_inject_callbacks(tmp_path):
+    """_handle_callback must forward inject: taps (regression: silently dropped)."""
+    from unittest.mock import AsyncMock
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        bot = _bot(store, coord=MagicMock())
+        bot._on_action_button = AsyncMock()
+        q = SimpleNamespace(
+            message=SimpleNamespace(chat=SimpleNamespace(id="1")),
+            from_user=SimpleNamespace(id="9"),
+            data="inject:deadbeef:yes",
+            answer=AsyncMock(),
+        )
+        await bot._handle_callback(q)
+        bot._on_action_button.assert_awaited_once()
+        assert bot._on_action_button.await_args[0][1] == "inject:deadbeef:yes"
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_group_question_names_live_vps1_count(tmp_path):
+    """Later VPS1 additions join the question, not just the tracked row."""
+    coord, _, _fuse = _coord(
+        tmp_path, [_torrent(H1, TRACKER1), _torrent(H2, TRACKER2)])
+    try:
+        coord.store.upsert(TorrentState(
+            source_infohash=H1, source_name=NAME, total_bytes=500,
+            state=State.WAITING_INDEXER))
+        bot = _bot(coord.store, coord=coord)
+        bot._refresh_active_message = AsyncMock()
+        msg = SimpleNamespace(
+            chat=SimpleNamespace(id="1"),
+            from_user=SimpleNamespace(id="9"),
+            message_id=51, text="/injectfuse_1",
+            caption=None, document=None, reply_to_message=None)
+        await bot._handle_chat_message(msg)
+        texts = _sent_texts(bot)
+        assert any("(2 copies)" in t for t in texts)
+        pend = bot._pending_live()
+        assert pend is not None and pend.get("kind") == "injectq"
+        assert sorted(h for (h, _) in pend["members"]) == [H1, H2]
+        assert coord.store.get(H1).state == State.WAITING_INDEXER
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_group_question_falls_back_when_vps1_gone(tmp_path):
+    """VPS1 entry removed: question still arms from the tracked snapshot."""
+    coord, _, _fuse = _coord(tmp_path, [])
+    try:
+        coord.store.upsert(TorrentState(
+            source_infohash=H1, source_name=NAME, total_bytes=500,
+            state=State.WAITING_INDEXER))
+        bot = _bot(coord.store, coord=coord)
+        bot._refresh_active_message = AsyncMock()
+        msg = SimpleNamespace(
+            chat=SimpleNamespace(id="1"),
+            from_user=SimpleNamespace(id="9"),
+            message_id=51, text="/injectfuse_1",
+            caption=None, document=None, reply_to_message=None)
+        await bot._handle_chat_message(msg)
+        pend = bot._pending_live()
+        assert pend is not None and pend.get("kind") == "injectq"
+        assert [h for (h, _) in pend["members"]] == [H1]
+    finally:
+        coord.store.close()

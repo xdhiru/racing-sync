@@ -1907,7 +1907,8 @@ class TelegramBot:
 
         data = str(getattr(query, "data", "") or "")
         if (data.startswith("pick:") or data.startswith("keep:")
-                or data.startswith("abort:")):
+                or data.startswith("abort:")
+                or data.startswith("inject:")):
             await self._on_action_button(query, data)
             return
         if not data.startswith("page:"):
@@ -2511,7 +2512,8 @@ class TelegramBot:
         except Exception:
             pass
 
-    def _injectfuse_member_label(self, t: Any) -> str:
+    @staticmethod
+    def _injectfuse_member_label(t: Any) -> str:
         """Short label for a VPS1 group member (tracker domain or hash)."""
         try:
             for u in list(getattr(t, "trackers", None) or []):
@@ -2527,6 +2529,24 @@ class TelegramBot:
             return (getattr(t, "infohash", "") or "")[:10] or "?"
         except Exception:
             return "?"
+
+    @staticmethod
+    def _injectfuse_snap(members: list) -> list[tuple[str, str]]:
+        """Frozen [(hash, label)] snapshot for an injectfuse question."""
+        snap: list[tuple[str, str]] = []
+        seen: dict[str, int] = {}
+        for t in members or []:
+            try:
+                h = (getattr(t, "infohash", "") or "").lower()
+            except Exception:
+                continue
+            if not h:
+                continue
+            base = TelegramBot._injectfuse_member_label(t)
+            n = seen.get(base, 0)
+            seen[base] = n + 1
+            snap.append((h, base if n == 0 else f"{base} {h[:6]}"))
+        return snap
 
     async def _start_injectfuse_single(self, full_hash: str, message: Any) -> None:
         """`/injectfuse <hash>`: tracked or untracked VPS1 torrent.
@@ -2582,19 +2602,7 @@ class TelegramBot:
                 pass
             return
         members = list(resolved.get("members") or [])
-        snap: list[tuple[str, str]] = []
-        seen: dict[str, int] = {}
-        for t in members:
-            try:
-                h = (getattr(t, "infohash", "") or "").lower()
-            except Exception:
-                continue
-            if not h:
-                continue
-            base = self._injectfuse_member_label(t)
-            n = seen.get(base, 0)
-            seen[base] = n + 1
-            snap.append((h, base if n == 0 else f"{base} {h[:6]}"))
+        snap = self._injectfuse_snap(members)
         if not snap:
             try:
                 await self._reply("Nothing to inject (group changed).",
@@ -2734,9 +2742,10 @@ class TelegramBot:
                 pass
             return
         # injectfuse: whole group, all-or-nothing — no member pick.
-        # Eligibility is decided at Yes-time (live VPS1 group + fuse
-        # gate), so the question arms for any listed group; SSD-active
-        # rows are refused then, never driven.
+        # The question names the LIVE VPS1 group (torrents added after
+        # the row was tracked belong to it); Yes-time execution
+        # re-resolves live too, so a stale list can never misinject.
+        # SSD-active rows are refused at Yes, never driven.
         if kind == "injectfuse":
             snap = pick_snapshot(_trip, "cancel")
             if not snap:
@@ -2746,7 +2755,31 @@ class TelegramBot:
                 except Exception:
                     pass
                 return
-            self._set_pending_injectq(title, snap, _gsize,
+            live_title, live_size = title, _gsize
+            try:
+                coord = getattr(self, "_coord", None)
+                if coord is not None:
+                    resolved = await coord.injectfuse_resolve(snap[0][0])
+                    live_snap = self._injectfuse_snap(
+                        list(resolved.get("members") or []))
+                    if live_snap:
+                        snap = live_snap
+                        live_title = str(
+                            resolved.get("title") or title)[:60]
+                        live_size = resolved.get("size") or _gsize
+            except (LookupError, ValueError) as e:
+                if "unignore" in str(e).lower():
+                    try:
+                        await self._reply(str(e)[:300], reply_to=message)
+                    except Exception:
+                        pass
+                    return
+                log.debug("injectfuse group live-resolve failed (%s); "
+                          "using tracked snapshot", e)
+            except Exception as e:  # noqa: BLE001
+                log.debug("injectfuse group live-resolve failed (%s); "
+                          "using tracked snapshot", e)
+            self._set_pending_injectq(live_title, snap, live_size,
                                       user_id=_actor)
             try:
                 await self._refresh_active_message()
@@ -2754,7 +2787,7 @@ class TelegramBot:
                 pass
             try:
                 await self._reply(
-                    f"Inject {title} ({len(snap)} copies) to fuse "
+                    f"Inject {live_title} ({len(snap)} copies) to fuse "
                     f"seeding? Files must already be at the remote. "
                     f"Choose below.",
                     reply_to=message)
@@ -2788,7 +2821,7 @@ class TelegramBot:
             pass
 
     async def _on_action_button(self, query: Any, data: str) -> None:
-        """Route pick:/keep:/abort: taps (initial ack already sent).
+        """Route pick:/keep:/inject:/abort: taps (initial ack already sent).
 
         Buttons address snapshot indices/sequences, never live
         positions or hashes — renumbering mid-flow cannot misroute.
