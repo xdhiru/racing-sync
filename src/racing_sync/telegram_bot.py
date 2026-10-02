@@ -499,6 +499,14 @@ FETCH_CMD_RE = re.compile(r"^/fetch_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 #: download now instead of waiting out its preferred-copy grace.
 PREFER_CMD_RE = re.compile(r"^/prefer_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
+#: `/injectfuse_<n|hex>` — list shortcut: group number or tracked
+#: hash/prefix for manual fuse seeding (operator moved the bytes).
+INJECTFUSE_CMD_RE = re.compile(r"^/injectfuse_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/injectfuse <full-hash>` — manual form: any VPS1 infohash, tracked
+#: or not yet tracked by the app.
+INJECTFUSE_HASH_RE = re.compile(r"^/injectfuse\s+([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
 #: `/add` — ingest the .torrent file in the replied-to message (or in
 #: the same message when sent with /add as caption) as a Telegram
 #: origin drop, processed like a watch-dir file. Optional `@bot` suffix,
@@ -866,10 +874,11 @@ def render_active(
     (``/cancel_3`` …) and open member-choice buttons below the list —
     the number is resolved once, at tap time, into a frozen member
     snapshot, so later renumbering cannot misroute the flow. Cancel
-    always ends at a keep/delete question; fetch/prefer appear only
-    while a member qualifies. Detail cards keep per-torrent text
-    commands (full-hash cancel). Pages count groups; numbers are global
-    across pages.
+    always ends at a keep/delete question (injectfuse at a Yes/No
+    question); fetch/prefer appear only while a member qualifies, and
+    injectfuse while a member waits pre-download. Detail cards keep
+    per-torrent text commands (full-hash cancel). Pages count groups;
+    numbers are global across pages.
 
     Compact mobile layout (detail cards stay fully detailed). `notes`
     maps source_infohash -> one-line extra shown on that tracker's line.
@@ -931,6 +940,7 @@ def render_active(
         # leading spaces only push long statuses into a wrap.
         _has_fetch = False
         _has_prefer = False
+        _has_inject = False
         for (ts, progress) in members:
             domain_full = (_tracker_domain(ts.source_announce_url)
                            or _tracker_domain(ts.source_tracker))
@@ -942,6 +952,9 @@ def render_active(
                 lines.append(f"▸ {state_text}")
             if ts.state == State.WAITING_INDEXER:
                 _has_fetch = True
+            if ts.state in (State.QUERYING, State.WAITING_INDEXER,
+                            State.WAITING_DISK):
+                _has_inject = True
             if (ts.state == State.NEW
                     and _is_grace_note_for_prefer(_note)):
                 _has_prefer = True
@@ -950,13 +963,15 @@ def render_active(
         # prefix marks them; every column counts against the wrap limit).
         # Positional group number — resolved once at tap time into a
         # frozen snapshot, so later renumbering cannot misroute.
-        # Cancel always; fetch/prefer only when a member qualifies
-        # right now.
+        # Cancel always; fetch/prefer/inject only when a member qualifies
+        # right now (injectfuse arms a Yes/No question, never acts).
         _cmds = [f"/cancel_{group_num}"]
         if _has_fetch:
             _cmds.append(f"/fetch_{group_num}")
         if _has_prefer:
             _cmds.append(f"/prefer_{group_num}")
+        if _has_inject:
+            _cmds.append(f"/injectfuse_{group_num}")
         lines.append(" ".join(_esc(_c) for _c in _cmds))
         lines.append("")
 
@@ -1691,14 +1706,42 @@ class TelegramBot:
         return _p
 
     def _set_pending_keepq(self, title: str, scope: str,
-                            hashes: list[str], size_bytes: object = None,
-                            user_id: object = None) -> dict:
+                             hashes: list[str], size_bytes: object = None,
+                             user_id: object = None) -> dict:
         """Arm the keep/delete question over frozen hashes."""
         _p = {
             "kind": "keepq", "seq": self._next_seq(),
             "title": (title or "")[:80], "scope": scope or "",
             "size": size_bytes,
             "hashes": [h for h in hashes or [] if h],
+            "user_id": str(user_id) if user_id is not None else None,
+            "expires": time.monotonic() + _PENDING_TTL_S,
+        }
+        try:
+            self._pending_pick = _p
+        except Exception:
+            pass
+        try:
+            self._last_active_cache = None
+        except Exception:
+            pass
+        return _p
+
+    def _set_pending_injectq(self, title: str,
+                             members: list[tuple[str, str]],
+                             size_bytes: object = None,
+                             user_id: object = None) -> dict:
+        """Arm the inject-to-fuse Yes/No question over frozen hashes.
+
+        Like keepq (all-or-nothing over the snapshot), but execution
+        re-verifies fuse readiness first and changes nothing unless every
+        member verifies: a "yes" never strands a row in a new state.
+        """
+        _p = {
+            "kind": "injectq", "seq": self._next_seq(),
+            "title": (title or "")[:80], "scope": "",
+            "size": size_bytes,
+            "members": [(h, label) for (h, label) in members or []],
             "user_id": str(user_id) if user_id is not None else None,
             "expires": time.monotonic() + _PENDING_TTL_S,
         }
@@ -1729,6 +1772,23 @@ class TelegramBot:
                     render_pending_question(_p),
                     [[("Keep files", f"keep:{_seq}:yes"),
                       ("Delete files", f"keep:{_seq}:no")],
+                     [("Cancel", f"abort:{_seq}")]],
+                )
+            if _p.get("kind") == "injectq":
+                try:
+                    _n = len(_p.get("members") or [])
+                except Exception:
+                    _n = 0
+                try:
+                    _title = _safe_display_name(
+                        str(_p.get("title") or "")[:80])
+                except Exception:
+                    _title = "?"
+                return (
+                    f"Inject {_n} torrent(s) for `{_title}` to fuse "
+                    f"seeding? Files must already be at the remote.",
+                    [[("Yes, inject", f"inject:{_seq}:yes"),
+                      ("No", f"inject:{_seq}:no")],
                      [("Cancel", f"abort:{_seq}")]],
                 )
             _btns = []
@@ -1937,14 +1997,16 @@ class TelegramBot:
         return row
 
     async def _handle_chat_message(self, message: Any) -> None:
-        """Execute `/cancel_` / `/fetch_` / `/prefer_` commands in the chat.
+        """Execute `/cancel_` / `/fetch_` / `/prefer_` / `/injectfuse` commands.
 
     Group commands (stable content ids from the active list) open
     member-choice buttons; full hashes and legacy hash prefixes act
     directly. Cancel always ends at a keep/delete question — nothing
-    is wiped without an explicit choice. `/add` ingests a replied-to
-    (or captioned) .torrent file as a Telegram-origin drop. Anything
-    else is ignored. Only the configured chat/user may send commands.
+    is wiped without an explicit choice. Injectfuse always ends at a
+    Yes/No question — nothing changes state without verification.
+    `/add` ingests a replied-to (or captioned) .torrent file as a
+    Telegram-origin drop. Anything else is ignored. Only the
+    configured chat/user may send commands.
     """
         try:
             chat = getattr(message, "chat", None)
@@ -1974,8 +2036,12 @@ class TelegramBot:
             m_fetch = FETCH_CMD_RE.match(text)
             m_prefer = PREFER_CMD_RE.match(text)
             m_cancel = CANCEL_CMD_RE.match(text)
+            m_injectfuse = INJECTFUSE_CMD_RE.match(text)
+            m_injectfuse_hash = INJECTFUSE_HASH_RE.match(text)
             m_add = ADD_CMD_RE.match(text)
-            if not m_fetch and not m_prefer and not m_cancel and not m_add:
+            if (not m_fetch and not m_prefer and not m_cancel
+                    and not m_injectfuse and not m_injectfuse_hash
+                    and not m_add):
                 return
             if not _tg_actor_allowed(self._cfg, user_id):
                 try:
@@ -1994,6 +2060,14 @@ class TelegramBot:
             if m_prefer:
                 await self._start_group_command(
                     "prefer", m_prefer.group(1), message)
+                return
+            if m_injectfuse_hash:
+                await self._start_single_command(
+                    "injectfuse", m_injectfuse_hash.group(1).lower(), message)
+                return
+            if m_injectfuse:
+                await self._start_group_command(
+                    "injectfuse", m_injectfuse.group(1), message)
                 return
             await self._start_group_command(
                 "cancel", m_cancel.group(1), message)
@@ -2390,6 +2464,9 @@ class TelegramBot:
 
     async def _start_single_command(self, kind: str, full_hash: str, message: Any) -> None:
         """Typed full-hash command: keepq for cancel, direct for fetch/prefer."""
+        if kind == "injectfuse":
+            await self._start_injectfuse_single(full_hash, message)
+            return
         try:
             row = await asyncio.to_thread(self._store.get, full_hash)
         except Exception:
@@ -2433,6 +2510,119 @@ class TelegramBot:
             await self._refresh_active_message()
         except Exception:
             pass
+
+    def _injectfuse_member_label(self, t: Any) -> str:
+        """Short label for a VPS1 group member (tracker domain or hash)."""
+        try:
+            for u in list(getattr(t, "trackers", None) or []):
+                try:
+                    d = _tracker_domain(u)
+                except Exception:
+                    d = ""
+                if d:
+                    return str(d)[:30]
+        except Exception:
+            pass
+        try:
+            return (getattr(t, "infohash", "") or "")[:10] or "?"
+        except Exception:
+            return "?"
+
+    async def _start_injectfuse_single(self, full_hash: str, message: Any) -> None:
+        """`/injectfuse <hash>`: tracked or untracked VPS1 torrent.
+
+        Resolves the live VPS1 group (category-agnostic, so torrents the
+        poller never ingested work too) and arms the Yes/No question.
+        Nothing changes until Yes — and Yes verifies fuse readiness
+        first, so a premature tap only yields an informative message.
+        """
+        coord = getattr(self, "_coord", None)
+        if coord is None:
+            try:
+                await self._reply("Action failed: bot not attached.",
+                                  reply_to=message)
+            except Exception:
+                pass
+            return
+        try:
+            resolved = await coord.injectfuse_resolve(full_hash)
+        except (LookupError, ValueError) as e:
+            try:
+                await self._reply(str(e)[:300], reply_to=message)
+            except Exception:
+                pass
+            return
+        except Exception as e:  # noqa: BLE001
+            try:
+                await self._reply(f"Action failed: {e}", reply_to=message)
+            except Exception:
+                pass
+            return
+        row = resolved.get("row")
+        try:
+            state = getattr(row, "state", None) if row is not None else None
+        except Exception:
+            state = None
+        title = str(resolved.get("title") or full_hash[:10])[:60]
+        if state in (State.DONE, State.RE_ADDING):
+            try:
+                await self._reply(
+                    f"already {state.value}: {title} (fuse gate runs next tick)",
+                    reply_to=message)
+            except Exception:
+                pass
+            return
+        if state in (State.QUEUED, State.DOWNLOADING, State.MOVING):
+            try:
+                await self._reply(
+                    f"SSD {state.value} in progress for {title} — "
+                    "/cancel it first for the manual path",
+                    reply_to=message)
+            except Exception:
+                pass
+            return
+        members = list(resolved.get("members") or [])
+        snap: list[tuple[str, str]] = []
+        seen: dict[str, int] = {}
+        for t in members:
+            try:
+                h = (getattr(t, "infohash", "") or "").lower()
+            except Exception:
+                continue
+            if not h:
+                continue
+            base = self._injectfuse_member_label(t)
+            n = seen.get(base, 0)
+            seen[base] = n + 1
+            snap.append((h, base if n == 0 else f"{base} {h[:6]}"))
+        if not snap:
+            try:
+                await self._reply("Nothing to inject (group changed).",
+                                  reply_to=message)
+            except Exception:
+                pass
+            return
+        self._set_pending_injectq(
+            title, snap, resolved.get("size"),
+            user_id=_tg_actor_id(message))
+        try:
+            await self._refresh_active_message()
+        except Exception:
+            pass
+        try:
+            await self._reply(
+                f"Inject {title} ({len(snap)} copies) to fuse seeding? "
+                f"Files must already be at the remote. Choose below.",
+                reply_to=message)
+        except Exception:
+            pass
+        try:
+            if members:
+                return _safe_display_name(
+                    str(getattr(members[0], "source_name", "") or "")[:60])
+        except Exception:
+            pass
+        return "?"
 
     def _group_title(self, members: list) -> str:
         """Display title for a group (lead row's name, truncated)."""
@@ -2543,6 +2733,34 @@ class TelegramBot:
             except Exception:
                 pass
             return
+        # injectfuse: whole group, all-or-nothing — no member pick.
+        # Eligibility is decided at Yes-time (live VPS1 group + fuse
+        # gate), so the question arms for any listed group; SSD-active
+        # rows are refused then, never driven.
+        if kind == "injectfuse":
+            snap = pick_snapshot(_trip, "cancel")
+            if not snap:
+                try:
+                    await self._reply("Already gone from tracking",
+                                      reply_to=message)
+                except Exception:
+                    pass
+                return
+            self._set_pending_injectq(title, snap, _gsize,
+                                      user_id=_actor)
+            try:
+                await self._refresh_active_message()
+            except Exception:
+                pass
+            try:
+                await self._reply(
+                    f"Inject {title} ({len(snap)} copies) to fuse "
+                    f"seeding? Files must already be at the remote. "
+                    f"Choose below.",
+                    reply_to=message)
+            except Exception:
+                pass
+            return
         # fetch/prefer: snapshot eligible members into a titled pick —
         # even a single candidate goes through the buttons, so the group
         # name is always on screen (with a Cancel row) before anything
@@ -2637,6 +2855,49 @@ class TelegramBot:
                 result = await self._execute_snapshot_cancel(
                     _hashes, _title, delete_files=(which == "no"))
                 await _say(result)
+                await _refresh()
+                return
+            if parts[0] == "inject" and len(parts) == 3:
+                _, seq, which = parts
+                p = self._pending_live()
+                if (p is None or p.get("kind") != "injectq"
+                        or str(p.get("seq") or "") != seq):
+                    await _say("Expired — tap the command again")
+                    return
+                if not _owner_ok(p):
+                    await _refuse_foreign()
+                    return
+                _hashes = [h for (h, _) in (p.get("members") or []) if h]
+                try:
+                    self._pending_pick = None
+                except Exception:
+                    pass
+                if which != "yes":
+                    await _say("Not injected — nothing changed.")
+                    await _refresh()
+                    return
+                if not _hashes:
+                    await _say("Not injected — nothing to verify (expired?).")
+                    await _refresh()
+                    return
+                try:
+                    from .api import _hold_ops_lock
+                except Exception:
+                    _hold_ops_lock = None  # type: ignore[assignment]
+                coord = getattr(self, "_coord", None)
+                if coord is None:
+                    await _say("Action failed: bot not attached")
+                    await _refresh()
+                    return
+                try:
+                    if _hold_ops_lock is not None:
+                        async with _hold_ops_lock(coord):
+                            result = await coord.injectfuse_confirmed(_hashes)
+                    else:
+                        result = await coord.injectfuse_confirmed(_hashes)
+                except Exception as e:  # noqa: BLE001
+                    result = f"Action failed: {e}"
+                await _say(result[:300])
                 await _refresh()
                 return
             if parts[0] == "pick" and len(parts) == 3:

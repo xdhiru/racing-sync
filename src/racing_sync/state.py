@@ -67,10 +67,11 @@ ALLOWED: dict[State, set[State]] = {
                 State.QUEUED, State.DOWNLOADING, State.MOVING, State.RE_ADDING,
                 State.DONE, State.FAILED},
     State.QUERYING: {State.WAITING_INDEXER, State.WAITING_DISK, State.QUEUED,
-                State.DOWNLOADING, State.DONE, State.FAILED},
+                State.DOWNLOADING, State.DONE, State.FAILED, State.RE_ADDING},
     State.WAITING_INDEXER: {State.QUERYING, State.WAITING_DISK,
-                State.QUEUED, State.DONE, State.FAILED},
-    State.WAITING_DISK: {State.QUEUED, State.DOWNLOADING, State.DONE, State.FAILED},
+                State.QUEUED, State.DONE, State.FAILED, State.RE_ADDING},
+    State.WAITING_DISK: {State.QUEUED, State.DOWNLOADING, State.DONE, State.FAILED,
+                State.RE_ADDING},
     State.QUEUED: {State.DOWNLOADING, State.MOVING, State.WAITING_DISK,
                    State.RE_ADDING, State.DONE, State.FAILED},
     State.DOWNLOADING: {State.MOVING, State.QUEUED, State.FAILED},
@@ -81,7 +82,12 @@ ALLOWED: dict[State, set[State]] = {
     # the late cross-seed guard demotes it back to MOVING so the rclone move
     # runs before any fuse injection. DONE -> RE_ADDING stays for lost fuses.
     State.DONE: {State.RE_ADDING, State.MOVING},
-    State.FAILED: {State.QUEUED, State.NEW},  # allow manual and auto retry
+    # Telegram /injectfuse (operator moved the bytes to the remote by
+    # hand): pre-SSD and failed rows may jump straight to RE_ADDING, where
+    # the fuse gate re-verifies everything before any skip_check inject.
+    # SSD-active rows (QUEUED/DOWNLOADING/MOVING) are refused by the
+    # command itself — driving mid-download would orphan SSD bytes.
+    State.FAILED: {State.QUEUED, State.NEW, State.RE_ADDING},  # allow manual and auto retry
 }
 
 
