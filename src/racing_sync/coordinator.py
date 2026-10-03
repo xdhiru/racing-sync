@@ -6172,12 +6172,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 and isinstance(local, Path)
                 and local.is_file()
             ):
-                # Single files move below via a bare `rclone move`, which —
-                # unlike the folder/season branches — never consults the
-                # verified-complete set above. Refuse to move
-                # client-unverified bytes: a partial file on the remote is
-                # worse than waiting. Park in MOVING for retry next tick
-                # (nothing is wiped).
+                # Single files move below via a bare `rclone move` for the
+                # single file itself (verified above); verified-complete
+                # siblings move right after via an exact files-from list.
+                # Refuse to move client-unverified bytes: a partial file on
+                # the remote is worse than waiting. Park in MOVING for
+                # retry next tick (nothing is wiped).
                 #
                 # Self-heal: DOWNLOADING gates on torrent-level progress
                 # (>=0.999), so a 99.9% torrent can advance while its single
@@ -6395,6 +6395,49 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         f"staying in MOVING without wiping",
                     )
                     return
+                # Dual-format/variant siblings (S01E01.mkv + S01E01.mp4,
+                # subs, extras): the bare move above ships only the single
+                # file, but the fuse gate expects EVERY blob file — a
+                # sibling left behind is wiped with the folder below and
+                # parks the gate forever. Move verified-complete siblings
+                # too (same verified set the folder branches use).
+                try:
+                    _sib_names: list[str] = []
+                    for _cf in completed_files:
+                        try:
+                            _joined = _safe_ssd_join(src_dir, _cf.name or "")
+                            if _joined is None:
+                                continue
+                            if _joined.resolve() == local_real:
+                                continue
+                            if not _joined.is_file():
+                                continue
+                            _sib_names.append(_cf.name or "")
+                        except OSError:
+                            continue
+                    _sib_names = files_from_names(
+                        [n for n in _sib_names if n])
+                except Exception:
+                    _sib_names = []
+                if _sib_names:
+                    log.info(
+                        "moving %d verified sibling file(s) for %s "
+                        "(e.g. %s)",
+                        len(_sib_names), ts.source_name[:60],
+                        _sib_names[0],
+                    )
+                    await self._rclone_move(
+                        src_dir, remote, ts, files_from=_sib_names)
+                    _sib_stuck = [n for n in _sib_names
+                                  if _left_on_disk(src_dir, n)]
+                    if _sib_stuck:
+                        self._park_moving(
+                            ts,
+                            f"sibling move left {len(_sib_stuck)} file(s) "
+                            f"on disk (e.g. {_sib_stuck[0]}); staying in "
+                            f"MOVING without wiping",
+                        )
+                        return
         else:
             # Mixed — per-episode moves with --include (single batch).
             # Only reachable when the pinned kind is mixed (see branch_kind

@@ -207,9 +207,14 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
         sole_key = next(iter(distinct_eps))
         main_ep = best_by_ep[sole_key]
         if len(eval_trip) == 1 or main_ep.size_bytes >= int(0.9 * total):
+            # Keep EVERY file variant of the episode (S01E01.mkv +
+            # S01E01.mp4, subs, extras): the mover moves all verified
+            # siblings, and dropping one here strands it — never moved,
+            # wiped with the folder, and the fuse gate parks forever.
             return Classification(
                 kind="episode",
-                episodes=[main_ep],
+                episodes=[e for e in deduped_eps
+                          if (e.season, e.episode) == sole_key],
                 single_file=main_ep.file_name,
                 total_bytes=total,
             )
