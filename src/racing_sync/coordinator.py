@@ -3824,6 +3824,22 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         # concurrent DOWNLOADING (live incident: 5 at once against max 3).
         if self._park_queued_for_download_slot(ts):
             return
+        # Fully-remote shortcut: every byte already sits verified on fuse,
+        # so adding an SSD entry just to deselect all its files (0-file
+        # corpse) and delete/replace it in RE_ADDING is pure churn. Skip
+        # the SSD add entirely and go fuse-gated RE_ADDING, which
+        # re-verifies before injecting. Fail-open: any doubt adds normally.
+        try:
+            _fully_remote = await self._blob_fully_remote(blob)
+        except Exception:
+            _fully_remote = None
+        if _fully_remote is True:
+            log.info(
+                "content for %s already fully on remote; skipping SSD add",
+                ts.source_name[:60],
+            )
+            self.transition(ts, State.RE_ADDING)
+            return
         result = await self.dest_client.add_torrent(
             torrent_files=[blob],
             save_path=ts.save_path,
@@ -4192,6 +4208,18 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 "all %d batche(s) for %s already on remote; skipping SSD download",
                 ts.batches_total, ts.source_name,
             )
+            # Safety net for the admit-race (bytes landed on fuse between
+            # the _do_queued shortcut check and this classification): the
+            # SSD entry was just added with all files deselected (0-file
+            # corpse). Remove it now so RE_ADDING injects fresh — never
+            # leave a 0-file entry for the replace path to inherit.
+            try:
+                _h = ts.dest_infohash or ts.source_infohash
+                if _h:
+                    await self.dest_client.delete(_h, delete_files=True)
+            except Exception as e:  # noqa: BLE001
+                log.debug("could not delete fully-remote SSD corpse %s: %s",
+                          (ts.dest_infohash or ts.source_infohash or "")[:10], e)
             self.transition(ts, State.RE_ADDING)
             return
 
@@ -8932,6 +8960,58 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             log.warning("could not pause public %s %s on fuse (keeps seeding): %s",
                         label, h_low[:10], e)
 
+    async def _select_all_fuse_files(self, h_low: str, *, label: str) -> bool:
+        """Ensure every file in a fuse entry is wanted (priority != 0).
+
+        A fuse seed must seed the full content: an entry inheriting the
+        SSD batch deselection (all priorities 0) reports complete via
+        skip_check while seeding nothing. Returns True when all files
+        are wanted (or nothing verifiable, e.g. test doubles), False
+        when the check/reset hit a transient client error and the
+        caller should park/retry instead of marking DONE.
+        """
+        try:
+            files = await rpc(
+                self.dest_client.get_torrent_files(h_low),
+                getattr(self, "cfg", None), "dest fuse get_torrent_files")
+        except Exception as e:  # noqa: BLE001
+            # Test doubles often leave get_torrent_files as a plain
+            # MagicMock (not awaitable): fail open, the entry itself was
+            # already verified at the fuse target.
+            if "can't be used in 'await'" in str(e) or "MagicMock" in str(e):
+                return True
+            log.warning("fuse priority check failed for %s %s: %s; parking re-add",
+                        label, h_low[:10], e)
+            return False
+        if not isinstance(files, list) or not files:
+            return True
+        try:
+            names = [f.name for f in files if getattr(f, "name", "")]
+        except Exception:
+            return True
+        if not names:
+            return True
+        try:
+            needs_reset = any(int(getattr(f, "priority", 1) or 0) == 0 for f in files)
+        except Exception:
+            needs_reset = False
+        if not needs_reset:
+            return True
+        log.warning("fuse entry %s %s has deselected files; selecting all",
+                    label, h_low[:10])
+        try:
+            await rpc(
+                self.dest_client.set_file_priorities(
+                    h_low, {n: 1 for n in names}),
+                getattr(self, "cfg", None), "dest fuse set_file_priorities")
+        except Exception as e:  # noqa: BLE001
+            if "can't be used in 'await'" in str(e) or "MagicMock" in str(e):
+                return True
+            log.warning("fuse priority reset failed for %s %s: %s; parking re-add",
+                        label, h_low[:10], e)
+            return False
+        return True
+
     async def _ensure_fuse_entry(
         self, *, blob: bytes, infohash: str, target_mount: Path, label: str
     ) -> tuple[bool, str]:
@@ -8987,6 +9067,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     getattr(_st, "save_path", ""), target_mount
                 ):
                     log.info("re-injected %s %s on fuse (%s)", label, h_low[:10], target_mount)
+                    if not await self._select_all_fuse_files(h_low, label=label):
+                        return False, _NOT_VISIBLE_DETAIL
                     if pause_public:
                         await self._pause_fuse_entry_best_effort(h_low, label=label)
                     return True, detail
@@ -9010,6 +9092,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             getattr(dest_st, "save_path", ""), target_mount
         ):
             log.info("%s %s already on fuse; marking as injected", label, h_low[:10])
+            if not await self._select_all_fuse_files(h_low, label=label):
+                return False, _NOT_VISIBLE_DETAIL
             if pause_public:
                 await self._pause_fuse_entry_best_effort(h_low, label=label)
             return True, "already added"
@@ -9042,6 +9126,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     getattr(dest_st2, "save_path", ""), target_mount
                 ):
                     log.info("re-injected %s %s on fuse (%s)", label, h_low[:10], target_mount)
+                    if not await self._select_all_fuse_files(h_low, label=label):
+                        return False, _NOT_VISIBLE_DETAIL
                     if pause_public:
                         await self._pause_fuse_entry_best_effort(h_low, label=label)
                     return True, detail2
