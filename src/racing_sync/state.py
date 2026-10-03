@@ -554,6 +554,18 @@ class StateStore:
                 f"ON CONFLICT(source_infohash) DO UPDATE SET {updates_str}",
                 tuple(row.values()),
             )
+            # Sync the revision back: an upsert-then-transition sequence on
+            # the same object must not trip the transition version guard
+            # below (only *other* writers invalidate this snapshot).
+            try:
+                _vrow = self._conn.execute(
+                    "SELECT version FROM torrent_state WHERE source_infohash = ?",
+                    (norm,),
+                ).fetchone()
+                if _vrow is not None:
+                    ts.version = int(_vrow["version"] or 0)
+            except Exception:
+                pass
 
     def list_by_state(self, *states: State) -> list[TorrentState]:
         self._ensure_open()
@@ -908,12 +920,16 @@ class StateStore:
         """Move a row to `dst`, refusing concurrent-move clobbers.
 
         The whole check-act sequence runs in one IMMEDIATE transaction:
-        the DB state is re-read and must still equal the in-memory source
-        state, otherwise another writer (API retry, recovery, a second
-        worker) moved the row and this transition raises AbandonedError
-        instead of silently overwriting its state. Callers holding only
-        stale snapshots therefore fail loudly (worker wrapper unwinds
-        quietly; API maps to 409).
+        the DB state AND revision are re-read and must still equal the
+        in-memory snapshot, otherwise another writer (API retry, recovery,
+        a second worker, or a bare upsert park) moved the row and this
+        transition raises AbandonedError instead of silently overwriting
+        its state. The write itself is guarded
+        (WHERE state+version match) so a tombstone or move landing
+        between the read and the write fails the rowcount instead of
+        diverging memory from the DB. Callers holding only stale
+        snapshots therefore fail loudly (worker wrapper unwinds quietly;
+        API maps to 409).
         """
         if self._is_tombstoned(ts.source_infohash):
             # Forget won this row: transitioning would upsert-resurrect it.
@@ -924,23 +940,36 @@ class StateStore:
         check_transition(ts.state, dst)
         src = ts.state
         now = dt.datetime.now(dt.timezone.utc)
-        # Snapshot everything this method mutates: a failed upsert (SQLITE_FULL,
-        # locked) must leave the in-memory object identical to the DB row.
+        try:
+            expected_version = int(ts.version or 0)
+        except (TypeError, ValueError):
+            expected_version = 0
+        # Snapshot everything this method mutates: a failed write
+        # (SQLITE_FULL, locked, lost race) must leave the in-memory
+        # object identical to the DB row.
         _snapshot = (
             ts.state, ts.last_error,
             ts.indexer_first_queried_at, ts.indexer_next_retry_at,
             ts.indexer_attempts, ts.readd_first_attempted_at,
             ts.readd_next_retry_at, ts.readd_attempts, ts.failed_retries,
             ts.completed_at, ts.batch_index, ts.readd_cycles, ts.version,
+            ts.updated_at,
         )
         try:
             with self._write_tx():
+                _norm = (ts.source_infohash or "").strip().lower()
                 _cur = self._conn.execute(
-                    "SELECT state, version FROM torrent_state "
-                    "WHERE source_infohash = ? AND deleted_at = ''",
-                    ((ts.source_infohash or "").strip().lower(),),
+                    "SELECT state, version, deleted_at FROM torrent_state "
+                    "WHERE source_infohash = ?",
+                    (_norm,),
                 ).fetchone()
                 if _cur is not None:
+                    if _cur["deleted_at"]:
+                        raise AbandonedError(
+                            f"row tombstoned (forgotten?) for "
+                            f"{(ts.source_infohash or '')[:10]}; "
+                            f"refusing {src.value} -> {dst.value}"
+                        )
                     _db_state = str(_cur["state"] or "")
                     if _db_state != src.value:
                         raise AbandonedError(
@@ -950,11 +979,19 @@ class StateStore:
                             f"refusing {src.value} -> {dst.value}"
                         )
                     try:
-                        ts.version = int(_cur["version"] or 0)
+                        _db_version = int(_cur["version"] or 0)
                     except (TypeError, ValueError):
-                        ts.version = 0
+                        _db_version = -1
+                    if _db_version != expected_version:
+                        raise AbandonedError(
+                            f"row written concurrently for "
+                            f"{(ts.source_infohash or '')[:10]} "
+                            f"(revision {_db_version} != {expected_version}); "
+                            f"refusing {src.value} -> {dst.value}"
+                        )
                 ts.state = dst
                 ts.last_error = error
+                ts.updated_at = now
                 if dst in (State.NEW, State.QUEUED):
                     ts.indexer_first_queried_at = None
                     ts.indexer_next_retry_at = None
@@ -997,16 +1034,62 @@ class StateStore:
                     ts.readd_cycles = (ts.readd_cycles + 1) if rapid else 0
                 if batch_index is not None:
                     ts.batch_index = batch_index
-                self.upsert(ts)
+                if _cur is None:
+                    # Brand-new row: nothing to clobber, plain insert path.
+                    self.upsert(ts)
+                else:
+                    self._transition_write(ts, src, expected_version)
+                    ts.version = expected_version + 1
         except Exception:
             (ts.state, ts.last_error,
              ts.indexer_first_queried_at, ts.indexer_next_retry_at,
              ts.indexer_attempts, ts.readd_first_attempted_at,
              ts.readd_next_retry_at, ts.readd_attempts, ts.failed_retries,
              ts.completed_at, ts.batch_index, ts.readd_cycles,
-             ts.version) = _snapshot
+             ts.version, ts.updated_at) = _snapshot
             raise
         log.info("state %s -> %s for %s", ts.source_infohash[:8], dst.value, ts.source_name)
+
+    def _transition_write(self, ts: TorrentState, src: State,
+                          expected_version: int) -> None:
+        """Persist a transitioned row under the state+version guard.
+
+        Same column semantics as upsert's conflict branch (blob kept when
+        the incoming bytes are empty), but as a guarded UPDATE: zero
+        affected rows means a tombstone or concurrent move landed between
+        the guard read and this write — AbandonedError, never silent
+        divergence. Caller owns the surrounding transaction.
+        """
+        row = ts.to_row()
+        sets: list[str] = []
+        params: list = []
+        for k, v in row.items():
+            if k in ("source_infohash", "created_at", "deleted_at", "version"):
+                continue
+            if k == "cross_seed_blob":
+                sets.append(
+                    f"{k} = CASE WHEN length(?) > 0 THEN ? "
+                    f"ELSE torrent_state.{k} END"
+                )
+                params.extend([v, v])
+            else:
+                sets.append(f"{k} = ?")
+                params.append(v)
+        sets.append("version = torrent_state.version + 1")
+        cur = self._conn.execute(
+            f"UPDATE torrent_state SET {', '.join(sets)} "
+            "WHERE source_infohash = ? AND state = ? AND version = ? "
+            "AND (deleted_at IS NULL OR deleted_at = '')",
+            (*params,
+             (ts.source_infohash or "").strip().lower(),
+             src.value, expected_version),
+        )
+        if (cur.rowcount or 0) <= 0:
+            raise AbandonedError(
+                f"row changed under transition for "
+                f"{(ts.source_infohash or '')[:10]}; "
+                f"refusing {src.value} -> {ts.state.value}"
+            )
 
     def append_log(self, level: str, message: str,
                    source_infohash: str | None = None) -> None:
@@ -1112,6 +1195,90 @@ class StateStore:
             )
             return (cur.rowcount or 0) > 0
 
+    # Columns a narrow update may touch (everything but identity,
+    # creation, and the tombstone stamp itself).
+    _UPDATABLE_COLUMNS = frozenset({
+        "dest_infohash", "source_name", "source_tracker",
+        "source_announce_url", "classification_kind", "total_bytes",
+        "save_path", "cross_seed_infohash", "cross_seed_source",
+        "cross_seed_blob", "injected_private_hashes",
+        "indexer_first_queried_at", "indexer_next_retry_at",
+        "indexer_attempts", "public_export_first_attempted_at",
+        "public_export_next_retry_at", "public_export_attempts",
+        "fuse_verified", "force_direct", "readd_first_attempted_at",
+        "readd_next_retry_at", "readd_attempts", "failed_retries",
+        "completed_at", "vps1_last_activity_at", "state", "batch_index",
+        "batches_total", "batch_cap_bytes", "readd_cycles", "last_error",
+        "telegram_message_id", "updated_at",
+    })
+
+    def update_columns(
+        self, source_infohash: str, mapping: dict | None = None,
+        *, expected_state: State | None = None,
+        expected_version: int | None = None,
+    ) -> int:
+        """Narrow UPDATE of a few columns; returns the new revision (0 = no row).
+
+        Unlike upsert() this never touches `state` unless asked and never
+        inserts: timer/display parks use it so a concurrent state move is
+        preserved (optionally enforced via expected_state/version, which
+        turn a lost race into 0 instead of a clobber). Tombstoned rows
+        never match. Datetimes serialize to ISO, States to values.
+        """
+        self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
+        if not norm or not isinstance(mapping, dict):
+            return 0
+        sets: list[str] = []
+        params: list = []
+        for k, v in mapping.items():
+            # updated_at/version are managed by this method itself —
+            # accepting them would duplicate the SET column.
+            if k not in self._UPDATABLE_COLUMNS or k in ("updated_at", "version"):
+                continue
+            try:
+                if isinstance(v, State):
+                    v = v.value
+                elif isinstance(v, dt.datetime):
+                    v = v.isoformat()
+                elif isinstance(v, bool):
+                    v = int(v)
+            except Exception:
+                continue
+            sets.append(f"{k} = ?")
+            params.append(v)
+        if not sets:
+            return 0
+        clauses = ["source_infohash = ?", "deleted_at = ''"]
+        params.append(norm)
+        if expected_state is not None:
+            clauses.append("state = ?")
+            params.append(expected_state.value)
+        if expected_version is not None:
+            try:
+                clauses.append("version = ?")
+                params.append(int(expected_version))
+            except (TypeError, ValueError):
+                return 0
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE torrent_state SET {', '.join(sets)}, "
+                f"updated_at = ?, version = version + 1 "
+                f"WHERE {' AND '.join(clauses)}",
+                (*params[:len(sets)], now, *params[len(sets):]),
+            )
+            if (cur.rowcount or 0) <= 0:
+                return 0
+            row = self._conn.execute(
+                "SELECT version FROM torrent_state WHERE source_infohash = ?",
+                (norm,),
+            ).fetchone()
+            try:
+                return int(row["version"] or 0) if row else 0
+            except (TypeError, ValueError):
+                return 0
+    
     def set_vps1_activity(self, source_infohash: str,
                           when: dt.datetime | None = None) -> bool:
         """Stamp swarm-activity observation; True when a row was updated.

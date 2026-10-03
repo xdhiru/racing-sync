@@ -97,9 +97,16 @@ class SSDLedgerMixin:
                 pass
             # Persist the freeze so a restart before any other upsert keeps
             # the same batch boundaries under a persisted batch_index.
+            # Narrow write (never a whole-row upsert): a read-path freeze
+            # must not regress a concurrently transitioned state.
             try:
                 store = getattr(self, "store", None)
-                if store is not None and hasattr(store, "upsert"):
+                _up = getattr(store, "update_columns", None)
+                if store is not None and callable(_up):
+                    if not _up((ts.source_infohash or ""),
+                               {"batch_cap_bytes": cap}):
+                        store.upsert(ts)
+                elif store is not None and hasattr(store, "upsert"):
                     store.upsert(ts)
             except Exception:
                 pass

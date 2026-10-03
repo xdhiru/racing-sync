@@ -5537,8 +5537,31 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             ts.last_error = f"moving parked ({n}x): {reason}"[:500]
         except Exception:
             pass
+        # Narrow park write: a concurrent transition (recovery, API retry)
+        # must survive the park — a whole-row upsert here would regress it
+        # (e.g. MOVING->RE_ADDING back to MOVING). The revision sync keeps
+        # later transitions on this object valid.
         try:
-            self.store.upsert(ts)
+            _up = getattr(self.store, "update_columns", None)
+            if callable(_up):
+                _nv = _up((ts.source_infohash or ""),
+                          {"last_error": ts.last_error})
+                if isinstance(_nv, int) and _nv > 0:
+                    try:
+                        ts.version = _nv
+                    except Exception:
+                        pass
+                elif self._abandoned(ts):
+                    raise AbandonedError(
+                        f"row gone for {(ts.source_infohash or '')[:10]}; "
+                        "not parking in MOVING"
+                    )
+                else:
+                    self.store.upsert(ts)
+            else:
+                self.store.upsert(ts)
+        except AbandonedError:
+            raise
         except Exception:  # noqa: BLE001
             pass
         if quiet:
