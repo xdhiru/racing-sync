@@ -193,6 +193,41 @@ def _clone_formdata(fd: aiohttp.FormData) -> aiohttp.FormData:
 # (e.g. missing torrent) that must surface immediately, not be retried.
 _TRANSIENT_STATUSES = (408, 425, 429, 502, 503, 504)
 
+# Deluge/JSON-RPC method prefixes that only read server state. Everything
+# runs over POST, so the HTTP method alone cannot tell reads from writes:
+# these prefixes keep their retries while mutating RPCs (core.add_*,
+# core.remove_*, core.pause_*, core.force_recheck, core.set_*, …) are
+# single-shot. `web.connect` only (re)attaches the daemon session and
+# `auth.*` just logs in — both harmless to repeat.
+_READ_RPC_PREFIXES = ("core.get", "web.", "auth.", "system.")
+
+
+def _is_idempotent_request(method: object, path: object,
+                           json_body: object) -> bool:
+    """True when blindly re-sending this request cannot double-apply it.
+
+    A lost response does not prove the server didn't process the call, so
+    mutations (qB POSTs, Deluge non-read RPCs) get exactly one attempt and
+    surface the error for the caller to verify-then-act on (e.g. qB's
+    "Fails."-duplicate handling). Reads keep all retries.
+    """
+    try:
+        m = (method or "").upper()  # type: ignore[union-attr]
+    except Exception:
+        return False
+    if m in ("GET", "HEAD", "OPTIONS"):
+        return True
+    if m != "POST":
+        return False
+    try:
+        if isinstance(json_body, dict):
+            rpc_method = str(json_body.get("method") or "")
+            if rpc_method.startswith(_READ_RPC_PREFIXES):
+                return True
+    except Exception:
+        pass
+    return False
+
 
 class HTTPClientBase:
     """Wraps aiohttp with:
@@ -492,8 +527,16 @@ class HTTPClientBase:
 
         path_clean = path.lstrip("/")
 
+        # A lost response never proves the server skipped the call, so only
+        # idempotent requests (reads) may be re-sent blindly. Mutations get
+        # one attempt; failures surface for verify-then-act handling at the
+        # call site (duplicate-tolerant adds, park-and-retry). A 401 proves
+        # the call was NOT processed, so the post-login re-issue below
+        # still runs for every method.
+        idempotent = _is_idempotent_request(method, path, json_body)
+
         async def _do() -> aiohttp.ClientResponse:
-            for attempt in range(3):
+            for attempt in range(3 if idempotent else 1):
                 req_data = _get_request_data()
                 try:
                     return await self.session.request(
@@ -510,7 +553,7 @@ class HTTPClientBase:
                     aiohttp.ClientOSError,
                     asyncio.TimeoutError,
                 ) as e:
-                    if attempt == 2:
+                    if not idempotent or attempt == 2:
                         raise
                     log.warning(
                         "[%s] %s %s network error (%s); retrying in %.1fs",
@@ -521,8 +564,9 @@ class HTTPClientBase:
 
         r = await _do()
 
-        # Retry transient gateway / rate-limit errors
-        for attempt in range(3):
+        # Retry transient gateway / rate-limit errors — reads only, for the
+        # same processed-but-lost reason as above.
+        for attempt in range(3 if idempotent else 0):
             if r.status not in _TRANSIENT_STATUSES:
                 break
             delay = 0.5 * (2 ** attempt)
@@ -607,8 +651,9 @@ class HTTPClientBase:
                 raise last_exc
 
         # A post-login response can still be a transient gateway/rate-limit
-        # error — retry it instead of surfacing a hard failure.
-        for attempt in range(3):
+        # error — retry it instead of surfacing a hard failure (reads only;
+        # a mutation that reached the server must not be re-issued).
+        for attempt in range(3 if idempotent else 0):
             if r.status not in _TRANSIENT_STATUSES:
                 break
             delay = 0.5 * (2 ** attempt)

@@ -705,9 +705,7 @@ async def test_http_client_form_data_rebuilt_per_attempt_and_tuple_specs():
 
     async def mock_req(method, url, data=None, **kwargs):
         attempts_data.append(data)
-        if len(attempts_data) == 1:
-            raise aiohttp.ClientOSError("network glitch")
-        return resp_ok
+        raise aiohttp.ClientOSError("network glitch")
 
     client._session.request = mock_req
 
@@ -715,14 +713,15 @@ async def test_http_client_form_data_rebuilt_per_attempt_and_tuple_specs():
         ("t1", ("file1.torrent", b"content1", "application/x-bittorrent")),
         ("t2", "file2.torrent", b"content2", "application/x-bittorrent", {"X-Custom": "val"}),
     ]
-    res = await client.request("POST", "/upload", data={"key": "val"}, files=files)
-    assert res == resp_ok
-    assert len(attempts_data) == 2
-    # Ensure distinct FormData objects were passed on each attempt
-    assert attempts_data[0] is not attempts_data[1]
+    # Mutations are single-shot (a lost response never proves the server
+    # skipped the call — re-sending could double-add). The error surfaces
+    # for verify-then-act handling instead of a blind retry.
+    with pytest.raises(aiohttp.ClientOSError):
+        await client.request("POST", "/upload", data={"key": "val"}, files=files)
+    assert len(attempts_data) == 1
 
-    # Verify field extraction on the successful FormData
-    fd = attempts_data[1]
+    # Verify field extraction on the built FormData
+    fd = attempts_data[0]
     field_names = [f[0]["name"] for f in fd._fields]
     assert "key" in field_names
     assert "t1" in field_names
