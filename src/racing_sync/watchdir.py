@@ -372,19 +372,21 @@ class WatchDirScanner:
         patterns = [self._cfg.glob]
         if ".torrent" in self._cfg.glob and ".TORRENT" not in self._cfg.glob:
             patterns.append(self._cfg.glob.replace(".torrent", ".TORRENT"))
-            # Mixed-case drops (Show.Torrent) are missed by glob on Linux:
-            # sweep the directory once and match suffix case-insensitively.
-            try:
-                for _p in Path(self._cfg.path).iterdir():
-                    try:
-                        if (_p.is_file() and not _p.is_symlink()
-                                and _p.suffix.lower() == ".torrent"):
-                            entries.add(_p)
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+        # Mixed-case drops (Show.Torrent) are missed by glob on Linux:
+        # sweep the directory once and match suffix case-insensitively.
+        # Declared BEFORE the sweep: adding inside the loop NameErrors
+        # per file (swallowed below) and drops the file silently.
         entries: set[Path] = set()
+        try:
+            for _p in Path(self._cfg.path).iterdir():
+                try:
+                    if (_p.is_file() and not _p.is_symlink()
+                            and _p.suffix.lower() == ".torrent"):
+                        entries.add(_p)
+                except Exception:
+                    continue
+        except Exception:
+            pass
         for pattern in patterns:
             try:
                 entries.update(Path(self._cfg.path).glob(pattern))
