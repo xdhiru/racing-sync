@@ -532,3 +532,110 @@ def test_set_vps1_activity_is_narrow(tmp_path: Path):
         assert store.set_vps1_activity("  ") is False
     finally:
         store.close()
+
+
+def test_transition_refuses_stale_version_same_state(tmp_path: Path):
+    """Same-state concurrent write (bare park) invalidates stale snapshots."""
+    from racing_sync.coordinator_errors import AbandonedError
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="s" * 40, source_name="S",
+                                  state=State.NEW))
+        a = store.get("s" * 40)
+        b = store.get("s" * 40)
+        assert a.version == b.version == 0
+        # Another writer parks without moving state (bumps revision only).
+        assert store.update_columns("s" * 40, {"last_error": "parked"}) > 0
+        assert store.get("s" * 40).version == 1
+        # B still holds v0: same-state transition must fail loudly and
+        # leave the DB exactly as the winner left it.
+        with pytest.raises(AbandonedError):
+            store.transition(b, State.QUEUED)
+        row = store.get("s" * 40)
+        assert (row.state, row.last_error, row.version) == (
+            State.NEW, "parked", 1)
+        assert b.state == State.NEW
+    finally:
+        store.close()
+
+
+def test_transition_chain_same_object(tmp_path: Path):
+    """Sequential transitions on one object keep working (revision chains)."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="c" * 40, source_name="C",
+                                  state=State.NEW))
+        ts = store.get("c" * 40)
+        store.transition(ts, State.QUEUED)
+        assert (ts.version, store.get("c" * 40).version) == (1, 1)
+        store.transition(ts, State.DOWNLOADING)
+        assert (ts.version, store.get("c" * 40).version) == (2, 2)
+        assert store.get("c" * 40).state == State.DOWNLOADING
+    finally:
+        store.close()
+
+
+def test_upsert_then_transition_same_object(tmp_path: Path):
+    """Demote-style upsert+transition must not trip the version guard."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="u" * 40, source_name="U",
+                                  state=State.MOVING))
+        ts = store.get("u" * 40)
+        ts.save_path = "/ssd"
+        store.upsert(ts)
+        assert ts.version == 1
+        store.transition(ts, State.RE_ADDING)
+        assert store.get("u" * 40).state == State.RE_ADDING
+    finally:
+        store.close()
+
+
+def test_update_columns_narrow_guarded(tmp_path: Path):
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="n" * 40, source_name="N",
+                                  state=State.MOVING, last_error="",
+                                  total_bytes=100))
+        v1 = store.update_columns("n" * 40, {"last_error": "parked"})
+        assert v1 == 1
+        row = store.get("n" * 40)
+        assert (row.last_error, row.state, row.total_bytes) == (
+            "parked", State.MOVING, 100)
+        # Guards: wrong state / wrong version write nothing.
+        assert store.update_columns(
+            "n" * 40, {"last_error": "x"},
+            expected_state=State.QUEUED) == 0
+        assert store.update_columns(
+            "n" * 40, {"last_error": "x"}, expected_version=999) == 0
+        assert store.get("n" * 40).last_error == "parked"
+        # Unknown + managed columns never reach SQL.
+        assert store.update_columns(
+            "n" * 40, {"nope": 1, "updated_at": "zzz", "version": 9}) == 0
+        assert store.get("n" * 40).version == 1
+        # Tombstoned rows never match.
+        assert store.tombstone("n" * 40) is True
+        assert store.update_columns("n" * 40, {"last_error": "x"}) == 0
+        assert store.update_columns("") == 0
+    finally:
+        store.close()
+
+
+def test_transition_tombstoned_no_diverge(tmp_path: Path):
+    """Mid-flight forget: loud refuse, in-memory object untouched."""
+    from racing_sync.coordinator_errors import AbandonedError
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="t" * 40, source_name="T",
+                                  state=State.MOVING,
+                                  last_error="before"))
+        ts = store.get("t" * 40)
+        assert store.tombstone("t" * 40) is True
+        with pytest.raises(AbandonedError):
+            store.transition(ts, State.RE_ADDING)
+        assert ts.state == State.MOVING
+        assert ts.last_error == "before"
+    finally:
+        store.close()

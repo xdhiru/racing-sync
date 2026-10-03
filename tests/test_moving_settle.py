@@ -106,6 +106,26 @@ def test_park_escalation_throttles_after_first_error(caplog):
     assert "(parked 25x" in errors[1].getMessage()
 
 
+@pytest.mark.anyio
+async def test_park_moving_preserves_concurrent_state(tmp_path):
+    """A park must not regress a state moved by someone else meanwhile."""
+    coord, store = _moving_single(tmp_path, progress=0.0)
+    try:
+        stale = store.get("s" * 40)
+        assert stale.state == State.MOVING
+        # Concurrent writer advances the row first.
+        other = store.get("s" * 40)
+        store.transition(other, State.RE_ADDING)
+        assert store.get("s" * 40).state == State.RE_ADDING
+        # The stale park records its reason but keeps the winner's state.
+        coord._park_moving(stale, "short bytes")
+        row = store.get("s" * 40)
+        assert row.state == State.RE_ADDING
+        assert "short bytes" in (row.last_error or "")
+    finally:
+        store.close()
+
+
 
 @pytest.mark.anyio
 async def test_pause_verified_short_circuits_checking(tmp_path):
