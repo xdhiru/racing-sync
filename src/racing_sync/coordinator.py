@@ -325,6 +325,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     # (incident over); attempts are capped so a remote that keeps losing
     # files falls through to the 24h max-age FAIL instead of looping.
     _readd_heal_track: dict[str, list] = field(default_factory=dict, init=False)
+    # Prowlarr supplement sweep: row-hash -> next-allowed monotonic time.
+    # tracker_map cross-seeds are opportunistic (VPS1 late arrivals are
+    # still checked every tick); one Prowlarr round per row per window.
+    _supplement_ok_at: dict[str, float] = field(default_factory=dict, init=False)
 
     @property
     def download_sem(self) -> asyncio.Semaphore:
@@ -7357,8 +7361,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         try:
             racing = await self._list_source_torrents()
         except Exception as e:  # noqa: BLE001
+            # No early return: an unreachable VPS1 must not skip the
+            # tracker_map supplements below (often the only remaining
+            # cross-seed source) — proceed with an empty racing set.
             log.warning("could not list racing torrents for re-injection: %s", e)
-            return
+            racing = []
 
         target_norm = normalize_content_name(ts.source_name)
         matches = [
@@ -7452,6 +7459,251 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     "re-inject: no racing torrents left on VPS1 for %s; cross-seed only",
                     ts.source_name[:60],
                 )
+
+        # Supplementary private cross-seeds harvested via Prowlarr: VPS1
+        # is not the whole world — tracker_map indexers may hold the same
+        # release under a different infohash (piece size, source tag).
+        # Same fail-closed rules as racing members (per-blob fuse gate,
+        # skip_check only onto verified bytes). Best-effort: never raises.
+        try:
+            await self._re_inject_tracker_map_supplements(ts)
+        except (asyncio.CancelledError, AbandonedError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.debug("re-inject supplements failed for %s: %s",
+                      ts.source_name[:60], e)
+
+    # Prowlarr supplement sweep interval (seconds): extra fuse seeds are
+    # opportunistic, not urgent — one search per row per window, while
+    # VPS1 late arrivals are still checked every tick by the caller.
+    _SUPPLEMENT_RETRY_S = 21600.0
+
+    async def _re_inject_tracker_map_supplements(self, ts: TorrentState) -> None:
+        """Inject same-release torrents from tracker_map indexers to fuse.
+
+        VPS1 supplements the racing set; it does not bound it. For each
+        configured tracker_map indexer with an exact same-release hit
+        (normalized name + size), download the .torrent, verify the
+        payload, and inject it onto the fuse mount with skip_check=True
+        — but only when its files are already stat-able at the target
+        (same bytes the row moved; never blind). Membership in
+        tracker_map is the opt-in: empty map = no-op. Never raises
+        (except cancellation/abandonment, which propagate).
+        """
+        if getattr(self, "_stop", False):
+            return
+        try:
+            prowlarr = getattr(self, "prowlarr", None)
+            if prowlarr is None:
+                return
+            cfg_prowlarr = getattr(getattr(self, "cfg", None), "prowlarr", None)
+            if cfg_prowlarr is None:
+                return
+            if not bool(getattr(self.cfg.cross_seed,
+                               "inject_racing_torrents_to_fuse", False)):
+                return
+            tmap = getattr(cfg_prowlarr, "tracker_map", None)
+            entries = getattr(tmap, "entries", None)
+            if not isinstance(entries, dict) or not entries:
+                return
+            try:
+                if callable(getattr(cfg_prowlarr, "should_skip_title", None)) \
+                        and cfg_prowlarr.should_skip_title(ts.source_name or ""):
+                    return
+            except Exception:
+                pass
+        except (asyncio.CancelledError, AbandonedError):
+            raise
+        except Exception:
+            return
+        try:
+            row_key = (ts.source_infohash or "").lower()
+        except Exception:
+            return
+        if not row_key:
+            return
+        try:
+            memo = getattr(self, "_supplement_ok_at", None)
+            if not isinstance(memo, dict):
+                memo = {}
+                self._supplement_ok_at = memo  # type: ignore[attr-defined]
+            now_m = time.monotonic()
+            nxt = memo.get(row_key)
+            try:
+                nxt_f = float(nxt) if nxt is not None else 0.0
+            except (TypeError, ValueError):
+                nxt_f = 0.0
+            if nxt_f and now_m < nxt_f:
+                return
+        except (asyncio.CancelledError, AbandonedError):
+            raise
+        except Exception:
+            return
+        try:
+            indexers = []
+            seen: set[str] = set()
+            for _sub, name in entries.items():
+                try:
+                    idx = prowlarr.get_indexer_by_name(name)
+                except Exception:
+                    continue
+                if idx is None:
+                    continue
+                try:
+                    if not bool(getattr(idx, "enable", False)):
+                        continue
+                    low = str(getattr(idx, "name", "") or "").lower()
+                except Exception:
+                    continue
+                if not low or low in seen:
+                    continue
+                seen.add(low)
+                indexers.append(idx)
+            if not indexers:
+                return
+            try:
+                hits_by_indexer = await asyncio.wait_for(
+                    prowlarr.search_indexers_parallel(
+                        indexers, ts.source_name or ""),
+                    timeout=30.0,
+                )
+            except (asyncio.CancelledError, AbandonedError):
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("supplement search failed for %s: %s",
+                            ts.source_name[:60], e)
+                return
+            try:
+                memo[row_key] = time.monotonic() + self._SUPPLEMENT_RETRY_S
+                if len(memo) > 5000:
+                    for _k in list(memo.keys())[: len(memo) - 5000]:
+                        memo.pop(_k, None)
+            except Exception:
+                pass
+            try:
+                known = {
+                    (h or "").lower() for h in (
+                        ts.source_infohash, ts.dest_infohash,
+                        ts.cross_seed_infohash,
+                        *ts.injected_private_hashes.split(","),
+                    ) if h
+                }
+            except Exception:
+                known = set()
+            try:
+                ts_fallback_mount = self._target_mount_for(ts)
+            except Exception:
+                return
+            added = 0
+            for idx_hits in (hits_by_indexer or {}).values():
+                for hit in idx_hits or []:
+                    try:
+                        ht = getattr(hit, "title", "") or ""
+                        hs = int(getattr(hit, "size_bytes", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    try:
+                        if not _matches_release(
+                                ht, hs, ts.source_name or "",
+                                int(ts.total_bytes or 0)):
+                            continue
+                    except Exception:
+                        continue
+                    try:
+                        blob = await asyncio.wait_for(
+                            prowlarr.download_torrent(hit), timeout=30.0)
+                    except (asyncio.CancelledError, AbandonedError):
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("supplement fetch failed for %s: %s",
+                                  ht[:50], e)
+                        continue
+                    try:
+                        verified = _verified_cross_seed_blob(
+                            blob, target_name=ts.source_name or "",
+                            target_size=int(ts.total_bytes or 0),
+                            hit_title=ht)
+                    except Exception:
+                        continue
+                    if verified is None:
+                        continue
+                    _blob, real_hash, _ann = verified
+                    try:
+                        h_low = (real_hash or "").lower()
+                    except Exception:
+                        continue
+                    if not h_low or h_low in known:
+                        continue
+                    try:
+                        if self._abandoned(ts):
+                            raise AbandonedError(
+                                f"row gone for {(ts.source_infohash or '')[:10]}")
+                    except AbandonedError:
+                        raise
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(self, "store", None) is not None and callable(
+                                getattr(self.store, "is_ignored", None)) \
+                                and self.store.is_ignored(h_low) is True:
+                            log.info("supplement: skipping cancelled torrent %s",
+                                     h_low[:10])
+                            known.add(h_low)
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        match_expected = self._expected_fuse_files(_blob)
+                    except Exception:
+                        match_expected = None
+                    if not match_expected:
+                        continue
+                    try:
+                        match_mount = self._target_mount_for_blob(
+                            _blob, ts_fallback_mount)
+                        match_missing = await self._missing_fuse_files(
+                            match_mount, match_expected)
+                    except Exception:
+                        continue
+                    if match_missing:
+                        continue
+                    try:
+                        ok, _detail = await self._ensure_fuse_entry(
+                            blob=_blob, infohash=h_low,
+                            target_mount=match_mount,
+                            label="tracker_map supplement")
+                    except (asyncio.CancelledError, AbandonedError):
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("supplement inject failed for %s: %s",
+                                  h_low[:10], e)
+                        continue
+                    if not ok:
+                        continue
+                    try:
+                        cur = ts.injected_private_hashes or ""
+                        parts = [p for p in cur.split(",") if p]
+                        if h_low not in parts:
+                            parts.append(h_low)
+                            ts.injected_private_hashes = ",".join(parts)
+                    except Exception:
+                        pass
+                    known.add(h_low)
+                    added += 1
+                    log.info("supplement: injected %s for %s from %s",
+                             h_low[:10], ts.source_name[:60],
+                             getattr(hit, "indexer", "?"))
+            if added:
+                try:
+                    self.store.upsert(ts)
+                except Exception:
+                    pass
+        except (asyncio.CancelledError, AbandonedError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.debug("re-inject supplements failed for %s: %s",
+                      ts.source_name[:60], e)
+            return
 
     # ---- Telegram /injectfuse: operator-moved manual seeding ----
 

@@ -187,6 +187,9 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
     - Delete the SSD torrent entry (`delete_files=False`; bytes already moved).
     - For each racing-client torrent for the content (+ the cross-seed):
       `add_torrent(save_path=fuse.mount, skip_check=True, paused=False)`.
+      Supplementary private cross-seeds are harvested from `tracker_map`
+      indexers via Prowlarr (same release, per-blob fuse gate, memoized
+      6h/row) — VPS1 supplements, never bounds, the racing set.
     - Every fresh add is **verified visible at the target** (4×2s). The fuse
       index lags while rclone is busy, so accepted-but-invisible parks and
       retries — never `DONE`, never destructive. Transient rejections park;
@@ -350,7 +353,12 @@ and values are Prowlarr indexer names. The first matching substring wins
 (evaluated in insertion order).
 
 Keys match case-insensitively against the announce URLs of racing torrents.
-This is what `prowlarr.resolve_indexer_for_announce(url)` uses internally.
+Live uses: (1) the watch-dir sacrificial flow adds every mapped indexer to
+its Prowlarr search pool (private cross-seeds for fuse); (2) the racing
+re-inject harvests same-release torrents from mapped indexers as
+supplementary fuse seeds (per-blob gate, 6h memo/row) — VPS1 supplements,
+never bounds, the racing set. The SSD download search itself always walks
+`download_indexers` in priority order; `tracker_map` never narrows it.
 
 ## Operational notes
 
