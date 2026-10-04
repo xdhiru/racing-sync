@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import pytest
 from unittest.mock import MagicMock
@@ -324,3 +325,108 @@ def test_move_timeout_seconds_falls_back_for_test_doubles():
     assert _move_timeout_seconds(cfg) == 1800
     cfg.rclone.move_timeout_seconds = 5  # below the 60s floor
     assert _move_timeout_seconds(cfg) == 60.0
+
+
+def _orphan_proc():
+    from unittest.mock import AsyncMock, MagicMock
+
+    proc = AsyncMock()
+    proc.communicate.side_effect = TimeoutError()
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock(side_effect=asyncio.TimeoutError())
+    proc.returncode = None
+    proc.pid = 4242
+    return proc
+
+
+def _rclone_cfg():
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+    cfg.rclone.binary = Path("/usr/bin/rclone")
+    return cfg
+
+
+@pytest.mark.anyio
+async def test_unreaped_orphan_blocks_duplicate_tree(monkeypatch, tmp_path):
+    """Timeout + unkillable child keeps the tree guard: retry parks, never races."""
+    import asyncio as _asyncio
+    from unittest.mock import AsyncMock
+    from racing_sync import rclone_ops
+    from racing_sync.rclone_ops import (
+        RcloneBusyError, RcloneTimeoutError, run_rclone,
+    )
+
+    tree = tmp_path / "Top"
+    tree.mkdir()
+    proc = _orphan_proc()
+    spawn = AsyncMock(return_value=proc)
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", spawn)
+    try:
+        with pytest.raises(RcloneTimeoutError):
+            await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"],
+                             timeout=0.01, tree=tree)
+        # Orphan unreaped (returncode None): guard held.
+        assert rclone_ops._ACTIVE_MOVES, "orphan must keep its tree guard"
+        with pytest.raises(RcloneBusyError) as exc_info:
+            await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"],
+                             timeout=0.01, tree=tree)
+        assert isinstance(exc_info.value, RcloneTimeoutError)  # parks like timeout
+        assert "4242" in str(exc_info.value)
+        assert spawn.await_count == 1, "no duplicate spawn while orphan lives"
+    finally:
+        rclone_ops._ACTIVE_MOVES.clear()
+
+
+@pytest.mark.anyio
+async def test_reaped_orphan_releases_tree(monkeypatch, tmp_path):
+    """Once the orphan exits, the next move for the tree proceeds."""
+    import asyncio as _asyncio
+    from unittest.mock import AsyncMock
+    from racing_sync import rclone_ops
+    from racing_sync.rclone_ops import run_rclone
+
+    tree = tmp_path / "Top"
+    tree.mkdir()
+    proc = _orphan_proc()
+    proc2 = AsyncMock()
+    proc2.communicate = AsyncMock(return_value=(b"", b""))
+    proc2.returncode = 0
+    spawn = AsyncMock(side_effect=[proc, proc2])
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", spawn)
+    try:
+        with pytest.raises(Exception):
+            await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"],
+                             timeout=0.01, tree=tree)
+        assert spawn.await_count == 1
+        proc.returncode = 0  # loop reaps the orphan meanwhile
+        res = await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"],
+                               timeout=60, tree=tree)
+        assert res.ok
+        assert spawn.await_count == 2
+        assert not rclone_ops._ACTIVE_MOVES
+    finally:
+        rclone_ops._ACTIVE_MOVES.clear()
+
+
+@pytest.mark.anyio
+async def test_success_drops_tree_guard(monkeypatch, tmp_path):
+    import asyncio as _asyncio
+    from unittest.mock import AsyncMock
+    from racing_sync import rclone_ops
+    from racing_sync.rclone_ops import run_rclone
+
+    tree = tmp_path / "Top"
+    tree.mkdir()
+    proc = AsyncMock()
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+    proc.returncode = 0
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec",
+                        AsyncMock(return_value=proc))
+    try:
+        res = await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"],
+                               timeout=60, tree=tree)
+        assert res.ok
+        assert not rclone_ops._ACTIVE_MOVES
+    finally:
+        rclone_ops._ACTIVE_MOVES.clear()

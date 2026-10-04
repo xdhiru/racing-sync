@@ -62,6 +62,98 @@ class RcloneTimeoutError(RcloneError):
     """
 
 
+class RcloneBusyError(RcloneTimeoutError):
+    """A previous move for the same tree is still running.
+
+    Raised instead of spawning a duplicate `rclone move` against a tree
+    an unreaped (unkillable) orphan may still be deleting from.
+    Subclasses RcloneTimeoutError so every existing park-on-timeout
+    handler treats it as retry-later, never as failure.
+    """
+
+
+# Live move procs by source tree (normcased absolute path): an
+# unkillable orphan keeps its entry until non-blocking `returncode`
+# shows it reaped, and any new move for the same tree refuses with
+# RcloneBusyError instead of racing it. Bounded: trees never retried
+# leave stale entries, so the map is capped (reaped ones are dropped
+# on next attempt for their tree first).
+_ACTIVE_MOVES: dict[str, object] = {}
+_ACTIVE_MOVES_CAP = 5000
+
+
+def _tree_key(tree: object) -> str | None:
+    try:
+        return os.path.normcase(os.path.abspath(os.fspath(tree)))
+    except Exception:
+        return None
+
+
+def _proc_reaped(proc: object) -> bool:
+    """Non-blocking liveness probe: True when the child already exited."""
+    try:
+        return getattr(proc, "returncode", None) is not None
+    except Exception:
+        return True
+
+
+def _active_check(tree: object) -> str | None:
+    """Reserve `tree` for a new move; returns its registry key (or None).
+
+    Raises RcloneBusyError when a previous move for the same tree is
+    still running (reaped entries are dropped transparently). Callers
+    record the spawned proc with _active_set() and release it with
+    _active_drop() — keep=True preserves an unreaped orphan's entry.
+    """
+    key = _tree_key(tree)
+    if key is None:
+        return None
+    try:
+        holder = _ACTIVE_MOVES.get(key)
+    except Exception:
+        holder = None
+    if holder is not None:
+        if _proc_reaped(holder):
+            try:
+                _ACTIVE_MOVES.pop(key, None)
+            except Exception:
+                pass
+        else:
+            try:
+                _pid = getattr(holder, "pid", "?")
+            except Exception:
+                _pid = "?"
+            raise RcloneBusyError(
+                f"previous rclone move for {tree} (pid={_pid}) still "
+                f"running; not starting a duplicate (source intact, "
+                f"retry later)")
+    try:
+        if len(_ACTIVE_MOVES) >= _ACTIVE_MOVES_CAP:
+            for _k in list(_ACTIVE_MOVES.keys())[: len(_ACTIVE_MOVES) - _ACTIVE_MOVES_CAP + 1]:
+                _ACTIVE_MOVES.pop(_k, None)
+    except Exception:
+        pass
+    return key
+
+
+def _active_set(key: str | None, proc: object) -> None:
+    if key is None:
+        return
+    try:
+        _ACTIVE_MOVES[key] = proc
+    except Exception:
+        pass
+
+
+def _active_drop(key: str | None, *, keep: bool) -> None:
+    if key is None or keep:
+        return
+    try:
+        _ACTIVE_MOVES.pop(key, None)
+    except Exception:
+        pass
+
+
 def _validate_rclone_binary(cfg: AppConfig) -> Path | None:
     """Require an absolute, executable rclone binary to avoid PATH hijack.
 
@@ -227,10 +319,19 @@ async def run_rclone(
     cmd: list[str],
     *,
     timeout: float | None = None,
+    tree: Path | None = None,
 ) -> RcloneResult:
+    """Run one rclone command with a wall-clock ceiling.
+
+    `tree`: the source tree being moved (move_local_to_remote passes
+    `local`). Refuses with RcloneBusyError while a previous move for
+    the same tree is still alive instead of racing it; an unreaped
+    orphan keeps its guard entry until it exits.
+    """
     if timeout is None:
         timeout = _move_timeout_seconds(cfg)
     _validate_rclone_binary(cfg)
+    _move_key = _active_check(tree)
     log.info("rclone: %s", redact_rclone_cmd(cmd))
     t0 = time.monotonic()
     try:
@@ -242,7 +343,9 @@ async def run_rclone(
             env=_env(cfg),
         )
     except (FileNotFoundError, PermissionError, OSError) as e:
+        _active_drop(_move_key, keep=False)
         raise RcloneError(f"could not spawn rclone {cmd[0]!r}: {e}") from e
+    _active_set(_move_key, proc)
     async def _kill_child() -> None:
         """Best-effort terminate+reap a still-running child (bounded)."""
         try:
@@ -295,6 +398,7 @@ async def run_rclone(
                     pass
         except Exception:
             pass
+        _active_drop(_move_key, keep=not _proc_reaped(proc))
         raise
     except asyncio.TimeoutError:
         import inspect as _inspect
@@ -319,8 +423,9 @@ async def run_rclone(
                 try:
                     # Bounded: an unkillable (D-state) process must not wedge
                     # the move worker (and its semaphore slot) forever. The
-                    # orphan is reaped by the event loop on exit; the row
-                    # stays put for retry via the straggler check.
+                    # orphan keeps its tree guard below, so the next tick
+                    # parks with RcloneBusyError instead of racing it; the
+                    # row stays put for retry via the straggler check.
                     await asyncio.wait_for(proc.wait(), timeout=10.0)
                 except asyncio.TimeoutError:
                     pass
@@ -333,6 +438,18 @@ async def run_rclone(
                     pass
             except Exception:
                 pass
+        _orphaned = not _proc_reaped(proc)
+        _active_drop(_move_key, keep=_orphaned)
+        if _orphaned:
+            try:
+                _opid = getattr(proc, "pid", "?")
+            except Exception:
+                _opid = "?"
+            log.warning(
+                "rclone move unreaped (pid=%s); tree guard held until it "
+                "exits — further moves for the same tree park meanwhile",
+                _opid,
+            )
         raise RcloneTimeoutError(
             f"rclone timeout after {timeout}s (source intact, retry later): "
             f"{redact_rclone_cmd(cmd)}"
@@ -341,8 +458,10 @@ async def run_rclone(
         # Any other communicate() failure (OSError, broken pipe, ...):
         # without a kill the child keeps running while the caller treats
         # the move as failed, and the next tick starts a duplicate move
-        # of the same content. Reap boundedly, then re-raise.
+        # of the same content. Reap boundedly, then re-raise (keeping the
+        # tree guard when the child survives).
         await _kill_child()
+        _active_drop(_move_key, keep=not _proc_reaped(proc))
         raise
     dt = time.monotonic() - t0
     stdout = stdout_b.decode("utf-8", errors="replace")
@@ -359,6 +478,7 @@ async def run_rclone(
         log.error("rclone failed (%d) in %.1fs:\n%s", res.returncode, dt, sanitize_log_text(stderr[-2000:]))
     else:
         log.info("rclone ok in %.1fs", dt)
+    _active_drop(_move_key, keep=False)
     return res
 
 
@@ -415,7 +535,7 @@ async def move_local_to_remote(
                 list_path = fh.name
         cmd = build_move_cmd(cfg, local, dest_remote, include=include,
                              files_from=list_path, extra=extra)
-        return await run_rclone(cfg, cmd, timeout=timeout)
+        return await run_rclone(cfg, cmd, timeout=timeout, tree=local)
     finally:
         if list_path:
             try:
