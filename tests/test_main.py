@@ -115,9 +115,11 @@ def test_main_run_startup_failure_is_clean(tmp_path: Path, capsys):
 
 def test_main_run_reset_clears_state_db_and_logs(tmp_path: Path):
     from racing_sync.config import AppConfig
+    from racing_sync.state import StateStore
 
     state_db = tmp_path / "state.db"
-    state_db.write_bytes(b"old-db")
+    store = StateStore(state_db)
+    store.close()
     (tmp_path / "state.db-wal").write_bytes(b"wal")
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
@@ -165,6 +167,67 @@ def test_run_reset_requires_yes(tmp_path: Path):
     cfg_file.write_text(MINIMAL_CONFIG)
     rc = main(["run", "--config", str(cfg_file), "--reset"])
     assert rc == 2
+
+
+def test_run_reset_refuses_when_backup_fails_and_db_exists(tmp_path: Path, capsys):
+    """Snapshot failure with a live DB refuses instead of deleting blind."""
+    from racing_sync.config import AppConfig
+
+    state_db = tmp_path / "state.db"
+    state_db.write_bytes(b"old-db")
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+    cfg = AppConfig.from_toml(cfg_file)
+    cfg.general.state_db = state_db
+    cfg.general.log_dir = log_dir
+
+    with patch("racing_sync.__main__.AppConfig") as mock_cfg_cls, \
+         patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
+         patch("racing_sync.__main__.setup_logging"), \
+         patch("racing_sync.safety.backup_db", return_value=None):
+        mock_cfg_cls.from_toml.return_value = cfg
+        mock_coord_cls.return_value = MagicMock()
+        rc = main(["run", "--config", str(cfg_file), "--reset", "--yes"])
+        assert rc == 2
+    assert "backup failed" in capsys.readouterr().err
+    assert state_db.exists()
+
+
+def test_run_reset_proceeds_without_backup_when_no_db(tmp_path: Path):
+    """Fresh start (no DB file) needs no backup to proceed."""
+    from racing_sync.config import AppConfig
+
+    state_db = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+    cfg = AppConfig.from_toml(cfg_file)
+    cfg.general.state_db = state_db
+    cfg.general.log_dir = log_dir
+
+    with patch("racing_sync.__main__.AppConfig") as mock_cfg_cls, \
+         patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
+         patch("racing_sync.__main__.setup_logging"), \
+         patch("racing_sync.safety.backup_db", return_value=None):
+        mock_cfg_cls.from_toml.return_value = cfg
+        mock_coord = MagicMock()
+
+        async def fake_run():
+            return 0
+
+        async def fake_shutdown():
+            pass
+
+        mock_coord.run.side_effect = fake_run
+        mock_coord.shutdown.side_effect = fake_shutdown
+        mock_coord_cls.return_value = mock_coord
+        rc = main(["run", "--config", str(cfg_file), "--reset", "--yes"])
+        assert rc == 0
 
 
 def test_run_refuses_when_daemon_lock_held(tmp_path: Path, capsys):
