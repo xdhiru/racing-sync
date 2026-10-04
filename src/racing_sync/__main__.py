@@ -698,6 +698,21 @@ def main(argv: list[str] | None = None) -> int:
             if _backup is not None:
                 print(f"state.db backed up to: {_backup}")
             else:
+                # Same guard as forget --apply: "no DB file yet" (nothing to
+                # lose) proceeds, but a real snapshot failure (e.g. full
+                # disk) refuses — deleting state.db without a backup when
+                # the backup itself just failed is how data is lost.
+                try:
+                    import os as _os
+                    _db_exists = _os.path.exists(str(cfg.general.state_db))
+                except Exception:
+                    _db_exists = True
+                if _db_exists:
+                    print("refusing --reset: state.db backup failed "
+                          "(snapshot error, not a missing DB); fix the backup "
+                          "path before deleting anything.",
+                          file=sys.stderr)
+                    return 2
                 print("no state.db to back up (fresh start)")
             for line in _do_reset(cfg):
                 print(line)
