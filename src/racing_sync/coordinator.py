@@ -221,6 +221,52 @@ def _group_is_ignored(group: list[Torrent], store) -> bool:
     return False
 
 
+# Boot-step retry budget: a 30s WebUI/SSH blip during deploy must not
+# kill the daemon into a supervisor restart storm. Auth errors fail fast
+# (bad credentials never heal, and hammering risks lockout); everything
+# else backs off and the boot continues.
+_STARTUP_ATTEMPTS = 5
+_STARTUP_BACKOFF_S = (2.0, 4.0, 8.0, 16.0)
+
+
+async def _start_with_backoff(label: str, factory, *,
+                              attempts: int = _STARTUP_ATTEMPTS,
+                              delays: tuple[float, ...] = _STARTUP_BACKOFF_S):
+    """Run an I/O-doing boot step, retrying transient failures.
+
+    `factory` is a no-arg async callable or a blocking sync callable
+    (ran in a worker thread so a dial stall never wedges the loop).
+    AuthError always fails fast; CancelledError propagates for shutdown.
+    """
+    try:
+        tries = max(1, int(attempts))
+    except (TypeError, ValueError):
+        tries = _STARTUP_ATTEMPTS
+    last: Exception | None = None
+    for attempt in range(1, tries + 1):
+        try:
+            if asyncio.iscoroutinefunction(factory):
+                return await factory()
+            return await asyncio.to_thread(factory)
+        except AuthError:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt >= tries:
+                break
+            try:
+                delay = float(delays[min(attempt - 1, len(delays) - 1)])
+            except (TypeError, ValueError, IndexError):
+                delay = 2.0
+            log.warning("startup: %s failed (%s); retrying in %.0fs (%d/%d)",
+                        label, e, delay, attempt, tries)
+            await asyncio.sleep(max(0.0, delay))
+    assert last is not None
+    raise last
+
+
 def _log_api_task_done(task: "asyncio.Task") -> None:
     """Done-callback for the API serve task: a dead API must be loud.
 
@@ -446,13 +492,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
             if self.cfg.prowlarr.enabled:
                 self.prowlarr = ProwlarrClient(self.cfg.prowlarr)
-                await self.prowlarr.start()
+                await _start_with_backoff("prowlarr", self.prowlarr.start)
 
             if (self.cfg.source.type == "deluge"
                     and self.cfg.source.deluge_sftp
                     and self.cfg.source.deluge_sftp.enabled):
                 self.sftp = SFTPExporter(self.cfg.source.deluge_sftp)
-                self.sftp.connect()
+                await _start_with_backoff("sftp", self.sftp.connect)
                 # Reuse the shared connection for Deluge .torrent fallback
                 # instead of a fresh handshake per get_torrent_files call.
                 wire = getattr(self.source_client, "set_sftp_exporter", None)
