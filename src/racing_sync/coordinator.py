@@ -4543,6 +4543,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         parking. Tolerates concurrent forget (abandoned row unwinds).
         """
         log.error("failing download for %s: %s", ts.source_name[:60], error[:200])
+        # Abandoned first: a row forgotten while the worker ran must not
+        # lose its dest entry (or SSD data) to a corpse cleanup for a row
+        # that no longer exists — the wrapper unwinds quietly instead.
+        if self._abandoned(ts):
+            raise AbandonedError(
+                f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}; "
+                "not failing it"
+            )
         try:
             _csd = getattr(self, "_checking_track", None)
             if isinstance(_csd, dict):
