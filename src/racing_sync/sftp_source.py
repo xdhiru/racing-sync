@@ -57,6 +57,38 @@ class SFTPError(RuntimeError):
     pass
 
 
+def _close_exec_streams(*streams) -> None:
+    """Best-effort close of exec_command streams plus their channel.
+
+    Leaked channels pin server-side sessions until transport teardown —
+    the janitor's periodic df/stat probes used to exhaust them
+    ("no more sessions"). Never raises.
+    """
+    seen_channels: list = []
+    for s in streams:
+        try:
+            if s is None:
+                continue
+            try:
+                ch = getattr(s, "channel", None)
+            except Exception:
+                ch = None
+            if ch is not None and not any(ch is c for c in seen_channels):
+                seen_channels.append(ch)
+            close = getattr(s, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            continue
+    for ch in seen_channels:
+        try:
+            close = getattr(ch, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            continue
+
+
 def _ipv4_socket(host: str, port: int, *, timeout: float = 15) -> socket.socket:
     """Resolve `host` to an IPv4 address and return a connected socket.
 
@@ -433,14 +465,19 @@ class _SFTPConnection:
         client = self._client
         if client is None:
             return None
+        stdin, stdout, stderr = None, None, None
         try:
-            _, stdout, _ = client.exec_command(
-                f"stat -f -c '%a %S' {shlex.quote(path)}")
             try:
-                stdout.channel.settimeout(10.0)
-            except Exception:
-                pass
-            out = stdout.read()
+                stdin, stdout, stderr = client.exec_command(
+                    f"stat -f -c '%a %S' {shlex.quote(path)}")
+                try:
+                    stdout.channel.settimeout(10.0)
+                except Exception:
+                    pass
+                out = stdout.read()
+            finally:
+                _close_exec_streams(stdin, stdout, stderr)
+                stdin = stdout = stderr = None
             if out is None:
                 return None
             parts = out.decode("utf-8", errors="replace").split()
@@ -452,9 +489,16 @@ class _SFTPConnection:
         except Exception as e:  # noqa: BLE001
             # socket.timeout stringifies to "" — log the repr so the
             # next diagnosis isn't another empty "failed: " line.
+            # Falls through to the df fallback below (as before).
             log.warning("ssh stat %s failed: %r", path, e)
+        stdin, stdout, stderr = None, None, None
         try:
-            _, stdout, _ = client.exec_command(f"df -kP {shlex.quote(path)}")
+            try:
+                stdin, stdout, stderr = client.exec_command(
+                    f"df -kP {shlex.quote(path)}")
+            except Exception as e:  # noqa: BLE001
+                log.warning("ssh df %s failed: %r", path, e)
+                return None
             # Bound the read at the channel: a wedged transport must not
             # hold the member lock forever. (A per-call helper thread was
             # the old mechanism — it leaked one thread per wedged df.)
@@ -462,13 +506,16 @@ class _SFTPConnection:
                 stdout.channel.settimeout(10.0)
             except Exception:
                 pass
-            out = stdout.read()
+            try:
+                out = stdout.read()
+            except Exception as e:  # noqa: BLE001
+                log.warning("ssh df %s failed: %r", path, e)
+                return None
             if out is None:
                 return None
             out = out.decode("utf-8", errors="replace")
-        except Exception as e:  # noqa: BLE001
-            log.warning("ssh df %s failed: %r", path, e)
-            return None
+        finally:
+            _close_exec_streams(stdin, stdout, stderr)
         try:
             lines = [ln.split() for ln in out.splitlines() if ln.split()]
             # Header + one data line; data line has >=6 fields with Available 4th.
@@ -513,26 +560,47 @@ class _SFTPConnection:
                 if hasattr(self._cfg.state_dir, "as_posix")
                 else str(self._cfg.state_dir).replace("\\", "/")
             ).as_posix()
+            # Bound the backlog: a 100k-file state dir must not OOM the
+            # daemon — stop collecting past the cap (coordinator treats
+            # the rest as "not yet seen", retried next poll). Streams via
+            # listdir_iter when available so a huge dir never materializes
+            # fully (listdir_attr fetches everything first).
+            _LIST_CAP = 20000
+            _lister = getattr(self._sftp, "listdir_iter", None)
             try:
-                entries = self._sftp.listdir_attr(remote_dir)
+                if callable(_lister):
+                    iterator = _lister(remote_dir)
+                else:
+                    iterator = iter(self._sftp.listdir_attr(remote_dir))
             except OSError as e:
                 raise SFTPError(f"sftp listdir failed for {remote_dir}: {e}") from e
             except (paramiko.SSHException, EOFError) as e:
                 raise SFTPError(f"sftp listdir failed for {remote_dir}: {e}") from e
-            # Bound the backlog: a 100k-file state dir must not OOM the
-            # daemon — stop collecting past the cap (coordinator treats
-            # the rest as "not yet seen", retried next poll).
-            _LIST_CAP = 20000
-            for entry in entries:
-                if len(out) >= _LIST_CAP:
-                    log.warning("sftp state dir exceeds %d entries; truncating list",
-                                _LIST_CAP)
-                    break
-                name = entry.filename
-                if name.endswith(".torrent"):
-                    digest = name[: -len(".torrent")]
-                    if _HEX40_RE is not None and _HEX40_RE.fullmatch(digest):
-                        out.append(digest.lower())
+            try:
+                for entry in iterator:
+                    if len(out) >= _LIST_CAP:
+                        log.warning("sftp state dir exceeds %d entries; truncating list",
+                                    _LIST_CAP)
+                        break
+                    try:
+                        name = entry.filename
+                    except AttributeError:
+                        continue
+                    if name.endswith(".torrent"):
+                        digest = name[: -len(".torrent")]
+                        if _HEX40_RE is not None and _HEX40_RE.fullmatch(digest):
+                            out.append(digest.lower())
+            except OSError as e:
+                raise SFTPError(f"sftp listdir failed for {remote_dir}: {e}") from e
+            except (paramiko.SSHException, EOFError) as e:
+                raise SFTPError(f"sftp listdir failed for {remote_dir}: {e}") from e
+            finally:
+                try:
+                    close = getattr(iterator, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    pass
             return out
 
 
@@ -671,6 +739,10 @@ class SFTPExporter:
 
     # ---- lifecycle ----
 
+    # Dial budget for the whole pool: one wedged dial must not hold
+    # connect() (and the boot that calls it) forever.
+    _DIAL_TIMEOUT_S = 60.0
+
     def connect(self) -> None:
         # Members are independent transports: dial in parallel instead of
         # serially (~3x45s worst case before). First failure closes EVERY
@@ -679,15 +751,20 @@ class SFTPExporter:
         import concurrent.futures as _fut
 
         members = self._members_snapshot()
+        pool = _fut.ThreadPoolExecutor(
+            max_workers=max(1, len(members)), thread_name_prefix="sftp-dial",
+        )
+        futs: dict = {}
         try:
-            with _fut.ThreadPoolExecutor(
-                max_workers=max(1, len(members)), thread_name_prefix="sftp-dial",
-            ) as pool:
-                futs = {pool.submit(m.connect): m for m in members}
-                for fut in _fut.as_completed(futs):
+            futs = {pool.submit(m.connect): m for m in members}
+            try:
+                for fut in _fut.as_completed(futs, timeout=self._DIAL_TIMEOUT_S):
                     exc = fut.exception()
                     if exc is not None:
                         raise exc
+            except _fut.TimeoutError as e:
+                raise SFTPError(
+                    f"sftp dial timed out after {self._DIAL_TIMEOUT_S:.0f}s") from e
         except Exception:
             for m in members:
                 try:
@@ -695,6 +772,23 @@ class SFTPExporter:
                 except Exception:
                     pass
             raise
+        finally:
+            # Never wait for hung dials on the way out: running threads
+            # die on their own socket timeouts; the transports they would
+            # have installed are closed by the failure path above (or by
+            # close() on shutdown).
+            try:
+                for _f in futs:
+                    _f.cancel()
+            except Exception:
+                pass
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                try:
+                    pool.shutdown(wait=False)
+                except Exception:
+                    pass
 
     def close(self) -> None:
         try:

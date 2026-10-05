@@ -1235,3 +1235,31 @@ async def test_download_torrent_sends_key_to_same_host_only():
         _dl_hit("http://prowlarr.local:9696/api/v1/download/1"))
     call_args = client._session.get.call_args
     assert call_args.kwargs.get("headers") == {"X-Api-Key": "prowlarr_key"}
+
+
+@pytest.mark.anyio
+async def test_parallel_search_overall_deadline(monkeypatch):
+    """A hung indexer batch returns a miss fast instead of outliving the tick."""
+    import asyncio as _asyncio
+    from racing_sync.prowlarr import Indexer, ProwlarrClient
+
+    cfg = ProwlarrConfig(
+        enabled=True,
+        base_url="http://localhost:9696",
+        api_key="secret",
+        download_indexers=[DownloadIndexerConfig(name="Slow (API)")],
+    )
+    client = ProwlarrClient(cfg)
+
+    async def _hung(idx, query):
+        await _asyncio.sleep(30)
+        return []
+
+    client.search_indexer = _hung
+    monkeypatch.setattr(ProwlarrClient, "_PARALLEL_SEARCH_TIMEOUT_S", 0.05)
+    import time
+    t0 = time.monotonic()
+    assert await client.search_indexers_parallel(
+        [Indexer(id=1, name="Slow (API)", protocol="torrent",
+                 enable=True, capabilities=[])], "Some.Release") == {}
+    assert time.monotonic() - t0 < 10

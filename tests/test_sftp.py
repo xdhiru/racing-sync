@@ -537,3 +537,84 @@ def test_disk_free_via_df_wedge_returns_none():
     assert stdout.channel.settimeout.call_count == 2
     stdout.channel.settimeout.assert_called_with(10.0)
 
+
+def test_exec_streams_closed_after_stat():
+    """Stat/df probes must not leak exec channels (fd exhaustion)."""
+    from unittest.mock import MagicMock
+
+    m = _live_member(_sftp_cfg())
+    stdin, stdout, stderr = MagicMock(), MagicMock(), MagicMock()
+    stdout.read.return_value = b"4096 512"
+    m._client.exec_command.return_value = (stdin, stdout, stderr)
+
+    assert m._disk_free_via_df("/data") == 4096 * 512
+    for s in (stdin, stdout, stderr):
+        s.close.assert_called_once_with()
+    stdout.channel.close.assert_called_once_with()
+
+
+def test_exec_streams_closed_on_failure():
+    """Failed probes close too — no leak on the error path."""
+    from unittest.mock import MagicMock
+
+    m = _live_member(_sftp_cfg())
+    stdin, stdout, stderr = MagicMock(), MagicMock(), MagicMock()
+    stdout.read.side_effect = OSError("wedged")
+    m._client.exec_command.return_value = (stdin, stdout, stderr)
+
+    assert m._disk_free_via_df("/data") is None
+    for s in (stdin, stdout, stderr):
+        assert s.close.call_count >= 1
+
+
+def test_listdir_streams_without_full_fetch():
+    """listdir_iter is consumed lazily; listdir_attr never runs."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    m = _live_member(_sftp_cfg())
+    entries = [
+        SimpleNamespace(filename="a" * 40 + ".torrent"),
+        SimpleNamespace(filename="notes.txt"),
+    ]
+    m._sftp.listdir_iter = MagicMock(return_value=iter(entries))
+    m._sftp.listdir_attr = MagicMock(
+        side_effect=AssertionError("must stream, not bulk-fetch"))
+
+    assert m._list_state_dir_locked() == ["a" * 40]
+
+
+def test_listdir_falls_back_without_iter():
+    """Ancient paramiko without listdir_iter keeps working."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    m = _live_member(_sftp_cfg())
+    m._sftp.listdir_iter = None
+    m._sftp.listdir_attr = MagicMock(return_value=[
+        SimpleNamespace(filename="b" * 40 + ".torrent"),
+    ])
+    assert m._list_state_dir_locked() == ["b" * 40]
+
+
+def test_pool_connect_timeout(monkeypatch):
+    """One wedged dial fails the pool fast instead of hanging connect()."""
+    import threading
+    from unittest.mock import MagicMock
+    from racing_sync.sftp_source import SFTPExporter, SFTPError
+
+    exporter = SFTPExporter(_sftp_cfg(), pool_size=1)
+    gate = threading.Event()
+    member = MagicMock()
+    member.connect.side_effect = lambda: gate.wait(30)
+    member.close = MagicMock()
+    exporter._members = [member]
+    monkeypatch.setattr(SFTPExporter, "_DIAL_TIMEOUT_S", 0.2)
+
+    import time
+    t0 = time.monotonic()
+    with pytest.raises(SFTPError, match="timed out"):
+        exporter.connect()
+    assert time.monotonic() - t0 < 10
+    member.close.assert_called()
+
