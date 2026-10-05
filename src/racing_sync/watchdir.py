@@ -40,6 +40,11 @@ class WatchItem:
     prowlarr_hit: TorrentHit | None = None
     # Final .torrent bytes the coordinator should hand to qBittorrent:
     prefer_dropped: bool = False
+    # On-disk identity at scan time (mtime + byte size): delete_picked_up
+    # re-stats and refuses when the file changed underneath us, so a
+    # replacement swapped in between scan and delete is never unlinked.
+    file_mtime: float = 0.0
+    file_size: int = -1
 
 
 MAX_TORRENT_BYTES: int = 20 * 1024 * 1024  # 20 MiB safety cap
@@ -492,6 +497,8 @@ class WatchDirScanner:
                 announce_url=announce,
                 torrent_bytes=data,
                 prefer_dropped=False,
+                file_mtime=mtime,
+                file_size=fsize,
             )
             out.append(item)
             from .coordinator_content import announce_domain
@@ -529,6 +536,33 @@ class WatchDirScanner:
         if not self._cfg.delete_after_pickup:
             return
         try:
+            # Identity re-check: the file must be the same bytes the scan
+            # ingested (same mtime + size, not a symlink). A replacement
+            # swapped in between scan and delete is left alone — the next
+            # scan re-emits it on its own merits.
+            try:
+                path = item.torrent_path
+                if path.is_symlink():
+                    log.warning("watch-dir: refusing to delete symlink %s",
+                                path.name)
+                    return
+                st = path.stat()
+                want_mtime = float(getattr(item, "file_mtime", 0.0) or 0.0)
+                want_size = int(getattr(item, "file_size", -1) or -1)
+                if want_size >= 0 and (
+                        st.st_size != want_size or st.st_mtime != want_mtime):
+                    log.warning(
+                        "watch-dir: %s changed since scan "
+                        "(mtime/size drift); leaving it", path.name)
+                    try:
+                        self._file_cache.pop(path, None)
+                    except Exception:
+                        pass
+                    return
+            except OSError as e:
+                log.warning("watch-dir: delete failed %s: %s",
+                            item.torrent_path, e)
+                return
             item.torrent_path.unlink()
             self._file_cache.pop(item.torrent_path, None)
             self._seen.discard(item.infohash)
