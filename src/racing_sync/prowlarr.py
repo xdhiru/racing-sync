@@ -514,6 +514,12 @@ class ProwlarrClient:
         )
         return None
 
+    # Backstop for a fan-out over many slow indexers: each search has the
+    # session timeout, but the gather itself must not outlive the tick.
+    # On timeout the in-flight searches are cancelled and an empty miss
+    # is returned (callers park and retry on their own schedule).
+    _PARALLEL_SEARCH_TIMEOUT_S = 90.0
+
     async def search_indexers_parallel(
         self,
         indexers: list[Indexer],
@@ -536,7 +542,15 @@ class ProwlarrClient:
                     return idx.name.lower(), []
 
         tasks = [_search_one(idx) for idx in indexers]
-        results = await asyncio.gather(*tasks)
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks),
+                timeout=self._PARALLEL_SEARCH_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            log.warning("prowlarr parallel search timed out after %.0fs for %r; "
+                        "using partial hits", self._PARALLEL_SEARCH_TIMEOUT_S, query)
+            return {}
         return dict(results)
 
 
