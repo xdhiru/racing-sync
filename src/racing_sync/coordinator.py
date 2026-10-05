@@ -4313,16 +4313,31 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
     async def _await_hash_for_name(self, name: str, *, timeout_s: float = 60) -> str | None:
         deadline = time.monotonic() + timeout_s
+        _gap = 2.0
         while time.monotonic() < deadline:
             if getattr(self, "_stop", False):
                 return None
             # Dest entries are always added with category="racing": filter
             # server-side instead of pulling 10k long-term seeds per poll.
-            rows = await self.dest_client.list_torrents(category="racing")
-            for t in rows:
-                if t.name == name:
-                    return t.hash.lower()
-            await asyncio.sleep(2)
+            # Bounded + backoff: a wedged WebUI must degrade this lookup
+            # instead of wedging the worker on a raw 60s poll loop.
+            try:
+                rows = await rpc(
+                    self.dest_client.list_torrents(category="racing"),
+                    getattr(self, "cfg", None), "dest await-hash list")
+            except (asyncio.CancelledError, AbandonedError):
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.debug("await-hash poll failed for %s: %s", name[:40], e)
+                rows = []
+            for t in rows or []:
+                try:
+                    if t.name == name:
+                        return t.hash.lower()
+                except Exception:
+                    continue
+            await asyncio.sleep(_gap)
+            _gap = min(10.0, _gap * 1.5)
         return None
 
     # ---- state: DOWNLOADING ----
