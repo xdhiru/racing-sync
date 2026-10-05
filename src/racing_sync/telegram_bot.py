@@ -90,6 +90,26 @@ def _tg_actor_id(obj: Any) -> str | None:
         return None
 
 
+def allowlist_open_warning(cfg: Any) -> str | None:
+    """Warning when Telegram destructive commands are open to the chat.
+
+    An empty `admin_user_ids` (the default) lets anyone in the authorized
+    chat tap keep/delete/inject — worth one loud line at startup, not a
+    behavior change.
+    """
+    try:
+        if cfg is None:
+            return None
+        allowed = getattr(cfg, "admin_user_ids", None) or []
+        if isinstance(allowed, (list, tuple, set)) and len(list(allowed)) == 0:
+            return ("telegram admin_user_ids is empty: anyone in the "
+                    "authorized chat may tap destructive buttons "
+                    "(cancel/inject). Set admin_user_ids to restrict.")
+    except Exception:
+        pass
+    return None
+
+
 def _tg_actor_allowed(cfg: Any, user_id: object) -> bool:
     """Admin-allowlist gate for destructive commands and taps.
 
@@ -1117,6 +1137,12 @@ class TelegramBot:
         if not self._cfg.enabled:
             return
         self._stopped = False
+        try:
+            _warn = allowlist_open_warning(self._cfg)
+            if _warn:
+                log.warning("telegram: %s", _warn)
+        except Exception:
+            pass
         bot_token = self._cfg.bot_token.get_secret_value() if hasattr(self._cfg.bot_token, "get_secret_value") else str(self._cfg.bot_token)
         self._bot = _make_bot(bot_token)
         # Publish the / menu (best-effort): operators discover /add by
