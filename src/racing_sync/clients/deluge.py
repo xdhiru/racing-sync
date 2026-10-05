@@ -76,7 +76,13 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         # the daemon's single-threaded loop and starves other programs
         # like autobrr). Concurrent callers share the in-flight scan.
         self._scan_cache: dict[str, tuple[float, dict]] = {}
-        self._scan_lock: Any = None
+        # Eager lock: two coroutines racing first use must not install two
+        # different locks (split-brain scans). The lazy fallback in
+        # _cached_scan stays for unpickled/legacy instances.
+        try:
+            self._scan_lock: Any = asyncio.Lock()
+        except Exception:
+            self._scan_lock = None
 
     def set_sftp_exporter(self, exporter) -> None:
         """Reuse the coordinator's shared SFTP connection for .torrent fallback."""
@@ -176,7 +182,13 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         except AuthError:
             raise
         except Exception as e:
-            log.warning("deluge web.connect check failed: %s", e)
+            # Fail closed: a health check that cannot complete proves
+            # nothing about the daemon link — returning "authed" here
+            # used to green-light a disconnected client. Transient blips
+            # heal via the boot backoff / per-call retry instead.
+            raise AuthError(
+                f"deluge daemon health check failed at {self._cfg.host}: {e}"
+            ) from e
 
     # ---- JSON-RPC plumbing ----
 

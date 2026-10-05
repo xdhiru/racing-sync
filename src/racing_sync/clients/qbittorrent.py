@@ -273,6 +273,25 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         if not urls and not torrent_files:
             raise ValueError("add_torrent requires urls or torrent_files")
 
+        if urls:
+            # Never hand daemon-local paths or hostless URLs to the
+            # qBittorrent daemon: it fetches `urls` server-side (SSRF +
+            # file read). Same gate as the Deluge client.
+            from urllib.parse import urlsplit as _us
+            for u in urls:
+                try:
+                    _p = _us(u)
+                except Exception:
+                    raise ValueError(f"qbittorrent add_torrent refusing unparsable URL: {u!r}")
+                if _p.scheme not in ("http", "https", "magnet"):
+                    raise ValueError(
+                        f"qbittorrent add_torrent refusing scheme "
+                        f"{_p.scheme!r} (file:// etc. would hand daemon-local "
+                        f"paths to the VPS2 daemon)")
+                if _p.scheme in ("http", "https") and not _p.hostname:
+                    raise ValueError(
+                        f"qbittorrent add_torrent refusing URL without host: {u!r}")
+
         fields: dict[str, str] = {
             "savepath": save_path,
             "paused": "true" if paused else "false",
@@ -598,6 +617,14 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
         except (TypeError, ValueError, OverflowError):
             return default
 
+    def _fprogress(value: object) -> float:
+        # Torrent progress is a 0..1 fraction; clamp the daemon's value
+        # (rogue builds report >1) so completion math can't exceed 100%.
+        try:
+            return min(1.0, max(0.0, float(value or 0.0)))  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+
     return Torrent(
         hash=infohash,
         name=torrent_name or infohash,
@@ -605,7 +632,7 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
         save_path=sp,
         size_bytes=_num(d.get("size", d.get("total_size", 0))),
         state=str(state),
-        progress=_fnum(d.get("progress", 0.0)),
+        progress=_fprogress(d.get("progress", 0.0)),
         ratio=_fnum(d.get("ratio", 0.0)),
         trackers=[],
         files=[],
