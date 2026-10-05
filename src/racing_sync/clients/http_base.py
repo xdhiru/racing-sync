@@ -603,8 +603,10 @@ class HTTPClientBase:
                 "[%s] %s %s -> %d; re-authenticating",
                 self._label, method, path, r.status,
             )
-            await r.read()
-            r.close()
+            try:
+                await r.read()
+            finally:
+                r.close()
             # Single-flight re-auth (forced: the 401/403 proves the cached
             # flag stale): concurrent workers share one login instead of
             # each logging in sequentially. Only a persistent failure (or

@@ -32,7 +32,7 @@ def _is_fetchable_http_url(url: str) -> bool:
     what a compromised/malicious feed entry can make us fetch.
     """
     try:
-        from ipaddress import ip_address as _ip
+        from ipaddress import ip_address as _ip, IPv4Address as _v4
 
         parts = urlsplit(url or "")
         if parts.scheme not in ("http", "https"):
@@ -46,7 +46,13 @@ def _is_fetchable_http_url(url: str) -> bool:
         try:
             ip = _ip(host)
         except ValueError:
-            return True
+            # Numeric literals the stdlib won't parse (decimal
+            # "2130706433", octal, hex) are still loopback/private
+            # candidates — decode and judge as literals, not hostnames.
+            try:
+                ip = _v4(int(host.strip().lower(), 0))
+            except (ValueError, TypeError, OverflowError):
+                return True
         if ip.is_multicast or ip.is_unspecified or ip.is_link_local:
             return False
         return True
