@@ -115,6 +115,26 @@ def test_daemon_lock_exclusive_and_released(tmp_path: Path):
     second.release()
 
 
+def test_daemon_lock_context_fails_shut(tmp_path: Path):
+    """`with` on a held lock raises instead of proceeding unguarded."""
+    import pytest
+
+    cfg = _cfg(state_db=str(tmp_path / "state.db"))
+    lock_path = daemon_lock_path(cfg)
+    assert lock_path is not None
+
+    first, second = DaemonLock(lock_path), DaemonLock(lock_path)
+    assert first.acquire() is True
+    try:
+        with pytest.raises(RuntimeError, match="daemon lock busy"):
+            with second:
+                pass
+    finally:
+        first.release()
+    with second:
+        assert second.held is True
+
+
 def test_backup_db_snapshot_and_prune(tmp_path: Path):
     from racing_sync.state import StateStore
 

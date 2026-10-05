@@ -308,9 +308,19 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
         result = asyncio.run(_run())
     except LookupError as e:
         print(f"forget: {e}", file=sys.stderr)
+        try:
+            if lock is not None:
+                lock.release()
+        except Exception:
+            pass
         return 1
     except Exception as e:
         print(f"forget failed: {e}", file=sys.stderr)
+        try:
+            if lock is not None:
+                lock.release()
+        except Exception:
+            pass
         return 1
     if not result["applied"]:
         print("dry-run plan (pass --apply to execute):")
