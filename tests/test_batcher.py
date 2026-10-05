@@ -6,6 +6,33 @@ from conftest import make_coordinator
 
 from racing_sync.batcher import make_batches
 from racing_sync.classifier import Episode
+from racing_sync.coordinator_errors import AbandonedError
+from racing_sync.state import State, StateStore, TorrentState
+
+
+@pytest.mark.anyio
+async def test_fail_downloading_row_abandoned_first(tmp_path):
+    """A forgotten row must not lose its dest entry to corpse cleanup."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(
+            source_infohash="f" * 40, source_name="F",
+            dest_infohash="f" * 40, state=State.DOWNLOADING))
+        coord = make_coordinator(store)
+        coord.cfg = MagicMock()
+        coord.dest_client = AsyncMock()
+        coord._notify_telegram = AsyncMock()
+        assert store.tombstone("f" * 40) is True
+        with pytest.raises(AbandonedError):
+            await coord._fail_downloading_row(
+                store.get("f" * 40) or TorrentState(
+                    source_infohash="f" * 40, source_name="F",
+                    dest_infohash="f" * 40, state=State.DOWNLOADING),
+                "f" * 40, "stalled")
+        coord.dest_client.delete.assert_not_called()
+        coord._notify_telegram.assert_not_called()
+    finally:
+        store.close()
 
 
 def test_batches_fit_under_cap():
