@@ -743,12 +743,10 @@ class StateStore:
         # Never hard-delete a live row: a later whole-row upsert would
         # resurrect it as a zombie. Stamp a tombstone instead (invisible
         # to reads, refusing writes, GC'd after TTL); hard-delete only
-        # when there is no live row to protect.
-        try:
-            if self.tombstone(norm):
-                return
-        except Exception:
-            pass
+        # when there is no live row to protect. A tombstone failure
+        # re-raises instead of falling through to a live-row DELETE.
+        if self.tombstone(norm):
+            return
         with self._lock:
             self._conn.execute(
                 "DELETE FROM torrent_state WHERE source_infohash = ?", (norm,)
