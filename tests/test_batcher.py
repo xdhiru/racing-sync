@@ -2707,3 +2707,31 @@ async def test_source_group_poison_does_not_skip_siblings(tmp_path):
         assert row is not None and row.state.value == "new"
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_await_hash_survives_blip_then_finds():
+    """A wedged WebUI degrades the lookup instead of wedging the worker."""
+    from racing_sync.clients.abstract import Torrent
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.cfg = MagicMock()
+    hit = Torrent(hash="H" * 40, name="Wanted", category="racing",
+                  save_path="/s", size_bytes=1, state="downloading",
+                  progress=0.5)
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(
+        side_effect=[OSError("blip"), [hit]])
+    assert await coord._await_hash_for_name("Wanted", timeout_s=30) == "h" * 40
+    assert coord.dest_client.list_torrents.await_count == 2
+
+
+@pytest.mark.anyio
+async def test_await_hash_none_on_deadline():
+    coord = make_coordinator()
+    coord._stop = False
+    coord.cfg = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    assert await coord._await_hash_for_name("Missing", timeout_s=0.05) is None
