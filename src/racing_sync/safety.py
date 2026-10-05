@@ -332,7 +332,12 @@ class DaemonLock:
             pass
 
     def __enter__(self) -> "DaemonLock":
-        self.acquire()
+        # Fail shut: `with` users must never proceed unguarded when the
+        # lock is held elsewhere — an ignored False here would race the
+        # daemon exactly like having no lock at all.
+        if not self.acquire():
+            raise RuntimeError(
+                f"daemon lock busy (state.db guarded): {self._path}")
         return self
 
     def __exit__(self, *exc: object) -> None:

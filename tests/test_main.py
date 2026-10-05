@@ -410,3 +410,39 @@ def test_check_config_warns_not_fails_on_down_fuse_mount(tmp_path: Path):
     warnings = _check_config_warnings(cfg)
     assert len(warnings) == 2
     assert all("parks" in w for w in warnings)
+
+
+def test_forget_releases_lock_on_lookup_error(tmp_path: Path):
+    """Error returns in _cmd_forget must not leak the daemon lock."""
+    from racing_sync.__main__ import _cmd_forget
+    from racing_sync.config import AppConfig
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+    cfg = AppConfig.from_toml(cfg_file)
+    cfg.general.state_db = tmp_path / "state.db"
+
+    released: list[bool] = []
+
+    class _FakeLock:
+        def acquire(self):
+            return True
+
+        def release(self):
+            released.append(True)
+
+    import racing_sync.safety as _safety
+
+    orig = _safety.DaemonLock
+    _safety.DaemonLock = lambda _p: _FakeLock()  # noqa: E731
+    try:
+        args = MagicMock()
+        args.apply = True
+        args.target = "no-such-torrent"
+        args.keep_files = False
+        args.ignore = False
+        rc = _cmd_forget(cfg, args)
+        assert rc == 1
+        assert released, "lock leaked on the LookupError path"
+    finally:
+        _safety.DaemonLock = orig
