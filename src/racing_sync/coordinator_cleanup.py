@@ -645,7 +645,9 @@ class CleanupMixin:
         if not h:
             return False
         try:
-            files = await self.dest_client.get_torrent_files(h)
+            files = await rpc(
+                self.dest_client.get_torrent_files(h),
+                getattr(self, "cfg", None), "source cleanup list files")
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup: cannot list SSD files for %s: %s",
                         ts.source_infohash[:10], e)
@@ -657,6 +659,35 @@ class CleanupMixin:
         if not expected:
             return False
         base = Path(ts.save_path) if ts.save_path else Path(self.cfg.dest.save_path)
+        # SSD-root assert: a stale save_path pointing at the fuse mount
+        # (or anywhere outside the SSD trees) must fail closed — proving
+        # bytes there is not proving them on SSD.
+        try:
+            _roots: list[Path] = []
+            try:
+                _cfg = getattr(self, "cfg", None)
+                _raw_roots = [
+                    getattr(getattr(_cfg, "ssd", None), "path", None),
+                    getattr(getattr(_cfg, "dest", None), "save_path", None),
+                ]
+            except Exception:
+                _raw_roots = []
+            for _raw in _raw_roots:
+                if not isinstance(_raw, (str, Path)) or not str(_raw):
+                    continue
+                try:
+                    _roots.append(Path(_raw).resolve())
+                except OSError:
+                    continue
+            _base_real = base.resolve()
+            if not _roots or not any(
+                    _base_real == _r or _base_real.is_relative_to(_r)
+                    for _r in _roots):
+                log.warning("cleanup: SSD base %s outside SSD roots for %s; "
+                            "keeping VPS1", base, ts.source_infohash[:10])
+                return False
+        except OSError:
+            return False
         for name, want, progress in expected:
             try:
                 p = _safe_ssd_join(base, name)

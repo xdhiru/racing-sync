@@ -458,3 +458,49 @@ async def test_moving_early_skipped_when_ssd_bytes_gone(tmp_path: Path):
     await coord._maybe_cleanup_source()
 
     assert src.deleted == []
+
+
+@pytest.mark.anyio
+async def test_ssd_bytes_present_with_verified_bytes(tmp_path: Path):
+    """Happy path still passes with the rpc wrap + root assert."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    (ssd / FNAME).write_bytes(b"\x00" * FSIZE)
+    files = [TorrentFile(name=FNAME, size_bytes=FSIZE, progress=1.0)]
+    pub = "b" * 40
+    store = StateStore(tmp_path / "s.db")
+    try:
+        _row(store, pub, State.MOVING, completed_h_ago=None,
+             activity_h_ago=10.0, injected="", save_path=str(ssd))
+        cfg = _base_cfg(ssd)
+        cfg.ssd.path = ssd
+        coord = _make_coord(ssd, store, _FakeSource([_member(pub)]),
+                            _FakeDest([pub], files=list(files)), cfg)
+        assert await coord._cleanup_ssd_bytes_present(
+            store.get(pub)) is True
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_ssd_bytes_outside_roots_fails_closed(tmp_path: Path):
+    """A stale fuse-pointing save_path never proves SSD bytes."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+    (fuse / FNAME).write_bytes(b"\x00" * FSIZE)
+    files = [TorrentFile(name=FNAME, size_bytes=FSIZE, progress=1.0)]
+    pub = "c" * 40
+    store = StateStore(tmp_path / "s.db")
+    try:
+        _row(store, pub, State.MOVING, completed_h_ago=None,
+             activity_h_ago=10.0, injected="", save_path=str(fuse))
+        cfg = _base_cfg(ssd)
+        cfg.ssd.path = ssd
+        coord = _make_coord(ssd, store, _FakeSource([_member(pub)]),
+                            _FakeDest([pub], files=list(files)), cfg)
+        assert await coord._cleanup_ssd_bytes_present(
+            store.get(pub)) is False
+    finally:
+        store.close()
