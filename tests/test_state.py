@@ -639,3 +639,36 @@ def test_transition_tombstoned_no_diverge(tmp_path: Path):
         assert ts.last_error == "before"
     finally:
         store.close()
+
+
+def test_delete_tombstones_live_row(tmp_path: Path):
+    """delete() stamps a tombstone, never hard-deletes a live row."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="d" * 40, source_name="D",
+                                  state=State.MOVING))
+        store.delete("d" * 40)
+        assert store.get("d" * 40) is None  # invisible, not gone
+        assert store.is_ignored("d" * 40) is False
+        # Second delete refreshes the stamp instead of erroring.
+        store.delete("d" * 40)
+    finally:
+        store.close()
+
+
+def test_delete_propagates_tombstone_failure(tmp_path: Path):
+    """A tombstone failure must not fall through to a live-row DELETE."""
+    from unittest.mock import MagicMock
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="e" * 40, source_name="E",
+                                  state=State.MOVING))
+        store.tombstone = MagicMock(side_effect=RuntimeError("disk gone"))
+        with pytest.raises(RuntimeError, match="disk gone"):
+            store.delete("e" * 40)
+        del store.tombstone  # restore the bound method
+        assert store.get("e" * 40) is not None
+        assert store.get("e" * 40).state == State.MOVING
+    finally:
+        store.close()
