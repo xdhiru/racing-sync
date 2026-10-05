@@ -297,11 +297,18 @@ class SSDLedgerMixin:
             amount = max(0, int(amount or 0))
         except Exception:
             return False
+        # Prune BEFORE the lock: the batched DB fetch runs off-loop and
+        # must never hold the admission lock (slow disk/WAL = stalled
+        # admissions). Staleness between prune and acquire is bounded —
+        # the next admission prunes again — and pops are idempotent.
+        try:
+            await self._ssd_prune_stale()
+        except Exception:
+            pass
         lk = await self._ssd_lock_for()
         if lk is not None:
             await lk.acquire()
         try:
-            await self._ssd_prune_stale()
             cap = self._ssd_global_cap()
             if cap is not None:
                 if self._ssd_reserved_total() + amount > cap:

@@ -258,3 +258,24 @@ async def test_prune_stale_reaps_forgotten_wait_and_park_keys(tmp_path):
         assert coord._moving_parks == {}
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_prune_runs_outside_admission_lock(tmp_path):
+    """The batched DB prune must never hold the admission lock."""
+    import asyncio
+
+    coord = _coord_with_cap(tmp_path, 40_000)
+    real_lock = asyncio.Lock()
+    coord._ssd_lock = real_lock
+    seen: dict = {}
+    orig = coord._ssd_prune_stale
+
+    async def _spy():
+        seen["locked"] = real_lock.locked()
+        return await orig()
+
+    coord._ssd_prune_stale = _spy  # type: ignore[method-assign]
+    assert await coord._ssd_try_reserve("n" * 40, 1_000) is True
+    assert seen.get("locked") is False
+    assert real_lock.locked() is False
