@@ -120,6 +120,24 @@ async def test_deluge_health_check_failure_is_auth_error():
         await client._do_client_auth()
 
 
+@pytest.mark.anyio
+async def test_nginx_form_post_rejects_bad_url():
+    from racing_sync.clients.http_base import HTTPClientBase, AuthError
+    from racing_sync.config import HTTPClientConfig
+
+    for bad in ("file:///etc/nginx-auth", "notaurl", "http:///no-host"):
+        cfg = HTTPClientConfig(
+            host="http://127.0.0.1:8080",
+            username="user",
+            password="pass",
+            nginx_mode="form_post",
+            nginx_url=bad,
+        )
+        client = HTTPClientBase(cfg, label="t")
+        with pytest.raises(AuthError, match="must be an http"):
+            await client._auth()
+
+
 def test_deluge_scan_lock_eager():
     from racing_sync.clients.deluge import DelugeClient
     from racing_sync.config import SourceConfig
