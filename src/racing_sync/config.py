@@ -988,6 +988,36 @@ class APIConfig(BaseModel):
                 for label, raw in (("tls_certfile", cert), ("tls_keyfile", key)):
                     if raw and not Path(raw).is_file():
                         raise ValueError(f"api.{label} does not exist: {raw}")
+            if self.enabled and self.trust_nginx_header:
+                # The header path trusts any listed proxy completely: a
+                # world-range entry is a full auth bypass, and a hostname
+                # never matches the IP literal the server actually sees
+                # (dead entry that looks protective).
+                import ipaddress as _ip
+
+                for entry in list(self.trusted_proxies or []):
+                    text = str(entry or "").strip().strip("[]")
+                    if not text:
+                        raise ValueError(
+                            "api.trusted_proxies has a blank entry "
+                            "(blank matches nothing; remove it)")
+                    if text.lower() == "localhost":
+                        continue
+                    try:
+                        if "/" in text:
+                            net = _ip.ip_network(text, strict=False)
+                        elif ":" in text:
+                            net = _ip.ip_network(text + "/128", strict=False)
+                        else:
+                            net = _ip.ip_network(text + "/32", strict=False)
+                    except ValueError:
+                        raise ValueError(
+                            f"api.trusted_proxies entry {entry!r} is not an "
+                            f"IP, CIDR range, or 'localhost'")
+                    if net.prefixlen == 0:
+                        raise ValueError(
+                            f"api.trusted_proxies entry {entry!r} trusts the "
+                            f"whole internet (prefix /0) — refusing")
         return self
 
 
