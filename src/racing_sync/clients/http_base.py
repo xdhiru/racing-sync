@@ -315,6 +315,21 @@ class HTTPClientBase:
                     raise AuthError(
                         f"[{self._label}] nginx_mode=form_post but no nginx_url"
                     )
+                try:
+                    _parsed_nginx = urllib.parse.urlsplit(
+                        str(self._cfg.nginx_url).strip())
+                except Exception:
+                    _parsed_nginx = None
+                if (_parsed_nginx is None
+                        or _parsed_nginx.scheme not in ("http", "https")
+                        or not _parsed_nginx.hostname):
+                    # Credentials ride this POST and redirects forward
+                    # them, so a schemeless/hostless URL must fail here
+                    # instead of leaking somewhere surprising.
+                    raise AuthError(
+                        f"[{self._label}] nginx_url must be an http(s) URL "
+                        f"with a host, got {self._cfg.nginx_url!r}"
+                    )
                 log.debug(
                     "[%s] nginx form POST %s", self._label, self._cfg.nginx_url
                 )
