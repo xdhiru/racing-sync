@@ -40,3 +40,33 @@ async def test_mixed_case_torrent_found(tmp_path: Path):
     assert sorted(i.name for i in items) == [
         "Lower.Release", "Mixed.Case.Release", "Upper.Release",
     ]
+
+
+@pytest.mark.anyio
+async def test_delete_refuses_swapped_file(tmp_path: Path):
+    """A replacement swapped in after the scan is never unlinked."""
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    target = watch_dir / "swap.torrent"
+    target.write_bytes(_torrent_bytes("Original.Release"))
+
+    cfg = WatchDirConfig(path=watch_dir, glob="*.torrent",
+                         delete_after_pickup=True)
+    scanner = WatchDirScanner(cfg, prowlarr=None)
+    items = await scanner.scan_once()
+    assert len(items) == 1
+
+    # Attacker/operator swaps the file before delete runs.
+    target.write_bytes(_torrent_bytes("Replacement.Release", length=999))
+    await scanner.delete_picked_up(items[0])
+    assert target.exists()
+    assert target.stat().st_size != items[0].file_size
+
+    # Untouched file deletes normally (fresh scanner: _seen already
+    # holds the first hash, which is correct — it was never picked up).
+    target.write_bytes(_torrent_bytes("Original.Release"))
+    scanner2 = WatchDirScanner(cfg, prowlarr=None)
+    items2 = await scanner2.scan_once()
+    assert len(items2) == 1
+    await scanner2.delete_picked_up(items2[0])
+    assert not target.exists()
