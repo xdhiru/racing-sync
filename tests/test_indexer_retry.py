@@ -216,6 +216,81 @@ async def test_do_waiting_indexer_transitions_failed_when_source_vanished():
 
 
 @pytest.mark.anyio
+async def test_vanished_parks_for_prowlarr_when_possible():
+    """Cleared-for-space VPS1 must not fail a row Prowlarr can still feed."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from racing_sync.coordinator import _SOURCE_GONE
+
+    coord = make_coordinator()
+    coord.source_client = AsyncMock()
+    coord.source_client.get_torrent.return_value = None
+    coord.prowlarr = AsyncMock()
+    coord.cfg.cross_seed.allow_prowlarr_cross_seed = True
+    coord.cfg.prowlarr.should_skip_title = MagicMock(return_value=False)
+    coord.transition = MagicMock()
+    coord._schedule_telegram_update = MagicMock()
+
+    ts = TorrentState(source_infohash="v" * 40, source_name="Gone.Show",
+                      total_bytes=500, state=State.NEW)
+    coord._source_miss_counts = {"v" * 40: 2}
+    got = await coord._fetch_source_or_fail(ts)
+    assert got is _SOURCE_GONE
+    coord.transition.assert_called_once()
+    assert coord.transition.call_args[0][1] == State.WAITING_INDEXER
+
+
+@pytest.mark.anyio
+async def test_vanished_fails_when_no_prowlarr_possible():
+    """No Prowlarr path (disabled client) keeps the terminal FAILED."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    coord = make_coordinator()
+    coord.source_client = AsyncMock()
+    coord.source_client.get_torrent.return_value = None
+    coord.prowlarr = None
+    coord.transition = MagicMock()
+
+    ts = TorrentState(source_infohash="w" * 40, source_name="Gone.Show",
+                      state=State.NEW)
+    coord._source_miss_counts = {"w" * 40: 2}
+    assert await coord._fetch_source_or_fail(ts) is None
+    coord.transition.assert_called_once_with(
+        ts, State.FAILED, error="source torrent vanished from client: " + "w" * 10
+    )
+
+
+@pytest.mark.anyio
+async def test_do_new_pseudo_picks_on_vanish():
+    """Vanished source proceeds from persisted metadata (siblings first)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    coord = make_coordinator()
+    coord.source_client = AsyncMock()
+    coord.source_client.get_torrent.return_value = None
+    coord.prowlarr = AsyncMock()
+    coord.cfg.cross_seed.allow_prowlarr_cross_seed = True
+    coord.cfg.prowlarr.should_skip_title = MagicMock(return_value=False)
+    coord.transition = MagicMock()
+    coord._schedule_telegram_update = MagicMock()
+    coord._adopt_manual_fuse_if_present = AsyncMock(return_value=False)
+    coord._pick_and_admit = AsyncMock()
+    coord._list_source_torrents = AsyncMock(return_value=[])
+
+    ts = TorrentState(source_infohash="x" * 40, source_name="Gone.Show",
+                      total_bytes=500,
+                      source_announce_url="https://t.example/announce",
+                      state=State.NEW)
+    coord._source_miss_counts = {"x" * 40: 2}
+    await coord._do_new(ts)
+    assert coord._pick_and_admit.await_count == 1
+    _picked_ts, st, others = coord._pick_and_admit.await_args[0][:3]
+    assert st is not None and st is not False
+    assert st.name == "Gone.Show" and st.size_bytes == 500
+    assert others == []
+
+
+@pytest.mark.anyio
 async def test_do_re_add_skips_when_already_injected_in_step_1():
     from unittest.mock import AsyncMock, MagicMock
 
