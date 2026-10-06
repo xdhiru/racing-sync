@@ -446,3 +446,32 @@ def test_forget_releases_lock_on_lookup_error(tmp_path: Path):
         assert released, "lock leaked on the LookupError path"
     finally:
         _safety.DaemonLock = orig
+
+
+def test_check_config_probes_without_creating(tmp_path: Path):
+    """check-config must never mkdir: a typo'd log_dir stays absent."""
+    from racing_sync.__main__ import _check_config_env
+    from racing_sync.config import AppConfig
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+    cfg = AppConfig.from_toml(cfg_file)
+    missing = tmp_path / "no-such-logs"
+    cfg.general.log_dir = missing
+    problems = _check_config_env(cfg)
+    assert any("does not exist" in p for p in problems)
+    assert not missing.exists()
+
+
+def test_check_config_rejects_file_as_dir(tmp_path: Path):
+    from racing_sync.__main__ import _check_config_env
+    from racing_sync.config import AppConfig
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+    cfg = AppConfig.from_toml(cfg_file)
+    f = tmp_path / "file-not-dir"
+    f.write_bytes(b"x")
+    cfg.ssd.path = f
+    problems = _check_config_env(cfg)
+    assert any("not a directory" in p for p in problems)

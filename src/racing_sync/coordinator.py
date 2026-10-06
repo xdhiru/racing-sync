@@ -856,6 +856,35 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
     # ---- main loop ----
 
+    def _api_task_failed(self) -> bool:
+        """True when the enabled API server died with an error.
+
+        Failing fast (stop) beats running headless: without this, a
+        `port in use` death is only logged and the daemon serves
+        forever with no control plane. Clean exits and cancellations
+        never trigger (a quiet API shutdown is not a failure).
+        """
+        try:
+            _api_task = getattr(self, "_api_task", None)
+            _api_cfg = getattr(getattr(self, "cfg", None), "api", None)
+            if not bool(_api_cfg and getattr(_api_cfg, "enabled", False)):
+                return False
+            if _api_task is None or not _api_task.done():
+                return False
+            if _api_task.cancelled():
+                return False
+            try:
+                _api_err = _api_task.exception()
+            except Exception:
+                return False
+            if _api_err is None:
+                return False
+            log.error("API server died (%s); stopping instead of "
+                      "running headless", _api_err)
+            return True
+        except Exception:
+            return False
+
     async def run(self) -> int:
         """Supervise the poller, scheduler and janitor loops.
 
@@ -892,6 +921,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     await asyncio.sleep(1.0)
                 except asyncio.CancelledError:
                     break
+                # A dead control plane must fail fast, not run headless:
+                # a bound port (or dead uvicorn) that only gets logged
+                # leaves the daemon believing the API is up.
+                try:
+                    if self._api_task_failed():
+                        self.request_stop()
+                        break
+                except Exception:
+                    pass
                 # A dead loop is a bug: respawn it loudly instead of
                 # silently losing a lane (or crashing the coordinator).
                 try:
@@ -5466,8 +5504,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 new_hash = None
         if new_hash:
             ts.dest_infohash = new_hash
+            # Narrow write: the whole-row upsert here used to clobber a
+            # concurrently transitioned state (and leak the live polling
+            # key). Revision sync keeps this worker's later transitions
+            # valid; a 0 means tombstoned/absent — keep the in-memory
+            # hash for this tick, guards catch it next tick.
             try:
-                self.store.upsert(ts)
+                _up2 = getattr(self.store, "update_columns", None)
+                if callable(_up2):
+                    _nv2 = _up2((ts.source_infohash or ""),
+                                {"dest_infohash": new_hash})
+                    if isinstance(_nv2, int) and _nv2 > 0:
+                        try:
+                            ts.version = _nv2
+                        except Exception:
+                            pass
+                else:
+                    self.store.upsert(ts)
             except Exception:
                 pass
         h_new = ts.dest_infohash or ts.source_infohash
