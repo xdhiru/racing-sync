@@ -1519,3 +1519,52 @@ async def test_shifted_numbering_cannot_misroute(tmp_path: Path):
     finally:
         store.close()
 
+@pytest.mark.anyio
+async def test_chat_message_unignore_lifts_ignore_and_tombstone(tmp_path: Path):
+    """/unignore_<full hash> makes a cancelled release addable again."""
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="c" * 40, source_name="Gone",
+                              state=State.WAITING_INDEXER))
+    store.ignore_torrent("c" * 40, "Gone")
+    store.tombstone("c" * 40)
+    assert store.is_ignored("c" * 40) is True
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/unignore_" + "c" * 40))
+        assert store.is_ignored("c" * 40) is False
+        assert store.get("c" * 40) is not None
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Unignored")
+    finally:
+        store.close()
+
+@pytest.mark.anyio
+async def test_chat_message_unignore_rejects_short_hash(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/unignore_abc123"))
+        sent = bot._bot.send_message.call_args[0][1]
+        assert "full 40-char" in sent
+    finally:
+        store.close()
+
+@pytest.mark.anyio
+async def test_chat_message_unignore_space_form(tmp_path: Path):
+    """/unignore <hash> (no underscore) works like the underscore form."""
+    store = StateStore(tmp_path / "state.db")
+    store.ignore_torrent("c" * 40, "Gone")
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/unignore " + "c" * 40))
+        assert store.is_ignored("c" * 40) is False
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Unignored")
+    finally:
+        store.close()

@@ -535,6 +535,15 @@ SKIP_CMD_RE = re.compile(r"^/skip_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 #: `/unskip_<hex>` — same shape: resume a held release immediately.
 UNSKIP_CMD_RE = re.compile(r"^/unskip_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
+#: `/unignore_<full-hash>` — drop a cancelled release from the ignore
+#: list (plus its forget tombstone) so it can be tracked again. Full
+#: 40-char hash only: ignore entries are invisible in the task list,
+#: so prefixes cannot be disambiguated there.
+UNIGNORE_CMD_RE = re.compile(r"^/unignore_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/unignore <full-hash>` — manual form (no underscore), same effect.
+UNIGNORE_HASH_RE = re.compile(r"^/unignore\s+([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
 #: `/injectfuse_<n|hex>` — list shortcut: group number or tracked
 #: hash/prefix for manual fuse seeding (operator moved the bytes).
 INJECTFUSE_CMD_RE = re.compile(r"^/injectfuse_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
@@ -2152,12 +2161,15 @@ class TelegramBot:
             m_prefer = PREFER_CMD_RE.match(text)
             m_skip = SKIP_CMD_RE.match(text)
             m_unskip = UNSKIP_CMD_RE.match(text)
+            m_unignore = UNIGNORE_CMD_RE.match(text)
+            m_unignore_hash = UNIGNORE_HASH_RE.match(text)
             m_cancel = CANCEL_CMD_RE.match(text)
             m_injectfuse = INJECTFUSE_CMD_RE.match(text)
             m_injectfuse_hash = INJECTFUSE_HASH_RE.match(text)
             m_add = ADD_CMD_RE.match(text)
             if (not m_fetch and not m_prefer and not m_cancel
-                    and not m_skip and not m_unskip
+                    and not m_skip and not m_unskip and not m_unignore
+                    and not m_unignore_hash
                     and not m_injectfuse and not m_injectfuse_hash
                     and not m_add):
                 return
@@ -2186,6 +2198,14 @@ class TelegramBot:
             if m_unskip:
                 await self._start_group_command(
                     "unskip", m_unskip.group(1), message)
+                return
+            if m_unignore:
+                await self._unignore_torrent(
+                    m_unignore.group(1).lower(), message)
+                return
+            if m_unignore_hash:
+                await self._unignore_torrent(
+                    m_unignore_hash.group(1).lower(), message)
                 return
             if m_injectfuse_hash:
                 await self._start_single_command(
@@ -3533,6 +3553,70 @@ class TelegramBot:
         return (f"Skipped {_title} — held with state kept, no workers "
                 f"until {_unskip_command(acted[0])}")
 
+    async def _unignore_torrent(self, target: str, message: Any) -> None:
+        """Drop one cancelled release from the ignore list (+ tombstone).
+
+        Full 40-char hash only: ignored entries are invisible in the
+        task list, so prefixes cannot be disambiguated there. Mirrors
+        the `unignore` CLI (which refuses while the daemon runs, so
+        this is the live path). After this, re-send the .torrent via
+        /add or re-drop it. Never raises: all outcomes arrive as replies.
+        """
+        try:
+            norm = (target or "").strip().lower()
+        except Exception:
+            norm = ""
+        if len(norm) != 40 or any(c not in "0123456789abcdef" for c in norm):
+            try:
+                await self._reply(
+                    "Send /unignore_<full 40-char infohash> "
+                    "(copy it from the detail card).", reply_to=message)
+            except Exception:
+                pass
+            return
+        store = getattr(self, "_store", None)
+        if store is None:
+            try:
+                await self._reply("Action failed: bot not attached.",
+                                  reply_to=message)
+            except Exception:
+                pass
+            return
+        try:
+            entry = await asyncio.to_thread(store.find_ignored, norm)
+        except LookupError as e:
+            try:
+                await self._reply(str(e)[:300], reply_to=message)
+            except Exception:
+                pass
+            return
+        except Exception as e:  # noqa: BLE001
+            try:
+                await self._reply(f"Action failed: {e}", reply_to=message)
+            except Exception:
+                pass
+            return
+        try:
+            h = (entry.get("source_infohash") or "").lower()
+            name = str(entry.get("source_name") or h[:10])[:60]
+        except Exception:
+            h, name = norm, norm[:10]
+        try:
+            await asyncio.to_thread(store.unignore_torrent, h)
+            await asyncio.to_thread(store.clear_tombstone, h)
+        except Exception as e:  # noqa: BLE001
+            try:
+                await self._reply(f"Action failed: {e}", reply_to=message)
+            except Exception:
+                pass
+            return
+        try:
+            await self._reply(
+                f"Unignored {name} — re-send its .torrent via /add "
+                f"(or re-drop it) to track it again.", reply_to=message)
+        except Exception:
+            pass
+
     async def _mark_detail_cancelled(
         self, message_id: int, name: str, infohash: str
     ) -> None:
@@ -3549,7 +3633,8 @@ class TelegramBot:
         text = (
             f"🚫 CANCELLED `{_esc(shown)}`\n"
             f"`{(infohash or '').lower()}`\n"
-            "✗ Cancelled by operator (removed + ignored)"
+            "✗ Cancelled by operator (removed + ignored)\n"
+            f"Unignore: `/unignore_{(infohash or '').lower()}`"
         )
         try:
             await bot.edit_message_text(
