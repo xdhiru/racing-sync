@@ -799,6 +799,90 @@ async def test_pick_and_admit_timeout_skips_public_groups():
     assert ts.force_direct == 0
 
 
+def _operator_blob(name="Op.Supplied.1080p", size=1000,
+                   announce="https://alpha.cc/announce/xyz"):
+    """Same-infohash .torrent bytes as /add would attach to a tracked row."""
+    from racing_sync.watchdir import _bencode, _bencoded_info_hash
+
+    raw = _bencode({
+        b"announce": announce.encode(),
+        b"info": {
+            b"name": name.encode(),
+            b"length": size,
+            b"piece length": 16384,
+            b"pieces": b"0" * 20,
+        },
+    })
+    raw = bytes(raw)
+    h, _, _, _ = _bencoded_info_hash(raw)
+    return raw, h
+
+
+@pytest.mark.anyio
+async def test_pick_and_admit_uses_operator_supplied_bytes(tmp_path):
+    """No pick + attached /add bytes for the same hash: admit from them.
+
+    Regression: a racing row whose VPS1 original vanished parked for a
+    Prowlarr cross-seed forever even after the operator supplied the
+    exact .torrent via /add (+ /fetch woke it to QUERYING and it just
+    parked again). The bytes come from the DB column (no in-memory
+    copy), so this also survives a restart mid-wait.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _pick_coord()
+        raw, h = _operator_blob()
+        ts = TorrentState(
+            source_infohash=h, source_name="Op.Supplied.1080p", total_bytes=1000,
+            source_announce_url="https://alpha.cc/announce/xyz",
+            source_tracker="https://alpha.cc/announce/xyz",
+            state=State.WAITING_INDEXER, force_direct=1,
+            cross_seed_blob=raw,
+        )
+        store.upsert(ts)
+        # Simulate a restart: workers only see the persisted row, blobs
+        # reloaded from the DB column on demand.
+        ts._blob = None
+        ts.cross_seed_blob = None
+        coord.store = store
+        with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
+                   new_callable=AsyncMock) as pick:
+            pick.return_value = None
+            await coord._pick_and_admit(ts, _priv_st(), [])
+        coord._park_for_indexer_retry.assert_not_called()
+        assert ts.cross_seed_source == "operator-supplied"
+        assert ts.cross_seed_infohash == h
+        coord.transition.assert_called_once()
+        assert coord.transition.call_args[0][1] == State.QUEUED
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_pick_and_admit_ignores_mismatched_blob():
+    """Attached bytes for another hash must never feed this row's download."""
+    from unittest.mock import AsyncMock, patch
+
+    coord = _pick_coord()
+    raw, _h = _operator_blob()
+    ts = TorrentState(
+        source_infohash="f" * 40, source_name="Other.Show",
+        total_bytes=1000, state=State.WAITING_INDEXER, force_direct=1,
+        cross_seed_blob=raw,
+    )
+    ts._blob = raw
+    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
+               new_callable=AsyncMock) as pick:
+        pick.return_value = None
+        await coord._pick_and_admit(ts, _priv_st(), [])
+    coord._park_for_indexer_retry.assert_called_once()
+    assert ts.cross_seed_source != "operator-supplied"
+
+
 @pytest.mark.anyio
 async def test_private_fallback_retries_sftp_timeout_once():
     """A single stalled SFTP read costs one retry, not the whole fallback."""

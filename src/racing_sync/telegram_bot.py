@@ -2304,6 +2304,34 @@ class TelegramBot:
                         reply_to=message)
                     await self._delete_chat_file(message, doc_msg)
                     return
+            try:
+                _pre = existing.state in (State.NEW, State.QUERYING,
+                                          State.WAITING_INDEXER,
+                                          State.WAITING_DISK)
+            except Exception:
+                _pre = False
+            if _pre:
+                # The operator just handed us the exact bytes for a row
+                # that has none usable (e.g. a racing row whose VPS1
+                # original vanished while it parks for a Prowlarr
+                # cross-seed that never comes). Same infohash means same
+                # content, so keeping them can never substitute a wrong
+                # release — and /fetch (or the next retry) can download
+                # from them instead of waiting on the indexer. Narrow
+                # blob write only: the row's state is left untouched.
+                try:
+                    _kept = bool(await asyncio.to_thread(
+                        store.set_blob, infohash, bytes(data)))
+                except Exception:
+                    _kept = False
+                if _kept:
+                    await self._reply(
+                        f"Attached supplied .torrent to {name} ({_st}) — "
+                        f"it can now download from your bytes: "
+                        f"`{_fetch_command(infohash)}`.",
+                        reply_to=message)
+                    await self._delete_chat_file(message, doc_msg)
+                    return
             await self._reply(f"Already tracked: {name} ({_st}).",
                               reply_to=message)
             await self._delete_chat_file(message, doc_msg)
@@ -3089,8 +3117,10 @@ class TelegramBot:
     async def _fetch_torrent(self, infohash: str) -> str:
         """Flag a waiting row to use its starting torrent now.
 
-        WAITING_INDEXER rows get the VPS1 original instead of
-        waiting out Prowlarr (force_direct + wake to QUERYING). NEW
+        WAITING_INDEXER rows use their starting bytes instead of
+        waiting out Prowlarr (force_direct + wake to QUERYING): the
+        VPS1 original when reachable, else a supplied .torrent
+        attached via /add. NEW
         grace-held rows get their starting bytes instead (force_direct
         only — no state change; the NEW flow honors the flag next tick
         and a worker is woken for this tick): watch drops use the starting
@@ -3120,8 +3150,8 @@ class TelegramBot:
                 row.indexer_attempts = 0
                 store.transition(row, State.QUERYING)
                 return (
-                    f"Fetching VPS1 original for {(row.source_name or infohash[:10])[:50]} "
-                    f"(bypassing Prowlarr; leeches the private swarm)"
+                    f"Fetching original for {(row.source_name or infohash[:10])[:50]} "
+                    f"(bypassing Prowlarr; VPS1 copy, else supplied .torrent)"
                 )
             # NEW grace-held rows: "fetch" = use the dropped .torrent now
             # (skip Prowlarr search and grace hold). No state change —
