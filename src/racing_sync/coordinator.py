@@ -3700,6 +3700,72 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             pass
         return None
 
+    async def _adopt_ssd_entry(self, ts: TorrentState, entry) -> bool:
+        """Adopt a complete SSD-resident dest entry; True when queued.
+
+        The bytes are already on disk, so no SSD budget is reserved —
+        the row rides QUEUED into the adopt+resume path (`_do_queued`
+        adopts the live entry instead of adding a second one). Needs
+        the .torrent bytes for `_do_queued`'s setup: memory, then the
+        DB column, then a best-effort export of the live dest entry
+        itself. Anything missing/unverifiable returns False and the
+        caller runs the normal pick (fail-open, never FAILED here).
+        """
+        try:
+            want = (ts.source_infohash or "").strip().lower()
+            if not want:
+                return False
+            blob = getattr(ts, "_blob", None) or getattr(ts, "cross_seed_blob", None)
+            if not blob and getattr(self, "store", None) is not None:
+                try:
+                    blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
+                except Exception:
+                    blob = None
+            if not blob:
+                try:
+                    dest = getattr(self, "dest_client", None)
+                    _export = getattr(dest, "export_torrent", None) if dest is not None else None
+                    if callable(_export):
+                        _h = (getattr(entry, "hash", "") or "").lower() or want
+                        blob = await asyncio.wait_for(_export(_h), timeout=15.0)
+                except Exception:
+                    blob = None
+            if not blob:
+                log.info(
+                    "ssd entry complete for %s but no .torrent bytes available "
+                    "(supply them via /add); falling back to normal pick",
+                    (ts.source_name or "")[:60],
+                )
+                return False
+            try:
+                from .watchdir import _bencoded_info_hash
+                real_hash, _, _, _ = _bencoded_info_hash(bytes(blob))
+            except Exception:
+                return False
+            if (real_hash or "").lower() != want:
+                return False
+            try:
+                if getattr(self, "store", None) is not None:
+                    await asyncio.to_thread(self.store.set_blob, ts.source_infohash, bytes(blob))
+            except Exception:
+                pass
+            ts.cross_seed_blob = bytes(blob)
+            ts._blob = bytes(blob)
+            ts.cross_seed_infohash = want
+            ts.cross_seed_source = "ssd-adopted"
+            log.info(
+                "adopting SSD-resident %s (already complete on VPS2 client); "
+                "skipping SSD budget",
+                (ts.source_name or "")[:60],
+            )
+            try:
+                self.transition(ts, State.QUEUED)
+            except Exception:
+                return False
+            return True
+        except Exception:
+            return False
+
     async def _do_waiting_indexer(self, ts: TorrentState) -> None:
         """Wake up from WAITING_INDEXER and re-pick the SSD source.
 
@@ -3712,6 +3778,57 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 return
         except Exception:
             pass
+
+        # SSD shortcut: the same hash already lives on the VPS2 client
+        # (added by hand and seeding/downloading from SSD) — adopt it
+        # instead of querying Prowlarr for a cross-seed. A complete
+        # entry rides QUEUED into the adopt+resume path (no SSD budget
+        # is reserved for bytes already on disk; _do_queued adopts the
+        # live entry instead of adding a second one). A still-
+        # downloading entry quiet-parks this window — no indexer spam —
+        # and gets adopted on completion by a later window. Fail-open:
+        # any doubt runs the normal pick below.
+        try:
+            _entries = await self._dest_entries_for(
+                [ts.source_infohash, getattr(ts, "cross_seed_infohash", None)])
+        except Exception:
+            _entries = []
+        _ssd_complete = None
+        _ssd_any = None
+        for _e in _entries or []:
+            if _ssd_any is None:
+                _ssd_any = _e
+            try:
+                if bool(_e.is_complete()):
+                    _ssd_complete = _e
+                    break
+            except Exception:
+                continue
+        if _ssd_complete is not None:
+            if await self._adopt_ssd_entry(ts, _ssd_complete):
+                return
+        elif _ssd_any is not None:
+            try:
+                _interval = max(60.0, float(
+                    self.cfg.cross_seed.prowlarr_retry_interval_seconds))
+            except (TypeError, ValueError):
+                _interval = 1800.0
+            log.info(
+                "dest entry %s still downloading on SSD client; waiting "
+                "for it instead of querying Prowlarr",
+                (ts.source_infohash or "")[:10],
+            )
+            try:
+                if self._abandoned(ts):
+                    raise AbandonedError(
+                        f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}")
+                ts.indexer_next_retry_at = (
+                    dt.datetime.now(dt.timezone.utc)
+                    + dt.timedelta(seconds=_interval))
+                self.store.upsert(ts)
+            except Exception:
+                pass
+            return
 
         # Watch rows (manual drops) carry their own bytes: the racing
         # pick below (VPS1 export / Prowlarr cross-seed) is meaningless
@@ -4345,6 +4462,33 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         except Exception:
             return None
 
+    async def _dest_entries_for(self, hashes: list[str] | None) -> list:
+        """Dest-client entries for any of `hashes` (complete or not), else [].
+
+        Raw material for the SSD shortcuts: callers decide what a hit
+        means (adopt a complete one, quiet-wait on a downloading one).
+        Never raises — [] means "no usable information".
+        """
+        try:
+            want = {(h or "").strip().lower() for h in (hashes or [])
+                    if (h or "").strip()}
+            if not want:
+                return []
+            dest = getattr(self, "dest_client", None)
+            if dest is None:
+                return []
+            found = await dest.list_torrents(hashes=sorted(want))
+            out = []
+            for t in found or []:
+                try:
+                    if (getattr(t, "hash", "") or "").lower() in want:
+                        out.append(t)
+                except Exception:
+                    continue
+            return out
+        except Exception:
+            return []
+
     async def _dest_complete_entry(self, hashes: list[str] | None):
         """Existing complete dest-client entry for one of `hashes`, else None.
 
@@ -4358,18 +4502,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         WAITING_DISK as today; callers re-verify downstream.
         """
         try:
-            want = {(h or "").strip().lower() for h in (hashes or [])
-                    if (h or "").strip()}
-            if not want:
-                return None
-            dest = getattr(self, "dest_client", None)
-            if dest is None:
-                return None
-            found = await dest.list_torrents(hashes=sorted(want))
-            for t in found or []:
+            for t in await self._dest_entries_for(hashes):
                 try:
-                    if ((getattr(t, "hash", "") or "").lower() in want
-                            and bool(t.is_complete())):
+                    if bool(t.is_complete()):
                         return t
                 except Exception:
                     continue

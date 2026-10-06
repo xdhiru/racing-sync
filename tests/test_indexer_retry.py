@@ -215,6 +215,117 @@ async def test_do_waiting_indexer_transitions_failed_when_source_vanished():
     )
 
 
+def _ssd_dest(entries):
+    """Fake VPS2 client: {hash: (progress, blob-for-export)}."""
+    from unittest.mock import AsyncMock
+
+    from racing_sync.clients.abstract import Torrent
+
+    class _FakeSSD:
+        def __init__(self):
+            self.export_calls: list[str] = []
+
+        async def list_torrents(self, *, category=None, hashes=None):
+            wanted = {h.lower() for h in hashes} if hashes is not None else None
+            out = []
+            for h, (progress, _blob) in entries.items():
+                if wanted is None or h in wanted:
+                    out.append(Torrent(
+                        hash=h, name="Hand.Added.mkv", category="",
+                        save_path="/ssd/Hand.Added.mkv", size_bytes=1000,
+                        state="seeding" if progress >= 1.0 else "downloading",
+                        progress=progress))
+            return out
+
+        async def export_torrent(self, h):
+            self.export_calls.append((h or "").lower())
+            return entries.get((h or "").lower(), (0.0, b""))[1]
+
+    dest = _FakeSSD()
+    dest.list_torrents = dest.list_torrents
+    return dest
+
+
+@pytest.mark.anyio
+async def test_do_waiting_indexer_adopts_complete_ssd_entry():
+    """Same hash complete on the SSD client: adopt, don't query Prowlarr."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    raw, h = _operator_blob(name="Hand.Added.mkv")
+    coord = make_coordinator()
+    coord._adopt_manual_fuse_if_present = AsyncMock(return_value=False)
+    coord._pick_and_admit = AsyncMock()
+    coord.dest_client = _ssd_dest({h: (1.0, b"")})
+    coord.transition = MagicMock(side_effect=lambda t, s, **k: setattr(t, "state", s))
+
+    ts = TorrentState(source_infohash=h, source_name="Hand.Added.mkv",
+                      total_bytes=1000, state=State.QUERYING)
+    ts._blob = raw
+    await coord._do_waiting_indexer(ts)
+
+    coord._pick_and_admit.assert_not_called()
+    assert ts.state == State.QUEUED
+    assert ts.cross_seed_source == "ssd-adopted"
+    assert ts.cross_seed_infohash == h
+
+
+@pytest.mark.anyio
+async def test_do_waiting_indexer_heals_blob_from_ssd_entry():
+    """No bytes on the row: export the live SSD entry, then adopt."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from racing_sync.state import StateStore
+
+    import tempfile
+    from pathlib import Path
+
+    raw, h = _operator_blob(name="Hand.Added.mkv")
+    tmp = Path(tempfile.mkdtemp())
+    store = StateStore(tmp / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord._adopt_manual_fuse_if_present = AsyncMock(return_value=False)
+        coord._pick_and_admit = AsyncMock()
+        dest = _ssd_dest({h: (1.0, raw)})
+        coord.dest_client = dest
+        coord.transition = MagicMock(side_effect=lambda t, s, **k: setattr(t, "state", s))
+
+        ts = TorrentState(source_infohash=h, source_name="Hand.Added.mkv",
+                          total_bytes=1000, state=State.QUERYING)
+        store.upsert(ts)
+        await coord._do_waiting_indexer(ts)
+
+        assert dest.export_calls == [h]
+        assert bytes(store.get_blob(h)) == raw
+        coord._pick_and_admit.assert_not_called()
+        assert ts.state == State.QUEUED
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_do_waiting_indexer_waits_on_downloading_ssd_entry():
+    """Same hash still downloading on SSD: quiet park, no Prowlarr query."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    raw, h = _operator_blob(name="Hand.Added.mkv")
+    coord = make_coordinator()
+    coord._adopt_manual_fuse_if_present = AsyncMock(return_value=False)
+    coord._pick_and_admit = AsyncMock()
+    coord.source_client = AsyncMock()
+    coord.dest_client = _ssd_dest({h: (0.5, raw)})
+    coord.transition = MagicMock()
+
+    ts = TorrentState(source_infohash=h, source_name="Hand.Added.mkv",
+                      total_bytes=1000, state=State.QUERYING)
+    await coord._do_waiting_indexer(ts)
+
+    coord._pick_and_admit.assert_not_called()
+    coord.source_client.get_torrent.assert_not_called()
+    coord.transition.assert_not_called()
+    assert ts.indexer_next_retry_at is not None
+
+
 @pytest.mark.anyio
 async def test_vanished_parks_for_prowlarr_when_possible():
     """Cleared-for-space VPS1 must not fail a row Prowlarr can still feed."""
