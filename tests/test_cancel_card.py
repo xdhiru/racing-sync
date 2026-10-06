@@ -72,6 +72,7 @@ async def test_cancel_edits_detail_card_from_cache(tmp_path: Path):
         _, kwargs = bot._bot.edit_message_text.call_args
         assert kwargs["message_id"] == 777
         assert "CANCELLED" in kwargs.get("text", bot._bot.edit_message_text.call_args[0][0])
+        assert f"/unignore_{h}" in kwargs.get("text", bot._bot.edit_message_text.call_args[0][0])
         # Cache evicted so a future re-discovery starts a fresh card.
         assert h not in bot._detail_cache
     finally:
