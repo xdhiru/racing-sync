@@ -1718,6 +1718,32 @@ async def test_watch_rank1_proceeds_despite_grace(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_watch_fetch_skips_search_and_hold(tmp_path: Path):
+    """A /fetch'd (force_direct) drop skips Prowlarr + grace, uses its bytes."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        # A download indexer that would be queried (and could supply a
+        # sacrificial hit) if the search ran.
+        coord.prowlarr.get_download_indexers = MagicMock(
+            return_value=[SimpleNamespace(name="DL-Indexer", enable=True)])
+        coord.prowlarr.search_indexers_parallel = AsyncMock(return_value={})
+        ts = _watch_drop(store, "Grace.Fetch.1080p", 5000, _PRIV_ANNOUNCE, 16384)
+        ts.force_direct = 1
+        store.upsert(ts)
+        await coord._do_new_watch_dir(ts)
+        coord.prowlarr.search_indexers_parallel.assert_not_called()
+        # Admitted from the dropped bytes instead of grace-holding.
+        assert coord.transitioned != []
+        assert ts.cross_seed_source in ("watch-dir", "public-watch-dir")
+    finally:
+        store.close()
+
+
 def _racing_inflight(store: StateStore, name: str, size: int = 5000):
     """Same-content racing row past admission (invisible to watch election)."""
     ts = TorrentState(
