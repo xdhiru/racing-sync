@@ -163,6 +163,11 @@ class TorrentState:
     # SSD download (Telegram /fetch_ or prowlarr-timeout fallback). Sticky:
     # once set, every SSD-source pick bypasses Prowlarr for this row.
     force_direct: int = 0
+    # Operator hold (Telegram /skip_): the row keeps its state but gets
+    # no workers — no Prowlarr queries, no downloads, no moves — until
+    # /unskip_ (or fresh input via /add / watch-dir re-drop) resumes it.
+    # Sticky across restarts like force_direct.
+    skipped: int = 0
     # VPS1 cleanup bookkeeping (see [cleanup]):
     # - completed_at: last time the row entered DONE (grace anchor).
     # - vps1_last_activity_at: last time the VPS1 swarm showed upload
@@ -230,6 +235,7 @@ class TorrentState:
             "public_export_attempts": self.public_export_attempts,
             "fuse_verified": int(self.fuse_verified or 0),
             "force_direct": int(self.force_direct or 0),
+            "skipped": int(self.skipped or 0),
             "readd_first_attempted_at": (
                 self.readd_first_attempted_at.isoformat()
                 if self.readd_first_attempted_at else ""
@@ -284,6 +290,7 @@ CREATE TABLE IF NOT EXISTS torrent_state (
     public_export_attempts           INTEGER NOT NULL DEFAULT 0,
     fuse_verified            INTEGER NOT NULL DEFAULT 0,
     force_direct             INTEGER NOT NULL DEFAULT 0,
+    skipped                  INTEGER NOT NULL DEFAULT 0,
     readd_first_attempted_at  TEXT NOT NULL DEFAULT '',
     readd_next_retry_at       TEXT NOT NULL DEFAULT '',
     readd_attempts            INTEGER NOT NULL DEFAULT 0,
@@ -340,7 +347,7 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = (
     "source_infohash, dest_infohash, source_name, source_tracker, source_announce_url, "
     "classification_kind, total_bytes, save_path, cross_seed_infohash, cross_seed_source, "
     "'' AS cross_seed_blob, injected_private_hashes, indexer_first_queried_at, "
-    "indexer_next_retry_at, indexer_attempts, force_direct, readd_first_attempted_at, "
+    "indexer_next_retry_at, indexer_attempts, force_direct, skipped, readd_first_attempted_at, "
     "readd_next_retry_at, readd_attempts, failed_retries, completed_at, "
     "vps1_last_activity_at, fuse_verified, public_export_first_attempted_at, "
     "public_export_next_retry_at, public_export_attempts, state, batch_index, batches_total, batch_cap_bytes, readd_cycles, version, "
@@ -393,6 +400,7 @@ class StateStore:
         # every column and would OperationalError on an old DB.
         for _ddl in (
             "ADD COLUMN force_direct INTEGER NOT NULL DEFAULT 0",
+            "ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0",
             "ADD COLUMN readd_first_attempted_at TEXT NOT NULL DEFAULT ''",
             "ADD COLUMN readd_next_retry_at TEXT NOT NULL DEFAULT ''",
             "ADD COLUMN readd_attempts INTEGER NOT NULL DEFAULT 0",
@@ -1248,7 +1256,7 @@ class StateStore:
         "indexer_first_queried_at", "indexer_next_retry_at",
         "indexer_attempts", "public_export_first_attempted_at",
         "public_export_next_retry_at", "public_export_attempts",
-        "fuse_verified", "force_direct", "readd_first_attempted_at",
+        "fuse_verified", "force_direct", "skipped", "readd_first_attempted_at",
         "readd_next_retry_at", "readd_attempts", "failed_retries",
         "completed_at", "vps1_last_activity_at", "state", "batch_index",
         "batches_total", "batch_cap_bytes", "readd_cycles", "last_error",
@@ -1466,6 +1474,7 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
             if "fuse_verified" in keys else 0
         ),
         force_direct=_safe_int(row["force_direct"]) if "force_direct" in keys else 0,
+        skipped=_safe_int(row["skipped"]) if "skipped" in keys else 0,
         readd_first_attempted_at=_safe_dt(ra_first),
         readd_next_retry_at=_safe_dt(ra_next),
         readd_attempts=_safe_int(ra_attempts),
