@@ -1003,7 +1003,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if not item_hash:
                 continue
             ingested = False
-            if self.store.get(item_hash, include_blob=False) is None:
+            _existing = self.store.get(item_hash, include_blob=False)
+            if _existing is None:
                 try:
                     _ignored = self.store.is_ignored(item_hash) is True
                 except Exception:
@@ -1036,6 +1037,30 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     item.size_bytes,
                     # Domain only: announce URLs embed per-user passkeys.
                     announce_domain(item.announce_url),
+                )
+            elif _existing.state == State.FAILED:
+                # A re-dropped file for a failed release is the operator
+                # retrying it by hand: revive into a fresh pipeline run
+                # (cancelled/ignored hashes stay ignored — unignore first).
+                try:
+                    self.revive_failed_row(
+                        infohash=item_hash, name=item.name,
+                        size=item.size_bytes,
+                        announce=item.announce_url or "",
+                        blob=item.torrent_bytes,
+                        source_label="watch-dir")
+                except LookupError as e:
+                    log.info("watch-dir: re-drop of failed %s not revived: %s",
+                             item.name[:60], e)
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    log.warning("watch-dir: revive failed for %s: %s",
+                                item.name[:60], e)
+                    continue
+                ingested = True
+                log.info(
+                    "watch-dir: re-queued failed release %s (%s)",
+                    item.name[:60], item.infohash[:10],
                 )
             # Delete only what this scan ingested: an already-tracked drop
             # still belongs to the user — never destroy what we didn't
@@ -2049,6 +2074,100 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             )
         except Exception:
             return None
+
+    def revive_failed_row(self, *, infohash: str, name: str = "",
+                            size: int = 0, announce: str = "",
+                            blob: bytes | None = None,
+                            source_label: str = "") -> TorrentState:
+        """Re-queue a FAILED row from freshly provided .torrent bytes.
+
+        Operator intent (Telegram /add, watch-dir re-drop) explicitly
+        re-runs the pipeline: FAILED (any cause, including
+        tracker-deleted) → NEW with the error, retry counters, timers,
+        batch cursors and force-direct flag cleared, and metadata/blob
+        refreshed from the new bytes. Anything else raises LookupError
+        (caller keeps its existing reply/behavior). Cancelled
+        (ignored) hashes are never revived — unignore first. The row's
+        stale dest entry (if any survived the failure cleanup) is left
+        alone: QUEUED setup re-adds or adopts it normally.
+        """
+        norm = (infohash or "").strip().lower()
+        if len(norm) != 40 or not all(c in "0123456789abcdef" for c in norm):
+            raise LookupError("need a full 40-char infohash to revive")
+        store = getattr(self, "store", None)
+        if store is None or not hasattr(store, "get"):
+            raise LookupError("state store unavailable")
+        try:
+            if callable(getattr(store, "is_ignored", None)) \
+                    and store.is_ignored(norm) is True:
+                raise LookupError(
+                    "Ignored (previously cancelled): unignore it first, "
+                    "then add again")
+        except LookupError:
+            raise
+        except Exception:
+            pass
+        try:
+            ts = store.get(norm)
+        except Exception as e:  # noqa: BLE001
+            raise LookupError(f"cannot look up {norm[:10]}: {e}") from e
+        if ts is None:
+            raise LookupError("no tracked torrent — ingest it as new")
+        try:
+            state = getattr(ts, "state", None)
+        except Exception:
+            state = None
+        if state != State.FAILED:
+            try:
+                label = state.value
+            except Exception:
+                label = "tracked"
+            raise LookupError(
+                f"Already tracked: {(ts.source_name or norm[:10])[:50]} "
+                f"({label})")
+        if name:
+            ts.source_name = name
+        if size:
+            try:
+                ts.total_bytes = max(0, int(size))
+            except (TypeError, ValueError):
+                pass
+        if announce:
+            ts.source_announce_url = announce
+            ts.source_tracker = announce
+        if blob:
+            try:
+                ts.cross_seed_blob = bytes(blob)
+            except Exception:
+                pass
+            try:
+                ts._blob = bytes(blob)
+            except Exception:
+                pass
+        if source_label:
+            try:
+                ts.cross_seed_source = source_label
+            except Exception:
+                pass
+        ts.last_error = ""
+        ts.failed_retries = 0
+        ts.indexer_first_queried_at = None
+        ts.indexer_next_retry_at = None
+        ts.indexer_attempts = 0
+        ts.public_export_first_attempted_at = None
+        ts.public_export_next_retry_at = None
+        ts.public_export_attempts = 0
+        ts.readd_first_attempted_at = None
+        ts.readd_next_retry_at = None
+        ts.readd_attempts = 0
+        ts.readd_cycles = 0
+        ts.force_direct = 0
+        ts.batch_index = 0
+        ts.batches_total = 0
+        self.transition(ts, State.NEW)
+        log.info("revived failed row %s (%s) -> NEW via operator re-add",
+                 (ts.source_name or norm[:10])[:60], norm[:10])
+        return ts
 
     async def _fetch_source_or_fail(self, ts: TorrentState):
         """Fresh VPS1 metadata, a vanish sentinel, or None (parked/failed).

@@ -132,6 +132,71 @@ async def test_process_caption_variant(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_process_add_revives_failed(tmp_path):
+    """Re-provided .torrent for a FAILED row re-queues it (fuse-seed goal)."""
+    from conftest import make_coordinator
+
+    from racing_sync.state import TorrentState
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        blob = _torrent_bytes(name="Comeback.mkv")
+        infohash, _, _, _ = _bencoded_info_hash(blob)
+        store.upsert(TorrentState(
+            source_infohash=infohash, source_name="Comeback.mkv",
+            state=State.FAILED, last_error="boom", failed_retries=2))
+        coord = make_coordinator(store)
+        bot = _bot(store, coord=coord)
+        bot._coord = coord  # harness kwarg lands on bot.coord; prod uses _coord
+        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
+            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+
+        file_msg = _doc(mid=50)
+        await bot._handle_chat_message(_cmd(reply_to=file_msg))
+
+        row = store.get(infohash)
+        assert row is not None and row.state == State.NEW
+        assert row.last_error == "" and row.failed_retries == 0
+        assert bytes(store.get_blob(infohash)) == blob
+        texts = _sent_texts(bot)
+        assert any("Re-queued" in t for t in texts)
+        bot._bot.delete_message.assert_awaited_once_with(
+            chat_id="1", message_id=50)
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_process_add_refuses_ignored_failed(tmp_path):
+    """Cancelled (ignored) hashes stay away even when re-provided."""
+    from conftest import make_coordinator
+
+    from racing_sync.state import TorrentState
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        blob = _torrent_bytes(name="Cancelled.mkv")
+        infohash, _, _, _ = _bencoded_info_hash(blob)
+        store.upsert(TorrentState(
+            source_infohash=infohash, source_name="Cancelled.mkv",
+            state=State.FAILED))
+        store.ignore_torrent(infohash, "Cancelled.mkv")
+        coord = make_coordinator(store)
+        bot = _bot(store, coord=coord)
+        bot._coord = coord  # harness kwarg lands on bot.coord; prod uses _coord
+        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
+            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+
+        file_msg = _doc(mid=50)
+        await bot._handle_chat_message(_cmd(reply_to=file_msg))
+
+        assert store.get(infohash).state == State.FAILED
+        assert any("Ignored" in t for t in _sent_texts(bot))
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_process_without_document_hints(tmp_path):
     """/add with nothing to process: usage hint, no ingest, no delete."""
     store = StateStore(tmp_path / "state.db")

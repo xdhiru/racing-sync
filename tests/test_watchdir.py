@@ -2114,3 +2114,71 @@ async def test_wait_disk_promotes_when_complete_lands_on_dest(tmp_path: Path):
         coord._ssd_try_reserve.assert_not_called()
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_watch_redrop_revives_failed(tmp_path: Path):
+    """A re-dropped file for a FAILED row re-queues it (operator retry)."""
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    raw = _create_sample_torrent_data("Revived.Release", 1000,
+                                      "http://tracker.example/announce")
+    from racing_sync.watchdir import _bencoded_info_hash as _bh
+    infohash, _, _, _ = _bh(raw)
+    (watch_dir / "revived.torrent").write_bytes(raw)
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.upsert(TorrentState(
+        source_infohash=infohash, source_name="Revived.Release",
+        state=State.FAILED, last_error="boom", failed_retries=2))
+
+    coord = make_coordinator()
+    coord.cfg = MagicMock()
+    coord.cfg.watch_dir = WatchDirConfig(path=watch_dir,
+                                         delete_after_pickup=True)
+    coord.cfg.max_active_downloads = 3
+    coord.cfg.max_concurrent_moves = 3
+    coord.store = store
+    coord.watch = WatchDirScanner(coord.cfg.watch_dir, prowlarr=None)
+    try:
+        items = await coord.scan_watch()
+        assert len(items) == 1
+        row = store.get(infohash)
+        assert row is not None and row.state == State.NEW
+        assert row.last_error == "" and row.failed_retries == 0
+        assert not (watch_dir / "revived.torrent").exists()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_watch_redrop_ignored_stays(tmp_path: Path):
+    """Cancelled (ignored) hashes never revive, even re-dropped."""
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    raw = _create_sample_torrent_data("Ignored.Release", 1000,
+                                      "http://tracker.example/announce")
+    from racing_sync.watchdir import _bencoded_info_hash as _bh2
+    infohash, _, _, _ = _bh2(raw)
+    (watch_dir / "ignored.torrent").write_bytes(raw)
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.upsert(TorrentState(
+        source_infohash=infohash, source_name="Ignored.Release",
+        state=State.FAILED))
+    store.ignore_torrent(infohash, "Ignored.Release")
+
+    coord = make_coordinator()
+    coord.cfg = MagicMock()
+    coord.cfg.watch_dir = WatchDirConfig(path=watch_dir,
+                                         delete_after_pickup=True)
+    coord.store = store
+    coord.watch = WatchDirScanner(coord.cfg.watch_dir, prowlarr=None)
+    try:
+        await coord.scan_watch()
+        assert store.get(infohash).state == State.FAILED
+        assert (watch_dir / "ignored.torrent").exists()
+    finally:
+        store.close()

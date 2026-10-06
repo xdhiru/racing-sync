@@ -2232,6 +2232,39 @@ class TelegramBot:
                 _st = existing.state.value
             except Exception:
                 _st = "tracked"
+            if _st == State.FAILED.value:
+                if _ignored:
+                    await self._reply(
+                        f"Ignored (previously cancelled): {name}. "
+                        f"Unignore it first, then add again.",
+                        reply_to=message)
+                    await self._delete_chat_file(message, doc_msg)
+                    return
+                # Operator re-provided the .torrent for a failed release
+                # (usually to fuse-seed it as the final goal): revive the
+                # row into a fresh pipeline run instead of refusing it.
+                coord = getattr(self, "_coord", None)
+                _revive = getattr(coord, "revive_failed_row", None)
+                if coord is not None and callable(_revive):
+                    try:
+                        _revived = _revive(
+                            infohash=infohash, name=name, size=size,
+                            announce=announce or "", blob=bytes(data),
+                            source_label="telegram")
+                    except LookupError as e:
+                        await self._reply(str(e)[:300], reply_to=message)
+                        await self._delete_chat_file(message, doc_msg)
+                        return
+                    except Exception as e:  # noqa: BLE001
+                        await self._reply(f"Action failed: {e}",
+                                          reply_to=message)
+                        return
+                    await self._reply(
+                        f"Re-queued {name} (was failed) — downloading "
+                        f"on VPS2, watch its card.",
+                        reply_to=message)
+                    await self._delete_chat_file(message, doc_msg)
+                    return
             await self._reply(f"Already tracked: {name} ({_st}).",
                               reply_to=message)
             await self._delete_chat_file(message, doc_msg)
