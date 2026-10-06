@@ -511,11 +511,12 @@ CANCEL_SHORT_LEN = 10
 #: `/cancel_<hex>` (optional `@bot` suffix, extra trailing text ignored).
 CANCEL_CMD_RE = re.compile(r"^/cancel_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
-#: `/fetch_<hex>` — same shape: use the VPS1 original for the SSD
-#: download of a WAITING_INDEXER row instead of waiting for Prowlarr.
+#: `/fetch_<hex>` — same shape: use the starting torrent for the SSD
+#: download instead of waiting for Prowlarr (WAITING_INDEXER rows use
+#: the VPS1 original; NEW grace-held rows use their starting bytes).
 FETCH_CMD_RE = re.compile(r"^/fetch_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
-#: `/prefer_<hex>` — same shape: start a grace-held watch row's SSD
+#: `/prefer_<hex>` — same shape: start a grace-held row's SSD
 #: download now instead of waiting out its preferred-copy grace.
 PREFER_CMD_RE = re.compile(r"^/prefer_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
@@ -801,10 +802,14 @@ def pick_snapshot(
     """Frozen member list for a group command: ``[(hash, label)]``.
 
     ``cmd`` cancel snapshots every member; fetch/prefer snapshot only
-    eligible members. Labels are short tracker names (hash-qualified on
-    repeats). The snapshot is taken once, at command-tap time — later
-    buttons address members by index, so list renumbering mid-flow
-    cannot misroute. Fail-open: [].
+    eligible members: WAITING_INDEXER rows for fetch (use the VPS1
+    original instead of waiting out Prowlarr), plus NEW grace-held rows
+    for fetch and prefer (watch drops use the starting .torrent,
+    racing rows use the VPS1 original — both skip the grace hold).
+    Labels are short tracker names (hash-qualified on repeats). The
+    snapshot is taken once, at command-tap time — later buttons
+    address members by index, so list renumbering mid-flow cannot
+    misroute. Fail-open: [].
     """
     try:
         if cmd not in ("cancel", "fetch", "prefer"):
@@ -814,7 +819,10 @@ def pick_snapshot(
             _h = _member_hash(ts)
             if not _h:
                 continue
-            if cmd == "fetch" and ts.state != State.WAITING_INDEXER:
+            if cmd == "fetch" and not (
+                    ts.state == State.WAITING_INDEXER or (
+                        ts.state == State.NEW and _is_grace_note_for_prefer(
+                            _active_note(ts, notes)))):
                 continue
             if cmd == "prefer" and not (
                     ts.state == State.NEW and _is_grace_note_for_prefer(
@@ -977,6 +985,7 @@ def render_active(
                 _has_inject = True
             if (ts.state == State.NEW
                     and _is_grace_note_for_prefer(_note)):
+                _has_fetch = True
                 _has_prefer = True
 
         # 3. Short group commands on ONE line with no indent (the `/`
@@ -1498,11 +1507,13 @@ class TelegramBot:
         except Exception:
             note = ""
         text = render_detail(ts, progress, note)
-        # Grace-held rows are actionable: offer the override inline so the
-        # operator doesn't have to remember the command shape.
+        # Grace-held rows are actionable: offer the overrides inline so
+        # the operator doesn't have to remember the command shape
+        # (prefer starts this copy now; fetch uses the starting bytes).
         try:
             if note.startswith("Waiting for preferred copy"):
                 text += f"\nPrefer this copy now: `{_prefer_command(infohash)}`"
+                text += f"\nFetch starting bytes now: `{_fetch_command(infohash)}`"
         except Exception:
             pass
         try:
@@ -2007,21 +2018,49 @@ class TelegramBot:
             "(it may already be done/cancelled)"
         )
 
-    def _resolve_fetch_target(self, short: str):
-        """Map a `/fetch_<prefix|full-hash>` token to a WAITING_INDEXER row.
+    def _fetch_new_eligible(self, row) -> bool:
+        """True when a NEW row is actually waiting (preferred-copy grace).
 
-        Same prefix/full-hash semantics as cancel; the resolved row must
-        still be waiting for the download indexer, otherwise fetching the
-        VPS1 original is meaningless. Raises LookupError otherwise.
+        Mirrors /prefer_ list eligibility: the grace note is the signal,
+        for watch drops (use the starting .torrent) and racing rows
+        (use the VPS1 original) alike. Fail-closed (False) when the
+        coordinator is unavailable — same as an empty note set.
+        """
+        try:
+            if getattr(row, "state", None) != State.NEW:
+                return False
+            coord = getattr(self, "_coord", None)
+            if coord is None:
+                return False
+            note_fn = getattr(coord, "_watch_wait_note", None)
+            if not callable(note_fn):
+                return False
+            return _is_grace_note_for_prefer(note_fn(row))
+        except Exception:
+            return False
+
+    def _fetch_watch_eligible(self, row) -> bool:
+        """Deprecated alias of :meth:`_fetch_new_eligible`."""
+        return self._fetch_new_eligible(row)
+
+    def _resolve_fetch_target(self, short: str):
+        """Map a `/fetch_<prefix|full-hash>` token to a waiting row.
+
+        WAITING_INDEXER rows fetch the VPS1 original instead of waiting
+        out Prowlarr. NEW grace-held rows (watch or racing) never wait
+        on that state — allow fetch while grace-held, mirroring
+        /prefer_ eligibility. Raises LookupError otherwise.
         """
         row = self._resolve_cancel_target(short, cmd="fetch")
-        if row.state != State.WAITING_INDEXER:
-            raise LookupError(
-                f"{(row.source_name or row.source_infohash[:10])[:50]} is "
-                f"{row.state.value}, not waiting for the download indexer — "
-                "nothing to fetch"
-            )
-        return row
+        if row.state == State.WAITING_INDEXER:
+            return row
+        if self._fetch_new_eligible(row):
+            return row
+        raise LookupError(
+            f"{(row.source_name or row.source_infohash[:10])[:50]} is "
+            f"{row.state.value}, not waiting for the download indexer — "
+            "nothing to fetch"
+        )
 
     async def _handle_chat_message(self, message: Any) -> None:
         """Execute `/cancel_` / `/fetch_` / `/prefer_` / `/injectfuse` commands.
@@ -3048,13 +3087,14 @@ class TelegramBot:
             log.debug("action button handling failed: %s", e)
 
     async def _fetch_torrent(self, infohash: str) -> str:
-        """Flag a WAITING_INDEXER row to use the VPS1 original now.
+        """Flag a waiting row to use its starting torrent now.
 
-        Sets the sticky `force_direct` flag and wakes the row
-        (WAITING_INDEXER -> QUERYING) so the next tick picks the racing
-        torrent's own bytes for the SSD download instead of waiting out
-        the Prowlarr retry window. VPS2 then leeches the private swarm,
-        which counts toward ratio.
+        WAITING_INDEXER rows get the VPS1 original instead of
+        waiting out Prowlarr (force_direct + wake to QUERYING). NEW
+        grace-held rows get their starting bytes instead (force_direct
+        only — no state change; the NEW flow honors the flag next tick
+        and a worker is woken for this tick): watch drops use the starting
+        .torrent, racing rows use the VPS1 original.
         """
         try:
             from .api import _hold_ops_lock
@@ -3065,25 +3105,71 @@ class TelegramBot:
         if coord is None or store is None:
             return "Fetch failed: bot not attached"
 
+        acted: list[str] = []
+
         def _flag() -> str:
             row = store.get(infohash)
             if row is None:
                 raise LookupError("no longer tracked (done/cancelled?)")
-            if row.state != State.WAITING_INDEXER:
+            if row.state == State.WAITING_INDEXER:
+                # Fresh retry window for the direct phase, same as the automatic
+                # timeout fallback: an explicit fetch buys full direct retries,
+                # not just the remainder of the spent prowlarr window.
+                row.force_direct = 1
+                row.indexer_first_queried_at = dt.datetime.now(dt.timezone.utc)
+                row.indexer_attempts = 0
+                store.transition(row, State.QUERYING)
                 return (
-                    f"{(row.source_name or infohash[:10])[:50]} is "
-                    f"{row.state.value} — nothing to fetch"
+                    f"Fetching VPS1 original for {(row.source_name or infohash[:10])[:50]} "
+                    f"(bypassing Prowlarr; leeches the private swarm)"
                 )
-            # Fresh retry window for the direct phase, same as the automatic
-            # timeout fallback: an explicit fetch buys full direct retries,
-            # not just the remainder of the spent prowlarr window.
-            row.force_direct = 1
-            row.indexer_first_queried_at = dt.datetime.now(dt.timezone.utc)
-            row.indexer_attempts = 0
-            store.transition(row, State.QUERYING)
+            # NEW grace-held rows: "fetch" = use the dropped .torrent now
+            # (skip Prowlarr search and grace hold). No state change —
+            # NEW rows are worked every tick — and election/in-flight
+            # deferrals still apply, since those guard live downloads,
+            # not indexer waits.
+            if row.state == State.NEW and self._fetch_new_eligible(row):
+                try:
+                    _upd = getattr(store, "update_columns", None)
+                    if callable(_upd):
+                        _applied = bool(_upd(
+                            infohash, {"force_direct": 1},
+                            expected_state=State.NEW))
+                    else:
+                        row.force_direct = 1
+                        store.upsert(row)
+                        _applied = True
+                except Exception as e:  # noqa: BLE001
+                    return f"Fetch failed: {e}"
+                if not _applied:
+                    return (
+                        f"{(row.source_name or infohash[:10])[:50]} moved "
+                        f"state — nothing to fetch"
+                    )
+                acted.append(infohash)
+                try:
+                    _is_watch = bool(coord._is_watch_row(row)) if callable(
+                        getattr(coord, "_is_watch_row", None)) else False
+                except Exception:
+                    _is_watch = False
+                if _is_watch:
+                    return (
+                        f"Using dropped .torrent directly for "
+                        f"{(row.source_name or infohash[:10])[:50]} "
+                        f"(skipping Prowlarr search and grace hold)"
+                    )
+                return (
+                    f"Using VPS1 original directly for "
+                    f"{(row.source_name or infohash[:10])[:50]} "
+                    f"(skipping Prowlarr search and grace hold)"
+                )
+            try:
+                _label = row.state.value
+            except Exception:
+                _label = "unknown"
             return (
-                f"Fetching VPS1 original for {(row.source_name or infohash[:10])[:50]} "
-                "(bypassing Prowlarr; leeches the private swarm)"
+                f"{(row.source_name or infohash[:10])[:50]} is "
+                f"{_label} — nothing to fetch"
             )
 
         try:
@@ -3099,6 +3185,17 @@ class TelegramBot:
             return f"Fetch failed: {e}"
         except Exception as e:  # noqa: BLE001
             return f"Fetch failed: {e}"
+        # NEW watch rows stay NEW: wake one worker now so the flag takes
+        # effect this tick (the scheduler is the backstop).
+        try:
+            if acted:
+                _wrow = store.get(acted[0])
+                if _wrow is not None:
+                    _spawn = getattr(coord, "_spawn_worker", None)
+                    if callable(_spawn):
+                        _spawn(_wrow)
+        except Exception:
+            log.debug("fetch wake failed; next tick picks it up")
         return outcome
 
     async def _prefer_torrent(self, short: str) -> str:

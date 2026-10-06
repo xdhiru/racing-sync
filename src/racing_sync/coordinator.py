@@ -3114,6 +3114,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 _exempted = bool(_ex.pop((ts.source_infohash or "").lower(), None))
         except Exception:
             pass
+        # Telegram /fetch on a manual drop means "stop waiting for the
+        # indexer Prowlarr search, use the starting .torrent now": skip
+        # the Prowlarr search, the sacrificial pick and the grace hold
+        # below. Sticky like racing /fetch (not consumed): it only ever
+        # matters pre-admission. Election/in-flight deferrals still
+        # apply — those guard live downloads, not indexer waits.
+        try:
+            _forced = bool(getattr(ts, "force_direct", 0))
+        except Exception:
+            _forced = False
         try:
             _prow = getattr(self.cfg, "prowlarr", None)
             _prefer_possible = bool(getattr(_prow, "enabled", False)) and bool(
@@ -3197,7 +3207,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         indexers_to_query = []
         download_idx_names: list[str] = []
         hits_by_indexer: dict[str, list[TorrentHit]] = {}
-        if not query_prowlarr:
+        if _forced:
+            log.info("prowlarr: skipping search for watch-dir release %r (/fetch override: using starting .torrent)", ts.source_name)
+        elif not query_prowlarr:
             log.info("prowlarr: skipping search for watch-dir release %r (watch_dir.query_prowlarr is False)", ts.source_name)
         elif should_skip_prowlarr:
             log.info(
@@ -3267,7 +3279,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
             # 1. Sacrificial download torrent from the download-target
             # indexers, in priority order — first exact match wins.
-            if prefer_prowlarr and download_idx_names:
+            # Skipped under /fetch (force_direct): the operator chose the
+            # dropped bytes, so a preferred hit must not override them.
+            if prefer_prowlarr and download_idx_names and not _forced:
                 for dl_name in download_idx_names:
                     dl_hits = hits_by_indexer.get(dl_name, [])
                     matching_dl = [
@@ -3370,10 +3384,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         # Preferred-copy grace, post-search: hold only when falling back to
         # the dropped non-preferred bytes (a preferred drop may still
         # arrive, or a later search may hit). A secured sacrificial copy,
-        # public/rank-1 rows, expired graces, /prefer_'d rows and setups
-        # without download indexers proceed immediately. Nothing is
-        # reserved yet, so returning keeps the row NEW with no leakage.
-        if (_hold_candidate and not _found_preferred
+        # public/rank-1 rows, expired graces, /prefer_'d rows, /fetch'd
+        # rows and setups without download indexers proceed immediately.
+        # Nothing is reserved yet, so returning keeps the row NEW with no
+        # leakage.
+        if (_hold_candidate and not _found_preferred and not _forced
                 and self._in_preferred_grace(ts)):
             log.info(
                 "watch-dir: holding %s for preferred copy (rank 2, %ds grace left)",
@@ -3618,6 +3633,27 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
         Called by _tick when the row's indexer_next_retry_at has elapsed.
         """
+        # Manual fuse fast-track before another prowlarr query: a torrent
+        # added by hand to VPS2 while parked must not wait out the retry.
+        try:
+            if await self._adopt_manual_fuse_if_present(ts):
+                return
+        except Exception:
+            pass
+
+        # Watch rows (manual drops) carry their own bytes: the racing
+        # pick below (VPS1 export / Prowlarr cross-seed) is meaningless
+        # for them — and its VPS1 lookup would fail a row whose torrent
+        # was never on VPS1. The watch flow proceeds from the dropped
+        # .torrent instead (honoring force_direct).
+        try:
+            _is_watch = self._is_watch_row(ts)
+        except Exception:
+            _is_watch = False
+        if _is_watch:
+            await self._do_new_watch_dir(ts)
+            return
+
         # Pull fresh data from VPS1 in case the torrent name changed.
         # A vanished VPS1 copy (space-cleared, pruned) proceeds from the
         # persisted metadata instead of failing: Prowlarr or a surviving
@@ -3632,14 +3668,6 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         else:
             ts.source_name = st.name
             ts.total_bytes = st.size_bytes
-
-        # Manual fuse fast-track before another prowlarr query: a torrent
-        # added by hand to VPS2 while parked must not wait out the retry.
-        try:
-            if await self._adopt_manual_fuse_if_present(ts):
-                return
-        except Exception:
-            pass
 
         # Same-content in-flight deferral: another row for this release is
         # already QUEUED/DOWNLOADING/MOVING/RE_ADDING (e.g. a watch-dropped

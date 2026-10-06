@@ -1029,6 +1029,116 @@ async def test_fetch_torrent_marks_stale_row(tmp_path: Path):
         store.close()
 
 
+def _grace_coord_stub(*, watch: bool):
+    """Coordinator double: grace-held NEW rows, watch-or-racing origin."""
+    coord = SimpleNamespace(
+        _watch_wait_note=lambda row: "Waiting for preferred copy · 100s left",
+        _is_watch_row=lambda row: watch,
+        _spawn_worker=MagicMock(),
+    )
+    return coord
+
+
+@pytest.mark.anyio
+async def test_fetch_torrent_new_watch_grace_uses_dropped(tmp_path: Path):
+    """NEW grace-held watch drop: force_direct set, stays NEW, woken."""
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(
+        source_infohash="f" * 40, source_name="Drop.One",
+        state=State.NEW, cross_seed_source="watch-dir"))
+    bot = _bot()
+    bot._store = store
+    bot._coord = _grace_coord_stub(watch=True)
+    try:
+        msg = await bot._fetch_torrent("f" * 40)
+        row = store.get("f" * 40)
+        assert row.force_direct == 1
+        assert row.state == State.NEW
+        assert "dropped .torrent directly" in msg
+        bot._coord._spawn_worker.assert_called_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_fetch_torrent_new_racing_grace_uses_vps1(tmp_path: Path):
+    """NEW grace-held racing row: force_direct set, stays NEW, woken."""
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(
+        source_infohash="e" * 40, source_name="Race.One",
+        state=State.NEW, cross_seed_source="prowlarr"))
+    bot = _bot()
+    bot._store = store
+    bot._coord = _grace_coord_stub(watch=False)
+    try:
+        msg = await bot._fetch_torrent("e" * 40)
+        row = store.get("e" * 40)
+        assert row.force_direct == 1
+        assert row.state == State.NEW
+        assert "VPS1 original directly" in msg
+        bot._coord._spawn_worker.assert_called_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_fetch_torrent_new_without_grace_refuses(tmp_path: Path):
+    """NEW rows with no grace note have nothing to fetch."""
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(
+        source_infohash="d" * 40, source_name="Fresh.One",
+        state=State.NEW, cross_seed_source="watch-dir"))
+    bot = _bot()
+    bot._store = store
+    bot._coord = SimpleNamespace(
+        _watch_wait_note=lambda row: "",
+        _is_watch_row=lambda row: True,
+        _spawn_worker=MagicMock(),
+    )
+    try:
+        msg = await bot._fetch_torrent("d" * 40)
+        assert "nothing to fetch" in msg
+        assert store.get("d" * 40).force_direct == 0
+        bot._coord._spawn_worker.assert_not_called()
+    finally:
+        store.close()
+
+
+def test_pick_snapshot_fetch_includes_new_grace():
+    """Group fetch snapshots WAITING_INDEXER + NEW grace-held members."""
+    from racing_sync.telegram_bot import pick_snapshot
+
+    mk = lambda h, st, dom: TorrentState(
+        source_infohash=h, source_name="Show.X", state=st,
+        total_bytes=1000, source_announce_url=f"https://{dom}/announce")
+    waiting = mk("a" * 40, State.WAITING_INDEXER, "alpha.cc")
+    grace = mk("b" * 40, State.NEW, "bte.example")
+    busy = mk("c" * 40, State.DOWNLOADING, "gamma.cc")
+    notes = {"b" * 40: "Waiting for preferred copy · 90s left"}
+    members = [(waiting, None), (grace, None), (busy, None)]
+    assert [h for (h, _) in pick_snapshot(members, "fetch", notes)] == [
+        "a" * 40, "b" * 40]
+
+
+def test_resolve_fetch_target_allows_new_grace(tmp_path: Path):
+    """Prefix resolution accepts grace-held NEW rows, rejects others."""
+    bot = _bot()
+    store = StateStore(tmp_path / "state.db")
+    bot._store = store
+    bot._coord = _grace_coord_stub(watch=True)
+    try:
+        store.upsert(TorrentState(source_infohash="f" * 40, source_name="Drop",
+                                  state=State.NEW,
+                                  cross_seed_source="watch-dir"))
+        store.upsert(TorrentState(source_infohash="b" * 40, source_name="Busy",
+                                  state=State.DOWNLOADING))
+        assert bot._resolve_fetch_target("f" * 10).source_name == "Drop"
+        with pytest.raises(LookupError, match="not waiting"):
+            bot._resolve_fetch_target("b" * 40)
+    finally:
+        store.close()
+
+
 def test_full_reset_refuses_symlink_ssd(tmp_path: Path, monkeypatch):
     from racing_sync.__main__ import _do_full_reset
 
