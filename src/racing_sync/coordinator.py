@@ -283,6 +283,14 @@ def _log_api_task_done(task: "asyncio.Task") -> None:
         log.error("API server task died: %s", exc)
 
 
+#: Sentinel from _fetch_source_or_fail: the VPS1 torrent is gone (third
+#: consecutive miss) but the row was parked — not failed — because a
+#: Prowlarr cross-seed may still supply the SSD bytes. Callers build a
+#: pseudo-source from persisted row metadata and pick normally. Truthy
+#: and distinct from None; compare by identity, never as a Torrent.
+_SOURCE_GONE = object()
+
+
 @dataclass
 class LiveItem:
     source_infohash: str
@@ -1990,8 +1998,60 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             pass
         return None
 
+    def _prowlarr_query_possible(self, ts: TorrentState) -> bool:
+        """True when a Prowlarr cross-seed search can run for this row."""
+        try:
+            if getattr(self, "prowlarr", None) is None:
+                return False
+            _cs = getattr(getattr(self, "cfg", None), "cross_seed", None)
+            if not bool(getattr(_cs, "allow_prowlarr_cross_seed", False)):
+                return False
+            _pq = getattr(getattr(self, "cfg", None), "prowlarr", None)
+            _skip = getattr(_pq, "should_skip_title", None)
+            if callable(_skip) and _skip(ts.source_name or ""):
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _pseudo_source_for_vanished(self, ts: TorrentState):
+        """Stand-in source built from persisted row metadata.
+
+        The VPS1 copy is gone, but name/size/trackers were persisted at
+        ingest: enough for a Prowlarr cross-seed search (name+size) and
+        for same-content sibling discovery on VPS1. None when even the
+        name is unknown (nothing to search for).
+        """
+        try:
+            name = (ts.source_name or "").strip()
+            if not name:
+                return None
+            try:
+                total = max(0, int(ts.total_bytes or 0))
+            except (TypeError, ValueError):
+                total = 0
+            trackers: list[str] = []
+            try:
+                for _u in (ts.source_announce_url, ts.source_tracker):
+                    if _u and _u not in trackers:
+                        trackers.append(_u)
+            except Exception:
+                pass
+            return Torrent(
+                hash=(ts.source_infohash or "").lower(),
+                name=name,
+                category="",
+                save_path="",
+                size_bytes=total,
+                state="vanished",
+                progress=0.0,
+                trackers=trackers,
+            )
+        except Exception:
+            return None
+
     async def _fetch_source_or_fail(self, ts: TorrentState):
-        """Fresh VPS1 metadata, or None (row already moved to FAILED).
+        """Fresh VPS1 metadata, a vanish sentinel, or None (parked/failed).
 
         Prefers the poller snapshot (no RPC); falls back to a live
         lookup that also refreshes the snapshot entry. A single poll
@@ -1999,6 +2059,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         only the third consecutive miss is terminal. Misses are tracked
         in-memory per infohash (a restart resets the count, which is
         safe — worst case one extra grace window).
+
+        Third miss (VPS1 copy really gone — operator cleared it for
+        space, tracker pruned it): fail ONLY when no other SSD source
+        can exist. Otherwise the row parks for a Prowlarr cross-seed
+        built from its persisted metadata and this returns the
+        _SOURCE_GONE sentinel — the VPS2 pipeline continues without
+        VPS1. Callers must handle the sentinel (pseudo-source pick),
+        never treat it as a torrent.
         """
         try:
             st = self._cached_source_torrent(ts.source_infohash)
@@ -2045,6 +2113,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 _misses.pop(_key, None)
             except Exception:
                 pass
+            if self._prowlarr_query_possible(ts):
+                # The VPS1 copy is gone but a Prowlarr cross-seed may
+                # still supply the SSD bytes: park (24h max-age backstop
+                # still applies) and let the caller pick from persisted
+                # metadata instead of failing a recoverable row.
+                log.warning("source torrent %s gone from VPS1; parking "
+                            "for Prowlarr cross-seed",
+                            (ts.source_infohash or "")[:10])
+                self._park_for_indexer_retry(
+                    ts, reason="source vanished from VPS1")
+                return _SOURCE_GONE
             err = f"source torrent vanished from client: {ts.source_infohash[:10]}"
             log.warning(err)
             self.transition(ts, State.FAILED, error=err)
@@ -2463,10 +2542,19 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         st = await self._fetch_source_or_fail(ts)
         if st is None:
             return
-        ts.source_name = st.name
-        ts.total_bytes = st.size_bytes
-        ts.source_tracker = st.trackers[0] if st.trackers else ""
-        ts.source_announce_url = ts.source_tracker or ts.source_announce_url
+        if st is _SOURCE_GONE:
+            # VPS1 copy gone (space-cleared, pruned): proceed from the
+            # row's persisted metadata. Siblings still on VPS1 (if any)
+            # are preferred automatically by the normal pick; otherwise
+            # a Prowlarr cross-seed supplies the SSD bytes.
+            st = self._pseudo_source_for_vanished(ts)
+            if st is None:
+                return
+        else:
+            ts.source_name = st.name
+            ts.total_bytes = st.size_bytes
+            ts.source_tracker = st.trackers[0] if st.trackers else ""
+            ts.source_announce_url = ts.source_tracker or ts.source_announce_url
 
         # Manual fuse fast-track: same infohash already seeding from fuse
         # (any category) with verified bytes needs no prowlarr/SSD work.
@@ -3412,11 +3500,19 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         Called by _tick when the row's indexer_next_retry_at has elapsed.
         """
         # Pull fresh data from VPS1 in case the torrent name changed.
+        # A vanished VPS1 copy (space-cleared, pruned) proceeds from the
+        # persisted metadata instead of failing: Prowlarr or a surviving
+        # same-content sibling can still supply the SSD bytes.
         st = await self._fetch_source_or_fail(ts)
         if st is None:
             return
-        ts.source_name = st.name
-        ts.total_bytes = st.size_bytes
+        if st is _SOURCE_GONE:
+            st = self._pseudo_source_for_vanished(ts)
+            if st is None:
+                return
+        else:
+            ts.source_name = st.name
+            ts.total_bytes = st.size_bytes
 
         # Manual fuse fast-track before another prowlarr query: a torrent
         # added by hand to VPS2 while parked must not wait out the retry.
