@@ -1422,3 +1422,72 @@ async def test_re_inject_zero_injection_warns(caplog):
     assert any("no .torrent bytes" in r.message for r in caplog.records)
     assert any("0/1 racing torrent" in r.message for r in caplog.records)
 
+
+def _original_row(fuse_dir, h="o" * 40):
+    (fuse_dir / "Orig.Movie.2026.mkv").write_bytes(b"x" * 100)
+    return TorrentState(
+        source_infohash="s" * 40, dest_infohash=h,
+        source_name="Orig.Movie.2026",
+        state=State.DONE,
+    )
+
+
+def _original_coord(tmp_path, blob):
+    from pathlib import Path as _Path
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.cfg = MagicMock()
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir(exist_ok=True)
+    coord.cfg.rclone.fuse.mount = fuse_dir
+    coord.cfg.rclone.fuse.mount_unsorted = fuse_dir / "unsorted"
+    coord.cfg.dest.save_path = tmp_path / "ssd"
+    coord.cfg.ssd.path = tmp_path / "ssd"
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.classifier._episode_re = None
+    coord.dest_client = AsyncMock()
+    coord.dest_client.export_torrent = AsyncMock(return_value=blob)
+    return coord, fuse_dir
+
+
+@pytest.mark.anyio
+async def test_original_healthy_memo_skips_reprobe(tmp_path: Path):
+    """Proven-healthy originals skip export+stats until the memo ages out."""
+    import time
+
+    blob = _single_file_torrent_bytes("Orig.Movie.2026.mkv", 100)
+    coord, fuse_dir = _original_coord(tmp_path, blob)
+    coord._ensure_fuse_entry = AsyncMock(return_value=(True, "already added"))
+    ts = _original_row(fuse_dir)
+    h = (ts.dest_infohash or "").lower()
+
+    await coord._ensure_original_fuse_entry(ts, fuse_dir)
+    assert coord.dest_client.export_torrent.await_count == 1
+    # Second tick: memo fresh, no export, no stats, no inject attempt.
+    await coord._ensure_original_fuse_entry(ts, fuse_dir)
+    assert coord.dest_client.export_torrent.await_count == 1
+    assert time.monotonic() < coord._original_healthy_at[h]
+    # Aged out: re-probes.
+    coord._original_healthy_at[h] = time.monotonic() - 1.0
+    await coord._ensure_original_fuse_entry(ts, fuse_dir)
+    assert coord.dest_client.export_torrent.await_count == 2
+
+
+@pytest.mark.anyio
+async def test_original_defer_never_memoizes(tmp_path: Path):
+    """Missing bytes keep re-probing (failure backoff only, no healthy memo)."""
+    blob = _single_file_torrent_bytes("Orig.Movie.2026.mkv", 100)
+    coord, fuse_dir = _original_coord(tmp_path, blob)
+    # NOTE: fuse file deliberately absent.
+    coord._ensure_fuse_entry = AsyncMock(return_value=(True, "already added"))
+    ts = _original_row(fuse_dir)
+    (fuse_dir / "Orig.Movie.2026.mkv").unlink()
+    h = (ts.dest_infohash or "").lower()
+
+    await coord._ensure_original_fuse_entry(ts, fuse_dir)
+    assert coord.dest_client.export_torrent.await_count == 1
+    assert h not in getattr(coord, "_original_healthy_at", {})
+    await coord._ensure_original_fuse_entry(ts, fuse_dir)
+    assert coord.dest_client.export_torrent.await_count == 2
+

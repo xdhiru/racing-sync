@@ -313,6 +313,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     _source_torrents_cache: list[Torrent] = field(default_factory=list, init=False)
     _source_torrents_cached_at: float = field(default=0.0, init=False)
     _failed_late_cross_seeds: dict[str, dt.datetime] = field(default_factory=dict, init=False)
+    # Proven-healthy original fuse entries (entry-hash -> next re-probe
+    # monotonic): skips the per-tick export + stats for healthy DONE rows.
+    _original_healthy_at: dict[str, float] = field(default_factory=dict, init=False)
     # VPS1 cleanup janitor ([cleanup]): monotonic timestamp of the last run
     # plus one monotonic timestamp per newly discovered racing release
     # (rolling intake-velocity signal for spam-burst grace shortening).
@@ -8501,11 +8504,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         bounded by one full scan per DONE row, then memoized).
         """
         try:
-            for attr in ("_failed_late_cross_seeds", "_late_seed_ok_at"):
+            for attr in ("_failed_late_cross_seeds", "_late_seed_ok_at",
+                         "_original_healthy_at"):
                 d = getattr(self, attr, None)
                 if not isinstance(d, dict) or len(d) <= 2000:
                     continue
-                if attr == "_late_seed_ok_at":
+                if attr in ("_late_seed_ok_at", "_original_healthy_at"):
                     now_m = time.monotonic()
                     for k in list(d.keys()):
                         try:
@@ -8792,6 +8796,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         # are the authoritative repair payload, and this keeps the late-tick
         # free of extra source calls. Unavailable => skip repair; new seeds
         # stay protected by their own per-torrent fuse gate.
+        #
+        # Healthy memo (30m, same window as the failure backoff above): a
+        # proven-healthy entry must not pay export + stats every tick —
+        # that was an INFO line plus qB/fuse round-trips per DONE row per
+        # poll. Only verified health memoizes; every defer/fail path
+        # re-probes next tick as before.
+        try:
+            _healthy = getattr(self, "_original_healthy_at", None)
+            if isinstance(_healthy, dict) and h:
+                _next = _healthy.get(h)
+                try:
+                    _fresh = _next is not None and time.monotonic() < float(_next)
+                except (TypeError, ValueError):
+                    _fresh = False
+                if _fresh:
+                    return
+        except Exception:
+            pass
         blob: bytes | None = None
         try:
             export_fn = getattr(self.dest_client, "export_torrent", None)
@@ -8835,6 +8857,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     _failed6 = getattr(self, "_failed_late_cross_seeds", None)
                     if isinstance(_failed6, dict):
                         _failed6.pop(h, None)
+                except Exception:
+                    pass
+                try:
+                    _hm = getattr(self, "_original_healthy_at", None)
+                    if not isinstance(_hm, dict):
+                        _hm = {}
+                        self._original_healthy_at = _hm  # type: ignore[attr-defined]
+                    _hm[h] = time.monotonic() + 1800.0
+                    if len(_hm) > 5000:
+                        for _k in list(_hm.keys())[: len(_hm) - 5000]:
+                            _hm.pop(_k, None)
                 except Exception:
                     pass
         except Exception as e:  # noqa: BLE001
