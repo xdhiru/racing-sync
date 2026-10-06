@@ -1278,6 +1278,72 @@ async def test_scan_watch_keeps_duplicate_drop_while_inflight(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_scan_watch_redrop_resumes_held_row(tmp_path: Path):
+    """Re-dropped file for a skipped row clears the hold (like /add)."""
+    from racing_sync.state import StateStore
+
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    raw = _create_sample_torrent_data("Held.Show.S01E01", 5000,
+                                      "https://alpha.cc/announce/xyz")
+    tfile = watch_dir / "held.torrent"
+    tfile.write_bytes(raw)
+    infohash, _, _, _ = _bencoded_info_hash(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash=infohash, source_name="Held.Show.S01E01",
+                              total_bytes=5000, cross_seed_source="watch-dir",
+                              state=State.NEW, skipped=1))
+    coord = make_coordinator()
+    coord.store = store
+    wcfg = WatchDirConfig(path=watch_dir, glob="*.torrent", delete_after_pickup=True)
+    coord.watch = WatchDirScanner(wcfg, prowlarr=None)
+    coord.cfg.watch_dir = wcfg
+    try:
+        await coord.scan_watch()
+        assert store.get(infohash).skipped == 0
+        assert not tfile.exists()
+    finally:
+        store.close()
+
+
+def test_watch_election_ignores_held_waiters(tmp_path: Path):
+    """A held NEW waiter owns nothing: it must not block fellow waiters."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _election_coord(tmp_path, store)
+        held = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 16384)
+        free = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 32768)
+        held.skipped = 1
+        store.upsert(held)
+        proceed, owner = coord._watch_election(free)
+        assert proceed is True and owner is None
+    finally:
+        store.close()
+
+
+def test_watch_election_held_locked_row_still_blocks(tmp_path: Path):
+    """A held QUEUED row still owns SSD/client presence: waiters defer."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _election_coord(tmp_path, store)
+        locked = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE,
+                             16384, state=State.QUEUED)
+        locked.skipped = 1
+        store.upsert(locked)
+        waiter = _watch_drop(store, "Shared.Release.1080p", 5000, _PRIV_ANNOUNCE, 32768)
+        proceed, owner = coord._watch_election(waiter)
+        assert proceed is False and owner is not None
+        assert owner.source_infohash == locked.source_infohash
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_scan_watch_keeps_done_duplicate_when_pickup_disabled(tmp_path: Path):
     from racing_sync.state import StateStore
 
