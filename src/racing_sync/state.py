@@ -483,6 +483,51 @@ class StateStore:
             ).fetchone()
             return _row_to_state(row) if row else None
 
+    def get_many(self, hashes, *, include_blob: bool = False) -> dict:
+        """Batch fetch: {lowercased hash: TorrentState | None}.
+
+        One round-trip per ~500 hashes (SQLite variable cap) instead of
+        one per hash — the SSD prune's stale sweep uses this so an
+        admission with a big ledger doesn't pay thousands of WAL reads.
+        Missing/tombstoned hashes map to None, exactly like get().
+        """
+        self._ensure_open()
+        try:
+            wanted = []
+            for h in hashes or []:
+                try:
+                    n = (h or "").strip().lower()
+                except Exception:
+                    continue
+                if n and n not in wanted:
+                    wanted.append(n)
+        except Exception:
+            return {}
+        out: dict = {n: None for n in wanted}
+        if not wanted:
+            return out
+        cols = "*" if include_blob else _TORRENT_STATE_COLUMNS_NO_BLOB
+        with self._lock:
+            for i in range(0, len(wanted), 500):
+                chunk = wanted[i:i + 500]
+                try:
+                    qmarks = ",".join(["?"] * len(chunk))
+                    rows = self._conn.execute(
+                        f"SELECT {cols} FROM torrent_state "
+                        f"WHERE source_infohash IN ({qmarks}) "
+                        "AND deleted_at = ''",
+                        chunk,
+                    ).fetchall()
+                except Exception:
+                    continue
+                for r in rows or []:
+                    try:
+                        ts = _row_to_state(r)
+                        out[(ts.source_infohash or "").lower()] = ts
+                    except Exception:
+                        continue
+        return out
+
     def get_blob(self, source_infohash: str) -> bytes:
         self._ensure_open()
         norm = (source_infohash or "").strip().lower()

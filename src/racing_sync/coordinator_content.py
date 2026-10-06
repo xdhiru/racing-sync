@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -251,12 +252,23 @@ WATCH_ELECTION_ACTIVE_STATES = frozenset(
     WATCH_ELECTION_WAITER_STATES | WATCH_ELECTION_LOCKED_STATES
 )
 
+#: Watch-row filesystem probe cache: (cache_key -> (mono, found)).
+#: 60s TTL, bounded; blob dirs appear once and vanish with their row.
+_WATCH_ROW_CACHE: dict[str, tuple[float, bool]] = {}
+_WATCH_ROW_TTL_S = 60.0
+_WATCH_ROW_CAP = 5000
+
 
 def is_watch_row(row: TorrentState, cfg) -> bool:
     """True when this row originated from a watch-dir drop.
 
     Pure version of the coordinator check (labels change past NEW, so the
     persisted blob dir is the durable signal). Never raises.
+
+    The filesystem probe is cached briefly (60s TTL, bounded): the
+    telegram refresh and every worker tick re-ask per row, and a blob
+    dir appears once (ingest) and disappears with its row (forget) —
+    a stale answer self-heals next window.
     """
     try:
         if (row.cross_seed_source or "") in WATCH_ORIGIN_LABELS:
@@ -264,14 +276,36 @@ def is_watch_row(row: TorrentState, cfg) -> bool:
     except Exception:
         pass
     try:
+        key_hash = (row.source_infohash or "").strip().lower()
+    except Exception:
+        return False
+    if not key_hash:
+        return False
+    try:
         base = Path(cfg.general.state_db).parent
     except Exception:
         return False
     try:
-        blob_dir = base / "watch_cross_seeds" / (row.source_infohash or "")
-        return blob_dir.is_dir() and any(blob_dir.glob("*.torrent"))
+        cache_key = f"{base}|{key_hash}"
+        now = time.monotonic()
+        hit = _WATCH_ROW_CACHE.get(cache_key)
+        if hit is not None and now - hit[0] < _WATCH_ROW_TTL_S:
+            return hit[1]
+    except Exception:
+        hit = None
+    try:
+        blob_dir = base / "watch_cross_seeds" / key_hash
+        found = blob_dir.is_dir() and any(blob_dir.glob("*.torrent"))
     except Exception:
         return False
+    try:
+        _WATCH_ROW_CACHE[cache_key] = (time.monotonic(), bool(found))
+        if len(_WATCH_ROW_CACHE) > _WATCH_ROW_CAP:
+            for k in list(_WATCH_ROW_CACHE.keys())[: len(_WATCH_ROW_CACHE) - _WATCH_ROW_CAP]:
+                _WATCH_ROW_CACHE.pop(k, None)
+    except Exception:
+        pass
+    return bool(found)
 
 
 def watch_rank(row: TorrentState, cfg) -> int:

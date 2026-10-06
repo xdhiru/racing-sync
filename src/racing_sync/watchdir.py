@@ -359,6 +359,18 @@ class WatchDirScanner:
     # only, so the cache can never hold onto megabytes per file; the
     # byte-hash proves identity on mtime+size hits (same-size swaps).
     _FILE_CACHE_MAX = 512
+    # Invalid-drop memory has the same unbounded-growth shape (a hostile
+    # or broken drop re-parse-fails every scan); cap it like the cache.
+    _BAD_FILES_MAX = 512
+
+    def _cap_bad_files(self) -> None:
+        try:
+            overflow = len(self._bad_files) - self._BAD_FILES_MAX
+            if overflow > 0:
+                for k in list(self._bad_files.keys())[:overflow]:
+                    self._bad_files.pop(k, None)
+        except Exception:
+            pass
 
     def __init__(self, cfg: WatchDirConfig, prowlarr: ProwlarrClient | None):
         self._cfg = cfg
@@ -448,16 +460,19 @@ class WatchDirScanner:
                         continue
                     # Same-size replacement guard: an mtime+size hit must
                     # still prove byte-identity, or a swapped file serves
-                    # the stale infohash forever. Re-parse on mismatch.
+                    # the stale infohash forever. Re-parse on mismatch
+                    # (off-loop: bdecode is CPU, not a syscall).
                     _tag = hashlib.sha256(data).hexdigest()
                     if len(cached) <= 6 or cached[6] != _tag:
                         self._file_cache.pop(entry, None)
                         try:
-                            infohash, name, size, announce = _bencoded_info_hash(data)
+                            infohash, name, size, announce = await asyncio.to_thread(
+                                _bencoded_info_hash, data)
                         except Exception as parse_err:
                             if time.time() - mtime < 2.0:
                                 continue
                             self._bad_files[entry] = (mtime, fsize)
+                            self._cap_bad_files()
                             log.warning("watch-dir: re-parse failed for swapped %s (%s)",
                                         entry.name, parse_err)
                             continue
@@ -465,7 +480,10 @@ class WatchDirScanner:
                             mtime, fsize, infohash, name, size, announce, _tag)
                 else:
                     try:
-                        infohash, name, size, announce, data = parse_torrent_file(entry)
+                        # Full parse (stat+read+bdecode) off the event loop:
+                        # a directory of large drops must not stall the tick.
+                        infohash, name, size, announce, data = await asyncio.to_thread(
+                            parse_torrent_file, entry)
                         self._file_cache[entry] = (
                             mtime, fsize, infohash, name, size, announce,
                             hashlib.sha256(data).hexdigest())
@@ -479,6 +497,7 @@ class WatchDirScanner:
                         if time.time() - mtime < 2.0:
                             continue
                         self._bad_files[entry] = (mtime, fsize)
+                        self._cap_bad_files()
                         log.warning("watch-dir: skipping invalid torrent %s (%s)", entry.name, parse_err)
                         continue
             except Exception as e:  # noqa: BLE001
