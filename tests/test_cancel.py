@@ -1139,6 +1139,136 @@ def test_resolve_fetch_target_allows_new_grace(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_chat_message_skip_and_unskip_full_hash(tmp_path: Path):
+    """/skip_<hash> holds the row; /unskip_<hash> resumes + wakes a worker."""
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show",
+                              state=State.WAITING_INDEXER))
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/skip_" + "a" * 40))
+        assert store.get("a" * 40).skipped == 1
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Skipped")
+
+        bot._callback_times.clear()
+        await bot._handle_chat_message(_message(text="/unskip_" + "a" * 40))
+        assert store.get("a" * 40).skipped == 0
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Resumed")
+        bot._coord._spawn_worker.assert_called_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_chat_message_skip_group_number(tmp_path: Path):
+    """/skip_1 holds every copy in the group at once."""
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Same.Show",
+                              total_bytes=1000, state=State.NEW))
+    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Same.Show",
+                              total_bytes=1000, state=State.WAITING_INDEXER))
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/skip_1"))
+        assert store.get("a" * 40).skipped == 1
+        assert store.get("b" * 40).skipped == 1
+        sent = bot._bot.send_message.call_args[0][1]
+        assert "2 copies" in sent
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_chat_message_skip_single_hash_holds_whole_group(tmp_path: Path):
+    """A single hash still holds the release: every grouped copy."""
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Same.Show",
+                              total_bytes=1000, state=State.NEW))
+    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Same.Show",
+                              total_bytes=1000, state=State.WAITING_INDEXER))
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/skip_" + "a" * 40))
+        assert store.get("a" * 40).skipped == 1
+        assert store.get("b" * 40).skipped == 1
+        sent = bot._bot.send_message.call_args[0][1]
+        assert "2 copies" in sent
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_fetch_torrent_refuses_held_row(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="d" * 40, source_name="Held",
+                              state=State.WAITING_INDEXER, skipped=1))
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        msg = await bot._fetch_torrent("d" * 40)
+        assert "skipped" in msg
+        assert store.get("d" * 40).force_direct == 0
+    finally:
+        store.close()
+
+
+def test_render_active_shows_skip_and_unskip():
+    """Held rows get /unskip_N + ⏭; running rows get /skip_N."""
+    from racing_sync.telegram_bot import render_active
+
+    held = TorrentState(source_infohash="a" * 40, source_name="Held",
+                        state=State.WAITING_INDEXER, total_bytes=1000,
+                        skipped=1)
+    text, _, _ = render_active([(held, None)], page=0, page_size=5)
+    assert "⏭ Skipped" in text
+    assert "/unskip\\_1" in text
+    assert "/skip\\_1" not in text
+    assert "/fetch\\_1" not in text
+
+    free = TorrentState(source_infohash="b" * 40, source_name="Free",
+                        state=State.WAITING_INDEXER, total_bytes=1000)
+    text, _, _ = render_active([(free, None)], page=0, page_size=5)
+    assert "/skip\\_1" in text
+    assert "/unskip\\_1" not in text
+
+
+def test_pick_snapshot_excludes_held_rows_from_fetch_prefer():
+    """Held members never snapshot for fetch/prefer (cancel unaffected)."""
+    from racing_sync.telegram_bot import pick_snapshot
+
+    mk = lambda h, st: TorrentState(  # noqa: E731
+        source_infohash=h, source_name="Show.X", state=st,
+        total_bytes=1000, source_announce_url="https://alpha.cc/announce")
+    grace = mk("b" * 40, State.NEW)
+    grace.skipped = 1
+    notes = {"b" * 40: "Waiting for preferred copy · 90s left"}
+    assert pick_snapshot([(grace, None)], "fetch", notes) == []
+    assert pick_snapshot([(grace, None)], "prefer", notes) == []
+    assert pick_snapshot([(grace, None)], "cancel") != []
+
+
+def test_render_detail_shows_held_resume():
+    """Held detail cards carry the /unskip_ line."""
+    from racing_sync.telegram_bot import render_detail
+
+    ts = TorrentState(source_infohash="e" * 40, source_name="Held",
+                      state=State.WAITING_INDEXER, total_bytes=1000,
+                      skipped=1)
+    detail = render_detail(ts)
+    assert "Skipped" in detail
+    assert f"/unskip_{'e' * 10}" in detail
+
+
 def test_full_reset_refuses_symlink_ssd(tmp_path: Path, monkeypatch):
     from racing_sync.__main__ import _do_full_reset
 
@@ -1388,3 +1518,4 @@ async def test_shifted_numbering_cannot_misroute(tmp_path: Path):
         assert sent.startswith("Already gone")
     finally:
         store.close()
+

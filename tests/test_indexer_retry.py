@@ -1496,3 +1496,84 @@ async def test_concurrent_source_lists_share_one_scan():
         *[coord._list_source_torrents() for _ in range(5)])
     assert coord.source_client.list_torrents.await_count == 1
     assert all(len(r) == 1 for r in results2)
+
+@pytest.mark.anyio
+async def test_wakeup_indexer_row_ignores_skipped():
+    """Timer-fired wakeups never revive a held row."""
+    from unittest.mock import MagicMock
+
+    from racing_sync.state import StateStore
+
+    import tempfile
+    from pathlib import Path
+
+    raw, h = _operator_blob(name="Hand.Added.mkv")
+    tmp = Path(tempfile.mkdtemp())
+    store = StateStore(tmp / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord.transition = MagicMock()
+        ts = TorrentState(source_infohash="s" * 40, source_name="Held",
+                          state=State.WAITING_INDEXER, skipped=1)
+        store.upsert(ts)
+        coord._wakeup_indexer_row(ts)
+        coord.transition.assert_not_called()
+        assert "s" * 40 not in coord._running_infohashes
+    finally:
+        store.close()
+
+@pytest.mark.anyio
+async def test_process_torrent_inner_honors_hold():
+    """A directly-spawned worker no-ops on a held row."""
+    from unittest.mock import AsyncMock
+
+    coord = make_coordinator()
+    coord._do_new = AsyncMock()
+    ts = TorrentState(source_infohash="s" * 40, state=State.NEW, skipped=1)
+    await coord._process_torrent_inner(ts)
+    coord._do_new.assert_not_called()
+
+@pytest.mark.anyio
+async def test_schedule_step_never_spawns_held_rows(tmp_path):
+    """The scheduler gives held rows no workers (but still works others)."""
+    import asyncio
+
+    from racing_sync.state import StateStore
+
+    tmp = tmp_path / "sched.db"
+    store = StateStore(tmp)
+    try:
+        coord = make_coordinator(
+            store,
+            cfg__max_active_downloads=3,
+            cfg__max_concurrent_moves=3,
+        )
+        held = TorrentState(source_infohash="a" * 40, source_name="Held",
+                            state=State.NEW, skipped=1)
+        store.upsert(held)
+        await coord._schedule_step()
+        assert "a" * 40 not in coord._running_infohashes
+        assert len(coord._tasks) == 0
+    finally:
+        for t in list(getattr(coord, "_tasks", []) or []):
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        store.close()
+
+def test_prefer_grace_row_refuses_held(tmp_path):
+    """Prefer on a held row explains itself instead of exempting it."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "prefer.db")
+    try:
+        coord = make_coordinator(store)
+        ts = TorrentState(source_infohash="b" * 40, source_name="Held",
+                          state=State.NEW, skipped=1)
+        store.upsert(ts)
+        row, msg = coord.prefer_grace_row("b" * 40)
+        assert row is None
+        assert "skipped" in msg
+    finally:
+        store.close()

@@ -1062,6 +1062,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     "watch-dir: re-queued failed release %s (%s)",
                     item.name[:60], item.infohash[:10],
                 )
+            elif getattr(_existing, "skipped", 0):
+                # A re-dropped file for a held row is the operator
+                # resuming it by hand (same as /add on a skipped row):
+                # clear the hold so the normal flow (fuse check, VPS1 /
+                # VPS2 checks, Prowlarr cross-seed search) runs again.
+                # Fail-open: a write failure just leaves it held for an
+                # explicit /unskip.
+                try:
+                    _resumed = bool(await asyncio.to_thread(
+                        self.store.update_columns, item_hash, {"skipped": 0}))
+                except Exception:
+                    _resumed = False
+                if _resumed:
+                    log.info(
+                        "watch-dir: re-drop resumes held release %s (%s)",
+                        item.name[:60], item.infohash[:10],
+                    )
+                    ingested = True
             # Delete only what this scan ingested: an already-tracked drop
             # still belongs to the user — never destroy what we didn't
             # consume on this run. Exception: a re-dropped duplicate whose
@@ -1197,7 +1215,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 except Exception:  # noqa: BLE001
                     pass
             if existing_ts.state == State.DONE and self.cfg.cross_seed.inject_racing_torrents_to_fuse:
-                await self._check_and_inject_late_cross_seeds(existing_ts, group)
+                if not getattr(existing_ts, "skipped", 0):
+                    await self._check_and_inject_late_cross_seeds(existing_ts, group)
             return
 
         # Elect ONE primary torrent for SSD download:
@@ -1366,6 +1385,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 break
             _tkey = (ts.source_infohash or "").lower()
             if _tkey in self._running_infohashes:
+                continue
+
+            # Operator hold (/skip_): no workers until resumed — no
+            # Prowlarr queries, no downloads, no moves. State is kept.
+            if getattr(ts, "skipped", 0):
                 continue
 
             # Skip WAITING_INDEXER rows: they are parked and woken up exclusively
@@ -1922,6 +1946,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             pass
 
     async def _process_torrent_inner(self, ts: TorrentState) -> None:
+        # Operator hold (/skip_): the row keeps its state but gets no
+        # work until resumed. Belt-and-braces alongside the scheduler
+        # guards (direct spawns must also honor the hold).
+        if getattr(ts, "skipped", 0):
+            log.debug("worker skip: %s is held (skipped)", ts.source_name)
+            return
         # Quiet-wait: parked WAITING_DISK re-checks are routine while batch
         # moves drain — debug, not info, to avoid filling the log disk.
         if ts.state == State.WAITING_DISK:
@@ -1967,6 +1997,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         except Exception:
             fresh = None
         if fresh is None or fresh.state != State.WAITING_INDEXER:
+            return
+        if getattr(fresh, "skipped", 0):
             return
         ts = fresh
         try:
@@ -2714,6 +2746,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         continue
                     if fresh.state not in (State.NEW, State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK):
                         continue
+                    if getattr(fresh, "skipped", 0):
+                        continue
                     await self._verify_and_adopt_manual_fuse(fresh, ext)
                 except Exception:
                     continue
@@ -2902,6 +2936,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         except Exception:
             pass
         try:
+            # Held (skipped) waiters own nothing yet — like grace-held
+            # peers they must not block fellow waiters while frozen.
+            # Held LOCKED rows keep blocking: their SSD budget / client
+            # presence is real and a duplicate download to the same
+            # save_path must still be prevented.
+            rows = [r for r in (rows or [])
+                    if not (getattr(r, "skipped", 0)
+                            and r.state in WATCH_ELECTION_WAITER_STATES)]
+        except Exception:
+            pass
+        try:
             winner = watch_election_winner(rows, ts, self.cfg)
         except Exception as e:  # noqa: BLE001
             log.warning("watch-dir election failed (%s); proceeding solo", e)
@@ -2987,6 +3032,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     "(it may already be running/done)")
             ts = cands[0]
         name = (ts.source_name or (ts.source_infohash or "")[:10])[:50]
+        if getattr(ts, "skipped", 0):
+            return None, (f"{name} is skipped — /unskip it first")
         if ts.state != State.NEW:
             return None, (f"{name} is {ts.state.value} — nothing to prefer "
                           "(only NEW rows waiting in grace can be started)")

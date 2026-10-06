@@ -483,6 +483,13 @@ def render_detail(ts: TorrentState, progress: float | None = None,
     if note:
         lines.append(f"⏳ {_esc(note)}")
 
+    try:
+        _held = bool(getattr(ts, "skipped", 0))
+    except Exception:
+        _held = False
+    if _held:
+        lines.append(f"⏭ Skipped — resume with `{_unskip_command(full_hash)}`")
+
     # Cross-seed info
     if ts.cross_seed_source:
         cs_hash = (ts.cross_seed_infohash or "").lower()
@@ -520,6 +527,14 @@ FETCH_CMD_RE = re.compile(r"^/fetch_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 #: download now instead of waiting out its preferred-copy grace.
 PREFER_CMD_RE = re.compile(r"^/prefer_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
+#: `/skip_<hex>` — same shape: hold a tracked release (whole group):
+#: no workers, no Prowlarr queries, no downloads, no moves until
+#: `/unskip_`. State is kept; `/add` / watch-dir re-drop resumes it.
+SKIP_CMD_RE = re.compile(r"^/skip_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/unskip_<hex>` — same shape: resume a held release immediately.
+UNSKIP_CMD_RE = re.compile(r"^/unskip_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
 #: `/injectfuse_<n|hex>` — list shortcut: group number or tracked
 #: hash/prefix for manual fuse seeding (operator moved the bytes).
 INJECTFUSE_CMD_RE = re.compile(r"^/injectfuse_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
@@ -548,6 +563,16 @@ def _fetch_command(infohash: str) -> str:
 def _prefer_command(infohash: str) -> str:
     """Copy-pasteable prefer command for one task (short hash)."""
     return f"/prefer_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+def _skip_command(infohash: str) -> str:
+    """Copy-pasteable skip command for one task (short hash)."""
+    return f"/skip_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+def _unskip_command(infohash: str) -> str:
+    """Copy-pasteable unskip command for one task (short hash)."""
+    return f"/unskip_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 def _flood_wait_seconds(e: BaseException, default: int = 5) -> int | None:
@@ -616,6 +641,10 @@ def _active_note(ts: TorrentState, notes: dict[str, str] | None) -> str:
 def _active_state_text(ts: TorrentState, progress: float | None, note: str) -> str:
     """One-line stage text for an active-tasks tracker row."""
     _bd = _batch_display(ts)
+    try:
+        _held = bool(getattr(ts, "skipped", 0))
+    except Exception:
+        _held = False
     if note and ts.state in (State.NEW, State.WAITING_DISK):
         _compact = _compact_wait_note(note)
         state_text = f"⏳ {_compact}" if _compact else f"⏳ {_esc(note)}"
@@ -657,6 +686,8 @@ def _active_state_text(ts: TorrentState, progress: float | None, note: str) -> s
 
     if _bd and ts.state != State.MOVING:
         state_text += f" · {_bd}"
+    if _held:
+        state_text = f"⏭ Skipped · {state_text}"
     return state_text
 
 
@@ -806,7 +837,8 @@ def pick_snapshot(
     original instead of waiting out Prowlarr), plus NEW grace-held rows
     for fetch and prefer (watch drops use the starting .torrent,
     racing rows use the VPS1 original — both skip the grace hold).
-    Labels are short tracker names (hash-qualified on repeats). The
+    Held (skipped) rows never snapshot for fetch/prefer. Labels are
+    short tracker names (hash-qualified on repeats). The
     snapshot is taken once, at command-tap time — later buttons
     address members by index, so list renumbering mid-flow cannot
     misroute. Fail-open: [].
@@ -818,6 +850,8 @@ def pick_snapshot(
         for (ts, _progress) in members or []:
             _h = _member_hash(ts)
             if not _h:
+                continue
+            if cmd in ("fetch", "prefer") and getattr(ts, "skipped", 0):
                 continue
             if cmd == "fetch" and not (
                     ts.state == State.WAITING_INDEXER or (
@@ -969,6 +1003,8 @@ def render_active(
         _has_fetch = False
         _has_prefer = False
         _has_inject = False
+        _has_skip = False
+        _has_unskip = False
         for (ts, progress) in members:
             domain_full = (_tracker_domain(ts.source_announce_url)
                            or _tracker_domain(ts.source_tracker))
@@ -978,6 +1014,14 @@ def render_active(
                 lines.append(f"▸ {_esc(domain_full)} {state_text}")
             else:
                 lines.append(f"▸ {state_text}")
+            try:
+                _held = bool(getattr(ts, "skipped", 0))
+            except Exception:
+                _held = False
+            if _held:
+                _has_unskip = True
+                continue
+            _has_skip = True
             if ts.state == State.WAITING_INDEXER:
                 _has_fetch = True
             if ts.state in (State.QUERYING, State.WAITING_INDEXER,
@@ -993,12 +1037,17 @@ def render_active(
         # Positional group number — resolved once at tap time into a
         # frozen snapshot, so later renumbering cannot misroute.
         # Cancel always; fetch/prefer/inject only when a member qualifies
-        # right now (injectfuse arms a Yes/No question, never acts).
+        # right now (injectfuse arms a Yes/No question, never acts);
+        # skip while a member runs free, unskip while one is held.
         _cmds = [f"/cancel_{group_num}"]
         if _has_fetch:
             _cmds.append(f"/fetch_{group_num}")
         if _has_prefer:
             _cmds.append(f"/prefer_{group_num}")
+        if _has_skip:
+            _cmds.append(f"/skip_{group_num}")
+        if _has_unskip:
+            _cmds.append(f"/unskip_{group_num}")
         if _has_inject:
             _cmds.append(f"/injectfuse_{group_num}")
         lines.append(" ".join(_esc(_c) for _c in _cmds))
@@ -2101,11 +2150,14 @@ class TelegramBot:
             text = str(text or "").strip()
             m_fetch = FETCH_CMD_RE.match(text)
             m_prefer = PREFER_CMD_RE.match(text)
+            m_skip = SKIP_CMD_RE.match(text)
+            m_unskip = UNSKIP_CMD_RE.match(text)
             m_cancel = CANCEL_CMD_RE.match(text)
             m_injectfuse = INJECTFUSE_CMD_RE.match(text)
             m_injectfuse_hash = INJECTFUSE_HASH_RE.match(text)
             m_add = ADD_CMD_RE.match(text)
             if (not m_fetch and not m_prefer and not m_cancel
+                    and not m_skip and not m_unskip
                     and not m_injectfuse and not m_injectfuse_hash
                     and not m_add):
                 return
@@ -2126,6 +2178,14 @@ class TelegramBot:
             if m_prefer:
                 await self._start_group_command(
                     "prefer", m_prefer.group(1), message)
+                return
+            if m_skip:
+                await self._start_group_command(
+                    "skip", m_skip.group(1), message)
+                return
+            if m_unskip:
+                await self._start_group_command(
+                    "unskip", m_unskip.group(1), message)
                 return
             if m_injectfuse_hash:
                 await self._start_single_command(
@@ -2325,10 +2385,21 @@ class TelegramBot:
                 except Exception:
                     _kept = False
                 if _kept:
+                    # Fresh input resumes a held row (same as a watch-dir
+                    # re-drop): the operator is acting on it again.
+                    try:
+                        _upd = getattr(store, "update_columns", None)
+                        _resumed = bool(await asyncio.to_thread(
+                            _upd, infohash, {"skipped": 0})) if callable(_upd) else False
+                    except Exception:
+                        _resumed = False
+                    _tail = (" — it can now download from your bytes: "
+                             f"`{_fetch_command(infohash)}`.")
+                    if _resumed and getattr(existing, "skipped", 0):
+                        _tail = (" — hold cleared, it resumes next tick"
+                                 " (bytes attached too).")
                     await self._reply(
-                        f"Attached supplied .torrent to {name} ({_st}) — "
-                        f"it can now download from your bytes: "
-                        f"`{_fetch_command(infohash)}`.",
+                        f"Attached supplied .torrent to {name} ({_st}){_tail}",
                         reply_to=message)
                     await self._delete_chat_file(message, doc_msg)
                     return
@@ -2605,6 +2676,31 @@ class TelegramBot:
                 pass
             return
         title = str(getattr(row, "source_name", "") or full_hash[:10])[:60]
+        if kind in ("skip", "unskip"):
+            # Group-scoped even from one hash: expand to the live group
+            # first (single hash as the fallback when it is not grouped
+            # anymore). See _group_hashes_for for why the hold covers
+            # the release, not the tracker copy.
+            try:
+                _gh = await asyncio.to_thread(
+                    self._group_hashes_for, full_hash)
+            except Exception:
+                _gh = None
+            try:
+                result = await self._skip_torrents(
+                    _gh or [full_hash], hold=(kind == "skip"))
+            except Exception as e:  # noqa: BLE001
+                result = f"Action failed: {e}"
+            try:
+                await self._reply(result[:300], reply_to=message)
+            except Exception:
+                pass
+            try:
+                self._last_active_cache = None
+                await self._refresh_active_message()
+            except Exception:
+                pass
+            return
         if kind == "cancel":
             self._set_pending_keepq(
                 title, "", [full_hash],
@@ -2768,6 +2864,41 @@ class TelegramBot:
             pass
         return "?"
 
+    def _group_hashes_for(self, full_hash: str) -> list[str] | None:
+        """Live group member hashes containing `full_hash`, else None.
+
+        Group-scoped commands (/skip_, /unskip_) act on the whole
+        release even from a single hash: every copy shares one hold
+        because the hold covers the content (fuse-seeding), not the
+        tracker — same all-or-nothing shape as injectfuse (cancel /
+        fetch / prefer stay per-member: destructive or surgical).
+        Fail-open None: the caller falls back to the single hash.
+        """
+        try:
+            norm = (full_hash or "").strip().lower()
+            if not norm:
+                return None
+            rows = self._store.list_active_inflight()
+            for (_key, _members) in _group_active_items(
+                    [(_r, None) for _r in rows or []]):
+                _hs: list[str] = []
+                _hit = False
+                for (_t, _p) in _members or []:
+                    try:
+                        _h = _member_hash(_t)
+                    except Exception:
+                        continue
+                    if not _h:
+                        continue
+                    _hs.append(_h)
+                    if _h == norm:
+                        _hit = True
+                if _hit and _hs:
+                    return _hs
+            return None
+        except Exception:
+            return None
+
     async def _start_group_command(self, kind: str, token: str, message: Any) -> None:
         """Typed command: positional number, gid, or legacy hash prefix.
 
@@ -2917,6 +3048,39 @@ class TelegramBot:
                     f"seeding? Files must already be at the remote. "
                     f"Choose below.",
                     reply_to=message)
+            except Exception:
+                pass
+            return
+        # skip/unskip: whole group, all-or-nothing — no member pick
+        # (a hold covers the release, every copy of it). Even one
+        # member goes direct with the group name on screen.
+        if kind in ("skip", "unskip"):
+            _hashes = []
+            for _m in members or []:
+                try:
+                    _mh = _member_hash(_m)
+                except Exception:
+                    _mh = ""
+                if _mh:
+                    _hashes.append(_mh)
+            if not _hashes:
+                try:
+                    await self._reply("Already gone from tracking",
+                                      reply_to=message)
+                except Exception:
+                    pass
+                return
+            try:
+                result = await self._skip_torrents(
+                    _hashes, hold=(kind == "skip"))
+            except Exception as e:  # noqa: BLE001
+                result = f"Action failed: {e}"
+            try:
+                await self._reply(result[:300], reply_to=message)
+            except Exception:
+                pass
+            try:
+                await self._refresh_active_message()
             except Exception:
                 pass
             return
@@ -3141,6 +3305,11 @@ class TelegramBot:
             row = store.get(infohash)
             if row is None:
                 raise LookupError("no longer tracked (done/cancelled?)")
+            if getattr(row, "skipped", 0):
+                return (
+                    f"{(row.source_name or infohash[:10])[:50]} is skipped — "
+                    f"{_unskip_command(infohash)} first"
+                )
             if row.state == State.WAITING_INDEXER:
                 # Fresh retry window for the direct phase, same as the automatic
                 # timeout fallback: an explicit fetch buys full direct retries,
@@ -3264,6 +3433,105 @@ class TelegramBot:
             except Exception as e:  # noqa: BLE001
                 log.debug("prefer wake failed (%s); next tick picks it up", e)
         return outcome
+
+    async def _skip_torrents(self, hashes: list[str], *, hold: bool) -> str:
+        """Hold (`hold=True`, /skip_) or resume (/unskip_) tracked releases.
+
+        Whole-hash list (a group acts on every copy): the `skipped` flag
+        keeps each row's state but gives it no workers — no Prowlarr
+        queries, no downloads, no moves — until resumed. Resumed rows
+        get a worker woken now (next tick is the backstop) so the
+        normal flow (fuse check, VPS1/VPS2 checks, Prowlarr cross-seed
+        search) restarts immediately. Never raises: all outcomes arrive
+        as reply text.
+        """
+        verb = "skip" if hold else "unskip"
+        try:
+            from .api import _hold_ops_lock
+        except Exception:
+            _hold_ops_lock = None  # type: ignore[assignment]
+        coord = getattr(self, "_coord", None)
+        store = getattr(self, "_store", None)
+        if coord is None or store is None:
+            return f"{verb.capitalize()} failed: bot not attached"
+        wanted = []
+        try:
+            for h in hashes or []:
+                _h = (h or "").strip().lower()
+                if len(_h) == 40 and all(
+                        c in "0123456789abcdef" for c in _h):
+                    wanted.append(_h)
+        except Exception:
+            pass
+        if not wanted:
+            return f"{verb.capitalize()} failed: nothing tracked to act on"
+
+        acted: list[str] = []
+        gone = 0
+
+        def _flag() -> None:
+            nonlocal gone
+            for h in wanted:
+                try:
+                    row = store.get(h, include_blob=False)
+                except Exception:
+                    row = None
+                if row is None:
+                    gone += 1
+                    continue
+                try:
+                    _upd = getattr(store, "update_columns", None)
+                    if callable(_upd):
+                        _applied = bool(_upd(
+                            h, {"skipped": 1 if hold else 0}))
+                    else:
+                        row.skipped = 1 if hold else 0
+                        store.upsert(row)
+                        _applied = True
+                except Exception:
+                    continue
+                if _applied:
+                    acted.append(h)
+
+        try:
+            if _hold_ops_lock is not None:
+                async with _hold_ops_lock(coord):
+                    await asyncio.to_thread(_flag)
+            else:
+                await asyncio.to_thread(_flag)
+        except Exception as e:  # noqa: BLE001
+            return f"{verb.capitalize()} failed: {e}"
+        if not acted:
+            return (f"Already gone from tracking"
+                    if gone else f"Nothing to {verb} (states changed)")
+        try:
+            _names = []
+            for h in acted:
+                try:
+                    _r = store.get(h, include_blob=False)
+                    _names.append(str(getattr(_r, "source_name", "") or h[:10])[:50])
+                except Exception:
+                    _names.append(h[:10])
+        except Exception:
+            _names = [h[:10] for h in acted]
+        _title = _names[0] if len(_names) == 1 else f"{len(acted)} copies"
+        if not hold:
+            try:
+                _spawn = getattr(coord, "_spawn_worker", None)
+                if callable(_spawn):
+                    for h in acted:
+                        try:
+                            _wrow = store.get(h, include_blob=False)
+                            if _wrow is not None:
+                                _spawn(_wrow)
+                        except Exception:
+                            continue
+            except Exception:
+                log.debug("unskip wake failed; next tick picks it up")
+            return (f"Resumed {_title} — fuse/VPS checks and Prowlarr "
+                    f"cross-seed search run again next tick")
+        return (f"Skipped {_title} — held with state kept, no workers "
+                f"until {_unskip_command(acted[0])}")
 
     async def _mark_detail_cancelled(
         self, message_id: int, name: str, infohash: str

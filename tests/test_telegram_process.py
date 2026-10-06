@@ -296,6 +296,32 @@ async def test_process_duplicate_waiting_attaches_bytes(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_process_duplicate_held_row_resumes_on_add(tmp_path):
+    """Fresh input resumes a skipped row (bytes attached, hold cleared)."""
+    from racing_sync.state import TorrentState
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        blob = _torrent_bytes()
+        infohash, _, _, _ = _bencoded_info_hash(blob)
+        store.upsert(TorrentState(
+            source_infohash=infohash, source_name="Show",
+            state=State.WAITING_INDEXER, skipped=1))
+        bot = _bot(store)
+        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
+            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+
+        await bot._handle_chat_message(_cmd(reply_to=_doc(mid=50)))
+
+        row = store.get(infohash)
+        assert row.skipped == 0
+        assert bytes(store.get_blob(infohash)) == blob
+        assert any("hold cleared" in t for t in _sent_texts(bot))
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_process_duplicate_downloading_keeps_old_reply(tmp_path):
     """Past-admission rows gain nothing from the bytes: old reply stands."""
     from racing_sync.state import TorrentState
