@@ -672,3 +672,23 @@ def test_delete_propagates_tombstone_failure(tmp_path: Path):
         assert store.get("e" * 40).state == State.MOVING
     finally:
         store.close()
+
+
+def test_get_many_batches(tmp_path: Path):
+    """One round-trip for many hashes; missing/tombstoned map to None."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A",
+                                  state=State.QUEUED))
+        store.upsert(TorrentState(source_infohash="b" * 40, source_name="B",
+                                  state=State.DONE))
+        assert store.tombstone("b" * 40) is True
+        res = store.get_many(["a" * 40, "b" * 40, "c" * 40, "A" * 40])
+        assert set(res) == {"a" * 40, "b" * 40, "c" * 40}
+        assert res["a" * 40].state == State.QUEUED
+        assert res["b" * 40] is None  # tombstoned reads as missing
+        assert res["c" * 40] is None
+        assert store.get_many([]) == {}
+        assert store.get_many(None) == {}
+    finally:
+        store.close()

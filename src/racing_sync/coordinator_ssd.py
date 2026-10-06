@@ -223,12 +223,25 @@ class SSDLedgerMixin:
                     continue
             if not keys and not (isinstance(d, dict) and d):
                 return
+            get_many = getattr(store, "get_many", None)
             get = getattr(store, "get", None)
-            if not callable(get):
+            if not callable(get_many) and not callable(get):
                 return
 
             def _fetch_all() -> dict[str, object]:
+                # One batched query (chunked inside) instead of a get per
+                # key; test doubles without get_many keep the legacy loop
+                # (whose unknown-double tolerance the ledger relies on).
+                if callable(get_many):
+                    try:
+                        res = get_many(list(keys), include_blob=False)
+                        if isinstance(res, dict):
+                            return {h: res.get(h) for h in keys}
+                    except Exception:
+                        pass
                 out: dict[str, object] = {}
+                if not callable(get):
+                    return out
                 for h in keys:
                     try:
                         out[h] = get(h, include_blob=False)
