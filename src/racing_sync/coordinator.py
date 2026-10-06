@@ -2267,6 +2267,76 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if t.infohash != st.infohash and (t.name == st.name or normalize_content_name(t.name) == st_norm)
         ]
 
+    async def _operator_supplied_decision(self, ts: TorrentState):
+        """SSD decision from operator-supplied same-infohash bytes, else None.
+
+        Covers .torrent files handed over via Telegram /add for an
+        already-tracked row whose own source is unavailable (e.g. a
+        racing row whose VPS1 original vanished while it parks for a
+        Prowlarr cross-seed that never comes). Same infohash means same
+        content, so these bytes can never substitute a wrong release —
+        they are only used when the normal pick yields nothing. Never
+        raises: any doubt returns None and the caller parks as before.
+        """
+        try:
+            want = (ts.source_infohash or "").strip().lower()
+            if not want:
+                return None
+            try:
+                total = int(ts.total_bytes or 0)
+            except (TypeError, ValueError):
+                total = 0
+            if total <= 0:
+                return None
+            blob = getattr(ts, "_blob", None) or getattr(ts, "cross_seed_blob", None)
+            if not blob and getattr(self, "store", None) is not None:
+                try:
+                    blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
+                except Exception:
+                    blob = None
+            if not blob:
+                return None
+            try:
+                from .watchdir import _bencoded_info_hash
+            except Exception:
+                return None
+            try:
+                real_hash, _, _, _ = _bencoded_info_hash(bytes(blob))
+            except Exception:
+                return None
+            if (real_hash or "").lower() != want:
+                return None
+            # Same non-preferred policy as the direct fallback: a private
+            # non-download swarm may still be superseded by a preferred
+            # copy (NEW grace hold), unless explicitly fetched.
+            try:
+                _urls = [u for u in (ts.source_announce_url or "").split(",") if u] or (
+                    [ts.source_tracker] if ts.source_tracker else []
+                )
+            except Exception:
+                _urls = []
+            try:
+                _preferred = _looks_public(_urls) or any(
+                    self.cfg.prowlarr.is_download_indexer(u or "") for u in _urls
+                )
+            except Exception:
+                _preferred = False
+            log.info(
+                "using operator-supplied .torrent for %s (own source unavailable)",
+                (ts.source_name or "")[:60],
+            )
+            return SourceDecision(
+                torrent_bytes=bytes(blob),
+                source_label="operator-supplied",
+                name=ts.source_name or "",
+                size_bytes=total,
+                infohash=want,
+                announce_url=(_urls[0] if _urls else ""),
+                preferred=bool(_preferred),
+            )
+        except Exception:
+            return None
+
     async def _pick_and_admit(self, ts: TorrentState, st, others: list,
                               *, park_reason: str | None = None,
                               attempt_prowlarr: bool = True) -> None:
@@ -2328,6 +2398,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     source_client=self.source_client,
                     attempt_prowlarr=False,
                 )
+            if decision is None:
+                decision = await self._operator_supplied_decision(ts)
             if decision is None:
                 self._park_for_indexer_retry(ts, reason=park_reason)
                 return

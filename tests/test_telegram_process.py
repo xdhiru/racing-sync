@@ -259,6 +259,67 @@ async def test_process_rejects_invalid_bytes(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_process_duplicate_waiting_attaches_bytes(tmp_path):
+    """Already-tracked but not downloading: supplied bytes are kept on the row.
+
+    Regression: /add used to discard the .torrent when the infohash was
+    already tracked (e.g. a racing row whose VPS1 original vanished),
+    leaving /fetch nothing to download from. Now the bytes are
+    attached (state untouched) and the reply points at /fetch.
+    """
+    from racing_sync.state import TorrentState
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        blob = _torrent_bytes()
+        infohash, _, _, _ = _bencoded_info_hash(blob)
+        store.upsert(TorrentState(
+            source_infohash=infohash, source_name="Show",
+            state=State.WAITING_INDEXER))
+        assert store.get_blob(infohash) == b""
+        bot = _bot(store)
+        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
+            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+
+        await bot._handle_chat_message(_cmd(reply_to=_doc(mid=50)))
+
+        row = store.get(infohash)
+        assert row.state == State.WAITING_INDEXER
+        assert bytes(store.get_blob(infohash)) == blob
+        texts = _sent_texts(bot)
+        assert any("Attached supplied .torrent" in t for t in texts)
+        assert any(f"/fetch_{infohash[:10]}" in t for t in texts)
+        bot._bot.delete_message.assert_awaited_once_with(
+            chat_id="1", message_id=50)
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_process_duplicate_downloading_keeps_old_reply(tmp_path):
+    """Past-admission rows gain nothing from the bytes: old reply stands."""
+    from racing_sync.state import TorrentState
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        blob = _torrent_bytes()
+        infohash, _, _, _ = _bencoded_info_hash(blob)
+        store.upsert(TorrentState(
+            source_infohash=infohash, source_name="Show",
+            state=State.DOWNLOADING))
+        bot = _bot(store)
+        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
+            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+
+        await bot._handle_chat_message(_cmd(reply_to=_doc(mid=50)))
+
+        assert store.get_blob(infohash) == b""
+        assert any("Already tracked" in t for t in _sent_texts(bot))
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_process_duplicate_reports_and_still_deletes(tmp_path):
     """Already-tracked infohash: reported, and the chat copy still removed."""
     from racing_sync.state import TorrentState

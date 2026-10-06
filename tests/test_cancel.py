@@ -886,7 +886,7 @@ async def test_chat_message_fetch_flags_and_wakes_row(tmp_path: Path):
         assert row.state == State.QUERYING
         bot._bot.send_message.assert_awaited_once()
         sent_text = bot._bot.send_message.call_args[0][1]
-        assert sent_text.startswith("Fetching VPS1 original")
+        assert sent_text.startswith("Fetching original for")
     finally:
         store.close()
 
