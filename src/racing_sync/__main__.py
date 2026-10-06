@@ -448,17 +448,35 @@ def _check_config_env(cfg: AppConfig) -> list[str]:
             return
         try:
             target = p if must_exist else p.parent
-            if must_exist and not p.exists():
-                problems.append(f"{label} does not exist: {p}")
-                return
-            if writable:
-                try:
-                    target.mkdir(parents=True, exist_ok=True)
-                except OSError as e:
-                    problems.append(f"{label} not writable ({p}): {e}")
+            if must_exist:
+                if not target.exists():
+                    problems.append(f"{label} does not exist: {target}")
                     return
-                if not os.access(str(target), os.W_OK):
-                    problems.append(f"{label} not writable: {target}")
+                if not target.is_dir():
+                    problems.append(f"{label} is not a directory: {target}")
+                    return
+            if writable:
+                # Probe, don't create: check-config must never mkdir (a
+                # typo'd log_dir would be created just by validating).
+                if not target.exists():
+                    problems.append(
+                        f"{label} does not exist (create it): {target}")
+                    return
+                if not target.is_dir():
+                    problems.append(f"{label} is not a directory: {target}")
+                    return
+                probe = target / ".racing-sync-write-probe"
+                try:
+                    with open(probe, "w") as _fh:
+                        _fh.write("probe")
+                except OSError as e:
+                    problems.append(f"{label} not writable ({target}): {e}")
+                    return
+                finally:
+                    try:
+                        probe.unlink(missing_ok=True)
+                    except OSError:
+                        pass
         except Exception as e:  # noqa: BLE001
             problems.append(f"{label} check failed ({raw!r}): {e}")
 
