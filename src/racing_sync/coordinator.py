@@ -1134,13 +1134,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         async with lock:
             await self._tick_inner()
 
-    async def _poll_source_racing(self, src_torrents: list[Torrent]) -> None:
+    async def _poll_source_racing(self, src_torrents: list[Torrent]) -> list[TorrentState]:
         """Step 2: group source torrents by release and ingest/track each group.
 
-        One poisoned group (corrupt row, failing lookup, doomed injection)
-        must neither skip the remaining groups nor abort the rest of the
-        tick (indexer wakeups, workers, janitor): every group is isolated,
-        failures are logged and skipped.
+        Returns the NEW rows created by this poll (intake events for the
+        immediate handoff in _poll_source_step; the scheduler remains the
+        backstop). One poisoned group (corrupt row, failing lookup, doomed
+        injection) must neither skip the remaining groups nor abort the
+        rest of the tick (indexer wakeups, workers, janitor): every group
+        is isolated, failures are logged and skipped.
         """
         # Group source torrents by content/release name. Multiple racing
         # torrents for the same content (e.g. public release + multiple
@@ -1154,9 +1156,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 norm_key = f"__infohash__:{st.infohash.lower()}"
             by_name.setdefault(norm_key, []).append(st)
 
+        fresh: list[TorrentState] = []
         for group in by_name.values():
             try:
-                await self._process_source_group(group)
+                created = await self._process_source_group(group)
+                if created is not None:
+                    fresh.append(created)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -1166,16 +1171,21 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     _gname = "?"
                 log.warning("source group %s failed; continuing with next group: %s",
                             _gname, e)
+        return fresh
 
-    async def _process_source_group(self, group: list[Torrent]) -> None:
-        """Ingest/track one release group from the source poll (step-2 body)."""
+    async def _process_source_group(self, group: list[Torrent]) -> TorrentState | None:
+        """Ingest/track one release group from the source poll (step-2 body).
+
+        Returns the NEW row when this poll created one (intake event),
+        else None (ignored / already tracked).
+        """
         # Cancelled releases stay cancelled while listed on VPS1.
         if _group_is_ignored(group, getattr(self, "store", None)):
             log.info(
                 "ignoring cancelled release: %s (%d duplicate(s))",
                 group[0].name[:60], len(group),
             )
-            return
+            return None
         # Check if any torrent in this release group is already tracked in state store
         # (state.get normalizes case internally — one lookup suffices).
         existing_ts: TorrentState | None = None
@@ -1216,7 +1226,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if existing_ts.state == State.DONE and self.cfg.cross_seed.inject_racing_torrents_to_fuse:
                 if not getattr(existing_ts, "skipped", 0):
                     await self._check_and_inject_late_cross_seeds(existing_ts, group)
-            return
+            return None
 
         # Elect ONE primary torrent for SSD download:
         # 1. Prefer public torrent if available (req #1)
@@ -1253,6 +1263,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 del arrivals[:2500]
         except Exception:
             pass
+        return ts
 
     async def _poll_source_step(self) -> None:
         """Source-poller pass: watch scan, source ingest, fuse sweep.
@@ -1266,8 +1277,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         log.debug("poller: enter")
         # 1. Watch dir (req #3). Isolated like every tick step: a poisoned
         # drop must not skip the source poll, workers or janitor below.
+        watch_items: list = []
         try:
-            await self.scan_watch()
+            watch_items = await self.scan_watch() or []
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -1288,7 +1300,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 self.cfg.source.min_age_seconds,
             )
             self._last_source_log_ts = now
-        await self._poll_source_racing(src_torrents)
+        fresh_racing = await self._poll_source_racing(src_torrents)
 
         # 2b. Manual fuse sweep: same infohash already seeding from fuse on
         # VPS2 (any category) with verified bytes needs no prowlarr/SSD work.
@@ -1299,6 +1311,107 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             await self._sweep_manual_fuse_adoptions()
         except Exception as e:  # noqa: BLE001
             log.warning("manual fuse sweep failed: %s", e)
+
+        # 2c. Intake handoff: freshly discovered NEW rows start work now
+        # instead of waiting out the next scheduler tick (racing is
+        # time-sensitive). Production only (the scheduler remains the
+        # backstop for tests and single-pass callers).
+        try:
+            await self._drain_intake(fresh_racing, watch_items)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("intake handoff failed; scheduler covers it: %s", e)
+
+    def _intake_started(self) -> bool:
+        """True once the coordinator is serving (production run loop).
+
+        Bare test doubles built via object.__new__ lack the flag and
+        read False — the intake handoff stays off there and the
+        scheduler backstop covers them.
+        """
+        try:
+            return bool(getattr(self, "_coordinator_started", False))
+        except Exception:
+            return False
+
+    async def _drain_intake(self, fresh_racing: list, watch_items: list) -> int:
+        """Spawn workers for rows ingested by this poller pass.
+
+        Returns the number spawned. Fresh racing rows arrive as NEW
+        TorrentStates; watch drops arrive as scanner items and are
+        resolved to their NEW rows (revived/resumed rows included).
+        Each spawn is isolated; capacity mirrors the scheduler burst
+        cap so an autobrr flood can't spawn unbounded workers.
+        Double-scheduling with the scheduler loop is closed by the
+        running-set + worker re-get guards.
+        """
+        if not self._intake_started() or getattr(self, "_stop", False):
+            return 0
+        try:
+            candidates: list[TorrentState] = [t for t in (fresh_racing or []) if t is not None]
+        except Exception:
+            candidates = []
+        try:
+            _store = getattr(self, "store", None)
+            _get = getattr(_store, "get", None) if _store is not None else None
+            for item in watch_items or []:
+                try:
+                    _h = getattr(item, "infohash", "") or ""
+                    if not _h or not callable(_get):
+                        continue
+                    _row = _get(_h, include_blob=False)
+                    if _row is not None:
+                        candidates.append(_row)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if not candidates:
+            return 0
+        try:
+            _max_workers = max(
+                12,
+                self.cfg.max_active_downloads * 2 + self.cfg.max_concurrent_moves * 2,
+            )
+        except (TypeError, ValueError, AttributeError):
+            _max_workers = 12
+        try:
+            _tasks = getattr(self, "_tasks", None)
+            _inflight = max(0, _max_workers - len(_tasks)) if isinstance(_tasks, set) else _max_workers
+        except Exception:
+            _inflight = _max_workers
+        spawned = 0
+        for ts in candidates:
+            if _max_workers and spawned >= max(0, _inflight):
+                break
+            try:
+                _state = getattr(ts, "state", None)
+                if _state != State.NEW:
+                    continue
+                if getattr(ts, "skipped", 0):
+                    continue
+                _key = (getattr(ts, "source_infohash", "") or "").lower()
+                try:
+                    _running = getattr(self, "_running_infohashes", None)
+                    if isinstance(_running, set) and _key and _key in _running:
+                        continue
+                except Exception:
+                    pass
+                self._spawn_worker(ts)
+                spawned += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                try:
+                    _h = (getattr(ts, "source_infohash", "") or "")[:10]
+                except Exception:
+                    _h = "?"
+                log.warning("intake handoff for %s failed; scheduler covers it: %s", _h, e)
+                continue
+        if spawned:
+            log.info("intake handoff: started %d worker(s) for fresh arrivals", spawned)
+        return spawned
 
     async def _schedule_step(self) -> None:
         """Scheduler pass: indexer wakeups, worker scheduling, live refresh.
@@ -2044,31 +2157,42 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         """Source torrent from the poller snapshot (no RPC), else None.
 
         The poller refreshes `_source_torrents_cache` every tick, so a
-        worker needing "fresh" VPS1 metadata usually finds ≤10s-old data
-        right here. Using it avoids one full client scan per row per tick
+        worker needing "fresh" VPS1 metadata usually finds ≤45s-old data
+        right here. Using it avoids one client lookup per row per tick
         — on Deluge every `get_torrent` is a full `get_torrents_status`
         scan, and N rows × full scans every 30s is what wedges the VPS1
         WebUI for other programs. A cache miss falls back to RPC.
 
-        Deluge-only: its list rows already carry trackers/files-shape the
-        freshness path needs, while qB fills trackers via a separate RPC
-        (`get_torrent`) — serving qB rows from the snapshot would drop
-        tracker assignment and misroute public detection.
+        Deluge list rows always carry trackers, so they are served
+        unconditionally. qB list rows carry only the first tracker
+        (`tracker` field); they are served when it is present, otherwise
+        the live lookup runs (which fills the full tracker set via a
+        separate RPC). Single-tracker racing torrents — the common
+        autobrr case — then need zero per-row RPCs while the snapshot
+        is fresh; multi-tracker rows keep today's behavior.
         """
         try:
-            if not isinstance(getattr(self, "source_client", None),
-                              DelugeClient):
-                return None
             want = (infohash or "").lower()
             if not want:
                 return None
             cache = getattr(self, "_source_torrents_cache", None)
             if not cache:
                 return None
+            _is_deluge = isinstance(
+                getattr(self, "source_client", None), DelugeClient)
             for st in cache:
                 try:
-                    if (getattr(st, "infohash", "") or "").lower() == want:
+                    if (getattr(st, "infohash", "") or "").lower() != want:
+                        continue
+                    if _is_deluge:
                         return st
+                    try:
+                        _trs = getattr(st, "trackers", None) or []
+                    except Exception:
+                        _trs = []
+                    if any(bool(u and str(u).strip()) for u in _trs):
+                        return st
+                    return None
                 except Exception:
                     continue
         except Exception:
@@ -2503,29 +2627,66 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         # Admit-time all-remote skip: the decision bytes already sit
         # verified on fuse, so no SSD budget is reserved at all — the QUEUED
         # setup shortcut carries the row fuse-gated to RE_ADDING. Fail-open:
-        # any doubt reserves normally.
+        # any doubt reserves normally. Shared tail with the watch-dir flow
+        # (see _admit_resolved): keep the two in sync via that helper.
+        await self._admit_resolved(
+            ts, blob=decision.torrent_bytes,
+            size_bytes=decision.size_bytes, display_name=st.name[:60],
+        )
+
+    async def _admit_resolved(
+        self, ts: TorrentState, *, blob: bytes | None,
+        size_bytes: int, display_name: str,
+    ) -> None:
+        """Shared intake admit tail (racing + watch-dir).
+
+        Both flows resolve SSD bytes first (Prowlarr cross-seed / SFTP
+        export / sacrificial pick) and then admit identically:
+          1. bytes already fully on fuse → QUEUED with no budget (the
+             QUEUED setup shortcut carries the row fuse-gated to RE_ADDING);
+          2. same hash already complete on the dest client → QUEUED with
+             no budget (_do_queued adopts + resumes instead of adding);
+          3. else reserve the estimate from the global ledger → QUEUED,
+             or park WAITING_DISK when full.
+        Fail-open throughout: any doubt reserves normally. Reservations
+        are released when the QUEUED transition itself fails, so a
+        leaked budget can never strand waiters.
+        """
         try:
-            _fully_remote = await self._blob_fully_remote(decision.torrent_bytes)
+            _fully_remote = await self._blob_fully_remote(blob)
         except Exception:
             _fully_remote = None
         if _fully_remote is True:
             log.info("content for %s already fully on remote; skipping SSD budget",
-                     st.name[:60])
+                     display_name)
             try:
                 self.transition(ts, State.QUEUED)
             except Exception:
                 await self._ssd_release(ts.source_infohash)
                 raise
             return
-
+        try:
+            _pre = await self._dest_complete_entry(
+                [ts.source_infohash, getattr(ts, "cross_seed_infohash", None)])
+        except Exception:
+            _pre = None
+        if _pre is not None:
+            log.info("content for %s already complete on dest; skipping SSD budget",
+                     display_name)
+            try:
+                self.transition(ts, State.QUEUED)
+            except Exception:
+                await self._ssd_release(ts.source_infohash)
+                raise
+            return
         # Global SSD ledger: reserve before QUEUED so concurrent high-size
         # arrivals can't all pass a point-in-time free check and exceed the
         # budget as they grow. Estimate uses the stable configured cap.
-        needed = self._ssd_estimate_for_new(decision.size_bytes)
+        needed = self._ssd_estimate_for_new(size_bytes)
         if not await self._ssd_try_reserve(ts.source_infohash, needed):
             log.info(
                 "ssd budget in use (reserved ~%d MB); parking %s",
-                self._ssd_reserved_total() // (1024 * 1024), st.name,
+                self._ssd_reserved_total() // (1024 * 1024), display_name,
             )
             self.transition(ts, State.WAITING_DISK)
         else:
@@ -3537,59 +3698,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             )
             return
 
-        # Admit-time all-remote skip: the bytes already sit verified on
-        # fuse, so no SSD budget is reserved at all (even reserve(0) can
-        # park on a full disk) — the QUEUED setup shortcut carries the row
-        # fuse-gated to RE_ADDING. Fail-open: any doubt reserves normally.
-        try:
-            _fully_remote = await self._blob_fully_remote(chosen_blob)
-        except Exception:
-            _fully_remote = None
-        if _fully_remote is True:
-            log.info("watch-dir: %s already fully on remote; skipping SSD budget",
-                     ts.source_name[:60])
-            try:
-                self.transition(ts, State.QUEUED)
-            except Exception:
-                await self._ssd_release(ts.source_infohash)
-                raise
-            return
-
-        # Admit-time on-SSD shortcut: the same hash already complete on
-        # the dest client (e.g. added manually earlier and seeding from
-        # the SSD save path) needs no SSD budget even though the rclone
-        # move is still ahead — _do_queued adopts + resumes it instead
-        # of adding a second entry. Without this a full ledger parks
-        # the row in WAITING_DISK for bytes that will never download.
-        # Fail-open: any doubt reserves normally.
-        try:
-            _pre = await self._dest_complete_entry(
-                [ts.source_infohash, ts.cross_seed_infohash])
-        except Exception:
-            _pre = None
-        if _pre is not None:
-            log.info("watch-dir: %s already complete on dest; skipping SSD budget",
-                     ts.source_name[:60])
-            try:
-                self.transition(ts, State.QUEUED)
-            except Exception:
-                await self._ssd_release(ts.source_infohash)
-                raise
-            return
-
-        needed = self._ssd_estimate_for_new(chosen_size)
-        if not await self._ssd_try_reserve(ts.source_infohash, needed):
-            log.info(
-                "ssd budget in use (reserved ~%d MB); parking %s",
-                self._ssd_reserved_total() // (1024 * 1024), ts.source_name,
-            )
-            self.transition(ts, State.WAITING_DISK)
-        else:
-            try:
-                self.transition(ts, State.QUEUED)
-            except Exception:
-                await self._ssd_release(ts.source_infohash)
-                raise
+        # Shared admit tail with the racing flow (all-remote skip,
+        # on-SSD shortcut, ledger reserve → QUEUED/WAITING_DISK).
+        await self._admit_resolved(
+            ts, blob=chosen_blob,
+            size_bytes=chosen_size, display_name=ts.source_name[:60],
+        )
 
     def _prowlarr_timed_out(self, ts: TorrentState) -> bool:
         """True when the opt-in racing-torrent fallback may fire.
