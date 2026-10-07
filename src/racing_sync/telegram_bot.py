@@ -1197,6 +1197,10 @@ class TelegramBot:
         # Pending group action (member pick or keep/delete question) for
         # the two-step flows; armed by group commands, expires quickly.
         self._pending_pick: dict | None = None
+        # Retired active-tasks message ids whose delete hit a transient
+        # (flood / timeout). The pointer has already moved on, so without
+        # this list they would linger in chat history forever.
+        self._orphan_active_ids: list[int] = []
 
     # ---- lifecycle ----
 
@@ -3758,6 +3762,12 @@ class TelegramBot:
         # Sentinel -1 means "stop trying to edit" (e.g. chat permission issue)
         if self._active_msg_id == -1:
             return
+        # Retired active ids first: a flood-delayed delete from an earlier
+        # repost must not strand an old card in history forever.
+        try:
+            await self._sweep_orphan_active_messages()
+        except Exception:
+            pass
         rows = await asyncio.to_thread(self._store.list_active_inflight)
         # Pull live progress from coordinator's tracker
         progress_map = self._coord.live_progress_map()
@@ -3917,16 +3927,72 @@ class TelegramBot:
                     return
 
         if self._active_msg_id is None:
-            # Clean up previously known message if any to prevent duplicate message spam
-            if self._prev_active_msg_id is not None and self._prev_active_msg_id > 0:
+            # Retire the previous id before resending: a flood-delayed
+            # delete must NEVER be followed by a send — that pair strands
+            # the old card while the pointer moves on. Transient delete
+            # failures abort this tick (the old card stays live); only a
+            # deleted, already-gone, or undeletable id proceeds to send.
+            try:
+                _prev_id = int(self._prev_active_msg_id or 0)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                _prev_id = 0
+            if _prev_id > 0:
                 try:
                     await self._bot.delete_message(
                         chat_id=self._cfg.chat_id,
-                        message_id=self._prev_active_msg_id,
+                        message_id=_prev_id,
                     )
-                except Exception:
-                    pass
-                self._prev_active_msg_id = None
+                    self._prev_active_msg_id = None
+                except (RetryAfter, TimedOut, NetworkError) as _prev_e:
+                    log.warning(
+                        "active-tasks previous message %s delete deferred "
+                        "(transient %s); keeping it, will retry next "
+                        "interval", _prev_id, _prev_e,
+                    )
+                    return
+                except TelegramError as _prev_e:
+                    _prev_msg = str(_prev_e).lower()
+                    if self._delete_gone(_prev_msg):
+                        log.debug(
+                            "active-tasks previous message %s already gone "
+                            "(%s); resending", _prev_id, _prev_e,
+                        )
+                        self._prev_active_msg_id = None
+                    elif self._delete_hopeless(_prev_msg):
+                        log.warning(
+                            "active-tasks previous message %s delete refused "
+                            "(%s); abandoning it and resending",
+                            _prev_id, _prev_e,
+                        )
+                        self._prev_active_msg_id = None
+                    elif (_is_transient_tg_error(_prev_e)
+                            or "flood control" in _prev_msg
+                            or "too many requests" in _prev_msg
+                            or "timed out" in _prev_msg
+                            or "timeout" in _prev_msg
+                            or "connection" in _prev_msg
+                            or "retry after" in _prev_msg
+                            or "retry in" in _prev_msg):
+                        log.warning(
+                            "active-tasks previous message %s delete "
+                            "rate-limited (%s); keeping it, will retry next "
+                            "interval", _prev_id, _prev_e,
+                        )
+                        return
+                    else:
+                        log.warning(
+                            "active-tasks previous message %s delete failed "
+                            "(%s); keeping it, will retry next interval",
+                            _prev_id, _prev_e,
+                        )
+                        return
+                except Exception as _prev_e:  # noqa: BLE001
+                    log.warning(
+                        "active-tasks previous message %s delete failed "
+                        "(%s); keeping it, will retry next interval",
+                        _prev_id, _prev_e,
+                    )
+                    return
 
             # New send attempt supersedes any uncertain earlier send.
             self._send_uncertain_key = None
@@ -4096,25 +4162,198 @@ class TelegramBot:
         except Exception:
             pass
 
+    def _orphan_ids(self) -> list[int]:
+        """Retired active ids awaiting a delete retry (creates on demand).
+
+        Unit-test doubles build the bot via object.__new__ (no __init__),
+        so every access goes through here instead of assuming attributes.
+        """
+        try:
+            ids = getattr(self, "_orphan_active_ids", None)
+            if not isinstance(ids, list):
+                ids = []
+                self._orphan_active_ids = ids
+            return ids
+        except Exception:
+            return []
+
+    def _remember_orphan(self, message_id: object) -> None:
+        """Queue a retired active id for the sweep; bounded, deduped."""
+        try:
+            mid = int(message_id)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return
+        if mid <= 0:
+            return
+        try:
+            if mid == self._active_msg_id:
+                return
+        except Exception:
+            pass
+        try:
+            ids = self._orphan_ids()
+            if mid in ids:
+                return
+            ids.append(mid)
+            del ids[:-20]
+        except Exception:
+            pass
+
+    @staticmethod
+    def _delete_gone(msg: str) -> bool:
+        """True when a delete failure means the message is already gone."""
+        try:
+            low = (msg or "").lower()
+        except Exception:
+            return False
+        return any(s in low for s in (
+            "message to delete not found",
+            "message to edit not found",
+            "message_id_invalid",
+            "message not found",
+            "couldn't find the message",
+        ))
+
+    @staticmethod
+    def _delete_hopeless(msg: str) -> bool:
+        """True when retrying a delete can never succeed (rights/chat)."""
+        try:
+            low = (msg or "").lower()
+        except Exception:
+            return False
+        return any(s in low for s in (
+            "chat not found",
+            "not enough rights",
+            "need administrator",
+            "not an administrator",
+            "bot was kicked",
+            "bot was blocked",
+            "forbidden",
+        ))
+
+    async def _sweep_orphan_active_messages(self) -> None:
+        """Best-effort delete of retired active ids (bounded per refresh).
+
+        Runs on every active refresh so a flood-delayed delete from a
+        repost cannot strand an old Active Tasks card in history forever.
+        At most 3 ids per pass so the sweep itself cannot cause a flood.
+        Never raises.
+        """
+        try:
+            bot = getattr(self, "_bot", None)
+            if bot is None:
+                return
+            deleter = getattr(bot, "delete_message", None)
+            if not callable(deleter):
+                return
+            try:
+                chat_id = self._cfg.chat_id
+            except Exception:
+                return
+            ids = self._orphan_ids()
+            if not ids:
+                return
+            for mid in list(ids)[:3]:
+                try:
+                    await deleter(chat_id=chat_id, message_id=mid)
+                except Exception as e:  # noqa: BLE001
+                    msg = str(e).lower()
+                    if self._delete_gone(msg) or self._delete_hopeless(msg):
+                        try:
+                            ids.remove(mid)
+                        except ValueError:
+                            pass
+                        continue
+                    log.warning(
+                        "active-tasks orphan delete %s deferred (%s); "
+                        "will retry next interval", mid, e,
+                    )
+                    continue
+                try:
+                    ids.remove(mid)
+                except ValueError:
+                    pass
+                log.info("active-tasks orphan %s deleted", mid)
+        except Exception:
+            pass
+
     async def _repost_active_message(
         self, text: str, keyboard: InlineKeyboardMarkup | None,
         cache_key: tuple[int, int, str],
     ) -> None:
         """Delete the old active message and resend it silently as newest.
 
-        Sends with notifications disabled so the periodic bump never buzzes
-        the chat. Any failure degrades to "resend fresh next tick" — the id
-        is cleared so the next refresh takes the normal send path.
+        Delete-first with abort: the resend only goes out once the old
+        card is gone (or proven already gone). A flood-delayed delete
+        must NEVER be followed by a send — that pair strands the old
+        card in history forever while the pointer moves on. Transient
+        delete failures keep the old id so the next refresh retries;
+        send failures degrade to "resend fresh next tick" with the
+        uncertain-send guard bounding lost-response duplicates.
+
+        Sends with notifications disabled so the periodic bump never
+        buzzes the chat.
         """
         assert self._bot is not None
         old_id = self._active_msg_id
         try:
+            old_int = int(old_id)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return
+        if old_int <= 0:
+            return
+        try:
             await self._bot.delete_message(
                 chat_id=self._cfg.chat_id,
-                message_id=old_id,
+                message_id=old_int,
             )
-        except Exception:
-            pass
+        except (RetryAfter, TimedOut, NetworkError) as e:
+            log.warning(
+                "active-tasks repost delete deferred "
+                "(transient %s); keeping old message, will retry next "
+                "interval", e,
+            )
+            return
+        except TelegramError as e:
+            msg = str(e).lower()
+            if self._delete_gone(msg):
+                log.debug("active-tasks repost: old message %s already "
+                          "gone; resending", old_int)
+            elif self._delete_hopeless(msg):
+                log.warning(
+                    "active-tasks repost delete refused (%s); keeping "
+                    "old message in place", e,
+                )
+                try:
+                    self._last_repost_monotonic = time.monotonic()
+                except Exception:
+                    pass
+                return
+            elif (_is_transient_tg_error(e)
+                    or "flood control" in msg
+                    or "too many requests" in msg
+                    or "timed out" in msg
+                    or "timeout" in msg
+                    or "connection" in msg
+                    or "retry after" in msg
+                    or "retry in" in msg):
+                log.warning(
+                    "active-tasks repost delete rate-limited (%s); "
+                    "keeping old message, will retry next interval", e,
+                )
+                return
+            else:
+                log.warning(
+                    "active-tasks repost delete failed (%s); keeping old "
+                    "message, will retry next interval", e,
+                )
+                return
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "active-tasks repost delete failed (%s); keeping old "
+                "message, will retry next interval", e,
+            )
+            return
         try:
             try:
                 sent = await self._bot.send_message(
