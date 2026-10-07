@@ -123,12 +123,13 @@ async def test_resolve_unknown_hash(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_resolve_ignored_group_refuses(tmp_path):
+async def test_resolve_ignored_group_still_resolves(tmp_path):
     coord, _, _ = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     try:
         coord.store.ignore_torrent(H1, NAME)
-        with pytest.raises(LookupError, match="unignore"):
-            await coord.injectfuse_resolve(H1)
+        resolved = await coord.injectfuse_resolve(H1)
+        assert resolved["ignored"] is True
+        assert len(resolved["members"]) == 1
     finally:
         coord.store.close()
 
@@ -200,6 +201,27 @@ async def test_confirmed_drives_waiting_row(tmp_path):
         out = await coord.injectfuse_confirmed([H1])
         assert out.startswith("injecting")
         assert coord.store.get(H1).state == State.RE_ADDING
+        # The verified blob must reach the row or the fuse gate parks
+        # forever on "missing blob".
+        assert bytes(coord.store.get_blob(H1)) == blob
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_confirmed_keeps_existing_blob(tmp_path):
+    coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
+    blob = _blob()
+    other = _blob("Other.mkv", 500)
+    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    try:
+        coord.store.upsert(TorrentState(
+            source_infohash=H1, source_name=NAME, total_bytes=500,
+            state=State.WAITING_INDEXER, cross_seed_blob=other))
+        out = await coord.injectfuse_confirmed([H1])
+        assert out.startswith("injecting")
+        assert bytes(coord.store.get_blob(H1)) == other
     finally:
         coord.store.close()
 
@@ -223,7 +245,7 @@ async def test_confirmed_missing_keeps_prior_state(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_confirmed_refuses_active_download(tmp_path):
+async def test_confirmed_preempts_active_download(tmp_path):
     coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     blob = _blob()
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
@@ -233,9 +255,28 @@ async def test_confirmed_refuses_active_download(tmp_path):
             source_infohash=H1, source_name=NAME, total_bytes=500,
             state=State.DOWNLOADING))
         out = await coord.injectfuse_confirmed([H1])
-        assert out.startswith("Not injected")
-        assert "/cancel" in out
-        assert coord.store.get(H1).state == State.DOWNLOADING
+        assert out.startswith("injecting")
+        assert "SSD downloading stopped" in out
+        assert coord.store.get(H1).state == State.RE_ADDING
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_confirmed_lifts_cancel(tmp_path):
+    coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
+    blob = _blob()
+    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    try:
+        coord.store.upsert(TorrentState(
+            source_infohash=H1, source_name=NAME, total_bytes=500,
+            state=State.WAITING_INDEXER))
+        coord.store.ignore_torrent(H1, NAME)
+        coord.store.tombstone(H1)
+        out = await coord.injectfuse_confirmed([H1])
+        assert out.startswith("injecting")
+        assert coord.store.get(H1).state == State.RE_ADDING
     finally:
         coord.store.close()
 

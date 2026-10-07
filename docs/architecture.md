@@ -324,8 +324,10 @@ Yes/No question naming the locked group; on Yes every member's
 .torrent must verify complete at its fuse target or nothing changes
 state (tracked rows keep their prior state, untracked groups gain no
 row) — verified groups drive/create a `RE_ADDING` row and the normal
-gate injects `skip_check=True`. SSD-active rows are refused
-(`/cancel` first); cancelled hashes need un-ignore first. Command and callback handling share a 0.5s per-chat debounce
+gate injects `skip_check=True`. Yes auto-lifts a prior cancel
+(ignore + tombstone) and stops any SSD download first (SSD entry
+removed, reservation released), so there is no unignore/cancel
+round-trip. Command and callback handling share a 0.5s per-chat debounce
 (double-sent commands resolve+act once). Cancelled releases live
 in `ignored_torrents` (in state.db, so `--reset` clears them) and are
 skipped at discovery, recovery adoption, re-injection and late-seed
