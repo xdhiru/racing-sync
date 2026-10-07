@@ -4370,6 +4370,22 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             ts.save_path = ext.save_path
             if self._park_queued_for_download_slot(ts):
                 return
+            # Batch-priority re-verify before resume: this entry may predate
+            # its priorities (setup-transient park, restart between add and
+            # deselect, recovery re-add). Resuming full-wanted downloads the
+            # whole season past the SSD cap — and qB pre-allocates every file
+            # at add time even while paused, so a late deselect never reclaims
+            # the bytes. Singles resolve to no batches and resume untouched.
+            try:
+                await self._prepare_next_batch(ts, strict=True)
+            except Exception as e:  # noqa: BLE001
+                log.warning("batch priorities not verified for %s (%s); staying queued",
+                            ts.source_infohash[:10], e)
+                try:
+                    self.store.upsert(ts)
+                except Exception:
+                    pass
+                return
             try:
                 await self.dest_client.resume(ext.hash)
             except Exception as e:  # noqa: BLE001
@@ -4736,6 +4752,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 await self.dest_client.set_file_priorities(
                     ts.dest_infohash or ts.source_infohash, prio_map,
                 )
+                await self._warn_if_preallocated(ts, files, first_need)
         elif cls.kind in ("movie", "unknown") and len(files) > 1:
             # Type-agnostic file-group batching for multi-file content that
             # is not episodic (games, disc images, complete packs with plain
@@ -4778,6 +4795,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 await self.dest_client.set_file_priorities(
                     ts.dest_infohash or ts.source_infohash, prio_map,
                 )
+                await self._warn_if_preallocated(ts, files, first_need)
 
         # All-remote fast path: every batch already sits verified on the
         # remote (remaining footprint zero) — nothing will ever hit SSD, so
@@ -5087,6 +5105,95 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         except Exception:
             return False
 
+    async def _warn_if_preallocated(
+        self, ts: TorrentState, files: list, wanted: set[str] | None,
+    ) -> None:
+        """Loud one-time hint when deselected files already occupy full size.
+
+        qB creates every file at add time even while paused; with
+        pre-allocation enabled the deselected episodes sit at full size and a
+        season bigger than the SSD fills the disk no matter how correct the
+        batch priorities are (deselect-after-add never reclaims the bytes).
+        Nothing here can free them (no client API removes the bytes short of
+        a full delete+re-add, which would pre-allocate again) — the fix is
+        sparse allocation on the VPS2 client. Probe once per row; never
+        raises so setup can never fail over a hint.
+        """
+        try:
+            if wanted is None:
+                return
+            key = (ts.source_infohash or "").lower()
+            if not key:
+                return
+            try:
+                _warned = getattr(self, "_prealloc_warned", None)
+                if not isinstance(_warned, set):
+                    _warned = set()
+                    self._prealloc_warned = _warned  # type: ignore[attr-defined]
+                if key in _warned:
+                    return
+            except Exception:
+                _warned = set()
+            try:
+                base = Path(ts.save_path) if ts.save_path else Path(self.cfg.dest.save_path)
+            except Exception:
+                return
+            others = [f for f in (files or [])
+                      if (getattr(f, "name", "") or "") not in (wanted or set())]
+
+            def _check() -> tuple[int, int]:
+                n = 0
+                total = 0
+                for f in others:
+                    try:
+                        name = getattr(f, "name", "") or ""
+                        want = int(getattr(f, "size_bytes", 0) or 0)
+                        if not name or want <= 0:
+                            continue
+                        try:
+                            prog = float(getattr(f, "progress", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            prog = 0.0
+                        if prog >= 0.01:
+                            continue
+                        p = _safe_ssd_join(base, name)
+                        if p is None:
+                            continue
+                        try:
+                            if not p.is_file():
+                                continue
+                            if p.stat().st_size >= int(want * 0.9):
+                                n += 1
+                                total += want
+                        except OSError:
+                            continue
+                    except Exception:
+                        continue
+                return n, total
+
+            try:
+                n, total = await asyncio.to_thread(_check)
+            except Exception:
+                return
+            if n <= 0:
+                return
+            try:
+                _warned.add(key)
+                if len(_warned) > 500:
+                    for k in list(_warned)[:250]:
+                        _warned.discard(k)
+            except Exception:
+                pass
+            log.warning(
+                "qB pre-allocated %d deselected file(s) (~%d MB) for %s: "
+                "deselect-after-add cannot reclaim them — disable pre-allocation "
+                "(sparse allocation) on the VPS2 client or seasons bigger than "
+                "the SSD will keep filling the disk",
+                n, total // (1024 * 1024), ts.source_name[:60],
+            )
+        except Exception:
+            pass
+
     async def _fail_downloading_row(self, ts: TorrentState, h: str, error: str) -> None:
         """Fail a DOWNLOADING row terminally and free its slot.
 
@@ -5363,11 +5470,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # Freshly adopted rows (e.g. recovery after --reset wiped the batch
             # cursors) skip QUEUED setup, so no batch was ever prioritized and
             # the client may still select a stale batch. Restart at batch 0.
+            # Strict: an unverifiable selection must park, never resume blind
+            # full-wanted past the SSD cap.
             try:
-                await self._prepare_next_batch(ts)
+                await self._prepare_next_batch(ts, strict=True)
             except Exception as e:  # noqa: BLE001
-                log.warning("could not prioritize first batch for %s: %s",
+                log.warning("could not prioritize first batch for %s: %s; retry next tick",
                             ts.source_infohash[:10], e)
+                self.store.upsert(ts)
+                return
             try:
                 await self.dest_client.resume(h)
             except Exception as e:  # noqa: BLE001
@@ -5376,6 +5487,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         is_batched = ts.batches_total > 1
         consecutive_batch_failures = 0
         max_batch_failures_per_tick = 5
+
+        if is_batched and hasattr(self, "dest_client"):
+            # Entry re-verify (best-effort): the client's selection may have
+            # drifted since setup (operator change, full-wanted recovery
+            # re-add, a setup that parked between add and deselect). Waiting
+            # on batch N while the client downloads everything past the SSD
+            # cap must never happen — re-assert the current batch before the
+            # wait loop. Idempotent when already correct. Best-effort (log +
+            # continue) rather than parking: the QUEUED-entry and adopted
+            # gates above are the hard guarantees; a transient RPC failure
+            # here retries on the next worker tick instead of abandoning an
+            # in-flight batch wait.
+            try:
+                await self._prepare_next_batch(ts, strict=True)
+            except Exception as e:  # noqa: BLE001
+                log.warning("batch priorities not verified for %s (%s); proceeding",
+                            ts.source_infohash[:10], e)
 
         while not self._stop:
             # Fresh-state re-guard: this loop runs for hours across batch
@@ -5852,30 +5980,59 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 return
             await asyncio.sleep(poll_interval)
 
-    async def _prepare_next_batch(self, ts: TorrentState) -> None:
+    async def _prepare_next_batch(self, ts: TorrentState, *, strict: bool = False) -> None:
+        """Select only the current batch's files on the dest client.
+
+        Lenient by default (log + return on unknown, preserving the
+        historical callers). With ``strict=True`` any unknowable step
+        raises instead: callers that would otherwise ``resume()`` a
+        possibly full-wanted entry must park instead — resuming blind
+        downloads the whole season past the SSD cap (and qB pre-allocates
+        every file at add time even while paused, so deselect-after-add
+        never reclaims the bytes). A genuinely single-flow torrent
+        (no batches) still returns normally under strict.
+        """
         h = ts.dest_infohash or ts.source_infohash
         try:
             files = await self.dest_client.get_torrent_files(h)
         except Exception as e:
             log.warning("could not get torrent files for next batch: %s", e)
+            if strict:
+                raise RuntimeError(f"batch files unlistable for {ts.source_name}: {e}") from e
             return
         try:
             kind = classify(files, self.cfg).kind
         except Exception as e:
             log.warning("could not classify files for next batch: %s", e)
+            if strict:
+                raise RuntimeError(f"batch classify failed for {ts.source_name}: {e}") from e
             return
         cap = self._frozen_batch_cap(ts)
         if cap <= 0:
-            cap = sum(f.size_bytes for f in files) or 1
+            try:
+                cap = sum(f.size_bytes for f in files) or 1
+            except Exception:
+                cap = 1
         try:
             batches = self._resolve_batches(files, kind, cap)
         except Exception as e:
             log.warning("could not make batches for next batch: %s", e)
+            if strict:
+                raise RuntimeError(f"batch resolve failed for {ts.source_name}: {e}") from e
             return
         if not batches:
             return
         if ts.batch_index >= len(batches):
-            return
+            if strict:
+                # Cursor drift (grouping shrank under a persisted index):
+                # heal like the download loop instead of resuming blind.
+                try:
+                    ts.batch_index = max(0, len(batches) - 1)
+                    self.store.upsert(ts)
+                except Exception:
+                    pass
+            else:
+                return
         cur = batches[ts.batch_index]
         skip = await self._fuse_skipped(
             [(e.file_name, e.size_bytes) for e in cur.episodes], kind,

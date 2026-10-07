@@ -2735,3 +2735,151 @@ async def test_await_hash_none_on_deadline():
     coord.dest_client = AsyncMock()
     coord.dest_client.list_torrents = AsyncMock(return_value=[])
     assert await coord._await_hash_for_name("Missing", timeout_s=0.05) is None
+
+
+def _batch_pack_coordinator(tmp_path, ssd_cap=10_000):
+    """Coordinator + SSD client doubles for a 3-file Pack (batches [a,b],[c])."""
+    from racing_sync.clients.abstract import TorrentFile
+
+    fuse = tmp_path / "fuse"
+    fuse.mkdir(exist_ok=True)
+    (tmp_path / "fuse-unsorted").mkdir(exist_ok=True)
+    coord = make_coordinator()
+    coord._stop = False
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = ssd_cap
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.fuse.mount = fuse
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-unsorted"
+    coord.dest_client = AsyncMock()
+    files = [
+        TorrentFile(name="Pack/a.bin", size_bytes=4000, progress=0.0),
+        TorrentFile(name="Pack/b.bin", size_bytes=4000, progress=0.0),
+        TorrentFile(name="Pack/c.bin", size_bytes=4000, progress=0.0),
+    ]
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=files)
+    coord.dest_client.set_file_priorities = AsyncMock()
+    coord.dest_client.resume = AsyncMock()
+    coord.dest_client.pause = AsyncMock()
+    return coord, files
+
+
+@pytest.mark.anyio
+async def test_queued_existing_entry_reapplies_batch_priorities_before_resume(tmp_path):
+    """A setup-transient park must not resume full-wanted on the next tick.
+
+    Regression for the Gangs.of.London incident: the row parked QUEUED with
+    a full-wanted client entry (add ran, deselect did not stick), and the
+    existing-entry path resumed it blind past the SSD cap.
+    """
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import TorrentState, State
+
+    coord, _files = _batch_pack_coordinator(tmp_path)
+    coord.dest_client.list_torrents = AsyncMock(return_value=[
+        Torrent(hash="e" * 40, name="Pack", category="racing",
+                save_path=str(tmp_path), size_bytes=12000,
+                state="pausedDL", progress=0.0),
+    ])
+    coord.transition = MagicMock(
+        side_effect=lambda t, s, error="": setattr(t, "state", s))
+    ts = TorrentState(
+        source_infohash="e" * 40, source_name="Pack", total_bytes=12000,
+        cross_seed_blob=b"blob", save_path=str(tmp_path), state=State.QUEUED,
+    )
+
+    await coord._do_queued(ts)
+
+    assert ts.state == State.DOWNLOADING
+    prio_map = coord.dest_client.set_file_priorities.call_args[0][1]
+    assert prio_map == {"Pack/a.bin": 1, "Pack/b.bin": 1, "Pack/c.bin": 0}
+    # Priorities land before the resume, never after a blind start.
+    calls = [c[0] for c in coord.dest_client.mock_calls]
+    assert calls.index("set_file_priorities") < calls.index("resume")
+    coord.dest_client.resume.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_queued_existing_entry_parks_when_priorities_unverifiable(tmp_path):
+    """Unlistable files park QUEUED without resume (never blind full-wanted)."""
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import TorrentState, State
+
+    coord, _files = _batch_pack_coordinator(tmp_path)
+    coord.dest_client.list_torrents = AsyncMock(return_value=[
+        Torrent(hash="e" * 40, name="Pack", category="racing",
+                save_path=str(tmp_path), size_bytes=12000,
+                state="pausedDL", progress=0.0),
+    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        side_effect=RuntimeError("qB busy"))
+    coord.transition = MagicMock(
+        side_effect=lambda t, s, error="": setattr(t, "state", s))
+    ts = TorrentState(
+        source_infohash="e" * 40, source_name="Pack", total_bytes=12000,
+        cross_seed_blob=b"blob", save_path=str(tmp_path), state=State.QUEUED,
+    )
+
+    await coord._do_queued(ts)
+
+    assert ts.state == State.QUEUED
+    coord.dest_client.resume.assert_not_called()
+    coord.dest_client.set_file_priorities.assert_not_called()
+    coord.store.upsert.assert_called()
+
+
+@pytest.mark.anyio
+async def test_downloading_entry_reverifies_batch_priorities(tmp_path):
+    """A drifted client selection is corrected to the current batch on entry."""
+    from racing_sync.state import TorrentState, State
+
+    coord, _files = _batch_pack_coordinator(tmp_path)
+    coord.transition = MagicMock(
+        side_effect=lambda t, s, **kw: setattr(t, "state", s))
+    coord._wait_for_completion = AsyncMock()
+    coord._move_and_clean_batch = AsyncMock()
+    coord._reset_torrent_for_next_batch = AsyncMock(
+        side_effect=lambda t, nxt: nxt)
+
+    ts = TorrentState(
+        source_infohash="e" * 40, source_name="Pack", total_bytes=12000,
+        dest_infohash="e" * 40, save_path=str(tmp_path),
+        classification_kind="movie", batches_total=2, batch_index=0,
+        state=State.DOWNLOADING,
+    )
+
+    await coord._do_downloading(ts)
+
+    first_map = coord.dest_client.set_file_priorities.call_args_list[0][0][1]
+    assert first_map == {"Pack/a.bin": 1, "Pack/b.bin": 1, "Pack/c.bin": 0}
+    assert ts.state == State.MOVING
+
+
+@pytest.mark.anyio
+async def test_frozen_cap_freeze_keeps_transition_valid(tmp_path):
+    """The cap-freeze narrow write must sync the revision (no phantom race).
+
+    Every first-time batch setup froze its cap via update_columns (which
+    bumps the DB revision) and then failed its own QUEUED->DOWNLOADING
+    transition as a "concurrent writer" — the Gangs.of.London 16:33:26
+    incident signature.
+    """
+    from racing_sync.state import StateStore, TorrentState, State
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord.cfg.ssd.max_inflight_bytes = 10_000
+        coord.cfg.ssd.path = tmp_path
+        ts = TorrentState(source_infohash="c" * 40, source_name="Pack",
+                          state=State.QUEUED)
+        store.upsert(ts)
+        row = store.get("c" * 40)
+
+        cap = coord._frozen_batch_cap(row)
+        assert cap > 0
+        store.transition(row, State.DOWNLOADING)
+        assert store.get("c" * 40).state == State.DOWNLOADING
+    finally:
+        store.close()

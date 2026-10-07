@@ -173,6 +173,38 @@ async def test_fix_orphan_already_downloading(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_fix_orphan_readd_stays_paused_for_priority_setup(tmp_path: Path):
+    """A recovery re-add must not resume full-wanted past the SSD cap.
+
+    The coordinator re-asserts the current batch's priorities before any
+    resume (QUEUED-entry and adopted-DOWNLOADING gates); resuming here
+    would download the whole season while qB pre-allocates every file.
+    """
+    from racing_sync.clients.abstract import AddResult
+    from racing_sync.recovery import fix_orphan
+    from racing_sync.state import TorrentState
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    ts = TorrentState("hash2", state=State.QUEUED)
+    store.upsert(ts)
+
+    dest = AsyncMock()
+    dest.add_torrent = AsyncMock(
+        return_value=AddResult(hash="ab" * 20, accepted=True, detail="Ok."))
+    cfg = MagicMock()
+    cfg.dest.save_path = tmp_path / "downloads"
+
+    res = await fix_orphan(ts, cfg, dest=dest, store=store, sftp_bytes=b"dummy-bytes")
+    assert res == State.DOWNLOADING.value
+    dest.add_torrent.assert_awaited_once()
+    add_kwargs = dest.add_torrent.call_args[1]
+    assert add_kwargs.get("paused") is True
+    dest.resume.assert_not_called()
+
+
+@pytest.mark.anyio
 async def test_do_re_add_fails_if_add_torrent_rejected():
     from unittest.mock import AsyncMock
     from racing_sync.state import TorrentState, State
