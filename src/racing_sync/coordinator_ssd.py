@@ -34,32 +34,43 @@ class SSDLedgerMixin:
     """Batch caps + global SSD reservation ledger (duck-typed ``self``)."""
 
     def _batch_cap_bytes(self) -> int:
-        from . import coordinator as _c
+        """Fixed per-torrent batch cap (refactor).
 
+        Previously folded live free space into the cap via
+        ssd_max_inflight_bytes(cfg) (one disk stat per batch resolution),
+        which made batch boundaries shift as free space changed — hence
+        the freeze cache + DB persist + version-sync machinery below.
+
+        Fixed cap = configured max_inflight_bytes. Boundaries are stable
+        by construction across restarts; SSD overfill is still prevented
+        by the global ledger (_ssd_try_reserve) + physical free check at
+        admission/grow time. No disk stat here.
+        """
         try:
-            cap = _c.ssd_max_inflight_bytes(self.cfg)
-            if isinstance(cap, int) and cap > 0:
-                return cap
+            raw = getattr(getattr(self, "cfg", None), "ssd", None)
+            raw = getattr(raw, "max_inflight_bytes", 0)
+            if isinstance(raw, bool):
+                return 0
+            if not isinstance(raw, (int, float)):
+                return 0
+            v = int(raw or 0)
+            return v if v > 0 else 0
         except Exception:
-            pass
-        # ssd_max_inflight_bytes folds free-space into the cap, so it
-        # reports 0 both when the disk is full and when nothing is
-        # configured. Fall back to the configured cap so batching never
-        # crashes with "cap_bytes must be positive".
-        try:
-            configured = int(getattr(self.cfg.ssd, "max_inflight_bytes", 0) or 0)
-            if configured > 0:
-                return configured
-        except Exception:
-            pass
-        return 0
+            return 0
 
     def _frozen_batch_cap(self, ts: TorrentState) -> int:
-        """Stable batch cap for one row (see _batch_cap_cache).
+        """Stable batch cap for one row (refactor, read-only).
 
-        Priority: in-memory cache, then the persisted ``batch_cap_bytes``
-        column (survives restarts so batch boundaries never shift under a
-        persisted ``batch_index``), then a fresh freeze from the live cap.
+        Priority: in-memory cache, then persisted ``batch_cap_bytes``
+        (upgrade compat: rows frozen under the old free-space scheme keep
+        their boundaries so a persisted ``batch_index`` never shifts),
+        then the fixed configured cap.
+
+        No DB writes, no version sync: the old freeze did
+        update_columns/upsert on a read path, which bumped the revision
+        and tripped the transition version guard as a phantom
+        "concurrent writer" (fixed with manual sync). Read-only freeze
+        cannot cause that class of bug.
         """
         try:
             cache = getattr(self, "_batch_cap_cache", None)
@@ -83,49 +94,15 @@ class SSDLedgerMixin:
         cap = self._batch_cap_bytes()
         if cap <= 0:
             return 0
+        # In-memory only: fixed caps are stable by construction, so no
+        # DB persist and no version-sync dance. Persisted legacy values
+        # above already returned; new rows just reuse the fixed cap.
         try:
             if key and cache is not None:
                 cache[key] = cap
                 if len(cache) > 5000:
-                    # Bound memory: drop an arbitrary chunk (oldest unknown
-                    # order, but caps re-freeze on next use).
                     for k in list(cache)[:2500]:
                         cache.pop(k, None)
-            try:
-                ts.batch_cap_bytes = cap
-            except Exception:
-                pass
-            # Persist the freeze so a restart before any other upsert keeps
-            # the same batch boundaries under a persisted batch_index.
-            # Narrow write (never a whole-row upsert): a read-path freeze
-            # must not regress a concurrently transitioned state.
-            try:
-                store = getattr(self, "store", None)
-                _up = getattr(store, "update_columns", None)
-                if store is not None and callable(_up):
-                    try:
-                        _nv = _up((ts.source_infohash or ""),
-                                  {"batch_cap_bytes": cap})
-                    except Exception:
-                        _nv = 0
-                    if isinstance(_nv, int) and _nv > 0:
-                        # Revision sync: update_columns bumps the DB
-                        # revision without touching this object — without
-                        # the sync the row's own next transition trips the
-                        # version guard as a phantom "concurrent writer"
-                        # (every first-time batch setup failed its
-                        # QUEUED->DOWNLOADING this way). upsert() syncs
-                        # itself; truthy non-int returns are mock doubles.
-                        try:
-                            ts.version = _nv
-                        except Exception:
-                            pass
-                    elif not _nv:
-                        store.upsert(ts)
-                elif store is not None and hasattr(store, "upsert"):
-                    store.upsert(ts)
-            except Exception:
-                pass
         except Exception:
             pass
         return cap

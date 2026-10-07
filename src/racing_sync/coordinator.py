@@ -529,26 +529,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 self.watch = WatchDirScanner(self.cfg.watch_dir, self.prowlarr)
 
             if self.cfg.recovery.run_on_startup:
-                from .recovery import _reconcile_snapshot, reconcile_verify
-                # Fast snapshot first (no per-row RPC verification), so the
-                # daemon serves in seconds even with hundreds of DONE rows;
-                # expensive verification (byte checks, classification, blob
-                # export, orphan fixes) runs in the background. Unverified
-                # rows stay fail-closed (janitor requires fuse_verified).
+                from .recovery import _reconcile_snapshot
+                # Refactor (lazy recovery): fast snapshot only (no per-row
+                # RPC verification), daemon serves in seconds. Byte
+                # verification, classification, blob export and orphan
+                # fixes heal lazily on the next worker tick via the
+                # existing fail-closed gates (fuse gate re-verifies,
+                # _do_queued classifies, blob exports on demand).
+                # Unverified rows stay fail-closed (janitor requires
+                # fuse_verified). reconcile_verify() remains for the
+                # API /recover endpoint and tests, but no longer runs
+                # as a background task (no shutdown race, no 4-wide
+                # per-row storm at boot).
                 await _reconcile_snapshot(
                     self.cfg, dest=self.dest_client, store=self.store,
                     verify=False,
                 )
-                try:
-                    self._recovery_task = asyncio.create_task(
-                        reconcile_verify(
-                            self.cfg, dest=self.dest_client,
-                            store=self.store,
-                        ),
-                        name="rs-recovery-verify",
-                    )
-                except RuntimeError:
-                    self._recovery_task = None
+                self._recovery_task = None
 
             # Auto-retry FAILED rows so a previous run's hard failures
             # (e.g. Deluge RPC unavailable) get another chance with the
@@ -6160,12 +6157,18 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             except Exception:
                 new_hash = None
         if not new_hash and isinstance(blob, (bytes, bytearray)):
-            try:
-                awaited = await self._await_hash_for_name(ts.source_name)
-                if isinstance(awaited, str) and awaited:
-                    new_hash = awaited.lower()
-            except Exception:
-                new_hash = None
+            # Refactor: drop the 60s _await_hash_for_name fallback here.
+            # Blob exists (checked above) so its hash parses except for
+            # corrupt bytes — in which case the add above already failed
+            # or the next tick retries with the same blob. A full racing
+            # list scan with backoff per batch reset cost up to 60s × N
+            # batches for a path that casi never fires. Keep the old
+            # hash for this tick; guards catch it next tick.
+            log.warning(
+                "isolated batch: hash unresolvable for %s after re-add; retry next tick",
+                ts.source_name,
+            )
+            return False
         if new_hash:
             ts.dest_infohash = new_hash
             # Narrow write: the whole-row upsert here used to clobber a

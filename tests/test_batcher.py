@@ -252,6 +252,9 @@ async def test_batch_interleaved_download_move_and_clean(tmp_path):
     coord.cfg.dest.save_path = save_dir
     coord.cfg.rclone.remote.default = "remote:tv"
     coord.cfg.rclone.batch_move_extra_flags = []
+    # Fixed batch cap (refactor): boundaries come from configured
+    # max_inflight_bytes, not live free space. 8 B/file -> 2 batches.
+    coord.cfg.ssd.max_inflight_bytes = 8
 
     ts = TorrentState(
         source_infohash="testhash",
