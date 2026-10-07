@@ -75,6 +75,8 @@ from .coordinator_errors import (
 from .coordinator_paths import _safe_ssd_join, _watch_cross_seed_dir, fuse_stat_cached
 from .coordinator_picker import pick_ssd_source_for_racing
 from .coordinator_ssd import SSDLedgerMixin
+from .content_keys import same_content as _same_content_key
+from .content_keys import same_release_name as _same_release_name
 from .io_bounds import chunked, offload, rpc
 from .prowlarr import ProwlarrClient, TorrentHit
 from .rclone_ops import (
@@ -1958,9 +1960,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             log.debug("worker start: %s state=%s", ts.source_name, ts.state.value)
         else:
             log.info("worker start: %s state=%s", ts.source_name, ts.state.value)
+        try:
+            _entry_state = ts.state
+        except Exception:
+            _entry_state = None
         if ts.state == State.NEW:
             await self._do_new(ts)
         if ts.state == State.QUERYING:
+            await self._do_waiting_indexer(ts)
+        if ts.state == State.WAITING_INDEXER and _entry_state in (
+            State.QUERYING,
+            State.WAITING_INDEXER,
+        ):
+            # Refactor: timer-elapsed WAITING_INDEXER rows work directly
+            # without the extra WAITING_INDEXER -> QUERYING transition.
+            # QUERYING is kept as a compat alias (old DB rows, manual
+            # /fetch wakes still use it), but the scheduler no longer
+            # spends a DB write to get here. Entry-state guard prevents
+            # same-tick fallthrough (NEW that just parked must wait).
             await self._do_waiting_indexer(ts)
         if ts.state == State.WAITING_DISK:
             await self._wait_disk_then_queue(ts)
@@ -1986,7 +2003,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             await self._do_re_add(ts)
 
     def _wakeup_indexer_row(self, ts: TorrentState) -> None:
-        """Wake one timer-elapsed WAITING_INDEXER row (step-3 loop body)."""
+        """Wake one timer-elapsed WAITING_INDEXER row (step-3 loop body).
+
+        Refactor: spawn the worker directly without the intermediate
+        WAITING_INDEXER -> QUERYING transition. The worker's
+        WAITING_INDEXER branch does the same `_do_waiting_indexer` work,
+        saving one DB write + version bump per wakeup. QUERYING remains
+        a valid state for old rows and manual /fetch wakes.
+        """
         _key = (ts.source_infohash or "").lower()
         if _key in self._running_infohashes:
             return
@@ -2013,7 +2037,6 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             ts.source_name[:40],
             ts.public_export_attempts if _public_mode else ts.indexer_attempts,
         )
-        self.transition(ts, State.QUERYING)
         self._spawn_worker(ts)
 
     # ---- state: NEW ----
@@ -2292,11 +2315,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
         qB/Deluge don't have a content-id, so heuristic: same name + same
         total size. We use name match — usually racing has 1-3 dupes.
+        Delegates to content_keys.same_release_name (single rule).
         """
-        st_norm = normalize_content_name(st.name)
         return [
             t for t in all_source
-            if t.infohash != st.infohash and (t.name == st.name or normalize_content_name(t.name) == st_norm)
+            if t.infohash != st.infohash and (
+                t.name == st.name or _same_release_name(t.name, st.name)
+            )
         ]
 
     async def _operator_supplied_decision(self, ts: TorrentState):
@@ -3718,11 +3743,6 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         heavy list scans live on offloaded paths instead.
         """
         try:
-            want_norm = normalize_content_name(ts.source_name or "")
-            try:
-                want_size = int(ts.total_bytes or 0)
-            except (TypeError, ValueError):
-                want_size = 0
             me = (ts.source_infohash or "").lower()
             rows = self.store.all_active()
         except Exception:
@@ -3734,12 +3754,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                             or r.state not in (State.QUEUED, State.DOWNLOADING,
                                                State.MOVING, State.RE_ADDING)):
                         continue
-                    try:
-                        r_size = int(r.total_bytes or 0)
-                    except (TypeError, ValueError):
-                        continue
-                    if (r_size == want_size and normalize_content_name(
-                            r.source_name or "") == want_norm):
+                    # Single content-key rule (see content_keys.same_content):
+                    # same normalized name + same size when both known.
+                    # Unknown sizes match (fail toward dedup, like the watch
+                    # election) to avoid duplicate SSD downloads.
+                    if _same_content_key(
+                        r.source_name or "", r.total_bytes or 0,
+                        ts.source_name or "", ts.total_bytes or 0,
+                    ):
                         return r
                 except Exception:
                     continue
@@ -4618,6 +4640,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         loop, and anything unstatable is downloaded (safe direction — the
         final fuse gate re-verifies everything before injection).
         Returns the input names (exact strings) to skip.
+        Delegates to fuse_gate.skipped_present (single implementation).
         """
         if not items:
             return set()
@@ -4625,26 +4648,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             mount = self._target_mount_for_kind(kind, Path(self.cfg.dest.save_path))
         except Exception:
             return set()
-
-        def _check() -> set[str]:
-            skipped: set[str] = set()
-            for name, size in items:
-                joined = _safe_ssd_join(mount, name or "")
-                if joined is None:
-                    continue
-                try:
-                    exists, actual = fuse_stat_cached(joined)
-                except Exception:
-                    continue
-                if not exists:
-                    continue
-                want = size or 0
-                if actual == want:
-                    skipped.add(name)
-            return skipped
-
         try:
-            return await asyncio.to_thread(_check)
+            from .fuse_gate import skipped_present as _skipped_present
+
+            return await _skipped_present(mount, items)
         except Exception as e:  # noqa: BLE001
             log.warning("fuse skip check failed, downloading everything: %s", e)
             return set()
@@ -9809,17 +9816,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         Returns None when there is nothing to verify (no blob / undecodable /
         empty) — callers then keep existing behavior and let downstream steps
         fail loudly instead of gating on an empty expectation.
+        Delegates to fuse_gate.expected_files_from_blob (single rule).
         """
-        if not blob or not isinstance(blob, (bytes, bytearray)):
-            return None
         try:
-            from .watchdir import extract_torrent_files_from_bencoded
-            pairs = [
-                (f.name, f.size_bytes)
-                for f in extract_torrent_files_from_bencoded(blob)
-                if f.name
-            ]
-            return pairs or None
+            from .fuse_gate import expected_files_from_blob as _expected
+
+            return _expected(blob)
         except Exception:
             return None
 
@@ -9828,43 +9830,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     ) -> list[str]:
         """Expected files absent (or size-mismatched) under the fuse target.
 
-        Blocking fuse stats are offloaded to a thread. A failed check itself
-        counts as missing — never inject blind when the mount can't be read.
-        A dead mount short-circuits on one mount stat instead of one failing
-        stat per file per row per tick.
+        Delegates to fuse_gate.missing_under (single implementation).
+        Fail-closed as before: unstatable mount/check returns a marker
+        missing entry, never an empty pass.
         """
-        mount = Path(target_mount)
-
-        def _check() -> list[str]:
-            try:
-                mount_ok, _ = fuse_stat_cached(mount)
-            except Exception:
-                mount_ok = False
-            if not mount_ok:
-                return [f"<mount unavailable: {mount}>"]
-            missing: list[str] = []
-            for name, want in files:
-                target = _safe_ssd_join(mount, name or "")
-                if target is None:
-                    missing.append(name)
-                    continue
-                try:
-                    exists, actual = fuse_stat_cached(target)
-                except Exception:
-                    missing.append(name)
-                    continue
-                if not exists:
-                    missing.append(name)
-                    continue
-                if want and actual != want:
-                    missing.append(f"{name} (size {actual}!={want})")
-            return missing
-
         try:
-            return await asyncio.to_thread(_check)
+            from .fuse_gate import missing_under as _missing_under
+
+            res = await _missing_under(target_mount, files or [])
         except Exception as e:  # noqa: BLE001
-            log.warning("fuse availability check failed for %s: %s", mount, e)
+            log.warning("fuse availability check failed for %s: %s", target_mount, e)
             return [f"<availability check failed: {e}>"]
+        if res is None:
+            return [f"<mount unavailable: {target_mount}>"]
+        return res
 
     def _fuse_mount_strs(self) -> list[str]:
         """Normalized fuse mount strings; [] when unconfigured/broken."""
