@@ -132,8 +132,10 @@ async def test_fetch_source_prefers_snapshot_on_deluge():
     """Deluge freshness checks reuse the poller snapshot (no per-row scan).
 
     Every Deluge get_torrent is a full get_torrents_status scan; serving
-    workers from the ≤10s-old snapshot avoids N scans per tick, which is
-    what wedges the VPS1 WebUI. Non-Deluge clients keep exact behavior.
+    workers from the ≤45s-old snapshot avoids N scans per tick, which is
+    what wedges the VPS1 WebUI. qB rows with a reported tracker are
+    served too (single-tracker racing torrents need no per-row RPCs);
+    trackerless qB rows still do the live lookup for full trackers.
     """
     from unittest.mock import AsyncMock, MagicMock
     from racing_sync.clients.abstract import Torrent
@@ -163,14 +165,28 @@ async def test_fetch_source_prefers_snapshot_on_deluge():
     coord.source_client.get_torrent.assert_awaited_once()
     coord.transition.assert_not_called()  # first miss only counts
 
-    # Non-Deluge source: snapshot ignored, RPC as before.
+    # Non-Deluge source with a tracked snapshot row: served from cache
+    # (single-tracker qB rows need no per-row RPCs while fresh).
     coord2 = make_coordinator()
     coord2.source_client = AsyncMock()
     coord2.source_client.get_torrent = AsyncMock(return_value=snap)
     coord2._source_torrents_cache = [snap]
     ts3 = TorrentState(source_infohash="d" * 40, state=State.NEW)
     assert await coord2._fetch_source_or_fail(ts3) is snap
-    coord2.source_client.get_torrent.assert_awaited_once()
+    coord2.source_client.get_torrent.assert_not_called()
+
+    # Non-Deluge source with a trackerless snapshot row: live RPC as
+    # before (full tracker set needed for public detection).
+    bare = Torrent(hash="d" * 40, name="Snap.Show", category="racing",
+                   save_path="/vps1", size_bytes=999, state="seeding",
+                   progress=1.0, trackers=[])
+    coord3 = make_coordinator()
+    coord3.source_client = AsyncMock()
+    coord3.source_client.get_torrent = AsyncMock(return_value=snap)
+    coord3._source_torrents_cache = [bare]
+    ts4 = TorrentState(source_infohash="d" * 40, state=State.NEW)
+    assert await coord3._fetch_source_or_fail(ts4) is snap
+    coord3.source_client.get_torrent.assert_awaited_once()
 
 
 @pytest.mark.anyio

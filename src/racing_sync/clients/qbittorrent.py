@@ -625,6 +625,17 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
         except (TypeError, ValueError, OverflowError):
             return 0.0
 
+    # qB /torrents/info carries the first tracker URL in `tracker`.
+    # Populate it so snapshot list rows are usable without a follow-up
+    # get_trackers RPC (the coordinator's source snapshot serves rows
+    # with trackers directly). Multi-tracker torrents report only the
+    # first here — get_torrent() still fetches the full set, so detail
+    # paths are unaffected.
+    _first_tracker = d.get("tracker", "") or ""
+    try:
+        _first_tracker = str(_first_tracker).strip()
+    except Exception:
+        _first_tracker = ""
     return Torrent(
         hash=infohash,
         name=torrent_name or infohash,
@@ -634,7 +645,7 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
         state=str(state),
         progress=_fprogress(d.get("progress", 0.0)),
         ratio=_fnum(d.get("ratio", 0.0)),
-        trackers=[],
+        trackers=[_first_tracker] if _first_tracker else [],
         files=[],
         added_on=_num(d.get("added_on")),
         upspeed_bps=_num(d.get("upspeed")),
