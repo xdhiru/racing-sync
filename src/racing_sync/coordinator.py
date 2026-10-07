@@ -7946,6 +7946,37 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 gate_blob = await asyncio.to_thread(store.get_blob, ts.source_infohash)
             except Exception:
                 gate_blob = None
+        if not gate_blob:
+            # Self-heal for rows driven to RE_ADDING before their blob was
+            # persisted (e.g. /injectfuse on a freshly discovered row):
+            # the racing torrent is still on VPS1, so live-fetch its bytes,
+            # persist them, and continue through the gate on this same tick
+            # instead of parking until max_age.
+            try:
+                healed = await self._fetch_racing_torrent_bytes(
+                    (ts.source_infohash or "").lower())
+            except Exception:
+                healed = None
+            if healed:
+                try:
+                    gate_blob = bytes(healed)
+                except Exception:
+                    gate_blob = None
+            if gate_blob and store is not None:
+                try:
+                    new_rev = store.update_columns(
+                        ts.source_infohash, {"cross_seed_blob": bytes(gate_blob)})
+                    if new_rev:
+                        ts.version = new_rev
+                except Exception:
+                    pass
+                try:
+                    ts.cross_seed_blob = bytes(gate_blob)
+                    ts._blob = bytes(gate_blob)
+                except Exception:
+                    pass
+                log.info("fuse gate: healed missing blob for %s from VPS1 (%d B)",
+                         ts.source_name[:50], len(gate_blob or b""))
         gate_expected = self._expected_fuse_files(gate_blob)
         if not gate_blob:
             # Fail closed: no blob at all means we cannot verify the fuse
@@ -8582,8 +8613,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
     # Row states /injectfuse may drive into RE_ADDING (operator moved the
     # bytes to the remote by hand; the fuse gate re-verifies before any
-    # skip_check inject). SSD-active rows are refused by injectfuse_apply
-    # (driving mid-download would orphan SSD bytes); DONE/RE_ADDING are
+    # skip_check inject). One command covers every case: waiting/failed rows
+    # drive straight there, SSD-active rows (QUEUED/DOWNLOADING/MOVING)
+    # abandon their partial download first (dest entry removed, reservation
+    # released), cancelled/untracked groups are adopted; DONE/RE_ADDING are
     # no-ops.
     _INJECTFUSE_DRIVABLE = frozenset({
         State.NEW, State.QUERYING, State.WAITING_INDEXER,
@@ -8675,8 +8708,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         """Resolve a VPS1 infohash to its content group + tracked row.
 
         Category-agnostic (manual commands reach torrents the racing poll
-        never ingests). Raises LookupError when unknown/cancelled. No
-        state change.
+        never ingests). Raises LookupError when unknown. Cancelled
+        (ignored) groups are NOT refused: explicit /injectfuse intent
+        overrides the ignore — apply auto-lifts it so one command (plus
+        Yes) is the whole manual path. No state change.
         """
         norm = (infohash or "").strip().lower()
         if len(norm) != 40 or not all(c in "0123456789abcdef" for c in norm):
@@ -8702,13 +8737,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         if not group:
             raise LookupError(f"hash {norm[:10]} not on VPS1")
         try:
-            if _group_is_ignored(group, getattr(self, "store", None)):
-                raise LookupError(
-                    "cancelled release — unignore it first, then inject")
-        except LookupError:
-            raise
+            ignored = bool(_group_is_ignored(group, getattr(self, "store", None)))
         except Exception:
-            pass
+            ignored = False
         primary = next(
             (t for t in group if _looks_public(getattr(t, "trackers", None) or [])),
             group[0],
@@ -8719,6 +8750,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             "row": self._injectfuse_find_row(group),
             "title": (getattr(primary, "name", "") or norm[:10])[:60],
             "size": int(getattr(primary, "size_bytes", 0) or 0),
+            "ignored": ignored,
         }
 
     async def injectfuse_verify(self, members: list) -> dict:
@@ -8786,19 +8818,194 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         return {"ready": ready and bool(members), "blobs": blobs,
                 "problems": problems}
 
+    def _injectfuse_lift_cancel(self, members: list) -> bool:
+        """Clear ignore entries + forget tombstones for a group (best-effort).
+
+        Explicit /injectfuse intent overrides a prior /cancel: returns True
+        when anything was lifted so callers can name it in the reply.
+        """
+        lifted = False
+        store = getattr(self, "store", None)
+        if store is None:
+            return False
+        seen: set[str] = set()
+        for t in members or []:
+            try:
+                h = (getattr(t, "infohash", "") or "").lower()
+            except Exception:
+                continue
+            if not h or h in seen:
+                continue
+            seen.add(h)
+            try:
+                if store.unignore_torrent(h):
+                    lifted = True
+            except Exception:
+                pass
+            try:
+                if store.clear_tombstone(h):
+                    lifted = True
+            except Exception:
+                pass
+        return lifted
+
+    def _injectfuse_unhold(self, row) -> None:
+        """Clear a /skip hold so the RE_ADDING worker actually runs."""
+        try:
+            if not getattr(row, "skipped", 0):
+                return
+        except Exception:
+            return
+        store = getattr(self, "store", None)
+        if store is None:
+            return
+        try:
+            upd = getattr(store, "update_columns", None)
+            if callable(upd):
+                upd(row.source_infohash, {"skipped": 0})
+            else:
+                row.skipped = 0
+                store.upsert(row)
+        except Exception:
+            pass
+
+    async def _injectfuse_preempt_ssd(self, row) -> None:
+        """Abandon an SSD-active download so the row can go RE_ADDING.
+
+        Releases the SSD reservation, drops the frozen batch cap, and
+        best-effort deletes the SSD-side dest entries (with files — the
+        bytes already live on the remote by operator claim and fuse verify
+        passed). Fuse-side entries are never deleted with files. Never
+        raises: a leftover partial only wastes SSD until the next janitor
+        pass; the state drive matters.
+        """
+        try:
+            await self._ssd_release(row.source_infohash or "")
+        except Exception:
+            pass
+        try:
+            self._drop_frozen_batch_cap(row)
+        except Exception:
+            pass
+        dest = getattr(self, "dest_client", None)
+        if dest is None:
+            return
+        hashes: list[str] = []
+        for raw in (
+            getattr(row, "dest_infohash", "") or "",
+            getattr(row, "cross_seed_infohash", "") or "",
+            getattr(row, "source_infohash", "") or "",
+        ):
+            h = (raw or "").strip().lower()
+            if h and h not in hashes:
+                hashes.append(h)
+        try:
+            for extra in (getattr(row, "injected_private_hashes", "") or "").split(","):
+                h = (extra or "").strip().lower()
+                if h and h not in hashes:
+                    hashes.append(h)
+        except Exception:
+            pass
+        if not hashes:
+            return
+        try:
+            entries = await dest.list_torrents(hashes=hashes) or []
+        except Exception as e:  # noqa: BLE001
+            log.debug("injectfuse: preempt list failed for %s: %s",
+                      (row.source_infohash or "")[:10], e)
+            return
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            try:
+                h = (getattr(entry, "hash", "") or "").lower()
+                if not h:
+                    continue
+                on_fuse = False
+                try:
+                    on_fuse = bool(self._save_path_is_on_fuse(
+                        getattr(entry, "save_path", "") or ""))
+                except Exception:
+                    on_fuse = False
+                await dest.delete(h, delete_files=not on_fuse)
+                log.info("injectfuse: preempt removed SSD entry %s (delete_files=%s)",
+                         h[:10], not on_fuse)
+            except Exception as e:  # noqa: BLE001
+                log.debug("injectfuse: preempt delete failed: %s", e)
+                continue
+
+    def _injectfuse_verified_blob(self, resolved: dict, blobs: dict) -> bytes | None:
+        """Primary verified .torrent bytes (fallback: first available)."""
+        try:
+            primary = resolved.get("primary")
+            p_hash = (getattr(primary, "infohash", "") or "").lower()
+        except Exception:
+            p_hash = ""
+        if isinstance(blobs, dict):
+            try:
+                if p_hash and blobs.get(p_hash):
+                    return bytes(blobs[p_hash])
+            except Exception:
+                pass
+            try:
+                for v in blobs.values():
+                    if v:
+                        return bytes(v)
+            except Exception:
+                pass
+        return None
+
+    def _injectfuse_ensure_blob(self, row, resolved: dict, blobs: dict) -> bool:
+        """Carry the verified blob onto a tracked row (in-memory).
+
+        The fuse gate reads `ts._blob or cross_seed_blob or store blob`:
+        a tracked row driven without one parks forever on "missing blob".
+        Only fills when the DB has nothing (never overwrites a good
+        prowlarr/SFTP blob); the following transition write persists it
+        in the same guarded UPDATE, so no version race. True when the row
+        now carries blob bytes.
+        """
+        try:
+            if getattr(row, "_blob", None) or getattr(row, "cross_seed_blob", None):
+                return True
+        except Exception:
+            pass
+        try:
+            store = getattr(self, "store", None)
+            if store is not None and hasattr(store, "get_blob"):
+                if store.get_blob(row.source_infohash or ""):
+                    return True
+        except Exception:
+            pass
+        blob = self._injectfuse_verified_blob(resolved, blobs)
+        if not blob:
+            return False
+        try:
+            row.cross_seed_blob = bytes(blob)
+        except Exception:
+            return False
+        try:
+            row._blob = bytes(blob)
+        except Exception:
+            pass
+        return True
+
     async def injectfuse_apply(self, resolved: dict, blobs: dict[str, bytes]) -> str:
         """Drive a verified group into RE_ADDING (or create its row).
 
         Callers must run injectfuse_verify first and pass its blobs: on
         ANY problem the caller reports and changes nothing — this method
-        assumes verification passed. SSD-active rows raise LookupError;
-        DONE/RE_ADDING rows report no-op.
+        assumes verification passed. Single manual path for every case:
+        a prior /cancel is auto-lifted, SSD-active rows abandon their
+        partial download first; DONE/RE_ADDING rows report no-op.
         """
         members = list(resolved.get("members") or [])
         primary = resolved.get("primary")
         title = str(resolved.get("title") or "group")[:60]
         if not members or primary is None:
             raise LookupError("empty group; nothing to inject")
+        lifted = self._injectfuse_lift_cancel(members)
+        lift_note = " (cancel lifted)" if lifted else ""
         # Re-resolve the row: the poller may have ingested it since resolve.
         row = self._injectfuse_find_row(members)
         if row is not None:
@@ -8809,20 +9016,35 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if fresh is None:
                 raise LookupError("already gone from tracking")
             row = fresh
-            if row.state in self._INJECTFUSE_ACTIVE:
-                raise LookupError(
-                    f"SSD {row.state.value} in progress for {title} — "
-                    "/cancel it first for the manual path")
             if row.state in (State.DONE, State.RE_ADDING):
                 return (f"already {row.state.value}: {title} "
                         "(fuse gate runs next tick)")
+            if row.state in self._INJECTFUSE_ACTIVE:
+                prev = row.state.value
+                await self._injectfuse_preempt_ssd(row)
+                try:
+                    fresh2 = self.store.get(row.source_infohash, include_blob=False)
+                    if fresh2 is not None:
+                        row = fresh2
+                except Exception:
+                    pass
+                self._injectfuse_unhold(row)
+                if not self._injectfuse_ensure_blob(row, resolved, blobs):
+                    raise LookupError("primary .torrent bytes missing; run again")
+                self.transition(row, State.RE_ADDING)
+                return (f"injecting {len(members)} torrent(s) for {title} "
+                        f"(SSD {prev} stopped{lift_note}; "
+                        "fuse gate runs next tick)")
             if row.state not in self._INJECTFUSE_DRIVABLE:
                 raise LookupError(
                     f"{title} is {row.state.value}; manual inject needs "
                     "a waiting/failed row")
+            self._injectfuse_unhold(row)
+            if not self._injectfuse_ensure_blob(row, resolved, blobs):
+                raise LookupError("primary .torrent bytes missing; run again")
             self.transition(row, State.RE_ADDING)
             return (f"injecting {len(members)} torrent(s) for {title} "
-                    "(fuse gate runs next tick)")
+                    f"(fuse gate runs next tick{lift_note})")
         try:
             p_hash = (getattr(primary, "infohash", "") or "").lower()
             p_name = (getattr(primary, "name", "") or p_hash[:10])

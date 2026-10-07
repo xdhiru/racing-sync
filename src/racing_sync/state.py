@@ -74,7 +74,11 @@ ALLOWED: dict[State, set[State]] = {
                 State.RE_ADDING},
     State.QUEUED: {State.DOWNLOADING, State.MOVING, State.WAITING_DISK,
                    State.RE_ADDING, State.DONE, State.FAILED},
-    State.DOWNLOADING: {State.MOVING, State.QUEUED, State.FAILED},
+    # DOWNLOADING -> RE_ADDING is the /injectfuse manual preempt: the operator
+    # moved the bytes to the remote by hand, fuse verification passed, so the
+    # SSD download is abandoned (dest entry removed, reservation released)
+    # and the row goes fuse-gated RE_ADDING instead of finishing the download.
+    State.DOWNLOADING: {State.MOVING, State.QUEUED, State.FAILED, State.RE_ADDING},
     State.MOVING: {State.RE_ADDING, State.DOWNLOADING, State.FAILED},
     State.RE_ADDING: {State.DONE, State.MOVING, State.FAILED},
     # DONE -> MOVING is the fresh-DB self-heal: recovery may have adopted an
@@ -83,10 +87,10 @@ ALLOWED: dict[State, set[State]] = {
     # runs before any fuse injection. DONE -> RE_ADDING stays for lost fuses.
     State.DONE: {State.RE_ADDING, State.MOVING},
     # Telegram /injectfuse (operator moved the bytes to the remote by
-    # hand): pre-SSD and failed rows may jump straight to RE_ADDING, where
+    # hand): pre-SSD, failed AND SSD-active rows may jump to RE_ADDING, where
     # the fuse gate re-verifies everything before any skip_check inject.
-    # SSD-active rows (QUEUED/DOWNLOADING/MOVING) are refused by the
-    # command itself — driving mid-download would orphan SSD bytes.
+    # SSD-active rows abandon their partial download (dest entry removed,
+    # reservation released) — no /cancel round-trip needed.
     State.FAILED: {State.QUEUED, State.NEW, State.RE_ADDING},  # allow manual and auto retry
 }
 

@@ -2801,6 +2801,8 @@ class TelegramBot:
         poller never ingested work too) and arms the Yes/No question.
         Nothing changes until Yes — and Yes verifies fuse readiness
         first, so a premature tap only yields an informative message.
+        Yes auto-lifts a prior /cancel and stops any SSD download first,
+        so there is no unignore/cancel round-trip.
         """
         coord = getattr(self, "_coord", None)
         if coord is None:
@@ -2838,15 +2840,6 @@ class TelegramBot:
             except Exception:
                 pass
             return
-        if state in (State.QUEUED, State.DOWNLOADING, State.MOVING):
-            try:
-                await self._reply(
-                    f"SSD {state.value} in progress for {title} — "
-                    "/cancel it first for the manual path",
-                    reply_to=message)
-            except Exception:
-                pass
-            return
         members = list(resolved.get("members") or [])
         snap = self._injectfuse_snap(members)
         if not snap:
@@ -2863,10 +2856,18 @@ class TelegramBot:
             await self._refresh_active_message()
         except Exception:
             pass
+        extra = ""
+        try:
+            if resolved.get("ignored"):
+                extra = " Prior cancel will be lifted."
+            elif state in (State.QUEUED, State.DOWNLOADING, State.MOVING):
+                extra = f" SSD {state.value} will be stopped first."
+        except Exception:
+            pass
         try:
             await self._reply(
                 f"Inject {title} ({len(snap)} copies) to fuse seeding? "
-                f"Files must already be at the remote. Choose below.",
+                f"Files must already be at the remote.{extra} Choose below.",
                 reply_to=message)
         except Exception:
             pass
@@ -3026,7 +3027,7 @@ class TelegramBot:
         # The question names the LIVE VPS1 group (torrents added after
         # the row was tracked belong to it); Yes-time execution
         # re-resolves live too, so a stale list can never misinject.
-        # SSD-active rows are refused at Yes, never driven.
+        # Yes auto-lifts a prior cancel and stops any SSD download first.
         if kind == "injectfuse":
             snap = pick_snapshot(_trip, "cancel")
             if not snap:
@@ -3049,12 +3050,6 @@ class TelegramBot:
                             resolved.get("title") or title)[:60]
                         live_size = resolved.get("size") or _gsize
             except (LookupError, ValueError) as e:
-                if "unignore" in str(e).lower():
-                    try:
-                        await self._reply(str(e)[:300], reply_to=message)
-                    except Exception:
-                        pass
-                    return
                 log.debug("injectfuse group live-resolve failed (%s); "
                           "using tracked snapshot", e)
             except Exception as e:  # noqa: BLE001
