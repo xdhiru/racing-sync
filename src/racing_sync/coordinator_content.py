@@ -350,6 +350,10 @@ def watch_election_winner(rows, ts: TorrentState, cfg) -> TorrentState | None:
         want_norm = normalize_content_name(ts.source_name or "")
         if not want_norm:
             return None
+        try:
+            from .content_keys import same_content as _same_content
+        except Exception:
+            _same_content = None
         self_hash = (ts.source_infohash or "").lower()
         peers: list[TorrentState] = []
         for p in rows or []:
@@ -358,10 +362,17 @@ def watch_election_winner(rows, ts: TorrentState, cfg) -> TorrentState | None:
                     continue
                 if p.state not in WATCH_ELECTION_ACTIVE_STATES:
                     continue
-                if normalize_content_name(p.source_name or "") != want_norm:
-                    continue
-                if ts.total_bytes and p.total_bytes and p.total_bytes != ts.total_bytes:
-                    continue
+                if _same_content is not None:
+                    if not _same_content(
+                        p.source_name or "", p.total_bytes or 0,
+                        ts.source_name or "", ts.total_bytes or 0,
+                    ):
+                        continue
+                else:
+                    if normalize_content_name(p.source_name or "") != want_norm:
+                        continue
+                    if ts.total_bytes and p.total_bytes and p.total_bytes != ts.total_bytes:
+                        continue
                 if not is_watch_row(p, cfg):
                     continue
                 peers.append(p)

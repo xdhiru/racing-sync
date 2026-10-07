@@ -1193,12 +1193,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     # size, or repacks/different seasons with common
                     # prefixes ("Show.S01" vs "Show.S01E02") would be
                     # swallowed as duplicates and never downloaded.
-                    norm_t = normalize_content_name(t.name)
                     same = [
                         m for m in matches
-                        if normalize_content_name(m.source_name or "") == norm_t
-                        and (not m.total_bytes or not t.size_bytes
-                             or m.total_bytes == t.size_bytes)
+                        if _same_content_key(
+                            m.source_name or "", m.total_bytes or 0,
+                            t.name, t.size_bytes or 0,
+                        )
                     ]
                     if same:
                         existing_ts = same[0]
@@ -3102,10 +3102,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                             continue
                         if not self._is_watch_row(p):
                             continue
-                        if normalize_content_name(p.source_name or "") != want:
-                            continue
-                        if (ts.total_bytes and p.total_bytes
-                                and p.total_bytes != ts.total_bytes):
+                        if not _same_content_key(
+                            p.source_name or "", p.total_bytes or 0,
+                            ts.source_name or "", ts.total_bytes or 0,
+                        ):
                             continue
                         sibs += 1
                     except Exception:
@@ -8656,13 +8656,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         out = []
         for t in live or []:
             try:
-                if normalize_content_name(getattr(t, "name", "") or "") != want_norm:
-                    continue
                 try:
                     t_size = int(getattr(t, "size_bytes", 0) or 0)
                 except (TypeError, ValueError):
                     t_size = 0
-                if want_size and t_size and t_size != want_size:
+                if not _same_content_key(
+                    getattr(t, "name", "") or "", t_size,
+                    getattr(anchor, "name", "") or "", want_size,
+                ):
                     continue
                 out.append(t)
             except Exception:
@@ -8699,13 +8700,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             norm = normalize_content_name(name)
             for m in (getattr(store, "find_by_name", lambda _n: [])(name) or []):
                 try:
-                    if normalize_content_name(getattr(m, "source_name", "") or "") != norm:
-                        continue
                     try:
                         m_size = int(getattr(m, "total_bytes", 0) or 0)
                     except (TypeError, ValueError):
                         m_size = 0
-                    if m_size and size and m_size != size:
+                    if not _same_content_key(
+                        getattr(m, "source_name", "") or "", m_size,
+                        name, size,
+                    ):
                         continue
                     return m
                 except Exception:
