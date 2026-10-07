@@ -173,6 +173,8 @@ src/racing_sync/
   coordinator_paths.py # Untrusted torrent-relative path guard
   coordinator_errors.py # Retryable WebUI / batch-move error contract
   coordinator_content.py # Stateless helpers (normalize, grace, notify filter)
+  content_keys.py     # Single same-release/same-content key rule
+  fuse_gate.py        # Single fuse verification gate (verdict + missing + skip)
   recovery.py         # Reconciler (req #4)
   forget.py           # Abandon a torrent (row + client entries + SSD data)
   watchdir.py         # Manual torrent drop scanner
