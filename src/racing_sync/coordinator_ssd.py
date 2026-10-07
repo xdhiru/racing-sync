@@ -103,8 +103,24 @@ class SSDLedgerMixin:
                 store = getattr(self, "store", None)
                 _up = getattr(store, "update_columns", None)
                 if store is not None and callable(_up):
-                    if not _up((ts.source_infohash or ""),
-                               {"batch_cap_bytes": cap}):
+                    try:
+                        _nv = _up((ts.source_infohash or ""),
+                                  {"batch_cap_bytes": cap})
+                    except Exception:
+                        _nv = 0
+                    if isinstance(_nv, int) and _nv > 0:
+                        # Revision sync: update_columns bumps the DB
+                        # revision without touching this object — without
+                        # the sync the row's own next transition trips the
+                        # version guard as a phantom "concurrent writer"
+                        # (every first-time batch setup failed its
+                        # QUEUED->DOWNLOADING this way). upsert() syncs
+                        # itself; truthy non-int returns are mock doubles.
+                        try:
+                            ts.version = _nv
+                        except Exception:
+                            pass
+                    elif not _nv:
                         store.upsert(ts)
                 elif store is not None and hasattr(store, "upsert"):
                     store.upsert(ts)

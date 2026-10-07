@@ -931,7 +931,11 @@ async def fix_orphan(
             log.error("orphan %s: no .torrent bytes available to re-add", h)
             _force_state(store, ts, State.FAILED, error="orphan: no .torrent bytes")
             return State.FAILED.value
-        # Add paused, then resolve the new hash, resume, and let coordinator drive.
+        # Add paused, then resolve the new hash and let the coordinator drive:
+        # it re-asserts the current batch's priorities before any resume
+        # (QUEUED-entry and adopted-DOWNLOADING gates). Resuming here would
+        # start a full-wanted entry past the SSD cap — and qB pre-allocates
+        # every file at add time even while paused.
         try:
             res = await dest.add_torrent(
                 torrent_files=[sftp_bytes],
@@ -958,10 +962,6 @@ async def fix_orphan(
             ts.dest_infohash = new_hash
         if not ts.save_path:
             ts.save_path = str(cfg.dest.save_path)
-        try:
-            await dest.resume(new_hash or h)
-        except Exception as e:
-            log.warning("orphan %s: resume after re-add failed: %s", h, e)
         if ts.state != State.DOWNLOADING:
             _force_state(store, ts, State.DOWNLOADING)
         else:
