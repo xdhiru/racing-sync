@@ -7381,61 +7381,155 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 # Unreachable: folder layouts move per-file above by design.
                 raise RuntimeError(f"refusing bare folder move of {local}")
             else:
-                await self._rclone_move(local, remote, ts)
+                # Single-file layout: folder-wrapped singles (Top/file.mkv)
+                # must move via files_from from src_dir so the top dir
+                # survives on the remote. A bare `rclone move <file>
+                # <remote:>` strips it (file lands in the remote root) and
+                # the fuse gate then parks forever on Top/file.mkv. Flat
+                # singles (no "/") keep the bare move.
+                _single_wrapped = False
+                _single_norm = ""
                 try:
-                    _left = local.is_symlink() or local.exists()
-                except OSError:
-                    _left = True
-                if _left:
-                    self._park_moving(
-                        ts,
-                        f"single-file move left {local} on disk; "
-                        f"staying in MOVING without wiping",
-                    )
-                    return
-                # Dual-format/variant siblings (S01E01.mkv + S01E01.mp4,
-                # subs, extras): the bare move above ships only the single
-                # file, but the fuse gate expects EVERY blob file — a
-                # sibling left behind is wiped with the folder below and
-                # parks the gate forever. Move verified-complete siblings
-                # too (same verified set the folder branches use).
-                try:
-                    _sib_names: list[str] = []
-                    for _cf in completed_files:
+                    _cand = (cls.single_file or "").replace("\\", "/").strip("/")
+                    if _cand and "/" in _cand:
+                        _joined = _safe_ssd_join(src_dir, _cand)
+                        if _joined is not None:
+                            try:
+                                if _joined.resolve() == local_real:
+                                    _single_wrapped = True
+                                    _single_norm = _cand
+                            except OSError:
+                                pass
+                    if not _single_wrapped:
                         try:
-                            _joined = _safe_ssd_join(src_dir, _cf.name or "")
-                            if _joined is None:
-                                continue
-                            if _joined.resolve() == local_real:
-                                continue
-                            if not _joined.is_file():
-                                continue
-                            _sib_names.append(_cf.name or "")
-                        except OSError:
-                            continue
-                    _sib_names = files_from_names(
-                        [n for n in _sib_names if n])
+                            _rel = local.resolve().relative_to(src_dir.resolve())
+                            _rel_posix = str(_rel).replace("\\", "/")
+                            if "/" in _rel_posix:
+                                _single_wrapped = True
+                                _single_norm = _cand if _cand else _rel_posix
+                        except Exception:
+                            pass
                 except Exception:
-                    _sib_names = []
-                if _sib_names:
-                    log.info(
-                        "moving %d verified sibling file(s) for %s "
-                        "(e.g. %s)",
-                        len(_sib_names), ts.source_name[:60],
-                        _sib_names[0],
-                    )
-                    await self._rclone_move(
-                        src_dir, remote, ts, files_from=_sib_names)
-                    _sib_stuck = [n for n in _sib_names
-                                  if _left_on_disk(src_dir, n)]
-                    if _sib_stuck:
+                    _single_wrapped = False
+                if _single_wrapped and _single_norm:
+                    try:
+                        _main_names: list[str] = []
+                        for _cf in completed_files:
+                            try:
+                                _joined = _safe_ssd_join(src_dir, _cf.name or "")
+                                if _joined is None:
+                                    continue
+                                if _joined.resolve() == local_real:
+                                    _main_names.append(_cf.name or "")
+                                    break
+                            except OSError:
+                                continue
+                        if not _main_names:
+                            _main_names = [_single_norm]
+                        _sib_names: list[str] = []
+                        for _cf in completed_files:
+                            try:
+                                _joined = _safe_ssd_join(src_dir, _cf.name or "")
+                                if _joined is None:
+                                    continue
+                                if _joined.resolve() == local_real:
+                                    continue
+                                if not _joined.is_file():
+                                    continue
+                                _sib_names.append(_cf.name or "")
+                            except OSError:
+                                continue
+                        _wrapped_names = files_from_names(
+                            [n for n in ([*_main_names, *_sib_names]) if n])
+                    except Exception:
+                        _wrapped_names = []
+                    if _wrapped_names:
+                        log.info(
+                            "moving %d verified file(s) for %s preserving "
+                            "torrent layout (e.g. %s)",
+                            len(_wrapped_names), ts.source_name[:60],
+                            _wrapped_names[0],
+                        )
+                        await self._rclone_move(
+                            src_dir, remote, ts, files_from=_wrapped_names)
+                        _wrapped_stuck = [n for n in _wrapped_names
+                                          if _left_on_disk(src_dir, n)]
+                        if _wrapped_stuck:
+                            self._park_moving(
+                                ts,
+                                f"single-file layout move left {len(_wrapped_stuck)} file(s) "
+                                f"on disk (e.g. {_wrapped_stuck[0]}); staying in "
+                                f"MOVING without wiping",
+                            )
+                            return
+                    else:
                         self._park_moving(
                             ts,
-                            f"sibling move left {len(_sib_stuck)} file(s) "
-                            f"on disk (e.g. {_sib_stuck[0]}); staying in "
-                            f"MOVING without wiping",
+                            f"single file {cls.single_file} has no verified "
+                            f"layout names; staying in MOVING without moving",
                         )
                         return
+                    # Layout move done (main + siblings together); skip the
+                    # bare/sibling path below.
+                    _wrapped_done = True
+                else:
+                    _wrapped_done = False
+                if not _wrapped_done:
+                    await self._rclone_move(local, remote, ts)
+                    try:
+                        _left = local.is_symlink() or local.exists()
+                    except OSError:
+                        _left = True
+                    if _left:
+                        self._park_moving(
+                            ts,
+                            f"single-file move left {local} on disk; "
+                            f"staying in MOVING without wiping",
+                        )
+                        return
+                    # Dual-format/variant siblings (S01E01.mkv + S01E01.mp4,
+                    # subs, extras): the bare move above ships only the single
+                    # file, but the fuse gate expects EVERY blob file — a
+                    # sibling left behind is wiped with the folder below and
+                    # parks the gate forever. Move verified-complete siblings
+                    # too (same verified set the folder branches use).
+                    try:
+                        _sib_names: list[str] = []
+                        for _cf in completed_files:
+                            try:
+                                _joined = _safe_ssd_join(src_dir, _cf.name or "")
+                                if _joined is None:
+                                    continue
+                                if _joined.resolve() == local_real:
+                                    continue
+                                if not _joined.is_file():
+                                    continue
+                                _sib_names.append(_cf.name or "")
+                            except OSError:
+                                continue
+                        _sib_names = files_from_names(
+                            [n for n in _sib_names if n])
+                    except Exception:
+                        _sib_names = []
+                    if _sib_names:
+                        log.info(
+                            "moving %d verified sibling file(s) for %s "
+                            "(e.g. %s)",
+                            len(_sib_names), ts.source_name[:60],
+                            _sib_names[0],
+                        )
+                        await self._rclone_move(
+                            src_dir, remote, ts, files_from=_sib_names)
+                        _sib_stuck = [n for n in _sib_names
+                                      if _left_on_disk(src_dir, n)]
+                        if _sib_stuck:
+                            self._park_moving(
+                                ts,
+                                f"sibling move left {len(_sib_stuck)} file(s) "
+                                f"on disk (e.g. {_sib_stuck[0]}); staying in "
+                                f"MOVING without wiping",
+                            )
+                            return
         else:
             # Mixed — per-episode moves with --include (single batch).
             # Only reachable when the pinned kind is mixed (see branch_kind
