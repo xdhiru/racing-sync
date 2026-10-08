@@ -340,16 +340,18 @@ def test_regexes():
     assert not INJECTFUSE_HASH_RE.match("/injectfuse_3")
 
 
-def test_pending_section_injectq():
-    bot = _bot(MagicMock())
-    bot._set_pending_injectq("Show X", [(H1, "trk"), (H2, "trk2")], 500,
-                             user_id="9")
-    qtext, qrows = bot._pending_section()
-    assert "Show X" in qtext
-    assert "2 torrent(s)" in qtext
-    assert qrows[0][0][1].startswith("inject:")
-    assert qrows[0][1] == ("No", qrows[0][1][1])
-    assert qrows[1] == [("Cancel", qrows[1][0][1])]
+def test_no_pending_machine_left():
+    """The snapshot/pending protocol is gone: no related names survive."""
+    import racing_sync.telegram_bot as _mod
+
+    for _name in ("pick_snapshot", "render_pending_question",
+                  "_PENDING_TTL_S"):
+        assert not hasattr(_mod, _name), _name
+    for _name in ("_pending_live", "_pending_pick", "_next_seq",
+                  "_set_pending_pick", "_set_pending_keepq",
+                  "_set_pending_injectq", "_pending_section",
+                  "_tg_pending_owner_ok"):
+        assert not hasattr(_mod.TelegramBot, _name), _name
 
 
 @pytest.mark.anyio
@@ -392,16 +394,17 @@ async def test_chat_hash_arms_question(tmp_path):
                 caption=None, document=None, reply_to_message=None))
         texts = _sent_texts(bot)
         assert any("to fuse seeding? " in t for t in texts)
-        pend = bot._pending_live()
-        assert pend is not None and pend.get("kind") == "injectq"
-        assert [h for (h, _) in pend["members"]] == [H1]
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        assert f"inject:{H1}:yes" in _data
     finally:
         store.close()
 
 
 @pytest.mark.anyio
 async def test_group_number_arms_question(tmp_path):
-    """`/injectfuse_1` on a listed waiting group arms Yes/No, changes nothing."""
+    """`/injectfuse_1` on a listed waiting group asks Yes/No, changes nothing."""
     coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     try:
         coord.store.upsert(TorrentState(
@@ -417,9 +420,10 @@ async def test_group_number_arms_question(tmp_path):
         await bot._handle_chat_message(msg)
         texts = _sent_texts(bot)
         assert any("to fuse seeding? " in t for t in texts)
-        pend = bot._pending_live()
-        assert pend is not None and pend.get("kind") == "injectq"
-        assert [h for (h, _) in pend["members"]] == [H1]
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        assert f"inject:{H1}:yes" in _data
         assert coord.store.get(H1).state == State.WAITING_INDEXER
     finally:
         coord.store.close()
@@ -441,8 +445,8 @@ async def test_underscore_hash_tracked_arms_question(tmp_path):
             message_id=51, text=f"/injectfuse_{H1}",
             caption=None, document=None, reply_to_message=None)
         await bot._handle_chat_message(msg)
-        pend = bot._pending_live()
-        assert pend is not None and pend.get("kind") == "injectq"
+        texts = _sent_texts(bot)
+        assert any("to fuse seeding? " in t for t in texts)
         assert coord.store.get(H1).state == State.WAITING_INDEXER
     finally:
         coord.store.close()
@@ -464,13 +468,10 @@ async def test_yes_executes_and_clears(tmp_path):
         coord.injectfuse_confirmed = AsyncMock(return_value="injecting 1")
         bot = _bot(store, coord=coord)
         bot._refresh_active_message = AsyncMock()
-        p = bot._set_pending_injectq("Show X", [(H1, "trk")], 500,
-                                     user_id="9")
         q = _query()
-        q.data = f"inject:{p['seq']}:yes"
+        q.data = f"inject:{H1}:yes"
         await bot._on_action_button(q, q.data)
         coord.injectfuse_confirmed.assert_awaited_once_with([H1])
-        assert bot._pending_pick is None
         assert any("injecting 1" in t for t in _sent_texts(bot))
     finally:
         store.close()
@@ -484,33 +485,28 @@ async def test_no_changes_nothing(tmp_path):
         coord.injectfuse_confirmed = AsyncMock()
         bot = _bot(store, coord=coord)
         bot._refresh_active_message = AsyncMock()
-        p = bot._set_pending_injectq("Show X", [(H1, "trk")], 500,
-                                     user_id="9")
         q = _query()
-        q.data = f"inject:{p['seq']}:no"
+        q.data = f"inject:{H1}:no"
         await bot._on_action_button(q, q.data)
         coord.injectfuse_confirmed.assert_not_called()
-        assert bot._pending_pick is None
         assert any("nothing changed" in t for t in _sent_texts(bot))
     finally:
         store.close()
 
 
 @pytest.mark.anyio
-async def test_foreign_tap_refused(tmp_path):
+async def test_tap_without_pending_state_acts_directly(tmp_path):
+    """No picker state exists anymore: every tap is self-describing."""
     store = StateStore(tmp_path / "state.db")
     try:
         coord = MagicMock()
-        coord.injectfuse_confirmed = AsyncMock()
+        coord.injectfuse_confirmed = AsyncMock(return_value="injecting 1")
         bot = _bot(store, coord=coord)
         bot._refresh_active_message = AsyncMock()
-        p = bot._set_pending_injectq("Show X", [(H1, "trk")], 500,
-                                     user_id="9")
         q = _query(uid="10")
-        q.data = f"inject:{p['seq']}:yes"
+        q.data = f"inject:{H1}:yes"
         await bot._on_action_button(q, q.data)
-        coord.injectfuse_confirmed.assert_not_called()
-        assert bot._pending_pick is not None
+        coord.injectfuse_confirmed.assert_awaited_once_with([H1])
     finally:
         store.close()
 
@@ -556,9 +552,10 @@ async def test_group_question_names_live_vps1_count(tmp_path):
         await bot._handle_chat_message(msg)
         texts = _sent_texts(bot)
         assert any("(2 copies)" in t for t in texts)
-        pend = bot._pending_live()
-        assert pend is not None and pend.get("kind") == "injectq"
-        assert sorted(h for (h, _) in pend["members"]) == [H1, H2]
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        assert f"inject:{H1}:yes" in _data
         assert coord.store.get(H1).state == State.WAITING_INDEXER
     finally:
         coord.store.close()
@@ -566,8 +563,8 @@ async def test_group_question_names_live_vps1_count(tmp_path):
 
 @pytest.mark.anyio
 async def test_group_question_falls_back_when_vps1_gone(tmp_path):
-    """VPS1 entry removed: question still arms from the tracked snapshot."""
-    coord, _, _fuse = _coord(tmp_path, [])
+    """VPS1 entry removed: question still asks from the tracked row."""
+    coord, _, fuse = _coord(tmp_path, [])
     try:
         coord.store.upsert(TorrentState(
             source_infohash=H1, source_name=NAME, total_bytes=500,
@@ -580,8 +577,12 @@ async def test_group_question_falls_back_when_vps1_gone(tmp_path):
             message_id=51, text="/injectfuse_1",
             caption=None, document=None, reply_to_message=None)
         await bot._handle_chat_message(msg)
-        pend = bot._pending_live()
-        assert pend is not None and pend.get("kind") == "injectq"
-        assert [h for (h, _) in pend["members"]] == [H1]
+        texts = _sent_texts(bot)
+        assert any("to fuse seeding? " in t for t in texts)
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        assert f"inject:{H1}:yes" in _data
+        assert coord.store.get(H1).state == State.WAITING_INDEXER
     finally:
         coord.store.close()

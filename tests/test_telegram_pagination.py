@@ -49,7 +49,8 @@ def test_render_active_pagination_and_numbering():
     # Source:/size lines); positional group commands, never hashes.
     assert "▸ nyaa.tracker.wf ⬇️ Downloading · 45.0% · Batch 1/2" in text0
     assert "▸ nyaa.tracker.wf 📋 Queued · Batch 1/2" in text0
-    assert "/cancel\\_1" in text0
+    assert "/act\\_1" in text0
+    assert "/cancel\\_1" not in text0
     assert "Cancel:" not in text0
 
     # Page 1 (items 6..10)
@@ -392,8 +393,6 @@ def test_render_active_shows_wait_note_for_deferred_rows():
 
 def test_render_active_groups_same_file_trackers():
     """Same file from two trackers: one heading, two lines, gid commands."""
-    from racing_sync.telegram_bot import pick_snapshot
-
     lead = TorrentState(
         source_infohash="a" * 40, source_name="Twin.Show.S01E01",
         state=State.WAITING_INDEXER, total_bytes=1000, indexer_attempts=3,
@@ -422,26 +421,25 @@ def test_render_active_groups_same_file_trackers():
     assert "▸ alpha.cc ⏳ Wait indexer miss #3" in text
     assert "▸ bte.example ⬇️ Downloading · 50.0%" in text
     assert "Source:" not in text
-    # Positional group commands on ONE line (never hashes).
-    assert "/cancel\\_1 /now\\_1" in text
+    # Positional action entry per group (never hashes, never verbs).
+    assert "/act\\_1" in text
     assert "/cancel\\_aaaaaaaaaa" not in text
     assert "/now\\_aaaaaaaaaa" not in text
     assert "/keep" not in text and "/prefer" not in text and "/fetch" not in text
-    # Sibling choice rides on pick snapshots (hash, label) pairs.
-    from racing_sync.telegram_bot import pick_snapshot
-    members = [(lead, None), (sib, 0.5)]
-    snap = pick_snapshot(members, "now")
-    assert snap == [("a" * 40, "alpha")]
-    snap_cancel = pick_snapshot(members, "cancel")
+    # Sibling choice rides on hash button labels.
+    from racing_sync.telegram_bot import _member_button_labels, _now_eligible_hashes
+    assert _member_button_labels([lead, sib]) == [
+        ("a" * 40, "alpha"), ("b" * 40, "bte")]
+    assert _now_eligible_hashes([lead, sib], {}) == ["a" * 40]
+    snap_cancel = [(h, lbl) for (h, lbl) in
+                   _member_button_labels([lead, sib])]
     assert [h for (h, _) in snap_cancel] == ["a" * 40, "b" * 40]
     assert snap_cancel[1] == ("b" * 40, "bte")
-    assert pick_snapshot(members, "prefer") == []
-    assert pick_snapshot(members, "fetch") == [("a" * 40, "alpha")]
 
 
 def test_render_active_sibling_prefer_uses_own_hash():
-    """Now renders group commands; the snapshot carries each hash."""
-    from racing_sync.telegram_bot import pick_snapshot
+    """Now entry renders per group; labels carry each copy's own hash."""
+    from racing_sync.telegram_bot import _member_button_labels, _now_eligible_hashes
 
     lead = TorrentState(
         source_infohash="a" * 40, source_name="Twin.Show.S01E01",
@@ -456,40 +454,39 @@ def test_render_active_sibling_prefer_uses_own_hash():
     notes = {"b" * 40: "Waiting for preferred copy (grace 12m left)"}
     text, _, _ = render_active([(lead, None), (sib, None)],
                                page=0, page_size=5, notes=notes)
-    # One group, one heading; group commands on one line (no hashes).
+    # One group, one heading; action entry per group (no hashes).
     assert text.count("Twin.Show.S01E01") == 1
-    assert "/cancel\\_1 /now\\_1" in text
+    assert "/act\\_1" in text
     assert "/cancel\\_aaaaaaaaaa" not in text
     assert "/now\\_bbbbbbbbbb" not in text
-    # The grace-held sibling snapshots with its own hash for now
-    # (and the legacy aliases agree).
-    snap = pick_snapshot([(lead, None), (sib, None)], "now", notes)
-    assert snap == [("b" * 40, "bte")]
-    assert pick_snapshot([(lead, None), (sib, None)], "prefer", notes) == [
-        ("b" * 40, "bte")]
-    assert pick_snapshot([(lead, None), (sib, None)], "fetch", notes) == [
-        ("b" * 40, "bte")]
+    # The grace-held sibling labels with its own hash and is eligible.
+    assert _member_button_labels([lead, sib]) == [
+        ("a" * 40, "alpha"), ("b" * 40, "bte")]
+    assert _now_eligible_hashes(
+        [lead, sib],
+        {"b" * 40: "Waiting for preferred copy (grace 12m left)"},
+    ) == ["b" * 40]
 
 
-def test_pick_snapshot_skips_malformed_and_disambiguates():
-    """Bad hashes never snapshot; repeat labels gain the short hash."""
-    from racing_sync.telegram_bot import pick_snapshot
+def test_member_button_labels_skip_malformed_and_disambiguate():
+    """Bad hashes never buttonize; repeat labels gain the short hash."""
+    from racing_sync.telegram_bot import _member_button_labels
 
-    mk = lambda h, st, dom, name="Show.X": TorrentState(
+    mk = lambda h, st, dom, name="Show.X": TorrentState(  # noqa: E731
         source_infohash=h, source_name=name,
         state=st, total_bytes=1000,
         source_announce_url=f"https://{dom}/announce")
     a = mk("a" * 40, State.WAITING_INDEXER, "alpha.cc", "Show.One.S01E01")
     bad = mk("zzz-not-hex", State.WAITING_INDEXER, "evil.example", "Show.One.S01E01")
-    assert pick_snapshot([(a, None), (bad, None)], "fetch") == [
+    assert _member_button_labels([a, bad]) == [
         ("a" * 40, "alpha")]
 
     b = mk("b" * 40, State.WAITING_INDEXER, "alpha.cc", "Show.Two.S01E01")
-    assert pick_snapshot([(b, None)], "fetch") == [("b" * 40, "alpha")]
+    assert _member_button_labels([b]) == [("b" * 40, "alpha")]
     # Same label twice inside one group: second gains the short hash.
     c = mk("c" * 40, State.WAITING_INDEXER, "alpha.cc", "Dupe.Show.S01E01")
     d = mk("d" * 40, State.WAITING_INDEXER, "alpha.cc", "Dupe.Show.S01E01")
-    assert pick_snapshot([(c, None), (d, None)], "fetch") == [
+    assert _member_button_labels([c, d]) == [
         ("c" * 40, "alpha"), ("d" * 40, f"alpha {'d' * 6}")]
 
 
@@ -810,74 +807,78 @@ def _action_bot(**kw):
 
 
 @pytest.mark.anyio
-async def test_callback_pick_prefer_runs_prefer_and_refreshes():
-    """Tapping a member button executes prefer for that snapshot hash."""
+async def test_callback_go_starts_copy_and_refreshes():
+    """Tapping a hash go button starts that copy via fetch path."""
     from unittest.mock import AsyncMock
     bot = _action_bot()
-    bot._pending_pick = {
-        "kind": "pick", "seq": "7", "cmd": "prefer", "title": "Twin.Show",
-        "members": [("a" * 40, "alpha"), ("b" * 40, "bte")],
-        "expires": 9999999999.0,
-    }
-    bot._prefer_torrent = AsyncMock(return_value="Preferred X")
+    bot._fetch_torrent = AsyncMock(return_value="Fetching original for X")
     bot._reply = AsyncMock()
-    await bot._handle_callback(_action_query("pick:7:1"))
-    bot._prefer_torrent.assert_awaited_once_with("b" * 40)
+    await bot._handle_callback(_action_query(f"go:{'b' * 40}"))
+    bot._fetch_torrent.assert_awaited_once_with("b" * 40)
     bot._reply.assert_awaited_once()
-    assert bot._reply.call_args[0][0].startswith("Preferred")
-    bot._refresh_active_message.assert_awaited_once()
-    assert bot._pending_pick is None  # consumed: double-tap expires
-
-
-@pytest.mark.anyio
-async def test_callback_pick_cancel_advances_to_keep_question():
-    """Tapping a member for cancel arms keepq (nothing deleted yet)."""
-    from unittest.mock import AsyncMock
-    bot = _action_bot()
-    bot._pending_pick = {
-        "kind": "pick", "seq": "7", "cmd": "cancel", "title": "Twin.Show",
-        "members": [("a" * 40, "alpha"), ("b" * 40, "bte")],
-        "expires": 9999999999.0,
-    }
-    bot._reply = AsyncMock()
-    bot._refresh_active_message = AsyncMock()
-    await bot._handle_callback(_action_query("pick:7:1"))
-    _p = bot._pending_live()
-    assert _p["kind"] == "keepq"
-    assert _p["hashes"] == ["b" * 40]
-    assert _p["scope"] == "bte copy"
+    assert bot._reply.call_args[0][0].startswith("Fetching")
     bot._refresh_active_message.assert_awaited_once()
 
 
 @pytest.mark.anyio
-async def test_callback_pick_all_arms_whole_group():
-    from unittest.mock import AsyncMock
+async def test_callback_cancel_opens_keep_question():
+    """Tapping a hash cancel button asks keep/delete inline (deletes nothing)."""
+    from unittest.mock import AsyncMock, MagicMock
     bot = _action_bot()
-    bot._pending_pick = {
-        "kind": "pick", "seq": "7", "cmd": "cancel", "title": "Twin.Show",
-        "members": [("a" * 40, "alpha"), ("b" * 40, "bte")],
-        "expires": 9999999999.0,
-    }
-    bot._reply = AsyncMock()
+    bot._store = MagicMock()
+    bot._store.get.return_value = TorrentState(
+        source_infohash="b" * 40, source_name="Twin.Show",
+        state=State.WAITING_INDEXER)
+    bot._bot = MagicMock()
+    bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
     bot._refresh_active_message = AsyncMock()
-    await bot._handle_callback(_action_query("pick:7:all"))
-    _p = bot._pending_live()
-    assert _p["kind"] == "keepq"
-    assert sorted(_p["hashes"]) == ["a" * 40, "b" * 40]
-    assert _p["scope"] == "all 2 copies"
+    await bot._handle_callback(_action_query(f"cancel:{'b' * 40}"))
+    _kwargs = bot._bot.send_message.call_args[1]
+    _data = [b.callback_data for r in
+             _kwargs["reply_markup"].inline_keyboard for b in r]
+    assert f"keep:{'b' * 40}:yes" in _data
+    assert f"keep:{'b' * 40}:no" in _data
+
+
+@pytest.mark.anyio
+async def test_callback_cancel_all_resolves_live_group():
+    """cancel:all:<leader> asks keep/delete over the live group."""
+    from unittest.mock import AsyncMock, MagicMock
+    bot = _action_bot()
+    bot._store = MagicMock()
+    bot._store.get.return_value = TorrentState(
+        source_infohash="a" * 40, source_name="Twin.Show",
+        state=State.WAITING_INDEXER, total_bytes=1000,
+        source_announce_url="https://alpha.cc/announce/xyz")
+    bot._store.list_active_inflight.return_value = [
+        TorrentState(source_infohash="a" * 40, source_name="Twin.Show",
+                     state=State.WAITING_INDEXER, total_bytes=1000,
+                     source_announce_url="https://alpha.cc/announce/xyz"),
+        TorrentState(source_infohash="b" * 40, source_name="Twin.Show",
+                     state=State.WAITING_INDEXER, total_bytes=1000,
+                     source_announce_url="https://alpha.cc/announce/xyz"),
+    ]
+    bot._bot = MagicMock()
+    bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=6))
+    await bot._handle_callback(_action_query(f"cancel:all:{'a' * 40}"))
+    _kwargs = bot._bot.send_message.call_args[1]
+    _data = [b.callback_data for r in
+             _kwargs["reply_markup"].inline_keyboard for b in r]
+    assert f"keep:all:{'a' * 40}:yes" in _data
+    assert "all 2 copies" in bot._bot.send_message.call_args[0][1]
 
 
 @pytest.mark.anyio
 async def test_callback_keep_yes_no_execute():
-    """Yes keeps files; No deletes; both consume the pending."""
-    from unittest.mock import AsyncMock
+    """Yes keeps files; No deletes; unknown hashes report gone."""
+    from unittest.mock import AsyncMock, MagicMock
 
-    async def _run(which):
+    async def _run(which, data=None):
         bot = _action_bot()
-        bot._pending_pick = {
-            "kind": "keepq", "seq": "9", "title": "Show", "scope": "",
-            "hashes": ["a" * 40], "expires": 9999999999.0,
-        }
+        bot._store = MagicMock()
+        bot._store.get.return_value = TorrentState(
+            source_infohash="a" * 40, source_name="Show",
+            state=State.WAITING_INDEXER)
         executed = {}
 
         async def _fake_snapshot_cancel(hashes, title, *, delete_files):
@@ -887,68 +888,68 @@ async def test_callback_keep_yes_no_execute():
         bot._execute_snapshot_cancel = _fake_snapshot_cancel
         bot._reply = AsyncMock()
         bot._refresh_active_message = AsyncMock()
-        q = _action_query(f"keep:9:{which}")
-        await bot._on_action_button(q, f"keep:9:{which}")
+        q = _action_query(data or f"keep:{'a' * 40}:{which}")
+        await bot._on_action_button(q, data or f"keep:{'a' * 40}:{which}")
         return executed, bot
 
     executed, bot = await _run("yes")
     assert executed["args"] == (["a" * 40], "Show", False)
-    assert bot._pending_pick is None
     executed, _ = await _run("no")
     assert executed["args"] == (["a" * 40], "Show", True)
 
 
 @pytest.mark.anyio
-async def test_callback_abort_drops_flow():
-    from unittest.mock import AsyncMock
+async def test_callback_abort_deletes_message():
+    """Abort removes the sheet message; nothing acts."""
+    from unittest.mock import AsyncMock, MagicMock
     bot = _action_bot()
-    bot._pending_pick = {
-        "kind": "pick", "seq": "7", "cmd": "cancel", "title": "Twin.Show",
-        "members": [("a" * 40, "alpha")], "expires": 9999999999.0,
-    }
-    bot._prefer_torrent = AsyncMock()
-    bot._reply = AsyncMock()
-    bot._refresh_active_message = AsyncMock()
-    await bot._handle_callback(_action_query("abort:7"))
-    assert bot._pending_live() is None
-    bot._prefer_torrent.assert_not_called()
-    bot._reply.assert_awaited_once()
-    assert "cancelled" in bot._reply.call_args[0][0].lower()
-    bot._refresh_active_message.assert_awaited_once()
-
-
-@pytest.mark.anyio
-async def test_callback_stale_seq_replies_expired():
-    from unittest.mock import AsyncMock
-    bot = _action_bot()
-    bot._prefer_torrent = AsyncMock()
+    bot._bot = MagicMock()
+    bot._bot.delete_message = AsyncMock()
     bot._fetch_torrent = AsyncMock()
     bot._reply = AsyncMock()
-    # No pending at all (or wrong seq): nothing acts.
-    await bot._handle_callback(_action_query("pick:99:0"))
-    bot._prefer_torrent.assert_not_called()
+    bot._refresh_active_message = AsyncMock()
+    q = _action_query("abort")
+    q.message.message_id = 77
+    await bot._handle_callback(q)
+    bot._bot.delete_message.assert_awaited_once_with("12345", 77)
     bot._fetch_torrent.assert_not_called()
-    bot._reply.assert_awaited_once()
-    assert "Expired" in bot._reply.call_args[0][0]
+    bot._reply.assert_not_called()
     bot._refresh_active_message.assert_not_called()
 
 
-def test_keyboard_includes_pending_rows():
+@pytest.mark.anyio
+async def test_callback_stale_data_replies_stale():
+    """Legacy index callbacks degrade to a stale hint, acting on nothing."""
+    from unittest.mock import AsyncMock
+    bot = _action_bot()
+    bot._fetch_torrent = AsyncMock()
+    bot._reply = AsyncMock()
+    # Old snapshot-index format (or garbage): nothing acts.
+    await bot._handle_callback(_action_query("pick:99:0"))
+    bot._fetch_torrent.assert_not_called()
+    bot._reply.assert_awaited_once()
+    assert "Stale button" in bot._reply.call_args[0][0]
+    bot._refresh_active_message.assert_not_called()
+
+
+def test_keyboard_includes_action_rows():
     bot = object.__new__(TelegramBot)
     kb = bot._build_keyboard(
         0, 1,
-        [[("aither", "pick:3:0"), ("bte", "pick:3:1"),
-          ("All (2)", "pick:3:all")],
-         [("Keep files", "keep:4:yes"), ("Delete files", "keep:4:no")],
-         [("Cancel", "abort:4")]])
+        [[("alpha", f"go:{'a' * 40}"), ("bte", f"go:{'b' * 40}"),
+          ("All (2)", f"cancel:all:{'a' * 40}")],
+         [("Keep files", f"keep:{'a' * 40}:yes"),
+          ("Delete files", f"keep:{'a' * 40}:no")],
+          [("Close", "abort")]])
     rows = kb.inline_keyboard
     assert rows[0][0].text == "🔄 Refresh"
-    assert [b.text for b in rows[1]] == ["aither", "bte", "All (2)"]
-    assert rows[1][0].callback_data == "pick:3:0"
+    assert [b.text for b in rows[1]] == ["alpha", "bte", "All (2)"]
+    assert rows[1][0].callback_data == f"go:{'a' * 40}"
     assert rows[2][0].text == "Keep files"
-    assert rows[3][0].text == "Cancel"
+    assert rows[3][0].text == "Close"
     assert all(len(b.callback_data) <= 64 for r in rows for b in r
-               if (b.callback_data or "").startswith(("pick:", "keep:", "abort:")))
+               if (b.callback_data or "").startswith(
+                   ("go:", "cancel:", "keep:", "abort", "pick:")))
 
 
 @pytest.mark.anyio
@@ -1105,8 +1106,8 @@ async def test_detail_card_offers_prefer_for_grace_note():
 
 
 def test_render_active_offers_prefer_for_grace_note():
-    """Grace-held rows get a positional now command + snapshot pick."""
-    from racing_sync.telegram_bot import pick_snapshot
+    """Grace-held rows get the positional action entry."""
+    from racing_sync.telegram_bot import _now_eligible_hashes
 
     h = "e" * 40
     ts = TorrentState(source_infohash=h, source_name="Grace.Hold",
@@ -1115,19 +1116,17 @@ def test_render_active_offers_prefer_for_grace_note():
     notes = {h: "Waiting for preferred copy ?? 42s left"}
     text, _, _ = render_active(
         [(ts, None)], page=0, page_size=5, notes=notes)
-    assert "/cancel\\_1 /now\\_1" in text
+    assert "/act\\_1" in text
+    assert "/cancel\\_1" not in text
     assert f"{h[:10]}" not in text  # no torrent hash in the message
     assert "Start this copy now:" not in text
-    assert pick_snapshot([(ts, None)], "now", notes) == [(h, "alpha")]
-    assert pick_snapshot([(ts, None)], "prefer", notes) == [(h, "alpha")]
-    assert pick_snapshot([(ts, None)], "fetch", notes) == [(h, "alpha")]
-    # Other notes (owner-deferred) and other states get no prefer.
-    assert pick_snapshot(
-        [(ts, None)], "prefer",
-        {h: "Waiting turn ?? example.net copy first"}) == []
+    assert _now_eligible_hashes([ts], notes) == [h]
+    # Other notes (owner-deferred) and other states get no eligibility.
+    assert _now_eligible_hashes(
+        [ts], {h: "Waiting turn ?? example.net copy first"}) == []
     ts_q = TorrentState(source_infohash=h, source_name="Grace.Hold",
                         state=State.QUEUED, total_bytes=1000)
-    assert pick_snapshot([(ts_q, None)], "prefer", notes) == []
+    assert _now_eligible_hashes([ts_q], notes) == []
 
 
 def test_short_tracker_label_generic_rule():

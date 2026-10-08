@@ -27,7 +27,6 @@ import datetime as dt
 import hashlib
 import logging
 import re
-import secrets
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -131,25 +130,6 @@ def _tg_actor_allowed(cfg: Any, user_id: object) -> bool:
         return str(user_id) in want or str(int(str(user_id))) in want
     except Exception:
         # Fail closed: a broken allowlist must not open destructive flows.
-        return False
-
-
-def _tg_pending_owner_ok(pending: dict, user_id: object) -> bool:
-    """A tap belongs to the pending flow when owners match (or unknown).
-
-    The pending records the commanding user at arm time; a different
-    known tapper is rejected so one operator cannot forge taps into
-    another's flow. Unknown either side fails open (single-operator
-    chats, channel posts) — the seq token remains the binding there.
-    """
-    try:
-        if not isinstance(pending, dict):
-            return True
-        owner = pending.get("user_id")
-        if not owner or user_id is None:
-            return True
-        return str(owner) == str(user_id)
-    except Exception:
         return False
 
 
@@ -563,6 +543,12 @@ UNIGNORE_HASH_RE = re.compile(r"^/unignore\s+([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 #: hash/prefix for manual fuse seeding (operator moved the bytes).
 INJECTFUSE_CMD_RE = re.compile(r"^/injectfuse_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
+#: `/act_<n|hex>` — action sheet for a content group: one entry point
+#: showing only the currently eligible actions (hash-direct buttons).
+#: Group number, tracked hash/prefix, or group id, like the other
+#: group commands.
+ACT_CMD_RE = re.compile(r"^/act_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
 #: `/injectfuse <full-hash>` — manual form: any VPS1 infohash, tracked
 #: or not yet tracked by the app.
 INJECTFUSE_HASH_RE = re.compile(r"^/injectfuse\s+([0-9a-fA-F]+)(?:@[\w_]+)?\b")
@@ -863,99 +849,100 @@ def _pick_member_label(ts: TorrentState, short_fallback: str = "") -> str:
         return short_fallback or "?"
 
 
-def pick_snapshot(
-    members: list[tuple[TorrentState, float | None]],
-    cmd: str,
-    notes: dict[str, str] | None = None,
-) -> list[tuple[str, str]]:
-    """Frozen member list for a group command: ``[(hash, label)]``.
+def _is_hex40(s: object) -> bool:
+    """True for a full 40-char lowercase hex infohash."""
+    try:
+        t = str(s or "").strip().lower()
+    except Exception:
+        return False
+    return len(t) == 40 and all(c in "0123456789abcdef" for c in t)
 
-    ``cmd`` cancel snapshots every member; ``now`` snapshots the union
-    of the old fetch + prefer sets (WAITING_INDEXER rows plus NEW
-    grace-held rows — fetch eligibility already covered prefer's, so
-    ``now`` ≡ fetch eligibility); fetch/prefer kept as aliases.
-    Held (skipped) rows never snapshot for now/fetch/prefer. Labels are
-    short tracker names (hash-qualified on repeats). The
-    snapshot is taken once, at command-tap time — later buttons
-    address members by index, so list renumbering mid-flow cannot
-    misroute. Fail-open: [].
+
+def _now_eligible_hashes(members, notes: dict | None = None) -> list[str]:
+    """Member hashes that may start at once (old fetch ∪ prefer sets).
+
+    WAITING_INDEXER rows plus NEW grace-held rows; skipped rows never.
+    Pure helper shared by the sheet builder and the group replies.
+    """
+    out: list[str] = []
+    for _ts in members or []:
+        try:
+            _h = _member_hash(_ts)
+            if not _h or getattr(_ts, "skipped", 0):
+                continue
+            if getattr(_ts, "state", None) == State.WAITING_INDEXER:
+                out.append(_h)
+                continue
+            try:
+                _note = (notes or {}).get(_h, "") if isinstance(
+                    notes, dict) else ""
+                if getattr(_ts, "state", None) == State.NEW \
+                        and _is_grace_note_for_prefer(_note):
+                    out.append(_h)
+            except Exception:
+                continue
+        except Exception:
+            continue
+    return out
+
+
+def _member_button_labels(members) -> list[tuple[str, str]]:
+    """[(hash, label)] for hash-direct action buttons.
+
+    Same short-tracker labels as the old member pick (hash-qualified
+    on repeats); the callback carries the full hash, so no snapshot,
+    index, or expiry is needed to route the tap.
     """
     try:
-        if cmd not in ("cancel", "fetch", "prefer", "now"):
-            return []
-        rows: list[tuple[TorrentState, str]] = []
-        for (ts, _progress) in members or []:
-            _h = _member_hash(ts)
-            if not _h:
-                continue
-            if cmd in ("fetch", "prefer", "now") and getattr(ts, "skipped", 0):
-                continue
-            if cmd in ("fetch", "now") and not (
-                    ts.state == State.WAITING_INDEXER or (
-                        ts.state == State.NEW and _is_grace_note_for_prefer(
-                            _active_note(ts, notes)))):
-                continue
-            if cmd == "prefer" and not (
-                    ts.state == State.NEW and _is_grace_note_for_prefer(
-                        _active_note(ts, notes))):
-                continue
-            rows.append((ts, _h))
-        if not rows:
-            return []
         out: list[tuple[str, str]] = []
         seen: dict[str, int] = {}
-        for (ts, _h) in rows:
+        for ts in members or []:
+            try:
+                _h = _member_hash(ts)
+            except Exception:
+                continue
+            if not _h:
+                continue
             _base = _pick_member_label(ts, _h[:10])
             _n = seen.get(_base, 0)
             seen[_base] = _n + 1
-            _label = _base if _n == 0 else f"{_base} {_h[:6]}"
-            out.append((_h, _label))
+            out.append((_h, _base if _n == 0 else f"{_base} {_h[:6]}"))
         return out
     except Exception:
         return []
 
 
-#: Pending group-action lifetime: buttons referencing regrouped lists go
-#: stale, so picks expire fast (re-tap the command for a fresh set).
-_PENDING_TTL_S = 300.0
+def _parse_action_data(data: str) -> tuple[str, bool, str, str]:
+    """Parse a hash-protocol callback into (cmd, all, hash, choice).
 
-
-def render_pending_question(pending: dict | None) -> str:
-    """Question section appended below the footer while a pick is pending.
-
-    Pure (testable): ``pending`` carries kind/title/scope (+ frozen
-    members/hashes) as set by the pick step. "" when nothing is pending.
-    The title lets the user verify the locked group before tapping.
+    Shapes: `<cmd>:<40hex>`, `<cmd>:all:<40hex>`,
+    `<cmd>:<40hex>:yes|no`, `<cmd>:all:<40hex>:yes|no`, `abort`.
+    Returns ("", False, "", "") when malformed — callers treat it
+    as a stale button.
     """
     try:
-        if not isinstance(pending, dict):
-            return ""
-        kind = str(pending.get("kind") or "")
-        title = _safe_display_name(str(pending.get("title") or "")[:80])
-        scope = _esc(str(pending.get("scope") or ""))
-        try:
-            _size = _size_compact(pending.get("size"))
-        except Exception:
-            _size = ""
-        _tspec = f"`{title}`" + (f" · {_size}" if _size else "")
-        if kind == "pick":
-            cmd = str(pending.get("cmd") or "")
-            verb = {"cancel": "Cancel", "fetch": "Fetch original for",
-                    "prefer": "Prefer", "now": "Start now"}.get(cmd, "Act on")
-            if scope == "all":
-                what = "every copy"
-            elif scope:
-                what = f"the {scope} copy"
-            else:
-                what = "which copy"
-            return (f"{verb} {_tspec} — {what}?\n"
-                    f"Pick below (tracker names).")
-        if kind == "keepq":
-            return (f"Cancel {_tspec}{(' · ' + scope) if scope else ''} — "
-                    f"keep downloaded files?")
-        return ""
+        parts = str(data or "").split(":")
+        if parts == ["abort"]:
+            return ("abort", False, "", "")
+        if len(parts) == 2 and parts[0] in (
+                "go", "cancel", "inject", "skip", "resume"):
+            if _is_hex40(parts[1]):
+                return (parts[0], False, parts[1].lower(), "")
+        if len(parts) == 3 and parts[0] in (
+                "cancel", "keep", "inject", "skip", "resume",
+                "go") and parts[1] == "all":
+            if _is_hex40(parts[2]):
+                return (parts[0], True, parts[2].lower(), "")
+        if len(parts) == 3 and parts[0] in ("keep", "inject"):
+            if _is_hex40(parts[1]) and parts[2] in ("yes", "no"):
+                return (parts[0], False, parts[1].lower(), parts[2])
+        if len(parts) == 4 and parts[0] in ("keep", "inject"):
+            if parts[1] == "all" and _is_hex40(parts[2]) \
+                    and parts[3] in ("yes", "no"):
+                return (parts[0], True, parts[2].lower(), parts[3])
     except Exception:
-        return ""
+        pass
+    return ("", False, "", "")
 
 
 def render_active(
@@ -969,15 +956,13 @@ def render_active(
 
     Same-content copies (one release, many trackers) share one numbered
     heading ``N. `Name` · size``; each tracker gets a display-only line
-    ``▸ <domain> <stage>``. Commands address the group by its number
-    (``/cancel_3`` …) and open member-choice buttons below the list —
-    the number is resolved once, at tap time, into a frozen member
-    snapshot, so later renumbering cannot misroute the flow. Cancel
-    always ends at a keep/delete question (injectfuse at a Yes/No
-    question); fetch/prefer appear only while a member qualifies, and
-    injectfuse while a member waits pre-download. Detail cards keep
-    per-torrent text commands (full-hash cancel). Pages count groups;
-    numbers are global across pages.
+    ``▸ <domain> <stage>``. Each group carries one command (``/act_3``)
+    opening the action sheet with only the currently eligible actions;
+    the typed verbs (``/cancel_`` / ``/now_`` / ``/skip_`` / ``/resume_``
+    / ``/injectfuse_`` with the same number or hash) all keep working
+    as shortcuts. Detail cards keep per-torrent text commands
+    (full-hash cancel). Pages count groups; numbers are global
+    across pages.
 
     Compact mobile layout (detail cards stay fully detailed). `notes`
     maps source_infohash -> one-line extra shown on that tracker's line.
@@ -1037,11 +1022,6 @@ def render_active(
         # 2. Display-only tracker lines, no indent: the ▸ glyph plus the
         # blank line between groups already carries the hierarchy, and
         # leading spaces only push long statuses into a wrap.
-        _has_fetch = False
-        _has_prefer = False
-        _has_inject = False
-        _has_skip = False
-        _has_unskip = False
         for (ts, progress) in members:
             domain_full = (_tracker_domain(ts.source_announce_url)
                            or _tracker_domain(ts.source_tracker))
@@ -1051,41 +1031,13 @@ def render_active(
                 lines.append(f"▸ {_esc(domain_full)} {state_text}")
             else:
                 lines.append(f"▸ {state_text}")
-            try:
-                _held = bool(getattr(ts, "skipped", 0))
-            except Exception:
-                _held = False
-            if _held:
-                _has_unskip = True
-                continue
-            _has_skip = True
-            if ts.state == State.WAITING_INDEXER:
-                _has_fetch = True
-            if ts.state in (State.WAITING_INDEXER,
-                            State.WAITING_DISK):
-                _has_inject = True
-            if (ts.state == State.NEW
-                    and _is_grace_note_for_prefer(_note)):
-                _has_fetch = True
-                _has_prefer = True
 
-        # 3. Short group commands on ONE line with no indent (the `/`
-        # prefix marks them; every column counts against the wrap limit).
-        # Positional group number — resolved once at tap time into a
-        # frozen snapshot, so later renumbering cannot misroute.
-        # Cancel always; now (old fetch/prefer united)/inject only when a
-        # member qualifies right now (injectfuse arms a Yes/No question,
-        # never acts); skip while a member runs free, resume while one is
-        # held.
-        _cmds = [f"/cancel_{group_num}"]
-        if _has_fetch or _has_prefer:
-            _cmds.append(f"/now_{group_num}")
-        if _has_skip:
-            _cmds.append(f"/skip_{group_num}")
-        if _has_unskip:
-            _cmds.append(f"/resume_{group_num}")
-        if _has_inject:
-            _cmds.append(f"/injectfuse_{group_num}")
+        # 3. One short group command (the `/` prefix marks it; every
+        # column counts against the wrap limit). /act_N opens the action
+        # sheet with only the currently eligible actions — the typed
+        # verbs (/cancel_ /now_ /skip_ /resume_ /injectfuse_ with the same
+        # number or hash) all keep working as shortcuts.
+        _cmds = [f"/act_{group_num}"]
         lines.append(" ".join(_esc(_c) for _c in _cmds))
         lines.append("")
 
@@ -1221,9 +1173,6 @@ class TelegramBot:
         # the footer refreshes every status tick but the SFTP probe is
         # reused for _VPS1_FREE_TTL_S so we don't chatter the channel.
         self._vps1_free_cache: tuple[float, int | None] | None = None
-        # Pending group action (member pick or keep/delete question) for
-        # the two-step flows; armed by group commands, expires quickly.
-        self._pending_pick: dict | None = None
         # Retired active-tasks message ids whose delete hit a transient
         # (flood / timeout). The pointer has already moved on, so without
         # this list they would linger in chat history forever.
@@ -1731,12 +1680,11 @@ class TelegramBot:
         total_pages: int,
         extra_rows: list[list[tuple[str, str]]] | tuple = (),
     ) -> InlineKeyboardMarkup | None:
-        """Pagination nav buttons plus pending-action rows.
+        """Pagination nav buttons plus extra action rows.
 
-        Extra rows are ``(label, callback_data)`` pairs (member-choice
-        pick buttons or keep Yes/No), already chunked by the caller —
-        stale/oversize entries are skipped defensively. Cancel/keep stay
-        as chat commands (destructive = keep the copy-paste friction).
+        Extra rows are ``(label, callback_data)`` pairs (hash-direct
+        action buttons), already chunked by the caller — stale/oversize
+        entries are skipped defensively.
         """
         if total_pages <= 1:
             buttons = [
@@ -1767,166 +1715,261 @@ class TelegramBot:
             pass
         return InlineKeyboardMarkup(buttons)
 
-    # ---- pending group actions (two-step pickers) ----
+    # ---- stateless hash protocol (no pending snapshots) ----
 
-    def _pending_live(self) -> dict | None:
-        """Live pending pick, else None (expired picks are purged)."""
+    def _live_group_hashes(self, leader_hash: str) -> list[str]:
+        """Live tracked member hashes sharing the leader's content.
+
+        Re-derives the group on every tap from the current store, so
+        renumbering, regrouping, or forgotten rows can never misroute
+        an `all:`-scoped button — an empty result means "re-tap".
+        """
         try:
-            _p = getattr(self, "_pending_pick", None)
-            if not isinstance(_p, dict):
-                return None
+            norm = (leader_hash or "").strip().lower()
+            if not _is_hex40(norm):
+                return []
+            store = getattr(self, "_store", None)
+            if store is None:
+                return []
+            _get = getattr(store, "get", None)
+            _all = getattr(store, "list_active_inflight", None)
+            leader = _get(norm, include_blob=False) if callable(_get) else None
+            rows = _all() if callable(_all) else []
+            if leader is None:
+                # Leader gone (forgotten/cancelled): siblings may still
+                # be live — match by the leader's last known content via
+                # members that share it. Without the row we have no
+                # name/size, so resolve fails cleanly instead of guessing.
+                return []
             try:
-                _exp = float(_p.get("expires", 0) or 0)
-            except (TypeError, ValueError):
-                return None
-            if _exp and time.monotonic() > _exp:
+                from .content_keys import same_content as _same
+            except Exception:
+                _same = None  # type: ignore[assignment]
+            out: list[str] = []
+            for _r in rows or []:
                 try:
-                    self._pending_pick = None
+                    _rh = ((_r.source_infohash or "").lower())
+                    if not _rh:
+                        continue
+                    if _same is not None:
+                        if not _same(_r.source_name or "",
+                                     _r.total_bytes or 0,
+                                     leader.source_name or "",
+                                     leader.total_bytes or 0):
+                            continue
+                    elif ((_r.source_name or "").strip().lower()
+                            != (leader.source_name or "").strip().lower()):
+                        continue
+                    out.append(_rh)
                 except Exception:
-                    pass
-                return None
-            if not _p.get("kind") or not isinstance(
-                    _p.get("members"), list):
-                # keepq carries hashes instead of members.
-                if not (_p.get("kind") == "keepq"
-                        and isinstance(_p.get("hashes"), list)):
-                    return None
-            return _p
+                    continue
+            return out
         except Exception:
-            return None
+            return []
 
-    def _next_seq(self) -> str:
-        """Next pending-flow sequence token (stale-tap guard).
+    def _now_eligible_hashes(
+        self, members, notes: dict | None = None,
+    ) -> list[str]:
+        """Member hashes that may start at once (old fetch ∪ prefer sets)."""
+        return _now_eligible_hashes(members, notes)
 
-        Unpredictable (not 1,2,3…): callback data is only obscure, so a
-        sequential id lets anyone in the authorized chat forge taps into
-        another operator's pending flow. Single pending per bot is
-        intentional (single-operator chat); the token still binds each
-        question to its own buttons until it expires.
-        """
+    def _sheet_text_and_rows(
+        self, members, title: str, size_bytes: object,
+        notes: dict | None = None,
+    ) -> tuple[str, list[list[tuple[str, str]]]]:
+        """Action sheet text + hash-button rows for a content group."""
         try:
-            return secrets.token_hex(8)
+            _size = _size_compact(size_bytes)
         except Exception:
-            raise RuntimeError("no entropy for pending-flow token")
-
-    def _set_pending_pick(self, cmd: str, title: str, size_bytes: object,
-                           members: list[tuple[str, str]],
-                           user_id: object = None) -> dict:
-        """Arm a member-choice pick; members are frozen (hash, label)."""
-        _p = {
-            "kind": "pick", "seq": self._next_seq(), "cmd": cmd,
-            "title": (title or "")[:80], "size": size_bytes,
-            "members": [(h, label) for (h, label) in members or []],
-            "user_id": str(user_id) if user_id is not None else None,
-            "expires": time.monotonic() + _PENDING_TTL_S,
-        }
+            _size = ""
+        _tspec = _safe_display_name((title or "")[:60])
+        _now_ok = set(self._now_eligible_hashes(members, notes))
+        _labels = _member_button_labels(members or [])
+        _held_any = False
+        _free_any = False
         try:
-            self._pending_pick = _p
+            for _ts in members or []:
+                if getattr(_ts, "skipped", 0):
+                    _held_any = True
+                else:
+                    _free_any = True
         except Exception:
             pass
+        _inject_ok = False
         try:
-            self._last_active_cache = None
+            for _ts in members or []:
+                if getattr(_ts, "state", None) in (
+                        State.WAITING_INDEXER, State.WAITING_DISK):
+                    _inject_ok = True
+                    break
         except Exception:
             pass
-        return _p
+        _rows: list[list[tuple[str, str]]] = []
+        _go_row = [(f"▶ {_lbl}", f"go:{_h}")
+                   for (_h, _lbl) in _labels if _h in _now_ok]
+        if _go_row:
+            _rows.extend([_go_row[i:i + 3]
+                          for i in range(0, len(_go_row), 3)])
+        _cancel_row = [(f"✖ {_lbl}", f"cancel:{_h}")
+                       for (_h, _lbl) in _labels]
+        if _cancel_row:
+            _rows.extend([_cancel_row[i:i + 3]
+                          for i in range(0, len(_cancel_row), 3)])
+        _leader = _labels[0][0] if _labels else ""
+        _group_row: list[tuple[str, str]] = []
+        if len(_labels) > 1 and _leader:
+            _group_row.append((f"✖ All ({len(_labels)})",
+                               f"cancel:all:{_leader}"))
+        if _inject_ok and _leader:
+            _group_row.append(("💉 Inject", f"inject:all:{_leader}"))
+        if _free_any and _leader:
+            _group_row.append(("⏭ Skip", f"skip:all:{_leader}"))
+        if _held_any and _leader:
+            _group_row.append(("⏪ Resume", f"resume:all:{_leader}"))
+        if _group_row:
+            _rows.extend([_group_row[i:i + 3]
+                          for i in range(0, len(_group_row), 3)])
+        _rows.append([("Close", "abort")])
+        _text = (f"{_tspec}" + (f" · {_size}" if _size else "")
+                 + "\nChoose an action below. "
+                 "Cancel and Inject ask first.")
+        return _text, _rows
 
-    def _set_pending_keepq(self, title: str, scope: str,
-                             hashes: list[str], size_bytes: object = None,
-                             user_id: object = None) -> dict:
-        """Arm the keep/delete question over frozen hashes."""
-        _p = {
-            "kind": "keepq", "seq": self._next_seq(),
-            "title": (title or "")[:80], "scope": scope or "",
-            "size": size_bytes,
-            "hashes": [h for h in hashes or [] if h],
-            "user_id": str(user_id) if user_id is not None else None,
-            "expires": time.monotonic() + _PENDING_TTL_S,
-        }
+    def _keepq_text_and_rows(
+        self, title: str, scope_label: str, scope: str,
+        size_bytes: object = None,
+    ) -> tuple[str, list[list[tuple[str, str]]]]:
+        """Keep/delete question text + hash buttons for a cancel scope."""
         try:
-            self._pending_pick = _p
+            _size = _size_compact(size_bytes)
         except Exception:
-            pass
-        try:
-            self._last_active_cache = None
-        except Exception:
-            pass
-        return _p
+            _size = ""
+        _tspec = _safe_display_name((title or "")[:60]) + (
+            f" · {_size}" if _size else "")
+        _text = (f"Cancel {_tspec}{scope_label} — keep downloaded files?")
+        _rows = [[("Keep files", f"keep:{scope}:yes"),
+                  ("Delete files", f"keep:{scope}:no")],
+                 [("Close", "abort")]]
+        return _text, _rows
 
-    def _set_pending_injectq(self, title: str,
-                             members: list[tuple[str, str]],
-                             size_bytes: object = None,
-                             user_id: object = None) -> dict:
-        """Arm the inject-to-fuse Yes/No question over frozen hashes.
-
-        Like keepq (all-or-nothing over the snapshot), but execution
-        re-verifies fuse readiness first and changes nothing unless every
-        member verifies: a "yes" never strands a row in a new state.
-        """
-        _p = {
-            "kind": "injectq", "seq": self._next_seq(),
-            "title": (title or "")[:80], "scope": "",
-            "size": size_bytes,
-            "members": [(h, label) for (h, label) in members or []],
-            "user_id": str(user_id) if user_id is not None else None,
-            "expires": time.monotonic() + _PENDING_TTL_S,
-        }
+    async def _send_sheet(
+        self, text: str, rows: list, reply_to: Any = None,
+    ) -> None:
+        """Best-effort sheet reply with action buttons (plain text)."""
+        bot = getattr(self, "_bot", None)
+        if bot is None:
+            return
         try:
-            self._pending_pick = _p
-        except Exception:
-            pass
-        try:
-            self._last_active_cache = None
-        except Exception:
-            pass
-        return _p
-
-    def _pending_section(self) -> tuple[str, list[list[tuple[str, str]]]]:
-        """Question text + keyboard rows for the live pending pick.
-
-        Renders purely from the frozen snapshot — later renumbering or
-        regrouping cannot shift what the buttons mean. Stale member
-        hashes fail safe at execution (liveness re-checked).
-        """
-        try:
-            _p = self._pending_live()
-            if _p is None:
-                return "", []
-            _seq = str(_p.get("seq") or "")
-            if _p.get("kind") == "keepq":
-                return (
-                    render_pending_question(_p),
-                    [[("Keep files", f"keep:{_seq}:yes"),
-                      ("Delete files", f"keep:{_seq}:no")],
-                     [("Cancel", f"abort:{_seq}")]],
-                )
-            if _p.get("kind") == "injectq":
-                try:
-                    _n = len(_p.get("members") or [])
-                except Exception:
-                    _n = 0
-                try:
-                    _title = _safe_display_name(
-                        str(_p.get("title") or "")[:80])
-                except Exception:
-                    _title = "?"
-                return (
-                    f"Inject {_n} torrent(s) for `{_title}` to fuse "
-                    f"seeding? Files must already be at the remote.",
-                    [[("Yes, inject", f"inject:{_seq}:yes"),
-                      ("No", f"inject:{_seq}:no")],
-                     [("Cancel", f"abort:{_seq}")]],
-                )
             _btns = []
-            _mems = _p.get("members") or []
-            if str(_p.get("cmd") or "") == "cancel" and len(_mems) > 1:
-                _btns.append((f"All ({len(_mems)})", f"pick:{_seq}:all"))
-            for _i, (_h, _label) in enumerate(_mems):
-                _btns.append((_label, f"pick:{_seq}:{_i}"))
-            _rows = [_btns[i:i + 3] for i in range(0, len(_btns), 3)]
-            _rows.append([("Cancel", f"abort:{_seq}")])
-            return render_pending_question(_p), _rows
+            for _row in rows or ():
+                _line = []
+                for (_label, _data) in _row or ():
+                    if not _label or not _data or len(_data) > 64:
+                        continue
+                    _line.append(InlineKeyboardButton(
+                        str(_label)[:60], callback_data=_data))
+                if _line:
+                    _btns.append(_line)
+            kwargs: dict[str, Any] = {}
+            try:
+                msg_id = getattr(reply_to, "message_id", None)
+                if isinstance(msg_id, int) and msg_id > 0:
+                    kwargs["reply_to_message_id"] = msg_id
+            except Exception:
+                pass
+            if _btns:
+                kwargs["reply_markup"] = InlineKeyboardMarkup(_btns)
+            sent = await bot.send_message(
+                self._cfg.chat_id, text, **kwargs)
+            self._note_outbound(getattr(sent, "message_id", None))
+        except Exception as e:  # noqa: BLE001
+            log.debug("sheet reply failed: %s", e)
+
+    async def _delete_query_message(self, query: Any) -> None:
+        """Best-effort delete of the message holding the tapped button."""
+        try:
+            bot = getattr(self, "_bot", None)
+            msg = getattr(query, "message", None)
+            if bot is None or msg is None:
+                return
+            try:
+                mid = getattr(msg, "message_id", None)
+            except Exception:
+                mid = None
+            if not isinstance(mid, int) or mid <= 0:
+                return
+            try:
+                await bot.delete_message(self._cfg.chat_id, mid)
+            except Exception as e:  # noqa: BLE001
+                log.debug("sheet delete failed: %s", e)
         except Exception:
-            return "", []
+            pass
+
+    async def _resume_hashes_reply(self, hashes: list[str]) -> str:
+        """Resume outcome text for hashes (no send/refresh).
+
+        Shared by the /resume_ entry point and hash-button taps:
+        unholds tracked rows, lifts ignored hashes, composes one reply.
+        """
+        try:
+            store = getattr(self, "_store", None)
+            if store is None:
+                return "Action failed: bot not attached."
+            wanted = []
+            try:
+                for h in hashes or []:
+                    _h = (h or "").strip().lower()
+                    if len(_h) == 40 and all(
+                            c in "0123456789abcdef" for c in _h):
+                        wanted.append(_h)
+            except Exception:
+                pass
+            if not wanted:
+                return "Resume failed: nothing tracked to act on."
+            tracked: list[str] = []
+            try:
+                _get = getattr(store, "get", None)
+                if callable(_get):
+                    for _h in wanted:
+                        try:
+                            if _get(_h, include_blob=False) is not None:
+                                tracked.append(_h)
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            unskip_text = ""
+            if tracked:
+                try:
+                    unskip_text = await self._skip_torrents(tracked, hold=False)
+                except Exception as e:  # noqa: BLE001
+                    unskip_text = f"Resume failed: {e}"
+            lifted: list[str] = []
+            try:
+                for _h in wanted:
+                    try:
+                        _name, _err = await asyncio.to_thread(
+                            self._unignore_core, _h)
+                    except Exception:
+                        continue
+                    if _name:
+                        lifted.append(_name)
+            except Exception:
+                pass
+            if not tracked and not lifted:
+                return ("Already gone from tracking"
+                        if not unskip_text else unskip_text)
+            reply = (unskip_text or "").strip()
+            if lifted:
+                shown = ", ".join(lifted[:3])
+                if len(lifted) > 3:
+                    shown += f" (+{len(lifted) - 3} more)"
+                extra = (f"Unignored {shown} — re-send .torrent via /add "
+                         f"(or re-drop) to track again.")
+                reply = f"{reply} {extra}".strip() if reply else extra
+            return reply or "Resume failed: nothing changed."
+        except Exception as e:  # noqa: BLE001
+            return f"Resume failed: {e}"
 
     async def _callback_loop(self) -> None:
         """Poll get_updates for pagination clicks and `/cancel_` commands."""
@@ -2032,8 +2075,10 @@ class TelegramBot:
 
         data = str(getattr(query, "data", "") or "")
         if (data.startswith("pick:") or data.startswith("keep:")
-                or data.startswith("abort:")
-                or data.startswith("inject:")):
+                or data.startswith("abort")
+                or data.startswith("inject:")
+                or data.startswith("go:") or data.startswith("cancel:")
+                or data.startswith("skip:") or data.startswith("resume:")):
             await self._on_action_button(query, data)
             return
         if not data.startswith("page:"):
@@ -2201,13 +2246,14 @@ class TelegramBot:
             m_cancel = CANCEL_CMD_RE.match(text)
             m_injectfuse = INJECTFUSE_CMD_RE.match(text)
             m_injectfuse_hash = INJECTFUSE_HASH_RE.match(text)
+            m_act = ACT_CMD_RE.match(text)
             m_add = ADD_CMD_RE.match(text)
             if (not m_fetch and not m_prefer and not m_now
                     and not m_cancel
                     and not m_skip and not m_unskip and not m_resume
                     and not m_unignore and not m_unignore_hash
                     and not m_injectfuse and not m_injectfuse_hash
-                    and not m_add):
+                    and not m_act and not m_add):
                 return
             if not _tg_actor_allowed(self._cfg, user_id):
                 try:
@@ -2260,6 +2306,10 @@ class TelegramBot:
             if m_injectfuse:
                 await self._start_group_command(
                     "injectfuse", m_injectfuse.group(1), message)
+                return
+            if m_act:
+                await self._act_command_entry(
+                    m_act.group(1).lower(), message)
                 return
             await self._start_group_command(
                 "cancel", m_cancel.group(1), message)
@@ -2774,18 +2824,11 @@ class TelegramBot:
                 pass
             return
         if kind == "cancel":
-            self._set_pending_keepq(
-                title, "", [full_hash],
-                getattr(row, "total_bytes", 0),
-                user_id=_tg_actor_id(message))
+            _text, _rows = self._keepq_text_and_rows(
+                title, "", full_hash,
+                getattr(row, "total_bytes", 0))
             try:
-                await self._refresh_active_message()
-            except Exception:
-                pass
-            try:
-                await self._reply(
-                    f"Cancel {title} — keep downloaded files? Choose below.",
-                    reply_to=message)
+                await self._send_sheet(_text, _rows, reply_to=message)
             except Exception:
                 pass
             return
@@ -2842,6 +2885,57 @@ class TelegramBot:
             snap.append((h, base if n == 0 else f"{base} {h[:6]}"))
         return snap
 
+    async def _inject_ask_send(self, resolved: dict, message: Any) -> None:
+        """Ask the fuse-inject Yes/No question with hash-scoped buttons.
+
+        Shared by the single, group, and tap-again ask paths: `resolved`
+        is a coordinator.injectfuse_resolve() dict (members/title/size).
+        The Yes button carries the resolved leader hash and re-resolves
+        live at tap time, so no snapshot needs to survive between taps.
+        """
+        try:
+            members = list(resolved.get("members") or [])
+            _lead = ""
+            try:
+                _m0 = members[0] if members else None
+                _lead = ((getattr(_m0, "infohash", "") or "")
+                         or (getattr(_m0, "source_infohash", "") or ""))
+                _lead = _lead.lower() if _lead else ""
+            except Exception:
+                _lead = ""
+            if not _lead:
+                try:
+                    await self._reply("Nothing to inject (group changed).",
+                                      reply_to=message)
+                except Exception:
+                    pass
+                return
+            title = str(resolved.get("title") or _lead[:10])[:60]
+            try:
+                _n = len(members)
+            except Exception:
+                _n = 0
+            extra = ""
+            try:
+                extra = str(resolved.get("extra_note") or "")
+            except Exception:
+                extra = ""
+            if not extra:
+                try:
+                    if resolved.get("ignored"):
+                        extra = " Prior cancel will be lifted."
+                except Exception:
+                    pass
+            _text = (f"Inject {title} ({_n} cop{'y' if _n == 1 else 'ies'}) "
+                     "to fuse seeding? Files must already be at the "
+                     f"remote.{extra} Choose below.")
+            _rows = [[(f"Yes, inject", f"inject:{_lead}:yes"),
+                      ("No", f"inject:{_lead}:no")],
+                     [("Close", "abort")]]
+            await self._send_sheet(_text, _rows, reply_to=message)
+        except Exception as e:  # noqa: BLE001
+            log.debug("inject ask failed: %s", e)
+
     async def _start_injectfuse_single(self, full_hash: str, message: Any) -> None:
         """`/injectfuse <hash>`: tracked or untracked VPS1 torrent.
 
@@ -2897,13 +2991,6 @@ class TelegramBot:
             except Exception:
                 pass
             return
-        self._set_pending_injectq(
-            title, snap, resolved.get("size"),
-            user_id=_tg_actor_id(message))
-        try:
-            await self._refresh_active_message()
-        except Exception:
-            pass
         extra = ""
         try:
             if resolved.get("ignored"):
@@ -2913,12 +3000,14 @@ class TelegramBot:
         except Exception:
             pass
         try:
-            await self._reply(
-                f"Inject {title} ({len(snap)} copies) to fuse seeding? "
-                f"Files must already be at the remote.{extra} Choose below.",
-                reply_to=message)
+            _resolved_for_ask = dict(resolved)
+        except Exception:
+            _resolved_for_ask = resolved
+        try:
+            _resolved_for_ask["extra_note"] = extra
         except Exception:
             pass
+        await self._inject_ask_send(_resolved_for_ask, message)
         try:
             if members:
                 return _safe_display_name(
@@ -2972,17 +3061,114 @@ class TelegramBot:
         except Exception:
             return None
 
+    async def _act_command_entry(self, token: str, message: Any) -> None:
+        """Reply with the action sheet for a content group.
+
+        Single displayed entry point (`/act_<n>`): resolves like the
+        other group commands (number, group id, hash, prefix) and shows
+        only the currently eligible actions as hash-direct buttons.
+        """
+        try:
+            store = getattr(self, "_store", None)
+            if store is None:
+                try:
+                    await self._reply("Action failed: bot not attached.",
+                                      reply_to=message)
+                except Exception:
+                    pass
+                return
+            norm = (token or "").strip().lower()
+            try:
+                rows = await asyncio.to_thread(store.list_active_inflight)
+            except Exception as e:  # noqa: BLE001
+                try:
+                    await self._reply(f"Action failed: {e}", reply_to=message)
+                except Exception:
+                    pass
+                return
+            try:
+                groups = _group_active_items([(_r, None) for _r in rows or []])
+            except Exception:
+                groups = []
+            members: list = []
+            if norm.isdigit():
+                try:
+                    _n = int(norm)
+                except (TypeError, ValueError):
+                    _n = 0
+                if 1 <= _n <= len(groups):
+                    _gk, _mem = groups[_n - 1]
+                    members = [t for (t, _) in _mem]
+            if not members and norm:
+                try:
+                    _by_gid = _live_group_by_gid(list(rows or []), norm)
+                except Exception:
+                    _by_gid = None
+                if _by_gid is not None:
+                    members = list(_by_gid[1])
+            if not members and norm:
+                try:
+                    target = await asyncio.to_thread(
+                        self._resolve_cancel_target, norm, cmd="act")
+                    _gh = await asyncio.to_thread(
+                        self._group_hashes_for,
+                        (target.source_infohash or "").lower())
+                    if _gh:
+                        _all = {(_r.source_infohash or "").lower(): _r
+                                for _r in rows or []}
+                        members = [_all[h] for h in _gh if h in _all]
+                    else:
+                        members = [target]
+                except LookupError as e:
+                    try:
+                        await self._reply(str(e)[:300], reply_to=message)
+                    except Exception:
+                        pass
+                    return
+                except Exception as e:  # noqa: BLE001
+                    try:
+                        await self._reply(f"Action failed: {e}", reply_to=message)
+                    except Exception:
+                        pass
+                    return
+            if not members:
+                try:
+                    await self._reply("No live group — refresh the list.",
+                                      reply_to=message)
+                except Exception:
+                    pass
+                return
+            title = self._group_title(members)
+            try:
+                notes = self._live_notes_for(members)
+            except Exception:
+                notes = {}
+            try:
+                _text, _rows = self._sheet_text_and_rows(
+                    members, title, getattr(members[0], "total_bytes", 0)
+                    if members else 0, notes)
+            except Exception as e:  # noqa: BLE001
+                try:
+                    await self._reply(f"Action failed: {e}", reply_to=message)
+                except Exception:
+                    pass
+                return
+            try:
+                await self._send_sheet(_text, _rows, reply_to=message)
+            except Exception:
+                pass
+        except Exception as e:  # noqa: BLE001
+            log.debug("act command failed: %s", e)
+
     async def _start_group_command(self, kind: str, token: str, message: Any) -> None:
         """Typed command: positional number, gid, or legacy hash prefix.
 
         Positional numbers (what the list shows) and group ids resolve
-        against the LIVE list right now and freeze into a member
-        snapshot — everything after (buttons, question, execution)
-        references the snapshot, so renumbering mid-flow cannot
+        against the LIVE list right now; member buttons below carry full
+        hashes re-resolved at tap time, so renumbering mid-flow cannot
         misroute. Full hashes and legacy prefixes act on one row.
         """
         token = (token or "").strip().lower()
-        _actor = _tg_actor_id(message)
         # Legacy aliases: fetch/prefer merged into the state-dependent
         # "now" verb (WAITING rows use original bytes, grace-held rows
         # start at once).
@@ -3040,15 +3226,10 @@ class TelegramBot:
             return
         _gkey, members = found
         title = self._group_title(members)
-        try:
-            _gsize = getattr(members[0], "total_bytes", 0) if members else 0
-        except Exception:
-            _gsize = 0
-        _trip = [(_m, None) for _m in members]
         if kind == "cancel":
-            snap = pick_snapshot(_trip, "cancel")
-            if len(snap) <= 1:
-                _hashes = [h for (h, _) in snap]
+            _labels = _member_button_labels(members)
+            if len(_labels) <= 1:
+                _hashes = [h for (h, _) in _labels]
                 if not _hashes:
                     try:
                         await self._reply("Already gone from tracking",
@@ -3056,72 +3237,98 @@ class TelegramBot:
                     except Exception:
                         pass
                     return
-                _lbl = snap[0][1]
-                self._set_pending_keepq(
-                    title, f"{_lbl} copy", _hashes, _gsize,
-                    user_id=_actor)
-                reply = (f"Cancel {title} — keep downloaded files? "
-                         f"Choose below.")
-            else:
-                self._set_pending_pick("cancel", title, _gsize, snap,
-                                       user_id=_actor)
-                reply = (f"Cancel {title} ({len(snap)} copies): "
-                         f"pick below.")
+                try:
+                    _size1 = getattr(members[0], "total_bytes", 0) \
+                        if members else 0
+                except Exception:
+                    _size1 = 0
+                _text, _rows = self._keepq_text_and_rows(
+                    title, "", _hashes[0], _size1)
+                try:
+                    await self._send_sheet(_text, _rows, reply_to=message)
+                except Exception:
+                    pass
+                return
+            _rows: list[list[tuple[str, str]]] = [
+                [(f"✖ {_lbl}", f"cancel:{_h}") for (_h, _lbl) in _labels][
+                    i:i + 3]
+                for i in range(0, len(_labels), 3)
+            ]
+            _rows.append([(
+                f"✖ All ({len(_labels)})",
+                f"cancel:all:{_labels[0][0]}")])
+            _rows.append([("Close", "abort")])
             try:
-                await self._refresh_active_message()
-            except Exception:
-                pass
-            try:
-                await self._reply(reply, reply_to=message)
+                await self._send_sheet(
+                    f"Cancel {title} ({len(_labels)} copies): "
+                    f"pick below (tracker names).",
+                    _rows, reply_to=message)
             except Exception:
                 pass
             return
-        # injectfuse: whole group, all-or-nothing — no member pick.
-        # The question names the LIVE VPS1 group (torrents added after
-        # the row was tracked belong to it); Yes-time execution
-        # re-resolves live too, so a stale list can never misinject.
-        # Yes auto-lifts a prior cancel and stops any SSD download first.
+        # injectfuse: whole group, all-or-nothing. The question names
+        # the LIVE VPS1 group (torrents added after the row was tracked
+        # belong to it); the Yes button below re-resolves live too, so a
+        # stale list can never misinject. Yes auto-lifts a prior cancel
+        # and stops any SSD download first.
         if kind == "injectfuse":
-            snap = pick_snapshot(_trip, "cancel")
-            if not snap:
+            _lead_hashes = []
+            for _m in members or []:
+                try:
+                    _mh = _member_hash(_m)
+                except Exception:
+                    _mh = ""
+                if _mh:
+                    _lead_hashes.append(_mh)
+            if not _lead_hashes:
                 try:
                     await self._reply("Already gone from tracking",
                                       reply_to=message)
                 except Exception:
                     pass
                 return
-            live_title, live_size = title, _gsize
             try:
                 coord = getattr(self, "_coord", None)
-                if coord is not None:
-                    resolved = await coord.injectfuse_resolve(snap[0][0])
-                    live_snap = self._injectfuse_snap(
-                        list(resolved.get("members") or []))
-                    if live_snap:
-                        snap = live_snap
-                        live_title = str(
-                            resolved.get("title") or title)[:60]
-                        live_size = resolved.get("size") or _gsize
+                if coord is None:
+                    raise LookupError("bot not attached")
+                resolved = await coord.injectfuse_resolve(_lead_hashes[0])
             except (LookupError, ValueError) as e:
-                log.debug("injectfuse group live-resolve failed (%s); "
-                          "using tracked snapshot", e)
+                # VPS1 no longer lists the group (cleaned/pruned): fall
+                # back to the tracked members — the remote bytes may
+                # still be injectable.
+                try:
+                    _tracked = []
+                    for _m in members or []:
+                        try:
+                            if _member_hash(_m):
+                                _tracked.append(_m)
+                        except Exception:
+                            continue
+                    if not _tracked:
+                        raise
+                    try:
+                        _tsz = getattr(_tracked[0], "total_bytes", 0)
+                    except Exception:
+                        _tsz = 0
+                    resolved = {"members": _tracked, "title": title,
+                                "size": _tsz}
+                except Exception:
+                    try:
+                        await self._reply(str(e)[:300], reply_to=message)
+                    except Exception:
+                        pass
+                    return
             except Exception as e:  # noqa: BLE001
-                log.debug("injectfuse group live-resolve failed (%s); "
-                          "using tracked snapshot", e)
-            self._set_pending_injectq(live_title, snap, live_size,
-                                      user_id=_actor)
+                try:
+                    await self._reply(f"Action failed: {e}", reply_to=message)
+                except Exception:
+                    pass
+                return
             try:
-                await self._refresh_active_message()
+                _resolved_for_ask = dict(resolved)
             except Exception:
-                pass
-            try:
-                await self._reply(
-                    f"Inject {live_title} ({len(snap)} copies) to fuse "
-                    f"seeding? Files must already be at the remote. "
-                    f"Choose below.",
-                    reply_to=message)
-            except Exception:
-                pass
+                _resolved_for_ask = resolved
+            await self._inject_ask_send(_resolved_for_ask, message)
             return
         # skip/unskip: whole group, all-or-nothing — no member pick
         # (a hold covers the release, every copy of it). Even one
@@ -3156,13 +3363,15 @@ class TelegramBot:
             except Exception:
                 pass
             return
-        # fetch/prefer: snapshot eligible members into a titled pick —
-        # even a single candidate goes through the buttons, so the group
-        # name is always on screen (with a Cancel row) before anything
-        # acts. Empty set replies inline.
-        snap = pick_snapshot(
-            _trip, kind, self._live_notes_for(members))
-        if not snap:
+        # now: eligible members choose their own copy via hash buttons.
+        # A lone eligible copy starts at once; several get one button
+        # each. Empty set replies inline. No snapshot: each button
+        # carries its copy's hash and execution re-checks eligibility.
+        _notes = self._live_notes_for(members)
+        _eligible = set(self._now_eligible_hashes(members, _notes))
+        _labels = [(h, lbl) for (h, lbl) in _member_button_labels(members)
+                   if h in _eligible]
+        if not _labels:
             try:
                 await self._reply(
                     f"Nothing to {kind} right now (states changed).",
@@ -3170,23 +3379,39 @@ class TelegramBot:
             except Exception:
                 pass
             return
-        self._set_pending_pick(kind, title, _gsize, snap, user_id=_actor)
+        if len(_labels) == 1:
+            try:
+                result = await self._fetch_torrent(_labels[0][0])
+            except Exception as e:  # noqa: BLE001
+                result = f"Action failed: {e}"
+            try:
+                await self._reply(result[:300], reply_to=message)
+            except Exception:
+                pass
+            try:
+                self._last_active_cache = None
+                await self._refresh_active_message()
+            except Exception:
+                pass
+            return
+        _rows = [[(f"▶ {_lbl}", f"go:{_h}") for (_h, _lbl) in _labels][
+            i:i + 3] for i in range(0, len(_labels), 3)]
+        _rows.append([("Close", "abort")])
         try:
-            await self._refresh_active_message()
-        except Exception:
-            pass
-        try:
-            await self._reply(
-                f"{kind.capitalize()} {title}: pick a copy below.",
-                reply_to=message)
+            await self._send_sheet(
+                f"Start {title}: pick a copy below (tracker names).",
+                _rows, reply_to=message)
         except Exception:
             pass
 
     async def _on_action_button(self, query: Any, data: str) -> None:
-        """Route pick:/keep:/inject:/abort: taps (initial ack already sent).
+        """Route hash-protocol taps (initial ack already sent).
 
-        Buttons address snapshot indices/sequences, never live
-        positions or hashes — renumbering mid-flow cannot misroute.
+        Every button carries its own scope (`<cmd>:<hash>` or
+        `<cmd>:all:<hash>`), re-resolved live at tap time — group
+        renumbering between list render and tap cannot misroute, so no
+        snapshot, sequence, or expiry exists. Per-tap admin auth already
+        ran in _handle_callback; execution re-checks liveness per hash.
         Short replies go back to the chat; the list refreshes after.
         """
         async def _say(text: str) -> None:
@@ -3203,76 +3428,102 @@ class TelegramBot:
             except Exception:
                 pass
 
+        async def _group_of(leader: str) -> list[str]:
+            try:
+                return await asyncio.to_thread(
+                    self._live_group_hashes, leader)
+            except Exception:
+                return []
+
+        async def _row_title(h: str) -> str:
+            try:
+                store = getattr(self, "_store", None)
+                _get = getattr(store, "get", None) if store else None
+                row = await asyncio.to_thread(_get, h) \
+                    if callable(_get) else None
+                if row is not None:
+                    return str(getattr(row, "source_name", "")
+                               or h[:10])[:60]
+            except Exception:
+                pass
+            return h[:10]
+
         try:
-            parts = (data or "").split(":")
-            _tapper = _tg_actor_id(query)
-
-            def _owner_ok(p) -> bool:
-                if _tg_pending_owner_ok(p or {}, _tapper):
-                    return True
-                return False
-
-            async def _refuse_foreign() -> None:
-                await _say("That picker belongs to another operator — "
-                           "tap the command again for your own.")
-
-            if parts[0] == "abort" and len(parts) == 2:
-                p = self._pending_live()
-                if p is None or str(p.get("seq") or "") != parts[1]:
-                    await _say("Expired — tap the command again")
-                    return
-                if not _owner_ok(p):
-                    await _refuse_foreign()
-                    return
-                try:
-                    self._pending_pick = None
-                except Exception:
-                    pass
-                await _say("Picker cancelled — nothing acted on.")
-                await _refresh()
+            cmd, _all, _h, _choice = _parse_action_data(data)
+            if not cmd:
+                await _say("Stale button — refresh the list")
                 return
-            if parts[0] == "keep" and len(parts) == 3:
-                _, seq, which = parts
-                p = self._pending_live()
-                if (p is None or p.get("kind") != "keepq"
-                        or str(p.get("seq") or "") != seq):
-                    await _say("Expired — tap the command again")
-                    return
-                if not _owner_ok(p):
-                    await _refuse_foreign()
-                    return
-                _hashes = [h for h in (p.get("hashes") or []) if h]
-                _title = str(p.get("title") or "")
+            if cmd == "abort":
+                await self._delete_query_message(query)
+                return
+            if cmd == "go" and not _all and _h and not _choice:
                 try:
-                    self._pending_pick = None
-                except Exception:
-                    pass
-                result = await self._execute_snapshot_cancel(
-                    _hashes, _title, delete_files=(which == "no"))
+                    result = await self._fetch_torrent(_h)
+                except Exception as e:  # noqa: BLE001
+                    result = f"Action failed: {e}"
                 await _say(result)
                 await _refresh()
                 return
-            if parts[0] == "inject" and len(parts) == 3:
-                _, seq, which = parts
-                p = self._pending_live()
-                if (p is None or p.get("kind") != "injectq"
-                        or str(p.get("seq") or "") != seq):
-                    await _say("Expired — tap the command again")
-                    return
-                if not _owner_ok(p):
-                    await _refuse_foreign()
-                    return
-                _hashes = [h for (h, _) in (p.get("members") or []) if h]
+            if cmd == "cancel" and _h and not _choice:
+                if _all:
+                    _hashes = await _group_of(_h)
+                    if not _hashes:
+                        await _say("Group changed — tap /act again.")
+                        return
+                    _title = await _row_title(_h)
+                    _text, _rows = self._keepq_text_and_rows(
+                        _title, f" · all {len(_hashes)} copies",
+                        f"all:{_h}")
+                else:
+                    _title = await _row_title(_h)
+                    _text, _rows = self._keepq_text_and_rows(
+                        _title, "", _h)
                 try:
-                    self._pending_pick = None
+                    await self._send_sheet(
+                        _text, _rows,
+                        reply_to=getattr(query, "message", None))
                 except Exception:
                     pass
-                if which != "yes":
-                    await _say("Not injected — nothing changed.")
+                return
+            if cmd == "keep" and _choice in ("yes", "no"):
+                if _all:
+                    _hashes = await _group_of(_h)
+                    _scope_title = await _row_title(_h)
+                else:
+                    _hashes = [_h]
+                    _scope_title = await _row_title(_h)
+                if not _hashes:
+                    await _say("Already gone from tracking")
                     await _refresh()
                     return
-                if not _hashes:
-                    await _say("Not injected — nothing to verify (expired?).")
+                result = await self._execute_snapshot_cancel(
+                    _hashes, _scope_title, delete_files=(_choice == "no"))
+                await _say(result)
+                await _refresh()
+                return
+            if cmd == "inject" and _h and not _choice:
+                coord = getattr(self, "_coord", None)
+                if coord is None:
+                    await _say("Action failed: bot not attached")
+                    return
+                try:
+                    resolved = await coord.injectfuse_resolve(_h)
+                except (LookupError, ValueError) as e:
+                    await _say(str(e)[:300])
+                    return
+                except Exception as e:  # noqa: BLE001
+                    await _say(f"Action failed: {e}")
+                    return
+                try:
+                    _ask = dict(resolved)
+                except Exception:
+                    _ask = resolved
+                await self._inject_ask_send(
+                    _ask, getattr(query, "message", None))
+                return
+            if cmd == "inject" and _choice in ("yes", "no"):
+                if _choice != "yes":
+                    await _say("Not injected — nothing changed.")
                     await _refresh()
                     return
                 try:
@@ -3287,62 +3538,38 @@ class TelegramBot:
                 try:
                     if _hold_ops_lock is not None:
                         async with _hold_ops_lock(coord):
-                            result = await coord.injectfuse_confirmed(_hashes)
+                            result = await coord.injectfuse_confirmed([_h])
                     else:
-                        result = await coord.injectfuse_confirmed(_hashes)
+                        result = await coord.injectfuse_confirmed([_h])
                 except Exception as e:  # noqa: BLE001
                     result = f"Action failed: {e}"
                 await _say(result[:300])
                 await _refresh()
                 return
-            if parts[0] == "pick" and len(parts) == 3:
-                _, seq, idx = parts
-                p = self._pending_live()
-                if (p is None or p.get("kind") != "pick"
-                        or str(p.get("seq") or "") != seq):
-                    await _say("Expired — tap the command again")
-                    return
-                if not _owner_ok(p):
-                    await _refuse_foreign()
-                    return
-                _mems = list(p.get("members") or [])
-                _cmd = str(p.get("cmd") or "")
-                _title = str(p.get("title") or "")
-                if idx == "all" and _cmd == "cancel" and len(_mems) > 1:
-                    self._set_pending_keepq(
-                        _title, f"all {len(_mems)} copies",
-                        [h for (h, _) in _mems], p.get("size"),
-                        user_id=_tapper)
-                    await _refresh()
-                    await _say("Keep downloaded files or delete them? Choose below.")
+            if cmd == "skip" and _all and _h:
+                _hashes = await _group_of(_h)
+                if not _hashes:
+                    await _say("Group changed — tap /act again.")
                     return
                 try:
-                    _i = int(idx)
-                    _h, _lbl = _mems[_i]
-                except (TypeError, ValueError, IndexError):
-                    await _say("Expired — tap the command again")
-                    return
-                except Exception:
-                    await _say("Expired — tap the command again")
-                    return
-                if _cmd == "cancel":
-                    self._set_pending_keepq(
-                        _title, f"{_lbl} copy", [_h], p.get("size"),
-                        user_id=_tapper)
-                    await _refresh()
-                    await _say("Keep downloaded files or delete them? Choose below.")
-                    return
-                try:
-                    self._pending_pick = None
-                except Exception:
-                    pass
-                try:
-                    if _cmd in ("fetch", "now"):
-                        result = await self._fetch_torrent(_h)
-                    else:
-                        result = await self._prefer_torrent(_h)
+                    result = await self._skip_torrents(_hashes, hold=True)
                 except Exception as e:  # noqa: BLE001
                     result = f"Action failed: {e}"
+                await _say(result)
+                await _refresh()
+                return
+            if cmd == "resume" and _h:
+                if _all:
+                    _hashes = await _group_of(_h)
+                    if not _hashes:
+                        await _say("Group changed — tap /act again.")
+                        return
+                else:
+                    _hashes = [_h]
+                try:
+                    result = await self._resume_hashes_reply(_hashes)
+                except Exception as e:  # noqa: BLE001
+                    result = f"Resume failed: {e}"
                 await _say(result)
                 await _refresh()
                 return
@@ -3695,12 +3922,6 @@ class TelegramBot:
                 return
             norm = (token or "").strip().lower()
             hashes: list[str] = []
-            # Unhold tracked rows (no-op text when nothing is held is
-            # still sent for group/prefix rows, matching /unskip_);
-            # skipped only for ignored-only hashes, where the lift
-            # below is the whole answer (keeps the "Unignored…"
-            # reply shape of /unignore_).
-            _skip_unhold = True
             if norm.isdigit():
                 try:
                     rows = await asyncio.to_thread(store.list_active_inflight)
@@ -3737,36 +3958,9 @@ class TelegramBot:
                     return
             elif len(norm) == 40 and all(
                     c in "0123456789abcdef" for c in norm):
-                # Single hash: unhold when tracked, lift when ignored —
-                # each half no-ops cleanly when absent, so one path
-                # covers rows, ignore entries, and both at once.
-                try:
-                    _row = await asyncio.to_thread(store.get, norm)
-                except Exception:
-                    _row = None
-                if _row is None:
-                    try:
-                        _fi = getattr(store, "find_ignored", None)
-                        _ign = await asyncio.to_thread(_fi, norm) \
-                            if callable(_fi) else None
-                    except LookupError:
-                        _ign = None
-                    except Exception:
-                        _ign = None
-                    if _ign is None:
-                        try:
-                            await self._reply(
-                                f"no tracked torrent starts with {norm!r} "
-                                "(it may already be done/cancelled)",
-                                reply_to=message)
-                        except Exception:
-                            pass
-                        return
-                    hashes = [norm]
-                    _skip_unhold = False
-                else:
-                    hashes = [norm]
-                    _skip_unhold = True
+                # Single hash: the shared core unholds tracked rows and
+                # lifts ignored hashes (each half no-ops cleanly absent).
+                hashes = [norm]
             else:
                 # Group id (older messages) or legacy torrent prefix for
                 # tracked rows. A hex token matching nothing tracked keeps
@@ -3821,32 +4015,9 @@ class TelegramBot:
                         pass
                     return
             try:
-                if _skip_unhold:
-                    unskip_text = await self._skip_torrents(hashes, hold=False)
-                else:
-                    unskip_text = ""
+                reply = await self._resume_hashes_reply(hashes)
             except Exception as e:  # noqa: BLE001
-                unskip_text = f"Resume failed: {e}"
-            lifted: list[str] = []
-            try:
-                for _h in hashes:
-                    try:
-                        _name, _err = await asyncio.to_thread(
-                            self._unignore_core, _h)
-                    except Exception:
-                        continue
-                    if _name:
-                        lifted.append(_name)
-            except Exception:
-                pass
-            reply = (unskip_text or "").strip()
-            if lifted:
-                shown = ", ".join(lifted[:3])
-                if len(lifted) > 3:
-                    shown += f" (+{len(lifted) - 3} more)"
-                extra = (f"Unignored {shown} — re-send .torrent via /add "
-                         f"(or re-drop) to track again.")
-                reply = f"{reply} {extra}".strip() if reply else extra
+                reply = f"Resume failed: {e}"
             try:
                 await self._reply(reply[:300], reply_to=message)
             except Exception:
@@ -4099,24 +4270,14 @@ class TelegramBot:
         if len(text) > 4096:
             text = _safe_truncate_markdown(text)
         self._current_page = cur_page
-        # Pending two-step pick (member choice or keep/delete question):
-        # question section under the footer, choice rows in the keyboard.
-        try:
-            qtext, qrows = self._pending_section()
-        except Exception:
-            qtext, qrows = "", []
-        if qtext:
-            text += f"\n{_esc('_' * 35)}\n{qtext}"
-        keyboard = self._build_keyboard(cur_page, total_pages, qrows)
+        keyboard = self._build_keyboard(cur_page, total_pages)
 
-        # Skip the API call if page, total_pages, text and pending rows
-        # are identical — unless a keep-at-bottom repost is due (position
-        # refreshes even when the content is unchanged). Button digests
-        # stay in the key: a button-only change must re-send, otherwise
-        # taps desync from the frozen snapshot.
+        # Skip the API call if page, total_pages and text are identical
+        # — unless a keep-at-bottom repost is due (position refreshes
+        # even when the content is unchanged). Button digests stay in
+        # the key: a button-only change must re-send.
         try:
-            cache_key = (cur_page, total_pages, text,
-                         tuple(_d for _r in qrows for _, _d in _r))
+            cache_key = (cur_page, total_pages, text)
         except Exception:
             cache_key = (cur_page, total_pages, text)
 
