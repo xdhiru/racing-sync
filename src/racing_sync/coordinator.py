@@ -1119,10 +1119,63 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             self._running_infohashes.discard(h)
             raise
         self._tasks.add(task)
+        try:
+            _wt = getattr(self, "_worker_tasks", None)
+            if not isinstance(_wt, dict):
+                _wt = {}
+                self._worker_tasks = _wt  # type: ignore[attr-defined]
+            _wt.setdefault(h, set()).add(task)
+        except Exception:
+            pass
         def _done_cb(t: asyncio.Task, infohash: str = h) -> None:
             self._tasks.discard(t)
             self._running_infohashes.discard(infohash)
+            try:
+                _wt2 = getattr(self, "_worker_tasks", None)
+                if isinstance(_wt2, dict):
+                    _s = _wt2.get(infohash)
+                    if isinstance(_s, set):
+                        _s.discard(t)
+                        if not _s:
+                            _wt2.pop(infohash, None)
+            except Exception:
+                pass
         task.add_done_callback(_done_cb)
+
+    async def stop_workers_for(self, infohash: str) -> bool:
+        """Cancel live workers for one hash; True when any were stopped.
+
+        Used by forget-without-remember (never-seen semantics): the row
+        is hard-deleted right after, so a stale in-flight upsert must
+        not resurrect it as a zombie. Cancellation is clean — the worker
+        wrapper unwinds through AbandonedError/quiet paths and its
+        finally drops the live map. Best-effort and idempotent; unknown
+        hashes (and bare test doubles) report False.
+        """
+        try:
+            h = (infohash or "").strip().lower()
+            if not h:
+                return False
+            try:
+                _wt = getattr(self, "_worker_tasks", None)
+                _tasks = list(_wt.get(h, ())) if isinstance(_wt, dict) else []
+            except Exception:
+                return False
+            _live = [t for t in _tasks if not t.done()]
+            if not _live:
+                return False
+            for t in _live:
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            try:
+                await asyncio.gather(*_live, return_exceptions=True)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
 
     async def _tick(self) -> None:
         """One iteration: poll sources, schedule work (serialized vs API ops)."""

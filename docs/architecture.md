@@ -299,10 +299,17 @@ the typed verbs (`/cancel_` / `/now_` / `/skip_` / `/resume_` /
 shortcuts. Every button carries its copy's hash (single `:<hash>` or
 group `:<all|all-scope>:<leader-hash>`) and is re-resolved live at tap
 time, so renumbering mid-flow cannot misroute and no picker state
-exists to expire. Tapping a group cancel asks a keep/delete question
-in reply (Yes = untrack + ignore with files kept, No = wiped);
-cancelling `All` drops every copy, a single copy drops just it
-(leader-tap cascades to deferred pairs as before). Full hashes and
+exists to expire. Tapping a group cancel first asks remember-or-not
+(Ignore blocks the release from coming back; Just forget leaves it
+re-addable), then keep/delete (Yes = untrack + optionally ignore with
+files kept, No = wiped); cancelling `All` drops every copy, a single
+copy drops just it
+(leader-tap cascades to deferred pairs as before). Without remember
+the row is hard-deleted (no tombstone), so a later re-drop re-ingests
+from scratch. Delete/keep only ever concerns SSD data and client
+entries: fuse/remote copies are never touched (fuse-pointing entries
+are always removed file-less, and local deletes are confined to the
+SSD roots). Full hashes and
 legacy hash prefixes still work when typed; detail cards keep their
 per-torrent text commands. `WAITING_INDEXER` detail cards additionally
 render `Start SSD download now: /now_<short-hash>`, and grace-held NEW

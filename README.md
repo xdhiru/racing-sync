@@ -123,11 +123,15 @@ numbered; same-file copies share one heading) to open its action sheet:
 per-copy Cancel buttons plus group actions (Cancel all, Start now,
 Inject, Skip/Resume) — every button carries its copy's hash and is
 re-resolved live at tap time, so renumbering mid-flow can't misroute.
-Cancelling asks a keep question in reply: `Keep files` untracks +
-ignores with data left in place (same as CLI `--keep-files`),
-`Delete files` wipes it. Nothing is deleted without that explicit
-choice. A `Start now: /now_<id>` line appears only while a copy
-qualifies (waiting on the indexer, or holding for a preferred copy):
+Cancelling first asks whether to remember the release: `Ignore +
+forget` blocks it from coming back (same as CLI `--ignore`), `Just
+forget` leaves it re-addable later. Then comes the keep question:
+`Keep files` untracks with data left in place (same as CLI
+`--keep-files`), `Delete files` wipes it. Nothing is deleted without
+those explicit choices, and delete/keep only ever concerns SSD data
+and client entries — fuse/remote copies are never touched. A `Start
+now: /now_<id>` line appears only while a copy qualifies (waiting on
+the indexer, or holding for a preferred copy):
 start its SSD download immediately — waiting on the indexer uses the
 VPS1 original right away rather than waiting out Prowlarr retries
 (counts toward private-tracker ratio); waiting siblings then seed

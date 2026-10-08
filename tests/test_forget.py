@@ -559,6 +559,122 @@ async def test_worker_never_resurrects_forgotten_row(tmp_path: Path):
         store.close()
 
 
+def test_hard_delete_removes_row_outright(tmp_path: Path):
+    """hard_delete drops the row with no tombstone (never-seen semantics)."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        store.upsert(_row())
+        assert store.hard_delete("a" * 40) is True
+        raw = store._conn.execute(
+            "SELECT COUNT(*) AS n FROM torrent_state WHERE source_infohash = ?",
+            ("a" * 40,)).fetchone()
+        assert raw["n"] == 0
+        assert store.hard_delete("a" * 40) is False
+        assert store.hard_delete("") is False
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_forget_hard_removes_row_and_allows_reingest(tmp_path: Path):
+    """Forget without remember: gone everywhere, re-drop works at once."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(_row(save_path=str(ssd)))
+    dest = FakeDest()
+    try:
+        result = await forget_torrent(
+            _cfg(ssd), dest=dest, store=store, target="a" * 40,
+            apply=True, delete_files=False, ignore=False, hard=True,
+        )
+        assert result["applied"] is True
+        assert result["ignored"] is False
+        assert result["errors"] == []
+        raw = store._conn.execute(
+            "SELECT COUNT(*) AS n FROM torrent_state WHERE source_infohash = ?",
+            ("a" * 40,)).fetchone()
+        assert raw["n"] == 0
+        assert store.is_ignored("a" * 40) is False
+        # Never-seen: the same hash re-ingests immediately (no tombstone
+        # refill refusal, no ignore veto).
+        store.upsert(_row(save_path=str(ssd)))
+        assert store.get("a" * 40) is not None
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_forget_hard_with_ignore_keeps_ignore_list(tmp_path: Path):
+    """hard + ignore compose: row gone, return still blocked."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(_row(save_path=str(ssd)))
+    dest = FakeDest()
+    try:
+        result = await forget_torrent(
+            _cfg(ssd), dest=dest, store=store, target="a" * 40,
+            apply=True, delete_files=False, ignore=True, hard=True,
+        )
+        assert result["ignored"] is True
+        assert store.get("a" * 40) is None
+        assert store.is_ignored("a" * 40) is True
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_stop_workers_for_cancels_live_task(tmp_path: Path):
+    """Forget-without-remember stops workers so no upsert resurrects."""
+    import asyncio
+
+    from conftest import make_coordinator
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        assert await coord.stop_workers_for("a" * 40) is False
+        task = asyncio.ensure_future(asyncio.sleep(60))
+        try:
+            coord._worker_tasks = {"a" * 40: {task}}
+            assert await coord.stop_workers_for("a" * 40) is True
+            assert task.done()
+            assert await coord.stop_workers_for("a" * 40) is False
+        finally:
+            if not task.done():
+                task.cancel()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_spawn_worker_tracks_task_until_done(tmp_path: Path):
+    """Spawned workers are tracked for stop_workers_for, then released."""
+    import asyncio
+
+    from unittest.mock import AsyncMock
+
+    from conftest import make_coordinator
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord.cfg = MagicMock()
+        coord._process_torrent = AsyncMock()
+        ts = TorrentState(source_infohash="a" * 40, source_name="Show",
+                          state=State.NEW)
+        coord._spawn_worker(ts)
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if not getattr(coord, "_worker_tasks", {}).get("a" * 40):
+                break
+        assert not getattr(coord, "_worker_tasks", {}).get("a" * 40)
+        assert "a" * 40 not in coord._running_infohashes
+    finally:
+        store.close()
+
+
 def test_resolve_row_rejects_short_hash_and_hash_dupes(tmp_path: Path):
     """1-char fragments never match hashes; dupes error instead of first-wins."""
     store = StateStore(tmp_path / "state.db")
