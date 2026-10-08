@@ -11,6 +11,7 @@ src/racing_sync/
   classifier.py       movie / episode / season
   batcher.py          SSD-aware episode batching
   rclone_ops.py       rclone subprocess wrapper
+  io_bounds.py        RPC timeouts + concurrency bounds (rpc/chunked/offload)
   safety.py           Central destructive-path guards (delete validation, fuse overlap, reset refusals)
   sftp_source.py      paramiko-based .torrent export (pooled)
   prowlarr.py         Prowlarr client (indexers, search, download)
@@ -37,18 +38,59 @@ src/racing_sync/
 
 ## State machine
 
+```mermaid
+stateDiagram-v2
+    direction TB
+
+    [*] --> NEW
+    NEW --> WAITING_INDEXER : need SSD source
+    WAITING_INDEXER --> WAITING_DISK : source found
+    NEW --> WAITING_DISK : source found
+    WAITING_DISK --> QUEUED : budget reserved
+    QUEUED --> DOWNLOADING : slot free
+    DOWNLOADING --> MOVING : batch complete
+    MOVING --> RE_ADDING : verified move
+    RE_ADDING --> DONE : fuse verified
+    DONE --> [*]
+
+    NEW --> DONE : manual adoption
+    WAITING_INDEXER --> DONE : manual adoption
+    WAITING_DISK --> DONE : manual adoption
+    QUEUED --> RE_ADDING : already remote
+    QUEUED --> MOVING : SSD-complete
+    DOWNLOADING --> RE_ADDING : /injectfuse
+    MOVING --> DOWNLOADING : resume
+    DOWNLOADING --> QUEUED : back off
+    QUEUED --> WAITING_DISK : over budget
+    RE_ADDING --> MOVING : SSD bytes remain
+    DONE --> RE_ADDING : lost fuse
+    DONE --> MOVING : false DONE
+
+    NEW --> FAILED
+    WAITING_INDEXER --> FAILED
+    WAITING_DISK --> FAILED
+    QUEUED --> FAILED
+    DOWNLOADING --> FAILED
+    MOVING --> FAILED
+    RE_ADDING --> FAILED : 24h max age
+    FAILED --> QUEUED : retry
+    FAILED --> NEW : retry
+    FAILED --> RE_ADDING : /injectfuse
+
+    classDef doneStyle stroke:#2da44e,stroke-width:3px
+    classDef failedStyle stroke:#cf222e,stroke-width:3px
+    classDef waitStyle stroke:#bf8700,stroke-width:2px
+    classDef moveStyle stroke:#0969da,stroke-width:2px
+    class DONE doneStyle
+    class FAILED failedStyle
+    class WAITING_INDEXER waitStyle
+    class WAITING_DISK waitStyle
+    class MOVING moveStyle
+    class RE_ADDING moveStyle
 ```
-NEW ──┬─> WAITING_INDEXER ──> WAITING_DISK ──> QUEUED ──> DOWNLOADING ──> MOVING ──> RE_ADDING ──> DONE
-      │              │                  │    │          │            │             │                  │ ^
-      │              │                  │    │          │            │             │                  │ │
-      └──────────────┴──────────────────┴────┴──────────┴────────────┴──> (any) ──> FAILED ──────────┘ │
-                                                                                  │  │                          │
-                                                                          QUEUED/NEW retry  │  lost fuse ───────┘
-                                                                                            │  (RE_ADDING, ≤5 rapid
-                                                                                            │   flaps, else FAILED)
-                                                                             false DONE ────────────────────────┘
-                                                                                  (self-heal via MOVING)
-```
+
+Full edge list is `ALLOWED` in `src/racing_sync/state.py`; the diagram
+shows the travelled edges.
 
 `DONE` is terminal-ish but not final: a lost fuse entry demotes
 `DONE → RE_ADDING`, a falsely adopted `DONE` (bytes never moved) demotes
@@ -165,7 +207,10 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
     to `ERROR "MOVING stalled …"` with the gate reason in `last_error`.
     - `rclone move <local> <remote> -- <extra_move_flags>` with per-file
       `--files-from-raw` lists (literal paths, no globs) preserving the
-      torrent-relative tree. `extra_move_flags` / `batch_move_extra_flags`
+      torrent-relative tree — including folder-wrapped single files
+      (`Top/file.mkv` moves as `Top/file.mkv`, never flattened to the
+      remote root; only root-level flat singles move bare).
+      `extra_move_flags` / `batch_move_extra_flags`
       live under `[rclone]` and reject config/credential-hijack flags.
     - A move only counts when rclone exits 0 *and* the listed files are gone
       from SSD (symlinks/unreadables count as leftovers); otherwise the

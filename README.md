@@ -5,45 +5,28 @@ Two-VPS torrent synchroniser for racing workflows.
 - **VPS1** (source) — fast racing client (qBittorrent or Deluge) with autobrr.
 - **VPS2** (destination) — long-term seed client (qBittorrent) with SSD cap + rclone offload to remote storage.
 
-If you race torrents on a fast seedbox but don't want to pay for huge disks
-there, this is for you: keep racing on VPS1, let racing-sync copy what
-matters to VPS2, offload it to remote storage with rclone, and keep seeding
-from there long-term — automatically.
-
-## What problem does it solve?
-
-Racing needs speed; long-term seeding needs cheap space. One box rarely
-gives you both:
-
-- VPS1 is fast with a small disk — great for winning the race, terrible for
-  keeping 100s of torrents around.
-- VPS2 has a small local SSD plus effectively unlimited remote storage
-  (via an rclone mount) — great for seeding forever, terrible for racing.
-
-Manually copying `.torrent` files between clients, watching SSD free space,
-moving finished files, and re-adding everything to seed is tedious and
-error-prone. racing-sync runs that loop for you, 24/7, with crash recovery.
+Race on VPS1, seed forever from VPS2: racing-sync copies what matters
+to the VPS2 SSD, offloads it to remote storage with rclone, and keeps
+seeding from a fuse mount — automatically, with crash recovery.
 
 ## How it works
 
 1. **Spot it:** a new torrent appears on VPS1.
 2. **Find the best copy:** prefer a public copy when one exists, otherwise
-   look the release up on your private indexers via Prowlarr, otherwise
+   look the release up on private indexers via Prowlarr, otherwise
    export it directly from VPS1.
-3. **Stage it on SSD:** download it to the VPS2 SSD (movies in one go, big
-   season packs in small batches so a 40 GB SSD can handle a 100 GB season).
-4. **Offload it:** `rclone move` verified files to your remote
-   (`remote:qbittorrent/`, single episodes go to `.../unsorted/`).
-5. **Keep seeding:** re-add the torrent on VPS2 pointing at the fuse mount
-   with instant-check, so you seed long-term without using SSD space.
+3. **Stage it on SSD:** download it to the VPS2 SSD (big season packs in
+   small batches, so a 40 GB SSD can handle a 100 GB season).
+4. **Offload it:** `rclone move` verified files to the remote
+   (movies/seasons to `remote:qbittorrent/`, single episodes to
+   `.../unsorted/`).
+5. **Keep seeding:** re-add the torrent on VPS2 pointing at the fuse mount,
+   so you seed long-term without using SSD space.
 
-A few guarantees underneath: one SSD budget shared by all downloads (no
-joint overfill); batches move only after verification, so only complete
-files reach the remote; every fuse re-add is confirmed visible (lagging
-mounts park and retry); anything already on fuse skips the download and
-goes straight to seeding; and all state lives in SQLite, so restarts resume
-mid-pipeline. Public torrents land paused by default (see
-`cross_seed.pause_public_torrents_on_fuse`). Full design in
+Only verified-complete files reach the remote; every fuse re-add is
+confirmed visible before marking done; anything already on fuse skips
+straight to seeding. State lives in SQLite, so restarts resume
+mid-pipeline. Public torrents land paused by default. Full design in
 `docs/architecture.md`.
 
 ## Quickstart
@@ -98,7 +81,7 @@ python3 run.py run --config config.toml --full --yes
 ### Abandon a torrent (`forget`)
 
 The off-switch for a torrent the pipeline won't drop on its own. Removes
-the DB row, the destination client entries, local SSD data and cached
+the DB row, destination client entries, local SSD data and cached
 `.torrent` blobs (fuse/remote copies are never touched). Dry-run by
 default; `--apply` deletes:
 
@@ -109,88 +92,31 @@ python3 run.py forget --config config.toml <infohash|name> --apply --keep-files
 python3 run.py forget --config config.toml <infohash|name> --apply --ignore
 ```
 
-`<infohash|name>` is a 40-char infohash or a unique name fragment
-(ambiguous names show candidates instead of guessing). Forgetting an SSD
-download also forgets the watch-dir rows waiting on it; `--ignore` blocks
-it from ever coming back while listed on VPS1 (undo with `unignore`,
-`--all` to undo every entry at once — both also lift the forget block so
-re-dropped files reprocess immediately).
-Same thing via API: `POST /api/forget/{hash}?ignore=true&delete_files=false`
-(full 40-char hash required, always applies; `delete_files=false` = `--keep-files`).
+`<infohash|name>` is a 40-char infohash or a unique name fragment.
+`--ignore` blocks it from ever coming back while listed on VPS1 (undo with
+`unignore`, `--all` to undo every entry). Same thing via API:
+`POST /api/forget/{hash}`. Full API surface in `docs/architecture.md`.
 
-From Telegram, tap the `/act_3` line under a file group (groups are
-numbered; same-file copies share one heading) to open its action sheet:
-per-copy Cancel buttons plus group actions (Cancel all, Start now,
-Inject, Skip/Resume) — every button carries its copy's hash and is
-re-resolved live at tap time, so renumbering mid-flow can't misroute.
-Cancelling first asks whether to remember the release: `Ignore +
-forget` blocks it from coming back (same as CLI `--ignore`), `Just
-forget` leaves it re-addable later. Then comes the keep question:
-`Keep files` untracks with data left in place (same as CLI
-`--keep-files`), `Delete files` wipes it. Nothing is deleted without
-those explicit choices, and delete/keep only ever concerns SSD data
-and client entries — fuse/remote copies are never touched. To cancel
-several groups at once, send `/cancel_match <text>` (also in the `/`
-menu): every active group whose title contains `<text>` is cancelled
-together after one remember + one keep/delete question. Answered
-question sheets delete themselves once tapped (only the outcome
-reply stays) — no manual Close needed. A `Start
-now: /now_<id>` line appears only while a copy qualifies (waiting on
-the indexer, or holding for a preferred copy):
-start its SSD download immediately — waiting on the indexer uses the
-VPS1 original right away rather than waiting out Prowlarr retries
-(counts toward private-tracker ratio); waiting siblings then seed
-from fuse/remote after. The same fallback can trigger
-automatically at the deadline with
-`cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout` (default off).
+### Telegram
+
+One message per torrent (detail card, edited in place) plus one
+active-tasks list. Tap `/act_<n>` under a group for its action sheet:
+Cancel, Start now, Inject, Skip/Resume. Cancelling asks two questions —
+remember the release (`Ignore` blocks it from coming back, `Just forget`
+leaves it re-addable) and keep or delete SSD data. `/cancel_match <text>`
+cancels every group whose title contains `<text>` at once; `/now_<id>`
+starts a waiting row immediately. Nothing is deleted without an explicit
+choice; fuse/remote copies are never touched.
 
 `check-config` also warns on unknown config keys (typo catcher).
-
-### Installed alternative
-
-Same virtualenv as above, then use the installed entrypoint instead of
-`run.py`:
-
-```bash
-pip install -e ".[api,test]"
-cp config.example.toml config.toml
-# edit config.toml
-racing-sync run --config config.toml
-```
-
-Editable installs also track `git pull` (restart only). Avoid plain
-`pip install .` — it freezes a copy of the code and ignores later pulls.
 
 ## Layout
 
 ```
-src/racing_sync/
-  __main__.py         # CLI entrypoint
-  config.py           # Pydantic config schema
-  logging_setup.py    # Logging: file + sink + ring buffer
-  prowlarr.py         # Prowlarr client
-  classifier.py       # movie / episode / season
-  batcher.py          # SSD-aware episode batching
-  rclone_ops.py       # rclone subprocess wrapper
-  sftp_source.py      # SSH / SFTP torrent export
-  state.py            # SQLite-backed state machine
-  coordinator.py      # Main async loop (tick, dispatch, transitions)
-  coordinator_ssd.py  # SSD batch caps + global reservation ledger
-  coordinator_picker.py # Cross-seed SSD-source picker (req #1/#2)
-  coordinator_cleanup.py # VPS1 cleanup janitor
-  coordinator_paths.py # Untrusted torrent-relative path guard
-  coordinator_errors.py # Retryable WebUI / batch-move error contract
-  coordinator_content.py # Stateless helpers (normalize, grace, notify filter)
-  content_keys.py     # Single same-release/same-content key rule
-  fuse_gate.py        # Single fuse verification gate (verdict + missing + skip)
-  recovery.py         # Reconciler (req #4)
-  forget.py           # Abandon a torrent (row + client entries + SSD data)
-  watchdir.py         # Manual torrent drop scanner
-  api.py              # Optional FastAPI control plane
-  clients/
-    abstract.py       # TorrentClient ABC + dataclasses
-    http_base.py      # HTTP client base with auth
-    qbittorrent.py    # qBittorrent WebUI wrapper
-    deluge.py         # Deluge JSON-RPC wrapper
-  telegram_bot.py     # Live status cards + active-tasks list
+src/racing_sync/   # coordinator.py = main loop; classifier/batcher =
+                   # what/how to download; rclone_ops = offload; state.py =
+                   # SQLite state machine; telegram_bot.py = status cards;
+                   # api.py = control plane; clients/ = qBittorrent/Deluge
 ```
+
+Full module map in `docs/architecture.md`.
