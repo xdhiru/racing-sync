@@ -952,6 +952,34 @@ async def test_group_now_singleton_executes_immediately(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_group_now_multi_offers_per_copy_start_buttons(tmp_path: Path):
+    """Several eligible copies each get their own Start button (by tracker)."""
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Twin.Show",
+                              total_bytes=1000, state=State.WAITING_INDEXER,
+                              source_announce_url="https://alpha.cc/announce"))
+    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Twin.Show",
+                              total_bytes=1000, state=State.WAITING_INDEXER,
+                              source_announce_url="https://bte.example/announce"))
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/now_1"))
+        assert store.get("a" * 40).force_direct == 0  # nothing started yet
+        _kwargs = bot._bot.send_message.call_args[1]
+        _labels = [b.text for r in
+                   _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        assert any(t.startswith("▶ Start ") for t in _labels)
+        assert f"go:{'a' * 40}" in _data
+        assert f"go:{'b' * 40}" in _data
+    finally:
+        store.close()
+
+
 def test_keepq_text_shows_size_or_omits():
     from racing_sync.telegram_bot import TelegramBot
 
@@ -965,9 +993,12 @@ def test_keepq_text_shows_size_or_omits():
     assert f"keep:all:{'a' * 40}:yes" in _flat
     assert f"keep:all:{'a' * 40}:no" in _flat
     assert ("Close", "abort") in _pairs
+    assert [t for (t, _) in _pairs] == [
+        "✔ Keep files", "✖ Delete files", "Close"]
     # Rows without size still render (no dangling separator).
     _text2, _ = bot._keepq_text_and_rows("Big.Show", "", "a" * 40)
     assert "Big.Show" in _text2 and "·" not in _text2.split("—")[0]
+    assert "data stays in place" in _text2 and "wipes" in _text2
 
 
 def test_sheet_buttons_fit_telegram_callback_budget():
@@ -1543,6 +1574,13 @@ async def test_act_command_replies_sheet_with_hash_buttons(tmp_path: Path):
         assert "abort" in _data
         assert not any(d.startswith("pick:") for d in _data)
         assert store.get("a" * 40) is not None  # sheet changes nothing
+        _labels = [b.text for r in
+                   _kwargs["reply_markup"].inline_keyboard for b in r]
+        # Every button names its verb and target — no memorized commands.
+        assert any(t.startswith("▶ Start ") for t in _labels)
+        assert any(t.startswith("✖ Cancel ") for t in _labels)
+        assert any("Skip" in t or "Resume" in t or "Inject" in t
+                   for t in _labels)
     finally:
         store.close()
 
