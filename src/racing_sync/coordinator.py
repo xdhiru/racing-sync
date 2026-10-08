@@ -2675,8 +2675,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             return
         # Global SSD ledger: reserve before QUEUED so concurrent high-size
         # arrivals can't all pass a point-in-time free check and exceed the
-        # budget as they grow. Estimate uses the stable configured cap.
+        # budget as they grow. Prefer the blob-derived batch footprint
+        # (what one batch really occupies) over the total-capped estimate,
+        # so a 100 GB season of small episodes admits on one batch of free
+        # space instead of demanding the whole cap while unclassified.
+        # Fail-open: any doubt keeps today's estimate.
         needed = self._ssd_estimate_for_new(size_bytes)
+        try:
+            _foot = self._blob_admit_footprint(ts, blob, size_bytes)
+        except Exception:
+            _foot = None
+        if isinstance(_foot, int) and not isinstance(_foot, bool) and _foot > 0:
+            if _foot < needed:
+                log.info(
+                    "admitting %s against ~%d MB batch footprint "
+                    "(total ~%d MB)", display_name,
+                    _foot // (1024 * 1024), needed // (1024 * 1024),
+                )
+            needed = min(needed, _foot)
         if not await self._ssd_try_reserve(ts.source_infohash, needed):
             log.info(
                 "ssd budget in use (reserved ~%d MB); parking %s",
@@ -4208,6 +4224,36 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 admitted = await self._ssd_try_reserve(ts.source_infohash, rem)
                 if admitted:
                     needed = rem
+        if not admitted:
+            # Still full: an unclassified row (never reached batch setup,
+            # so no cursors for the retry above) may still be batchable —
+            # size one batch from its persisted .torrent bytes instead of
+            # demanding the whole cap. Blob fetch is off-loop and runs
+            # only on this otherwise-park path.
+            try:
+                _blob = getattr(ts, "_blob", None) or None
+                if not _blob:
+                    try:
+                        _blob = await asyncio.to_thread(
+                            self.store.get_blob, ts.source_infohash)
+                    except Exception:
+                        _blob = None
+                try:
+                    _foot = self._blob_admit_footprint(
+                        ts, _blob, ts.total_bytes or 0)
+                except Exception:
+                    _foot = None
+            except Exception:
+                _foot = None
+            if isinstance(_foot, int) and not isinstance(_foot, bool) \
+                    and 0 < _foot < needed:
+                log.info("retrying %s against ~%d MB batch footprint "
+                         "(full ~%d MB did not fit)",
+                         ts.source_name[:60], _foot // (1024 * 1024),
+                         needed // (1024 * 1024))
+                admitted = await self._ssd_try_reserve(ts.source_infohash, _foot)
+                if admitted:
+                    needed = _foot
         if admitted:
             try:
                 _wd = getattr(self, "_waiting_disk_next_check", None)
@@ -4818,6 +4864,46 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 ts, State.FAILED, error=f"single file larger than skip threshold: {too_big}",
             )
             return
+
+        # Batch-cap feasibility: a single file bigger than the batch cap
+        # can never download — admission reserves at most the cap, and
+        # the post-classify refine to the real footprint would fail every
+        # cycle, looping add/delete + WAITING_DISK forever without ever
+        # failing (e.g. skip threshold set above max_inflight_bytes).
+        # Fail loudly here instead, with the same terminal handling.
+        try:
+            _fit_cap = self._frozen_batch_cap(ts)
+        except Exception:
+            _fit_cap = 0
+        if _fit_cap > 0:
+            _too_big_for_cap: str | None = None
+            try:
+                for _f in files or []:
+                    try:
+                        _nm = getattr(_f, "name", "") or ""
+                        _sz = int(getattr(_f, "size_bytes", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if _nm and _sz > _fit_cap:
+                        _too_big_for_cap = _nm
+                        break
+            except Exception:
+                _too_big_for_cap = None
+            if _too_big_for_cap is not None:
+                log.warning("single file %s exceeds batch cap (%d B); failing %s",
+                            _too_big_for_cap, _fit_cap, ts.source_name)
+                # Remove the paused torrent from VPS2 so it does not leak as an orphan
+                h = ts.dest_infohash or ts.source_infohash
+                if h:
+                    try:
+                        await self.dest_client.delete(h, delete_files=True)
+                    except Exception as e:
+                        log.warning("failed to delete over-cap content %s: %s", h[:10], e)
+                self.transition(
+                    ts, State.FAILED,
+                    error=f"single file larger than batch cap ({_fit_cap} B): {_too_big_for_cap}",
+                )
+                return
 
         # Apply batch file priorities for seasons
         first_need: set[str] | None = None
