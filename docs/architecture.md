@@ -105,13 +105,13 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
       The same rule covers watch drops: a NEW drop defers to an in-flight
       same-content row of any origin (the watch election can't see racing
       rows) instead of grace-holding and then downloading a duplicate —
-      operator `/prefer_` still overrides.
+       operator `/now_` still overrides.
       Past `prowlarr_max_age_seconds` the row fails — unless
       `cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout` is set,
       in which case it uses the racing torrent's own bytes instead (with a
       fresh retry window for the direct attempts, then FAILED if VPS1 stays
-      unreachable), or the operator sends Telegram `/fetch_<hash>` while it
-      is still waiting (sticky per-row `force_direct` bypasses Prowlarr on
+       unreachable), or the operator sends Telegram `/now_<hash>` while it
+       is still waiting (sticky per-row `force_direct` bypasses Prowlarr on
       every later pick, also with a fresh window). Transient SFTP drops
       park for the next interval; only a persistently unreachable VPS1 fails
       the row. `--reset` wipes the flag with the DB — the torrent is
@@ -292,35 +292,33 @@ advances) plus one active-tasks list message, refreshed every
 `status_update_interval` seconds with pagination buttons. The list groups
 same-file copies (normalized name + size, the election identity) under one
 numbered heading with the size once; each tracker gets a display-only
-`▸ <domain> <stage>` line; short positional commands on one line
-(`/cancel_3` plus `/fetch_3` / `/prefer_3` while a member qualifies —
-group numbers, never torrent hashes, so cancel + fetch fit one row on
-narrow screens) open member-choice buttons below the list
-(3 across, tracker shortnames; the tap freezes a member snapshot, so
-later renumbering cannot misroute, and every flow has a Cancel button).
-Tapping a group cancel asks a keep/delete question under the footer
-(Yes = untrack + ignore with files kept, No = wiped); cancelling `All`
-drops every copy, a single copy drops just it (leader-tap cascades to
-deferred pairs as before). The pending question always names the locked
-group title so a shifted list is verifiable; stale taps expire after
-5 minutes. Full hashes and legacy hash prefixes still
-work when typed; detail cards keep their per-torrent text commands.
-`WAITING_INDEXER` detail cards additionally render
-`Fetch original: /fetch_<short-hash>`, and grace-held NEW watch rows'
-cards render `Prefer this copy now: /prefer_<short-hash>`. The updates poller also watches
+`▸ <domain> <stage>` line; one positional command per group (`/act_3`)
+opens its action sheet with only the currently eligible actions —
+the typed verbs (`/cancel_` / `/now_` / `/skip_` / `/resume_` /
+`/injectfuse_` with the same number or hash) all keep working as
+shortcuts. Every button carries its copy's hash (single `:<hash>` or
+group `:<all|all-scope>:<leader-hash>`) and is re-resolved live at tap
+time, so renumbering mid-flow cannot misroute and no picker state
+exists to expire. Tapping a group cancel asks a keep/delete question
+in reply (Yes = untrack + ignore with files kept, No = wiped);
+cancelling `All` drops every copy, a single copy drops just it
+(leader-tap cascades to deferred pairs as before). Full hashes and
+legacy hash prefixes still work when typed; detail cards keep their
+per-torrent text commands. `WAITING_INDEXER` detail cards additionally
+render `Start SSD download now: /now_<short-hash>`, and grace-held NEW
+watch rows' cards render `Start this copy now: /now_<short-hash>`.
+The updates poller also watches
 chat messages: a group/hash command from the configured chat/user
-resolves and runs the two-step flow above, then replies with the outcome
+resolves and runs the flow above, then replies with the outcome
 and frees the SSD reservation. Cancelling an SSD owner also forgets the watch rows
 currently deferred on it (same election winner), reported in the reply;
-cancelling a waiter leaves the rest alone. A `/fetch_<...>` line flags
-a waiting row (`force_direct`)
-and marks its timer due so the next scheduler wakeup picks it up at once
-(the racing torrent's own bytes feed the SSD download); non-waiting targets get an
-explanatory reply. A `/prefer_<...>` line exempts a grace-held row
-(watch drop or racing row, one-shot) and wakes it so its SSD download
-starts at once; later same-content rows defer to it via the existing election, no follower
-update needed. Unknown/ambiguous prefixes get an explanatory
-reply. `/injectfuse_<group>` (waiting groups in the list) and
+cancelling a waiter leaves the rest alone. A `/now_<...>` line starts
+a waiting row at once (`force_direct`, timer due for the next scheduler
+wakeup — the racing torrent's own bytes feed the SSD download) or a
+grace-held row (watch drop or racing row); non-waiting targets get an
+explanatory reply, and later same-content rows defer via the existing
+election (no follower update needed). Unknown/ambiguous prefixes get an
+explanatory reply. `/injectfuse_<group>` (waiting groups in the list) and
 `/injectfuse <full-hash>` (any VPS1 torrent, tracked or not) ask a
 Yes/No question naming the locked group; on Yes every member's
 .torrent must verify complete at its fuse target or nothing changes

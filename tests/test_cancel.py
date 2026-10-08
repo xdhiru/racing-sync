@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from conftest import make_coordinator
 
-from racing_sync.clients.abstract import Torrent, TorrentFile
+from racing_sync.clients.abstract import Torrent
 from racing_sync.state import State, StateStore, TorrentState
 
 # ---------------------------------------------------------------------------
@@ -519,48 +519,49 @@ async def test_admin_allowlist_refuses_stranger_command(tmp_path: Path):
         store.upsert(TorrentState(source_infohash="a" * 40,
                                   source_name="Show", state=State.MOVING))
         await bot._handle_chat_message(_message(user="9", text="/cancel_1"))
-        assert bot._pending_live() is None
         sent = [c.args[1] for c in
                 bot._bot.send_message.await_args_list]
         assert any("Not authorized" in str(t) for t in sent)
-        # Listed admin proceeds normally.
+        # Listed admin proceeds normally (keep question, nothing deleted).
         bot._bot.send_message.reset_mock()
         bot._callback_times.clear()
         await bot._handle_chat_message(
             _message(user="4242", text="/cancel_1"))
-        assert bot._pending_live() is not None
+        assert store.get("a" * 40) is not None
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        assert f"keep:{'a' * 40}:yes" in _data
     finally:
         store.close()
 
 
 @pytest.mark.anyio
-async def test_pending_flow_bound_to_commanding_user(tmp_path: Path):
-    """A different known user cannot tap another operator's picker."""
+async def test_stranger_tap_refused_by_allowlist(tmp_path: Path):
+    """Per-tap admin auth replaces picker owner-binding: strangers refused."""
     from racing_sync.state import StateStore
 
     store = StateStore(tmp_path / "state.db")
     bot = _bot()
     bot._store = store
-    bot._coord = MagicMock()
-    bot._refresh_active_message = AsyncMock()
+    bot._cfg = SimpleNamespace(chat_id="1", page_size=5,
+                               admin_user_ids=[4242])
     try:
         store.upsert(TorrentState(source_infohash="a" * 40,
                                   source_name="Show", state=State.MOVING))
         store.upsert(TorrentState(source_infohash="b" * 40,
                                   source_name="Show", state=State.QUEUED))
-        await bot._handle_chat_message(
-            _message(user="4242", text="/cancel_1"))
-        p = bot._pending_live()
-        assert p is not None and p["user_id"] == "4242"
-        # Foreign tap refused, flow intact.
-        q = _query(f"pick:{p['seq']}:0", user="777")
-        await bot._on_action_button(q, q.data)
-        assert bot._pending_live() is not None
-        # Owner tap advances.
-        q2 = _query(f"pick:{p['seq']}:0", user="4242")
-        await bot._on_action_button(q2, q2.data)
-        p2 = bot._pending_live()
-        assert p2 is not None and p2["kind"] == "keepq"
+        # Stranger tap refused before any routing.
+        q = _query(f"cancel:{'a' * 40}", user="777")
+        await bot._handle_callback(q)
+        q.answer.assert_awaited_with("Not authorized for destructive actions",
+                                     show_alert=True)
+        assert store.get("a" * 40) is not None
+        # Listed admin's tap opens the keep question.
+        bot._callback_times.clear()
+        q2 = _query(f"cancel:{'a' * 40}", user="4242")
+        await bot._handle_callback(q2)
+        assert store.get("a" * 40) is not None
     finally:
         store.close()
 
@@ -642,9 +643,10 @@ def test_render_active_has_cancel_command_per_task():
     ts2 = TorrentState(source_infohash="b" * 40, source_name="Show2",
                        state=State.QUEUED, total_bytes=2000)
     text, _, _ = render_active([(ts, 0.5), (ts2, None)], page=0, page_size=5)
-    # Positional group commands (escaped underscore, no labels).
-    assert "/cancel\\_1" in text
-    assert "/cancel\\_2" in text
+    # One positional action entry per group (escaped underscore, no labels).
+    assert "/act\\_1" in text
+    assert "/act\\_2" in text
+    assert "/cancel\\_1" not in text
     assert "/cancel\\_aaaaaaaaaa" not in text
     assert "Cancel:" not in text
     # No inline-button artefacts in the text itself.
@@ -704,7 +706,7 @@ def test_resolve_cancel_target_ignores_done_history(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_chat_message_cancel_arms_keep_question(tmp_path: Path):
-    """Sending `/cancel_<short>` arms keepq — nothing deleted yet."""
+    """Sending `/cancel_<short>` asks keep/delete — nothing deleted yet."""
     ssd = tmp_path / "ssd"
     ssd.mkdir()
     store = StateStore(tmp_path / "state.db")
@@ -725,14 +727,17 @@ async def test_chat_message_cancel_arms_keep_question(tmp_path: Path):
     bot._store = store
     try:
         await bot._handle_chat_message(_message(text="/cancel_aaaaaaaaaa"))
-        # Row untouched; pending keep-question armed instead.
+        # Row untouched; keep question asked with hash buttons instead.
         assert store.get("a" * 40) is not None
         assert store.is_ignored("a" * 40) is False
-        _p = bot._pending_live()
-        assert _p["kind"] == "keepq" and _p["hashes"] == ["a" * 40]
         bot._bot.send_message.assert_awaited_once()
         sent_text = bot._bot.send_message.call_args[0][1]
         assert sent_text.startswith("Cancel Show")
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        assert f"keep:{'a' * 40}:yes" in _data
+        assert f"keep:{'a' * 40}:no" in _data
     finally:
         store.close()
 
@@ -783,7 +788,10 @@ async def test_chat_message_cancel_supports_full_hash_and_suffix(tmp_path: Path)
             _message(text=f"/cancel_{'c' * 40}@mybot"))
         # Full hash also lands on the keep question (never instant).
         assert store.get("c" * 40) is not None
-        assert bot._pending_live()["hashes"] == ["c" * 40]
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        assert f"keep:{'c' * 40}:yes" in _data
     finally:
         store.close()
 
@@ -827,9 +835,10 @@ def test_render_active_shows_fetch_only_for_waiting_indexer():
                                state=State.DOWNLOADING, total_bytes=2000)
     text, _, _ = render_active([(waiting, None), (downloading, 0.5)],
                                page=0, page_size=5)
-    assert "/cancel\\_1 /now\\_1" in text
+    assert "/act\\_1" in text
+    assert "/act\\_2" in text
     assert "Fetch original:" not in text
-    assert "/cancel\\_2" in text
+    assert "/cancel\\_1" not in text
     assert "/now\\_aaaaaaaaaa" not in text
 
 
@@ -924,10 +933,8 @@ async def test_chat_message_fetch_opens_fresh_direct_window(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_group_fetch_singleton_opens_titled_pick(tmp_path: Path):
-    """Even one eligible copy goes through buttons: title + Cancel shown."""
-    from racing_sync.telegram_bot import render_pending_question
-
+async def test_group_now_singleton_executes_immediately(tmp_path: Path):
+    """One eligible copy starts at once (no pick step for singletons)."""
     store = StateStore(tmp_path / "state.db")
     store.upsert(TorrentState(source_infohash="a" * 40, source_name="Lone.Show",
                               state=State.WAITING_INDEXER, indexer_attempts=2,
@@ -937,65 +944,57 @@ async def test_group_fetch_singleton_opens_titled_pick(tmp_path: Path):
     bot._store = store
     try:
         await bot._handle_chat_message(_message(text="/fetch_1"))
-        # Nothing executed: a titled pick with one button + Cancel.
-        _p = bot._pending_live()
-        assert _p["kind"] == "pick" and _p["cmd"] == "now"
-        assert [h for (h, _) in _p["members"]] == ["a" * 40]
-        _qtext, _qrows = bot._pending_section()
-        assert "Lone.Show" in _qtext and "1000 B" in _qtext
-        assert _qrows[0][0][0] != "Cancel"  # member button first...
-        assert _qrows[-1] == [("Cancel", f"abort:{_p['seq']}")]
         row = store.get("a" * 40)
-        assert row.state == State.WAITING_INDEXER  # untouched
-        assert row.force_direct == 0
+        assert row.force_direct == 1
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Fetching original for Lone.Show")
     finally:
         store.close()
 
 
-def test_pending_question_shows_size_or_omits():
-    from racing_sync.telegram_bot import render_pending_question
-
-    assert "2.4G" in render_pending_question({
-        "kind": "pick", "cmd": "cancel", "title": "Big.Show",
-        "size": 2_600_000_000, "members": [], "seq": "1",
-        "expires": 9999999999.0})
-    assert "2.4G" in render_pending_question({
-        "kind": "keepq", "title": "Big.Show", "scope": "bte copy",
-        "size": 2_600_000_000, "hashes": [], "seq": "1",
-        "expires": 9999999999.0})
-    # Legacy pendings without size still render (no dangling separator).
-    _q = render_pending_question({
-        "kind": "keepq", "title": "Big.Show", "scope": "",
-        "hashes": [], "seq": "1", "expires": 9999999999.0})
-    assert "Big.Show" in _q and "·" not in _q.split("—")[0]
-
-
-def test_pending_seq_unpredictable_and_prefix_min_length():
-    """Seq tokens are random hex (no 1,2,3… forgery); <4-char prefixes rejected."""
+def test_keepq_text_shows_size_or_omits():
     from racing_sync.telegram_bot import TelegramBot
 
     bot = TelegramBot.__new__(TelegramBot)
-    bot._pending_seq = 0
-    seen = {bot._next_seq() for _ in range(10)}
-    assert len(seen) == 10  # no repeats in a short run
-    assert all(len(s) == 16 and all(c in "0123456789abcdef" for c in s)
-               for s in seen)
+    _text, _rows = bot._keepq_text_and_rows("Big.Show", " · all 2 copies",
+                                            "all:" + "a" * 40, 2_600_000_000)
+    assert "Big.Show" in _text and "all 2 copies" in _text
+    assert "2.4G" in _text
+    _pairs = [t for r in _rows for t in r]
+    _flat = [d for (_, d) in _pairs]
+    assert f"keep:all:{'a' * 40}:yes" in _flat
+    assert f"keep:all:{'a' * 40}:no" in _flat
+    assert ("Close", "abort") in _pairs
+    # Rows without size still render (no dangling separator).
+    _text2, _ = bot._keepq_text_and_rows("Big.Show", "", "a" * 40)
+    assert "Big.Show" in _text2 and "·" not in _text2.split("—")[0]
 
-    bot._store = None
-    with pytest.raises(LookupError, match="too short"):
-        bot._resolve_cancel_target("a", cmd="cancel")
-    with pytest.raises(LookupError, match="too short"):
-        bot._resolve_cancel_target("ab", cmd="fetch")
+
+def test_sheet_buttons_fit_telegram_callback_budget():
+    """Every hash-protocol callback shape fits 64 bytes."""
+    _h = "a" * 40
+    for _data in (f"go:{_h}", f"go:all:{_h}", f"cancel:{_h}",
+                  f"cancel:all:{_h}", f"keep:{_h}:yes",
+                  f"keep:all:{_h}:no", f"inject:{_h}",
+                  f"inject:{_h}:yes", f"inject:all:{_h}:no",
+                  f"skip:all:{_h}", f"resume:{_h}",
+                  f"resume:all:{_h}", "abort"):
+        assert len(_data) <= 64, _data
+        from racing_sync.telegram_bot import _parse_action_data
+        assert _parse_action_data(_data)[0] in (
+            "go", "cancel", "keep", "inject", "skip", "resume", "abort")
+    from racing_sync.telegram_bot import _parse_action_data
+    assert _parse_action_data("pick:7:1") == ("", False, "", "")
+    assert _parse_action_data("keep:9:yes") == ("", False, "", "")
 
 
-def test_pending_question_sanitizes_backtick_title():
-    from racing_sync.telegram_bot import render_pending_question
+def test_keepq_text_sanitizes_backtick_title():
+    from racing_sync.telegram_bot import TelegramBot
 
-    _q = render_pending_question({
-        "kind": "pick", "cmd": "cancel", "title": "Evil` — `x",
-        "members": [], "seq": "1", "expires": 9999999999.0})
-    assert "`" not in _q.replace("`Evil' — 'x`", "")  # span stays closed
-    assert "Evil' — 'x" in _q
+    bot = TelegramBot.__new__(TelegramBot)
+    _text, _rows = bot._keepq_text_and_rows("Evil` — `x", "", "a" * 40)
+    assert "`" not in _text.replace("`Evil' — 'x`", "")  # span stays closed
+    assert "Evil' — 'x" in _text
 
 
 @pytest.mark.anyio
@@ -1108,19 +1107,19 @@ async def test_fetch_torrent_new_without_grace_refuses(tmp_path: Path):
         store.close()
 
 
-def test_pick_snapshot_fetch_includes_new_grace():
-    """Group fetch snapshots WAITING_INDEXER + NEW grace-held members."""
-    from racing_sync.telegram_bot import pick_snapshot
+def test_now_eligibility_covers_waiting_and_new_grace():
+    """Group now covers WAITING_INDEXER + NEW grace-held members."""
+    from racing_sync.telegram_bot import _now_eligible_hashes
 
-    mk = lambda h, st, dom: TorrentState(
+    mk = lambda h, st, dom: TorrentState(  # noqa: E731
         source_infohash=h, source_name="Show.X", state=st,
         total_bytes=1000, source_announce_url=f"https://{dom}/announce")
     waiting = mk("a" * 40, State.WAITING_INDEXER, "alpha.cc")
     grace = mk("b" * 40, State.NEW, "bte.example")
     busy = mk("c" * 40, State.DOWNLOADING, "gamma.cc")
     notes = {"b" * 40: "Waiting for preferred copy · 90s left"}
-    members = [(waiting, None), (grace, None), (busy, None)]
-    assert [h for (h, _) in pick_snapshot(members, "fetch", notes)] == [
+    members = [waiting, grace, busy]
+    assert _now_eligible_hashes(members, notes) == [
         "a" * 40, "b" * 40]
 
 
@@ -1235,20 +1234,20 @@ def test_render_active_shows_skip_and_unskip():
                         skipped=1)
     text, _, _ = render_active([(held, None)], page=0, page_size=5)
     assert "⏭ Skipped" in text
-    assert "/resume\\_1" in text
+    assert "/act\\_1" in text
     assert "/skip\\_1" not in text
     assert "/now\\_1" not in text
 
     free = TorrentState(source_infohash="b" * 40, source_name="Free",
                         state=State.WAITING_INDEXER, total_bytes=1000)
     text, _, _ = render_active([(free, None)], page=0, page_size=5)
-    assert "/skip\\_1" in text
+    assert "/act\\_1" in text
     assert "/resume\\_1" not in text
 
 
-def test_pick_snapshot_excludes_held_rows_from_fetch_prefer():
-    """Held members never snapshot for fetch/prefer (cancel unaffected)."""
-    from racing_sync.telegram_bot import pick_snapshot
+def test_member_labels_include_held_but_eligibility_skips_them():
+    """Held members get cancel buttons but never start-now buttons."""
+    from racing_sync.telegram_bot import _member_button_labels, _now_eligible_hashes
 
     mk = lambda h, st: TorrentState(  # noqa: E731
         source_infohash=h, source_name="Show.X", state=st,
@@ -1256,9 +1255,9 @@ def test_pick_snapshot_excludes_held_rows_from_fetch_prefer():
     grace = mk("b" * 40, State.NEW)
     grace.skipped = 1
     notes = {"b" * 40: "Waiting for preferred copy · 90s left"}
-    assert pick_snapshot([(grace, None)], "fetch", notes) == []
-    assert pick_snapshot([(grace, None)], "prefer", notes) == []
-    assert pick_snapshot([(grace, None)], "cancel") != []
+    assert _member_button_labels([grace]) == [("b" * 40, "alpha")]
+    assert _now_eligible_hashes([grace], notes) == []
+    assert _member_button_labels([mk("c" * 40, State.NEW)]) != []
 
 
 def test_render_detail_shows_held_resume():
@@ -1437,36 +1436,29 @@ def _tap(data):
 
 
 @pytest.mark.anyio
-async def test_cancel_group_pick_member_then_yes_keeps_files(tmp_path: Path):
-    """Group cancel → pick one sibling → Yes: only it goes, files kept."""
+async def test_cancel_group_member_then_yes_keeps_files(tmp_path: Path):
+    """Group cancel → member hash button → Yes: only it goes, files kept."""
     store, ssd = _twins_store(tmp_path)
     bot, coord = _twins_bot(store, ssd, tmp_path)
     try:
-        # Twins share name+size: group 1. Snapshot freezes both hashes
-        # (store order: newest first — derive indices, don't assume).
+        # Twins share name+size: group 1. Buttons carry each copy's hash.
         await bot._handle_chat_message(_message(text="/cancel_1"))
-        _p = bot._pending_live()
-        assert _p["kind"] == "pick"
-        _hashes = [h for (h, _) in _p["members"]]
-        assert sorted(_hashes) == ["a" * 40, "b" * 40]
-        _bi = _hashes.index("b" * 40)
-        _seq = _p["seq"]
-        # Tap the b-copy; nothing deleted yet, keep-question armed.
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        assert f"cancel:{'b' * 40}" in _data
+        assert any(d.startswith("cancel:all:") for d in _data)
+        # Tap the b-copy; nothing deleted yet, keep question asked inline.
         await bot._on_action_button(
-            _tap(f"pick:{_seq}:{_bi}"), f"pick:{_seq}:{_bi}")
-        _p = bot._pending_live()
-        assert _p["kind"] == "keepq"
-        assert _p["hashes"] == ["b" * 40]
+            _tap(f"cancel:{'b' * 40}"), f"cancel:{'b' * 40}")
         assert store.get("b" * 40) is not None
         # Yes: forget with files kept; the a-copy keeps seeding tracked.
-        _seq = _p["seq"]
         await bot._on_action_button(
-            _tap(f"keep:{_seq}:yes"), f"keep:{_seq}:yes")
+            _tap(f"keep:{'b' * 40}:yes"), f"keep:{'b' * 40}:yes")
         assert store.get("b" * 40) is None
         assert store.is_ignored("b" * 40) is True
         assert store.get("a" * 40) is not None
         assert store.is_ignored("a" * 40) is False
-        assert bot._pending_live() is None  # consumed
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Kept files")
     finally:
@@ -1480,15 +1472,18 @@ async def test_cancel_all_then_no_deletes_everything(tmp_path: Path):
     bot, coord = _twins_bot(store, ssd, tmp_path)
     try:
         await bot._handle_chat_message(_message(text="/cancel_1"))
-        _seq = bot._pending_live()["seq"]
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _all = next(d for d in _data if d.startswith("cancel:all:"))
+        _leader = _all.split(":")[2]
+        await bot._on_action_button(_tap(_all), _all)
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        assert f"keep:all:{_leader}:yes" in _data
         await bot._on_action_button(
-            _tap(f"pick:{_seq}:all"), f"pick:{_seq}:all")
-        _p = bot._pending_live()
-        assert _p["kind"] == "keepq"
-        assert sorted(_p["hashes"]) == ["a" * 40, "b" * 40]
-        _seq = _p["seq"]
-        await bot._on_action_button(
-            _tap(f"keep:{_seq}:no"), f"keep:{_seq}:no")
+            _tap(f"keep:all:{_leader}:no"), f"keep:all:{_leader}:no")
         assert store.get("a" * 40) is None
         assert store.get("b" * 40) is None
         sent = bot._bot.send_message.call_args[0][1]
@@ -1498,36 +1493,68 @@ async def test_cancel_all_then_no_deletes_everything(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_pick_abort_cancels_nothing(tmp_path: Path):
-    """Abort button drops the flow; rows untouched, pending cleared."""
+async def test_abort_deletes_sheet_and_acts_on_nothing(tmp_path: Path):
+    """Abort removes the sheet message; rows untouched."""
     store, ssd = _twins_store(tmp_path)
     bot, coord = _twins_bot(store, ssd, tmp_path)
+    bot._bot.delete_message = AsyncMock()
     try:
         await bot._handle_chat_message(_message(text="/cancel_1"))
-        _seq = bot._pending_live()["seq"]
-        await bot._on_action_button(
-            _tap(f"abort:{_seq}"), f"abort:{_seq}")
-        assert bot._pending_live() is None
+        q = _tap("abort")
+        q.message.message_id = 61
+        await bot._on_action_button(q, "abort")
+        bot._bot.delete_message.assert_awaited_once()
         assert store.get("a" * 40) is not None
         assert store.get("b" * 40) is not None
+    finally:
+        store.close()
+
+
+def test_act_regex_shapes():
+    from racing_sync.telegram_bot import ACT_CMD_RE
+
+    assert ACT_CMD_RE.match("/act_3")
+    assert ACT_CMD_RE.match("/act_" + "a" * 40)
+    assert not ACT_CMD_RE.match("/act")
+    assert not ACT_CMD_RE.match("/act_xyz")
+
+
+@pytest.mark.anyio
+async def test_act_command_replies_sheet_with_hash_buttons(tmp_path: Path):
+    """/act_1 shows eligible actions only; every button is hash-scoped."""
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Twin.Show",
+                              total_bytes=1000, state=State.WAITING_INDEXER))
+    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Twin.Show",
+                              total_bytes=1000, state=State.WAITING_INDEXER))
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/act_1"))
         sent = bot._bot.send_message.call_args[0][1]
-        assert sent.startswith("Picker cancelled")
+        assert "Twin.Show" in sent
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        assert f"go:{'a' * 40}" in _data
+        assert f"cancel:{'b' * 40}" in _data
+        assert any(d.startswith("cancel:all:") for d in _data)
+        assert "abort" in _data
+        assert not any(d.startswith("pick:") for d in _data)
+        assert store.get("a" * 40) is not None  # sheet changes nothing
     finally:
         store.close()
 
 
 @pytest.mark.anyio
 async def test_shifted_numbering_cannot_misroute(tmp_path: Path):
-    """Number resolved once at tap: later regrouping can't redirect."""
+    """Hash buttons outlive regrouping: old taps can't hit new rows."""
     store, ssd = _twins_store(tmp_path)
     bot, coord = _twins_bot(store, ssd, tmp_path)
     try:
-        # Group 1 = twins. Snapshot freezes their hashes...
+        # Group 1 = twins. Buttons carry each copy's own hash...
         await bot._handle_chat_message(_message(text="/cancel_1"))
-        _p = bot._pending_live()
-        _hashes = [h for (h, _) in _p["members"]]
-        assert sorted(_hashes) == ["a" * 40, "b" * 40]
-        _seq = _p["seq"]
         # ...then the world changes: twins gone from tracking, a new
         # same-named row appears (fresh drop re-takes group 1).
         store.tombstone("a" * 40)
@@ -1536,17 +1563,12 @@ async def test_shifted_numbering_cannot_misroute(tmp_path: Path):
                                   source_name="Twin.Show",
                                   save_path=str(ssd), state=State.NEW,
                                   total_bytes=1000))
-        # The old tap still addresses only the snapshotted hashes, both
-        # gone now — nothing acted on, certainly not the new row.
-        _bi = _hashes.index("b" * 40)
+        # The old tap still addresses only the b-copy hash, gone now —
+        # nothing acted on, certainly not the new row.
         await bot._on_action_button(
-            _tap(f"pick:{_seq}:{_bi}"), f"pick:{_seq}:{_bi}")
-        _p = bot._pending_live()
-        assert _p["kind"] == "keepq"
-        assert _p["hashes"] == ["b" * 40]
-        _seq = _p["seq"]
+            _tap(f"cancel:{'b' * 40}"), f"cancel:{'b' * 40}")
         await bot._on_action_button(
-            _tap(f"keep:{_seq}:yes"), f"keep:{_seq}:yes")
+            _tap(f"keep:{'b' * 40}:yes"), f"keep:{'b' * 40}:yes")
         assert store.get("c" * 40) is not None  # untouched
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Already gone")
