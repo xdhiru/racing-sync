@@ -1777,7 +1777,13 @@ class TelegramBot:
         self, members, title: str, size_bytes: object,
         notes: dict | None = None,
     ) -> tuple[str, list[list[tuple[str, str]]]]:
-        """Action sheet text + hash-button rows for a content group."""
+        """Action sheet text + self-explanatory button rows for a group.
+
+        Every button names its verb and target ("Start <tracker> now",
+        "Cancel <tracker>…") so no memorized command is needed; "…"
+        marks actions that ask a follow-up question first. One button
+        per row — narrow screens wrap multi-button rows into ambiguity.
+        """
         try:
             _size = _size_compact(size_bytes)
         except Exception:
@@ -1785,6 +1791,10 @@ class TelegramBot:
         _tspec = _safe_display_name((title or "")[:60])
         _now_ok = set(self._now_eligible_hashes(members, notes))
         _labels = _member_button_labels(members or [])
+        try:
+            _n = len(_labels)
+        except Exception:
+            _n = 0
         _held_any = False
         _free_any = False
         try:
@@ -1805,34 +1815,32 @@ class TelegramBot:
         except Exception:
             pass
         _rows: list[list[tuple[str, str]]] = []
-        _go_row = [(f"▶ {_lbl}", f"go:{_h}")
-                   for (_h, _lbl) in _labels if _h in _now_ok]
-        if _go_row:
-            _rows.extend([_go_row[i:i + 3]
-                          for i in range(0, len(_go_row), 3)])
-        _cancel_row = [(f"✖ {_lbl}", f"cancel:{_h}")
-                       for (_h, _lbl) in _labels]
-        if _cancel_row:
-            _rows.extend([_cancel_row[i:i + 3]
-                          for i in range(0, len(_cancel_row), 3)])
+        # One row per copy: start and cancel side by side stay readable
+        # while keeping the copy context shared.
+        for (_h, _lbl) in _labels:
+            _row: list[tuple[str, str]] = []
+            if _h in _now_ok:
+                _row.append((f"▶ Start {_lbl} now", f"go:{_h}"))
+            _row.append((f"✖ Cancel {_lbl}…", f"cancel:{_h}"))
+            _rows.append(_row)
         _leader = _labels[0][0] if _labels else ""
-        _group_row: list[tuple[str, str]] = []
         if len(_labels) > 1 and _leader:
-            _group_row.append((f"✖ All ({len(_labels)})",
-                               f"cancel:all:{_leader}"))
+            _rows.append([(f"✖ Cancel all {_n} copies…",
+                           f"cancel:all:{_leader}")])
         if _inject_ok and _leader:
-            _group_row.append(("💉 Inject", f"inject:all:{_leader}"))
+            _rows.append([("💉 Inject all to fuse…",
+                           f"inject:all:{_leader}")])
         if _free_any and _leader:
-            _group_row.append(("⏭ Skip", f"skip:all:{_leader}"))
+            _rows.append([("⏭ Skip release (pause downloads)",
+                           f"skip:all:{_leader}")])
         if _held_any and _leader:
-            _group_row.append(("⏪ Resume", f"resume:all:{_leader}"))
-        if _group_row:
-            _rows.extend([_group_row[i:i + 3]
-                          for i in range(0, len(_group_row), 3)])
+            _rows.append([("⏪ Resume release (restart it)",
+                           f"resume:all:{_leader}")])
         _rows.append([("Close", "abort")])
         _text = (f"{_tspec}" + (f" · {_size}" if _size else "")
-                 + "\nChoose an action below. "
-                 "Cancel and Inject ask first.")
+                 + (f" · {_n} cop{'y' if _n == 1 else 'ies'} tracked" if _n else "")
+                 + "\nStart downloads now. Cancel/Inject ask first. "
+                 "Skip pauses, Resume restarts.")
         return _text, _rows
 
     def _keepq_text_and_rows(
@@ -1846,9 +1854,11 @@ class TelegramBot:
             _size = ""
         _tspec = _safe_display_name((title or "")[:60]) + (
             f" · {_size}" if _size else "")
-        _text = (f"Cancel {_tspec}{scope_label} — keep downloaded files?")
-        _rows = [[("Keep files", f"keep:{scope}:yes"),
-                  ("Delete files", f"keep:{scope}:no")],
+        _text = (f"Cancel {_tspec}{scope_label} — keep downloaded files?"
+                 f"\nKeep untracks (data stays in place); "
+                 f"Delete wipes the torrent and its data.")
+        _rows = [[("✔ Keep files", f"keep:{scope}:yes")],
+                 [("✖ Delete files", f"keep:{scope}:no")],
                  [("Close", "abort")]]
         return _text, _rows
 
@@ -2929,8 +2939,8 @@ class TelegramBot:
             _text = (f"Inject {title} ({_n} cop{'y' if _n == 1 else 'ies'}) "
                      "to fuse seeding? Files must already be at the "
                      f"remote.{extra} Choose below.")
-            _rows = [[(f"Yes, inject", f"inject:{_lead}:yes"),
-                      ("No", f"inject:{_lead}:no")],
+            _rows = [[("✔ Yes, inject", f"inject:{_lead}:yes")],
+                     [("✖ No", f"inject:{_lead}:no")],
                      [("Close", "abort")]]
             await self._send_sheet(_text, _rows, reply_to=message)
         except Exception as e:  # noqa: BLE001
@@ -3250,12 +3260,13 @@ class TelegramBot:
                     pass
                 return
             _rows: list[list[tuple[str, str]]] = [
-                [(f"✖ {_lbl}", f"cancel:{_h}") for (_h, _lbl) in _labels][
-                    i:i + 3]
-                for i in range(0, len(_labels), 3)
+                [(f"✖ Cancel {_lbl}…", f"cancel:{_h}")
+                 for (_h, _lbl) in _labels][
+                    i:i + 1]
+                for i in range(0, len(_labels), 1)
             ]
             _rows.append([(
-                f"✖ All ({len(_labels)})",
+                f"✖ Cancel all {len(_labels)} copies…",
                 f"cancel:all:{_labels[0][0]}")])
             _rows.append([("Close", "abort")])
             try:
@@ -3394,8 +3405,8 @@ class TelegramBot:
             except Exception:
                 pass
             return
-        _rows = [[(f"▶ {_lbl}", f"go:{_h}") for (_h, _lbl) in _labels][
-            i:i + 3] for i in range(0, len(_labels), 3)]
+        _rows = [[(f"▶ Start {_lbl} now", f"go:{_h}")]
+                   for (_h, _lbl) in _labels]
         _rows.append([("Close", "abort")])
         try:
             await self._send_sheet(
