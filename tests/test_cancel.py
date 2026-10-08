@@ -827,10 +827,10 @@ def test_render_active_shows_fetch_only_for_waiting_indexer():
                                state=State.DOWNLOADING, total_bytes=2000)
     text, _, _ = render_active([(waiting, None), (downloading, 0.5)],
                                page=0, page_size=5)
-    assert "/cancel\\_1 /fetch\\_1" in text
+    assert "/cancel\\_1 /now\\_1" in text
     assert "Fetch original:" not in text
     assert "/cancel\\_2" in text
-    assert "/fetch\\_aaaaaaaaaa" not in text
+    assert "/now\\_aaaaaaaaaa" not in text
 
 
 def test_render_detail_shows_fetch_hint_for_waiting_indexer():
@@ -840,13 +840,13 @@ def test_render_detail_shows_fetch_hint_for_waiting_indexer():
                            state=State.WAITING_INDEXER, total_bytes=1000,
                            indexer_attempts=9)
     detail = render_detail(waiting)
-    # Full hash untouched in the detail card; fetch hint added.
+    # Full hash untouched in the detail card; now hint added.
     assert "`" + "a" * 40 + "`" in detail
-    assert "`/fetch_aaaaaaaaaa`" in detail
+    assert "`/now_aaaaaaaaaa`" in detail
 
     downloading = TorrentState(source_infohash="b" * 40, source_name="Show2",
                                state=State.DOWNLOADING, total_bytes=2000)
-    assert "/fetch_" not in render_detail(downloading)
+    assert "/now_" not in render_detail(downloading)
 
 
 def test_resolve_fetch_target_requires_waiting(tmp_path: Path):
@@ -939,7 +939,7 @@ async def test_group_fetch_singleton_opens_titled_pick(tmp_path: Path):
         await bot._handle_chat_message(_message(text="/fetch_1"))
         # Nothing executed: a titled pick with one button + Cancel.
         _p = bot._pending_live()
-        assert _p["kind"] == "pick" and _p["cmd"] == "fetch"
+        assert _p["kind"] == "pick" and _p["cmd"] == "now"
         assert [h for (h, _) in _p["members"]] == ["a" * 40]
         _qtext, _qrows = bot._pending_section()
         assert "Lone.Show" in _qtext and "1000 B" in _qtext
@@ -1227,7 +1227,7 @@ async def test_fetch_torrent_refuses_held_row(tmp_path: Path):
 
 
 def test_render_active_shows_skip_and_unskip():
-    """Held rows get /unskip_N + ⏭; running rows get /skip_N."""
+    """Held rows get /resume_N + ⏭; running rows get /skip_N."""
     from racing_sync.telegram_bot import render_active
 
     held = TorrentState(source_infohash="a" * 40, source_name="Held",
@@ -1235,15 +1235,15 @@ def test_render_active_shows_skip_and_unskip():
                         skipped=1)
     text, _, _ = render_active([(held, None)], page=0, page_size=5)
     assert "⏭ Skipped" in text
-    assert "/unskip\\_1" in text
+    assert "/resume\\_1" in text
     assert "/skip\\_1" not in text
-    assert "/fetch\\_1" not in text
+    assert "/now\\_1" not in text
 
     free = TorrentState(source_infohash="b" * 40, source_name="Free",
                         state=State.WAITING_INDEXER, total_bytes=1000)
     text, _, _ = render_active([(free, None)], page=0, page_size=5)
     assert "/skip\\_1" in text
-    assert "/unskip\\_1" not in text
+    assert "/resume\\_1" not in text
 
 
 def test_pick_snapshot_excludes_held_rows_from_fetch_prefer():
@@ -1262,7 +1262,7 @@ def test_pick_snapshot_excludes_held_rows_from_fetch_prefer():
 
 
 def test_render_detail_shows_held_resume():
-    """Held detail cards carry the /unskip_ line."""
+    """Held detail cards carry the /resume_ line."""
     from racing_sync.telegram_bot import render_detail
 
     ts = TorrentState(source_infohash="e" * 40, source_name="Held",
@@ -1270,7 +1270,7 @@ def test_render_detail_shows_held_resume():
                       skipped=1)
     detail = render_detail(ts)
     assert "Skipped" in detail
-    assert f"/unskip_{'e' * 10}" in detail
+    assert f"/resume_{'e' * 10}" in detail
 
 
 def test_full_reset_refuses_symlink_ssd(tmp_path: Path, monkeypatch):
@@ -1331,7 +1331,7 @@ async def test_chat_command_double_tap_debounced(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_chat_message_prefer_starts_grace_held_row(tmp_path: Path):
-    """`/prefer_<hash>` exempts a grace-held drop and wakes a worker."""
+    """`/prefer_<hash>` (legacy alias of `/now_`) starts a grace-held drop."""
     from conftest import make_coordinator
 
     store = StateStore(tmp_path / "state.db")
@@ -1355,15 +1355,45 @@ async def test_chat_message_prefer_starts_grace_held_row(tmp_path: Path):
         await bot._handle_chat_message(_message(text=f"/prefer_{'e' * 40}"))
         bot._bot.send_message.assert_awaited_once()
         sent = bot._bot.send_message.call_args[0][1]
-        assert sent.startswith("Preferred")
+        assert sent.startswith("Using dropped .torrent directly for")
+        row = store.get("e" * 40)
+        assert row.force_direct == 1
         coord._spawn_worker.assert_called_once()
-        assert "e" * 40 in (coord._grace_exempt or {})
         # Unknown hashes get an explanatory reply, not a crash.
         # (Clear the debounce so the second command is processed.)
         bot._callback_times.clear()
         bot._bot.send_message.reset_mock()
         await bot._handle_chat_message(_message(text="/prefer_dddddddddd"))
         bot._bot.send_message.assert_awaited_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_chat_message_now_starts_waiting_and_grace_rows(tmp_path: Path):
+    """`/now_<hash>` unites fetch+prefer: WAITING rows and grace rows start."""
+    from conftest import make_coordinator
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord.cfg.general.preferred_copy_grace_seconds = 3600
+        coord.cfg.prowlarr.enabled = True
+        coord.cfg.prowlarr.download_indexers = [MagicMock()]
+        coord.cfg.prowlarr.is_download_indexer = lambda url: False
+        coord._spawn_worker = MagicMock()
+        store.upsert(TorrentState(
+            source_infohash="f" * 40, source_name="Waiting.Now",
+            state=State.WAITING_INDEXER, indexer_attempts=3))
+        bot = _bot()
+        bot._coord = coord
+        bot._store = store
+        await bot._handle_chat_message(_message(text=f"/now_{'f' * 40}"))
+        row = store.get("f" * 40)
+        assert row.force_direct == 1
+        assert row.indexer_attempts == 0
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Fetching original for")
     finally:
         store.close()
 
