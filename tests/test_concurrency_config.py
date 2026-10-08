@@ -530,7 +530,7 @@ def test_sched_priority_pipeline_before_discovery():
         return TorrentState(source_infohash="h1", source_name="x", state=state)
 
     for st in (State.RE_ADDING, State.QUEUED, State.MOVING,
-               State.QUERYING, State.DOWNLOADING):
+               State.DOWNLOADING):
         assert _sched_priority(_row(st))[0] == 0
     assert _sched_priority(_row(State.NEW))[0] == 1
     assert _sched_priority(_row(State.WAITING_DISK))[0] == 2

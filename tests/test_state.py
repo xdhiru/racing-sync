@@ -13,7 +13,7 @@ def test_done_can_only_transition_to_re_adding():
     # back to MOVING so the rclone move runs before any fuse injection.
     check_transition(State.DONE, State.MOVING)
     for s in [State.NEW, State.QUEUED, State.DOWNLOADING,
-              State.WAITING_DISK, State.QUERYING, State.FAILED]:
+              State.WAITING_DISK, State.WAITING_INDEXER, State.FAILED]:
         with pytest.raises(ValueError):
             check_transition(State.DONE, s)
 
@@ -28,12 +28,11 @@ def test_new_can_fast_track_to_done_for_manual_fuse():
     # verified bytes needs no SSD work (NEW/WAITING_INDEXER -> DONE).
     check_transition(State.NEW, State.DONE)
     check_transition(State.WAITING_INDEXER, State.DONE)
-    check_transition(State.QUERYING, State.DONE)
     check_transition(State.WAITING_DISK, State.DONE)
 
 
 def test_new_can_go_to_any_inflight():
-    for s in [State.QUERYING, State.WAITING_DISK, State.QUEUED,
+    for s in [State.WAITING_INDEXER, State.WAITING_DISK, State.QUEUED,
               State.DOWNLOADING, State.MOVING, State.RE_ADDING, State.DONE]:
         check_transition(State.NEW, s)
 
@@ -54,10 +53,40 @@ def test_moving_to_done_is_illegal():
 
 def test_indexer_park_and_retry():
     check_transition(State.NEW, State.WAITING_INDEXER)
-    check_transition(State.QUERYING, State.WAITING_INDEXER)
-    check_transition(State.WAITING_INDEXER, State.QUERYING)
     check_transition(State.WAITING_INDEXER, State.QUEUED)
     check_transition(State.WAITING_INDEXER, State.FAILED)
+
+
+def test_retired_querying_rows_migrate_to_waiting_indexer(tmp_path: Path):
+    """Pre-upgrade 'querying' rows resume as WAITING_INDEXER (never FAILED)."""
+    import sqlite3
+
+    from racing_sync.state import StateStore
+
+    db = tmp_path / "mig.db"
+    store = StateStore(db)
+    try:
+        store.upsert(TorrentState(source_infohash="q" * 40, source_name="Q",
+                                  state=State.WAITING_INDEXER))
+        store.close()
+        raw = sqlite3.connect(str(db))
+        try:
+            raw.execute("UPDATE torrent_state SET state = 'querying' "
+                        "WHERE source_infohash = ?", ("q" * 40,))
+            raw.commit()
+        finally:
+            raw.close()
+        reopened = StateStore(db)
+        try:
+            row = reopened.get("q" * 40, include_blob=False)
+            assert row is not None and row.state == State.WAITING_INDEXER
+        finally:
+            reopened.close()
+    finally:
+        try:
+            store.close()
+        except Exception:
+            pass
 
 
 def test_force_direct_defaults_zero_and_roundtrips(tmp_path: Path):
@@ -536,13 +565,13 @@ def test_transition_refuses_concurrent_move(tmp_path: Path):
         stale = store.get("m" * 40)
         fresh = store.get("m" * 40)
         assert stale.version == fresh.version == 0
-        store.transition(fresh, State.QUERYING)
+        store.transition(fresh, State.WAITING_INDEXER)
         assert store.get("m" * 40).version == 1
         # Stale copy still thinks NEW: its transition must fail loudly,
         # and the DB keeps the winner's state.
         with pytest.raises(AbandonedError):
             store.transition(stale, State.QUEUED)
-        assert store.get("m" * 40).state == State.QUERYING
+        assert store.get("m" * 40).state == State.WAITING_INDEXER
         # In-memory loser is untouched (snapshot restored).
         assert stale.state == State.NEW
     finally:

@@ -872,7 +872,9 @@ def test_resolve_fetch_target_requires_waiting(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_chat_message_fetch_flags_and_wakes_row(tmp_path: Path):
-    """Sending `/fetch_<short>` sets force_direct and wakes to QUERYING."""
+    """Sending `/fetch_<short>` sets force_direct and marks the timer due."""
+    import datetime as dt
+
     store = StateStore(tmp_path / "state.db")
     store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show",
                               state=State.WAITING_INDEXER, indexer_attempts=9))
@@ -883,7 +885,9 @@ async def test_chat_message_fetch_flags_and_wakes_row(tmp_path: Path):
         await bot._handle_chat_message(_message(text="/fetch_aaaaaaaaaa"))
         row = store.get("a" * 40)
         assert row.force_direct == 1
-        assert row.state == State.QUERYING
+        assert row.state == State.WAITING_INDEXER
+        assert row.indexer_next_retry_at is not None
+        assert row.indexer_next_retry_at <= dt.datetime.now(dt.timezone.utc)
         bot._bot.send_message.assert_awaited_once()
         sent_text = bot._bot.send_message.call_args[0][1]
         assert sent_text.startswith("Fetching original for")
@@ -910,7 +914,7 @@ async def test_chat_message_fetch_opens_fresh_direct_window(tmp_path: Path):
         await bot._handle_chat_message(_message(text="/fetch_eeeeeeeeee"))
         row = store.get("e" * 40)
         assert row.force_direct == 1
-        assert row.state == State.QUERYING
+        assert row.state == State.WAITING_INDEXER
         assert row.indexer_attempts == 0
         fresh = (dt.datetime.now(dt.timezone.utc)
                  - row.indexer_first_queried_at).total_seconds()

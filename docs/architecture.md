@@ -38,10 +38,10 @@ src/racing_sync/
 ## State machine
 
 ```
-NEW ──┬─> QUERYING ──> WAITING_INDEXER ──> WAITING_DISK ──> QUEUED ──> DOWNLOADING ──> MOVING ──> RE_ADDING ──> DONE
-      │       │                │                  │    │          │            │             │                  │ ^
-      │       │                │                  │    │          │            │             │                  │ │
-      └───────┴────────────────┴──────────────────┴────┴──────────┴────────────┴──> (any) ──> FAILED ──────────┘ │
+NEW ──┬─> WAITING_INDEXER ──> WAITING_DISK ──> QUEUED ──> DOWNLOADING ──> MOVING ──> RE_ADDING ──> DONE
+      │              │                  │    │          │            │             │                  │ ^
+      │              │                  │    │          │            │             │                  │ │
+      └──────────────┴──────────────────┴────┴──────────┴────────────┴──> (any) ──> FAILED ──────────┘ │
                                                                                   │  │                          │
                                                                           QUEUED/NEW retry  │  lost fuse ───────┘
                                                                                             │  (RE_ADDING, ≤5 rapid
@@ -56,7 +56,7 @@ NEW ──┬─> QUERYING ──> WAITING_INDEXER ──> WAITING_DISK ──> 
 past 5 in 24h the row fails for operator attention instead of flapping
 forever. `FAILED → QUEUED/NEW` allows manual and auto retry.
 
-Pre-SSD states (`NEW`/`QUERYING`/`WAITING_INDEXER`/`WAITING_DISK`) may
+Pre-SSD states (`NEW`/`WAITING_INDEXER`/`WAITING_DISK`) may
 fast-track straight to `DONE` on manual fuse adoption: the operator moved
 the files to the remote and added the same infohash on VPS2 pointing at a
 fuse mount (any category) with verified bytes, so no SSD download or rclone
@@ -314,8 +314,8 @@ and frees the SSD reservation. Cancelling an SSD owner also forgets the watch ro
 currently deferred on it (same election winner), reported in the reply;
 cancelling a waiter leaves the rest alone. A `/fetch_<...>` line flags
 a waiting row (`force_direct`)
-and wakes it (WAITING_INDEXER → QUERYING) so the racing torrent's own
-bytes feed the SSD download at once; non-waiting targets get an
+and marks its timer due so the next scheduler wakeup picks it up at once
+(the racing torrent's own bytes feed the SSD download); non-waiting targets get an
 explanatory reply. A `/prefer_<...>` line exempts a grace-held row
 (watch drop or racing row, one-shot) and wakes it so its SSD download
 starts at once; later same-content rows defer to it via the existing election, no follower

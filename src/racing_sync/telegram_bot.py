@@ -5,7 +5,7 @@ stays clean:
 
   1. **Per-torrent detail message** — one Telegram message per source_infohash.
      Created when the torrent first leaves NEW. Edited in place as it advances
-     through states (NEW → QUERYING → WAITING_INDEXER → ... → DONE). The
+     through states (NEW → WAITING_INDEXER → ... → DONE). The
      final DONE message stays in the chat as a clean history record.
      The message_id is persisted in torrent_state.telegram_message_id.
 
@@ -50,7 +50,6 @@ log = logging.getLogger(__name__)
 
 _STATE_ICON = {
     State.NEW: "🆕 NEW",
-    State.QUERYING: "🔍 QUERY",
     State.WAITING_INDEXER: "⏳ WAIT-IDX",
     State.WAITING_DISK: "💾 WAIT-SSD",
     State.QUEUED: "📋 QUEUED",
@@ -677,8 +676,6 @@ def _active_state_text(ts: TorrentState, progress: float | None, note: str) -> s
             state_text = f"🔄 Re-adding (retry in {_mins}m)"
         else:
             state_text = "🔄 Re-adding"
-    elif ts.state == State.QUERYING:
-        state_text = "🔍 Querying"
     elif ts.state == State.WAITING_INDEXER:
         # A same-content deferral note (waiting on the in-flight copy)
         # replaces the stale miss count while it holds.
@@ -1033,7 +1030,7 @@ def render_active(
             _has_skip = True
             if ts.state == State.WAITING_INDEXER:
                 _has_fetch = True
-            if ts.state in (State.QUERYING, State.WAITING_INDEXER,
+            if ts.state in (State.WAITING_INDEXER,
                             State.WAITING_DISK):
                 _has_inject = True
             if (ts.state == State.NEW
@@ -2389,7 +2386,7 @@ class TelegramBot:
                     await self._delete_chat_file(message, doc_msg)
                     return
             try:
-                _pre = existing.state in (State.NEW, State.QUERYING,
+                _pre = existing.state in (State.NEW,
                                           State.WAITING_INDEXER,
                                           State.WAITING_DISK)
             except Exception:
@@ -3301,7 +3298,7 @@ class TelegramBot:
         """Flag a waiting row to use its starting torrent now.
 
         WAITING_INDEXER rows use their starting bytes instead of
-        waiting out Prowlarr (force_direct + wake to QUERYING): the
+        waiting out Prowlarr (force_direct + due timer): the
         VPS1 original when reachable, else a supplied .torrent
         attached via /add. NEW
         grace-held rows get their starting bytes instead (force_direct
@@ -3332,11 +3329,17 @@ class TelegramBot:
             if row.state == State.WAITING_INDEXER:
                 # Fresh retry window for the direct phase, same as the automatic
                 # timeout fallback: an explicit fetch buys full direct retries,
-                # not just the remainder of the spent prowlarr window.
+                # not just the remainder of the spent prowlarr window. The row
+                # stays WAITING_INDEXER with its timer due now, so the next
+                # scheduler wakeup picks it up without an intermediate state.
                 row.force_direct = 1
                 row.indexer_first_queried_at = dt.datetime.now(dt.timezone.utc)
                 row.indexer_attempts = 0
-                store.transition(row, State.QUERYING)
+                row.indexer_next_retry_at = dt.datetime.now(dt.timezone.utc)
+                try:
+                    store.upsert(row)
+                except Exception as e:  # noqa: BLE001
+                    return f"Fetch failed: {e}"
                 return (
                     f"Fetching original for {(row.source_name or infohash[:10])[:50]} "
                     f"(bypassing Prowlarr; VPS1 copy, else supplied .torrent)"

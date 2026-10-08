@@ -64,16 +64,16 @@ def test_expired_max_age_marks_failed():
 
 
 @pytest.mark.anyio
-async def test_process_torrent_inner_dispatches_querying_state():
+async def test_process_torrent_inner_dispatches_waiting_indexer_state():
     from unittest.mock import AsyncMock
 
     coord = make_coordinator()
     coord._do_waiting_indexer = AsyncMock()
 
-    ts = TorrentState("hash1", state=State.QUERYING)
+    ts = TorrentState("hash1", state=State.WAITING_INDEXER)
     await coord._process_torrent_inner(ts)
 
-    # Must dispatch to _do_waiting_indexer when in QUERYING state
+    # Must dispatch to _do_waiting_indexer for timer-elapsed WAITING rows
     coord._do_waiting_indexer.assert_awaited_once_with(ts)
 
 
@@ -220,7 +220,7 @@ async def test_do_waiting_indexer_transitions_failed_when_source_vanished():
     coord.source_client.get_torrent.return_value = None
     coord.transition = MagicMock()
 
-    ts = TorrentState(source_infohash="vanished_hash_67890", state=State.QUERYING)
+    ts = TorrentState(source_infohash="vanished_hash_67890", state=State.WAITING_INDEXER)
     await coord._do_waiting_indexer(ts)
     await coord._do_waiting_indexer(ts)
     coord.transition.assert_not_called()
@@ -275,7 +275,7 @@ async def test_do_waiting_indexer_adopts_complete_ssd_entry():
     coord.transition = MagicMock(side_effect=lambda t, s, **k: setattr(t, "state", s))
 
     ts = TorrentState(source_infohash=h, source_name="Hand.Added.mkv",
-                      total_bytes=1000, state=State.QUERYING)
+                      total_bytes=1000, state=State.WAITING_INDEXER)
     ts._blob = raw
     await coord._do_waiting_indexer(ts)
 
@@ -307,7 +307,7 @@ async def test_do_waiting_indexer_heals_blob_from_ssd_entry():
         coord.transition = MagicMock(side_effect=lambda t, s, **k: setattr(t, "state", s))
 
         ts = TorrentState(source_infohash=h, source_name="Hand.Added.mkv",
-                          total_bytes=1000, state=State.QUERYING)
+                          total_bytes=1000, state=State.WAITING_INDEXER)
         store.upsert(ts)
         await coord._do_waiting_indexer(ts)
 
@@ -333,7 +333,7 @@ async def test_do_waiting_indexer_waits_on_downloading_ssd_entry():
     coord.transition = MagicMock()
 
     ts = TorrentState(source_infohash=h, source_name="Hand.Added.mkv",
-                      total_bytes=1000, state=State.QUERYING)
+                      total_bytes=1000, state=State.WAITING_INDEXER)
     await coord._do_waiting_indexer(ts)
 
     coord._pick_and_admit.assert_not_called()
@@ -829,7 +829,7 @@ async def test_pick_and_admit_force_direct_bypasses_prowlarr():
     from unittest.mock import AsyncMock, patch
 
     coord = _pick_coord()
-    ts = TorrentState(source_infohash="d" * 40, state=State.QUERYING, force_direct=1)
+    ts = TorrentState(source_infohash="d" * 40, state=State.WAITING_INDEXER, force_direct=1)
     with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
                new_callable=AsyncMock) as pick:
         pick.return_value = _decision()
@@ -847,7 +847,7 @@ async def test_pick_and_admit_first_miss_parks_despite_fallback_flag():
     from unittest.mock import AsyncMock, patch
 
     coord = _pick_coord(fallback_to_racing_torrent_on_prowlarr_timeout=True)
-    ts = TorrentState(source_infohash="d" * 40, state=State.QUERYING)
+    ts = TorrentState(source_infohash="d" * 40, state=State.WAITING_INDEXER)
     assert ts.indexer_first_queried_at is None
     with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
                new_callable=AsyncMock) as pick:
@@ -865,7 +865,7 @@ async def test_pick_and_admit_timeout_falls_back_to_racing():
 
     coord = _pick_coord(fallback_to_racing_torrent_on_prowlarr_timeout=True)
     ts = TorrentState(
-        source_infohash="d" * 40, state=State.QUERYING,
+        source_infohash="d" * 40, state=State.WAITING_INDEXER,
         indexer_first_queried_at=_past_max_age(coord.cfg),
         indexer_attempts=40,
     )
@@ -888,7 +888,7 @@ async def test_pick_and_admit_timeout_without_flag_parks():
 
     coord = _pick_coord()
     ts = TorrentState(
-        source_infohash="d" * 40, state=State.QUERYING,
+        source_infohash="d" * 40, state=State.WAITING_INDEXER,
         indexer_first_queried_at=_past_max_age(coord.cfg),
         indexer_attempts=40,
     )
@@ -914,7 +914,7 @@ async def test_pick_and_admit_timeout_skips_public_groups():
         trackers=["http://tracker.opentrackr.org/announce"],
     )
     ts = TorrentState(
-        source_infohash="e" * 40, state=State.QUERYING,
+        source_infohash="e" * 40, state=State.WAITING_INDEXER,
         indexer_first_queried_at=_past_max_age(coord.cfg),
     )
     with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
@@ -951,7 +951,7 @@ async def test_pick_and_admit_uses_operator_supplied_bytes(tmp_path):
 
     Regression: a racing row whose VPS1 original vanished parked for a
     Prowlarr cross-seed forever even after the operator supplied the
-    exact .torrent via /add (+ /fetch woke it to QUERYING and it just
+    exact .torrent via /add (+ /fetch flagged it and it just
     parked again). The bytes come from the DB column (no in-memory
     copy), so this also survives a restart mid-wait.
     """
@@ -1077,7 +1077,7 @@ async def test_fallback_trip_opens_fresh_direct_window():
     # Real park (not mocked) so the max-age give-up logic actually runs.
     del coord._park_for_indexer_retry
     ts = TorrentState(
-        source_infohash="d" * 40, state=State.QUERYING,
+        source_infohash="d" * 40, state=State.WAITING_INDEXER,
         indexer_first_queried_at=_past_max_age(coord.cfg),
         indexer_attempts=40,
     )
