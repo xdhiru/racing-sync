@@ -822,7 +822,7 @@ async def test_callback_go_starts_copy_and_refreshes():
 
 @pytest.mark.anyio
 async def test_callback_cancel_opens_keep_question():
-    """Tapping a hash cancel button asks keep/delete inline (deletes nothing)."""
+    """Tapping a hash cancel button asks remember-first (deletes nothing)."""
     from unittest.mock import AsyncMock, MagicMock
     bot = _action_bot()
     bot._store = MagicMock()
@@ -836,13 +836,13 @@ async def test_callback_cancel_opens_keep_question():
     _kwargs = bot._bot.send_message.call_args[1]
     _data = [b.callback_data for r in
              _kwargs["reply_markup"].inline_keyboard for b in r]
-    assert f"keep:{'b' * 40}:yes" in _data
-    assert f"keep:{'b' * 40}:no" in _data
+    assert f"forget:{'b' * 40}:1" in _data
+    assert f"forget:{'b' * 40}:0" in _data
 
 
 @pytest.mark.anyio
 async def test_callback_cancel_all_resolves_live_group():
-    """cancel:all:<leader> asks keep/delete over the live group."""
+    """cancel:all:<leader> asks remember-first over the live group."""
     from unittest.mock import AsyncMock, MagicMock
     bot = _action_bot()
     bot._store = MagicMock()
@@ -864,7 +864,7 @@ async def test_callback_cancel_all_resolves_live_group():
     _kwargs = bot._bot.send_message.call_args[1]
     _data = [b.callback_data for r in
              _kwargs["reply_markup"].inline_keyboard for b in r]
-    assert f"keep:all:{'a' * 40}:yes" in _data
+    assert f"forget:all:{'a' * 40}:1" in _data
     assert "all 2 copies" in bot._bot.send_message.call_args[0][1]
 
 
@@ -881,8 +881,9 @@ async def test_callback_keep_yes_no_execute():
             state=State.WAITING_INDEXER)
         executed = {}
 
-        async def _fake_snapshot_cancel(hashes, title, *, delete_files):
-            executed["args"] = (list(hashes), title, delete_files)
+        async def _fake_snapshot_cancel(hashes, title, *, delete_files,
+                                        remember=True):
+            executed["args"] = (list(hashes), title, delete_files, remember)
             return "done"
 
         bot._execute_snapshot_cancel = _fake_snapshot_cancel
@@ -893,9 +894,9 @@ async def test_callback_keep_yes_no_execute():
         return executed, bot
 
     executed, bot = await _run("yes")
-    assert executed["args"] == (["a" * 40], "Show", False)
+    assert executed["args"] == (["a" * 40], "Show", False, True)
     executed, _ = await _run("no")
-    assert executed["args"] == (["a" * 40], "Show", True)
+    assert executed["args"] == (["a" * 40], "Show", True, True)
 
 
 @pytest.mark.anyio

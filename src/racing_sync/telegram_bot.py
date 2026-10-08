@@ -912,37 +912,58 @@ def _member_button_labels(members) -> list[tuple[str, str]]:
         return []
 
 
-def _parse_action_data(data: str) -> tuple[str, bool, str, str]:
-    """Parse a hash-protocol callback into (cmd, all, hash, choice).
+def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
+    """Parse a hash-protocol callback into (cmd, all, hash, choice, remember).
 
     Shapes: `<cmd>:<40hex>`, `<cmd>:all:<40hex>`,
-    `<cmd>:<40hex>:yes|no`, `<cmd>:all:<40hex>:yes|no`, `abort`.
-    Returns ("", False, "", "") when malformed — callers treat it
+    `<cmd>:<40hex>:yes|no`, `<cmd>:all:<40hex>:yes|no` (keep/inject),
+    `forget:<scope>`, `forget:<scope>:<0|1>`,
+    `keep:<scope>:<0|1>:<yes|no>`, `abort`.
+    `remember` is True/False when the buttons carried the Q1 remember
+    choice, else None (legacy 3-part keep buttons predate it and mean
+    remember, matching the old always-ignore cancel).
+    Returns ("", False, "", "", None) when malformed — callers treat it
     as a stale button.
     """
     try:
         parts = str(data or "").split(":")
         if parts == ["abort"]:
-            return ("abort", False, "", "")
+            return ("abort", False, "", "", None)
         if len(parts) == 2 and parts[0] in (
-                "go", "cancel", "inject", "skip", "resume"):
+                "go", "cancel", "inject", "skip", "resume", "forget"):
             if _is_hex40(parts[1]):
-                return (parts[0], False, parts[1].lower(), "")
+                return (parts[0], False, parts[1].lower(), "", None)
         if len(parts) == 3 and parts[0] in (
                 "cancel", "keep", "inject", "skip", "resume",
-                "go") and parts[1] == "all":
+                "go", "forget") and parts[1] == "all":
             if _is_hex40(parts[2]):
-                return (parts[0], True, parts[2].lower(), "")
+                return (parts[0], True, parts[2].lower(), "", None)
         if len(parts) == 3 and parts[0] in ("keep", "inject"):
             if _is_hex40(parts[1]) and parts[2] in ("yes", "no"):
-                return (parts[0], False, parts[1].lower(), parts[2])
+                return (parts[0], False, parts[1].lower(), parts[2], True)
         if len(parts) == 4 and parts[0] in ("keep", "inject"):
-            if parts[1] == "all" and _is_hex40(parts[2]) \
+            if _is_hex40(parts[1]) and parts[2] in ("0", "1") \
                     and parts[3] in ("yes", "no"):
-                return (parts[0], True, parts[2].lower(), parts[3])
+                return (parts[0], False, parts[1].lower(), parts[3],
+                        parts[2] == "1")
+        if len(parts) == 5 and parts[0] in ("keep", "inject"):
+            if parts[1] == "all" and _is_hex40(parts[2]) \
+                    and parts[3] in ("0", "1") \
+                    and parts[4] in ("yes", "no"):
+                return (parts[0], True, parts[2].lower(), parts[4],
+                        parts[3] == "1")
+        if len(parts) == 3 and parts[0] == "forget":
+            if _is_hex40(parts[1]) and parts[2] in ("0", "1"):
+                return (parts[0], False, parts[1].lower(), "",
+                        parts[2] == "1")
+        if len(parts) == 4 and parts[0] == "forget":
+            if parts[1] == "all" and _is_hex40(parts[2]) \
+                    and parts[3] in ("0", "1"):
+                return (parts[0], True, parts[2].lower(), "",
+                        parts[3] == "1")
     except Exception:
         pass
-    return ("", False, "", "")
+    return ("", False, "", "", None)
 
 
 def render_active(
@@ -1845,20 +1866,29 @@ class TelegramBot:
 
     def _keepq_text_and_rows(
         self, title: str, scope_label: str, scope: str,
-        size_bytes: object = None,
+        size_bytes: object = None, remember: bool = True,
     ) -> tuple[str, list[list[tuple[str, str]]]]:
-        """Keep/delete question text + hash buttons for a cancel scope."""
+        """Keep/delete question text + hash buttons for a cancel scope.
+
+        `remember` (the Q1 answer) travels in the buttons
+        (`keep:<scope>:<0|1>:<yes|no>`); the question text names which
+        variant applies so a forwarded screenshot stays intelligible.
+        """
         try:
             _size = _size_compact(size_bytes)
         except Exception:
             _size = ""
         _tspec = _safe_display_name((title or "")[:60]) + (
             f" · {_size}" if _size else "")
-        _text = (f"Cancel {_tspec}{scope_label} — keep downloaded files?"
+        _ig = "1" if remember else "0"
+        _blocked = "blocked from returning" if remember else \
+            "allowed back later"
+        _text = (f"Cancel {_tspec}{scope_label} — keep downloaded files? "
+                 f"({_blocked})"
                  f"\nKeep untracks (data stays in place); "
                  f"Delete wipes the torrent and its data.")
-        _rows = [[("✔ Keep files", f"keep:{scope}:yes")],
-                 [("✖ Delete files", f"keep:{scope}:no")],
+        _rows = [[("✔ Keep files", f"keep:{scope}:{_ig}:yes")],
+                 [("✖ Delete files", f"keep:{scope}:{_ig}:no")],
                  [("Close", "abort")]]
         return _text, _rows
 
@@ -2633,11 +2663,19 @@ class TelegramBot:
         except Exception as e:  # noqa: BLE001
             log.debug("cancel reply failed: %s", e)
 
-    async def _execute_cancel_one(self, infohash: str, *, delete_files: bool) -> str:
-        """Forget + ignore one release; files kept iff not `delete_files`."""
+    async def _execute_cancel_one(self, infohash: str, *, delete_files: bool,
+                                    remember: bool = True) -> str:
+        """Forget one release; files kept iff not `delete_files`.
+
+        `remember=False` skips the ignore entry and hard-deletes the row
+        (never-seen semantics): workers are stopped first so no stale
+        upsert resurrects it, and a later re-drop re-ingests from scratch.
+        """
         _verb = "Cancelled" if delete_files else "Kept files for"
-        _done = "(removed + ignored)" if delete_files else (
-            "untracked + ignored, data left in place")
+        _done = ("(removed + ignored)" if remember
+                 else "(removed, can be re-added)") if delete_files else (
+            "untracked + ignored, data left in place" if remember else
+            "untracked, data left in place (can be re-added)")
         try:
             from .api import _hold_ops_lock
         except Exception:
@@ -2670,11 +2708,18 @@ class TelegramBot:
         except Exception:
             detail_msg_id = None
         try:
+            _stop = getattr(coord, "stop_workers_for", None)
+            if callable(_stop):
+                try:
+                    await _stop(infohash)
+                except Exception:
+                    pass
             if _hold_ops_lock is not None:
                 async with _hold_ops_lock(coord):
                     result = await forget_torrent(
                         cfg, dest=dest, store=store, target=infohash,
-                        apply=True, delete_files=delete_files, ignore=True,
+                        apply=True, delete_files=delete_files,
+                        ignore=remember, hard=not remember,
                     )
                     try:
                         await coord._ssd_release(
@@ -2684,7 +2729,8 @@ class TelegramBot:
             else:
                 result = await forget_torrent(
                     cfg, dest=dest, store=store, target=infohash,
-                    apply=True, delete_files=delete_files, ignore=True,
+                    apply=True, delete_files=delete_files,
+                    ignore=remember, hard=not remember,
                 )
                 try:
                     await coord._ssd_release(
@@ -2735,8 +2781,14 @@ class TelegramBot:
         return f"{_verb} {name}{pair_note} {_done}"
 
     async def _execute_snapshot_cancel(self, hashes: list[str], title: str,
-                                         *, delete_files: bool) -> str:
-        """Forget frozen snapshot hashes (liveness re-checked each)."""
+                                         *, delete_files: bool,
+                                         remember: bool = True) -> str:
+        """Forget resolved hashes (liveness re-checked each).
+
+        `remember=False` forgets without the ignore entry and hard-deletes
+        the rows (never-seen semantics): a later re-drop re-ingests from
+        scratch. Workers are stopped first so no stale upsert resurrects.
+        """
         try:
             live = []
             for h in hashes or []:
@@ -2752,7 +2804,7 @@ class TelegramBot:
             for h in live:
                 try:
                     outs.append(await self._execute_cancel_one(
-                        h, delete_files=delete_files))
+                        h, delete_files=delete_files, remember=remember))
                 except Exception as e:  # noqa: BLE001
                     outs.append(f"Action failed: {e}")
             if len(outs) == 1:
@@ -2834,9 +2886,13 @@ class TelegramBot:
                 pass
             return
         if kind == "cancel":
-            _text, _rows = self._keepq_text_and_rows(
-                title, "", full_hash,
-                getattr(row, "total_bytes", 0))
+            _text = (
+                f"Forget {title}?\n"
+                f"🚫 Ignore blocks it from coming back; "
+                f"👻 Just forget allows re-adding it later.")
+            _rows = [[("🚫 Ignore + forget", f"forget:{full_hash}:1"),
+                      ("👻 Just forget", f"forget:{full_hash}:0")],
+                     [("Close", "abort")]]
             try:
                 await self._send_sheet(_text, _rows, reply_to=message)
             except Exception:
@@ -3248,14 +3304,16 @@ class TelegramBot:
                         pass
                     return
                 try:
-                    _size1 = getattr(members[0], "total_bytes", 0) \
-                        if members else 0
-                except Exception:
-                    _size1 = 0
-                _text, _rows = self._keepq_text_and_rows(
-                    title, "", _hashes[0], _size1)
-                try:
-                    await self._send_sheet(_text, _rows, reply_to=message)
+                    await self._send_sheet(
+                        f"Forget {title}?\n"
+                        f"🚫 Ignore blocks it from coming back; "
+                        f"👻 Just forget allows re-adding it later.",
+                        [[("🚫 Ignore + forget",
+                           f"forget:{_hashes[0]}:1"),
+                          ("👻 Just forget",
+                           f"forget:{_hashes[0]}:0")],
+                         [("Close", "abort")]],
+                        reply_to=message)
                 except Exception:
                     pass
                 return
@@ -3460,7 +3518,7 @@ class TelegramBot:
             return h[:10]
 
         try:
-            cmd, _all, _h, _choice = _parse_action_data(data)
+            cmd, _all, _h, _choice, _ig = _parse_action_data(data)
             if not cmd:
                 await _say("Stale button — refresh the list")
                 return
@@ -3476,6 +3534,38 @@ class TelegramBot:
                 await _refresh()
                 return
             if cmd == "cancel" and _h and not _choice:
+                # First question is remember-or-not (keep/delete follows);
+                # the scope travels in the buttons, nothing is stored.
+                if _all:
+                    _hashes = await _group_of(_h)
+                    if not _hashes:
+                        await _say("Group changed — tap /act again.")
+                        return
+                    _title = await _row_title(_h)
+                    _scope = f"all:{_h}"
+                    _scope_label = f" · all {len(_hashes)} copies"
+                else:
+                    _title = await _row_title(_h)
+                    _scope = _h
+                    _scope_label = ""
+                _text = (
+                    f"Forget {_safe_display_name((_title or '')[:60])}"
+                    f"{_scope_label}?\n"
+                    f"🚫 Ignore blocks it from coming back; "
+                    f"👻 Just forget allows re-adding it later.")
+                _rows = [[("🚫 Ignore + forget", f"forget:{_scope}:1"),
+                          ("👻 Just forget", f"forget:{_scope}:0")],
+                         [("Close", "abort")]]
+                try:
+                    await self._send_sheet(
+                        _text, _rows,
+                        reply_to=getattr(query, "message", None))
+                except Exception:
+                    pass
+                return
+            if cmd == "forget" and _h:
+                if _ig is None:
+                    _ig = True
                 if _all:
                     _hashes = await _group_of(_h)
                     if not _hashes:
@@ -3484,11 +3574,11 @@ class TelegramBot:
                     _title = await _row_title(_h)
                     _text, _rows = self._keepq_text_and_rows(
                         _title, f" · all {len(_hashes)} copies",
-                        f"all:{_h}")
+                        f"all:{_h}", None, remember=_ig)
                 else:
                     _title = await _row_title(_h)
                     _text, _rows = self._keepq_text_and_rows(
-                        _title, "", _h)
+                        _title, "", _h, None, remember=_ig)
                 try:
                     await self._send_sheet(
                         _text, _rows,
@@ -3497,6 +3587,8 @@ class TelegramBot:
                     pass
                 return
             if cmd == "keep" and _choice in ("yes", "no"):
+                if _ig is None:
+                    _ig = True
                 if _all:
                     _hashes = await _group_of(_h)
                     _scope_title = await _row_title(_h)
@@ -3508,7 +3600,8 @@ class TelegramBot:
                     await _refresh()
                     return
                 result = await self._execute_snapshot_cancel(
-                    _hashes, _scope_title, delete_files=(_choice == "no"))
+                    _hashes, _scope_title, delete_files=(_choice == "no"),
+                    remember=_ig)
                 await _say(result)
                 await _refresh()
                 return

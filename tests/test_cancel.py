@@ -522,7 +522,7 @@ async def test_admin_allowlist_refuses_stranger_command(tmp_path: Path):
         sent = [c.args[1] for c in
                 bot._bot.send_message.await_args_list]
         assert any("Not authorized" in str(t) for t in sent)
-        # Listed admin proceeds normally (keep question, nothing deleted).
+        # Listed admin proceeds normally (remember question, nothing deleted).
         bot._bot.send_message.reset_mock()
         bot._callback_times.clear()
         await bot._handle_chat_message(
@@ -531,7 +531,7 @@ async def test_admin_allowlist_refuses_stranger_command(tmp_path: Path):
         _kwargs = bot._bot.send_message.call_args[1]
         _data = [b.callback_data for r in
                  _kwargs["reply_markup"].inline_keyboard for b in r]
-        assert f"keep:{'a' * 40}:yes" in _data
+        assert f"forget:{'a' * 40}:1" in _data
     finally:
         store.close()
 
@@ -706,7 +706,7 @@ def test_resolve_cancel_target_ignores_done_history(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_chat_message_cancel_arms_keep_question(tmp_path: Path):
-    """Sending `/cancel_<short>` asks keep/delete — nothing deleted yet."""
+    """Sending `/cancel_<short>` asks remember-first — nothing deleted yet."""
     ssd = tmp_path / "ssd"
     ssd.mkdir()
     store = StateStore(tmp_path / "state.db")
@@ -727,17 +727,17 @@ async def test_chat_message_cancel_arms_keep_question(tmp_path: Path):
     bot._store = store
     try:
         await bot._handle_chat_message(_message(text="/cancel_aaaaaaaaaa"))
-        # Row untouched; keep question asked with hash buttons instead.
+        # Row untouched; remember question asked with hash buttons instead.
         assert store.get("a" * 40) is not None
         assert store.is_ignored("a" * 40) is False
         bot._bot.send_message.assert_awaited_once()
         sent_text = bot._bot.send_message.call_args[0][1]
-        assert sent_text.startswith("Cancel Show")
+        assert sent_text.startswith("Forget Show?")
         _kwargs = bot._bot.send_message.call_args[1]
         _data = [b.callback_data for r in
                  _kwargs["reply_markup"].inline_keyboard for b in r]
-        assert f"keep:{'a' * 40}:yes" in _data
-        assert f"keep:{'a' * 40}:no" in _data
+        assert f"forget:{'a' * 40}:1" in _data
+        assert f"forget:{'a' * 40}:0" in _data
     finally:
         store.close()
 
@@ -786,12 +786,13 @@ async def test_chat_message_cancel_supports_full_hash_and_suffix(tmp_path: Path)
     try:
         await bot._handle_chat_message(
             _message(text=f"/cancel_{'c' * 40}@mybot"))
-        # Full hash also lands on the keep question (never instant).
+        # Full hash also lands on the remember question (never instant).
         assert store.get("c" * 40) is not None
         _kwargs = bot._bot.send_message.call_args[1]
         _data = [b.callback_data for r in
                  _kwargs["reply_markup"].inline_keyboard for b in r]
-        assert f"keep:{'c' * 40}:yes" in _data
+        assert f"forget:{'c' * 40}:1" in _data
+        assert f"forget:{'c' * 40}:0" in _data
     finally:
         store.close()
 
@@ -985,14 +986,21 @@ def test_keepq_text_shows_size_or_omits():
 
     bot = TelegramBot.__new__(TelegramBot)
     _text, _rows = bot._keepq_text_and_rows("Big.Show", " · all 2 copies",
-                                            "all:" + "a" * 40, 2_600_000_000)
+                                            "all:" + "a" * 40, 2_600_000_000,
+                                            remember=True)
     assert "Big.Show" in _text and "all 2 copies" in _text
     assert "2.4G" in _text
     _pairs = [t for r in _rows for t in r]
     _flat = [d for (_, d) in _pairs]
-    assert f"keep:all:{'a' * 40}:yes" in _flat
-    assert f"keep:all:{'a' * 40}:no" in _flat
+    assert f"keep:all:{'a' * 40}:1:yes" in _flat
+    assert f"keep:all:{'a' * 40}:1:no" in _flat
     assert ("Close", "abort") in _pairs
+    _text0, _rows0 = bot._keepq_text_and_rows("Big.Show", "", "a" * 40,
+                                              remember=False)
+    _flat0 = [d for r in _rows0 for (_, d) in r]
+    assert f"keep:{'a' * 40}:0:yes" in _flat0
+    assert f"keep:{'a' * 40}:0:no" in _flat0
+    assert "allowed back later" in _text0
     assert [t for (t, _) in _pairs] == [
         "✔ Keep files", "✖ Delete files", "Close"]
     # Rows without size still render (no dangling separator).
@@ -1002,21 +1010,32 @@ def test_keepq_text_shows_size_or_omits():
 
 
 def test_sheet_buttons_fit_telegram_callback_budget():
-    """Every hash-protocol callback shape fits 64 bytes."""
+    """Every hash-protocol callback shape fits 64 bytes and parses."""
+    from racing_sync.telegram_bot import _parse_action_data
+
     _h = "a" * 40
-    for _data in (f"go:{_h}", f"go:all:{_h}", f"cancel:{_h}",
-                  f"cancel:all:{_h}", f"keep:{_h}:yes",
-                  f"keep:all:{_h}:no", f"inject:{_h}",
-                  f"inject:{_h}:yes", f"inject:all:{_h}:no",
-                  f"skip:all:{_h}", f"resume:{_h}",
+    for _data in (f"go:{_h}", f"cancel:{_h}",
+                  f"cancel:all:{_h}", f"forget:{_h}:1",
+                  f"forget:all:{_h}:0", f"keep:{_h}:1:yes",
+                  f"keep:all:{_h}:0:no", f"inject:{_h}",
+                  f"inject:{_h}:yes", f"skip:all:{_h}", f"resume:{_h}",
                   f"resume:all:{_h}", "abort"):
         assert len(_data) <= 64, _data
-        from racing_sync.telegram_bot import _parse_action_data
         assert _parse_action_data(_data)[0] in (
-            "go", "cancel", "keep", "inject", "skip", "resume", "abort")
-    from racing_sync.telegram_bot import _parse_action_data
-    assert _parse_action_data("pick:7:1") == ("", False, "", "")
-    assert _parse_action_data("keep:9:yes") == ("", False, "", "")
+            "go", "cancel", "forget", "keep", "inject", "skip",
+            "resume", "abort")
+    # Remember choice travels in keep buttons (legacy 3-part = remember).
+    assert _parse_action_data(f"keep:{_h}:1:yes") == (
+        "keep", False, _h, "yes", True)
+    assert _parse_action_data(f"keep:{_h}:0:no") == (
+        "keep", False, _h, "no", False)
+    assert _parse_action_data(f"keep:{_h}:yes") == (
+        "keep", False, _h, "yes", True)
+    assert _parse_action_data(f"forget:{_h}:0") == (
+        "forget", False, _h, "", False)
+    assert _parse_action_data("pick:7:1") == ("", False, "", "", None)
+    assert _parse_action_data("keep:9:yes") == ("", False, "", "", None)
+    assert _parse_action_data("abort:7") == ("", False, "", "", None)
 
 
 def test_keepq_text_sanitizes_backtick_title():
@@ -1194,6 +1213,48 @@ async def test_chat_message_skip_and_unskip_full_hash(tmp_path: Path):
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Resumed")
         bot._coord._spawn_worker.assert_called_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_chat_message_resume_group_unholds_and_lifts(tmp_path: Path):
+    """/resume_1 resumes held copies and lifts their ignore entries."""
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Same.Show",
+                              total_bytes=1000, state=State.NEW, skipped=1))
+    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Same.Show",
+                              total_bytes=1000, state=State.WAITING_INDEXER,
+                              skipped=1))
+    store.ignore_torrent("b" * 40, "Same.Show")
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/resume_1"))
+        assert store.get("a" * 40).skipped == 0
+        assert store.get("b" * 40).skipped == 0
+        assert store.is_ignored("b" * 40) is False
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Resumed")
+        assert "Unignored" in sent
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_chat_message_resume_ignored_only_hash(tmp_path: Path):
+    """/resume_<hash> on an ignored-only hash lifts it (unignore parity)."""
+    store = StateStore(tmp_path / "state.db")
+    store.ignore_torrent("c" * 40, "Gone")
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/resume_" + "c" * 40))
+        assert store.is_ignored("c" * 40) is False
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Unignored")
     finally:
         store.close()
 
@@ -1468,7 +1529,7 @@ def _tap(data):
 
 @pytest.mark.anyio
 async def test_cancel_group_member_then_yes_keeps_files(tmp_path: Path):
-    """Group cancel → member hash button → Yes: only it goes, files kept."""
+    """Group cancel → member → Just forget → Yes: only it goes, no ignore."""
     store, ssd = _twins_store(tmp_path)
     bot, coord = _twins_bot(store, ssd, tmp_path)
     try:
@@ -1479,26 +1540,39 @@ async def test_cancel_group_member_then_yes_keeps_files(tmp_path: Path):
                  _kwargs["reply_markup"].inline_keyboard for b in r]
         assert f"cancel:{'b' * 40}" in _data
         assert any(d.startswith("cancel:all:") for d in _data)
-        # Tap the b-copy; nothing deleted yet, keep question asked inline.
+        # Tap the b-copy → remember question (nothing deleted yet).
         await bot._on_action_button(
             _tap(f"cancel:{'b' * 40}"), f"cancel:{'b' * 40}")
         assert store.get("b" * 40) is not None
-        # Yes: forget with files kept; the a-copy keeps seeding tracked.
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        assert f"forget:{'b' * 40}:1" in _data
+        assert f"forget:{'b' * 40}:0" in _data
+        # Just forget (no remember) → keep question for files.
         await bot._on_action_button(
-            _tap(f"keep:{'b' * 40}:yes"), f"keep:{'b' * 40}:yes")
+            _tap(f"forget:{'b' * 40}:0"), f"forget:{'b' * 40}:0")
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        assert f"keep:{'b' * 40}:0:yes" in _data
+        # Yes: forget with files kept and NOT ignored; a-copy untouched.
+        await bot._on_action_button(
+            _tap(f"keep:{'b' * 40}:0:yes"), f"keep:{'b' * 40}:0:yes")
         assert store.get("b" * 40) is None
-        assert store.is_ignored("b" * 40) is True
+        assert store.is_ignored("b" * 40) is False
         assert store.get("a" * 40) is not None
         assert store.is_ignored("a" * 40) is False
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Kept files")
+        assert "re-added" in sent
     finally:
         store.close()
 
 
 @pytest.mark.anyio
 async def test_cancel_all_then_no_deletes_everything(tmp_path: Path):
-    """All + No: every copy forgotten with files deleted."""
+    """All + ignore + No: every copy forgotten, ignored, files deleted."""
     store, ssd = _twins_store(tmp_path)
     bot, coord = _twins_bot(store, ssd, tmp_path)
     try:
@@ -1512,13 +1586,27 @@ async def test_cancel_all_then_no_deletes_everything(tmp_path: Path):
         _kwargs = bot._bot.send_message.call_args[1]
         _data = [b.callback_data for r in
                  _kwargs["reply_markup"].inline_keyboard for b in r]
-        assert f"keep:all:{_leader}:yes" in _data
+        _forget = next(d for d in _data if d.startswith("forget:all:"))
+        assert _forget.endswith(":1") or _forget.endswith(":0")
+        await bot._on_action_button(_tap(_forget), _forget)
+        _kwargs = bot._bot.send_message.call_args[1]
+        _data = [b.callback_data for r in
+                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _ig = _forget.split(":")[3]
+        assert f"keep:all:{_leader}:{_ig}:yes" in _data
         await bot._on_action_button(
-            _tap(f"keep:all:{_leader}:no"), f"keep:all:{_leader}:no")
+            _tap(f"keep:all:{_leader}:{_ig}:no"),
+            f"keep:all:{_leader}:{_ig}:no")
         assert store.get("a" * 40) is None
         assert store.get("b" * 40) is None
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Cancelled")
+        if _ig == "1":
+            assert store.is_ignored("a" * 40) is True
+            assert store.is_ignored("b" * 40) is True
+        else:
+            assert store.is_ignored("a" * 40) is False
+            assert store.is_ignored("b" * 40) is False
     finally:
         store.close()
 

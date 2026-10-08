@@ -822,6 +822,25 @@ class StateStore:
                 "DELETE FROM torrent_state WHERE source_infohash = ?", (norm,)
             )
 
+    def hard_delete(self, source_infohash: str) -> bool:
+        """Delete a row outright, tombstone or not; True when one was removed.
+
+        ONLY for forget-without-remember (never-seen semantics): the
+        caller must have stopped the row's workers and removed its dest
+        entries first, otherwise a stale in-flight upsert resurrects it
+        as a zombie — exactly what delete()/tombstone() protects
+        against. No ignore entry is touched (the caller owns that).
+        """
+        self._ensure_open()
+        norm = (source_infohash or "").strip().lower()
+        if not norm:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM torrent_state WHERE source_infohash = ?", (norm,)
+            )
+            return (cur.rowcount or 0) > 0
+
     def tombstone(self, source_infohash: str) -> bool:
         """Stamp a forget tombstone; True when a live row was stamped.
 

@@ -293,6 +293,7 @@ async def _forget_one(
     apply: bool,
     delete_files: bool = True,
     ignore: bool = False,
+    hard: bool = False,
 ) -> dict:
     """Forget a single already-resolved row (no cascade)."""
     known = sorted(_row_hashes(row))
@@ -453,7 +454,18 @@ async def _forget_one(
             result["errors"].append(f"ignore list: {e}")
             result["ignored"] = False
     # `still`/unverifiable deletes return early above (row kept for retry),
-    # so reaching here means every dest entry is gone: safe to tombstone.
+    # so reaching here means every dest entry is gone: safe to drop the row.
+    if hard:
+        # Never-seen semantics (forget without remember): hard-delete so a
+        # later re-drop/re-poll re-ingests from scratch instead of resuming
+        # the old row or waiting out the tombstone TTL. The caller must
+        # have stopped the row's workers and removed its dest entries
+        # first (both true here), or a stale upsert resurrects a zombie.
+        try:
+            store.hard_delete(row.source_infohash)
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append(f"db row: {e}")
+        return result
     try:
         # Tombstone, not hard-delete: in-flight workers, retries and
         # re-discovery refuse tombstoned hashes instead of resurrecting
@@ -473,6 +485,7 @@ async def forget_torrent(
     apply: bool,
     delete_files: bool = True,
     ignore: bool = False,
+    hard: bool = False,
 ) -> dict:
     """Plan (apply=False) or execute (apply=True) abandoning one torrent.
 
@@ -486,12 +499,18 @@ async def forget_torrent(
     `ignore=True` additionally records the release on the ignore list so
     discovery/recovery/re-injection never pick it up again while it stays
     on the VPS1 racing client (only meaningful with apply=True).
+
+    `hard=True` (only meaningful with apply=True and ignore=False)
+    hard-deletes the row instead of tombstoning it, so a later re-drop
+    or re-poll re-ingests from scratch like a new encounter. The caller
+    must stop the row's workers first (else a stale upsert resurrects
+    a zombie); paired rows inherit both flags.
     """
     row = resolve_row(store, target)
     paired = _paired_waiter_identities(store, cfg, row)
     result = await _forget_one(
         cfg, dest=dest, store=store, row=row,
-        apply=apply, delete_files=delete_files, ignore=ignore,
+        apply=apply, delete_files=delete_files, ignore=ignore, hard=hard,
     )
     result["paired_cancelled"] = []
     if not apply:
@@ -513,6 +532,7 @@ async def forget_torrent(
             pres = await _forget_one(
                 cfg, dest=dest, store=store, row=prow,
                 apply=True, delete_files=delete_files, ignore=ignore,
+                hard=hard,
             )
         except LookupError:
             continue
