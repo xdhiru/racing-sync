@@ -481,14 +481,18 @@ async def test_process_delete_disabled_keeps_file(tmp_path):
 
 @pytest.mark.anyio
 async def test_bot_command_menu_lists_add(tmp_path):
-    """The `/` popup offers /add with a self-explaining description."""
+    """The `/` popup offers /add and /cancel_match with descriptions."""
     from racing_sync.telegram_bot import _bot_command_menu
 
     cmds = _bot_command_menu()
     assert [(c.command, c.description) for c in cmds] == [(
         "add",
-        "Add a .torrent file \u2014 reply to it with /add, or send it "
+        "Add a .torrent file — reply to it with /add, or send it "
         "with /add as caption",
+    ), (
+        "cancel_match",
+        "Cancel every active group whose title contains <text> — "
+        "/cancel_match <text>",
     )]
 
 
@@ -527,7 +531,7 @@ async def test_start_publishes_command_menu(tmp_path):
             await bot.start()
         try:
             cmds = fake.set_my_commands.await_args.args[0]
-            assert [c.command for c in cmds] == ["add"]
+            assert [c.command for c in cmds] == ["add", "cancel_match"]
         finally:
             try:
                 await bot.stop()

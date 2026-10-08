@@ -304,7 +304,14 @@ exists to expire. Tapping a group cancel first asks remember-or-not
 re-addable), then keep/delete (Yes = untrack + optionally ignore with
 files kept, No = wiped); cancelling `All` drops every copy, a single
 copy drops just it
-(leader-tap cascades to deferred pairs as before). Without remember
+(leader-tap cascades to deferred pairs as before). `/cancel_match
+<text>` cancels every live group whose title contains `<text>` after
+one remember + one keep/delete question: the substring travels
+base64url-encoded in the buttons (`forget:match:<tok>:<0|1>` /
+`keep:match:<tok>:<0|1>:<yes|no>`) and is re-resolved live at each
+tap, so no stored pending state exists to expire. Tapping any action
+button deletes its sheet once handled, so answered questions never
+linger behind their follow-up (only the outcome reply stays). Without remember
 the row is hard-deleted (no tombstone), so a later re-drop re-ingests
 from scratch. Delete/keep only ever concerns SSD data and client
 entries: fuse/remote copies are never touched (fuse-pointing entries

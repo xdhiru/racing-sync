@@ -129,7 +129,12 @@ forget` leaves it re-addable later. Then comes the keep question:
 `Keep files` untracks with data left in place (same as CLI
 `--keep-files`), `Delete files` wipes it. Nothing is deleted without
 those explicit choices, and delete/keep only ever concerns SSD data
-and client entries — fuse/remote copies are never touched. A `Start
+and client entries — fuse/remote copies are never touched. To cancel
+several groups at once, send `/cancel_match <text>` (also in the `/`
+menu): every active group whose title contains `<text>` is cancelled
+together after one remember + one keep/delete question. Answered
+question sheets delete themselves once tapped (only the outcome
+reply stays) — no manual Close needed. A `Start
 now: /now_<id>` line appears only while a copy qualifies (waiting on
 the indexer, or holding for a preferred copy):
 start its SSD download immediately — waiting on the indexer uses the
