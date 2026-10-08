@@ -423,23 +423,24 @@ def test_render_active_groups_same_file_trackers():
     assert "▸ bte.example ⬇️ Downloading · 50.0%" in text
     assert "Source:" not in text
     # Positional group commands on ONE line (never hashes).
-    assert "/cancel\\_1 /fetch\\_1" in text
+    assert "/cancel\\_1 /now\\_1" in text
     assert "/cancel\\_aaaaaaaaaa" not in text
-    assert "/fetch\\_aaaaaaaaaa" not in text
-    assert "/keep" not in text and "/prefer" not in text
+    assert "/now\\_aaaaaaaaaa" not in text
+    assert "/keep" not in text and "/prefer" not in text and "/fetch" not in text
     # Sibling choice rides on pick snapshots (hash, label) pairs.
     from racing_sync.telegram_bot import pick_snapshot
     members = [(lead, None), (sib, 0.5)]
-    snap = pick_snapshot(members, "fetch")
+    snap = pick_snapshot(members, "now")
     assert snap == [("a" * 40, "alpha")]
     snap_cancel = pick_snapshot(members, "cancel")
     assert [h for (h, _) in snap_cancel] == ["a" * 40, "b" * 40]
     assert snap_cancel[1] == ("b" * 40, "bte")
     assert pick_snapshot(members, "prefer") == []
+    assert pick_snapshot(members, "fetch") == [("a" * 40, "alpha")]
 
 
 def test_render_active_sibling_prefer_uses_own_hash():
-    """Prefer/fetch render group commands; the snapshot carries each hash."""
+    """Now renders group commands; the snapshot carries each hash."""
     from racing_sync.telegram_bot import pick_snapshot
 
     lead = TorrentState(
@@ -457,12 +458,15 @@ def test_render_active_sibling_prefer_uses_own_hash():
                                page=0, page_size=5, notes=notes)
     # One group, one heading; group commands on one line (no hashes).
     assert text.count("Twin.Show.S01E01") == 1
-    assert "/cancel\\_1 /fetch\\_1 /prefer\\_1" in text
+    assert "/cancel\\_1 /now\\_1" in text
     assert "/cancel\\_aaaaaaaaaa" not in text
-    assert "/prefer\\_bbbbbbbbbb" not in text
-    # The grace-held sibling snapshots with its own hash for both.
-    snap = pick_snapshot([(lead, None), (sib, None)], "prefer", notes)
+    assert "/now\\_bbbbbbbbbb" not in text
+    # The grace-held sibling snapshots with its own hash for now
+    # (and the legacy aliases agree).
+    snap = pick_snapshot([(lead, None), (sib, None)], "now", notes)
     assert snap == [("b" * 40, "bte")]
+    assert pick_snapshot([(lead, None), (sib, None)], "prefer", notes) == [
+        ("b" * 40, "bte")]
     assert pick_snapshot([(lead, None), (sib, None)], "fetch", notes) == [
         ("b" * 40, "bte")]
 
@@ -1072,7 +1076,7 @@ async def test_notify_falls_back_to_plain_text_on_parse_error():
 
 @pytest.mark.anyio
 async def test_detail_card_offers_prefer_for_grace_note():
-    """Grace-held detail cards carry copy-paste /prefer_ + /fetch_ lines."""
+    """Grace-held detail cards carry a copy-paste /now_ line."""
     from unittest.mock import AsyncMock, MagicMock
 
     bot = object.__new__(TelegramBot)
@@ -1094,13 +1098,14 @@ async def test_detail_card_offers_prefer_for_grace_note():
         total_bytes=1000, source_announce_url="https://alpha.cc/announce/xyz")
     await bot._send_one_detail(h, None)
     sent_text = bot._bot.send_message.call_args[0][1]
-    assert "Prefer this copy now:" in sent_text
-    assert f"/prefer_{h[:10]}" in sent_text
-    assert f"/fetch_{h[:10]}" in sent_text
+    assert "Start this copy now:" in sent_text
+    assert f"/now_{h[:10]}" in sent_text
+    assert "/prefer_" not in sent_text
+    assert "/fetch_" not in sent_text
 
 
 def test_render_active_offers_prefer_for_grace_note():
-    """Grace-held rows get positional prefer+fetch commands + snapshot pick."""
+    """Grace-held rows get a positional now command + snapshot pick."""
     from racing_sync.telegram_bot import pick_snapshot
 
     h = "e" * 40
@@ -1110,9 +1115,10 @@ def test_render_active_offers_prefer_for_grace_note():
     notes = {h: "Waiting for preferred copy ?? 42s left"}
     text, _, _ = render_active(
         [(ts, None)], page=0, page_size=5, notes=notes)
-    assert "/cancel\\_1 /fetch\\_1 /prefer\\_1" in text
+    assert "/cancel\\_1 /now\\_1" in text
     assert f"{h[:10]}" not in text  # no torrent hash in the message
-    assert "Prefer this copy now:" not in text
+    assert "Start this copy now:" not in text
+    assert pick_snapshot([(ts, None)], "now", notes) == [(h, "alpha")]
     assert pick_snapshot([(ts, None)], "prefer", notes) == [(h, "alpha")]
     assert pick_snapshot([(ts, None)], "fetch", notes) == [(h, "alpha")]
     # Other notes (owner-deferred) and other states get no prefer.

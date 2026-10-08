@@ -426,7 +426,7 @@ def render_detail(ts: TorrentState, progress: float | None = None,
 
     # 2. Hash & size line: full hash copiable by click + size in plain text
     # (detail card keeps the FULL hash; the Active Tasks list carries the
-    # short hash inside its /cancel_ · /fetch_ · /prefer_ commands).
+    # short hash inside its /cancel_ · /now_ commands).
     meta_parts = [f"`{full_hash}`", size]
     _bd = _batch_display(ts)
     if _bd:
@@ -441,7 +441,7 @@ def render_detail(ts: TorrentState, progress: float | None = None,
             f"Indexer miss #{ts.indexer_attempts}; next retry at {when}"
         )
     if ts.state == State.WAITING_INDEXER:
-        lines.append(f"Fetch VPS1 original now: `{_fetch_command(full_hash)}`")
+        lines.append(f"Start SSD download now: `{_now_command(full_hash)}`")
     elif ts.state == State.WAITING_DISK:
         lines.append("Waiting for SSD cap to free up")
     elif ts.state == State.QUEUED:
@@ -487,7 +487,7 @@ def render_detail(ts: TorrentState, progress: float | None = None,
     except Exception:
         _held = False
     if _held:
-        lines.append(f"⏭ Skipped — resume with `{_unskip_command(full_hash)}`")
+        lines.append(f"⏭ Skipped — resume with `{_resume_command(full_hash)}`")
 
     # Cross-seed info
     if ts.cross_seed_source:
@@ -520,11 +520,19 @@ CANCEL_CMD_RE = re.compile(r"^/cancel_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 #: `/fetch_<hex>` — same shape: use the starting torrent for the SSD
 #: download instead of waiting for Prowlarr (WAITING_INDEXER rows use
 #: the VPS1 original; NEW grace-held rows use their starting bytes).
+#: (Legacy alias: canonical verb is now `/now_`.)
 FETCH_CMD_RE = re.compile(r"^/fetch_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 #: `/prefer_<hex>` — same shape: start a grace-held row's SSD
 #: download now instead of waiting out its preferred-copy grace.
+#: (Legacy alias: canonical verb is now `/now_`.)
 PREFER_CMD_RE = re.compile(r"^/prefer_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/now_<hex>` — same shape, replaces `/fetch_` + `/prefer_` with one
+#: state-dependent verb: WAITING_INDEXER rows use the starting torrent
+#: (VPS1 original) instead of waiting out Prowlarr; NEW grace-held
+#: rows (watch or racing) start their SSD download at once.
+NOW_CMD_RE = re.compile(r"^/now_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 #: `/skip_<hex>` — same shape: hold a tracked release (whole group):
 #: no workers, no Prowlarr queries, no downloads, no moves until
@@ -532,12 +540,20 @@ PREFER_CMD_RE = re.compile(r"^/prefer_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 SKIP_CMD_RE = re.compile(r"^/skip_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 #: `/unskip_<hex>` — same shape: resume a held release immediately.
+#: (Legacy alias: canonical verb is now `/resume_`.)
 UNSKIP_CMD_RE = re.compile(r"^/unskip_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
-#: `/unignore_<full-hash>` — drop a cancelled release from the ignore
-#: list (plus its forget tombstone) so it can be tracked again. Full
-#: 40-char hash only: ignore entries are invisible in the task list,
-#: so prefixes cannot be disambiguated there.
+#: `/resume_<hex>` — same shape, replaces `/unskip_` + `/unignore_`
+#: with one verb: held rows resume, cancelled (ignored) hashes are
+#: lifted so they track again. Full 40-char hash also reaches ignored
+#: entries (invisible in the list, like `/unignore_` before it).
+RESUME_CMD_RE = re.compile(r"^/resume_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/unignore_<full-hash>` — legacy alias of `/resume_`: drop a
+#: cancelled release from the ignore list (plus its forget tombstone)
+#: so it can be tracked again. Full 40-char hash only: ignore entries
+#: are invisible in the task list, so prefixes cannot be disambiguated
+#: there.
 UNIGNORE_CMD_RE = re.compile(r"^/unignore_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 #: `/unignore <full-hash>` — manual form (no underscore), same effect.
@@ -569,8 +585,16 @@ def _fetch_command(infohash: str) -> str:
 
 
 def _prefer_command(infohash: str) -> str:
-    """Copy-pasteable prefer command for one task (short hash)."""
+    """Copy-pasteable prefer command for one task (short hash).
+
+    Legacy alias: canonical verb is now `/now_` (see _now_command).
+    """
     return f"/prefer_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+def _now_command(infohash: str) -> str:
+    """Copy-pasteable now command for one task (short hash)."""
+    return f"/now_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 def _skip_command(infohash: str) -> str:
@@ -579,8 +603,16 @@ def _skip_command(infohash: str) -> str:
 
 
 def _unskip_command(infohash: str) -> str:
-    """Copy-pasteable unskip command for one task (short hash)."""
+    """Copy-pasteable unskip command for one task (short hash).
+
+    Legacy alias: canonical verb is now `/resume_` (see _resume_command).
+    """
     return f"/unskip_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+def _resume_command(infohash: str) -> str:
+    """Copy-pasteable resume command for one task (short hash)."""
+    return f"/resume_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 def _flood_wait_seconds(e: BaseException, default: int = 5) -> int | None:
@@ -838,28 +870,27 @@ def pick_snapshot(
 ) -> list[tuple[str, str]]:
     """Frozen member list for a group command: ``[(hash, label)]``.
 
-    ``cmd`` cancel snapshots every member; fetch/prefer snapshot only
-    eligible members: WAITING_INDEXER rows for fetch (use the VPS1
-    original instead of waiting out Prowlarr), plus NEW grace-held rows
-    for fetch and prefer (watch drops use the starting .torrent,
-    racing rows use the VPS1 original — both skip the grace hold).
-    Held (skipped) rows never snapshot for fetch/prefer. Labels are
+    ``cmd`` cancel snapshots every member; ``now`` snapshots the union
+    of the old fetch + prefer sets (WAITING_INDEXER rows plus NEW
+    grace-held rows — fetch eligibility already covered prefer's, so
+    ``now`` ≡ fetch eligibility); fetch/prefer kept as aliases.
+    Held (skipped) rows never snapshot for now/fetch/prefer. Labels are
     short tracker names (hash-qualified on repeats). The
     snapshot is taken once, at command-tap time — later buttons
     address members by index, so list renumbering mid-flow cannot
     misroute. Fail-open: [].
     """
     try:
-        if cmd not in ("cancel", "fetch", "prefer"):
+        if cmd not in ("cancel", "fetch", "prefer", "now"):
             return []
         rows: list[tuple[TorrentState, str]] = []
         for (ts, _progress) in members or []:
             _h = _member_hash(ts)
             if not _h:
                 continue
-            if cmd in ("fetch", "prefer") and getattr(ts, "skipped", 0):
+            if cmd in ("fetch", "prefer", "now") and getattr(ts, "skipped", 0):
                 continue
-            if cmd == "fetch" and not (
+            if cmd in ("fetch", "now") and not (
                     ts.state == State.WAITING_INDEXER or (
                         ts.state == State.NEW and _is_grace_note_for_prefer(
                             _active_note(ts, notes)))):
@@ -910,7 +941,7 @@ def render_pending_question(pending: dict | None) -> str:
         if kind == "pick":
             cmd = str(pending.get("cmd") or "")
             verb = {"cancel": "Cancel", "fetch": "Fetch original for",
-                    "prefer": "Prefer"}.get(cmd, "Act on")
+                    "prefer": "Prefer", "now": "Start now"}.get(cmd, "Act on")
             if scope == "all":
                 what = "every copy"
             elif scope:
@@ -1042,18 +1073,17 @@ def render_active(
         # prefix marks them; every column counts against the wrap limit).
         # Positional group number — resolved once at tap time into a
         # frozen snapshot, so later renumbering cannot misroute.
-        # Cancel always; fetch/prefer/inject only when a member qualifies
-        # right now (injectfuse arms a Yes/No question, never acts);
-        # skip while a member runs free, unskip while one is held.
+        # Cancel always; now (old fetch/prefer united)/inject only when a
+        # member qualifies right now (injectfuse arms a Yes/No question,
+        # never acts); skip while a member runs free, resume while one is
+        # held.
         _cmds = [f"/cancel_{group_num}"]
-        if _has_fetch:
-            _cmds.append(f"/fetch_{group_num}")
-        if _has_prefer:
-            _cmds.append(f"/prefer_{group_num}")
+        if _has_fetch or _has_prefer:
+            _cmds.append(f"/now_{group_num}")
         if _has_skip:
             _cmds.append(f"/skip_{group_num}")
         if _has_unskip:
-            _cmds.append(f"/unskip_{group_num}")
+            _cmds.append(f"/resume_{group_num}")
         if _has_inject:
             _cmds.append(f"/injectfuse_{group_num}")
         lines.append(" ".join(_esc(_c) for _c in _cmds))
@@ -1566,13 +1596,12 @@ class TelegramBot:
         except Exception:
             note = ""
         text = render_detail(ts, progress, note)
-        # Grace-held rows are actionable: offer the overrides inline so
+        # Grace-held rows are actionable: offer the override inline so
         # the operator doesn't have to remember the command shape
-        # (prefer starts this copy now; fetch uses the starting bytes).
+        # (now starts this copy at once with its starting bytes).
         try:
             if note.startswith("Waiting for preferred copy"):
-                text += f"\nPrefer this copy now: `{_prefer_command(infohash)}`"
-                text += f"\nFetch starting bytes now: `{_fetch_command(infohash)}`"
+                text += f"\nStart this copy now: `{_now_command(infohash)}`"
         except Exception:
             pass
         try:
@@ -2122,7 +2151,10 @@ class TelegramBot:
         )
 
     async def _handle_chat_message(self, message: Any) -> None:
-        """Execute `/cancel_` / `/fetch_` / `/prefer_` / `/injectfuse` commands.
+        """Execute `/cancel_` / `/now_` / `/resume_` / `/injectfuse` commands.
+
+    Legacy `/fetch_` + `/prefer_` parse as `/now_`; `/unskip_` +
+    `/unignore_` parse as `/resume_` (same shapes, unified executors).
 
     Group commands (stable content ids from the active list) open
     member-choice buttons; full hashes and legacy hash prefixes act
@@ -2160,17 +2192,20 @@ class TelegramBot:
             text = str(text or "").strip()
             m_fetch = FETCH_CMD_RE.match(text)
             m_prefer = PREFER_CMD_RE.match(text)
+            m_now = NOW_CMD_RE.match(text)
             m_skip = SKIP_CMD_RE.match(text)
             m_unskip = UNSKIP_CMD_RE.match(text)
+            m_resume = RESUME_CMD_RE.match(text)
             m_unignore = UNIGNORE_CMD_RE.match(text)
             m_unignore_hash = UNIGNORE_HASH_RE.match(text)
             m_cancel = CANCEL_CMD_RE.match(text)
             m_injectfuse = INJECTFUSE_CMD_RE.match(text)
             m_injectfuse_hash = INJECTFUSE_HASH_RE.match(text)
             m_add = ADD_CMD_RE.match(text)
-            if (not m_fetch and not m_prefer and not m_cancel
-                    and not m_skip and not m_unskip and not m_unignore
-                    and not m_unignore_hash
+            if (not m_fetch and not m_prefer and not m_now
+                    and not m_cancel
+                    and not m_skip and not m_unskip and not m_resume
+                    and not m_unignore and not m_unignore_hash
                     and not m_injectfuse and not m_injectfuse_hash
                     and not m_add):
                 return
@@ -2186,26 +2221,36 @@ class TelegramBot:
                 return
             if m_fetch:
                 await self._start_group_command(
-                    "fetch", m_fetch.group(1), message)
+                    "now", m_fetch.group(1), message)
                 return
             if m_prefer:
                 await self._start_group_command(
-                    "prefer", m_prefer.group(1), message)
+                    "now", m_prefer.group(1), message)
+                return
+            if m_now:
+                await self._start_group_command(
+                    "now", m_now.group(1), message)
                 return
             if m_skip:
                 await self._start_group_command(
                     "skip", m_skip.group(1), message)
                 return
             if m_unskip:
-                await self._start_group_command(
-                    "unskip", m_unskip.group(1), message)
+                # Legacy alias: same shapes as /resume_ (digits, prefix,
+                # full hash) via the unified resume entry point.
+                await self._resume_command_entry(
+                    m_unskip.group(1).lower(), message)
+                return
+            if m_resume:
+                await self._resume_command_entry(
+                    m_resume.group(1).lower(), message)
                 return
             if m_unignore:
-                await self._unignore_torrent(
+                await self._resume_command_entry(
                     m_unignore.group(1).lower(), message)
                 return
             if m_unignore_hash:
-                await self._unignore_torrent(
+                await self._resume_command_entry(
                     m_unignore_hash.group(1).lower(), message)
                 return
             if m_injectfuse_hash:
@@ -2415,7 +2460,7 @@ class TelegramBot:
                     except Exception:
                         _resumed = False
                     _tail = (" — it can now download from your bytes: "
-                             f"`{_fetch_command(infohash)}`.")
+                             f"`{_now_command(infohash)}`.")
                     if _resumed and getattr(existing, "skipped", 0):
                         _tail = (" — hold cleared, it resumes next tick"
                                  " (bytes attached too).")
@@ -2682,7 +2727,13 @@ class TelegramBot:
         return notes
 
     async def _start_single_command(self, kind: str, full_hash: str, message: Any) -> None:
-        """Typed full-hash command: keepq for cancel, direct for fetch/prefer."""
+        """Typed full-hash command: keepq for cancel, direct otherwise.
+
+        fetch/prefer merged into "now": WAITING rows and grace-held rows
+        both start at once via the starting-bytes path.
+        """
+        if kind in ("fetch", "prefer"):
+            kind = "now"
         if kind == "injectfuse":
             await self._start_injectfuse_single(full_hash, message)
             return
@@ -2739,7 +2790,7 @@ class TelegramBot:
                 pass
             return
         try:
-            if kind == "fetch":
+            if kind in ("fetch", "now"):
                 result = await self._fetch_torrent(full_hash)
             else:
                 result = await self._prefer_torrent(full_hash)
@@ -2932,6 +2983,11 @@ class TelegramBot:
         """
         token = (token or "").strip().lower()
         _actor = _tg_actor_id(message)
+        # Legacy aliases: fetch/prefer merged into the state-dependent
+        # "now" verb (WAITING rows use original bytes, grace-held rows
+        # start at once).
+        if kind in ("fetch", "prefer"):
+            kind = "now"
         if len(token) == 40 and all(
                 c in "0123456789abcdef" for c in token):
             await self._start_single_command(kind, token, message)
@@ -3281,7 +3337,7 @@ class TelegramBot:
                 except Exception:
                     pass
                 try:
-                    if _cmd == "fetch":
+                    if _cmd in ("fetch", "now"):
                         result = await self._fetch_torrent(_h)
                     else:
                         result = await self._prefer_torrent(_h)
@@ -3324,7 +3380,7 @@ class TelegramBot:
             if getattr(row, "skipped", 0):
                 return (
                     f"{(row.source_name or infohash[:10])[:50]} is skipped — "
-                    f"{_unskip_command(infohash)} first"
+                    f"{_resume_command(infohash)} first"
                 )
             if row.state == State.WAITING_INDEXER:
                 # Fresh retry window for the direct phase, same as the automatic
@@ -3553,11 +3609,48 @@ class TelegramBot:
             return (f"Resumed {_title} — fuse/VPS checks and Prowlarr "
                     f"cross-seed search run again next tick")
         return (f"Skipped {_title} — held with state kept, no workers "
-                f"until {_unskip_command(acted[0])}")
+                f"until {_resume_command(acted[0])}")
+
+    def _unignore_core(self, target: str) -> tuple[str | None, str | None]:
+        """Lift one ignore entry (+ tombstone); returns (name, error).
+
+        Sync core behind _unignore_torrent and the /resume_ composer:
+        (name, None) on success, (None, message) when there is nothing
+        to lift or it fails. Full 40-char hash only (see _unignore_torrent).
+        """
+        try:
+            norm = (target or "").strip().lower()
+        except Exception:
+            norm = ""
+        if len(norm) != 40 or any(c not in "0123456789abcdef" for c in norm):
+            return None, ("Send /resume_<full 40-char infohash> "
+                           "(copy it from the detail card).")
+        store = getattr(self, "_store", None)
+        if store is None:
+            return None, "Action failed: bot not attached."
+        try:
+            entry = store.find_ignored(norm)
+        except LookupError as e:
+            return None, str(e)[:300]
+        except Exception as e:  # noqa: BLE001
+            return None, f"Action failed: {e}"
+        try:
+            h = (entry.get("source_infohash") or "").lower()
+            name = str(entry.get("source_name") or h[:10])[:60]
+        except Exception:
+            h, name = norm, norm[:10]
+        try:
+            store.unignore_torrent(h)
+            store.clear_tombstone(h)
+        except Exception as e:  # noqa: BLE001
+            return None, f"Action failed: {e}"
+        return name, None
 
     async def _unignore_torrent(self, target: str, message: Any) -> None:
         """Drop one cancelled release from the ignore list (+ tombstone).
 
+        Legacy alias: canonical verb is now `/resume_`, which also
+        resumes held rows. This path keeps the exact historical replies.
         Full 40-char hash only: ignored entries are invisible in the
         task list, so prefixes cannot be disambiguated there. Mirrors
         the `unignore` CLI (which refuses while the daemon runs, so
@@ -3565,50 +3658,12 @@ class TelegramBot:
         /add or re-drop it. Never raises: all outcomes arrive as replies.
         """
         try:
-            norm = (target or "").strip().lower()
-        except Exception:
-            norm = ""
-        if len(norm) != 40 or any(c not in "0123456789abcdef" for c in norm):
-            try:
-                await self._reply(
-                    "Send /unignore_<full 40-char infohash> "
-                    "(copy it from the detail card).", reply_to=message)
-            except Exception:
-                pass
-            return
-        store = getattr(self, "_store", None)
-        if store is None:
-            try:
-                await self._reply("Action failed: bot not attached.",
-                                  reply_to=message)
-            except Exception:
-                pass
-            return
-        try:
-            entry = await asyncio.to_thread(store.find_ignored, norm)
-        except LookupError as e:
-            try:
-                await self._reply(str(e)[:300], reply_to=message)
-            except Exception:
-                pass
-            return
+            name, err = await asyncio.to_thread(self._unignore_core, target)
         except Exception as e:  # noqa: BLE001
+            name, err = None, f"Action failed: {e}"
+        if err is not None and name is None:
             try:
-                await self._reply(f"Action failed: {e}", reply_to=message)
-            except Exception:
-                pass
-            return
-        try:
-            h = (entry.get("source_infohash") or "").lower()
-            name = str(entry.get("source_name") or h[:10])[:60]
-        except Exception:
-            h, name = norm, norm[:10]
-        try:
-            await asyncio.to_thread(store.unignore_torrent, h)
-            await asyncio.to_thread(store.clear_tombstone, h)
-        except Exception as e:  # noqa: BLE001
-            try:
-                await self._reply(f"Action failed: {e}", reply_to=message)
+                await self._reply(err[:300], reply_to=message)
             except Exception:
                 pass
             return
@@ -3618,6 +3673,191 @@ class TelegramBot:
                 f"(or re-drop it) to track it again.", reply_to=message)
         except Exception:
             pass
+
+    async def _resume_command_entry(self, token: str, message: Any) -> None:
+        """Unified resume: unhold tracked rows + lift ignored hashes.
+
+        Replaces `/unskip_` + `/unignore_` with one verb branching on
+        current state (digits address a live group like the other group
+        commands; a full hash reaches tracked rows AND invisible ignore
+        entries; shorter prefixes resolve tracked rows only — ignored
+        entries still need the full hash, as with `/unignore_` before).
+        Never raises: all outcomes arrive as replies.
+        """
+        try:
+            store = getattr(self, "_store", None)
+            if store is None:
+                try:
+                    await self._reply("Action failed: bot not attached.",
+                                      reply_to=message)
+                except Exception:
+                    pass
+                return
+            norm = (token or "").strip().lower()
+            hashes: list[str] = []
+            # Unhold tracked rows (no-op text when nothing is held is
+            # still sent for group/prefix rows, matching /unskip_);
+            # skipped only for ignored-only hashes, where the lift
+            # below is the whole answer (keeps the "Unignored…"
+            # reply shape of /unignore_).
+            _skip_unhold = True
+            if norm.isdigit():
+                try:
+                    rows = await asyncio.to_thread(store.list_active_inflight)
+                except Exception as e:  # noqa: BLE001
+                    try:
+                        await self._reply(f"Action failed: {e}", reply_to=message)
+                    except Exception:
+                        pass
+                    return
+                try:
+                    groups = _group_active_items([(_r, None) for _r in rows or []])
+                except Exception:
+                    groups = []
+                try:
+                    _n = int(norm)
+                except (TypeError, ValueError):
+                    _n = 0
+                if 1 <= _n <= len(groups):
+                    _gk, _mem = groups[_n - 1]
+                    for _t in [t for (t, _) in _mem]:
+                        try:
+                            _h = _member_hash(_t)
+                        except Exception:
+                            continue
+                        if _h:
+                            hashes.append(_h)
+                if not hashes:
+                    try:
+                        await self._reply(
+                            f"No live group #{norm} — refresh the list.",
+                            reply_to=message)
+                    except Exception:
+                        pass
+                    return
+            elif len(norm) == 40 and all(
+                    c in "0123456789abcdef" for c in norm):
+                # Single hash: unhold when tracked, lift when ignored —
+                # each half no-ops cleanly when absent, so one path
+                # covers rows, ignore entries, and both at once.
+                try:
+                    _row = await asyncio.to_thread(store.get, norm)
+                except Exception:
+                    _row = None
+                if _row is None:
+                    try:
+                        _fi = getattr(store, "find_ignored", None)
+                        _ign = await asyncio.to_thread(_fi, norm) \
+                            if callable(_fi) else None
+                    except LookupError:
+                        _ign = None
+                    except Exception:
+                        _ign = None
+                    if _ign is None:
+                        try:
+                            await self._reply(
+                                f"no tracked torrent starts with {norm!r} "
+                                "(it may already be done/cancelled)",
+                                reply_to=message)
+                        except Exception:
+                            pass
+                        return
+                    hashes = [norm]
+                    _skip_unhold = False
+                else:
+                    hashes = [norm]
+                    _skip_unhold = True
+            else:
+                # Group id (older messages) or legacy torrent prefix for
+                # tracked rows. A hex token matching nothing tracked keeps
+                # the old /unignore_ hint (ignored entries need the full
+                # hash); anything else keeps the resolver text.
+                _by_gid = None
+                try:
+                    _rows_g = await asyncio.to_thread(
+                        store.list_active_inflight)
+                    _by_gid = _live_group_by_gid(
+                        list(_rows_g or []), norm)
+                except Exception:
+                    _by_gid = None
+                if _by_gid is not None:
+                    _gk, _mem = _by_gid
+                    for _t in list(_mem or []):
+                        try:
+                            _h = _member_hash(_t)
+                        except Exception:
+                            continue
+                        if _h:
+                            hashes.append(_h)
+                if not hashes:
+                    try:
+                        target = await asyncio.to_thread(
+                            self._resolve_cancel_target, norm, cmd="resume")
+                        hashes = [(target.source_infohash or "").lower()]
+                    except LookupError as e:
+                        try:
+                            _hexish = bool(norm) and all(
+                                c in "0123456789abcdef" for c in norm)
+                        except Exception:
+                            _hexish = False
+                        await self._reply(
+                            ("Send /resume_<full 40-char infohash> "
+                             "(copy it from the detail card).")
+                            if _hexish else str(e)[:300],
+                            reply_to=message)
+                        return
+                    except Exception as e:  # noqa: BLE001
+                        try:
+                            await self._reply(f"Action failed: {e}", reply_to=message)
+                        except Exception:
+                            pass
+                        return
+                if not hashes:
+                    try:
+                        await self._reply(
+                            f"No live group #{norm} — refresh the list.",
+                            reply_to=message)
+                    except Exception:
+                        pass
+                    return
+            try:
+                if _skip_unhold:
+                    unskip_text = await self._skip_torrents(hashes, hold=False)
+                else:
+                    unskip_text = ""
+            except Exception as e:  # noqa: BLE001
+                unskip_text = f"Resume failed: {e}"
+            lifted: list[str] = []
+            try:
+                for _h in hashes:
+                    try:
+                        _name, _err = await asyncio.to_thread(
+                            self._unignore_core, _h)
+                    except Exception:
+                        continue
+                    if _name:
+                        lifted.append(_name)
+            except Exception:
+                pass
+            reply = (unskip_text or "").strip()
+            if lifted:
+                shown = ", ".join(lifted[:3])
+                if len(lifted) > 3:
+                    shown += f" (+{len(lifted) - 3} more)"
+                extra = (f"Unignored {shown} — re-send .torrent via /add "
+                         f"(or re-drop) to track again.")
+                reply = f"{reply} {extra}".strip() if reply else extra
+            try:
+                await self._reply(reply[:300], reply_to=message)
+            except Exception:
+                pass
+            try:
+                self._last_active_cache = None
+                await self._refresh_active_message()
+            except Exception:
+                pass
+        except Exception as e:  # noqa: BLE001
+            log.debug("resume command failed: %s", e)
 
     async def _mark_detail_cancelled(
         self, message_id: int, name: str, infohash: str
@@ -3636,7 +3876,7 @@ class TelegramBot:
             f"🚫 CANCELLED `{_esc(shown)}`\n"
             f"`{(infohash or '').lower()}`\n"
             "✗ Cancelled by operator (removed + ignored)\n"
-            f"Unignore: `/unignore_{(infohash or '').lower()}`"
+            f"Unignore: `/resume_{(infohash or '').lower()}`"
         )
         try:
             await bot.edit_message_text(
