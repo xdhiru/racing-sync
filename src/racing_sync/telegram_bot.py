@@ -23,6 +23,7 @@ App logging goes to local files only (no Telegram forwarding).
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime as dt
 import hashlib
 import logging
@@ -560,6 +561,44 @@ INJECTFUSE_HASH_RE = re.compile(r"^/injectfuse\s+([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 ADD_CMD_RE = re.compile(r"^/add(?:@[\w_]+)?\b")
 
 
+#: `/cancel_match <text>` — bulk cancel: every live group whose title
+#: contains `<text>` (case-insensitive) is cancelled together after one
+#: remember + one keep/delete question. Optional `@bot` suffix for group
+#: chats; the text runs to end of line.
+CANCEL_MATCH_RE = re.compile(r"^/cancel_match(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
+
+#: Shortest substring worth matching: 1 char matches nearly everything.
+_MATCH_MIN_CHARS = 2
+#: Longest query (UTF-8 bytes) whose base64url token still fits the
+#: 64-byte button budget inside `keep:match:<tok>:1:yes`.
+_MATCH_MAX_BYTES = 35
+#: Valid token chars (base64url, padding stripped at encode time).
+_MATCH_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,47}$")
+
+
+def _match_token(query: str) -> str:
+    """URL-safe token for a match query, "" when it cannot fit a button."""
+    try:
+        raw = (query or "").strip().encode("utf-8")
+        if not raw or len(raw) > _MATCH_MAX_BYTES:
+            return ""
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    except Exception:
+        return ""
+
+
+def _match_query(token: str) -> str:
+    """Decode a match token back to the query, "" when malformed."""
+    try:
+        tok = (token or "").strip()
+        if not _MATCH_TOKEN_RE.match(tok):
+            return ""
+        padded = tok + "=" * (-len(tok) % 4)
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except Exception:
+        return ""
+
+
 def _cancel_command(infohash: str) -> str:
     """Copy-pasteable cancel command for one task (short hash)."""
     return f"/cancel_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
@@ -918,7 +957,9 @@ def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
     Shapes: `<cmd>:<40hex>`, `<cmd>:all:<40hex>`,
     `<cmd>:<40hex>:yes|no`, `<cmd>:all:<40hex>:yes|no` (keep/inject),
     `forget:<scope>`, `forget:<scope>:<0|1>`,
-    `keep:<scope>:<0|1>:<yes|no>`, `abort`.
+    `keep:<scope>:<0|1>:<yes|no>`, `abort`, plus the bulk-match scope
+    `forget:match:<tok>:<0|1>` / `keep:match:<tok>:<0|1>:<yes|no>`
+    (`<tok>` = base64url query, `match:<tok>` in the hash slot).
     `remember` is True/False when the buttons carried the Q1 remember
     choice, else None (legacy 3-part keep buttons predate it and mean
     remember, matching the old always-ignore cancel).
@@ -960,6 +1001,19 @@ def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
             if parts[1] == "all" and _is_hex40(parts[2]) \
                     and parts[3] in ("0", "1"):
                 return (parts[0], True, parts[2].lower(), "",
+                        parts[3] == "1")
+        # Bulk-match scope: the substring travels base64url-encoded and is
+        # re-resolved live at every tap (`match:<tok>` in the hash slot).
+        if len(parts) == 4 and parts[0] == "forget":
+            if parts[1] == "match" and parts[3] in ("0", "1") \
+                    and _MATCH_TOKEN_RE.match(parts[2] or ""):
+                return (parts[0], False, f"match:{parts[2]}", "",
+                        parts[3] == "1")
+        if len(parts) == 5 and parts[0] == "keep":
+            if parts[1] == "match" and parts[3] in ("0", "1") \
+                    and parts[4] in ("yes", "no") \
+                    and _MATCH_TOKEN_RE.match(parts[2] or ""):
+                return (parts[0], False, f"match:{parts[2]}", parts[4],
                         parts[3] == "1")
     except Exception:
         pass
@@ -1100,15 +1154,20 @@ def _is_transient_tg_error(e: BaseException) -> bool:
 def _bot_command_menu() -> list:
     """Commands shown in the chat's `/` popup (Bot API menu).
 
-    Only `/add` takes no argument (it acts on the replied-to or captioned
-    .torrent); the pickers need IDs the operator won't know, so they stay
-    unlisted to keep the menu to the one actionable entry.
+    `/add` takes no argument (it acts on the replied-to or captioned
+    .torrent); `/cancel_match` takes free text (any substring works),
+    so both stay listed. The pickers need IDs the operator won't know,
+    so they stay unlisted to keep the menu short.
     """
     try:
         return [BotCommand(
             "add",
             "Add a .torrent file — reply to it with /add, or send it with "
             "/add as caption",
+        ), BotCommand(
+            "cancel_match",
+            "Cancel every active group whose title contains <text> — "
+            "/cancel_match <text>",
         )]
     except Exception:
         return []
@@ -2115,11 +2174,22 @@ class TelegramBot:
 
         data = str(getattr(query, "data", "") or "")
         if (data.startswith("pick:") or data.startswith("keep:")
+                or data.startswith("forget:")
                 or data.startswith("abort")
                 or data.startswith("inject:")
                 or data.startswith("go:") or data.startswith("cancel:")
                 or data.startswith("skip:") or data.startswith("resume:")):
             await self._on_action_button(query, data)
+            if not data.startswith("abort"):
+                # The tapped sheet served its purpose: remove it so
+                # answered questions don't linger behind their follow-up
+                # (`abort` already deletes itself above; the active-list
+                # message never carries action buttons, only pagination,
+                # so this only ever removes disposable sheets).
+                try:
+                    await self._delete_query_message(query)
+                except Exception:
+                    pass
             return
         if not data.startswith("page:"):
             return
@@ -2236,7 +2306,7 @@ class TelegramBot:
         )
 
     async def _handle_chat_message(self, message: Any) -> None:
-        """Execute `/cancel_` / `/now_` / `/resume_` / `/injectfuse` commands.
+        """Execute `/cancel_` / `/cancel_match` / `/now_` / `/resume_` / `/injectfuse` commands.
 
     Legacy `/fetch_` + `/prefer_` parse as `/now_`; `/unskip_` +
     `/unignore_` parse as `/resume_` (same shapes, unified executors).
@@ -2284,12 +2354,13 @@ class TelegramBot:
             m_unignore = UNIGNORE_CMD_RE.match(text)
             m_unignore_hash = UNIGNORE_HASH_RE.match(text)
             m_cancel = CANCEL_CMD_RE.match(text)
+            m_cancel_match = CANCEL_MATCH_RE.match(text)
             m_injectfuse = INJECTFUSE_CMD_RE.match(text)
             m_injectfuse_hash = INJECTFUSE_HASH_RE.match(text)
             m_act = ACT_CMD_RE.match(text)
             m_add = ADD_CMD_RE.match(text)
             if (not m_fetch and not m_prefer and not m_now
-                    and not m_cancel
+                    and not m_cancel and not m_cancel_match
                     and not m_skip and not m_unskip and not m_resume
                     and not m_unignore and not m_unignore_hash
                     and not m_injectfuse and not m_injectfuse_hash
@@ -2350,6 +2421,10 @@ class TelegramBot:
             if m_act:
                 await self._act_command_entry(
                     m_act.group(1).lower(), message)
+                return
+            if m_cancel_match:
+                await self._cancel_match_command_entry(
+                    m_cancel_match.group(1) or "", message)
                 return
             await self._start_group_command(
                 "cancel", m_cancel.group(1), message)
@@ -3226,6 +3301,114 @@ class TelegramBot:
         except Exception as e:  # noqa: BLE001
             log.debug("act command failed: %s", e)
 
+    def _live_match(self, query: str) -> list[tuple[str, list[str]]]:
+        """Live (title, member-hashes) groups whose title contains `query`.
+
+        Case-insensitive substring on the lead row's full name (the same
+        name the list heading shows). Re-derived from the current store
+        on every call, so the Q1 sheet, the Q2 sheet, and execution each
+        see the live set — same stateless shape as `all:`-scoped buttons.
+        """
+        try:
+            q = (query or "").strip().casefold()
+            if not q:
+                return []
+            store = getattr(self, "_store", None)
+            if store is None:
+                return []
+            _all = getattr(store, "list_active_inflight", None)
+            rows = _all() if callable(_all) else []
+            out: list[tuple[str, list[str]]] = []
+            for (_key, _members) in _group_active_items(
+                    [(_r, None) for _r in rows or []]):
+                try:
+                    _rows = [_t for (_t, _) in _members or []]
+                    if not _rows:
+                        continue
+                    _name = str(getattr(_rows[0], "source_name", "") or "")
+                    if q not in _name.casefold():
+                        continue
+                    _hashes = [_h for _h in
+                               (_member_hash(_t) for _t in _rows) if _h]
+                    if _hashes:
+                        out.append((self._group_title(_rows), _hashes))
+                except Exception:
+                    continue
+            return out
+        except Exception:
+            return []
+
+    async def _cancel_match_command_entry(
+            self, query: str, message: Any) -> None:
+        """`/cancel_match <text>`: one remember + one keep/delete for all.
+
+        No match → explanatory reply. A single live copy skips straight
+        to its normal forget sheet; otherwise one sheet names every
+        matched group and the two remember buttons carry the whole set
+        (`forget:match:<tok>:<0|1>`), re-resolved live at each tap.
+        """
+        q = (query or "").strip()
+        if len(q) < _MATCH_MIN_CHARS:
+            try:
+                await self._reply(
+                    "Send /cancel_match <text> (at least "
+                    f"{_MATCH_MIN_CHARS} characters) — cancels every "
+                    "active group whose title contains <text>.",
+                    reply_to=message)
+            except Exception:
+                pass
+            return
+        tok = _match_token(q)
+        if not tok:
+            try:
+                await self._reply(
+                    "That text is too long for buttons — shorten it to "
+                    f"~{_MATCH_MAX_BYTES} characters.",
+                    reply_to=message)
+            except Exception:
+                pass
+            return
+        try:
+            matches = await asyncio.to_thread(self._live_match, q)
+        except Exception as e:  # noqa: BLE001
+            try:
+                await self._reply(f"Action failed: {e}", reply_to=message)
+            except Exception:
+                pass
+            return
+        if not matches:
+            try:
+                await self._reply(
+                    f"No active groups match "
+                    f"'{_safe_display_name(q[:60])}'",
+                    reply_to=message)
+            except Exception:
+                pass
+            return
+        if len(matches) == 1 and len(matches[0][1]) == 1:
+            await self._start_single_command(
+                "cancel", matches[0][1][0], message)
+            return
+        _total = sum(len(_hs) for (_, _hs) in matches)
+        _shown = [f"• {_t} ({len(_hs)})" for (_t, _hs) in matches[:8]]
+        if len(matches) > 8:
+            _shown.append(f"• …and {len(matches) - 8} more")
+        _text = (
+            f"{len(matches)} groups "
+            f"({_total} copies) match "
+            f"'{_safe_display_name(q[:60])}':\n"
+            + "\n".join(_shown) +
+            "\nForget them all?\n"
+            "🚫 Ignore blocks them from coming back; "
+            "👻 Just forget allows re-adding later.")
+        _rows = [[("🚫 Ignore + forget", f"forget:match:{tok}:1"),
+                   ("👻 Just forget", f"forget:match:{tok}:0")],
+                  [("Close", "abort")]]
+        try:
+            await self._send_sheet(_text, _rows, reply_to=message)
+        except Exception:
+            pass
+
     async def _start_group_command(self, kind: str, token: str, message: Any) -> None:
         """Typed command: positional number, gid, or legacy hash prefix.
 
@@ -3482,6 +3665,8 @@ class TelegramBot:
         snapshot, sequence, or expiry exists. Per-tap admin auth already
         ran in _handle_callback; execution re-checks liveness per hash.
         Short replies go back to the chat; the list refreshes after.
+        The tapped sheet is deleted by the caller once this returns, so
+        answered questions never linger behind their follow-up.
         """
         async def _say(text: str) -> None:
             try:
@@ -3562,6 +3747,58 @@ class TelegramBot:
                         reply_to=getattr(query, "message", None))
                 except Exception:
                     pass
+                return
+            if cmd == "forget" and _h.startswith("match:"):
+                # Bulk-match scope: re-resolve the substring live; the set
+                # can shrink between taps, so the keep question names the
+                # live count, not the Q1 count.
+                if _ig is None:
+                    _ig = True
+                _mtok = _h[len("match:"):]
+                _mq = _match_query(_mtok)
+                try:
+                    _matches = await asyncio.to_thread(
+                        self._live_match, _mq) if _mq else []
+                except Exception:
+                    _matches = []
+                if not _matches:
+                    await _say("Already gone from tracking")
+                    await _refresh()
+                    return
+                _mtotal = sum(len(_hs) for (_, _hs) in _matches or [])
+                _text, _rows = self._keepq_text_and_rows(
+                    f"{len(_matches)} groups matching "
+                    f"'{_safe_display_name(_mq[:40])}'",
+                    f" · {_mtotal} copies",
+                    f"match:{_mtok}", None, remember=_ig)
+                try:
+                    await self._send_sheet(
+                        _text, _rows,
+                        reply_to=getattr(query, "message", None))
+                except Exception:
+                    pass
+                return
+            if cmd == "keep" and _choice in ("yes", "no") \
+                    and _h.startswith("match:"):
+                if _ig is None:
+                    _ig = True
+                _mq = _match_query(_h[len("match:"):])
+                try:
+                    _matches = await asyncio.to_thread(
+                        self._live_match, _mq) if _mq else []
+                except Exception:
+                    _matches = []
+                _hashes = [_hh for (_, _hs) in _matches or []
+                           for _hh in _hs or []]
+                if not _hashes:
+                    await _say("Already gone from tracking")
+                    await _refresh()
+                    return
+                result = await self._execute_snapshot_cancel(
+                    _hashes, f"{len(_matches)} matched groups",
+                    delete_files=(_choice == "no"), remember=_ig)
+                await _say(result)
+                await _refresh()
                 return
             if cmd == "forget" and _h:
                 if _ig is None:

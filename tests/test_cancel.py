@@ -1750,3 +1750,228 @@ async def test_chat_message_unignore_space_form(tmp_path: Path):
         assert sent.startswith("Unignored")
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# /cancel_match bulk cancel (substring over live group titles)
+# ---------------------------------------------------------------------------
+
+def _sheet_data(bot):
+    _kwargs = bot._bot.send_message.call_args[1]
+    return [b.callback_data for r in
+            _kwargs["reply_markup"].inline_keyboard for b in r]
+
+
+def _match_bot(tmp_path: Path, rows):
+    """Real-store bot with a ready coordinator mock, rows upserted."""
+    from racing_sync.state import StateStore
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir(exist_ok=True)
+    store = StateStore(tmp_path / "state.db")
+    for r in rows:
+        store.upsert(r)
+    coord = MagicMock()
+    cfg = MagicMock()
+    cfg.ssd.path = ssd
+    cfg.dest.save_path = ssd
+    cfg.general.state_db = tmp_path / "state.db"
+    coord.cfg = cfg
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
+    coord.dest_client.get_torrent = AsyncMock(return_value=None)
+    bot = _bot()
+    bot._coord = coord
+    bot._store = store
+    return bot, store, ssd
+
+
+@pytest.mark.anyio
+async def test_cancel_match_bulk_forgets_matched_groups_only(tmp_path: Path):
+    """/cancel_match evil → Q1 remember → Q2 keep/delete → matched gone."""
+    _root = tmp_path / "ssd"
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="a" * 40, source_name="Flower.of.Evil.S01",
+                     total_bytes=1000, save_path=str(_root),
+                     state=State.DOWNLOADING),
+        TorrentState(source_infohash="b" * 40, source_name="Flower.of.Evil.S01",
+                     total_bytes=1000, save_path=str(_root),
+                     state=State.QUEUED),
+        TorrentState(source_infohash="c" * 40, source_name="Flower.of.Evil.S02",
+                     total_bytes=2000, save_path=str(_root),
+                     state=State.MOVING),
+        TorrentState(source_infohash="d" * 40, source_name="Unrelated.Show",
+                     total_bytes=3000, save_path=str(_root),
+                     state=State.MOVING),
+    ])
+    try:
+        await bot._handle_chat_message(_message(text="/cancel_match evil"))
+        _data = _sheet_data(bot)
+        _forget = sorted(d for d in _data if d.startswith("forget:match:"))
+        assert _forget == [d for d in _forget if d.endswith((":1", ":0"))]
+        assert len(_forget) == 2
+        _tok = _forget[0].split(":")[2]
+
+        bot._callback_times.clear()
+        await bot._handle_callback(_query(f"forget:match:{_tok}:1"))
+        _data = _sheet_data(bot)
+        assert f"keep:match:{_tok}:1:yes" in _data
+        assert f"keep:match:{_tok}:1:no" in _data
+
+        bot._callback_times.clear()
+        await bot._handle_callback(_query(f"keep:match:{_tok}:1:no"))
+        assert store.get("a" * 40) is None
+        assert store.get("b" * 40) is None
+        assert store.get("c" * 40) is None
+        assert store.get("d" * 40) is not None
+        assert store.is_ignored("a" * 40) is True
+        assert store.is_ignored("c" * 40) is True
+        assert store.is_ignored("d" * 40) is False
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_cancel_match_reresolves_between_questions(tmp_path: Path):
+    """A group forgotten after Q1 is not acted on at Q2."""
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="a" * 40, source_name="Evil.One",
+                     state=State.QUEUED),
+        TorrentState(source_infohash="b" * 40, source_name="Evil.Two",
+                     state=State.QUEUED),
+    ])
+    try:
+        await bot._handle_chat_message(_message(text="/cancel_match evil"))
+        _tok = next(d.split(":")[2] for d in _sheet_data(bot)
+                    if d.startswith("forget:match:"))
+        await bot._handle_callback(_query(f"forget:match:{_tok}:0"))
+        # Sibling flow removes one group before the keep tap.
+        assert store.hard_delete("b" * 40) is True
+        bot._callback_times.clear()
+        await bot._handle_callback(_query(f"keep:match:{_tok}:0:yes"))
+        assert store.get("a" * 40) is None
+        assert store.get("b" * 40) is None
+        assert store.is_ignored("a" * 40) is False
+        sent = bot._bot.send_message.call_args[0][1]
+        assert "Kept files for" in sent
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_cancel_match_single_copy_uses_normal_sheet(tmp_path: Path):
+    """One matching copy skips the bulk sheet for its forget question."""
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="a" * 40, source_name="Only.Evil",
+                     state=State.QUEUED),
+        TorrentState(source_infohash="d" * 40, source_name="Unrelated",
+                     state=State.QUEUED),
+    ])
+    try:
+        await bot._handle_chat_message(_message(text="/cancel_match only"))
+        _data = _sheet_data(bot)
+        assert f"forget:{'a' * 40}:1" in _data
+        assert not any(d.startswith("forget:match:") for d in _data)
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_cancel_match_no_match_short_and_long(tmp_path: Path):
+    """Unknown text, missing text, and 1-char text all explain."""
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="a" * 40, source_name="Some.Show",
+                     state=State.QUEUED),
+    ])
+    try:
+        await bot._handle_chat_message(_message(text="/cancel_match zzz-nope"))
+        assert "No active groups match" in \
+            bot._bot.send_message.call_args[0][1]
+        bot._callback_times.clear()
+        await bot._handle_chat_message(_message(text="/cancel_match"))
+        assert "/cancel_match <text>" in \
+            bot._bot.send_message.call_args[0][1]
+        bot._callback_times.clear()
+        await bot._handle_chat_message(_message(text="/cancel_match e"))
+        assert "/cancel_match <text>" in \
+            bot._bot.send_message.call_args[0][1]
+        bot._callback_times.clear()
+        await bot._handle_chat_message(
+            _message(text="/cancel_match " + "x" * 36))
+        assert "too long" in bot._bot.send_message.call_args[0][1]
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_callback_router_forwards_forget_taps(tmp_path: Path):
+    """`forget:` taps must reach the dispatcher (regression: router gap)."""
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="a" * 40, source_name="Routed.Show",
+                     state=State.QUEUED),
+    ])
+    try:
+        await bot._handle_callback(_query(f"forget:{'a' * 40}:1"))
+        _data = _sheet_data(bot)
+        assert f"keep:{'a' * 40}:1:yes" in _data
+        assert f"keep:{'a' * 40}:1:no" in _data
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_answered_sheets_are_deleted(tmp_path: Path):
+    """Each tapped sheet is deleted; replies and follow-ups stay."""
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="a" * 40, source_name="Gone.Show",
+                     state=State.QUEUED),
+    ])
+    bot._bot.delete_message = AsyncMock()
+    try:
+        await bot._handle_callback(_query(f"cancel:{'a' * 40}"))
+        bot._bot.delete_message.assert_awaited_once_with("1", 43)
+        bot._bot.delete_message.reset_mock()
+        bot._callback_times.clear()
+        await bot._handle_callback(_query(f"forget:{'a' * 40}:1"))
+        bot._bot.delete_message.assert_awaited_once_with("1", 43)
+        assert f"keep:{'a' * 40}:1:yes" in _sheet_data(bot)
+        bot._bot.delete_message.reset_mock()
+        bot._callback_times.clear()
+        await bot._handle_callback(_query(f"keep:{'a' * 40}:1:yes"))
+        bot._bot.delete_message.assert_awaited_once_with("1", 43)
+        sent = bot._bot.send_message.call_args[0][1]
+        assert "Kept files for" in sent
+        assert store.get("a" * 40) is None
+        # Close deletes exactly once (explicit path, router skips it).
+        bot._bot.delete_message.reset_mock()
+        bot._callback_times.clear()
+        await bot._handle_callback(_query("abort"))
+        bot._bot.delete_message.assert_awaited_once_with("1", 43)
+    finally:
+        store.close()
+
+
+def test_cancel_match_protocol_shapes_fit_buttons():
+    """Match tokens round-trip and every button shape fits 64 bytes."""
+    from racing_sync.telegram_bot import (
+        _bot_command_menu,
+        _match_query,
+        _match_token,
+        _parse_action_data,
+    )
+
+    assert any(c.command == "cancel_match" for c in _bot_command_menu())
+    tok = _match_token("Flower.of.Evil")
+    assert _match_query(tok) == "Flower.of.Evil"
+    assert _match_token("x" * 36) == ""
+    assert _match_query("!!!") == ""
+    assert _match_query("") == ""
+    for data in (f"forget:match:{tok}:1", f"forget:match:{tok}:0",
+                 f"keep:match:{tok}:1:yes", f"keep:match:{tok}:0:no"):
+        assert len(data) <= 64
+        assert _parse_action_data(data)[0] in ("forget", "keep")
+    assert _parse_action_data(f"keep:match:{tok}:1:yes") == (
+        "keep", False, f"match:{tok}", "yes", True)
+    assert _parse_action_data(f"forget:match:{tok}:0") == (
+        "forget", False, f"match:{tok}", "", False)
