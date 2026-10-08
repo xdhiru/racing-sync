@@ -4844,7 +4844,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             ts.batches_total = len(batches)
             ts.batch_index = 0
             # Refine global reservation to the real footprint (max REMAINING
-            # batch — covers varying episode sizes, isolated batches hold one
+            # batch — covers varying episode sizes, in-place batches hold one
             # at a time; bytes already on the remote hold no SSD).
             _rem = await self._remaining_batch_footprint(batches, cls.kind)
             if _rem is None:
@@ -5604,7 +5604,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         consecutive_batch_failures = 0
         max_batch_failures_per_tick = 5
         # First wait iteration reuses the pre-loop batch resolution (see
-        # above); later iterations re-resolve after each isolated reset.
+                # above); later iterations re-resolve after each flip.
         _first_wait = True
 
         if is_batched and hasattr(self, "dest_client"):
@@ -5882,40 +5882,35 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     consecutive_batch_failures = 0
                     next_index = ts.batch_index + 1
                     if next_index < ts.batches_total:
-                        # Isolated batches: fresh delete(with-files) + re-add
-                        # so next batch downloads from zero with no shared-piece
-                        # partials. Only verified-complete files ever moved.
-                        # Index advances only after reset succeeds; a transient
-                        # failure replays this already-moved batch as a no-op
-                        # via _fuse_skipped next tick.
+                        # In-place batch advance: the entry stays (same
+                        # hash, same live key) and only the next batch's
+                        # files are selected + resumed. Shared-piece
+                        # partials of the next batch carry over instead of
+                        # being wiped + re-downloaded. Index advances only
+                        # after the flip succeeds; a transient failure
+                        # replays this already-moved batch as a no-op via
+                        # _fuse_skipped next tick. The dest hash never
+                        # changes, so no live-key refresh is needed.
                         try:
-                            reset_pos = await self._reset_torrent_for_next_batch(ts, next_index)
+                            flip_pos = await self._flip_to_next_batch(ts, next_index)
                         except Exception as e:  # noqa: BLE001
                             if not is_retryable_client_error(e):
                                 raise
                             log.warning(
-                                "isolated batch reset hit transient dest error for %s (%s); retry next tick",
+                                "batch flip hit transient dest error for %s (%s); retry next tick",
                                 ts.source_name, e,
                             )
                             self.store.upsert(ts)
                             self._live.pop(h.lower(), None)
                             return
-                        if reset_pos is False or reset_pos is None:
+                        if flip_pos is False or flip_pos is None:
                             self.store.upsert(ts)
                             self._live.pop(h.lower(), None)
                             return
                         # Position contract: int (possibly reconciled on
-                        # grouping shrink), or legacy True from test doubles.
-                        ts.batch_index = reset_pos if isinstance(reset_pos, int) else next_index
+                        # grouping shrink).
+                        ts.batch_index = flip_pos if isinstance(flip_pos, int) else next_index
                         self.store.upsert(ts)
-                        # dest hash may have changed on re-add; refresh live key.
-                        try:
-                            new_h = ts.dest_infohash or ts.source_infohash
-                            if new_h.lower() != h.lower():
-                                self._live.pop(h.lower(), None)
-                                h = new_h
-                        except Exception:
-                            pass
                     else:
                         ts.batch_index = next_index
                         self.store.upsert(ts)
@@ -5956,7 +5951,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
                 if ts.batch_index < ts.batches_total:
                     # Next batch was already prioritized + resumed inside the
-                    # isolated reset above; loop back to wait for it.
+                    # flip above; loop back to wait for it.
                     continue
 
             break
@@ -6186,156 +6181,37 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         await self.dest_client.set_file_priorities(h, prio_map)
         return batches
 
-    async def _reset_torrent_for_next_batch(self, ts: TorrentState, next_index: int) -> int | bool:
-        """Delete + fresh re-add for isolated per-batch downloads.
+    async def _flip_to_next_batch(self, ts: TorrentState, next_index: int) -> int | bool:
+        """Select the next batch's files in place (no delete/re-add).
 
-        After batch N is verified moved (straggler check passed), the old
-        torrent entry holds deselected partials of batch N+1 (shared pieces)
-        plus preallocated files. Flipping priorities in place can leave the
-        next batch's first file permanently partial. A fresh
-        ``delete(delete_files=True) + add`` wipes those partials so the next
-        batch downloads from zero and only verified-complete files ever reach
-        ``rclone move`` — guaranteeing 100% of bytes land on the remote.
+        After batch N is verified moved (straggler check passed), the
+        entry keeps seeding FROM the same hash: deselected leftovers of
+        already-moved batches stay put (never moved, wiped with the
+        folder at the end of MOVING), and the next batch's files are
+        selected + resumed. Shared-piece partials of batch N+1 left over
+        from the previous download are an asset, not a hazard — the next
+        batch resumes from them instead of re-downloading.
 
-        Crash-safe: batch_index is only advanced by the caller AFTER this
-        returns a position. A crash before then replays the already-moved
-        batch, which is a no-op via _fuse_skipped.
+        Crash-safe like the old isolated reset: batch_index is only
+        advanced by the caller AFTER this returns a position. A crash
+        before then replays the already-moved batch, which is a no-op
+        via _fuse_skipped (empty expected-files wait).
 
         Returns the batch position the caller must record, or False on
-        transient failure (stay DOWNLOADING, retry next tick). When the
-        re-resolved grouping shrank (kind flip) past ``next_index``, the
-        total/index are reconciled to the finished position instead of
-        parking forever.
+        transient failure (stay DOWNLOADING, retry next tick). Fatal
+        disk/permission errors raise for the worker wrapper. When the
+        re-resolved grouping shrank past ``next_index``, the total/index
+        are reconciled to the finished position instead of parking
+        forever.
         """
-        h_old = ts.dest_infohash or ts.source_infohash
-        blob = getattr(ts, "_blob", None) or ts.cross_seed_blob or None
-        if blob is None or (isinstance(blob, (bytes, bytearray)) and len(blob) == 0):
-            try:
-                fetched = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
-            except Exception:
-                fetched = None
-            # Test doubles may return non-bytes MagicMocks — accept truthy
-            # values, reject only None/empty-bytes (real missing case).
-            if fetched is None or (isinstance(fetched, (bytes, bytearray)) and len(fetched) == 0):
-                pass
-            else:
-                blob = fetched
-                try:
-                    ts.cross_seed_blob = blob if isinstance(blob, (bytes, bytearray)) else ts.cross_seed_blob
-                    ts._blob = blob
-                except Exception:
-                    pass
-        if blob is None or (isinstance(blob, (bytes, bytearray)) and len(blob) == 0):
-            log.warning(
-                "isolated batch: missing .torrent bytes for %s; keeping batch %d to retry",
-                ts.source_name, ts.batch_index,
-            )
-            return False
-        save_path_str = ts.save_path or str(self.cfg.dest.save_path)
-
-        # 1. Remove old entry WITH files: clears deselected partials and
-        # preallocated leftovers of the next batch. Already-moved batch files
-        # are gone from SSD (on remote), so only unwanted partials are lost.
-        try:
-            await self.dest_client.delete(h_old, delete_files=True)
-            log.info(
-                "isolated batch: removed torrent %s with files after batch %d/%d",
-                h_old[:10], ts.batch_index + 1, ts.batches_total,
-            )
-        except Exception as e:  # noqa: BLE001
-            # Not-found or transient: continue to add — add handles
-            # "already added" duplicates, next tick retries on failure.
-            log.warning(
-                "isolated batch: delete %s with files failed (%s); continuing to re-add",
-                h_old[:10], e,
-            )
-
-        # 2. Fresh add, paused, no skip-check (clean download of next batch).
-        try:
-            result = await self.dest_client.add_torrent(
-                torrent_files=[blob],
-                save_path=save_path_str,
-                category="racing",
-                paused=True,
-                skip_check=False,
-            )
-        except Exception as e:  # noqa: BLE001
-            if is_fatal_os_error(e):
-                # Disk-full/permission errors must fail loudly via the
-                # worker wrapper, never spin a retry loop.
-                raise
-            log.warning(
-                "isolated batch: re-add for %s failed (%s); retry next tick",
-                ts.source_name, e,
-            )
-            return False
-        if not result.accepted:
-            log.warning(
-                "isolated batch: re-add rejected for %s (%s); retry next tick",
-                ts.source_name, result.detail,
-            )
-            return False
-
-        # 3. Resolve new hash (same torrent → usually same hash).
-        # Test doubles may return non-str hashes — only accept real strings,
-        # otherwise keep the old hash (re-added same torrent).
-        new_hash: str | None = None
-        try:
-            _rh = result.hash
-            if isinstance(_rh, str) and _rh:
-                new_hash = _rh.lower()
-        except Exception:
-            new_hash = None
-        if not new_hash and isinstance(blob, (bytes, bytearray)):
-            try:
-                from .watchdir import _bencoded_info_hash
-
-                parsed_hash, _, _, _ = _bencoded_info_hash(bytes(blob))
-                if isinstance(parsed_hash, str) and parsed_hash:
-                    new_hash = parsed_hash.lower()
-            except Exception:
-                new_hash = None
-        if not new_hash and isinstance(blob, (bytes, bytearray)):
-            # Refactor: drop the 60s _await_hash_for_name fallback here.
-            # Blob exists (checked above) so its hash parses except for
-            # corrupt bytes — in which case the add above already failed
-            # or the next tick retries with the same blob. A full racing
-            # list scan with backoff per batch reset cost up to 60s × N
-            # batches for a path that casi never fires. Keep the old
-            # hash for this tick; guards catch it next tick.
-            log.warning(
-                "isolated batch: hash unresolvable for %s after re-add; retry next tick",
-                ts.source_name,
-            )
-            return False
-        if new_hash:
-            ts.dest_infohash = new_hash
-            # Narrow write: the whole-row upsert here used to clobber a
-            # concurrently transitioned state (and leak the live polling
-            # key). Revision sync keeps this worker's later transitions
-            # valid; a 0 means tombstoned/absent — keep the in-memory
-            # hash for this tick, guards catch it next tick.
-            try:
-                _up2 = getattr(self.store, "update_columns", None)
-                if callable(_up2):
-                    _nv2 = _up2((ts.source_infohash or ""),
-                                {"dest_infohash": new_hash})
-                    if isinstance(_nv2, int) and _nv2 > 0:
-                        try:
-                            ts.version = _nv2
-                        except Exception:
-                            pass
-                else:
-                    self.store.upsert(ts)
-            except Exception:
-                pass
-        h_new = ts.dest_infohash or ts.source_infohash
-
-        # 4. Wait for file list (registration lag) + prioritize next batch only.
+        h = ts.dest_infohash or ts.source_infohash
+        # Fresh file list (registration/transient lag tolerated): the
+        # priority map below must name every file, or an unnamed file
+        # keeps its old (selected) priority and downloads past the cap.
         files: list[TorrentFile] = []
         for _ in range(4):
             try:
-                files = await self.dest_client.get_torrent_files(h_new)
+                files = await self.dest_client.get_torrent_files(h)
                 if files:
                     break
             except Exception:
@@ -6343,7 +6219,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             await asyncio.sleep(2)
         if not files:
             log.warning(
-                "isolated batch: file list not ready for %s after re-add; retry next tick",
+                "batch flip: file list not ready for %s; retry next tick",
                 ts.source_name,
             )
             return False
@@ -6357,11 +6233,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         try:
             batches = self._resolve_batches(files, kind, cap)
         except Exception as e:  # noqa: BLE001
-            log.warning("isolated batch: could not resolve batches for %s: %s", ts.source_name, e)
+            log.warning("batch flip: could not resolve batches for %s: %s", ts.source_name, e)
             return False
         if not batches:
             log.warning(
-                "isolated batch: no batches resolvable for %s; retry next tick",
+                "batch flip: no batches resolvable for %s; retry next tick",
                 ts.source_name,
             )
             return False
@@ -6370,7 +6246,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # requested batch no longer exists: everything resolvable is done.
             # Reconcile cursors to finished instead of parking forever.
             log.warning(
-                "isolated batch: grouping shrank to %d batches for %s; finishing",
+                "batch flip: grouping shrank to %d batches for %s; finishing",
                 len(batches), ts.source_name,
             )
             ts.batches_total = len(batches)
@@ -6390,18 +6266,22 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         wanted = {e.file_name for e in nxt.episodes} - skip
         prio_map = {f.name: (1 if f.name in wanted else 0) for f in files}
         try:
-            await self.dest_client.set_file_priorities(h_new, prio_map)
+            await self.dest_client.set_file_priorities(h, prio_map)
         except Exception as e:  # noqa: BLE001
-            log.warning("isolated batch: priority set failed for %s: %s", ts.source_name, e)
+            if is_fatal_os_error(e):
+                raise
+            log.warning("batch flip: priority set failed for %s: %s", ts.source_name, e)
             return False
         if wanted:
             try:
-                await self.dest_client.resume(h_new)
+                await self.dest_client.resume(h)
             except Exception as e:  # noqa: BLE001
-                log.warning("isolated batch: resume failed for %s: %s", ts.source_name, e)
+                if is_fatal_os_error(e):
+                    raise
+                log.warning("batch flip: resume failed for %s: %s", ts.source_name, e)
                 return False
         log.info(
-            "isolated batch: ready for batch %d/%d for %s (%d file(s) wanted)",
+            "batch flip: ready for batch %d/%d for %s (%d file(s) wanted)",
             next_index + 1, ts.batches_total, ts.source_name, len(wanted),
         )
         return next_index
