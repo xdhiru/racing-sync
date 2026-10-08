@@ -311,7 +311,12 @@ base64url-encoded in the buttons (`forget:match:<tok>:<0|1>` /
 `keep:match:<tok>:<0|1>:<yes|no>`) and is re-resolved live at each
 tap, so no stored pending state exists to expire. Tapping any action
 button deletes its sheet once handled, so answered questions never
-linger behind their follow-up (only the outcome reply stays). Without remember
+linger behind their follow-up (only the outcome reply stays).
+Liveness is checked at the first question for single-copy scopes
+(dead rows answer at once instead of wasting two taps); a failed
+liveness read reports `Action failed`, never "gone". A duplicate tap
+while one forget is still running gets "working on it" instead of a
+second execution (the 0.5s debounce can't cover a 60s client delete). Without remember
 the row is hard-deleted (no tombstone), so a later re-drop re-ingests
 from scratch. Delete/keep only ever concerns SSD data and client
 entries: fuse/remote copies are never touched (fuse-pointing entries

@@ -1238,6 +1238,11 @@ class TelegramBot:
         # Per-chat debounce (monotonic timestamps by chat/user key): one
         # chat's burst must not starve pagination for everyone else.
         self._callback_times: dict[str, float] = {}
+        # Destructive scopes currently executing (monotonic start time by
+        # scope key): the 0.5s tap debounce can't cover a 60s client
+        # delete, so a re-tap mid-execution would run the whole forget a
+        # second time and report "gone". Second tap gets "working on it".
+        self._action_inflight: dict[str, float] = {}
         # Last monotonic timestamp of an active-message (re)post, for the
         # keep-at-bottom repost interval.
         self._last_repost_monotonic: float = 0.0
@@ -2129,6 +2134,38 @@ class TelegramBot:
             pass
         return False
 
+    def _claim_action(self, key: str, *, ttl: float = 600.0) -> bool:
+        """Hold a destructive scope while it executes (True when free).
+
+        Same fail-open shape as _debounced (tests build the bot without
+        __init__): bookkeeping trouble never blocks operator intent.
+        Stale holds (crashed mid-execution) expire via `ttl`.
+        """
+        now = time.monotonic()
+        try:
+            inflight = getattr(self, "_action_inflight", None)
+            if not isinstance(inflight, dict):
+                inflight = {}
+                self._action_inflight = inflight
+            for k in [k for k, t in inflight.items()
+                      if now - float(t or 0.0) > ttl]:
+                inflight.pop(k, None)
+            if key in inflight:
+                return False
+            inflight[key] = now
+            return True
+        except Exception:
+            return True
+
+    def _release_action(self, key: str) -> None:
+        """Drop a destructive-scope hold (best-effort)."""
+        try:
+            inflight = getattr(self, "_action_inflight", None)
+            if isinstance(inflight, dict):
+                inflight.pop(key, None)
+        except Exception:
+            pass
+
     async def _handle_callback(self, query: Any) -> None:
         # Authenticate callback: query must originate from configured chat or user
         chat_id = None
@@ -2863,14 +2900,24 @@ class TelegramBot:
         `remember=False` forgets without the ignore entry and hard-deletes
         the rows (never-seen semantics): a later re-drop re-ingests from
         scratch. Workers are stopped first so no stale upsert resurrects.
+        A duplicate tap while one execution is still running gets "working
+        on it" instead of a second full forget (which would end in "gone").
         """
+        _key = (f"keep:{','.join(sorted((h or '').lower() for h in hashes or []))}"
+                f":{'1' if remember else '0'}:{'del' if delete_files else 'keep'}")
+        if not self._claim_action(_key):
+            return "Already working on it — one tap is enough."
         try:
             live = []
             for h in hashes or []:
                 try:
                     row = await asyncio.to_thread(self._store.get, h)
-                except Exception:
-                    row = None
+                except Exception as e:  # noqa: BLE001
+                    # A failed read is not a gone row: reporting "gone"
+                    # here strands a live torrent with no way forward.
+                    log.warning("cancel liveness read failed for %s: %s",
+                                (h or "")[:10], e)
+                    return f"Action failed: {e}"
                 if row is not None:
                     live.append(h)
             if not live:
@@ -2891,6 +2938,8 @@ class TelegramBot:
             return f"{verb} {title} ({ok}/{len(outs)} copies){suffix}"
         except Exception as e:  # noqa: BLE001
             return f"Action failed: {e}"
+        finally:
+            self._release_action(_key)
 
     def _live_notes_for(self, members: list) -> dict[str, str]:
         """Wait-note map for prefer eligibility (best-effort, str-only)."""
@@ -2926,8 +2975,15 @@ class TelegramBot:
             return
         try:
             row = await asyncio.to_thread(self._store.get, full_hash)
-        except Exception:
-            row = None
+        except Exception as e:  # noqa: BLE001
+            # Same rule as the snapshot cancel: a failed read is not a
+            # gone row — say so instead of stranding a live torrent.
+            try:
+                await self._reply(f"Action failed: {e}"[:300],
+                                  reply_to=message)
+            except Exception:
+                pass
+            return
         if row is None:
             try:
                 await self._reply("Already gone from tracking", reply_to=message)
@@ -3730,6 +3786,20 @@ class TelegramBot:
                     _scope = f"all:{_h}"
                     _scope_label = f" · all {len(_hashes)} copies"
                 else:
+                    # Liveness now, not at execution: a dead row gets its
+                    # answer here instead of two wasted question sheets.
+                    try:
+                        _get = getattr(getattr(self, "_store", None),
+                                       "get", None)
+                        _row = await asyncio.to_thread(_get, _h) \
+                            if callable(_get) else None
+                    except Exception as e:  # noqa: BLE001
+                        await _say(f"Action failed: {e}")
+                        return
+                    if _row is None:
+                        await _say("Already gone from tracking")
+                        await _refresh()
+                        return
                     _title = await _row_title(_h)
                     _scope = _h
                     _scope_label = ""
