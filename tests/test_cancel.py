@@ -1952,6 +1952,101 @@ async def test_answered_sheets_are_deleted(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_cancel_liveness_read_error_is_action_failed(tmp_path: Path):
+    """A failed liveness read must not masquerade as 'gone'."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Live",
+                              state=State.QUEUED))
+    real_get = store.get
+
+    def _boom(h, **kw):
+        raise RuntimeError("boom")
+
+    store.get = _boom
+    bot = _bot()
+    bot._store = store
+    try:
+        out = await bot._execute_snapshot_cancel(
+            ["a" * 40], "Live", delete_files=True)
+        assert out.startswith("Action failed")
+        assert "Already gone" not in out
+        assert real_get("a" * 40) is not None
+        bot._callback_times.clear()
+        await bot._start_single_command(
+            "cancel", "a" * 40, _message(text="/cancel_" + "a" * 40))
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Action failed")
+        assert real_get("a" * 40) is not None
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_cancel_sheet_dead_row_answers_gone_immediately(tmp_path: Path):
+    """Q1 on a dead row answers at once — no wasted question sheets."""
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="d" * 40, source_name="Unrelated",
+                     state=State.QUEUED),
+    ])
+    try:
+        await bot._handle_callback(_query(f"cancel:{'e' * 40}"))
+        _calls = bot._bot.send_message.await_args_list
+        assert _calls
+        assert _calls[-1].args[1] == "Already gone from tracking"
+        _data = [b.callback_data
+                 for c in _calls
+                 for r in (c.kwargs.get("reply_markup").inline_keyboard
+                           if c.kwargs.get("reply_markup") else [])
+                 for b in r]
+        assert not any(d.startswith("forget:") for d in _data)
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_duplicate_keep_tap_gets_working_on_it(tmp_path: Path):
+    """A re-tap mid-execution must not run a second forget."""
+    import asyncio
+
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="a" * 40, source_name="Slow.Show",
+                     state=State.QUEUED),
+    ])
+    bot._bot.delete_message = AsyncMock()
+    _release = asyncio.Event()
+    _calls: list[str] = []
+    _real = bot._execute_cancel_one
+
+    async def _slow(h, **kw):
+        _calls.append(h)
+        await _release.wait()
+        return await _real(h, **kw)
+
+    bot._execute_cancel_one = _slow
+    try:
+        first = asyncio.create_task(
+            bot._handle_callback(_query(f"keep:{'a' * 40}:1:yes")))
+        for _ in range(200):
+            if getattr(bot, "_action_inflight", None):
+                break
+            await asyncio.sleep(0.01)
+        assert getattr(bot, "_action_inflight", None)
+        bot._callback_times.clear()
+        await bot._handle_callback(_query(f"keep:{'a' * 40}:1:yes"))
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Already working on it")
+        _release.set()
+        await first
+        assert _calls == ["a" * 40]
+        assert store.get("a" * 40) is None
+        assert store.is_ignored("a" * 40) is True
+    finally:
+        store.close()
+
+
 def test_cancel_match_protocol_shapes_fit_buttons():
     """Match tokens round-trip and every button shape fits 64 bytes."""
     from racing_sync.telegram_bot import (
