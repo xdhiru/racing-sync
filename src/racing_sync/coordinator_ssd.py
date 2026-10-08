@@ -154,6 +154,79 @@ class SSDLedgerMixin:
             return cap
         return min(total, cap)
 
+    def _blob_admit_footprint(self, ts: TorrentState, blob: bytes | None,
+                              size_bytes: int = 0) -> int | None:
+        """Max single-batch bytes from .torrent metadata, None when unknowable.
+
+        Lets admission reserve what a torrent will REALLY occupy (one
+        batch at a time) instead of min(total, cap): a 100 GB season of
+        7 GB episodes admits on ~7 GB free instead of demanding the full
+        40 GB cap while parked unclassified. Pure metadata math — sync,
+        no I/O beyond the passed bytes (callers fetch the blob).
+
+        Returns None (caller keeps today's estimate) when the blob is
+        missing/undecodable, the cap is unusable, any single file exceeds
+        the cap (defer to the estimate + setup path, which fails such
+        rows loudly instead of parking them on a footprint they can
+        never reserve), or anything looks off. Never raises.
+        """
+        try:
+            if not blob or not isinstance(blob, (bytes, bytearray)):
+                return None
+            try:
+                cap = self._frozen_batch_cap(ts)
+            except Exception:
+                return None
+            if not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0:
+                return None
+            try:
+                from .watchdir import extract_torrent_files_from_bencoded
+            except Exception:
+                return None
+            try:
+                parsed = extract_torrent_files_from_bencoded(bytes(blob))
+            except Exception:
+                return None
+            names = [(f.name, f.size_bytes) for f in (parsed or [])
+                     if getattr(f, "name", "")]
+            if not names:
+                return None
+            try:
+                biggest = max(int(s or 0) for _, s in names)
+            except (TypeError, ValueError):
+                return None
+            if biggest <= 0 or biggest > cap:
+                # Empty, or a single file that can never fit one batch:
+                # let the normal estimate + setup path handle it (which
+                # fails oversize files loudly instead of parking them on
+                # an unreservable footprint).
+                return None
+            try:
+                from .classifier import classify as _classify
+            except Exception:
+                return None
+            try:
+                kind = _classify(parsed, self.cfg).kind
+            except Exception:
+                return None
+            try:
+                batches = self._resolve_batches(parsed, kind, cap)
+            except Exception:
+                return None
+            if not batches:
+                try:
+                    total = int(size_bytes or 0) or sum(
+                        int(s or 0) for _, s in names)
+                except (TypeError, ValueError):
+                    total = 0
+                return total if total > 0 else None
+            try:
+                return max(int(b.size_bytes or 0) for b in batches) or None
+            except (TypeError, ValueError):
+                return None
+        except Exception:
+            return None
+
     def _ssd_reserved_total(self) -> int:
         try:
             d = getattr(self, "_ssd_reserved", None)

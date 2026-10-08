@@ -279,3 +279,91 @@ async def test_prune_runs_outside_admission_lock(tmp_path):
     assert await coord._ssd_try_reserve("n" * 40, 1_000) is True
     assert seen.get("locked") is False
     assert real_lock.locked() is False
+
+
+def _pack_blob(top, parts):
+    """Multi-file .torrent bytes: parts = [(relpath, size)]."""
+    from racing_sync.watchdir import _bencode
+
+    files = []
+    for rel, size in parts:
+        segs = [p.encode() for p in rel.split("/")]
+        files.append({b"length": size, b"path": segs})
+    return bytes(_bencode({
+        b"info": {b"name": top.encode(), b"files": files,
+                  b"piece length": 16384, b"pieces": b"0" * 20},
+    }))
+
+
+def test_blob_admit_footprint_is_max_batch(tmp_path):
+    """A 24KB pack in 8KB files admits on one 8KB batch, not 10KB cap."""
+    coord = _coord_with_cap(tmp_path, 10_000)
+    ts = TorrentState(source_infohash="f" * 40, source_name="Pack",
+                      state=State.NEW)
+    blob = _pack_blob("Pack", [("a.bin", 8000), ("b.bin", 8000),
+                               ("c.bin", 8000)])
+    assert coord._blob_admit_footprint(ts, blob, 24_000) == 8000
+
+
+def test_blob_admit_footprint_single_file_is_total(tmp_path):
+    coord = _coord_with_cap(tmp_path, 10_000)
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 10 ** 12
+    ts = TorrentState(source_infohash="g" * 40, source_name="Movie",
+                      state=State.NEW)
+    blob = _pack_blob("Movie", [("film.mkv", 5000)])
+    assert coord._blob_admit_footprint(ts, blob, 5000) == 5000
+
+
+def test_blob_admit_footprint_refuses_over_cap_and_garbage(tmp_path):
+    coord = _coord_with_cap(tmp_path, 10_000)
+    ts = TorrentState(source_infohash="h" * 40, source_name="Big",
+                      state=State.NEW)
+    # A single file that can never fit one batch: defer (setup fails it).
+    blob = _pack_blob("Big", [("huge.bin", 15_000)])
+    assert coord._blob_admit_footprint(ts, blob, 15_000) is None
+    assert coord._blob_admit_footprint(ts, None, 100) is None
+    assert coord._blob_admit_footprint(ts, b"not-a-torrent", 100) is None
+
+
+@pytest.mark.anyio
+async def test_admit_prefers_batch_footprint_over_total_estimate(tmp_path):
+    """_admit_resolved reserves one batch (~8KB), not min(total, cap)."""
+    coord = _coord_with_cap(tmp_path, 10_000)
+    coord.dest_client = None
+    blob = _pack_blob("Pack", [("a.bin", 8000), ("b.bin", 8000),
+                               ("c.bin", 8000)])
+    ts = TorrentState(source_infohash="f" * 40, source_name="Pack",
+                      total_bytes=24_000, state=State.NEW)
+    with patch.object(coord, "_ssd_try_reserve",
+                      AsyncMock(return_value=True)) as reserve:
+        await coord._admit_resolved(
+            ts, blob=blob, size_bytes=24_000, display_name="Pack")
+    reserve.assert_awaited_once_with("f" * 40, 8000)
+    assert ts.state == State.QUEUED
+
+
+@pytest.mark.anyio
+async def test_wait_disk_retries_against_blob_batches(tmp_path):
+    """A parked 24KB pack with only batch room promotes to QUEUED."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        blob = _pack_blob("Pack", [("a.bin", 8000), ("b.bin", 8000),
+                                   ("c.bin", 8000)])
+        ts = TorrentState(source_infohash="f" * 40, source_name="Pack",
+                          total_bytes=24_000, state=State.WAITING_DISK,
+                          cross_seed_blob=blob)
+        store.upsert(ts)
+        coord = _coord_with_cap(tmp_path, 10_000)
+        coord.store = store
+        coord.dest_client = AsyncMock()
+        coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
+        row = store.get("f" * 40, include_blob=False)
+        with patch.object(coord, "_ssd_try_reserve",
+                          AsyncMock(side_effect=[False, True])) as reserve:
+            await coord._wait_disk_then_queue(row)
+        assert reserve.await_count == 2
+        assert reserve.call_args_list[0][0][1] == 10_000  # full estimate
+        assert reserve.call_args_list[1][0][1] == 8000  # one batch
+        assert row.state == State.QUEUED  # transition mock sets in-memory
+    finally:
+        store.close()
