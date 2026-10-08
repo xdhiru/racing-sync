@@ -55,7 +55,7 @@ Expected behaviour on VPS2 within ~5 minutes:
 
 1. `state.db` row appears with `state=new` (DB values are lowercase; enum names are uppercase).
 2. Cross-seed picker logs `picked public-prowlarr` (`cross_seed_source: prowlarr|sftp|self`).
-3. Transition `new -> querying -> waiting_indexer|waiting_disk -> queued -> downloading`.
+3. Transition `new -> waiting_indexer|waiting_disk -> queued -> downloading`.
 4. After finish, log `rclone ok in Ns`.
 5. Transition `downloading -> moving -> re_adding -> done`.
 6. VPS2 qB has the movie on `fuse.mount`, status "seeding", `skip_check=true`.

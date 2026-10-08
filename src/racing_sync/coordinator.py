@@ -142,7 +142,6 @@ _SCHED_STATE_PRIORITY = {
     State.RE_ADDING: 0,
     State.QUEUED: 0,
     State.MOVING: 0,
-    State.QUERYING: 0,
     State.DOWNLOADING: 0,
     # Unbounded discovery after that: endless NEW rows must not crowd out
     # the rows above.
@@ -2076,18 +2075,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             _entry_state = None
         if ts.state == State.NEW:
             await self._do_new(ts)
-        if ts.state == State.QUERYING:
-            await self._do_waiting_indexer(ts)
         if ts.state == State.WAITING_INDEXER and _entry_state in (
-            State.QUERYING,
             State.WAITING_INDEXER,
         ):
-            # Refactor: timer-elapsed WAITING_INDEXER rows work directly
-            # without the extra WAITING_INDEXER -> QUERYING transition.
-            # QUERYING is kept as a compat alias (old DB rows, manual
-            # /fetch wakes still use it), but the scheduler no longer
-            # spends a DB write to get here. Entry-state guard prevents
-            # same-tick fallthrough (NEW that just parked must wait).
+            # Refactor: timer-elapsed WAITING_INDEXER rows work directly.
+            # The retired QUERYING hop is gone (see state.py migration);
+            # the scheduler wakes due rows and the worker picks them up
+            # without an intermediate transition. Entry-state guard
+            # prevents same-tick fallthrough (NEW that just parked must
+            # wait out its timer).
             await self._do_waiting_indexer(ts)
         if ts.state == State.WAITING_DISK:
             await self._wait_disk_then_queue(ts)
@@ -2115,11 +2111,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     def _wakeup_indexer_row(self, ts: TorrentState) -> None:
         """Wake one timer-elapsed WAITING_INDEXER row (step-3 loop body).
 
-        Refactor: spawn the worker directly without the intermediate
-        WAITING_INDEXER -> QUERYING transition. The worker's
-        WAITING_INDEXER branch does the same `_do_waiting_indexer` work,
-        saving one DB write + version bump per wakeup. QUERYING remains
-        a valid state for old rows and manual /fetch wakes.
+        Spawns the worker directly: the worker's WAITING_INDEXER branch
+        does the `_do_waiting_indexer` work with no intermediate
+        transition (the retired QUERYING hop is gone).
         """
         _key = (ts.source_infohash or "").lower()
         if _key in self._running_infohashes:
@@ -2714,7 +2708,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         try:
             if ts.state == State.DONE:
                 return True
-            if ts.state not in (State.NEW, State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK):
+            if ts.state not in (State.NEW, State.WAITING_INDEXER, State.WAITING_DISK):
                 return False
             try:
                 if getattr(self, "store", None) is not None and hasattr(self.store, "is_ignored"):
@@ -2833,7 +2827,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             dest_client = getattr(self, "dest_client", None)
             if dest_client is None:
                 return False
-            if ts.state not in (State.NEW, State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK):
+            if ts.state not in (State.NEW, State.WAITING_INDEXER, State.WAITING_DISK):
                 return False
             h = (ts.source_infohash or "").lower()
             if not h:
@@ -2868,7 +2862,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             try:
                 pre_ssd = await offload(
                     store.list_by_state,
-                    State.NEW, State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK,
+                    State.NEW, State.WAITING_INDEXER, State.WAITING_DISK,
                 )
             except Exception:
                 return
@@ -2927,7 +2921,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                         fresh = None
                     if fresh is None or fresh.state != ts.state:
                         continue
-                    if fresh.state not in (State.NEW, State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK):
+                    if fresh.state not in (State.NEW, State.WAITING_INDEXER, State.WAITING_DISK):
                         continue
                     if getattr(fresh, "skipped", 0):
                         continue
@@ -3110,7 +3104,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         (/prefer_'d) rows always block. Inert when grace is disabled.
         """
         try:
-            rows = self.store.all()
+            # all_active() suffices: election peers/winners can only be in
+            # waiter/locked states (all non-terminal), so DONE/FAILED rows
+            # could never match — and skipping them shrinks the scan on
+            # long-lived DBs with hundreds of settled rows.
+            rows = self.store.all_active()
         except Exception as e:  # noqa: BLE001
             log.warning("watch-dir election: cannot list rows (%s); proceeding solo", e)
             return True, None
@@ -5424,7 +5422,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         release from a *different* tracker has a live swarm and must never
         be killed by name match alone; rows with unknown tracker or size
         are left for their own watchdog. Only pre-download states
-        (NEW/QUERYING/QUEUED/WAITING_DISK/WAITING_INDEXER) cascade —
+        (NEW/QUEUED/WAITING_DISK/WAITING_INDEXER) cascade —
         MOVING/RE_ADDING rows already hold the bytes, DOWNLOADING rows
         trip the watchdog themselves, DONE/FAILED are settled.
         Capped (25) so one deletion can't page a stampede.
@@ -5443,7 +5441,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             rows = self.store.all_active()
         except Exception:
             return
-        _CASCADE_STATES = (State.NEW, State.QUERYING, State.QUEUED,
+        _CASCADE_STATES = (State.NEW, State.QUEUED,
                            State.WAITING_DISK, State.WAITING_INDEXER)
         done = 0
         for r in rows or []:
@@ -5605,6 +5603,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         is_batched = ts.batches_total > 1
         consecutive_batch_failures = 0
         max_batch_failures_per_tick = 5
+        # First wait iteration reuses the pre-loop batch resolution (see
+        # above); later iterations re-resolve after each isolated reset.
+        _first_wait = True
 
         if is_batched and hasattr(self, "dest_client"):
             # Entry re-verify (best-effort): the client's selection may have
@@ -5616,12 +5617,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # continue) rather than parking: the QUEUED-entry and adopted
             # gates above are the hard guarantees; a transient RPC failure
             # here retries on the next worker tick instead of abandoning an
-            # in-flight batch wait.
+            # in-flight batch wait. The resolved list is reused for the
+            # first wait iteration below so the file list isn't fetched
+            # twice back-to-back.
+            _pre_batches: list[Batch] | None = None
             try:
-                await self._prepare_next_batch(ts, strict=True)
+                _pre_batches = await self._prepare_next_batch(ts, strict=True)
             except Exception as e:  # noqa: BLE001
                 log.warning("batch priorities not verified for %s (%s); proceeding",
                             ts.source_infohash[:10], e)
+                _pre_batches = None
 
         while not self._stop:
             # Fresh-state re-guard: this loop runs for hours across batch
@@ -5664,8 +5669,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             expected_files: list[str] | None = None
 
             if is_batched and hasattr(self, "dest_client"):
-                try:
+                # First wait iteration reuses the pre-loop resolution above
+                # (same files, cap and kind — more consistent than two
+                # back-to-back fetches, and one fewer file-list RPC).
+                # Only a non-empty resolution is reused: an empty one means
+                # "single flow / unknown" here, and the fresh resolve below
+                # stays authoritative (mock doubles and drifted cursors
+                # fall back too). Later iterations always re-resolve (the
+                # reset replaces the client entry between batches).
+                if isinstance(_pre_batches, list) and _pre_batches and _first_wait:
+                    batches: list[Batch] | None = _pre_batches
+                else:
                     batches = await self._get_batches_for_torrent(ts)
+                _first_wait = False
+                try:
                     if batches is None:
                         # Transient RPC failure (not "no batches"): park this
                         # tick rather than degrading to a full-torrent wait
@@ -5714,7 +5731,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                     _err = ""
                 if _err.startswith(TRACKER_UNREGISTERED_MARKER):
                     # Same-tracker siblings waiting on this release (NEW /
-                    # QUERYING / QUEUED / WAITING_DISK / WAITING_INDEXER) are
+                    # QUEUED / WAITING_DISK / WAITING_INDEXER) are
                     # doomed by the same deletion — fail them now instead of
                     # letting each burn a slot and trip the watchdog alone.
                     # Auth deaths don't cascade (fixable account-side).
@@ -6098,7 +6115,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 return
             await asyncio.sleep(poll_interval)
 
-    async def _prepare_next_batch(self, ts: TorrentState, *, strict: bool = False) -> None:
+    async def _prepare_next_batch(
+        self, ts: TorrentState, *, strict: bool = False
+    ) -> list[Batch] | None:
         """Select only the current batch's files on the dest client.
 
         Lenient by default (log + return on unknown, preserving the
@@ -6109,6 +6128,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         every file at add time even while paused, so deselect-after-add
         never reclaims the bytes). A genuinely single-flow torrent
         (no batches) still returns normally under strict.
+
+        Returns the resolved batch list (possibly []) so callers with a
+        hot loop (the download worker) can reuse it instead of
+        re-fetching the file list immediately after; None means
+        unknowable (lenient path only — strict raises instead).
         """
         h = ts.dest_infohash or ts.source_infohash
         try:
@@ -6117,14 +6141,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             log.warning("could not get torrent files for next batch: %s", e)
             if strict:
                 raise RuntimeError(f"batch files unlistable for {ts.source_name}: {e}") from e
-            return
+            return None
         try:
             kind = classify(files, self.cfg).kind
         except Exception as e:
             log.warning("could not classify files for next batch: %s", e)
             if strict:
                 raise RuntimeError(f"batch classify failed for {ts.source_name}: {e}") from e
-            return
+            return None
         cap = self._frozen_batch_cap(ts)
         if cap <= 0:
             try:
@@ -6137,9 +6161,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             log.warning("could not make batches for next batch: %s", e)
             if strict:
                 raise RuntimeError(f"batch resolve failed for {ts.source_name}: {e}") from e
-            return
+            return None
         if not batches:
-            return
+            return []
         if ts.batch_index >= len(batches):
             if strict:
                 # Cursor drift (grouping shrank under a persisted index):
@@ -6150,7 +6174,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 except Exception:
                     pass
             else:
-                return
+                return batches
         cur = batches[ts.batch_index]
         skip = await self._fuse_skipped(
             [(e.file_name, e.size_bytes) for e in cur.episodes], kind,
@@ -6160,6 +6184,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             if ep.file_name not in skip:
                 prio_map[ep.file_name] = 1
         await self.dest_client.set_file_priorities(h, prio_map)
+        return batches
 
     async def _reset_torrent_for_next_batch(self, ts: TorrentState, next_index: int) -> int | bool:
         """Delete + fresh re-add for isolated per-batch downloads.
@@ -8395,10 +8420,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             log.warning("could not list racing torrents for re-injection: %s", e)
             racing = []
 
-        target_norm = normalize_content_name(ts.source_name)
         matches = [
             t for t in racing
-            if t.name == ts.source_name or normalize_content_name(t.name) == target_norm
+            if t.name == ts.source_name or _same_release_name(t.name, ts.source_name)
         ]
 
         try:
@@ -8743,7 +8767,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     # released), cancelled/untracked groups are adopted; DONE/RE_ADDING are
     # no-ops.
     _INJECTFUSE_DRIVABLE = frozenset({
-        State.NEW, State.QUERYING, State.WAITING_INDEXER,
+        State.NEW, State.WAITING_INDEXER,
         State.WAITING_DISK, State.FAILED,
     })
     _INJECTFUSE_ACTIVE = frozenset({
@@ -8758,10 +8782,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         map) for a flat live list.
         """
         try:
-            want_norm = normalize_content_name(getattr(anchor, "name", "") or "")
+            _anchor_name = getattr(anchor, "name", "") or ""
+            if not _anchor_name.strip():
+                return []
         except Exception:
-            return []
-        if not want_norm:
             return []
         try:
             want_size = int(getattr(anchor, "size_bytes", 0) or 0)
@@ -8811,7 +8835,6 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             anchor = members[0]
             name = getattr(anchor, "name", "") or ""
             size = int(getattr(anchor, "size_bytes", 0) or 0)
-            norm = normalize_content_name(name)
             for m in (getattr(store, "find_by_name", lambda _n: [])(name) or []):
                 try:
                     try:

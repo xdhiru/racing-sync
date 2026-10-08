@@ -103,7 +103,6 @@ def _sent_texts(bot):
 # ---- state edges ----
 
 def test_allowed_edges_for_injectfuse():
-    assert State.RE_ADDING in ALLOWED[State.QUERYING]
     assert State.RE_ADDING in ALLOWED[State.WAITING_INDEXER]
     assert State.RE_ADDING in ALLOWED[State.WAITING_DISK]
     assert State.RE_ADDING in ALLOWED[State.FAILED]

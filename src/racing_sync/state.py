@@ -34,7 +34,6 @@ class State(str, enum.Enum):
     SSD download + rclone move + fuse re-add has these stages:
 
       NEW                 we noticed the torrent on VPS1, need to make decisions
-      QUERYING            asking the download-target indexers for a cross-seed torrent (req #1,#2,#3)
       WAITING_INDEXER     no download-target indexer returned a hit yet; we park and retry later
       WAITING_DISK        waiting for SSD to have room (cap in use)
       QUEUED              ready to add to qBittorrent on VPS2
@@ -46,7 +45,6 @@ class State(str, enum.Enum):
     """
 
     NEW = "new"
-    QUERYING = "querying"
     WAITING_INDEXER = "waiting_indexer"
     WAITING_DISK = "waiting_disk"
     QUEUED = "queued"
@@ -58,17 +56,15 @@ class State(str, enum.Enum):
 
 
 # Allowed transitions (everything else raises ValueError).
-# Pre-SSD states (NEW/QUERYING/WAITING_INDEXER/WAITING_DISK) may fast-track
+# Pre-SSD states (NEW/WAITING_INDEXER/WAITING_DISK) may fast-track
 # straight to DONE when a manual fuse seed is detected: the operator added
 # the same infohash on VPS2 pointing at the fuse mount (any category) with
 # verified bytes, so no SSD download / rclone move is needed.
 ALLOWED: dict[State, set[State]] = {
-    State.NEW: {State.QUERYING, State.WAITING_INDEXER, State.WAITING_DISK,
+    State.NEW: {State.WAITING_INDEXER, State.WAITING_DISK,
                 State.QUEUED, State.DOWNLOADING, State.MOVING, State.RE_ADDING,
                 State.DONE, State.FAILED},
-    State.QUERYING: {State.WAITING_INDEXER, State.WAITING_DISK, State.QUEUED,
-                State.DOWNLOADING, State.DONE, State.FAILED, State.RE_ADDING},
-    State.WAITING_INDEXER: {State.QUERYING, State.WAITING_DISK,
+    State.WAITING_INDEXER: {State.WAITING_DISK,
                 State.QUEUED, State.DONE, State.FAILED, State.RE_ADDING},
     State.WAITING_DISK: {State.QUEUED, State.DOWNLOADING, State.DONE, State.FAILED,
                 State.RE_ADDING},
@@ -425,6 +421,23 @@ class StateStore:
                 self._conn.execute(f"ALTER TABLE torrent_state {_ddl}")
             except Exception:
                 pass
+        # Retired states: QUERYING was folded into WAITING_INDEXER (the
+        # wakeup hop that created it is gone; workers handle timer-elapsed
+        # WAITING_INDEXER rows directly). A pre-upgrade row parked there
+        # keeps its retry timers — both schedules are covered by
+        # list_waiting_ready — so it resumes on the next tick instead of
+        # falling into FAILED via _safe_state's unknown-state mapping.
+        try:
+            _cur = self._conn.execute(
+                "UPDATE torrent_state SET state = 'waiting_indexer', "
+                "updated_at = ? WHERE state = 'querying'",
+                (dt.datetime.now(dt.timezone.utc).isoformat(),),
+            )
+            if (_cur.rowcount or 0) > 0:
+                log.info("state DB: migrated %d retired 'querying' row(s) to "
+                         "'waiting_indexer'", _cur.rowcount)
+        except Exception:
+            pass
 
     def _ensure_open(self) -> None:
         if self._closed:
