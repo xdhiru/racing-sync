@@ -39,6 +39,7 @@ from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from .config import TelegramConfig
 from .coordinator import Coordinator
 from .state import State, StateStore, TorrentState
+from .telegram_buttons import ButtonMaker, validate_rows
 
 log = logging.getLogger(__name__)
 
@@ -1768,8 +1769,9 @@ class TelegramBot:
         """Pagination nav buttons plus extra action rows.
 
         Extra rows are ``(label, callback_data)`` pairs (hash-direct
-        action buttons), already chunked by the caller — stale/oversize
-        entries are skipped defensively.
+        action buttons) or a ButtonMaker, already chunked by the caller —
+        invalid entries are logged and skipped so one bad button can
+        never break the periodic list render.
         """
         if total_pages <= 1:
             buttons = [
@@ -1787,13 +1789,11 @@ class TelegramBot:
                 ],
             ]
         try:
-            for _row in extra_rows or ():
+            for _row in validate_rows(extra_rows):
                 _btns = []
-                for (_label, _data) in _row or ():
-                    if not _label or not _data or len(_data) > 64:
-                        continue
+                for (_label, _data) in _row:
                     _btns.append(InlineKeyboardButton(
-                        str(_label)[:60], callback_data=_data))
+                        _label, callback_data=_data))
                 if _btns:
                     buttons.append(_btns)
         except Exception:
@@ -1899,34 +1899,33 @@ class TelegramBot:
                     break
         except Exception:
             pass
-        _rows: list[list[tuple[str, str]]] = []
+        _maker = ButtonMaker()
         # One row per copy: start and cancel side by side stay readable
         # while keeping the copy context shared.
         for (_h, _lbl) in _labels:
-            _row: list[tuple[str, str]] = []
             if _h in _now_ok:
-                _row.append((f"▶ Start {_lbl} now", f"go:{_h}"))
-            _row.append((f"✖ Cancel {_lbl}…", f"cancel:{_h}"))
-            _rows.append(_row)
+                _maker.add(f"▶ Start {_lbl} now", f"go:{_h}")
+            _maker.add(f"✖ Cancel {_lbl}…", f"cancel:{_h}")
+            _maker.newline()
         _leader = _labels[0][0] if _labels else ""
         if len(_labels) > 1 and _leader:
-            _rows.append([(f"✖ Cancel all {_n} copies…",
-                           f"cancel:all:{_leader}")])
+            _maker.add(f"✖ Cancel all {_n} copies…",
+                       f"cancel:all:{_leader}").newline()
         if _inject_ok and _leader:
-            _rows.append([("💉 Inject all to fuse…",
-                           f"inject:all:{_leader}")])
+            _maker.add("💉 Inject all to fuse…",
+                       f"inject:all:{_leader}").newline()
         if _free_any and _leader:
-            _rows.append([("⏭ Skip release (pause downloads)",
-                           f"skip:all:{_leader}")])
+            _maker.add("⏭ Skip release (pause downloads)",
+                       f"skip:all:{_leader}").newline()
         if _held_any and _leader:
-            _rows.append([("⏪ Resume release (restart it)",
-                           f"resume:all:{_leader}")])
-        _rows.append([("Close", "abort")])
+            _maker.add("⏪ Resume release (restart it)",
+                       f"resume:all:{_leader}").newline()
+        _maker.add("Close", "abort")
         _text = (f"{_tspec}" + (f" · {_size}" if _size else "")
                  + (f" · {_n} cop{'y' if _n == 1 else 'ies'} tracked" if _n else "")
                  + "\nStart downloads now. Cancel/Inject ask first. "
                  "Skip pauses, Resume restarts.")
-        return _text, _rows
+        return _text, _maker.rows()
 
     def _keepq_text_and_rows(
         self, title: str, scope_label: str, scope: str,
@@ -1951,27 +1950,31 @@ class TelegramBot:
                  f"({_blocked})"
                  f"\nKeep untracks (data stays in place); "
                  f"Delete wipes the torrent and its data.")
-        _rows = [[("✔ Keep files", f"keep:{scope}:{_ig}:yes")],
-                 [("✖ Delete files", f"keep:{scope}:{_ig}:no")],
-                 [("Close", "abort")]]
+        _rows = (ButtonMaker()
+                 .add("✔ Keep files", f"keep:{scope}:{_ig}:yes").newline()
+                 .add("✖ Delete files", f"keep:{scope}:{_ig}:no").newline()
+                 .add("Close", "abort").rows())
         return _text, _rows
 
     async def _send_sheet(
         self, text: str, rows: list, reply_to: Any = None,
     ) -> None:
-        """Best-effort sheet reply with action buttons (plain text)."""
+        """Best-effort sheet reply with action buttons (plain text).
+
+        `rows` is a ButtonMaker (strict, validated at build time) or
+        legacy ``(label, data)`` rows (validated leniently: invalid
+        buttons are logged and dropped, never silently).
+        """
         bot = getattr(self, "_bot", None)
         if bot is None:
             return
         try:
             _btns = []
-            for _row in rows or ():
+            for _row in validate_rows(rows):
                 _line = []
-                for (_label, _data) in _row or ():
-                    if not _label or not _data or len(_data) > 64:
-                        continue
+                for (_label, _data) in _row:
                     _line.append(InlineKeyboardButton(
-                        str(_label)[:60], callback_data=_data))
+                        _label, callback_data=_data))
                 if _line:
                     _btns.append(_line)
             kwargs: dict[str, Any] = {}
@@ -3021,9 +3024,10 @@ class TelegramBot:
                 f"Forget {title}?\n"
                 f"🚫 Ignore blocks it from coming back; "
                 f"👻 Just forget allows re-adding it later.")
-            _rows = [[("🚫 Ignore + forget", f"forget:{full_hash}:1"),
-                      ("👻 Just forget", f"forget:{full_hash}:0")],
-                     [("Close", "abort")]]
+            _rows = (ButtonMaker()
+                     .add("🚫 Ignore + forget", f"forget:{full_hash}:1")
+                     .add("👻 Just forget", f"forget:{full_hash}:0")
+                     .newline().add("Close", "abort").rows())
             try:
                 await self._send_sheet(_text, _rows, reply_to=message)
             except Exception:
@@ -3126,9 +3130,10 @@ class TelegramBot:
             _text = (f"Inject {title} ({_n} cop{'y' if _n == 1 else 'ies'}) "
                      "to fuse seeding? Files must already be at the "
                      f"remote.{extra} Choose below.")
-            _rows = [[("✔ Yes, inject", f"inject:{_lead}:yes")],
-                     [("✖ No", f"inject:{_lead}:no")],
-                     [("Close", "abort")]]
+            _rows = (ButtonMaker()
+                     .add("✔ Yes, inject", f"inject:{_lead}:yes").newline()
+                     .add("✖ No", f"inject:{_lead}:no").newline()
+                     .add("Close", "abort").rows())
             await self._send_sheet(_text, _rows, reply_to=message)
         except Exception as e:  # noqa: BLE001
             log.debug("inject ask failed: %s", e)
@@ -3457,9 +3462,10 @@ class TelegramBot:
             "\nForget them all?\n"
             "🚫 Ignore blocks them from coming back; "
             "👻 Just forget allows re-adding later.")
-        _rows = [[("🚫 Ignore + forget", f"forget:match:{tok}:1"),
-                   ("👻 Just forget", f"forget:match:{tok}:0")],
-                  [("Close", "abort")]]
+        _rows = (ButtonMaker()
+                 .add("🚫 Ignore + forget", f"forget:match:{tok}:1")
+                 .add("👻 Just forget", f"forget:match:{tok}:0")
+                 .newline().add("Close", "abort").rows())
         try:
             await self._send_sheet(_text, _rows, reply_to=message)
         except Exception:
@@ -3547,25 +3553,24 @@ class TelegramBot:
                         f"Forget {title}?\n"
                         f"🚫 Ignore blocks it from coming back; "
                         f"👻 Just forget allows re-adding it later.",
-                        [[("🚫 Ignore + forget",
-                           f"forget:{_hashes[0]}:1"),
-                          ("👻 Just forget",
-                           f"forget:{_hashes[0]}:0")],
-                         [("Close", "abort")]],
+                        ButtonMaker()
+                        .add("🚫 Ignore + forget",
+                             f"forget:{_hashes[0]}:1")
+                        .add("👻 Just forget",
+                             f"forget:{_hashes[0]}:0")
+                        .newline().add("Close", "abort"),
                         reply_to=message)
                 except Exception:
                     pass
                 return
-            _rows: list[list[tuple[str, str]]] = [
-                [(f"✖ Cancel {_lbl}…", f"cancel:{_h}")
-                 for (_h, _lbl) in _labels][
-                    i:i + 1]
-                for i in range(0, len(_labels), 1)
-            ]
-            _rows.append([(
+            _maker = ButtonMaker()
+            for (_h, _lbl) in _labels:
+                _maker.add(f"✖ Cancel {_lbl}…", f"cancel:{_h}").newline()
+            _maker.add(
                 f"✖ Cancel all {len(_labels)} copies…",
-                f"cancel:all:{_labels[0][0]}")])
-            _rows.append([("Close", "abort")])
+                f"cancel:all:{_labels[0][0]}").newline()
+            _maker.add("Close", "abort")
+            _rows = _maker.rows()
             try:
                 await self._send_sheet(
                     f"Cancel {title} ({len(_labels)} copies): "
@@ -3702,9 +3707,11 @@ class TelegramBot:
             except Exception:
                 pass
             return
-        _rows = [[(f"▶ Start {_lbl} now", f"go:{_h}")]
-                   for (_h, _lbl) in _labels]
-        _rows.append([("Close", "abort")])
+        _maker = ButtonMaker()
+        for (_h, _lbl) in _labels:
+            _maker.add(f"▶ Start {_lbl} now", f"go:{_h}").newline()
+        _maker.add("Close", "abort")
+        _rows = _maker.rows()
         try:
             await self._send_sheet(
                 f"Start {title}: pick a copy below (tracker names).",
@@ -3808,9 +3815,10 @@ class TelegramBot:
                     f"{_scope_label}?\n"
                     f"🚫 Ignore blocks it from coming back; "
                     f"👻 Just forget allows re-adding it later.")
-                _rows = [[("🚫 Ignore + forget", f"forget:{_scope}:1"),
-                          ("👻 Just forget", f"forget:{_scope}:0")],
-                         [("Close", "abort")]]
+                _rows = (ButtonMaker()
+                         .add("🚫 Ignore + forget", f"forget:{_scope}:1")
+                         .add("👻 Just forget", f"forget:{_scope}:0")
+                         .newline().add("Close", "abort").rows())
                 try:
                     await self._send_sheet(
                         _text, _rows,
