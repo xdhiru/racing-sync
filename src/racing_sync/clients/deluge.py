@@ -296,6 +296,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             # a daemon that doesn't report them yields 0s, which the janitor
             # treats as "activity unknown", never as "quiet").
             "upload_payload_rate",
+            "download_payload_rate",
             "num_seeds",
             "num_peers",
             "total_uploaded",
@@ -347,6 +348,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     files=[],
                     added_on=_num(status.get("time_added", 0)),
                     upspeed_bps=_num(status.get("upload_payload_rate")),
+                    dlspeed_bps=_num(status.get("download_payload_rate")),
                     num_leechers=max(0, peers - seeds),
                     num_seeds=seeds,
                     total_uploaded_bytes=_num(status.get("total_uploaded")),

@@ -439,6 +439,8 @@ async def test_deluge_list_torrents_progress_and_hash_filtering():
             "ratio": 0.0,
             "trackers": [],
             "time_added": 123456,
+            "download_payload_rate": 2000000,
+            "upload_payload_rate": 1000,
         },
         "hash_2": {
             "name": "Torrent 2",
@@ -462,6 +464,9 @@ async def test_deluge_list_torrents_progress_and_hash_filtering():
     t2 = next(t for t in torrents if t.hash == "hash_2")
     assert pytest.approx(t1.progress, 0.001) == 0.015
     assert not t1.is_complete()
+    assert t1.dlspeed_bps == 2000000
+    assert t1.upspeed_bps == 1000
+    assert t2.dlspeed_bps == 0
     assert pytest.approx(t2.progress, 0.001) == 1.0
     assert t2.is_complete()
 
@@ -1259,5 +1264,19 @@ def test_host_with_userinfo_rejected():
     with pytest.raises(ValueError, match="credentials"):
         _ensure_base_url("http://user:pass@localhost:8080")
     assert _ensure_base_url("http://localhost:8080") == "http://localhost:8080/"
+
+
+def test_qb_parses_dlspeed_best_effort():
+    """qB download rate feeds the active-tasks speed display."""
+    from racing_sync.clients.qbittorrent import _torrent_from_qb
+
+    t = _torrent_from_qb({
+        "hash": "a" * 40, "name": "S", "progress": 0.5,
+        "dlspeed": 1234567, "upspeed": 9,
+    })
+    assert t.dlspeed_bps == 1234567
+    assert t.upspeed_bps == 9
+    assert _torrent_from_qb(
+        {"hash": "b" * 40, "name": "S"}).dlspeed_bps == 0
 
 

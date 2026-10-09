@@ -38,6 +38,9 @@ class Torrent:
     # them). Used by the VPS1 cleanup janitor to confirm a race is over
     # before deleting: quiet = upspeed ~0 AND no leechers.
     upspeed_bps: int = 0
+    # Live download rate, best-effort (0 when unknown). Feeds the
+    # active-tasks speed/ETA display via the coordinator's live map.
+    dlspeed_bps: int = 0
     num_leechers: int = 0
     num_seeds: int = 0
     total_uploaded_bytes: int = 0
