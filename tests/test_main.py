@@ -475,3 +475,19 @@ def test_check_config_rejects_file_as_dir(tmp_path: Path):
     cfg.ssd.path = f
     problems = _check_config_env(cfg)
     assert any("not a directory" in p for p in problems)
+
+
+def test_run_async_falls_back_without_uvloop():
+    """_run_async runs the coroutine on the stdlib loop when uvloop
+    is unavailable (Windows/macOS), and never breaks the call sites."""
+    import asyncio
+
+    from racing_sync.__main__ import _run_async
+
+    async def _value():
+        await asyncio.sleep(0)
+        return 42
+
+    assert _run_async(_value()) == 42
+    with patch.dict("sys.modules", {"uvloop": None}):
+        assert _run_async(_value()) == 42
