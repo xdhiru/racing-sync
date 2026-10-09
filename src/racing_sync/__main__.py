@@ -16,6 +16,21 @@ from .coordinator import Coordinator
 from .logging_setup import setup_logging
 
 
+def _run_async(coro):
+    """Run a coroutine to completion, on uvloop when available.
+
+    uvloop (Linux-only dependency) measurably lowers loop overhead for
+    the tick/poll-heavy coordinator; every other platform (and any
+    import/runtime failure) falls back to the stdlib loop. Kept in one
+    helper so all three asyncio.run call sites share the policy.
+    """
+    try:
+        import uvloop
+        return asyncio.run(coro, loop_factory=uvloop.new_event_loop)
+    except Exception:
+        return asyncio.run(coro)
+
+
 async def _runner(coord: Coordinator) -> int:
     log = logging.getLogger("racing_sync")
     loop = asyncio.get_running_loop()
@@ -305,7 +320,7 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
                 pass
 
     try:
-        result = asyncio.run(_run())
+        result = _run_async(_run())
     except LookupError as e:
         print(f"forget: {e}", file=sys.stderr)
         try:
@@ -745,7 +760,7 @@ def main(argv: list[str] | None = None) -> int:
             for line in _do_reset(cfg):
                 print(line)
             if getattr(args, "full", False):
-                for line in asyncio.run(_do_full_reset(cfg)):
+                for line in _run_async(_do_full_reset(cfg)):
                     print(line)
 
         try:
@@ -762,7 +777,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Failed to initialise coordinator: {e}", file=sys.stderr)
             return 2
         try:
-            return asyncio.run(_runner(coord))
+            return _run_async(_runner(coord))
         except KeyboardInterrupt:
             return 130
         except Exception as e:

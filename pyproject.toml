@@ -16,6 +16,9 @@ dependencies = [
     "python-telegram-bot>=22.0,<23",
     "paramiko>=3.4,<6",
     "defusedxml>=0.7",
+    # Faster asyncio loop on Linux (VPS); Windows/macOS fall back to
+    # stdlib via _run_async. Pinned out of test scope (no uvloop there).
+    "uvloop>=0.21; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
