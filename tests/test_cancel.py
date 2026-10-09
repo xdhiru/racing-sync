@@ -1009,6 +1009,41 @@ def test_keepq_text_shows_size_or_omits():
     assert "data stays in place" in _text2 and "wipes" in _text2
 
 
+def test_chat_command_registry_covers_all_verbs():
+    """Registry: unique names, valid handlers, mutually exclusive patterns."""
+    from racing_sync.telegram_bot import _CHAT_COMMANDS
+
+    names = [c.name for c in _CHAT_COMMANDS]
+    assert len(names) == len(set(names)) == 14
+    for c in _CHAT_COMMANDS:
+        assert callable(c.pattern.match)
+        assert callable(c.handle)
+    cases = {
+        "/add": ["add"],
+        "/fetch_abc123": ["fetch"],
+        "/prefer_1": ["prefer"],
+        "/now_abcdef12": ["now"],
+        "/skip_3": ["skip"],
+        "/unskip_abc123": ["unskip"],
+        "/resume_abc123": ["resume"],
+        "/unignore_abc123": ["unignore"],
+        "/unignore abc123": ["unignore_hash"],
+        "/cancel_abc123": ["cancel"],
+        "/cancel_match evil show": ["cancel_match"],
+        "/cancel_match": ["cancel_match"],
+        "/injectfuse_2": ["injectfuse"],
+        "/injectfuse abc123": ["injectfuse_hash"],
+        "/act_1": ["act"],
+    }
+    for text, want in cases.items():
+        hits = [c.name for c in _CHAT_COMMANDS if c.pattern.match(text)]
+        assert hits == want, (text, hits)
+    for text in ("/hello", "/cancel_xyz", "/cancel_", "/act_", "/now_",
+                 "/cancel_match_foo", ""):
+        assert [c.name for c in _CHAT_COMMANDS
+                if c.pattern.match(text)] == [], text
+
+
 def test_sheet_buttons_fit_telegram_callback_budget():
     """Every hash-protocol callback shape fits 64 bytes and parses."""
     from racing_sync.telegram_bot import _parse_action_data

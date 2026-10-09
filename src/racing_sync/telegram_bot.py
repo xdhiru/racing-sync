@@ -29,7 +29,7 @@ import hashlib
 import logging
 import re
 import time
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
 from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
@@ -561,12 +561,81 @@ INJECTFUSE_HASH_RE = re.compile(r"^/injectfuse\s+([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 #: extra trailing text ignored.
 ADD_CMD_RE = re.compile(r"^/add(?:@[\w_]+)?\b")
 
-
 #: `/cancel_match <text>` — bulk cancel: every live group whose title
 #: contains `<text>` (case-insensitive) is cancelled together after one
 #: remember + one keep/delete question. Optional `@bot` suffix for group
 #: chats; the text runs to end of line.
+#: (Defined ahead of the command registry, which references it.)
 CANCEL_MATCH_RE = re.compile(r"^/cancel_match(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
+
+
+class _ChatCommand(NamedTuple):
+    """One typed chat command: name, matcher, and dispatch handler.
+
+    Adding a command is one table row below — matching *is* the gate,
+    so no separate "did we forget this pattern" check exists to drift
+    (the class of bug that once left `forget:` taps unrouted).
+    `handle` is an unbound ``async (bot, match, message)`` function.
+    """
+    name: str
+    pattern: re.Pattern
+    handle: Any
+
+
+def _cmd_group(kind: str):
+    """Handler factory: ``/verb_<token>`` via the group command."""
+    async def _run(bot, match, message):
+        await bot._start_group_command(kind, match.group(1), message)
+    _run.__name__ = f"_cmd_group_{kind}"
+    return _run
+
+
+async def _cmd_resume(bot, match, message):
+    """`/unskip_` / `/resume_` / `/unignore_` / `/unignore <hash>`."""
+    await bot._resume_command_entry(match.group(1).lower(), message)
+
+
+async def _cmd_single_injectfuse(bot, match, message):
+    """`/injectfuse <full-hash>` (manual form)."""
+    await bot._start_single_command(
+        "injectfuse", match.group(1).lower(), message)
+
+
+async def _cmd_act(bot, match, message):
+    """`/act_<n|hex>` action sheet."""
+    await bot._act_command_entry(match.group(1).lower(), message)
+
+
+async def _cmd_cancel_match(bot, match, message):
+    """`/cancel_match <text>` bulk cancel (empty text shows usage)."""
+    await bot._cancel_match_command_entry(match.group(1) or "", message)
+
+
+async def _cmd_add(bot, match, message):
+    """`/add` document ingest (acts on the message, not the token)."""
+    await bot._process_document_command(message)
+
+
+#: Chat command registry, in dispatch order. First match wins (patterns
+#: are mutually exclusive by construction — see the registry test).
+_CHAT_COMMANDS: tuple = (
+    _ChatCommand("add", ADD_CMD_RE, _cmd_add),
+    _ChatCommand("fetch", FETCH_CMD_RE, _cmd_group("fetch")),
+    _ChatCommand("prefer", PREFER_CMD_RE, _cmd_group("prefer")),
+    _ChatCommand("now", NOW_CMD_RE, _cmd_group("now")),
+    _ChatCommand("skip", SKIP_CMD_RE, _cmd_group("skip")),
+    _ChatCommand("unskip", UNSKIP_CMD_RE, _cmd_resume),
+    _ChatCommand("resume", RESUME_CMD_RE, _cmd_resume),
+    _ChatCommand("unignore", UNIGNORE_CMD_RE, _cmd_resume),
+    _ChatCommand("unignore_hash", UNIGNORE_HASH_RE, _cmd_resume),
+    _ChatCommand("injectfuse_hash", INJECTFUSE_HASH_RE,
+                 _cmd_single_injectfuse),
+    _ChatCommand("injectfuse", INJECTFUSE_CMD_RE, _cmd_group("injectfuse")),
+    _ChatCommand("act", ACT_CMD_RE, _cmd_act),
+    _ChatCommand("cancel_match", CANCEL_MATCH_RE, _cmd_cancel_match),
+    _ChatCommand("cancel", CANCEL_CMD_RE, _cmd_group("cancel")),
+)
+
 
 #: Shortest substring worth matching: 1 char matches nearly everything.
 _MATCH_MIN_CHARS = 2
@@ -2358,7 +2427,8 @@ class TelegramBot:
     Yes/No question — nothing changes state without verification.
     `/add` ingests a replied-to (or captioned) .torrent file as a
     Telegram-origin drop. Anything else is ignored. Only the
-    configured chat/user may send commands.
+    configured chat/user may send commands. Dispatch is table-driven
+    (:data:`_CHAT_COMMANDS`): first pattern match wins.
     """
         try:
             chat = getattr(message, "chat", None)
@@ -2385,27 +2455,6 @@ class TelegramBot:
                 or ""
             )
             text = str(text or "").strip()
-            m_fetch = FETCH_CMD_RE.match(text)
-            m_prefer = PREFER_CMD_RE.match(text)
-            m_now = NOW_CMD_RE.match(text)
-            m_skip = SKIP_CMD_RE.match(text)
-            m_unskip = UNSKIP_CMD_RE.match(text)
-            m_resume = RESUME_CMD_RE.match(text)
-            m_unignore = UNIGNORE_CMD_RE.match(text)
-            m_unignore_hash = UNIGNORE_HASH_RE.match(text)
-            m_cancel = CANCEL_CMD_RE.match(text)
-            m_cancel_match = CANCEL_MATCH_RE.match(text)
-            m_injectfuse = INJECTFUSE_CMD_RE.match(text)
-            m_injectfuse_hash = INJECTFUSE_HASH_RE.match(text)
-            m_act = ACT_CMD_RE.match(text)
-            m_add = ADD_CMD_RE.match(text)
-            if (not m_fetch and not m_prefer and not m_now
-                    and not m_cancel and not m_cancel_match
-                    and not m_skip and not m_unskip and not m_resume
-                    and not m_unignore and not m_unignore_hash
-                    and not m_injectfuse and not m_injectfuse_hash
-                    and not m_act and not m_add):
-                return
             if not _tg_actor_allowed(self._cfg, user_id):
                 try:
                     await self._reply("Not authorized for destructive actions.",
@@ -2413,61 +2462,16 @@ class TelegramBot:
                 except Exception:
                     pass
                 return
-            if m_add:
-                await self._process_document_command(message)
+            for _cmd in _CHAT_COMMANDS:
+                try:
+                    _m = _cmd.pattern.match(text)
+                except Exception:
+                    _m = None
+                if _m is None:
+                    continue
+                await _cmd.handle(self, _m, message)
                 return
-            if m_fetch:
-                await self._start_group_command(
-                    "now", m_fetch.group(1), message)
-                return
-            if m_prefer:
-                await self._start_group_command(
-                    "now", m_prefer.group(1), message)
-                return
-            if m_now:
-                await self._start_group_command(
-                    "now", m_now.group(1), message)
-                return
-            if m_skip:
-                await self._start_group_command(
-                    "skip", m_skip.group(1), message)
-                return
-            if m_unskip:
-                # Legacy alias: same shapes as /resume_ (digits, prefix,
-                # full hash) via the unified resume entry point.
-                await self._resume_command_entry(
-                    m_unskip.group(1).lower(), message)
-                return
-            if m_resume:
-                await self._resume_command_entry(
-                    m_resume.group(1).lower(), message)
-                return
-            if m_unignore:
-                await self._resume_command_entry(
-                    m_unignore.group(1).lower(), message)
-                return
-            if m_unignore_hash:
-                await self._resume_command_entry(
-                    m_unignore_hash.group(1).lower(), message)
-                return
-            if m_injectfuse_hash:
-                await self._start_single_command(
-                    "injectfuse", m_injectfuse_hash.group(1).lower(), message)
-                return
-            if m_injectfuse:
-                await self._start_group_command(
-                    "injectfuse", m_injectfuse.group(1), message)
-                return
-            if m_act:
-                await self._act_command_entry(
-                    m_act.group(1).lower(), message)
-                return
-            if m_cancel_match:
-                await self._cancel_match_command_entry(
-                    m_cancel_match.group(1) or "", message)
-                return
-            await self._start_group_command(
-                "cancel", m_cancel.group(1), message)
+            return
         except Exception as e:  # noqa: BLE001
             log.debug("chat command handling failed: %s", e)
 
