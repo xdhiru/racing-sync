@@ -47,7 +47,7 @@ def test_render_active_pagination_and_numbering():
 
     # 3. Tracker + stage share one display-only ▸ line (no separate
     # Source:/size lines); positional group commands, never hashes.
-    assert "▸ nyaa.tracker.wf ⬇️ Downloading · 45.0% · Batch 1/2" in text0
+    assert "▸ nyaa.tracker.wf ⬇️ Downloading · 45.0% · ████░░░░ · Batch 1/2" in text0
     assert "▸ nyaa.tracker.wf 📋 Queued · Batch 1/2" in text0
     assert "/act\\_1" in text0
     assert "/cancel\\_1" not in text0
@@ -388,7 +388,7 @@ def test_render_active_shows_wait_note_for_deferred_rows():
     text2, _, _ = render_active([(other, 0.5)], page=0, page_size=5,
                                 notes=notes)
     assert "Waiting turn" not in text2
-    assert "⬇️ Downloading · 50.0%" in text2
+    assert "⬇️ Downloading · 50.0% · ████░░░░" in text2
 
 
 def test_render_active_groups_same_file_trackers():
@@ -419,7 +419,7 @@ def test_render_active_groups_same_file_trackers():
     assert "2. `Other.Show.S01E01`" in text
     # Display-only tracker lines, no per-tracker commands.
     assert "▸ alpha.cc ⏳ Wait indexer miss #3" in text
-    assert "▸ bte.example ⬇️ Downloading · 50.0%" in text
+    assert "▸ bte.example ⬇️ Downloading · 50.0% · ████░░░░" in text
     assert "Source:" not in text
     # Positional action entry per group (never hashes, never verbs).
     assert "/act\\_1" in text
@@ -1231,5 +1231,46 @@ async def test_active_footer_unknown_vps1(tmp_path):
     footer = await bot._active_footer()
     assert footer.splitlines()[1] == "·  VPS1 Free: ?"
     assert "SSD Free: " in footer
+
+
+def test_render_active_downloading_shows_speed_and_eta():
+    """Tracker lines gain bar + rate + ETA when speeds are known."""
+    from racing_sync.telegram_bot import _eta_human, _speed_human
+
+    ts = TorrentState(
+        source_infohash="a" * 40, source_name="Fast.Show",
+        state=State.DOWNLOADING, total_bytes=1_000_000_000,
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
+    text, _, _ = render_active([(ts, 0.5)], page=0, page_size=5,
+                               speeds={"a" * 40: 10_000_000})
+    assert "50.0%" in text and "████░░░░" in text
+    assert "9.5M/s" in text and "ETA 50s" in text
+    # Unknown speed: old shape (bar, no rate, no ETA guess).
+    text2, _, _ = render_active([(ts, 0.5)], page=0, page_size=5)
+    assert "50.0%" in text2 and "M/s" not in text2 and "ETA" not in text2
+    text3, _, _ = render_active([(ts, 0.5)], page=0, page_size=5,
+                                speeds={"a" * 40: 0})
+    assert "M/s" not in text3 and "ETA" not in text3
+    assert _speed_human(0) == "" and _speed_human("bogus") == ""
+    assert _speed_human(512) == "512 B/s"
+    assert _eta_human(0) == "" and _eta_human(45) == "45s"
+    assert _eta_human(240) == "4m" and _eta_human(7200) == "2h"
+
+
+def test_live_speed_map_aliases_and_clamps():
+    """Speed map mirrors the progress map (dest + source keys)."""
+    from racing_sync.coordinator import LiveItem
+
+    coord = make_coordinator()
+    coord._live = {
+        "DESTHASH": LiveItem(
+            source_infohash="sourcehash", name="S", state="downloading",
+            progress=0.5, size_mb=1.0, dlspeed_bps=1234),
+    }
+    assert coord.live_speed_map() == {
+        "desthash": 1234, "sourcehash": 1234}
+    coord._live["DESTHASH"].dlspeed_bps = -5
+    assert coord.live_speed_map()["desthash"] == 0
 
 

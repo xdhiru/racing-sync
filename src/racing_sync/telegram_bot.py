@@ -275,6 +275,41 @@ def _size_compact(n: int) -> str:
     return s
 
 
+def _speed_human(bps: object) -> str:
+    """Compact download rate for the active list (``1.2M/s``, "" when 0)."""
+    try:
+        n = int(bps or 0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    return f"{_size_compact(n)}/s"
+
+
+def _eta_human(secs: object) -> str:
+    """Compact ETA for the active list (``45s`` / ``4m`` / ``2h``)."""
+    try:
+        s = int(secs or 0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    if s <= 0:
+        return ""
+    if s < 90:
+        return f"{s}s"
+    if s < 5400:
+        return f"{max(1, round(s / 60))}m"
+    return f"{s // 3600}h"
+
+
+def _list_bar(progress: float, width: int = 8) -> str:
+    """Narrow progress bar for active-list rows (detail cards use 16)."""
+    try:
+        filled = int(round(max(0.0, min(1.0, float(progress))) * width))
+    except (TypeError, ValueError):
+        return ""
+    return "█" * filled + "░" * (width - filled)
+
+
 def _compact_wait_note(note: str) -> str | None:
     """Compact a watch-deferral note for the active list, or None.
 
@@ -773,8 +808,14 @@ def _active_note(ts: TorrentState, notes: dict[str, str] | None) -> str:
         return ""
 
 
-def _active_state_text(ts: TorrentState, progress: float | None, note: str) -> str:
-    """One-line stage text for an active-tasks tracker row."""
+def _active_state_text(ts: TorrentState, progress: float | None, note: str,
+                       speed_bps: object = 0) -> str:
+    """One-line stage text for an active-tasks tracker row.
+
+    DOWNLOADING rows additionally show bar + percent + rate + ETA when
+    known (``⬇️ Downloading · 45.0% · ████░░░░ · 1.2M/s · ETA 4m``);
+    anything unknown is omitted rather than guessed.
+    """
     _bd = _batch_display(ts)
     try:
         _held = bool(getattr(ts, "skipped", 0))
@@ -784,10 +825,31 @@ def _active_state_text(ts: TorrentState, progress: float | None, note: str) -> s
         _compact = _compact_wait_note(note)
         state_text = f"⏳ {_compact}" if _compact else f"⏳ {_esc(note)}"
     elif ts.state == State.DOWNLOADING:
+        parts = ["⬇️ Downloading"]
         if progress is not None:
-            state_text = f"⬇️ Downloading · {progress * 100:.1f}%"
-        else:
-            state_text = "⬇️ Downloading"
+            try:
+                _pct = float(progress)
+            except (TypeError, ValueError):
+                _pct = None
+            if _pct is not None:
+                parts.append(f"{_pct * 100:.1f}%")
+                _bar = _list_bar(_pct)
+                if _bar:
+                    parts.append(_bar)
+        _spd = _speed_human(speed_bps)
+        if _spd:
+            parts.append(_spd)
+        try:
+            _p = float(progress) if progress is not None else None
+            _bps = int(speed_bps or 0)
+            _total = int(getattr(ts, "total_bytes", 0) or 0)
+        except (TypeError, ValueError):
+            _p, _bps, _total = None, 0, 0
+        if _p is not None and _bps > 0 and _total > 0 and 0.0 <= _p < 1.0:
+            _eta = _eta_human(int((_total * (1.0 - _p)) / _bps))
+            if _eta:
+                parts.append(f"ETA {_eta}")
+        state_text = " · ".join(parts)
     elif ts.state == State.QUEUED:
         state_text = "📋 Queued"
     elif ts.state == State.MOVING:
@@ -1096,12 +1158,15 @@ def render_active(
     page_size: int = 5,
     notes: dict[str, str] | None = None,
     footer: str = "",
+    speeds: dict[str, int] | None = None,
 ) -> tuple[str, int, int]:
     """Render paginated active tasks, grouped by file for mobile width.
 
     Same-content copies (one release, many trackers) share one numbered
     heading ``N. `Name` · size``; each tracker gets a display-only line
-    ``▸ <domain> <stage>``. Each group carries one command (``/act_3``)
+    ``▸ <domain> <stage>`` (downloading rows add bar + rate + ETA when
+    `speeds` maps their lowercase infohash to bytes/s). Each group
+    carries one command (``/act_3``)
     opening the action sheet with only the currently eligible actions;
     the typed verbs (``/cancel_`` / ``/now_`` / ``/skip_`` / ``/resume_``
     / ``/injectfuse_`` with the same number or hash) all keep working
@@ -1171,7 +1236,12 @@ def render_active(
             domain_full = (_tracker_domain(ts.source_announce_url)
                            or _tracker_domain(ts.source_tracker))
             _note = _active_note(ts, notes)
-            state_text = _active_state_text(ts, progress, _note)
+            try:
+                _spd = (speeds or {}).get(
+                    (ts.source_infohash or "").lower(), 0)
+            except Exception:
+                _spd = 0
+            state_text = _active_state_text(ts, progress, _note, _spd)
             if domain_full:
                 lines.append(f"▸ {_esc(domain_full)} {state_text}")
             else:
@@ -4601,8 +4671,14 @@ class TelegramBot:
         except Exception:
             pass
         rows = await asyncio.to_thread(self._store.list_active_inflight)
-        # Pull live progress from coordinator's tracker
+        # Pull live progress + download rates from coordinator's tracker
         progress_map = self._coord.live_progress_map()
+        try:
+            speed_map = self._coord.live_speed_map()
+            if not isinstance(speed_map, dict):
+                speed_map = {}
+        except Exception:
+            speed_map = {}
         items: list[tuple[TorrentState, float | None]] = [
             (ts, progress_map.get(ts.source_infohash.lower()))
             for ts in rows
@@ -4688,7 +4764,7 @@ class TelegramBot:
         footer = await self._active_footer()
         text, cur_page, total_pages = render_active(
             items, page=self._current_page, page_size=self._cfg.page_size,
-            notes=notes, footer=footer,
+            notes=notes, footer=footer, speeds=speed_map,
         )
         if len(text) > 4096:
             text = _safe_truncate_markdown(text)

@@ -649,6 +649,7 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
         files=[],
         added_on=_num(d.get("added_on")),
         upspeed_bps=_num(d.get("upspeed")),
+        dlspeed_bps=_num(d.get("dlspeed")),
         num_leechers=_num(d.get("num_leechs")),
         num_seeds=_num(d.get("num_seeds")),
         total_uploaded_bytes=_num(d.get("uploaded")),

@@ -300,6 +300,9 @@ class LiveItem:
     progress: float
     size_mb: float
     eta: str = ""
+    # Last polled download rate (bytes/s, 0 when unknown). Feeds the
+    # Telegram active-tasks speed/ETA display via live_speed_map.
+    dlspeed_bps: int = 0
 
 
 @dataclass
@@ -1823,6 +1826,28 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 _src = (getattr(item, "source_infohash", "") or "").lower()
                 if _src and _src not in out:
                     out[_src] = item.progress
+            except Exception:
+                continue
+        return out
+
+    def live_speed_map(self) -> dict[str, int]:
+        """Snapshot of in-flight download speeds (bytes/s) by infohash.
+
+        Same dest+source aliasing as :meth:`live_progress_map`; unknown
+        or odd values read 0 (never negative, never non-numeric). Feeds
+        the Telegram active-tasks speed/ETA display.
+        """
+        out: dict[str, int] = {}
+        for h, item in self._live.items():
+            try:
+                speed = int(getattr(item, "dlspeed_bps", 0) or 0)
+            except (TypeError, ValueError):
+                speed = 0
+            try:
+                out[h.lower()] = max(0, speed)
+                _src = (getattr(item, "source_infohash", "") or "").lower()
+                if _src and _src not in out:
+                    out[_src] = max(0, speed)
             except Exception:
                 continue
         return out
@@ -6214,6 +6239,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
 
             if h.lower() in self._live:
                 self._live[h.lower()].progress = prog
+                try:
+                    self._live[h.lower()].dlspeed_bps = int(
+                        getattr(t, "dlspeed_bps", 0) or 0)
+                except (TypeError, ValueError):
+                    self._live[h.lower()].dlspeed_bps = 0
 
             now = time.monotonic()
             if now - last_log > 60:
