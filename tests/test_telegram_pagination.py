@@ -166,6 +166,35 @@ async def test_refresh_live_status_filters_by_hashes():
 
 
 @pytest.mark.anyio
+async def test_refresh_live_status_updates_speed():
+    """The periodic refresh carries download rates, not just progress."""
+    from unittest.mock import AsyncMock
+    from racing_sync.coordinator import LiveItem
+    from racing_sync.clients.abstract import Torrent
+
+    coord = make_coordinator()
+    coord.dest_client = AsyncMock()
+    coord._live = {
+        "hash1": LiveItem("hash1", "Show1", "downloading", 0.1, 100.0),
+    }
+    coord.dest_client.list_torrents.return_value = [
+        Torrent(
+            hash="hash1",
+            name="Show1",
+            category="racing",
+            save_path="",
+            size_bytes=1024 * 1024 * 500,
+            state="downloading",
+            progress=0.8,
+            dlspeed_bps=7654321,
+        )
+    ]
+    await coord._refresh_live_status()
+    assert coord._live["hash1"].dlspeed_bps == 7654321
+    assert coord.live_speed_map()["hash1"] == 7654321
+
+
+@pytest.mark.anyio
 async def test_send_one_detail_handles_timedelta_retry_after():
     import asyncio
     import datetime as dt
@@ -1231,6 +1260,24 @@ async def test_active_footer_unknown_vps1(tmp_path):
     footer = await bot._active_footer()
     assert footer.splitlines()[1] == "·  VPS1 Free: ?"
     assert "SSD Free: " in footer
+
+
+@pytest.mark.anyio
+async def test_active_footer_caches_vps1_probe():
+    """The SFTP probe runs once per TTL, not once per 15s refresh."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    bot = object.__new__(TelegramBot)
+    coord = MagicMock()
+    coord.cfg = MagicMock()
+    coord._ssd_reserved_total = MagicMock(return_value=0)
+    coord._source_free_bytes = AsyncMock(return_value=10_000_000_000)
+    bot._coord = coord
+    bot._vps1_free_cache = None
+    f1 = await bot._active_footer()
+    f2 = await bot._active_footer()
+    assert "VPS1 Free" in f1 and f1 == f2
+    coord._source_free_bytes.assert_awaited_once()
 
 
 def test_render_active_downloading_shows_speed_and_eta():

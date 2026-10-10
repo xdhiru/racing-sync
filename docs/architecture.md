@@ -123,12 +123,15 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
 
    Manual fuse fast-track runs first: if the same infohash already seeds
    from a fuse mount on VPS2 (any category) with verified bytes, the row
-   goes straight to `DONE` with no Prowlarr query or SSD work. Workers check
-   this at the top of `_do_new` / `_do_waiting_indexer`, and each tick runs
-   one batched hash lookup (`_sweep_manual_fuse_adoptions`) so parked
-   `WAITING_INDEXER` rows are picked up within one poll interval instead of
-   waiting out their 30-minute retry timer. Rows with live workers are
-   skipped by the sweep — their own worker check adopts without racing it.
+    goes straight to `DONE` with no Prowlarr query or SSD work. Workers check
+    this at the top of `_do_new` / `_do_waiting_indexer`, and each tick runs
+    one batched hash lookup (`_sweep_manual_fuse_adoptions`) so parked
+    `WAITING_INDEXER` rows are picked up within one poll interval instead of
+    waiting out their 30-minute retry timer. Rows with live workers are
+    skipped by the sweep — their own worker check adopts without racing it.
+    The sweep (like the live-status refresh, the VPS1 footer probe, and the
+    source listing cache) is demand-gated: with no rows that could use it,
+    no client RPC fires — idle ticks stay store-local.
     - Multiple racing-client torrents for the same content?
      Prefer public. Try:
        - `cross_seed.refetch_public_via_prowlarr` → prowlarr → download-target indexers (priority order)

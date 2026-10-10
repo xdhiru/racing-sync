@@ -1808,8 +1808,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
                 continue
             item.progress = t.progress
             item.size_mb = t.size_bytes / (1024 * 1024)
-            # No ETA: we don't track downspeed, and the old
-            # (1-progress)*60 placeholder misled operators.
+            try:
+                item.dlspeed_bps = int(getattr(t, "dlspeed_bps", 0) or 0)
+            except (TypeError, ValueError):
+                item.dlspeed_bps = 0
+            # No absolute ETA here: the Telegram renderer derives it
+            # from speed + remaining bytes (the old (1-progress)*60
+            # placeholder misled operators).
 
     def live_progress_map(self) -> dict[str, float]:
         """Snapshot of in-flight download progress keyed by infohash.

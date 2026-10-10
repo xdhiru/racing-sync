@@ -2616,6 +2616,22 @@ async def test_do_downloading_clears_live_on_batch_resolve_miss(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_fuse_sweep_skips_client_lookup_without_pre_ssd_rows(tmp_path):
+    """No NEW/WAITING rows: the sweep must not touch the dest client."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(
+            source_infohash="d" * 40, source_name="Done",
+            dest_infohash="d" * 40, state=State.DONE))
+        coord = make_coordinator(store)
+        coord.dest_client = AsyncMock()
+        await coord._sweep_manual_fuse_adoptions()
+        coord.dest_client.list_torrents.assert_not_called()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_do_moving_parks_on_transient_file_list_error(tmp_path):
     """One qB timeout at MOVING entry parks instead of failing the row."""
     from racing_sync.coordinator_errors import WebUIUnresponsiveError
