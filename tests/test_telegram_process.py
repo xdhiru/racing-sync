@@ -493,6 +493,10 @@ async def test_bot_command_menu_lists_add(tmp_path):
         "cancel_match",
         "Cancel every active group whose title contains <text> — "
         "/cancel_match <text>",
+    ), (
+        "cancel_stalled",
+        "Cancel every downloading group with no seeders — "
+        "/cancel_stalled",
     )]
 
 
@@ -531,7 +535,7 @@ async def test_start_publishes_command_menu(tmp_path):
             await bot.start()
         try:
             cmds = fake.set_my_commands.await_args.args[0]
-            assert [c.command for c in cmds] == ["add", "cancel_match"]
+            assert [c.command for c in cmds] == ["add", "cancel_match", "cancel_stalled"]
         finally:
             try:
                 await bot.stop()

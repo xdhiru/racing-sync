@@ -603,6 +603,11 @@ ADD_CMD_RE = re.compile(r"^/add(?:@[\w_]+)?\b")
 #: (Defined ahead of the command registry, which references it.)
 CANCEL_MATCH_RE = re.compile(r"^/cancel_match(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
 
+#: `/cancel_stalled` — bulk cancel every live group whose download is
+#: stalled (DOWNLOADING with 0 seeders and incomplete progress, per the
+#: dest client at tap time). Optional `@bot` suffix; no argument.
+CANCEL_STALLED_RE = re.compile(r"^/cancel_stalled(?:@[\w_]+)?\s*$")
+
 
 class _ChatCommand(NamedTuple):
     """One typed chat command: name, matcher, and dispatch handler.
@@ -646,6 +651,11 @@ async def _cmd_cancel_match(bot, match, message):
     await bot._cancel_match_command_entry(match.group(1) or "", message)
 
 
+async def _cmd_cancel_stalled(bot, match, message):
+    """`/cancel_stalled` bulk cancel of seederless downloads."""
+    await bot._cancel_stalled_command_entry(message)
+
+
 async def _cmd_add(bot, match, message):
     """`/add` document ingest (acts on the message, not the token)."""
     await bot._process_document_command(message)
@@ -668,6 +678,7 @@ _CHAT_COMMANDS: tuple = (
     _ChatCommand("injectfuse", INJECTFUSE_CMD_RE, _cmd_group("injectfuse")),
     _ChatCommand("act", ACT_CMD_RE, _cmd_act),
     _ChatCommand("cancel_match", CANCEL_MATCH_RE, _cmd_cancel_match),
+    _ChatCommand("cancel_stalled", CANCEL_STALLED_RE, _cmd_cancel_stalled),
     _ChatCommand("cancel", CANCEL_CMD_RE, _cmd_group("cancel")),
 )
 
@@ -679,6 +690,18 @@ _MATCH_MIN_CHARS = 2
 _MATCH_MAX_BYTES = 35
 #: Valid token chars (base64url, padding stripped at encode time).
 _MATCH_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,47}$")
+
+
+def _is_bulk_scope(h: str) -> bool:
+    """True for re-resolved bulk scopes (`match:<tok>`, `stalled`).
+
+    Bulk scopes carry no frozen hash list: every tap re-resolves the
+    live set, so no stored pending state exists to expire.
+    """
+    try:
+        return h == "stalled" or h.startswith("match:")
+    except Exception:
+        return False
 
 
 def _match_token(query: str) -> str:
@@ -1104,9 +1127,11 @@ def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
     Shapes: `<cmd>:<40hex>`, `<cmd>:all:<40hex>`,
     `<cmd>:<40hex>:yes|no`, `<cmd>:all:<40hex>:yes|no` (keep/inject),
     `forget:<scope>`, `forget:<scope>:<0|1>`,
-    `keep:<scope>:<0|1>:<yes|no>`, `abort`, plus the bulk-match scope
+    `keep:<scope>:<0|1>:<yes|no>`, `abort`, bulk-match scopes
     `forget:match:<tok>:<0|1>` / `keep:match:<tok>:<0|1>:<yes|no>`
-    (`<tok>` = base64url query, `match:<tok>` in the hash slot).
+    (`<tok>` = base64url query, `match:<tok>` in the hash slot) and the
+    predicate scope `forget:stalled:<0|1>` /
+    `keep:stalled:<0|1>:<yes|no>` (`stalled` in the hash slot).
     `remember` is True/False when the buttons carried the Q1 remember
     choice, else None (legacy 3-part keep buttons predate it and mean
     remember, matching the old always-ignore cancel).
@@ -1162,6 +1187,16 @@ def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
                     and _MATCH_TOKEN_RE.match(parts[2] or ""):
                 return (parts[0], False, f"match:{parts[2]}", parts[4],
                         parts[3] == "1")
+        # Predicate scope: fixed predicate, no token to carry.
+        if len(parts) == 3 and parts[0] == "forget":
+            if parts[1] == "stalled" and parts[2] in ("0", "1"):
+                return (parts[0], False, "stalled", "",
+                        parts[2] == "1")
+        if len(parts) == 4 and parts[0] == "keep":
+            if parts[1] == "stalled" and parts[2] in ("0", "1") \
+                    and parts[3] in ("yes", "no"):
+                return (parts[0], False, "stalled", parts[3],
+                        parts[2] == "1")
     except Exception:
         pass
     return ("", False, "", "", None)
@@ -1310,9 +1345,10 @@ def _bot_command_menu() -> list:
     """Commands shown in the chat's `/` popup (Bot API menu).
 
     `/add` takes no argument (it acts on the replied-to or captioned
-    .torrent); `/cancel_match` takes free text (any substring works),
-    so both stay listed. The pickers need IDs the operator won't know,
-    so they stay unlisted to keep the menu short.
+    .torrent); `/cancel_match` takes free text (any substring works) and
+    `/cancel_stalled` takes none, so all three stay listed. The pickers
+    need IDs the operator won't know, so they stay unlisted to keep the
+    menu short.
     """
     try:
         return [BotCommand(
@@ -1323,6 +1359,10 @@ def _bot_command_menu() -> list:
             "cancel_match",
             "Cancel every active group whose title contains <text> — "
             "/cancel_match <text>",
+        ), BotCommand(
+            "cancel_stalled",
+            "Cancel every downloading group with no seeders — "
+            "/cancel_stalled",
         )]
     except Exception:
         return []
@@ -3488,6 +3528,114 @@ class TelegramBot:
         except Exception:
             return []
 
+    async def _live_stalled(self) -> list[tuple[str, list[str]]]:
+        """Live (title, member-hashes) groups with a stalled download.
+
+        Stalled = DOWNLOADING row whose dest-client entry reports 0
+        seeders and incomplete progress. Rows with no dest entry get no
+        verdict (entry gone/transient) and are never assumed stalled.
+        Groups qualify on any stalled member; execution covers the whole
+        group (same release — the sheet names the counts). Raises on
+        infrastructure failure (callers report Action failed, never
+        "none found").
+        """
+        try:
+            from .forget import _row_hashes
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"stalled check unavailable: {e}") from e
+        store = getattr(self, "_store", None)
+        coord = getattr(self, "_coord", None)
+        dest = getattr(coord, "dest_client", None) if coord else None
+        if store is None or dest is None:
+            raise RuntimeError("stalled check unavailable: bot not attached")
+        rows = [r for r in (store.list_active_inflight() or [])
+                if getattr(r, "state", None) == State.DOWNLOADING]
+        if not rows:
+            return []
+        known: dict[str, object] = {}
+        for r in rows:
+            try:
+                for k in _row_hashes(r) or ():
+                    known.setdefault((k or "").lower(), r)
+            except Exception:
+                continue
+        if not known:
+            return []
+        entries = await dest.list_torrents(hashes=sorted(known))
+        by_hash = {}
+        for t in entries or []:
+            try:
+                _h = (getattr(t, "hash", "") or "").lower()
+            except Exception:
+                continue
+            if _h:
+                by_hash[_h] = t
+        stalled: list = []
+        for r in rows:
+            try:
+                _hs = [k for k in _row_hashes(r) or () if k in by_hash]
+                if not _hs:
+                    continue
+                t = by_hash[_hs[0]]
+                try:
+                    _seeds = int(getattr(t, "num_seeds", 0) or 0)
+                except (TypeError, ValueError):
+                    _seeds = 0
+                try:
+                    _done = bool(t.is_complete()) \
+                        if callable(getattr(t, "is_complete", None)) \
+                        else float(getattr(t, "progress", 1) or 1) >= 0.999
+                except (TypeError, ValueError):
+                    continue
+                if _seeds == 0 and not _done:
+                    stalled.append(r)
+            except Exception:
+                continue
+        out: list[tuple[str, list[str]]] = []
+        for (_key, _members) in _group_active_items(
+                [(_r, None) for _r in stalled]):
+            try:
+                _rows = [_t for (_t, _) in _members or []]
+                if not _rows:
+                    continue
+                _hashes = [_h for _h in
+                           (_member_hash(_t) for _t in _rows) if _h]
+                if _hashes:
+                    out.append((self._group_title(_rows), _hashes))
+            except Exception:
+                continue
+        return out
+
+    async def _resolve_bulk_scope(
+            self, h: str) -> tuple[str, str, list[str]]:
+        """Resolve a bulk scope to (keep-question title, execute title, hashes).
+
+        Re-resolved live at every tap; empty hashes mean the set is gone.
+        Raises on infrastructure failure (callers report Action failed,
+        never "gone"). Malformed match tokens resolve empty (stale button).
+        """
+        if h.startswith("match:"):
+            _mq = _match_query(h[len("match:"):])
+            try:
+                _matches = await asyncio.to_thread(
+                    self._live_match, _mq) if _mq else []
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"match resolve failed: {e}") from e
+            if not _matches:
+                return ("", "", [])
+            return (f"{len(_matches)} groups matching "
+                    f"'{_safe_display_name(_mq[:40])}'",
+                    f"{len(_matches)} matched groups",
+                    [_hh for (_, _hs) in _matches for _hh in _hs or []])
+        if h == "stalled":
+            _groups = await self._live_stalled()
+            if not _groups:
+                return ("", "", [])
+            return (f"{len(_groups)} stalled downloads",
+                    f"{len(_groups)} stalled groups",
+                    [_hh for (_, _hs) in _groups for _hh in _hs or []])
+        return ("", "", [])
+
     async def _cancel_match_command_entry(
             self, query: str, message: Any) -> None:
         """`/cancel_match <text>`: one remember + one keep/delete for all.
@@ -3554,6 +3702,57 @@ class TelegramBot:
         _rows = (ButtonMaker()
                  .add("🚫 Ignore + forget", f"forget:match:{tok}:1")
                  .add("👻 Just forget", f"forget:match:{tok}:0")
+                 .newline().add("Close", "abort").rows())
+        try:
+            await self._send_sheet(_text, _rows, reply_to=message)
+        except Exception:
+            pass
+
+    async def _cancel_stalled_command_entry(self, message: Any) -> None:
+        """`/cancel_stalled`: one remember + one keep/delete for all stalled.
+
+        Stalled = DOWNLOADING with 0 seeders and incomplete progress
+        (dest-client verdict at tap time). Same flow shape as
+        `/cancel_match`: single live copy skips to its normal forget
+        sheet, otherwise one sheet names every stalled group and the
+        remember buttons carry the `stalled` scope,
+        re-resolved live at each tap.
+        """
+        try:
+            groups = await self._live_stalled()
+        except Exception as e:  # noqa: BLE001
+            try:
+                await self._reply(f"Action failed: {e}", reply_to=message)
+            except Exception:
+                pass
+            return
+        if not groups:
+            try:
+                await self._reply(
+                    "No stalled downloads right now — every downloading "
+                    "copy has seeders.",
+                    reply_to=message)
+            except Exception:
+                pass
+            return
+        if len(groups) == 1 and len(groups[0][1]) == 1:
+            await self._start_single_command(
+                "cancel", groups[0][1][0], message)
+            return
+        _total = sum(len(_hs) for (_, _hs) in groups)
+        _shown = [f"• {_t} ({len(_hs)})" for (_t, _hs) in groups[:8]]
+        if len(groups) > 8:
+            _shown.append(f"• …and {len(groups) - 8} more")
+        _text = (
+            f"{len(groups)} stalled downloads "
+            f"({_total} copies, no seeders):\n"
+            + "\n".join(_shown) +
+            "\nForget them all?\n"
+            "🚫 Ignore blocks them from coming back; "
+            "👻 Just forget allows re-adding later.")
+        _rows = (ButtonMaker()
+                 .add("🚫 Ignore + forget", "forget:stalled:1")
+                 .add("👻 Just forget", "forget:stalled:0")
                  .newline().add("Close", "abort").rows())
         try:
             await self._send_sheet(_text, _rows, reply_to=message)
@@ -3915,29 +4114,25 @@ class TelegramBot:
                 except Exception:
                     pass
                 return
-            if cmd == "forget" and _h.startswith("match:"):
-                # Bulk-match scope: re-resolve the substring live; the set
-                # can shrink between taps, so the keep question names the
-                # live count, not the Q1 count.
+            if cmd == "forget" and _is_bulk_scope(_h):
+                # Bulk scope (match/stalled): re-resolve live; the set can
+                # shrink between taps, so the keep question names the live
+                # count, not the Q1 count.
                 if _ig is None:
                     _ig = True
-                _mtok = _h[len("match:"):]
-                _mq = _match_query(_mtok)
                 try:
-                    _matches = await asyncio.to_thread(
-                        self._live_match, _mq) if _mq else []
-                except Exception:
-                    _matches = []
-                if not _matches:
+                    _qlabel, _, _hashes = \
+                        await self._resolve_bulk_scope(_h)
+                except Exception as e:  # noqa: BLE001
+                    await _say(f"Action failed: {e}")
+                    return
+                if not _hashes:
                     await _say("Already gone from tracking")
                     await _refresh()
                     return
-                _mtotal = sum(len(_hs) for (_, _hs) in _matches or [])
                 _text, _rows = self._keepq_text_and_rows(
-                    f"{len(_matches)} groups matching "
-                    f"'{_safe_display_name(_mq[:40])}'",
-                    f" · {_mtotal} copies",
-                    f"match:{_mtok}", None, remember=_ig)
+                    _qlabel, f" · {len(_hashes)} copies",
+                    _h, None, remember=_ig)
                 try:
                     await self._send_sheet(
                         _text, _rows,
@@ -3946,23 +4141,21 @@ class TelegramBot:
                     pass
                 return
             if cmd == "keep" and _choice in ("yes", "no") \
-                    and _h.startswith("match:"):
+                    and _is_bulk_scope(_h):
                 if _ig is None:
                     _ig = True
-                _mq = _match_query(_h[len("match:"):])
                 try:
-                    _matches = await asyncio.to_thread(
-                        self._live_match, _mq) if _mq else []
-                except Exception:
-                    _matches = []
-                _hashes = [_hh for (_, _hs) in _matches or []
-                           for _hh in _hs or []]
+                    _, _elabel, _hashes = \
+                        await self._resolve_bulk_scope(_h)
+                except Exception as e:  # noqa: BLE001
+                    await _say(f"Action failed: {e}")
+                    return
                 if not _hashes:
                     await _say("Already gone from tracking")
                     await _refresh()
                     return
                 result = await self._execute_snapshot_cancel(
-                    _hashes, f"{len(_matches)} matched groups",
+                    _hashes, _elabel,
                     delete_files=(_choice == "no"), remember=_ig)
                 await _say(result)
                 await _refresh()

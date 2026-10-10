@@ -97,15 +97,9 @@ python3 run.py forget --config config.toml <infohash|name> --apply --ignore
 `unignore`, `--all` to undo every entry). Same thing via API:
 `POST /api/forget/{hash}`. Full API surface in `docs/architecture.md`.
 
-### Telegram
-
-One message per torrent (detail card, edited in place) plus one
-active-tasks list. Tap `/act_<n>` under a group for its action sheet:
-Cancel, Start now, Inject, Skip/Resume. Cancelling asks two questions —
-remember the release (`Ignore` blocks it from coming back, `Just forget`
-leaves it re-addable) and keep or delete SSD data. `/cancel_match <text>`
 cancels every group whose title contains `<text>` at once; `/now_<id>`
-starts a waiting row immediately. Nothing is deleted without an explicit
+starts a waiting row immediately; `/cancel_stalled` cancels every
+downloading group with no seeders. Nothing is deleted without an explicit
 choice; fuse/remote copies are never touched.
 
 `check-config` also warns on unknown config keys (typo catcher).
