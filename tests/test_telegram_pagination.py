@@ -196,7 +196,7 @@ async def test_send_one_detail_handles_timedelta_retry_after():
 
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         await bot._send_one_detail("abc123", 0.5)
-        mock_sleep.assert_awaited_once_with(6)
+        mock_sleep.assert_awaited_once_with(7)
     assert not bot._detail_queue.empty()
 
 
@@ -207,8 +207,8 @@ def test_flood_wait_seconds_helper():
     from racing_sync.telegram_bot import _flood_wait_seconds
 
     assert _flood_wait_seconds(TelegramError(
-        "Flood control exceeded. Retry in 39 seconds")) == 40
-    assert _flood_wait_seconds(TelegramError("Too Many Requests")) == 5
+        "Flood control exceeded. Retry in 39 seconds")) == 47
+    assert _flood_wait_seconds(TelegramError("Too Many Requests")) == 7
     assert _flood_wait_seconds(TelegramError("Bad Request: message is empty")) is None
     assert _flood_wait_seconds(ValueError("nope")) is None
 
@@ -220,8 +220,8 @@ def test_flood_wait_seconds_helper():
         def retry_after(self):
             return self._v
 
-    assert _flood_wait_seconds(_RA(33)) == 34
-    assert _flood_wait_seconds(_RA(dt.timedelta(seconds=5))) == 6
+    assert _flood_wait_seconds(_RA(33)) == 40
+    assert _flood_wait_seconds(_RA(dt.timedelta(seconds=5))) == 7
 
 
 @pytest.mark.anyio
@@ -253,7 +253,7 @@ async def test_send_one_detail_recovers_plain_flood_edit():
 
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         await bot._send_one_detail(h, None)
-        mock_sleep.assert_awaited_once_with(40)
+        mock_sleep.assert_awaited_once_with(47)
     assert not bot._detail_queue.empty()
     # Nothing recorded as sent yet — the card still shows the old state.
     assert bot._sent_state_map().get(h) != State.DONE.value
@@ -290,7 +290,7 @@ async def test_send_one_detail_send_path_flood_requeues():
 
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         await bot._send_one_detail(h, None)
-        mock_sleep.assert_awaited_once_with(13)
+        mock_sleep.assert_awaited_once_with(15)
     assert not bot._detail_queue.empty()
 
 
