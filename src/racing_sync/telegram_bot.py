@@ -745,6 +745,21 @@ def _resume_command(infohash: str) -> str:
     return f"/resume_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
+#: Flood-wait safety margin: sleeping the exact requested window
+#: re-triggers the ban on clock skew or a queued duplicate, so every
+#: parsed/default wait is stretched (mirror-leech-telegram-bot
+#: practice is `value * 1.2` on every send/edit path).
+_FLOOD_MARGIN = 1.2
+
+
+def _with_flood_margin(base: object) -> int:
+    """Stretch a parsed flood wait by the safety margin (+1s headroom)."""
+    try:
+        return max(1, int(float(base or 0) * _FLOOD_MARGIN) + 1)
+    except (TypeError, ValueError):
+        return 1
+
+
 def _flood_wait_seconds(e: BaseException, default: int = 5) -> int | None:
     """Seconds Telegram asks us to wait, or None when not rate-limited.
 
@@ -759,8 +774,8 @@ def _flood_wait_seconds(e: BaseException, default: int = 5) -> int | None:
         if isinstance(e, RetryAfter):
             raw = e.retry_after
             if isinstance(raw, dt.timedelta):
-                return int(raw.total_seconds()) + 1
-            return int(raw) + 1
+                return _with_flood_margin(raw.total_seconds())
+            return _with_flood_margin(raw)
     except Exception:
         pass
     try:
@@ -775,10 +790,10 @@ def _flood_wait_seconds(e: BaseException, default: int = 5) -> int | None:
     try:
         m = re.search(r"retry (?:in|after) (\d+)", msg)
         if m:
-            return int(m.group(1)) + 1
+            return _with_flood_margin(int(m.group(1)))
     except Exception:
         pass
-    return default
+    return _with_flood_margin(default)
 
 
 def _active_group_key(name: str, size_bytes: object) -> tuple[str, int]:
@@ -1882,9 +1897,9 @@ class TelegramBot:
                         )
         except RetryAfter as e:
             if isinstance(e.retry_after, dt.timedelta):
-                wait_s = int(e.retry_after.total_seconds()) + 1
+                wait_s = _with_flood_margin(e.retry_after.total_seconds())
             else:
-                wait_s = int(e.retry_after) + 1
+                wait_s = _with_flood_margin(e.retry_after)
             log.warning("telegram flood control hit; backing off for %ds", wait_s)
             await asyncio.sleep(wait_s)
             self._enqueue_detail(infohash, progress)
