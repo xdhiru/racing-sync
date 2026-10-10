@@ -1,0 +1,24 @@
+# Primary runtime environment: venv + this file.
+#
+#   python3 -m venv .venv
+#   source .venv/bin/activate        (Windows: .venv\Scripts\Activate.ps1)
+#   pip install -r requirements.txt
+#
+# Source of truth is the `dependencies` + `api` extra in pyproject.toml;
+# keep this file in sync when those change (same specifiers, no extra pins,
+# so upgrades stay predictable). To freeze exact versions for a deploy:
+#   pip freeze | grep -Ei 'aiohttp|pydantic|python-telegram-bot|paramiko|defusedxml|uvloop|fastapi|uvicorn'
+#
+# --- runtime (pyproject `dependencies`) ---
+aiohttp>=3.9,<4
+pydantic>=2.5,<3
+python-telegram-bot>=22.0,<23
+paramiko>=3.4,<6
+defusedxml>=0.7
+# Faster asyncio loop on Linux (VPS); other platforms skip it via the
+# marker and fall back to stdlib in racing_sync.__main__._run_async.
+uvloop>=0.21; sys_platform == 'linux'
+
+# --- API control plane (pyproject `api` extra) ---
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1

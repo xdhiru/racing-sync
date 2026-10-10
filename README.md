@@ -41,12 +41,18 @@ with `--break-system-packages`):
 git clone https://github.com/xdhiru/racing-sync.git
 cd racing-sync
 python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[api]"   # use -e "." without the API, -e ".[test]" for tests
+source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
+`requirements.txt` is the primary environment (runtime + API deps, kept in
+sync with `pyproject.toml`). Contributors who want the `racing-sync`
+console script instead can `pip install -e ".[api]"` (`-e "."` without the
+API, `-e ".[test]"` for tests) — same packages, installed editable.
+
 Run straight from source — no install step beyond that, so `git pull` +
-restart is the upgrade:
+restart is the upgrade (re-run `pip install -r requirements.txt` only when
+dependencies change):
 
 ```bash
 cp config.example.toml config.toml
