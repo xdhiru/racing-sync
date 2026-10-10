@@ -1014,7 +1014,7 @@ def test_chat_command_registry_covers_all_verbs():
     from racing_sync.telegram_bot import _CHAT_COMMANDS
 
     names = [c.name for c in _CHAT_COMMANDS]
-    assert len(names) == len(set(names)) == 14
+    assert len(names) == len(set(names)) == 15
     for c in _CHAT_COMMANDS:
         assert callable(c.pattern.match)
         assert callable(c.handle)
@@ -1031,6 +1031,7 @@ def test_chat_command_registry_covers_all_verbs():
         "/cancel_abc123": ["cancel"],
         "/cancel_match evil show": ["cancel_match"],
         "/cancel_match": ["cancel_match"],
+        "/cancel_stalled": ["cancel_stalled"],
         "/injectfuse_2": ["injectfuse"],
         "/injectfuse abc123": ["injectfuse_hash"],
         "/act_1": ["act"],
@@ -1039,7 +1040,7 @@ def test_chat_command_registry_covers_all_verbs():
         hits = [c.name for c in _CHAT_COMMANDS if c.pattern.match(text)]
         assert hits == want, (text, hits)
     for text in ("/hello", "/cancel_xyz", "/cancel_", "/act_", "/now_",
-                 "/cancel_match_foo", ""):
+                 "/cancel_match_foo", "/cancel_stalledx", ""):
         assert [c.name for c in _CHAT_COMMANDS
                 if c.pattern.match(text)] == [], text
 
@@ -2105,3 +2106,140 @@ def test_cancel_match_protocol_shapes_fit_buttons():
         "keep", False, f"match:{tok}", "yes", True)
     assert _parse_action_data(f"forget:match:{tok}:0") == (
         "forget", False, f"match:{tok}", "", False)
+
+
+@pytest.mark.anyio
+async def test_cancel_stalled_flow(tmp_path: Path):
+    """`/cancel_stalled` cancels only seederless downloading groups."""
+    from racing_sync.clients.abstract import Torrent
+
+    _root = tmp_path / "ssd"
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="a" * 40, source_name="Dead.Show.S01",
+                     total_bytes=1000, save_path=str(_root),
+                     state=State.DOWNLOADING),
+        TorrentState(source_infohash="b" * 40, source_name="Dead.Show.S01",
+                     total_bytes=1000, save_path=str(_root),
+                     state=State.DOWNLOADING),
+        TorrentState(source_infohash="c" * 40, source_name="Live.Show.S01",
+                     total_bytes=2000, save_path=str(_root),
+                     state=State.DOWNLOADING),
+        TorrentState(source_infohash="d" * 40, source_name="Queued.Show",
+                     total_bytes=3000, save_path=str(_root),
+                     state=State.QUEUED),
+    ])
+
+    def _entry(h, seeds, progress=0.1):
+        return Torrent(hash=h, name="x", category="", save_path="",
+                       size_bytes=1000, state="downloading",
+                       progress=progress, num_seeds=seeds)
+
+    _entries = {
+        "a" * 40: _entry("a" * 40, 0),
+        "b" * 40: _entry("b" * 40, 0),
+        "c" * 40: _entry("c" * 40, 5),
+    }
+
+    async def _list(hashes=None, **kw):
+        if hashes is None:
+            return list(_entries.values())
+        want = {(h or "").lower() for h in hashes}
+        return [e for h, e in _entries.items() if h in want]
+
+    async def _delete(h, **kw):
+        _entries.pop((h or "").lower(), None)
+
+    bot._coord.dest_client.list_torrents = _list
+    bot._coord.dest_client.delete = _delete
+    try:
+        await bot._handle_chat_message(_message(text="/cancel_stalled"))
+        _data = _sheet_data(bot)
+        assert "forget:stalled:1" in _data
+        assert "forget:stalled:0" in _data
+
+        bot._callback_times.clear()
+        await bot._handle_callback(_query("forget:stalled:1"))
+        _data = _sheet_data(bot)
+        assert "keep:stalled:1:yes" in _data
+        assert "keep:stalled:1:no" in _data
+
+        bot._callback_times.clear()
+        await bot._handle_callback(_query("keep:stalled:1:no"))
+        assert store.get("a" * 40) is None
+        assert store.get("b" * 40) is None
+        assert store.get("c" * 40) is not None
+        assert store.get("d" * 40) is not None
+        assert store.is_ignored("a" * 40) is True
+        assert store.is_ignored("c" * 40) is False
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_cancel_stalled_none_and_client_error(tmp_path: Path):
+    """No stalled group explains; a dead client fails honestly."""
+    from racing_sync.clients.abstract import Torrent
+
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="c" * 40, source_name="Live.Show",
+                     state=State.DOWNLOADING),
+    ])
+    bot._coord.dest_client.list_torrents = AsyncMock(return_value=[
+        Torrent(hash="c" * 40, name="x", category="", save_path="",
+                size_bytes=1000, state="downloading", progress=0.1,
+                num_seeds=4),
+    ])
+    try:
+        await bot._handle_chat_message(_message(text="/cancel_stalled"))
+        assert "No stalled downloads" in \
+            bot._bot.send_message.call_args[0][1]
+        assert store.get("c" * 40) is not None
+
+        async def _boom(**kw):
+            raise RuntimeError("client down")
+
+        bot._coord.dest_client.list_torrents = _boom
+        bot._callback_times.clear()
+        await bot._handle_chat_message(_message(text="/cancel_stalled"))
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Action failed")
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_cancel_stalled_single_copy_uses_normal_sheet(tmp_path: Path):
+    """One stalled copy skips the bulk sheet for its forget question."""
+    from racing_sync.clients.abstract import Torrent
+
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="a" * 40, source_name="Dead.Solo",
+                     state=State.DOWNLOADING),
+    ])
+    bot._coord.dest_client.list_torrents = AsyncMock(return_value=[
+        Torrent(hash="a" * 40, name="x", category="", save_path="",
+                size_bytes=1000, state="downloading", progress=0.0,
+                num_seeds=0),
+    ])
+    try:
+        await bot._handle_chat_message(_message(text="/cancel_stalled"))
+        _data = _sheet_data(bot)
+        assert f"forget:{'a' * 40}:1" in _data
+        assert not any(d.startswith("forget:stalled") for d in _data)
+    finally:
+        store.close()
+
+
+def test_cancel_stalled_protocol_shapes():
+    """Stalled scope parses, fits buttons, and routes both questions."""
+    from racing_sync.telegram_bot import _parse_action_data
+
+    for data in ("forget:stalled:1", "forget:stalled:0",
+                 "keep:stalled:1:yes", "keep:stalled:0:no"):
+        assert len(data) <= 64
+    assert _parse_action_data("forget:stalled:1") == (
+        "forget", False, "stalled", "", True)
+    assert _parse_action_data("keep:stalled:0:no") == (
+        "keep", False, "stalled", "no", False)
+    assert _parse_action_data("keep:stalled:1:yes") == (
+        "keep", False, "stalled", "yes", True)

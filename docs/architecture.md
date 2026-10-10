@@ -357,7 +357,10 @@ copy drops just it
 one remember + one keep/delete question: the substring travels
 base64url-encoded in the buttons (`forget:match:<tok>:<0|1>` /
 `keep:match:<tok>:<0|1>:<yes|no>`) and is re-resolved live at each
-tap, so no stored pending state exists to expire. Tapping any action
+tap, so no stored pending state exists to expire. `/cancel_stalled`
+is the same flow over a predicate scope instead of a substring:
+DOWNLOADING groups whose dest entry reports 0 seeders and incomplete
+progress (rows with no dest entry get no verdict and are skipped). Tapping any action
 button deletes its sheet once handled, so answered questions never
 linger behind their follow-up (only the outcome reply stays).
 Liveness is checked at the first question for single-copy scopes
