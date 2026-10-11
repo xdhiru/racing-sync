@@ -315,6 +315,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     sftp: SFTPExporter | None = field(init=False, default=None)
     watch: WatchDirScanner | None = field(init=False, default=None)
     _stop: bool = field(default=False, init=False)
+    # Operator intake pause (/pause_intake): no NEW work starts until
+    # resumed; in-flight rows drain normally. In-memory on purpose — a
+    # restart resumes normal intake, so nothing can wedge paused.
+    _intake_paused: bool = field(default=False, init=False)
     _live: dict[str, LiveItem] = field(default_factory=dict, init=False)
     _tasks: set[asyncio.Task] = field(default_factory=set, init=False)
     _running_infohashes: set[str] = field(default_factory=set, init=False)
@@ -766,6 +770,18 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
     def request_stop(self) -> None:
         log.warning("stop requested")
         self._stop = True
+
+    def set_intake_paused(self, paused: bool) -> bool:
+        """Pause/resume intake of NEW work; returns the new state.
+
+        Pause stops workers from starting on NEW rows (poller intake
+        handoff and scheduler); rows already in flight drain normally
+        and discovery keeps recording arrivals for the resume.
+        """
+        self._intake_paused = bool(paused)
+        log.warning("intake %s by operator",
+                    "paused" if self._intake_paused else "resumed")
+        return self._intake_paused
 
     async def shutdown(self) -> None:
         # Idempotent: __main__ and run() both call us, so guard against
@@ -1403,6 +1419,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
         """
         if not self._intake_started() or getattr(self, "_stop", False):
             return 0
+        if getattr(self, "_intake_paused", False):
+            return 0
         try:
             candidates: list[TorrentState] = [t for t in (fresh_racing or []) if t is not None]
         except Exception:
@@ -1557,6 +1575,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin):
             # Operator hold (/skip_): no workers until resumed — no
             # Prowlarr queries, no downloads, no moves. State is kept.
             if getattr(ts, "skipped", 0):
+                continue
+
+            # Operator intake pause (/pause_intake): NEW rows wait until
+            # resumed; every other state keeps draining normally.
+            if getattr(ts, "state", None) == State.NEW and getattr(
+                    self, "_intake_paused", False):
                 continue
 
             # Skip WAITING_INDEXER rows: they are parked and woken up exclusively

@@ -1014,7 +1014,7 @@ def test_chat_command_registry_covers_all_verbs():
     from racing_sync.telegram_bot import _CHAT_COMMANDS
 
     names = [c.name for c in _CHAT_COMMANDS]
-    assert len(names) == len(set(names)) == 15
+    assert len(names) == len(set(names)) == 19
     for c in _CHAT_COMMANDS:
         assert callable(c.pattern.match)
         assert callable(c.handle)
@@ -1035,14 +1035,71 @@ def test_chat_command_registry_covers_all_verbs():
         "/injectfuse_2": ["injectfuse"],
         "/injectfuse abc123": ["injectfuse_hash"],
         "/act_1": ["act"],
+        "/pause_intake": ["pause_intake"],
+        "/resume_intake": ["resume_intake"],
+        "/tick": ["tick"],
+        "/stats": ["stats"],
     }
     for text, want in cases.items():
         hits = [c.name for c in _CHAT_COMMANDS if c.pattern.match(text)]
         assert hits == want, (text, hits)
     for text in ("/hello", "/cancel_xyz", "/cancel_", "/act_", "/now_",
-                 "/cancel_match_foo", "/cancel_stalledx", ""):
+                 "/cancel_match_foo", "/cancel_stalledx", "/pause_intakex",
+                 "/statsx", ""):
         assert [c.name for c in _CHAT_COMMANDS
                 if c.pattern.match(text)] == [], text
+
+
+@pytest.mark.anyio
+async def test_ops_pause_and_resume_intake():
+    """Pause/resume flip the coordinator flag and confirm in chat."""
+    bot = _bot()
+    bot._coord = MagicMock()
+    await bot._handle_chat_message(_message(text="/pause_intake"))
+    bot._coord.set_intake_paused.assert_called_once_with(True)
+    assert "paused" in bot._bot.send_message.call_args[0][1]
+    bot._callback_times.clear()
+    await bot._handle_chat_message(_message(text="/resume_intake"))
+    bot._coord.set_intake_paused.assert_called_with(False)
+    assert "resumed" in bot._bot.send_message.call_args[0][1]
+
+
+@pytest.mark.anyio
+async def test_ops_tick_runs_and_reports():
+    """Tick runs the pipeline step and refreshes the list."""
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._coord._tick_inner = AsyncMock()
+    await bot._handle_chat_message(_message(text="/tick"))
+    bot._coord._tick_inner.assert_awaited_once()
+    assert bot._bot.send_message.call_args[0][1] == "Tick done."
+    bot._refresh_active_message.assert_awaited()
+
+
+@pytest.mark.anyio
+async def test_ops_stats_snapshot(tmp_path: Path):
+    """Stats counts rows by state without needing the coordinator."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="New",
+                              state=State.NEW))
+    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Down",
+                              state=State.DOWNLOADING))
+    store.upsert(TorrentState(source_infohash="c" * 40, source_name="Done",
+                              state=State.DONE))
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._coord._intake_paused = False
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/stats"))
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("📊 Stats")
+        assert "NEW 1" in sent and "DL 1" in sent and "DONE 1" in sent
+        assert "intake running" in sent
+    finally:
+        store.close()
 
 
 def test_sheet_buttons_fit_telegram_callback_budget():

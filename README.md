@@ -99,8 +99,10 @@ python3 run.py forget --config config.toml <infohash|name> --apply --ignore
 
 cancels every group whose title contains `<text>` at once; `/now_<id>`
 starts a waiting row immediately; `/cancel_stalled` cancels every
-downloading group with no seeders. Nothing is deleted without an explicit
-choice; fuse/remote copies are never touched.
+downloading group with no seeders. Operator commands: `/stats` for a
+pipeline snapshot, `/tick` to run one tick now, `/pause_intake` /
+`/resume_intake` to hold and release new downloads. Nothing is deleted
+without an explicit choice; fuse/remote copies are never touched.
 
 `check-config` also warns on unknown config keys (typo catcher).
 
