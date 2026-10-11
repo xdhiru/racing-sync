@@ -2300,3 +2300,87 @@ def test_cancel_stalled_protocol_shapes():
         "keep", False, "stalled", "no", False)
     assert _parse_action_data("keep:stalled:1:yes") == (
         "keep", False, "stalled", "yes", True)
+
+
+def _work_bot(tmp_path: Path, **kw):
+    """Single DOWNLOADING row + stateful dest double honoring deletes."""
+    from racing_sync.clients.abstract import Torrent
+
+    _root = tmp_path / "ssd"
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="a" * 40, source_name="Work.Show",
+                     total_bytes=1000, save_path=str(_root),
+                     state=State.DOWNLOADING),
+    ])
+    _entries = {"a" * 40: Torrent(
+        hash="a" * 40, name="x", category="", save_path="",
+        size_bytes=1000, state="downloading", progress=0.4, num_seeds=2)}
+
+    async def _list(hashes=None, **k):
+        if hashes is None:
+            return list(_entries.values())
+        want = {(h or "").lower() for h in hashes}
+        return [e for h, e in _entries.items() if h in want]
+
+    async def _delete(h, **k):
+        _entries.pop((h or "").lower(), None)
+
+    bot._coord.dest_client.list_torrents = _list
+    bot._coord.dest_client.delete = _delete
+    bot._bot.edit_message_text = AsyncMock()
+    bot._bot.delete_message = AsyncMock()
+    return bot, store
+
+
+@pytest.mark.anyio
+async def test_slow_keep_tap_marks_sheet_working(tmp_path: Path):
+    """Delete-files taps show Working first, then execute as usual."""
+    bot, store = _work_bot(tmp_path)
+    try:
+        q = _query(f"keep:{'a' * 40}:1:no")
+        q.message.text = "Cancel Work.Show — keep downloaded files?"
+        await bot._handle_callback(q)
+        _pos, _kw = bot._bot.edit_message_text.call_args
+        assert _kw["message_id"] == 43
+        assert _pos[0].endswith("⏳ Working on it…")
+        assert "Cancel Work.Show" in _pos[0]
+        assert store.get("a" * 40) is None
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Cancelled")
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_fast_keep_tap_skips_working_mark(tmp_path: Path):
+    """Keep-files taps execute without the extra working edit."""
+    bot, store = _work_bot(tmp_path)
+    try:
+        q = _query(f"keep:{'a' * 40}:1:yes")
+        q.message.text = "Cancel Work.Show — keep downloaded files?"
+        await bot._handle_callback(q)
+        bot._bot.edit_message_text.assert_not_called()
+        assert store.get("a" * 40) is None
+        sent = bot._bot.send_message.call_args[0][1]
+        assert "Kept files for" in sent
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_working_mark_failure_still_executes(tmp_path: Path):
+    """A failed working edit must never block the execution itself."""
+    from telegram.error import TelegramError
+
+    bot, store = _work_bot(tmp_path)
+    bot._bot.edit_message_text = AsyncMock(
+        side_effect=TelegramError("Flood control exceeded. Retry in 5"))
+    try:
+        q = _query(f"keep:{'a' * 40}:1:no")
+        q.message.text = "Cancel Work.Show — keep downloaded files?"
+        await bot._handle_callback(q)
+        assert store.get("a" * 40) is None
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("Cancelled")
+    finally:
+        store.close()
