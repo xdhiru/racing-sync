@@ -608,6 +608,19 @@ CANCEL_MATCH_RE = re.compile(r"^/cancel_match(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
 #: dest client at tap time). Optional `@bot` suffix; no argument.
 CANCEL_STALLED_RE = re.compile(r"^/cancel_stalled(?:@[\w_]+)?\s*$")
 
+#: Operator pause/resume for intake of NEW work (in-flight rows drain
+#: normally; the flag resets on restart). Optional `@bot` suffix.
+PAUSE_INTAKE_RE = re.compile(r"^/pause_intake(?:@[\w_]+)?\s*$")
+RESUME_INTAKE_RE = re.compile(r"^/resume_intake(?:@[\w_]+)?\s*$")
+
+#: `/tick` — run one full pipeline tick now (poll + schedule + janitor).
+#: Optional `@bot` suffix; no argument.
+TICK_RE = re.compile(r"^/tick(?:@[\w_]+)?\s*$")
+
+#: `/stats` — pipeline snapshot (rows by state, workers, intake, ignored,
+#: storage footer). Optional `@bot` suffix; no argument.
+STATS_RE = re.compile(r"^/stats(?:@[\w_]+)?\s*$")
+
 
 class _ChatCommand(NamedTuple):
     """One typed chat command: name, matcher, and dispatch handler.
@@ -656,6 +669,158 @@ async def _cmd_cancel_stalled(bot, match, message):
     await bot._cancel_stalled_command_entry(message)
 
 
+async def _cmd_pause_intake(bot, match, message):
+    """`/pause_intake`: stop starting NEW work until resumed."""
+    coord = getattr(bot, "_coord", None)
+    setter = getattr(coord, "set_intake_paused", None)
+    if coord is None or not callable(setter):
+        try:
+            await bot._reply("Action failed: bot not attached.",
+                             reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        setter(True)
+    except Exception as e:  # noqa: BLE001
+        try:
+            await bot._reply(f"Action failed: {e}", reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        await bot._reply(
+            "Intake paused — no new downloads start until "
+            "/resume_intake. In-flight rows drain normally "
+            "(resets on restart).",
+            reply_to=message)
+    except Exception:
+        pass
+
+
+async def _cmd_resume_intake(bot, match, message):
+    """`/resume_intake`: intake of NEW work resumes."""
+    coord = getattr(bot, "_coord", None)
+    setter = getattr(coord, "set_intake_paused", None)
+    if coord is None or not callable(setter):
+        try:
+            await bot._reply("Action failed: bot not attached.",
+                             reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        setter(False)
+    except Exception as e:  # noqa: BLE001
+        try:
+            await bot._reply(f"Action failed: {e}", reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        await bot._reply("Intake resumed — NEW rows start workers again.",
+                         reply_to=message)
+    except Exception:
+        pass
+
+
+async def _cmd_tick(bot, match, message):
+    """`/tick`: run one full pipeline tick now."""
+    coord = getattr(bot, "_coord", None)
+    step = getattr(coord, "_tick_inner", None)
+    if coord is None or not callable(step):
+        try:
+            await bot._reply("Action failed: bot not attached.",
+                             reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        await step()
+    except Exception as e:  # noqa: BLE001
+        try:
+            await bot._reply(f"Action failed: {e}", reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        await bot._reply("Tick done.", reply_to=message)
+    except Exception:
+        pass
+    try:
+        bot._last_active_cache = None
+        await bot._refresh_active_message()
+    except Exception:
+        pass
+
+
+_STATS_ORDER = (
+    ("new", "NEW"), ("queued", "QUEUED"), ("downloading", "DL"),
+    ("moving", "MOVING"), ("waiting_indexer", "WAIT-IDX"),
+    ("waiting_disk", "WAIT-SSD"), ("re_adding", "RE-ADDING"),
+    ("done", "DONE"), ("failed", "FAILED"),
+)
+
+
+async def _cmd_stats(bot, match, message):
+    """`/stats`: rows by state, workers, intake, ignored, storage."""
+    store = getattr(bot, "_store", None)
+    if store is None:
+        try:
+            await bot._reply("Action failed: bot not attached.",
+                             reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        _all = getattr(store, "all", None)
+        rows = list(_all() or []) if callable(_all) else []
+    except Exception:
+        rows = []
+    counts: dict[str, int] = {}
+    skipped = 0
+    for r in rows:
+        try:
+            _st = getattr(getattr(r, "state", None), "value", None)
+            if _st:
+                counts[_st] = counts.get(_st, 0) + 1
+            if int(getattr(r, "skipped", 0) or 0):
+                skipped += 1
+        except Exception:
+            continue
+    _parts = [f"{lbl} {counts.get(val, 0)}" for (val, lbl) in _STATS_ORDER]
+    try:
+        _tasks = getattr(getattr(bot, "_coord", None), "_tasks", None)
+        _workers = len(_tasks) if isinstance(_tasks, (set, list)) else 0
+    except Exception:
+        _workers = 0
+    try:
+        _paused = bool(getattr(getattr(bot, "_coord", None),
+                               "_intake_paused", False))
+    except Exception:
+        _paused = False
+    try:
+        _ign = getattr(store, "list_ignored", None)
+        _ignored = len(_ign() or []) if callable(_ign) else 0
+    except Exception:
+        _ignored = 0
+    _lines = ["📊 Stats",
+              " · ".join(_parts),
+              f"workers {_workers} · intake "
+              f"{'paused' if _paused else 'running'} · held {skipped} · "
+              f"ignored {_ignored}"]
+    try:
+        _footer = await bot._active_footer()
+    except Exception:
+        _footer = ""
+    if _footer:
+        _lines.append(_footer)
+    try:
+        await bot._reply("\n".join(_lines)[:1000], reply_to=message)
+    except Exception:
+        pass
+
+
 async def _cmd_add(bot, match, message):
     """`/add` document ingest (acts on the message, not the token)."""
     await bot._process_document_command(message)
@@ -679,6 +844,10 @@ _CHAT_COMMANDS: tuple = (
     _ChatCommand("act", ACT_CMD_RE, _cmd_act),
     _ChatCommand("cancel_match", CANCEL_MATCH_RE, _cmd_cancel_match),
     _ChatCommand("cancel_stalled", CANCEL_STALLED_RE, _cmd_cancel_stalled),
+    _ChatCommand("pause_intake", PAUSE_INTAKE_RE, _cmd_pause_intake),
+    _ChatCommand("resume_intake", RESUME_INTAKE_RE, _cmd_resume_intake),
+    _ChatCommand("tick", TICK_RE, _cmd_tick),
+    _ChatCommand("stats", STATS_RE, _cmd_stats),
     _ChatCommand("cancel", CANCEL_CMD_RE, _cmd_group("cancel")),
 )
 
@@ -1363,6 +1532,18 @@ def _bot_command_menu() -> list:
             "cancel_stalled",
             "Cancel every downloading group with no seeders — "
             "/cancel_stalled",
+        ), BotCommand(
+            "pause_intake",
+            "Pause intake — no new downloads start until /resume_intake",
+        ), BotCommand(
+            "resume_intake",
+            "Resume intake of new downloads",
+        ), BotCommand(
+            "tick",
+            "Run one pipeline tick now (poll + schedule + janitor)",
+        ), BotCommand(
+            "stats",
+            "Pipeline snapshot — rows by state, workers, storage",
         )]
     except Exception:
         return []

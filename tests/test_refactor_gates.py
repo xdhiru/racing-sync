@@ -100,6 +100,57 @@ async def test_intake_handoff_skips_running_and_held():
 
 
 @pytest.mark.anyio
+async def test_intake_pause_holds_new_and_resumes():
+    """Paused intake starts nothing; resume restores the handoff."""
+    import sys
+    from unittest.mock import MagicMock
+
+    sys.path.insert(0, "tests")
+    from conftest import make_coordinator
+    from racing_sync.state import TorrentState, State
+
+    coord = make_coordinator()
+    assert coord._intake_paused is False
+    coord._coordinator_started = True
+    coord._spawn_worker = MagicMock()
+    fresh = TorrentState(source_infohash="f" * 40, source_name="Fresh",
+                         state=State.NEW)
+    assert coord.set_intake_paused(True) is True
+    assert await coord._drain_intake([fresh], []) == 0
+    coord._spawn_worker.assert_not_called()
+    assert coord.set_intake_paused(False) is False
+    assert await coord._drain_intake([fresh], []) == 1
+    coord._spawn_worker.assert_called_once_with(fresh)
+
+
+@pytest.mark.anyio
+async def test_schedule_step_paused_intake_parks_new(tmp_path):
+    """Paused scheduler starts no workers for NEW rows."""
+    import sys
+
+    sys.path.insert(0, "tests")
+    from conftest import make_coordinator
+    from racing_sync.state import StateStore, TorrentState, State
+
+    store = StateStore(tmp_path / "paused.db")
+    try:
+        coord = make_coordinator(store)
+        coord.set_intake_paused(True)
+        store.upsert(TorrentState(source_infohash="a" * 40,
+                                  source_name="New", state=State.NEW))
+        await coord._schedule_step()
+        assert "a" * 40 not in coord._running_infohashes
+        assert len(coord._tasks) == 0
+    finally:
+        for t in list(getattr(coord, "_tasks", []) or []):
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_fuse_gate_skipped_strict_equality(tmp_path):
     """Unknown-size wants only skip actual zero-byte files (legacy rule)."""
     from racing_sync.fuse_gate import skipped_present

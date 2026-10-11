@@ -497,6 +497,18 @@ async def test_bot_command_menu_lists_add(tmp_path):
         "cancel_stalled",
         "Cancel every downloading group with no seeders — "
         "/cancel_stalled",
+    ), (
+        "pause_intake",
+        "Pause intake — no new downloads start until /resume_intake",
+    ), (
+        "resume_intake",
+        "Resume intake of new downloads",
+    ), (
+        "tick",
+        "Run one pipeline tick now (poll + schedule + janitor)",
+    ), (
+        "stats",
+        "Pipeline snapshot — rows by state, workers, storage",
     )]
 
 
@@ -535,7 +547,9 @@ async def test_start_publishes_command_menu(tmp_path):
             await bot.start()
         try:
             cmds = fake.set_my_commands.await_args.args[0]
-            assert [c.command for c in cmds] == ["add", "cancel_match", "cancel_stalled"]
+            assert [c.command for c in cmds] == [
+                "add", "cancel_match", "cancel_stalled", "pause_intake",
+                "resume_intake", "tick", "stats"]
         finally:
             try:
                 await bot.stop()

@@ -360,7 +360,11 @@ base64url-encoded in the buttons (`forget:match:<tok>:<0|1>` /
 tap, so no stored pending state exists to expire. `/cancel_stalled`
 is the same flow over a predicate scope instead of a substring:
 DOWNLOADING groups whose dest entry reports 0 seeders and incomplete
-progress (rows with no dest entry get no verdict and are skipped). Tapping any action
+progress (rows with no dest entry get no verdict and are skipped).
+Operator commands share the same chat gates: `/stats` (rows by state,
+workers, intake, ignored, storage footer), `/tick` (one full pass on
+demand), `/pause_intake` / `/resume_intake` (hold NEW work; in-memory,
+so restarts resume normal intake and nothing wedges paused). Tapping any action
 button deletes its sheet once handled, so answered questions never
 linger behind their follow-up (only the outcome reply stays).
 Liveness is checked at the first question for single-copy scopes
