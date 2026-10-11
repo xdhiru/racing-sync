@@ -873,6 +873,22 @@ def _is_bulk_scope(h: str) -> bool:
         return False
 
 
+def _slow_tap(data: str) -> bool:
+    """True for taps whose execution is slow enough to need feedback.
+
+    Delete-files keeps and confirmed injects run client deletes,
+    verifications, and wipes (10s+ against a flaky client) while their
+    sheet stays live with working buttons — the operator needs a
+    working state on screen, or they re-tap into the in-flight guard
+    (or worse, before it existed, into a duplicate execution).
+    """
+    try:
+        return (data.startswith("keep:") and data.endswith(":no")) or \
+            (data.startswith("inject:") and data.endswith(":yes"))
+    except Exception:
+        return False
+
+
 def _match_token(query: str) -> str:
     """URL-safe token for a match query, "" when it cannot fit a button."""
     try:
@@ -2387,6 +2403,36 @@ class TelegramBot:
         except Exception:
             pass
 
+    async def _mark_sheet_working(self, query: Any) -> None:
+        """Best-effort: append a working note to the tapped sheet's text.
+
+        Only used for slow taps (delete-files keeps, confirmed
+        injects): their execution outlives the tap by 10s+, and the
+        sheet stays live meanwhile. Idempotent (skips when already
+        marked); failure never blocks the execution itself.
+        """
+        try:
+            bot = getattr(self, "_bot", None)
+            msg = getattr(query, "message", None)
+            if bot is None or msg is None:
+                return
+            old = getattr(msg, "text", None)
+            mid = getattr(msg, "message_id", None)
+            if not isinstance(old, str) or not isinstance(mid, int):
+                return
+            if mid <= 0 or old.rstrip().endswith("Working on it…"):
+                return
+            try:
+                await bot.edit_message_text(
+                    f"{old[:4000]}\n\n⏳ Working on it…",
+                    chat_id=self._cfg.chat_id,
+                    message_id=mid,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.debug("sheet working mark failed: %s", e)
+        except Exception:
+            pass
+
     async def _resume_hashes_reply(self, hashes: list[str]) -> str:
         """Resume outcome text for hashes (no send/refresh).
 
@@ -2594,6 +2640,11 @@ class TelegramBot:
                 or data.startswith("inject:")
                 or data.startswith("go:") or data.startswith("cancel:")
                 or data.startswith("skip:") or data.startswith("resume:")):
+            if _slow_tap(data):
+                # Feedback first: the execution below can outlive the tap
+                # by a minute while the sheet stays live — a silent sheet
+                # invites the re-tap this guard exists to absorb.
+                await self._mark_sheet_working(query)
             await self._on_action_button(query, data)
             if not data.startswith("abort"):
                 # The tapped sheet served its purpose: remove it so

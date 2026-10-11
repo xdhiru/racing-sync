@@ -367,6 +367,9 @@ demand), `/pause_intake` / `/resume_intake` (hold NEW work; in-memory,
 so restarts resume normal intake and nothing wedges paused). Tapping any action
 button deletes its sheet once handled, so answered questions never
 linger behind their follow-up (only the outcome reply stays).
+Slow taps (delete-files keeps, confirmed injects) first edit their
+sheet to a working state — best-effort and idempotent — so a silent
+sheet never invites the re-tap the in-flight guard absorbs.
 Liveness is checked at the first question for single-copy scopes
 (dead rows answer at once instead of wasting two taps); a failed
 liveness read reports `Action failed`, never "gone". A duplicate tap
