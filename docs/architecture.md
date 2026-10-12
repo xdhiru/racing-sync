@@ -29,6 +29,7 @@ src/racing_sync/
   content_keys.py     Single same-release/same-content key rule
   fuse_gate.py        Single fuse verification gate (verdict + missing + skip)
   telegram_bot.py     Per-torrent detail cards + active-tasks list
+  telegram_protocol.py Chat/callback protocol (patterns, handlers, parsing)
   telegram_buttons.py ButtonMaker with Telegram budget enforcement
   api.py              Optional FastAPI control plane (/healthz + authed /readyz, /metrics, state ops)
   clients/

@@ -1,0 +1,624 @@
+"""Telegram command + callback protocol (patterns, handlers, parsing).
+
+Split out of the telegram bot god-file. Everything here is pure
+(matchers, button-data shapes, flood math) except the ``_cmd_*``
+handlers, which are unbound ``async (bot, match, message)`` functions
+duck-typing the bot surface (`_start_group_command`,
+`_resume_command_entry`, `_reply`, ...). No import of telegram_bot,
+so the dependency runs one way: bot -> protocol.
+"""
+
+from __future__ import annotations
+
+import base64
+import datetime as dt
+import re
+from typing import Any, NamedTuple
+
+from telegram import BotCommand
+from telegram.error import RetryAfter
+
+#: Hex chars of the infohash shown in the per-task `/cancel_` command.
+#: 10 chars (40 bits) is unambiguous for hundreds of rows and short enough
+#: to copy-paste; full 40-char hashes are also accepted by the watcher.
+CANCEL_SHORT_LEN = 10
+
+#: `/cancel_<hex>` (optional `@bot` suffix, extra trailing text ignored).
+CANCEL_CMD_RE = re.compile(r"^/cancel_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/fetch_<hex>` — same shape: use the starting torrent for the SSD
+#: download instead of waiting for Prowlarr (WAITING_INDEXER rows use
+#: the VPS1 original; NEW grace-held rows use their starting bytes).
+#: (Legacy alias: canonical verb is now `/now_`.)
+FETCH_CMD_RE = re.compile(r"^/fetch_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/prefer_<hex>` — same shape: start a grace-held row's SSD
+#: download now instead of waiting out its preferred-copy grace.
+#: (Legacy alias: canonical verb is now `/now_`.)
+PREFER_CMD_RE = re.compile(r"^/prefer_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/now_<hex>` — same shape, replaces `/fetch_` + `/prefer_` with one
+#: state-dependent verb: WAITING_INDEXER rows use the starting torrent
+#: (VPS1 original) instead of waiting out Prowlarr; NEW grace-held
+#: rows (watch or racing) start their SSD download at once.
+NOW_CMD_RE = re.compile(r"^/now_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/skip_<hex>` — same shape: hold a tracked release (whole group):
+#: no workers, no Prowlarr queries, no downloads, no moves until
+#: `/unskip_`. State is kept; `/add` / watch-dir re-drop resumes it.
+SKIP_CMD_RE = re.compile(r"^/skip_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/unskip_<hex>` — same shape: resume a held release immediately.
+#: (Legacy alias: canonical verb is now `/resume_`.)
+UNSKIP_CMD_RE = re.compile(r"^/unskip_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/resume_<hex>` — same shape, replaces `/unskip_` + `/unignore_`
+#: with one verb: held rows resume, cancelled (ignored) hashes are
+#: lifted so they track again. Full 40-char hash also reaches ignored
+#: entries (invisible in the list, like `/unignore_` before it).
+RESUME_CMD_RE = re.compile(r"^/resume_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/unignore_<full-hash>` — legacy alias of `/resume_`: drop a
+#: cancelled release from the ignore list (plus its forget tombstone)
+#: so it can be tracked again. Full 40-char hash only: ignore entries
+#: are invisible in the task list, so prefixes cannot be disambiguated
+#: there.
+UNIGNORE_CMD_RE = re.compile(r"^/unignore_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/unignore <full-hash>` — manual form (no underscore), same effect.
+UNIGNORE_HASH_RE = re.compile(r"^/unignore\s+([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/injectfuse_<n|hex>` — list shortcut: group number or tracked
+#: hash/prefix for manual fuse seeding (operator moved the bytes).
+INJECTFUSE_CMD_RE = re.compile(r"^/injectfuse_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/act_<n|hex>` — action sheet for a content group: one entry point
+#: showing only the currently eligible actions (hash-direct buttons).
+#: Group number, tracked hash/prefix, or group id, like the other
+#: group commands.
+ACT_CMD_RE = re.compile(r"^/act_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/injectfuse <full-hash>` — manual form: any VPS1 infohash, tracked
+#: or not yet tracked by the app.
+INJECTFUSE_HASH_RE = re.compile(r"^/injectfuse\s+([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/add` — ingest the .torrent file in the replied-to message (or in
+#: the same message when sent with /add as caption) as a Telegram
+#: origin drop, processed like a watch-dir file. Optional `@bot` suffix,
+#: extra trailing text ignored.
+ADD_CMD_RE = re.compile(r"^/add(?:@[\w_]+)?\b")
+
+#: `/cancel_match <text>` — bulk cancel: every live group whose title
+#: contains `<text>` (case-insensitive) is cancelled together after one
+#: remember + one keep/delete question. Optional `@bot` suffix for group
+#: chats; the text runs to end of line.
+#: (Defined ahead of the command registry, which references it.)
+CANCEL_MATCH_RE = re.compile(r"^/cancel_match(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
+
+#: `/cancel_stalled` — bulk cancel every live group whose download is
+#: stalled (DOWNLOADING with 0 seeders and incomplete progress, per the
+#: dest client at tap time). Optional `@bot` suffix; no argument.
+CANCEL_STALLED_RE = re.compile(r"^/cancel_stalled(?:@[\w_]+)?\s*$")
+
+#: Operator pause/resume for intake of NEW work (in-flight rows drain
+#: normally; the flag resets on restart). Optional `@bot` suffix.
+PAUSE_INTAKE_RE = re.compile(r"^/pause_intake(?:@[\w_]+)?\s*$")
+RESUME_INTAKE_RE = re.compile(r"^/resume_intake(?:@[\w_]+)?\s*$")
+
+#: `/tick` — run one full pipeline tick now (poll + schedule + janitor).
+#: Optional `@bot` suffix; no argument.
+TICK_RE = re.compile(r"^/tick(?:@[\w_]+)?\s*$")
+
+#: `/stats` — pipeline snapshot (rows by state, workers, intake, ignored,
+#: storage footer). Optional `@bot` suffix; no argument.
+STATS_RE = re.compile(r"^/stats(?:@[\w_]+)?\s*$")
+
+
+class _ChatCommand(NamedTuple):
+    """One typed chat command: name, matcher, and dispatch handler.
+
+    Adding a command is one table row below — matching *is* the gate,
+    so no separate "did we forget this pattern" check exists to drift
+    (the class of bug that once left `forget:` taps unrouted).
+    `handle` is an unbound ``async (bot, match, message)`` function.
+    """
+    name: str
+    pattern: re.Pattern
+    handle: Any
+
+
+def _cmd_group(kind: str):
+    """Handler factory: ``/verb_<token>`` via the group command."""
+    async def _run(bot, match, message):
+        await bot._start_group_command(kind, match.group(1), message)
+    _run.__name__ = f"_cmd_group_{kind}"
+    return _run
+
+
+async def _cmd_resume(bot, match, message):
+    """`/unskip_` / `/resume_` / `/unignore_` / `/unignore <hash>`."""
+    await bot._resume_command_entry(match.group(1).lower(), message)
+
+
+async def _cmd_single_injectfuse(bot, match, message):
+    """`/injectfuse <full-hash>` (manual form)."""
+    await bot._start_single_command(
+        "injectfuse", match.group(1).lower(), message)
+
+
+async def _cmd_act(bot, match, message):
+    """`/act_<n|hex>` action sheet."""
+    await bot._act_command_entry(match.group(1).lower(), message)
+
+
+async def _cmd_cancel_match(bot, match, message):
+    """`/cancel_match <text>` bulk cancel (empty text shows usage)."""
+    await bot._cancel_match_command_entry(match.group(1) or "", message)
+
+
+async def _cmd_cancel_stalled(bot, match, message):
+    """`/cancel_stalled` bulk cancel of seederless downloads."""
+    await bot._cancel_stalled_command_entry(message)
+
+
+async def _cmd_pause_intake(bot, match, message):
+    """`/pause_intake`: stop starting NEW work until resumed."""
+    coord = getattr(bot, "_coord", None)
+    setter = getattr(coord, "set_intake_paused", None)
+    if coord is None or not callable(setter):
+        try:
+            await bot._reply("Action failed: bot not attached.",
+                             reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        setter(True)
+    except Exception as e:  # noqa: BLE001
+        try:
+            await bot._reply(f"Action failed: {e}", reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        await bot._reply(
+            "Intake paused — no new downloads start until "
+            "/resume_intake. In-flight rows drain normally "
+            "(resets on restart).",
+            reply_to=message)
+    except Exception:
+        pass
+
+
+async def _cmd_resume_intake(bot, match, message):
+    """`/resume_intake`: intake of NEW work resumes."""
+    coord = getattr(bot, "_coord", None)
+    setter = getattr(coord, "set_intake_paused", None)
+    if coord is None or not callable(setter):
+        try:
+            await bot._reply("Action failed: bot not attached.",
+                             reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        setter(False)
+    except Exception as e:  # noqa: BLE001
+        try:
+            await bot._reply(f"Action failed: {e}", reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        await bot._reply("Intake resumed — NEW rows start workers again.",
+                         reply_to=message)
+    except Exception:
+        pass
+
+
+async def _cmd_tick(bot, match, message):
+    """`/tick`: run one full pipeline tick now."""
+    coord = getattr(bot, "_coord", None)
+    step = getattr(coord, "_tick_inner", None)
+    if coord is None or not callable(step):
+        try:
+            await bot._reply("Action failed: bot not attached.",
+                             reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        await step()
+    except Exception as e:  # noqa: BLE001
+        try:
+            await bot._reply(f"Action failed: {e}", reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        await bot._reply("Tick done.", reply_to=message)
+    except Exception:
+        pass
+    try:
+        bot._last_active_cache = None
+        await bot._refresh_active_message()
+    except Exception:
+        pass
+
+
+_STATS_ORDER = (
+    ("new", "NEW"), ("queued", "QUEUED"), ("downloading", "DL"),
+    ("moving", "MOVING"), ("waiting_indexer", "WAIT-IDX"),
+    ("waiting_disk", "WAIT-SSD"), ("re_adding", "RE-ADDING"),
+    ("done", "DONE"), ("failed", "FAILED"),
+)
+
+
+async def _cmd_stats(bot, match, message):
+    """`/stats`: rows by state, workers, intake, ignored, storage."""
+    store = getattr(bot, "_store", None)
+    if store is None:
+        try:
+            await bot._reply("Action failed: bot not attached.",
+                             reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        _all = getattr(store, "all", None)
+        rows = list(_all() or []) if callable(_all) else []
+    except Exception:
+        rows = []
+    counts: dict[str, int] = {}
+    skipped = 0
+    for r in rows:
+        try:
+            _st = getattr(getattr(r, "state", None), "value", None)
+            if _st:
+                counts[_st] = counts.get(_st, 0) + 1
+            if int(getattr(r, "skipped", 0) or 0):
+                skipped += 1
+        except Exception:
+            continue
+    _parts = [f"{lbl} {counts.get(val, 0)}" for (val, lbl) in _STATS_ORDER]
+    try:
+        _tasks = getattr(getattr(bot, "_coord", None), "_tasks", None)
+        _workers = len(_tasks) if isinstance(_tasks, (set, list)) else 0
+    except Exception:
+        _workers = 0
+    try:
+        _paused = bool(getattr(getattr(bot, "_coord", None),
+                               "_intake_paused", False))
+    except Exception:
+        _paused = False
+    try:
+        _ign = getattr(store, "list_ignored", None)
+        _ignored = len(_ign() or []) if callable(_ign) else 0
+    except Exception:
+        _ignored = 0
+    _lines = ["📊 Stats",
+              " · ".join(_parts),
+              f"workers {_workers} · intake "
+              f"{'paused' if _paused else 'running'} · held {skipped} · "
+              f"ignored {_ignored}"]
+    try:
+        _footer = await bot._active_footer()
+    except Exception:
+        _footer = ""
+    if _footer:
+        _lines.append(_footer)
+    try:
+        await bot._reply("\n".join(_lines)[:1000], reply_to=message)
+    except Exception:
+        pass
+
+
+async def _cmd_add(bot, match, message):
+    """`/add` document ingest (acts on the message, not the token)."""
+    await bot._process_document_command(message)
+
+
+#: Chat command registry, in dispatch order. First match wins (patterns
+#: are mutually exclusive by construction — see the registry test).
+_CHAT_COMMANDS: tuple = (
+    _ChatCommand("add", ADD_CMD_RE, _cmd_add),
+    _ChatCommand("fetch", FETCH_CMD_RE, _cmd_group("fetch")),
+    _ChatCommand("prefer", PREFER_CMD_RE, _cmd_group("prefer")),
+    _ChatCommand("now", NOW_CMD_RE, _cmd_group("now")),
+    _ChatCommand("skip", SKIP_CMD_RE, _cmd_group("skip")),
+    _ChatCommand("unskip", UNSKIP_CMD_RE, _cmd_resume),
+    _ChatCommand("resume", RESUME_CMD_RE, _cmd_resume),
+    _ChatCommand("unignore", UNIGNORE_CMD_RE, _cmd_resume),
+    _ChatCommand("unignore_hash", UNIGNORE_HASH_RE, _cmd_resume),
+    _ChatCommand("injectfuse_hash", INJECTFUSE_HASH_RE,
+                 _cmd_single_injectfuse),
+    _ChatCommand("injectfuse", INJECTFUSE_CMD_RE, _cmd_group("injectfuse")),
+    _ChatCommand("act", ACT_CMD_RE, _cmd_act),
+    _ChatCommand("cancel_match", CANCEL_MATCH_RE, _cmd_cancel_match),
+    _ChatCommand("cancel_stalled", CANCEL_STALLED_RE, _cmd_cancel_stalled),
+    _ChatCommand("pause_intake", PAUSE_INTAKE_RE, _cmd_pause_intake),
+    _ChatCommand("resume_intake", RESUME_INTAKE_RE, _cmd_resume_intake),
+    _ChatCommand("tick", TICK_RE, _cmd_tick),
+    _ChatCommand("stats", STATS_RE, _cmd_stats),
+    _ChatCommand("cancel", CANCEL_CMD_RE, _cmd_group("cancel")),
+)
+
+
+#: Shortest substring worth matching: 1 char matches nearly everything.
+_MATCH_MIN_CHARS = 2
+#: Longest query (UTF-8 bytes) whose base64url token still fits the
+#: 64-byte button budget inside `keep:match:<tok>:1:yes`.
+_MATCH_MAX_BYTES = 35
+#: Valid token chars (base64url, padding stripped at encode time).
+_MATCH_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,47}$")
+
+
+def _is_bulk_scope(h: str) -> bool:
+    """True for re-resolved bulk scopes (`match:<tok>`, `stalled`).
+
+    Bulk scopes carry no frozen hash list: every tap re-resolves the
+    live set, so no stored pending state exists to expire.
+    """
+    try:
+        return h == "stalled" or h.startswith("match:")
+    except Exception:
+        return False
+
+
+def _slow_tap(data: str) -> bool:
+    """True for taps whose execution is slow enough to need feedback.
+
+    Delete-files keeps and confirmed injects run client deletes,
+    verifications, and wipes (10s+ against a flaky client) while their
+    sheet stays live with working buttons — the operator needs a
+    working state on screen, or they re-tap into the in-flight guard
+    (or worse, before it existed, into a duplicate execution).
+    """
+    try:
+        return (data.startswith("keep:") and data.endswith(":no")) or \
+            (data.startswith("inject:") and data.endswith(":yes"))
+    except Exception:
+        return False
+
+
+def _match_token(query: str) -> str:
+    """URL-safe token for a match query, "" when it cannot fit a button."""
+    try:
+        raw = (query or "").strip().encode("utf-8")
+        if not raw or len(raw) > _MATCH_MAX_BYTES:
+            return ""
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    except Exception:
+        return ""
+
+
+def _match_query(token: str) -> str:
+    """Decode a match token back to the query, "" when malformed."""
+    try:
+        tok = (token or "").strip()
+        if not _MATCH_TOKEN_RE.match(tok):
+            return ""
+        padded = tok + "=" * (-len(tok) % 4)
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _cancel_command(infohash: str) -> str:
+    """Copy-pasteable cancel command for one task (short hash)."""
+    return f"/cancel_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+def _fetch_command(infohash: str) -> str:
+    """Copy-pasteable fetch command for one task (short hash)."""
+    return f"/fetch_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+def _prefer_command(infohash: str) -> str:
+    """Copy-pasteable prefer command for one task (short hash).
+
+    Legacy alias: canonical verb is now `/now_` (see _now_command).
+    """
+    return f"/prefer_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+def _now_command(infohash: str) -> str:
+    """Copy-pasteable now command for one task (short hash)."""
+    return f"/now_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+def _skip_command(infohash: str) -> str:
+    """Copy-pasteable skip command for one task (short hash)."""
+    return f"/skip_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+def _unskip_command(infohash: str) -> str:
+    """Copy-pasteable unskip command for one task (short hash).
+
+    Legacy alias: canonical verb is now `/resume_` (see _resume_command).
+    """
+    return f"/unskip_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+def _resume_command(infohash: str) -> str:
+    """Copy-pasteable resume command for one task (short hash)."""
+    return f"/resume_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+
+
+#: Flood-wait safety margin: sleeping the exact requested window
+#: re-triggers the ban on clock skew or a queued duplicate, so every
+#: parsed/default wait is stretched (mirror-leech-telegram-bot
+#: practice is `value * 1.2` on every send/edit path).
+_FLOOD_MARGIN = 1.2
+
+
+def _with_flood_margin(base: object) -> int:
+    """Stretch a parsed flood wait by the safety margin (+1s headroom)."""
+    try:
+        return max(1, int(float(base or 0) * _FLOOD_MARGIN) + 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _flood_wait_seconds(e: BaseException, default: int = 5) -> int | None:
+    """Seconds Telegram asks us to wait, or None when not rate-limited.
+
+    Flood control does not always arrive as a `RetryAfter` instance — the
+    observed failure mode is a plain `TelegramError("Flood control
+    exceeded. Retry in N seconds")`, which the old code logged and
+    dropped, freezing the card at its last state forever. Any
+    rate-limit-shaped error sleeps out the requested window and retries
+    instead of dropping the update.
+    """
+    try:
+        if isinstance(e, RetryAfter):
+            raw = e.retry_after
+            if isinstance(raw, dt.timedelta):
+                return _with_flood_margin(raw.total_seconds())
+            return _with_flood_margin(raw)
+    except Exception:
+        pass
+    try:
+        msg = str(e or "").lower()
+    except Exception:
+        return None
+    if not any(k in msg for k in (
+        "flood", "too many requests", "rate limit", "ratelimit",
+        "slow mode", "slowmode",
+    )) and re.search(r"retry (?:in|after) \d+", msg) is None:
+        return None
+    try:
+        m = re.search(r"retry (?:in|after) (\d+)", msg)
+        if m:
+            return _with_flood_margin(int(m.group(1)))
+    except Exception:
+        pass
+    return _with_flood_margin(default)
+
+
+def _is_hex40(s: object) -> bool:
+    """True for a full 40-char lowercase hex infohash."""
+    try:
+        t = str(s or "").strip().lower()
+    except Exception:
+        return False
+    return len(t) == 40 and all(c in "0123456789abcdef" for c in t)
+
+
+def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
+    """Parse a hash-protocol callback into (cmd, all, hash, choice, remember).
+
+    Shapes: `<cmd>:<40hex>`, `<cmd>:all:<40hex>`,
+    `<cmd>:<40hex>:yes|no`, `<cmd>:all:<40hex>:yes|no` (keep/inject),
+    `forget:<scope>`, `forget:<scope>:<0|1>`,
+    `keep:<scope>:<0|1>:<yes|no>`, `abort`, bulk-match scopes
+    `forget:match:<tok>:<0|1>` / `keep:match:<tok>:<0|1>:<yes|no>`
+    (`<tok>` = base64url query, `match:<tok>` in the hash slot) and the
+    predicate scope `forget:stalled:<0|1>` /
+    `keep:stalled:<0|1>:<yes|no>` (`stalled` in the hash slot).
+    `remember` is True/False when the buttons carried the Q1 remember
+    choice, else None (legacy 3-part keep buttons predate it and mean
+    remember, matching the old always-ignore cancel).
+    Returns ("", False, "", "", None) when malformed — callers treat it
+    as a stale button.
+    """
+    try:
+        parts = str(data or "").split(":")
+        if parts == ["abort"]:
+            return ("abort", False, "", "", None)
+        if len(parts) == 2 and parts[0] in (
+                "go", "cancel", "inject", "skip", "resume", "forget"):
+            if _is_hex40(parts[1]):
+                return (parts[0], False, parts[1].lower(), "", None)
+        if len(parts) == 3 and parts[0] in (
+                "cancel", "keep", "inject", "skip", "resume",
+                "go", "forget") and parts[1] == "all":
+            if _is_hex40(parts[2]):
+                return (parts[0], True, parts[2].lower(), "", None)
+        if len(parts) == 3 and parts[0] in ("keep", "inject"):
+            if _is_hex40(parts[1]) and parts[2] in ("yes", "no"):
+                return (parts[0], False, parts[1].lower(), parts[2], True)
+        if len(parts) == 4 and parts[0] in ("keep", "inject"):
+            if _is_hex40(parts[1]) and parts[2] in ("0", "1") \
+                    and parts[3] in ("yes", "no"):
+                return (parts[0], False, parts[1].lower(), parts[3],
+                        parts[2] == "1")
+        if len(parts) == 5 and parts[0] in ("keep", "inject"):
+            if parts[1] == "all" and _is_hex40(parts[2]) \
+                    and parts[3] in ("0", "1") \
+                    and parts[4] in ("yes", "no"):
+                return (parts[0], True, parts[2].lower(), parts[4],
+                        parts[3] == "1")
+        if len(parts) == 3 and parts[0] == "forget":
+            if _is_hex40(parts[1]) and parts[2] in ("0", "1"):
+                return (parts[0], False, parts[1].lower(), "",
+                        parts[2] == "1")
+        if len(parts) == 4 and parts[0] == "forget":
+            if parts[1] == "all" and _is_hex40(parts[2]) \
+                    and parts[3] in ("0", "1"):
+                return (parts[0], True, parts[2].lower(), "",
+                        parts[3] == "1")
+        # Bulk-match scope: the substring travels base64url-encoded and is
+        # re-resolved live at every tap (`match:<tok>` in the hash slot).
+        if len(parts) == 4 and parts[0] == "forget":
+            if parts[1] == "match" and parts[3] in ("0", "1") \
+                    and _MATCH_TOKEN_RE.match(parts[2] or ""):
+                return (parts[0], False, f"match:{parts[2]}", "",
+                        parts[3] == "1")
+        if len(parts) == 5 and parts[0] == "keep":
+            if parts[1] == "match" and parts[3] in ("0", "1") \
+                    and parts[4] in ("yes", "no") \
+                    and _MATCH_TOKEN_RE.match(parts[2] or ""):
+                return (parts[0], False, f"match:{parts[2]}", parts[4],
+                        parts[3] == "1")
+        # Predicate scope: fixed predicate, no token to carry.
+        if len(parts) == 3 and parts[0] == "forget":
+            if parts[1] == "stalled" and parts[2] in ("0", "1"):
+                return (parts[0], False, "stalled", "",
+                        parts[2] == "1")
+        if len(parts) == 4 and parts[0] == "keep":
+            if parts[1] == "stalled" and parts[2] in ("0", "1") \
+                    and parts[3] in ("yes", "no"):
+                return (parts[0], False, "stalled", parts[3],
+                        parts[2] == "1")
+    except Exception:
+        pass
+    return ("", False, "", "", None)
+
+
+def _bot_command_menu() -> list:
+    """Commands shown in the chat's `/` popup (Bot API menu).
+
+    Listed commands take no ID the operator won't know (`/add` acts on
+    the message, `/cancel_match` takes free text, the rest take none).
+    The pickers need group numbers or hashes, so they stay unlisted to
+    keep the menu short.
+    """
+    try:
+        return [BotCommand(
+            "add",
+            "Add a .torrent file — reply to it with /add, or send it with "
+            "/add as caption",
+        ), BotCommand(
+            "cancel_match",
+            "Cancel every active group whose title contains <text> — "
+            "/cancel_match <text>",
+        ), BotCommand(
+            "cancel_stalled",
+            "Cancel every downloading group with no seeders — "
+            "/cancel_stalled",
+        ), BotCommand(
+            "pause_intake",
+            "Pause intake — no new downloads start until /resume_intake",
+        ), BotCommand(
+            "resume_intake",
+            "Resume intake of new downloads",
+        ), BotCommand(
+            "tick",
+            "Run one pipeline tick now (poll + schedule + janitor)",
+        ), BotCommand(
+            "stats",
+            "Pipeline snapshot — rows by state, workers, storage",
+        )]
+    except Exception:
+        return []
