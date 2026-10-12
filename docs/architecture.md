@@ -364,6 +364,11 @@ tap, so no stored pending state exists to expire. `/cancel_stalled`
 is the same flow over a predicate scope instead of a substring:
 DOWNLOADING groups whose dest entry reports 0 seeders and incomplete
 progress (rows with no dest entry get no verdict and are skipped).
+All four cancel scopes (single copy, whole group, title match,
+stalled predicate) run through one `CancelScope` model: resolution,
+the remember question, the keep question, and execution are scope
+operations, so the dispatcher branches stay thin and every scope
+re-resolves live at each tap.
 Operator commands share the same chat gates: `/stats` (rows by state,
 workers, intake, ignored, storage footer), `/tick` (one full pass on
 demand), `/pause_intake` / `/resume_intake` (hold NEW work; in-memory,
