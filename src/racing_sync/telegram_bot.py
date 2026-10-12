@@ -52,6 +52,8 @@ from .telegram_protocol import (
     INJECTFUSE_HASH_RE,
     STATS_RE,
     TICK_RE,
+    CancelScope,
+    ScopeGone,
     _bot_command_menu,
     _flood_wait_seconds,
     _is_bulk_scope,
@@ -76,6 +78,8 @@ __all__ = [
     "INJECTFUSE_HASH_RE",
     "STATS_RE",
     "TICK_RE",
+    "CancelScope",
+    "ScopeGone",
     "_bot_command_menu",
     "_CHAT_COMMANDS",
     "_flood_wait_seconds",
@@ -2831,14 +2835,8 @@ class TelegramBot:
                 pass
             return
         if kind == "cancel":
-            _text = (
-                f"Forget {title}?\n"
-                f"🚫 Ignore blocks it from coming back; "
-                f"👻 Just forget allows re-adding it later.")
-            _rows = (ButtonMaker()
-                     .add("🚫 Ignore + forget", f"forget:{full_hash}:1")
-                     .add("👻 Just forget", f"forget:{full_hash}:0")
-                     .newline().add("Close", "abort").rows())
+            _text, _rows = CancelScope("single", full_hash).remember_sheet(
+                f"Forget {title}?")
             try:
                 await self._send_sheet(_text, _rows, reply_to=message)
             except Exception:
@@ -3288,36 +3286,6 @@ class TelegramBot:
                 continue
         return out
 
-    async def _resolve_bulk_scope(
-            self, h: str) -> tuple[str, str, list[str]]:
-        """Resolve a bulk scope to (keep-question title, execute title, hashes).
-
-        Re-resolved live at every tap; empty hashes mean the set is gone.
-        Raises on infrastructure failure (callers report Action failed,
-        never "gone"). Malformed match tokens resolve empty (stale button).
-        """
-        if h.startswith("match:"):
-            _mq = _match_query(h[len("match:"):])
-            try:
-                _matches = await asyncio.to_thread(
-                    self._live_match, _mq) if _mq else []
-            except Exception as e:  # noqa: BLE001
-                raise RuntimeError(f"match resolve failed: {e}") from e
-            if not _matches:
-                return ("", "", [])
-            return (f"{len(_matches)} groups matching "
-                    f"'{_safe_display_name(_mq[:40])}'",
-                    f"{len(_matches)} matched groups",
-                    [_hh for (_, _hs) in _matches for _hh in _hs or []])
-        if h == "stalled":
-            _groups = await self._live_stalled()
-            if not _groups:
-                return ("", "", [])
-            return (f"{len(_groups)} stalled downloads",
-                    f"{len(_groups)} stalled groups",
-                    [_hh for (_, _hs) in _groups for _hh in _hs or []])
-        return ("", "", [])
-
     async def _cancel_match_command_entry(
             self, query: str, message: Any) -> None:
         """`/cancel_match <text>`: one remember + one keep/delete for all.
@@ -3373,18 +3341,13 @@ class TelegramBot:
         _shown = [f"• {_t} ({len(_hs)})" for (_t, _hs) in matches[:8]]
         if len(matches) > 8:
             _shown.append(f"• …and {len(matches) - 8} more")
-        _text = (
+        _scope = CancelScope("match", tok)
+        _text, _rows = _scope.remember_sheet(
             f"{len(matches)} groups "
             f"({_total} copies) match "
             f"'{_safe_display_name(q[:60])}':\n"
             + "\n".join(_shown) +
-            "\nForget them all?\n"
-            "🚫 Ignore blocks them from coming back; "
-            "👻 Just forget allows re-adding later.")
-        _rows = (ButtonMaker()
-                 .add("🚫 Ignore + forget", f"forget:match:{tok}:1")
-                 .add("👻 Just forget", f"forget:match:{tok}:0")
-                 .newline().add("Close", "abort").rows())
+            "\nForget them all?")
         try:
             await self._send_sheet(_text, _rows, reply_to=message)
         except Exception:
@@ -3425,17 +3388,12 @@ class TelegramBot:
         _shown = [f"• {_t} ({len(_hs)})" for (_t, _hs) in groups[:8]]
         if len(groups) > 8:
             _shown.append(f"• …and {len(groups) - 8} more")
-        _text = (
+        _scope = CancelScope("stalled", "")
+        _text, _rows = _scope.remember_sheet(
             f"{len(groups)} stalled downloads "
             f"({_total} copies, no seeders):\n"
             + "\n".join(_shown) +
-            "\nForget them all?\n"
-            "🚫 Ignore blocks them from coming back; "
-            "👻 Just forget allows re-adding later.")
-        _rows = (ButtonMaker()
-                 .add("🚫 Ignore + forget", "forget:stalled:1")
-                 .add("👻 Just forget", "forget:stalled:0")
-                 .newline().add("Close", "abort").rows())
+            "\nForget them all?")
         try:
             await self._send_sheet(_text, _rows, reply_to=message)
         except Exception:
@@ -3519,17 +3477,11 @@ class TelegramBot:
                         pass
                     return
                 try:
+                    _text, _rows = CancelScope(
+                        "single", _hashes[0]).remember_sheet(
+                            f"Forget {title}?")
                     await self._send_sheet(
-                        f"Forget {title}?\n"
-                        f"🚫 Ignore blocks it from coming back; "
-                        f"👻 Just forget allows re-adding it later.",
-                        ButtonMaker()
-                        .add("🚫 Ignore + forget",
-                             f"forget:{_hashes[0]}:1")
-                        .add("👻 Just forget",
-                             f"forget:{_hashes[0]}:0")
-                        .newline().add("Close", "abort"),
-                        reply_to=message)
+                        _text, _rows, reply_to=message)
                 except Exception:
                     pass
                 return
@@ -3722,19 +3674,6 @@ class TelegramBot:
             except Exception:
                 return []
 
-        async def _row_title(h: str) -> str:
-            try:
-                store = getattr(self, "_store", None)
-                _get = getattr(store, "get", None) if store else None
-                row = await asyncio.to_thread(_get, h) \
-                    if callable(_get) else None
-                if row is not None:
-                    return str(getattr(row, "source_name", "")
-                               or h[:10])[:60]
-            except Exception:
-                pass
-            return h[:10]
-
         try:
             cmd, _all, _h, _choice, _ig = _parse_action_data(data)
             if not cmd:
@@ -3754,110 +3693,52 @@ class TelegramBot:
             if cmd == "cancel" and _h and not _choice:
                 # First question is remember-or-not (keep/delete follows);
                 # the scope travels in the buttons, nothing is stored.
-                if _all:
-                    _hashes = await _group_of(_h)
-                    if not _hashes:
-                        await _say("Group changed — tap /act again.")
-                        return
-                    _title = await _row_title(_h)
-                    _scope = f"all:{_h}"
-                    _scope_label = f" · all {len(_hashes)} copies"
+                # Liveness now, not at execution: a dead scope gets its
+                # answer here instead of wasted question sheets.
+                _scope = CancelScope.from_parsed(_all, _h)
+                try:
+                    _r = await _scope.resolve(self)
+                except ScopeGone as e:
+                    await _say(e.reply)
+                    await _refresh()
+                    return
+                except Exception as e:  # noqa: BLE001
+                    await _say(f"Action failed: {e}")
+                    return
+                if _scope.kind == "group":
+                    _subject = (
+                        f"Forget {_safe_display_name((_r.title_raw or '')[:60])}"
+                        f" · all {len(_r.hashes)} copies?")
                 else:
-                    # Liveness now, not at execution: a dead row gets its
-                    # answer here instead of two wasted question sheets.
-                    try:
-                        _get = getattr(getattr(self, "_store", None),
-                                       "get", None)
-                        _row = await asyncio.to_thread(_get, _h) \
-                            if callable(_get) else None
-                    except Exception as e:  # noqa: BLE001
-                        await _say(f"Action failed: {e}")
-                        return
-                    if _row is None:
-                        await _say("Already gone from tracking")
-                        await _refresh()
-                        return
-                    _title = await _row_title(_h)
-                    _scope = _h
-                    _scope_label = ""
-                _text = (
-                    f"Forget {_safe_display_name((_title or '')[:60])}"
-                    f"{_scope_label}?\n"
-                    f"🚫 Ignore blocks it from coming back; "
-                    f"👻 Just forget allows re-adding it later.")
-                _rows = (ButtonMaker()
-                         .add("🚫 Ignore + forget", f"forget:{_scope}:1")
-                         .add("👻 Just forget", f"forget:{_scope}:0")
-                         .newline().add("Close", "abort").rows())
+                    _subject = (
+                        f"Forget {_safe_display_name((_r.title_raw or '')[:60])}?")
+                _text, _rows = _scope.remember_sheet(_subject)
                 try:
                     await self._send_sheet(
                         _text, _rows,
                         reply_to=getattr(query, "message", None))
                 except Exception:
                     pass
-                return
-            if cmd == "forget" and _is_bulk_scope(_h):
-                # Bulk scope (match/stalled): re-resolve live; the set can
-                # shrink between taps, so the keep question names the live
-                # count, not the Q1 count.
-                if _ig is None:
-                    _ig = True
-                try:
-                    _qlabel, _, _hashes = \
-                        await self._resolve_bulk_scope(_h)
-                except Exception as e:  # noqa: BLE001
-                    await _say(f"Action failed: {e}")
-                    return
-                if not _hashes:
-                    await _say("Already gone from tracking")
-                    await _refresh()
-                    return
-                _text, _rows = self._keepq_text_and_rows(
-                    _qlabel, f" · {len(_hashes)} copies",
-                    _h, None, remember=_ig)
-                try:
-                    await self._send_sheet(
-                        _text, _rows,
-                        reply_to=getattr(query, "message", None))
-                except Exception:
-                    pass
-                return
-            if cmd == "keep" and _choice in ("yes", "no") \
-                    and _is_bulk_scope(_h):
-                if _ig is None:
-                    _ig = True
-                try:
-                    _, _elabel, _hashes = \
-                        await self._resolve_bulk_scope(_h)
-                except Exception as e:  # noqa: BLE001
-                    await _say(f"Action failed: {e}")
-                    return
-                if not _hashes:
-                    await _say("Already gone from tracking")
-                    await _refresh()
-                    return
-                result = await self._execute_snapshot_cancel(
-                    _hashes, _elabel,
-                    delete_files=(_choice == "no"), remember=_ig)
-                await _say(result)
-                await _refresh()
                 return
             if cmd == "forget" and _h:
+                # Q2 keep/delete for any scope, re-resolved live (the set
+                # can shrink between taps, so the question names the live
+                # set, not the Q1 set).
                 if _ig is None:
                     _ig = True
-                if _all:
-                    _hashes = await _group_of(_h)
-                    if not _hashes:
-                        await _say("Group changed — tap /act again.")
-                        return
-                    _title = await _row_title(_h)
-                    _text, _rows = self._keepq_text_and_rows(
-                        _title, f" · all {len(_hashes)} copies",
-                        f"all:{_h}", None, remember=_ig)
-                else:
-                    _title = await _row_title(_h)
-                    _text, _rows = self._keepq_text_and_rows(
-                        _title, "", _h, None, remember=_ig)
+                _scope = CancelScope.from_parsed(_all, _h)
+                try:
+                    _r = await _scope.resolve(self)
+                except ScopeGone as e:
+                    await _say(e.reply)
+                    await _refresh()
+                    return
+                except Exception as e:  # noqa: BLE001
+                    await _say(f"Action failed: {e}")
+                    return
+                _text, _rows = self._keepq_text_and_rows(
+                    _r.title_raw, _r.qlabel,
+                    _r.scope, None, remember=_ig)
                 try:
                     await self._send_sheet(
                         _text, _rows,
@@ -3868,19 +3749,19 @@ class TelegramBot:
             if cmd == "keep" and _choice in ("yes", "no"):
                 if _ig is None:
                     _ig = True
-                if _all:
-                    _hashes = await _group_of(_h)
-                    _scope_title = await _row_title(_h)
-                else:
-                    _hashes = [_h]
-                    _scope_title = await _row_title(_h)
-                if not _hashes:
-                    await _say("Already gone from tracking")
+                _scope = CancelScope.from_parsed(_all, _h)
+                try:
+                    _r = await _scope.resolve(self)
+                except ScopeGone as e:
+                    await _say(e.reply)
                     await _refresh()
                     return
+                except Exception as e:  # noqa: BLE001
+                    await _say(f"Action failed: {e}")
+                    return
                 result = await self._execute_snapshot_cancel(
-                    _hashes, _scope_title, delete_files=(_choice == "no"),
-                    remember=_ig)
+                    _r.hashes, _r.etitle_raw,
+                    delete_files=(_choice == "no"), remember=_ig)
                 await _say(result)
                 await _refresh()
                 return

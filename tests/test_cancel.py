@@ -2302,6 +2302,64 @@ def test_cancel_stalled_protocol_shapes():
         "keep", False, "stalled", "yes", True)
 
 
+def test_cancel_scope_round_trip():
+    """Every scope survives button encoding and parses back identically."""
+    from racing_sync.telegram_bot import CancelScope, _parse_action_data
+
+    h = "a" * 40
+    for scope in (CancelScope("single", h), CancelScope("group", h),
+                  CancelScope("match", "dG9r"), CancelScope("stalled", "")):
+        cmd, all_, ph, choice, ig = _parse_action_data(
+            f"forget:{scope.to_data()}:1")
+        assert (cmd, choice, ig) == ("forget", "", True)
+        back = CancelScope.from_parsed(all_, ph)
+        assert (back.kind, back.key) == (scope.kind, scope.key)
+
+
+@pytest.mark.anyio
+async def test_cancel_scope_resolve_and_remember_parity(tmp_path: Path):
+    """Resolve finds the live set per kind; Q1 sheets share one shape."""
+    from racing_sync.telegram_bot import (
+        CancelScope, ScopeGone, _match_token,
+    )
+
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="a" * 40, source_name="Same.Show",
+                     state=State.QUEUED),
+        TorrentState(source_infohash="b" * 40, source_name="Same.Show",
+                     state=State.QUEUED),
+    ])
+    try:
+        r = await CancelScope("single", "a" * 40).resolve(bot)
+        assert r.hashes == ["a" * 40] and r.scope == "a" * 40
+        r = await CancelScope("group", "a" * 40).resolve(bot)
+        assert sorted(r.hashes) == ["a" * 40, "b" * 40]
+        assert r.scope == "all:" + "a" * 40
+        r = await CancelScope(
+            "match", _match_token("same")).resolve(bot)
+        assert sorted(r.hashes) == ["a" * 40, "b" * 40]
+        with pytest.raises(ScopeGone) as exc:
+            await CancelScope("single", "e" * 40).resolve(bot)
+        assert str(exc.value) == "Already gone from tracking"
+        with pytest.raises(ScopeGone) as exc:
+            await CancelScope("group", "e" * 40).resolve(bot)
+        assert str(exc.value) == "Group changed — tap /act again."
+        for scope in (CancelScope("single", "a" * 40),
+                      CancelScope("group", "a" * 40),
+                      CancelScope("match", "dG9r"),
+                      CancelScope("stalled", "")):
+            text, rows = scope.remember_sheet("Forget X?")
+            flat = [d for r in rows for (_, d) in r]
+            assert f"forget:{scope.to_data()}:1" in flat
+            assert f"forget:{scope.to_data()}:0" in flat
+            assert ("Close", "abort") in [
+                t for r in rows for t in r]
+            assert text.startswith("Forget X?")
+            assert "Ignore blocks it from coming back" in text
+    finally:
+        store.close()
+
+
 def _work_bot(tmp_path: Path, **kw):
     """Single DOWNLOADING row + stateful dest double honoring deletes."""
     from racing_sync.clients.abstract import Torrent

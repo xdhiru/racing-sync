@@ -10,6 +10,7 @@ so the dependency runs one way: bot -> protocol.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import datetime as dt
 import re
@@ -363,6 +364,146 @@ def _is_bulk_scope(h: str) -> bool:
         return h == "stalled" or h.startswith("match:")
     except Exception:
         return False
+
+
+class ScopeGone(Exception):
+    """A cancel scope resolved empty — carries the user-facing reply."""
+
+    def __init__(self, reply: str = "Already gone from tracking"):
+        super().__init__(reply)
+        self.reply = reply
+
+
+class ResolvedScope(NamedTuple):
+    """Live cancel scope: Q2 title, Q2 scope label, button scope, titles."""
+
+    title_raw: str
+    qlabel: str
+    scope: str
+    etitle_raw: str
+    hashes: list[str]
+
+
+class CancelScope(NamedTuple):
+    """Declarative cancel scope: one model for all four Q1/Q2/execute paths.
+
+    Kinds: `single` (one hash), `group` (leader hash, all live copies),
+    `match` (base64url title substring), `stalled` (0-seeder predicate).
+    `resolve` re-derives the live set on every call (raising
+    :class:`ScopeGone` with the kind's reply when empty, ``RuntimeError``
+    on infrastructure failure); `remember_sheet` builds the identical
+    Q1 question for every scope. Callers pass subjects pre-sanitized —
+    titles stay raw here so each renderer keeps its own convention.
+    """
+
+    kind: str
+    key: str
+
+    @classmethod
+    def from_parsed(cls, all: bool, h: str) -> CancelScope:
+        """Scope from a parsed callback (`_parse_action_data` output)."""
+        if _is_bulk_scope(h):
+            if h == "stalled":
+                return cls("stalled", "")
+            return cls("match", h[len("match:"):])
+        if all:
+            return cls("group", h)
+        return cls("single", h)
+
+    def to_data(self) -> str:
+        """Button scope string (round-trips through the callback parser)."""
+        if self.kind == "group":
+            return f"all:{self.key}"
+        if self.kind == "match":
+            return f"match:{self.key}"
+        if self.kind == "stalled":
+            return "stalled"
+        return self.key
+
+    async def resolve(self, bot: Any) -> ResolvedScope:
+        """Live (title, label, scope, execute-title, hashes) for the scope."""
+        store = getattr(bot, "_store", None)
+        if self.kind == "single":
+            get = getattr(store, "get", None) if store else None
+            try:
+                row = await asyncio.to_thread(get, self.key) \
+                    if callable(get) else None
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"resolve failed: {e}") from e
+            if row is None:
+                raise ScopeGone()
+            title = str(getattr(row, "source_name", "")
+                        or self.key[:10])[:60]
+            return ResolvedScope(title, "", self.key, title, [self.key])
+        if self.kind == "group":
+            fn = getattr(bot, "_live_group_hashes", None)
+            try:
+                hashes = await asyncio.to_thread(fn, self.key) \
+                    if callable(fn) else []
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"resolve failed: {e}") from e
+            if not hashes:
+                raise ScopeGone("Group changed — tap /act again.")
+            title = self.key[:10]
+            try:
+                get = getattr(store, "get", None) if store else None
+                leader = get(self.key) if callable(get) else None
+                if leader is not None:
+                    title = str(getattr(leader, "source_name", "")
+                                or self.key[:10])[:60]
+            except Exception:
+                pass
+            return ResolvedScope(
+                title, f" · all {len(hashes)} copies",
+                f"all:{self.key}", title, list(hashes))
+        if self.kind == "match":
+            return await self._resolve_match(bot)
+        if self.kind == "stalled":
+            fn = getattr(bot, "_live_stalled", None)
+            if not callable(fn):
+                raise RuntimeError("stalled resolve unavailable")
+            groups = await fn()
+            if not groups:
+                raise ScopeGone()
+            total = sum(len(hs) for (_, hs) in groups)
+            return ResolvedScope(
+                f"{len(groups)} stalled downloads",
+                f" · {total} copies", "stalled",
+                f"{len(groups)} stalled groups",
+                [h for (_, hs) in groups for h in hs or []])
+        raise ScopeGone()
+
+    async def _resolve_match(self, bot: Any) -> ResolvedScope:
+        """Match-scope resolution (substring token in :attr:`key`)."""
+        q = _match_query(self.key)
+        fn = getattr(bot, "_live_match", None)
+        try:
+            matches = await asyncio.to_thread(fn, q) \
+                if (callable(fn) and q) else []
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"match resolve failed: {e}") from e
+        if not matches:
+            raise ScopeGone()
+        total = sum(len(hs) for (_, hs) in matches)
+        return ResolvedScope(
+            f"{len(matches)} groups matching '{q[:40]}'",
+            f" · {total} copies", f"match:{self.key}",
+            f"{len(matches)} matched groups",
+            [h for (_, hs) in matches for h in hs or []])
+
+    def remember_sheet(self, subject: str) -> tuple[str, list]:
+        """Q1 remember question for the scope (subject pre-sanitized)."""
+        from .telegram_buttons import ButtonMaker
+
+        scope = self.to_data()
+        text = (f"{subject}\n"
+                "🚫 Ignore blocks it from coming back; "
+                "👻 Just forget allows re-adding it later.")
+        rows = (ButtonMaker()
+                .add("🚫 Ignore + forget", f"forget:{scope}:1")
+                .add("👻 Just forget", f"forget:{scope}:0")
+                .newline().add("Close", "abort").rows())
+        return text, rows
 
 
 def _slow_tap(data: str) -> bool:
