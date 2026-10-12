@@ -20,6 +20,7 @@ src/racing_sync/
   forget.py           Abandon-torrent off-switch (row + entries + SSD data + blob cache + optional ignore)
   coordinator.py      Main async loops + per-torrent workers (poll, schedule, janitor)
   coordinator_ssd.py  SSD batch caps + global reservation ledger
+  coordinator_watchdog.py Dead-torrent watchdog + tracker-deletion cascade
   coordinator_picker.py  Cross-seed SSD-source picker (req #1/#2)
   coordinator_cleanup.py VPS1 cleanup janitor
   coordinator_paths.py   Untrusted torrent-relative path guard
@@ -28,6 +29,7 @@ src/racing_sync/
   content_keys.py     Single same-release/same-content key rule
   fuse_gate.py        Single fuse verification gate (verdict + missing + skip)
   telegram_bot.py     Per-torrent detail cards + active-tasks list
+  telegram_buttons.py ButtonMaker with Telegram budget enforcement
   api.py              Optional FastAPI control plane (/healthz + authed /readyz, /metrics, state ops)
   clients/
     abstract.py       TorrentClient ABC + dataclasses
