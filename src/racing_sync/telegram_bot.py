@@ -45,6 +45,7 @@ from .telegram_protocol import (
     CANCEL_CMD_RE,
     CANCEL_MATCH_RE,
     CANCEL_STALLED_RE,
+    FILES_RE,
     FIND_RE,
     INJECTFUSE_CMD_RE,
     INJECTFUSE_HASH_RE,
@@ -101,6 +102,7 @@ __all__ = [
     "CANCEL_CMD_RE",
     "CANCEL_MATCH_RE",
     "CANCEL_STALLED_RE",
+    "FILES_RE",
     "FIND_RE",
     "INJECTFUSE_CMD_RE",
     "INJECTFUSE_HASH_RE",
@@ -2025,6 +2027,87 @@ class TelegramBot:
             pass
         return notes
 
+    async def _files_for_row(self, row: Any, message: Any) -> None:
+        """Read-only file listing for one tracked row (group leader).
+
+        Dest-client files with sizes, progress, and skip flags, plus
+        the row's batch position. Pure readout — file priorities are
+        owned by the batch flow and never touched here.
+        """
+        dest = getattr(getattr(self, "_coord", None), "dest_client", None)
+        if dest is None:
+            try:
+                await self._reply("Action failed: bot not attached.",
+                                  reply_to=message)
+            except Exception:
+                pass
+            return
+        try:
+            h = ((getattr(row, "dest_infohash", "") or "")
+                 or (getattr(row, "source_infohash", "") or "")).lower()
+        except Exception:
+            h = ""
+        if not h:
+            try:
+                await self._reply("No client entry for this row.",
+                                  reply_to=message)
+            except Exception:
+                pass
+            return
+        try:
+            files = await dest.get_torrent_files(h)
+        except Exception as e:  # noqa: BLE001
+            try:
+                await self._reply(f"Action failed: {e}", reply_to=message)
+            except Exception:
+                pass
+            return
+        if not files:
+            try:
+                await self._reply("No files listed yet (nothing "
+                                  "downloaded?).", reply_to=message)
+            except Exception:
+                pass
+            return
+        try:
+            title = self._group_title([row])
+        except Exception:
+            title = "?"
+        try:
+            _bd = _batch_display(row)
+            _spec = f" · {_bd}" if _bd else ""
+        except Exception:
+            _spec = ""
+        lines = [f"📁 {title}{_spec} ({len(files)} files):"]
+        for f in (files or [])[:25]:
+            try:
+                _name = str(getattr(f, "name", "") or "?")[:70]
+            except Exception:
+                _name = "?"
+            try:
+                _size = _size_compact(getattr(f, "size_bytes", 0))
+            except Exception:
+                _size = "?"
+            try:
+                _skipped = int(getattr(f, "priority", 1)) == 0
+            except (TypeError, ValueError):
+                _skipped = False
+            if _skipped:
+                lines.append(f"• {_name} ({_size}) — skipped")
+                continue
+            try:
+                _pct = float(getattr(f, "progress", 0) or 0)
+                _pct_s = f"{_pct * 100:.0f}%"
+            except (TypeError, ValueError):
+                _pct_s = "?"
+            lines.append(f"• {_name} ({_size}, {_pct_s})")
+        if len(files) > 25:
+            lines.append(f"+{len(files) - 25} more")
+        try:
+            await self._reply("\n".join(lines)[:1500], reply_to=message)
+        except Exception:
+            pass
+
     async def _start_single_command(self, kind: str, full_hash: str, message: Any) -> None:
         """Typed full-hash command: keepq for cancel, direct otherwise.
 
@@ -2054,6 +2137,9 @@ class TelegramBot:
                 pass
             return
         title = str(getattr(row, "source_name", "") or full_hash[:10])[:60]
+        if kind == "files":
+            await self._files_for_row(row, message)
+            return
         if kind in ("skip", "unskip"):
             # Group-scoped even from one hash: expand to the live group
             # first (single hash as the fallback when it is not grouped
@@ -2710,6 +2796,16 @@ class TelegramBot:
             return
         _gkey, members = found
         title = self._group_title(members)
+        if kind == "files":
+            if not members:
+                try:
+                    await self._reply("Already gone from tracking",
+                                      reply_to=message)
+                except Exception:
+                    pass
+            else:
+                await self._files_for_row(members[0], message)
+            return
         if kind == "cancel":
             _labels = _member_button_labels(members)
             if len(_labels) <= 1:

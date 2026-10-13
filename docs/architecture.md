@@ -375,7 +375,9 @@ workers, intake, ignored, storage footer), `/tick` (one full pass on
 demand), `/pause_intake` / `/resume_intake` (hold NEW work; in-memory,
 so restarts resume normal intake and nothing wedges paused).
 `/find <text>` fans out read-only over the download-target indexers
-(titles + sizes) for triage — it never queues or downloads. Tapping any action
+(titles + sizes) for triage — it never queues or downloads.
+`/files_<n|hash>` lists one torrent's files with batch position
+(read-only; file priorities stay owned by the batch flow). Tapping any action
 button deletes its sheet once handled, so answered questions never
 linger behind their follow-up (only the outcome reply stays).
 Slow taps (delete-files keeps, confirmed injects) first edit their

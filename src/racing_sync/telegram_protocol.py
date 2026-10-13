@@ -119,6 +119,10 @@ STATS_RE = re.compile(r"^/stats(?:@[\w_]+)?\s*$")
 #: `@bot` suffix; the text runs to end of line.
 FIND_RE = re.compile(r"^/find(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
 
+#: `/files_<n|hex>` — read-only file listing for a group (group number,
+#: tracked hash/prefix, or group id, like the other group commands).
+FILES_RE = re.compile(r"^/files_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
 
 class _ChatCommand(NamedTuple):
     """One typed chat command: name, matcher, and dispatch handler.
@@ -424,6 +428,7 @@ _CHAT_COMMANDS: tuple = (
     _ChatCommand("tick", TICK_RE, _cmd_tick),
     _ChatCommand("stats", STATS_RE, _cmd_stats),
     _ChatCommand("find", FIND_RE, _cmd_find),
+    _ChatCommand("files", FILES_RE, _cmd_group("files")),
     _ChatCommand("cancel", CANCEL_CMD_RE, _cmd_group("cancel")),
 )
 
@@ -846,6 +851,9 @@ def _bot_command_menu() -> list:
         ), BotCommand(
             "find",
             "Search download-target indexers (read-only) — /find <text>",
+        ), BotCommand(
+            "files",
+            "List a torrent's files (read-only) — /files_<n|hash>",
         )]
     except Exception:
         return []
