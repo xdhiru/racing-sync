@@ -1014,7 +1014,7 @@ def test_chat_command_registry_covers_all_verbs():
     from racing_sync.telegram_bot import _CHAT_COMMANDS
 
     names = [c.name for c in _CHAT_COMMANDS]
-    assert len(names) == len(set(names)) == 19
+    assert len(names) == len(set(names)) == 20
     for c in _CHAT_COMMANDS:
         assert callable(c.pattern.match)
         assert callable(c.handle)
@@ -1039,13 +1039,15 @@ def test_chat_command_registry_covers_all_verbs():
         "/resume_intake": ["resume_intake"],
         "/tick": ["tick"],
         "/stats": ["stats"],
+        "/find evil show": ["find"],
+        "/find": ["find"],
     }
     for text, want in cases.items():
         hits = [c.name for c in _CHAT_COMMANDS if c.pattern.match(text)]
         assert hits == want, (text, hits)
     for text in ("/hello", "/cancel_xyz", "/cancel_", "/act_", "/now_",
                  "/cancel_match_foo", "/cancel_stalledx", "/pause_intakex",
-                 "/statsx", ""):
+                 "/statsx", "/findx", ""):
         assert [c.name for c in _CHAT_COMMANDS
                 if c.pattern.match(text)] == [], text
 
@@ -1124,6 +1126,43 @@ async def test_ops_stats_includes_overview(tmp_path: Path):
         assert "▼ 1.9M/s · 1 downloading" in sent
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_find_routes_and_reads_out(tmp_path: Path):
+    """Find searches read-only and lists hits per indexer."""
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._coord.find_release = AsyncMock(return_value={
+        "query": "Evil.Show",
+        "indexers": [
+            {"name": "Alpha", "total": 2,
+             "hits": [{"title": "Evil.Show.S01.1080p-GRP",
+                       "size_bytes": 1_500_000_000},
+                      {"title": "Evil.Show.S01.720p-GRP",
+                       "size_bytes": 800_000_000}]},
+            {"name": "Beta", "total": 0, "hits": []},
+        ],
+    })
+    await bot._handle_chat_message(_message(text="/find Evil.Show"))
+    sent = bot._bot.send_message.call_args[0][1]
+    assert sent.startswith("🔍 'Evil.Show'")
+    assert "Alpha: Evil.Show.S01.1080p-GRP (1.4G)" in sent
+    assert "Read-only — nothing queued." in sent
+    bot._callback_times.clear()
+    await bot._handle_chat_message(_message(text="/find"))
+    assert "read-only" in bot._bot.send_message.call_args[0][1].lower()
+
+
+@pytest.mark.anyio
+async def test_find_lookup_error_replies(tmp_path: Path):
+    """A refused search explains itself instead of failing silently."""
+    bot = _bot()
+    bot._coord = MagicMock()
+    bot._coord.find_release = AsyncMock(
+        side_effect=LookupError("Prowlarr is not configured."))
+    await bot._handle_chat_message(_message(text="/find Evil.Show"))
+    assert "not configured" in bot._bot.send_message.call_args[0][1]
 
 
 def test_sheet_buttons_fit_telegram_callback_budget():

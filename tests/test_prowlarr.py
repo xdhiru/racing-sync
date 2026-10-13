@@ -1263,3 +1263,68 @@ async def test_parallel_search_overall_deadline(monkeypatch):
         [Indexer(id=1, name="Slow (API)", protocol="torrent",
                  enable=True, capabilities=[])], "Some.Release") == {}
     assert time.monotonic() - t0 < 10
+
+
+def _find_hit(title, size, indexer="Alpha"):
+    from racing_sync.prowlarr import TorrentHit
+
+    return TorrentHit(title=title, guid="g", indexer=indexer, indexer_id=1,
+                      size_bytes=size, download_url="http://x/y.torrent",
+                      magnet_url="", info_url="", publish_date="")
+
+
+@pytest.mark.anyio
+async def test_find_release_readout_structure():
+    """find_release fans out read-only and caps per-indexer hits."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from racing_sync.prowlarr import Indexer
+
+    coord = make_coordinator()
+    prow = MagicMock()
+    prow._cfg = MagicMock()
+    prow._cfg.should_skip_title = MagicMock(return_value=False)
+    prow.get_download_indexers = MagicMock(return_value=[
+        Indexer(id=1, name="Alpha", protocol="torrent", enable=True,
+                capabilities=[]),
+        Indexer(id=2, name="Beta", protocol="torrent", enable=True,
+                capabilities=[]),
+    ])
+    prow.search_indexers_parallel = AsyncMock(return_value={
+        "alpha": [_find_hit("Show.S01E01.1080p-GRP", 1000),
+                  _find_hit("Show.S01E01.720p-GRP", 500),
+                  _find_hit("Show.S01E01.480p-GRP", 200),
+                  _find_hit("Show.S01E01.360p-GRP", 100)],
+        "beta": [],
+    })
+    coord.prowlarr = prow
+    res = await coord.find_release("Show.S01E01", per_indexer=2)
+    assert res["query"] == "Show.S01E01"
+    assert [i["name"] for i in res["indexers"]] == ["Alpha", "Beta"]
+    assert res["indexers"][0]["total"] == 4
+    assert [h["title"] for h in res["indexers"][0]["hits"]] == [
+        "Show.S01E01.1080p-GRP", "Show.S01E01.720p-GRP"]
+    assert res["indexers"][1]["hits"] == []
+
+
+@pytest.mark.anyio
+async def test_find_release_refusals():
+    """Empty query, missing client, and skips explain themselves."""
+    from unittest.mock import MagicMock
+
+    coord = make_coordinator()
+    coord.prowlarr = None
+    with pytest.raises(LookupError, match="not configured"):
+        await coord.find_release("Show.S01")
+    with pytest.raises(LookupError, match="release name"):
+        await coord.find_release("   ")
+    prow = MagicMock()
+    prow._cfg = MagicMock()
+    prow._cfg.should_skip_title = MagicMock(return_value=True)
+    prow.get_download_indexers = MagicMock(return_value=[])
+    coord.prowlarr = prow
+    with pytest.raises(LookupError, match="skipped by config"):
+        await coord.find_release("Skipped.Show")
+    prow._cfg.should_skip_title = MagicMock(return_value=False)
+    with pytest.raises(LookupError, match="No download-target"):
+        await coord.find_release("Show.S01")

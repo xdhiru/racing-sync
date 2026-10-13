@@ -509,6 +509,9 @@ async def test_bot_command_menu_lists_add(tmp_path):
     ), (
         "stats",
         "Pipeline snapshot — rows by state, workers, storage",
+    ), (
+        "find",
+        "Search download-target indexers (read-only) — /find <text>",
     )]
 
 
@@ -549,7 +552,7 @@ async def test_start_publishes_command_menu(tmp_path):
             cmds = fake.set_my_commands.await_args.args[0]
             assert [c.command for c in cmds] == [
                 "add", "cancel_match", "cancel_stalled", "pause_intake",
-                "resume_intake", "tick", "stats"]
+                "resume_intake", "tick", "stats", "find"]
         finally:
             try:
                 await bot.stop()
