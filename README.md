@@ -102,7 +102,8 @@ starts a waiting row immediately; `/cancel_stalled` cancels every
 downloading group with no seeders. Operator commands: `/stats` for a
 pipeline snapshot, `/tick` to run one tick now, `/pause_intake` /
 `/resume_intake` to hold and release new downloads, `/find <text>` to
-search indexers read-only. Nothing is deleted
+search indexers read-only, `/files_<n|hash>` to list a torrent's files.
+Nothing is deleted
 without an explicit choice; fuse/remote copies are never touched.
 
 `check-config` also warns on unknown config keys (typo catcher).

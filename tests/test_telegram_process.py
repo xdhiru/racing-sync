@@ -512,6 +512,9 @@ async def test_bot_command_menu_lists_add(tmp_path):
     ), (
         "find",
         "Search download-target indexers (read-only) — /find <text>",
+    ), (
+        "files",
+        "List a torrent's files (read-only) — /files_<n|hash>",
     )]
 
 
@@ -552,7 +555,7 @@ async def test_start_publishes_command_menu(tmp_path):
             cmds = fake.set_my_commands.await_args.args[0]
             assert [c.command for c in cmds] == [
                 "add", "cancel_match", "cancel_stalled", "pause_intake",
-                "resume_intake", "tick", "stats", "find"]
+                "resume_intake", "tick", "stats", "find", "files"]
         finally:
             try:
                 await bot.stop()

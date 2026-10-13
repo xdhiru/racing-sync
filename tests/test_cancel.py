@@ -1014,7 +1014,7 @@ def test_chat_command_registry_covers_all_verbs():
     from racing_sync.telegram_bot import _CHAT_COMMANDS
 
     names = [c.name for c in _CHAT_COMMANDS]
-    assert len(names) == len(set(names)) == 20
+    assert len(names) == len(set(names)) == 21
     for c in _CHAT_COMMANDS:
         assert callable(c.pattern.match)
         assert callable(c.handle)
@@ -1041,13 +1041,15 @@ def test_chat_command_registry_covers_all_verbs():
         "/stats": ["stats"],
         "/find evil show": ["find"],
         "/find": ["find"],
+        "/files_3": ["files"],
+        "/files_abcdef12": ["files"],
     }
     for text, want in cases.items():
         hits = [c.name for c in _CHAT_COMMANDS if c.pattern.match(text)]
         assert hits == want, (text, hits)
     for text in ("/hello", "/cancel_xyz", "/cancel_", "/act_", "/now_",
                  "/cancel_match_foo", "/cancel_stalledx", "/pause_intakex",
-                 "/statsx", "/findx", ""):
+                 "/statsx", "/findx", "/files_", ""):
         assert [c.name for c in _CHAT_COMMANDS
                 if c.pattern.match(text)] == [], text
 
@@ -1163,6 +1165,59 @@ async def test_find_lookup_error_replies(tmp_path: Path):
         side_effect=LookupError("Prowlarr is not configured."))
     await bot._handle_chat_message(_message(text="/find Evil.Show"))
     assert "not configured" in bot._bot.send_message.call_args[0][1]
+
+
+@pytest.mark.anyio
+async def test_files_lists_with_sizes_and_skips(tmp_path: Path):
+    """Files shows names, sizes, progress, skips, and batch position."""
+    from racing_sync.clients.abstract import TorrentFile
+
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="a" * 40, source_name="Season.Show",
+                     total_bytes=3000, state=State.DOWNLOADING,
+                     batches_total=3, batch_index=1),
+    ])
+    bot._coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Season.Show/S01E01.mkv", size_bytes=1000,
+                    priority=1, progress=1.0),
+        TorrentFile(name="Season.Show/S01E02.mkv", size_bytes=1000,
+                    priority=1, progress=0.45),
+        TorrentFile(name="Season.Show/Extras.mkv", size_bytes=1000,
+                    priority=0, progress=0.0),
+    ])
+    try:
+        await bot._handle_chat_message(_message(text="/files_1"))
+        sent = bot._bot.send_message.call_args[0][1]
+        assert sent.startswith("📁 Season.Show · Batch 2/3 (3 files):")
+        assert "S01E01.mkv (1000 B, 100%)" in sent
+        assert "S01E02.mkv (1000 B, 45%)" in sent
+        assert "Extras.mkv (1000 B) — skipped" in sent
+        bot._callback_times.clear()
+        await bot._handle_chat_message(
+            _message(text="/files_" + "a" * 40))
+        assert "S01E01.mkv" in bot._bot.send_message.call_args[0][1]
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_files_empty_and_unknown(tmp_path: Path):
+    """Empty listings and unknown tokens explain themselves."""
+    bot, store, _ssd = _match_bot(tmp_path, [
+        TorrentState(source_infohash="a" * 40, source_name="Empty.Show",
+                     state=State.QUEUED),
+    ])
+    bot._coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
+    try:
+        await bot._handle_chat_message(_message(text="/files_1"))
+        assert "No files listed yet" in \
+            bot._bot.send_message.call_args[0][1]
+        bot._callback_times.clear()
+        await bot._handle_chat_message(_message(text="/files_99"))
+        sent = bot._bot.send_message.call_args[0][1]
+        assert "at least 4 hex chars" in sent
+    finally:
+        store.close()
 
 
 def test_sheet_buttons_fit_telegram_callback_budget():
