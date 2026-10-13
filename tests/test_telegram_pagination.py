@@ -1321,6 +1321,37 @@ def test_live_speed_map_aliases_and_clamps():
     assert coord.live_speed_map()["desthash"] == 0
 
 
+def test_live_totals_sums_speeds():
+    """Overview aggregate: total rate + live count, guarded."""
+    from racing_sync.coordinator import LiveItem
+
+    coord = make_coordinator()
+    assert coord.live_totals() == (0, 0)
+    coord._live = {
+        "a": LiveItem("a", "A", "downloading", 0.5, 1.0,
+                      dlspeed_bps=1_000_000),
+        "b": LiveItem("b", "B", "downloading", 0.2, 1.0,
+                      dlspeed_bps=500_000),
+    }
+    assert coord.live_totals() == (1_500_000, 2)
+
+
+def test_overview_line_formats_or_stays_quiet():
+    """The /stats overview line shows totals; never guesses."""
+    from unittest.mock import MagicMock
+
+    bot = object.__new__(TelegramBot)
+    bot._coord = MagicMock()
+    bot._coord.live_totals = MagicMock(return_value=(10_000_000, 2))
+    assert bot._overview_line() == "▼ 9.5M/s · 2 downloading"
+    bot._coord.live_totals = MagicMock(return_value=(0, 3))
+    assert bot._overview_line() == "▼ 0 B/s · 3 downloading"
+    bot._coord.live_totals = MagicMock(return_value=(0, 0))
+    assert bot._overview_line() == ""
+    bot._coord = MagicMock()
+    assert bot._overview_line() == ""
+
+
 def test_render_active_wait_indexer_shows_retry_countdown():
     """WAITING_INDEXER lines name the live retry timer (no fake positions)."""
     import datetime as dt

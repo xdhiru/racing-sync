@@ -1102,6 +1102,30 @@ async def test_ops_stats_snapshot(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_ops_stats_includes_overview(tmp_path: Path):
+    """Stats appends the download overview when anything is live."""
+    from types import SimpleNamespace
+
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Down",
+                              state=State.DOWNLOADING))
+    bot = _bot()
+    bot._coord = SimpleNamespace(
+        _tasks=set(), _intake_paused=False,
+        live_totals=lambda: (2_000_000, 1),
+    )
+    bot._store = store
+    try:
+        await bot._handle_chat_message(_message(text="/stats"))
+        sent = bot._bot.send_message.call_args[0][1]
+        assert "▼ 1.9M/s · 1 downloading" in sent
+    finally:
+        store.close()
+
+
 def test_sheet_buttons_fit_telegram_callback_budget():
     """Every hash-protocol callback shape fits 64 bytes and parses."""
     from racing_sync.telegram_bot import _parse_action_data

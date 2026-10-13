@@ -1880,6 +1880,26 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin):
                 continue
         return out
 
+    def live_totals(self) -> tuple[int, int]:
+        """(Total in-flight download bytes/s, live download count).
+
+        Overview aggregate for the Telegram /stats snapshot; same
+        guarded coercion as :meth:`live_speed_map`.
+        """
+        try:
+            items = list((getattr(self, "_live", None) or {}).values())
+        except Exception:
+            return (0, 0)
+        total = 0
+        for item in items:
+            try:
+                total += max(0, int(getattr(item, "dlspeed_bps", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+            except Exception:
+                continue
+        return (total, len(items))
+
     # ---- VPS1 cleanup janitor ([cleanup]) ----
 
     # (VPS1 cleanup janitor lives in coordinator_cleanup.CleanupMixin)
