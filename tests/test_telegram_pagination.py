@@ -1321,3 +1321,27 @@ def test_live_speed_map_aliases_and_clamps():
     assert coord.live_speed_map()["desthash"] == 0
 
 
+def test_render_active_wait_indexer_shows_retry_countdown():
+    """WAITING_INDEXER lines name the live retry timer (no fake positions)."""
+    import datetime as dt
+
+    soon = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=12)
+    ts = TorrentState(
+        source_infohash="a" * 40, source_name="Wait.Show",
+        state=State.WAITING_INDEXER, total_bytes=1000, indexer_attempts=3,
+        indexer_next_retry_at=soon,
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
+    text, _, _ = render_active([(ts, None)], page=0, page_size=5)
+    assert "Wait indexer miss #3 · retry in 12m" in text
+    # Spent/missing timer: old text, no countdown guess.
+    ts2 = TorrentState(
+        source_infohash="b" * 40, source_name="Wait.Show",
+        state=State.WAITING_INDEXER, total_bytes=1000, indexer_attempts=3,
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
+    text2, _, _ = render_active([(ts2, None)], page=0, page_size=5)
+    assert "Wait indexer miss #3" in text2
+    assert "retry in" not in text2
+
+
