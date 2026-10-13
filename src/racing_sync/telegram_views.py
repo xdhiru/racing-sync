@@ -504,9 +504,17 @@ def _active_state_text(ts: TorrentState, progress: float | None, note: str,
             state_text = "🔄 Re-adding"
     elif ts.state == State.WAITING_INDEXER:
         # A same-content deferral note (waiting on the in-flight copy)
-        # replaces the stale miss count while it holds.
-        state_text = (f"⏳ {_esc(note)}" if note
-                      else f"⏳ Wait indexer miss #{ts.indexer_attempts}")
+        # replaces the stale miss count while it holds. A live retry
+        # timer appends its countdown — positions would lie (waits are
+        # timer/election-based, not FIFO), but the timer is exact.
+        try:
+            _retry_s = _retry_in_future_seconds(ts.indexer_next_retry_at)
+            _retry = (f" · retry in {max(1, round(_retry_s / 60))}m"
+                      if _retry_s else "")
+        except Exception:
+            _retry = ""
+        state_text = (f"⏳ {_esc(note)}{_retry}" if note
+                      else f"⏳ Wait indexer miss #{ts.indexer_attempts}{_retry}")
     elif ts.state == State.WAITING_DISK:
         state_text = "⏳ Wait SSD space"
     elif ts.state == State.DONE:
