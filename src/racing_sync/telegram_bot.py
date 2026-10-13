@@ -3601,6 +3601,29 @@ class TelegramBot:
             pass
         return None
 
+    def _overview_line(self) -> str:
+        """One-line download overview for /stats ("" when nothing live)."""
+        try:
+            fn = getattr(getattr(self, "_coord", None), "live_totals", None)
+            tot = fn() if callable(fn) else (0, 0)
+            bps_raw, n_raw = tot[0], tot[1]
+        except Exception:
+            return ""
+        # Strict types: test doubles answer truthy to everything
+        # (MagicMock.__int__ is 1) and must never render fake totals.
+        if isinstance(bps_raw, bool) or not isinstance(bps_raw, (int, float)):
+            return ""
+        if isinstance(n_raw, bool) or not isinstance(n_raw, (int, float)):
+            return ""
+        bps, n = int(bps_raw), int(n_raw)
+        if n <= 0:
+            return ""
+        try:
+            spd = _speed_human(bps) or "0 B/s"
+        except Exception:
+            return ""
+        return f"▼ {spd} · {n} downloading"
+
     async def _active_footer(self) -> str:
         """Storage footer for the active-tasks message.
 

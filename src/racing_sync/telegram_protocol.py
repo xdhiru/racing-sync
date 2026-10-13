@@ -303,6 +303,13 @@ async def _cmd_stats(bot, match, message):
               f"{'paused' if _paused else 'running'} · held {skipped} · "
               f"ignored {_ignored}"]
     try:
+        _ovfn = getattr(bot, "_overview_line", None)
+        _ovl = _ovfn() if callable(_ovfn) else ""
+    except Exception:
+        _ovl = ""
+    if _ovl:
+        _lines.append(_ovl)
+    try:
         _footer = await bot._active_footer()
     except Exception:
         _footer = ""
