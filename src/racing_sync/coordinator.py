@@ -2064,6 +2064,68 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin):
         except Exception:
             return False
 
+    async def find_release(
+        self, query: str, *, per_indexer: int = 3, max_indexers: int = 10,
+    ) -> dict:
+        """Read-only Prowlarr search for the operator (/find command).
+
+        Fans out over the download-target indexers and returns plain
+        data (no downloads, no state changes, no exactness claims —
+        titles alone answer "is it on my indexers"). Raises LookupError
+        with a user-facing reason when nothing can be searched.
+        """
+        q = (query or "").strip()
+        if not q:
+            raise LookupError("Send /find <release name> to search.")
+        prow = getattr(self, "prowlarr", None)
+        if prow is None:
+            raise LookupError("Prowlarr is not configured.")
+        try:
+            _skip = getattr(getattr(prow, "_cfg", None),
+                            "should_skip_title", None)
+            if callable(_skip) and _skip(q):
+                raise LookupError(
+                    f"{q!r} is skipped by config (skip_query_substrings).")
+        except LookupError:
+            raise
+        except Exception:
+            pass
+        try:
+            indexers = list(prow.get_download_indexers() or [])
+        except Exception as e:  # noqa: BLE001
+            raise LookupError(f"indexer list unavailable: {e}") from e
+        if not indexers:
+            raise LookupError("No download-target indexers configured.")
+        indexers = indexers[:max(1, max_indexers)]
+        try:
+            per = max(1, int(per_indexer or 3))
+        except (TypeError, ValueError):
+            per = 3
+        try:
+            hits = await prow.search_indexers_parallel(indexers, q)
+        except Exception as e:  # noqa: BLE001
+            raise LookupError(f"search failed: {e}") from e
+        out = []
+        for idx in indexers:
+            try:
+                name = str(getattr(idx, "name", "") or "")
+                hs = sorted(
+                    hits.get(name.lower(), []) or [],
+                    key=lambda h: -(getattr(h, "size_bytes", 0) or 0),
+                )
+                out.append({
+                    "name": name,
+                    "total": len(hs),
+                    "hits": [
+                        {"title": str(getattr(h, "title", "") or ""),
+                         "size_bytes": int(getattr(h, "size_bytes", 0) or 0)}
+                        for h in hs[:per]
+                    ],
+                })
+            except Exception:
+                continue
+        return {"query": q, "indexers": out}
+
     def transition(self, ts: TorrentState, dst: State,
                    *, error: str = "", batch_index: int | None = None) -> None:
         """Wrap store.transition + log + queue a Telegram update.

@@ -114,6 +114,11 @@ TICK_RE = re.compile(r"^/tick(?:@[\w_]+)?\s*$")
 #: storage footer). Optional `@bot` suffix; no argument.
 STATS_RE = re.compile(r"^/stats(?:@[\w_]+)?\s*$")
 
+#: `/find <text>` — read-only Prowlarr search over the download-target
+#: indexers (titles + sizes, nothing queued or downloaded). Optional
+#: `@bot` suffix; the text runs to end of line.
+FIND_RE = re.compile(r"^/find(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
+
 
 class _ChatCommand(NamedTuple):
     """One typed chat command: name, matcher, and dispatch handler.
@@ -326,6 +331,76 @@ async def _cmd_add(bot, match, message):
     await bot._process_document_command(message)
 
 
+async def _cmd_find(bot, match, message):
+    """`/find <text>`: read-only Prowlarr search readout."""
+    from .telegram_views import _size_compact
+
+    q = ((match.group(1) if match else "") or "").strip()
+    if not q:
+        try:
+            await bot._reply("Send /find <release name> to search the "
+                             "download-target indexers (read-only).",
+                             reply_to=message)
+        except Exception:
+            pass
+        return
+    coord = getattr(bot, "_coord", None)
+    finder = getattr(coord, "find_release", None)
+    if coord is None or not callable(finder):
+        try:
+            await bot._reply("Action failed: bot not attached.",
+                             reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        res = await finder(q)
+    except LookupError as e:
+        try:
+            await bot._reply(str(e)[:300], reply_to=message)
+        except Exception:
+            pass
+        return
+    except Exception as e:  # noqa: BLE001
+        try:
+            await bot._reply(f"Action failed: {e}", reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        _idx = res.get("indexers") or []
+        _total = sum(i.get("total", 0) for i in _idx)
+        if not _total:
+            await bot._reply(
+                f"No hits for '{q[:60]}' on {len(_idx)} indexer(s).",
+                reply_to=message)
+            return
+        _lines = [f"🔍 '{q[:60]}' — {_total} hit(s) "
+                   f"on {len(_idx)} indexer(s):"]
+        for entry in _idx:
+            _hs = entry.get("hits") or []
+            if not _hs:
+                continue
+            for h in _hs:
+                try:
+                    _t = str(h.get("title", "") or "")[:80]
+                    _s = _size_compact(h.get("size_bytes", 0))
+                except Exception:
+                    continue
+                _lines.append(f"• {entry.get('name', '?')}: {_t} ({_s})")
+            if entry.get("total", 0) > len(_hs):
+                _lines.append(
+                    f"  +{entry['total'] - len(_hs)} more on "
+                    f"{entry.get('name', '?')}")
+        _lines.append("Read-only — nothing queued.")
+        await bot._reply("\n".join(_lines)[:1500], reply_to=message)
+    except Exception as e:  # noqa: BLE001
+        try:
+            await bot._reply(f"Action failed: {e}", reply_to=message)
+        except Exception:
+            pass
+
+
 #: Chat command registry, in dispatch order. First match wins (patterns
 #: are mutually exclusive by construction — see the registry test).
 _CHAT_COMMANDS: tuple = (
@@ -348,6 +423,7 @@ _CHAT_COMMANDS: tuple = (
     _ChatCommand("resume_intake", RESUME_INTAKE_RE, _cmd_resume_intake),
     _ChatCommand("tick", TICK_RE, _cmd_tick),
     _ChatCommand("stats", STATS_RE, _cmd_stats),
+    _ChatCommand("find", FIND_RE, _cmd_find),
     _ChatCommand("cancel", CANCEL_CMD_RE, _cmd_group("cancel")),
 )
 
@@ -767,6 +843,9 @@ def _bot_command_menu() -> list:
         ), BotCommand(
             "stats",
             "Pipeline snapshot — rows by state, workers, storage",
+        ), BotCommand(
+            "find",
+            "Search download-target indexers (read-only) — /find <text>",
         )]
     except Exception:
         return []
