@@ -147,5 +147,27 @@ def fuse_stat_invalidate(path: Path | str) -> None:
         pass
 
 
+def _left_on_disk(src_dir: Path, name: str) -> bool:
+    """True iff `name` still occupies real SSD bytes (0-transfer detector).
+
+    Goes through the traversal guard and treats symlinks/unreadables as
+    leftovers: `Path.exists()` is False for broken symlinks and can lie on
+    permission errors, and neither case means "reached the remote". Doubt
+    fails closed (leftover → retry, never advance).
+    """
+    try:
+        p = _safe_ssd_join(src_dir, name)
+    except OSError:
+        return True
+    if p is None:
+        return True
+    try:
+        if p.is_symlink():
+            return True
+        return p.exists()
+    except OSError:
+        return True
+
+
 __all__ = ["_safe_ssd_join", "_watch_cross_seed_dir", "fuse_stat_cached",
-           "fuse_stat_invalidate", "FUSE_STAT_TTL_S"]
+           "fuse_stat_invalidate", "FUSE_STAT_TTL_S", "_left_on_disk"]
