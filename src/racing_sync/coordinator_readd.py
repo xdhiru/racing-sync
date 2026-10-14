@@ -1,12 +1,12 @@
 """RE_ADDING phase mixin: fuse-gate re-injection + sustained-missing healer.
 
-Split out of the coordinator god-file (part A: heal clock, gate, drive,
-cross-seed re-add; the `_re_inject_*` supplements follow separately).
-RE_ADDING rows re-inject their torrents onto the fuse mount with
-skip_check=True only after the availability gate proves the moved bytes
-are there; a sustained-missing set past the heal window is selectively
-re-downloaded and moved. Fail-closed throughout: doubt parks, never
-advances blind.
+Split out of the coordinator god-file: heal clock, availability gate,
+drive, cross-seed re-add, and the `_re_inject_*` supplements (watch-dir,
+racing, tracker_map). RE_ADDING rows re-inject their torrents onto the
+fuse mount with skip_check=True only after the availability gate proves
+the moved bytes are there; a sustained-missing set past the heal window
+is selectively re-downloaded and moved. Fail-closed throughout: doubt
+parks, never advances blind.
 """
 
 from __future__ import annotations
@@ -18,13 +18,20 @@ import stat
 import time
 from pathlib import Path
 
+from .content_keys import same_release_name as _same_release_name
+from .coordinator_content import _matches_release, _verified_cross_seed_blob
 from .coordinator_errors import (
     _NOT_VISIBLE_DETAIL,
     AbandonedError,
     WebUIUnresponsiveError,
     is_retryable_client_error,
 )
-from .coordinator_paths import _left_on_disk, _safe_ssd_join
+from .coordinator_inject import _group_is_ignored
+from .coordinator_paths import (
+    _left_on_disk,
+    _safe_ssd_join,
+    _watch_cross_seed_dir,
+)
 from .io_bounds import rpc
 from .state import _MAX_READD_CYCLES, State, TorrentState
 
@@ -751,4 +758,427 @@ class ReaddMixin:
             if detail == "Fails." or not detail or detail == _NOT_VISIBLE_DETAIL or "already" in (detail or "").lower():
                 raise WebUIUnresponsiveError(err_msg)
             self.transition(ts, State.FAILED, error=err_msg)
+            return
+
+    async def _re_inject_watch_dir_torrents(self, ts: TorrentState) -> None:
+        """Re-add every watch-dir dropped torrent and discovered cross-seeds onto FUSE."""
+        watch_cross_dir = _watch_cross_seed_dir(
+            self.cfg.general.state_db, ts.source_infohash)
+        if watch_cross_dir is None or not watch_cross_dir.exists():
+            return
+        ts_fallback_mount = self._target_mount_for(ts)
+        injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
+        injected_set = set(injected)
+
+        try:
+            for p in sorted(watch_cross_dir.glob("*.torrent")):
+                try:
+                    blob = await asyncio.to_thread(p.read_bytes)
+                    from .watchdir import _bencoded_info_hash
+                    h, _, _, _ = _bencoded_info_hash(blob)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("failed to read watch-dir torrent %s: %s", p.name, e)
+                    continue
+
+                h_low = h.lower()
+                if h_low in injected_set:
+                    continue
+
+                # Fuse gate (fail-closed): never point a re-added torrent at
+                # missing/unverifiable data.
+                target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
+                watch_expected = self._expected_fuse_files(blob)
+                if not watch_expected:
+                    log.warning(
+                        "re-inject watch-dir torrent %s: cannot decode file list; skipping blind injection",
+                        h[:10],
+                    )
+                    continue
+                watch_missing = await self._missing_fuse_files(target_mount, watch_expected)
+                if watch_missing:
+                    log.warning(
+                        "re-inject watch-dir torrent %s: fuse content missing at %s (%d files); skipping blind injection",
+                        h[:10], target_mount, len(watch_missing),
+                    )
+                    continue
+
+                ok, detail = await self._ensure_fuse_entry(
+                    blob=blob, infohash=h_low, target_mount=target_mount,
+                    label="watch-dir torrent",
+                )
+
+                if ok:
+                    injected.append(h_low)
+                    injected_set.add(h_low)
+                else:
+                    # Split like _re_add_cross_seed_torrent: transient client
+                    # states park the row for retry; a hard rejection (e.g.
+                    # invalid blob) skips just this torrent so one bad .torrent
+                    # can't hold the whole row (and its moved bytes) hostage.
+                    if (not detail or detail == "Fails."
+                            or detail == _NOT_VISIBLE_DETAIL
+                            or "already" in detail.lower()):
+                        log.warning("re-inject watch-dir torrent %s rejected: %s", h[:10], detail)
+                        raise WebUIUnresponsiveError(f"re-inject watch-dir torrent {h[:10]} rejected: {detail}")
+                    log.warning(
+                        "re-inject watch-dir torrent %s hard-rejected (%s); skipping it",
+                        h[:10], detail,
+                    )
+                    continue
+        finally:
+            ts.injected_private_hashes = ",".join(dict.fromkeys(injected))
+
+    async def _re_inject_racing_torrents(self, ts: TorrentState) -> None:
+        """Re-add every racing-client torrent matching this content onto VPS2
+        pointing at the fuse mount with skip_check=True.
+        """
+        ts_fallback_mount = self._target_mount_for(ts)
+        injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
+        injected_set = set(injected)
+        added = 0
+
+        try:
+            racing = await self._list_source_torrents()
+        except Exception as e:  # noqa: BLE001
+            # No early return: an unreachable VPS1 must not skip the
+            # tracker_map supplements below (often the only remaining
+            # cross-seed source) — proceed with an empty racing set.
+            log.warning("could not list racing torrents for re-injection: %s", e)
+            racing = []
+
+        matches = [
+            t for t in racing
+            if t.name == ts.source_name or _same_release_name(t.name, ts.source_name)
+        ]
+
+        try:
+            for t in matches:
+                h_low = t.infohash.lower()
+                if h_low in injected_set:
+                    continue
+                if _group_is_ignored([t], getattr(self, "store", None)):
+                    log.info("re-inject: skipping cancelled torrent %s (%s)",
+                             t.infohash[:10], (t.name or "")[:40])
+                    continue
+                try:
+                    blob = await self._fetch_racing_torrent_bytes(t.infohash)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("re-inject: fetch %s failed: %s",
+                                t.infohash[:10], e)
+                    continue
+                if not blob:
+                    # SFTP clean-miss + no export endpoint (Deluge has no
+                    # core.get_torrent_file) surface nowhere else — log
+                    # loudly so a skipped racing seed is visible.
+                    log.warning(
+                        "re-inject: no .torrent bytes available for %s (%s); "
+                        "skipping for now (late-seed job will retry)",
+                        t.infohash[:10], t.name[:50],
+                    )
+                    continue
+                # Per-torrent mount: ts.kind may be stale "unknown" (fresh
+                # adoption); the blob's own layout is authoritative.
+                target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
+                # Per-match fuse gate (fail-closed): only inject torrents
+                # whose content is actually available at the target (same
+                # release name does not guarantee the bytes were moved).
+                match_expected = self._expected_fuse_files(blob)
+                if not match_expected:
+                    log.warning(
+                        "re-inject: cannot decode file list for %s; skipping blind injection",
+                        t.infohash[:10],
+                    )
+                    continue
+                match_missing = await self._missing_fuse_files(target_mount, match_expected)
+                if match_missing:
+                    log.warning(
+                        "re-inject: fuse content missing for %s (%s) at %s (%d files); skipping blind injection",
+                        t.infohash[:10], t.name[:50], target_mount, len(match_missing),
+                    )
+                    continue
+                ok, detail = await self._ensure_fuse_entry(
+                    blob=blob, infohash=h_low, target_mount=target_mount,
+                    label="racing torrent",
+                )
+                if not ok:
+                    # Split like _re_add_cross_seed_torrent: transient client
+                    # states park the row for retry; a hard rejection skips
+                    # just this torrent so the cross-seed still lands.
+                    if (not detail or detail == "Fails."
+                            or detail == _NOT_VISIBLE_DETAIL
+                            or "already" in detail.lower()):
+                        log.warning(
+                            "re-inject: add %s rejected: %s",
+                            t.infohash[:10], detail,
+                        )
+                        raise WebUIUnresponsiveError(f"re-inject add {t.infohash[:10]} rejected: {detail}")
+                    log.warning(
+                        "re-inject: add %s hard-rejected (%s); skipping it",
+                        t.infohash[:10], detail,
+                    )
+                    continue
+                injected.append(h_low)
+                injected_set.add(h_low)
+                added += 1
+        finally:
+            ts.injected_private_hashes = ",".join(dict.fromkeys(injected))
+
+        if added == 0:
+            pending = [t for t in matches if t.infohash.lower() not in injected_set]
+            if pending:
+                log.warning(
+                    "re-inject: 0/%d racing torrent(s) injected for %s "
+                    "(VPS1 still lists them); row proceeds with cross-seed "
+                    "only and the late-seed job will retry the racing injection",
+                    len(pending), ts.source_name[:60],
+                )
+            elif not matches:
+                log.info(
+                    "re-inject: no racing torrents left on VPS1 for %s; cross-seed only",
+                    ts.source_name[:60],
+                )
+
+        # Supplementary private cross-seeds harvested via Prowlarr: VPS1
+        # is not the whole world — tracker_map indexers may hold the same
+        # release under a different infohash (piece size, source tag).
+        # Same fail-closed rules as racing members (per-blob fuse gate,
+        # skip_check only onto verified bytes). Best-effort: never raises.
+        try:
+            await self._re_inject_tracker_map_supplements(ts)
+        except (asyncio.CancelledError, AbandonedError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.debug("re-inject supplements failed for %s: %s",
+                      ts.source_name[:60], e)
+
+    # Prowlarr supplement sweep interval (seconds): extra fuse seeds are
+    # opportunistic, not urgent — one search per row per window, while
+    # VPS1 late arrivals are still checked every tick by the caller.
+    _SUPPLEMENT_RETRY_S = 21600.0
+
+    async def _re_inject_tracker_map_supplements(self, ts: TorrentState) -> None:
+        """Inject same-release torrents from tracker_map indexers to fuse.
+
+        VPS1 supplements the racing set; it does not bound it. For each
+        configured tracker_map indexer with an exact same-release hit
+        (normalized name + size), download the .torrent, verify the
+        payload, and inject it onto the fuse mount with skip_check=True
+        — but only when its files are already stat-able at the target
+        (same bytes the row moved; never blind). Membership in
+        tracker_map is the opt-in: empty map = no-op. Never raises
+        (except cancellation/abandonment, which propagate).
+        """
+        if getattr(self, "_stop", False):
+            return
+        try:
+            prowlarr = getattr(self, "prowlarr", None)
+            if prowlarr is None:
+                return
+            cfg_prowlarr = getattr(getattr(self, "cfg", None), "prowlarr", None)
+            if cfg_prowlarr is None:
+                return
+            if not bool(getattr(self.cfg.cross_seed,
+                               "inject_racing_torrents_to_fuse", False)):
+                return
+            tmap = getattr(cfg_prowlarr, "tracker_map", None)
+            entries = getattr(tmap, "entries", None)
+            if not isinstance(entries, dict) or not entries:
+                return
+            try:
+                if callable(getattr(cfg_prowlarr, "should_skip_title", None)) \
+                        and cfg_prowlarr.should_skip_title(ts.source_name or ""):
+                    return
+            except Exception:
+                pass
+        except (asyncio.CancelledError, AbandonedError):
+            raise
+        except Exception:
+            return
+        try:
+            row_key = (ts.source_infohash or "").lower()
+        except Exception:
+            return
+        if not row_key:
+            return
+        try:
+            memo = getattr(self, "_supplement_ok_at", None)
+            if not isinstance(memo, dict):
+                memo = {}
+                self._supplement_ok_at = memo  # type: ignore[attr-defined]
+            now_m = time.monotonic()
+            nxt = memo.get(row_key)
+            try:
+                nxt_f = float(nxt) if nxt is not None else 0.0
+            except (TypeError, ValueError):
+                nxt_f = 0.0
+            if nxt_f and now_m < nxt_f:
+                return
+        except (asyncio.CancelledError, AbandonedError):
+            raise
+        except Exception:
+            return
+        try:
+            indexers = []
+            seen: set[str] = set()
+            for _sub, name in entries.items():
+                try:
+                    idx = prowlarr.get_indexer_by_name(name)
+                except Exception:
+                    continue
+                if idx is None:
+                    continue
+                try:
+                    if not bool(getattr(idx, "enable", False)):
+                        continue
+                    low = str(getattr(idx, "name", "") or "").lower()
+                except Exception:
+                    continue
+                if not low or low in seen:
+                    continue
+                seen.add(low)
+                indexers.append(idx)
+            if not indexers:
+                return
+            try:
+                hits_by_indexer = await asyncio.wait_for(
+                    prowlarr.search_indexers_parallel(
+                        indexers, ts.source_name or ""),
+                    timeout=30.0,
+                )
+            except (asyncio.CancelledError, AbandonedError):
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("supplement search failed for %s: %s",
+                            ts.source_name[:60], e)
+                return
+            try:
+                memo[row_key] = time.monotonic() + self._SUPPLEMENT_RETRY_S
+                if len(memo) > 5000:
+                    for _k in list(memo.keys())[: len(memo) - 5000]:
+                        memo.pop(_k, None)
+            except Exception:
+                pass
+            try:
+                known = {
+                    (h or "").lower() for h in (
+                        ts.source_infohash, ts.dest_infohash,
+                        ts.cross_seed_infohash,
+                        *ts.injected_private_hashes.split(","),
+                    ) if h
+                }
+            except Exception:
+                known = set()
+            try:
+                ts_fallback_mount = self._target_mount_for(ts)
+            except Exception:
+                return
+            added = 0
+            for idx_hits in (hits_by_indexer or {}).values():
+                for hit in idx_hits or []:
+                    try:
+                        ht = getattr(hit, "title", "") or ""
+                        hs = int(getattr(hit, "size_bytes", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    try:
+                        if not _matches_release(
+                                ht, hs, ts.source_name or "",
+                                int(ts.total_bytes or 0)):
+                            continue
+                    except Exception:
+                        continue
+                    try:
+                        blob = await asyncio.wait_for(
+                            prowlarr.download_torrent(hit), timeout=30.0)
+                    except (asyncio.CancelledError, AbandonedError):
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("supplement fetch failed for %s: %s",
+                                  ht[:50], e)
+                        continue
+                    try:
+                        verified = _verified_cross_seed_blob(
+                            blob, target_name=ts.source_name or "",
+                            target_size=int(ts.total_bytes or 0),
+                            hit_title=ht)
+                    except Exception:
+                        continue
+                    if verified is None:
+                        continue
+                    _blob, real_hash, _ann = verified
+                    try:
+                        h_low = (real_hash or "").lower()
+                    except Exception:
+                        continue
+                    if not h_low or h_low in known:
+                        continue
+                    try:
+                        if self._abandoned(ts):
+                            raise AbandonedError(
+                                f"row gone for {(ts.source_infohash or '')[:10]}")
+                    except AbandonedError:
+                        raise
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(self, "store", None) is not None and callable(
+                                getattr(self.store, "is_ignored", None)) \
+                                and self.store.is_ignored(h_low) is True:
+                            log.info("supplement: skipping cancelled torrent %s",
+                                     h_low[:10])
+                            known.add(h_low)
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        match_expected = self._expected_fuse_files(_blob)
+                    except Exception:
+                        match_expected = None
+                    if not match_expected:
+                        continue
+                    try:
+                        match_mount = self._target_mount_for_blob(
+                            _blob, ts_fallback_mount)
+                        match_missing = await self._missing_fuse_files(
+                            match_mount, match_expected)
+                    except Exception:
+                        continue
+                    if match_missing:
+                        continue
+                    try:
+                        ok, _detail = await self._ensure_fuse_entry(
+                            blob=_blob, infohash=h_low,
+                            target_mount=match_mount,
+                            label="tracker_map supplement")
+                    except (asyncio.CancelledError, AbandonedError):
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("supplement inject failed for %s: %s",
+                                  h_low[:10], e)
+                        continue
+                    if not ok:
+                        continue
+                    try:
+                        cur = ts.injected_private_hashes or ""
+                        parts = [p for p in cur.split(",") if p]
+                        if h_low not in parts:
+                            parts.append(h_low)
+                            ts.injected_private_hashes = ",".join(parts)
+                    except Exception:
+                        pass
+                    known.add(h_low)
+                    added += 1
+                    log.info("supplement: injected %s for %s from %s",
+                             h_low[:10], ts.source_name[:60],
+                             getattr(hit, "indexer", "?"))
+            if added:
+                try:
+                    self.store.upsert(ts)
+                except Exception:
+                    pass
+        except (asyncio.CancelledError, AbandonedError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.debug("re-inject supplements failed for %s: %s",
+                      ts.source_name[:60], e)
             return
