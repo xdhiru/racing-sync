@@ -32,6 +32,7 @@ src/racing_sync/
   fuse_gate.py        Single fuse verification gate (verdict + missing + skip)
   telegram_bot.py     Per-torrent detail cards + active-tasks list
   telegram_protocol.py Chat/callback protocol (patterns, handlers, parsing)
+  telegram_sheets.py Question-sheet builders (act/keep/group titles)
   telegram_views.py Active-tasks + detail-card rendering (pure functions)
   telegram_buttons.py ButtonMaker with Telegram budget enforcement
   api.py              Optional FastAPI control plane (/healthz + authed /readyz, /metrics, state ops)
