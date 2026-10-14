@@ -21,6 +21,7 @@ src/racing_sync/
   coordinator.py      Main async loops + per-torrent workers (poll, schedule, janitor)
   coordinator_ssd.py  SSD batch caps + global reservation ledger
   coordinator_watchdog.py Dead-torrent watchdog + tracker-deletion cascade
+  coordinator_live.py Live-download tracking (_live refresh + snapshots)
   coordinator_picker.py  Cross-seed SSD-source picker (req #1/#2)
   coordinator_cleanup.py VPS1 cleanup janitor
   coordinator_paths.py   Untrusted torrent-relative path guard
