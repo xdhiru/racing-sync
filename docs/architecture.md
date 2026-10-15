@@ -25,6 +25,7 @@ src/racing_sync/
   coordinator_inject.py Manual inject-to-fuse flow + group veto rule
   coordinator_readd.py RE_ADDING drive + sustained-missing healer
   coordinator_fuse.py Late cross-seeds + fuse-entry management
+  coordinator_download.py Batch download loop + completion wait
   coordinator_picker.py  Cross-seed SSD-source picker (req #1/#2)
   coordinator_cleanup.py VPS1 cleanup janitor
   coordinator_paths.py   Untrusted torrent-relative path guard
