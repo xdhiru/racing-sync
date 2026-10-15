@@ -35,7 +35,7 @@ from .coordinator_errors import (
 )
 from .coordinator_paths import _left_on_disk, _safe_ssd_join
 from .io_bounds import rpc
-from .rclone_ops import RcloneTransientError, move_local_to_remote
+from .rclone_ops import move_local_to_remote
 from .state import State, TorrentState
 
 # Keep the historic logger name so log output is unchanged by the split.
