@@ -36,7 +36,8 @@ src/racing_sync/
   fuse_gate.py        Single fuse verification gate (verdict + missing + skip)
   telegram_bot.py     Per-torrent detail cards + active-tasks list
   telegram_protocol.py Chat/callback protocol (patterns, handlers, parsing)
-  telegram_router.py Tap dispatcher (_on_action_button routing)
+  telegram_router.py Inbound updates (loops, guards, chat/document,
+    tap dispatcher) + actor-allowlist gate
   telegram_refresh.py Active-message refresh (list/detail, repost, orphans)
   telegram_sheets.py Question-sheet builders (act/keep/group titles)
   telegram_views.py Active-tasks + detail-card rendering (pure functions)
