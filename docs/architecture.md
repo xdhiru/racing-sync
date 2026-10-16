@@ -37,6 +37,7 @@ src/racing_sync/
   telegram_bot.py     Per-torrent detail cards + active-tasks list
   telegram_protocol.py Chat/callback protocol (patterns, handlers, parsing)
   telegram_router.py Tap dispatcher (_on_action_button routing)
+  telegram_refresh.py Active-message refresh (list/detail, repost, orphans)
   telegram_sheets.py Question-sheet builders (act/keep/group titles)
   telegram_views.py Active-tasks + detail-card rendering (pure functions)
   telegram_buttons.py ButtonMaker with Telegram budget enforcement

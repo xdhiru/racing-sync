@@ -17,7 +17,7 @@ import re
 from typing import Any, NamedTuple
 
 from telegram import BotCommand
-from telegram.error import RetryAfter
+from telegram.error import NetworkError, RetryAfter, TimedOut
 
 #: Hex chars of the infohash shown in the per-task `/cancel_` command.
 #: 10 chars (40 bits) is unambiguous for hundreds of rows and short enough
@@ -723,6 +723,39 @@ def _flood_wait_seconds(e: BaseException, default: int = 5) -> int | None:
     except Exception:
         pass
     return _with_flood_margin(default)
+
+
+def _is_parse_error(e: BaseException) -> bool:
+    """True iff a Telegram error is a Markdown parse/entity failure.
+
+    Those (and only those) are retried as plain text; every other error
+    keeps its own handling at each call site.
+    """
+    msg = str(e).lower()
+    return "can't parse" in msg or "entity" in msg
+
+
+#: How long a VPS1 free-space probe stays valid for the active-tasks
+#: footer. Refresh ticks every status_update_interval (45s default); a
+#: probe per tick would chatter the SFTP channel for a footer line.
+_VPS1_FREE_TTL_S = 300.0
+
+
+def _is_transient_tg_error(e: BaseException) -> bool:
+    """True for timeout/network-class Telegram failures (worth a retry)."""
+    try:
+        if isinstance(e, (TimedOut, NetworkError)):
+            return True
+    except Exception:
+        pass
+    try:
+        m = str(e).lower()
+    except Exception:
+        return False
+    return any(s in m for s in (
+        "timed out", "timeout", "connection", "temporary",
+        "service unavailable", "bad gateway", "gateway timeout",
+    ))
 
 
 def _is_hex40(s: object) -> bool:
