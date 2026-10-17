@@ -21,14 +21,19 @@ def _run_async(coro):
 
     uvloop (Linux-only dependency) measurably lowers loop overhead for
     the tick/poll-heavy coordinator; every other platform (and any
-    import/runtime failure) falls back to the stdlib loop. Kept in one
+    import failure) falls back to the stdlib loop. Kept in one
     helper so all three asyncio.run call sites share the policy.
+
+    Only the import is guarded: once a loop starts running the
+    coroutine, its exception must propagate untouched. Re-running the
+    same coroutine object would mask every app error as
+    "cannot reuse already awaited coroutine".
     """
     try:
         import uvloop
-        return asyncio.run(coro, loop_factory=uvloop.new_event_loop)
-    except Exception:
+    except ImportError:
         return asyncio.run(coro)
+    return asyncio.run(coro, loop_factory=uvloop.new_event_loop)
 
 
 async def _runner(coord: Coordinator) -> int:
