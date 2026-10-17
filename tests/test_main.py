@@ -491,3 +491,25 @@ def test_run_async_falls_back_without_uvloop():
     assert _run_async(_value()) == 42
     with patch.dict("sys.modules", {"uvloop": None}):
         assert _run_async(_value()) == 42
+
+
+def test_run_async_does_not_mask_app_errors():
+    """An app exception must propagate as-is, never as 'cannot reuse
+    already awaited coroutine' from running the same coroutine twice."""
+    import asyncio
+
+    from racing_sync.__main__ import _run_async
+
+    async def _boom():
+        await asyncio.sleep(0)
+        raise ValueError("app blew up")
+
+    with pytest.raises(ValueError, match="app blew up"):
+        _run_async(_boom())
+
+    # Same on the uvloop path: a failing coro must not be awaited twice.
+    fake = MagicMock()
+    fake.new_event_loop = None  # force stdlib loop creation
+    with patch.dict("sys.modules", {"uvloop": fake}):
+        with pytest.raises(ValueError, match="app blew up"):
+            _run_async(_boom())
