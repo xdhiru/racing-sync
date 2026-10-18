@@ -678,14 +678,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 ),
                 getattr(self, "cfg", None), "source list_torrents",
             )
+        except AuthError:
+            # Bad credentials never heal by retrying, and hammering risks
+            # lockout: surface to the poller/scheduler loops' dedicated
+            # AuthError arms (loud error + backoff) instead of serving an
+            # infinite stale cache. Worker callers park via the
+            # _process_torrent AuthError arm — rows must never fail over
+            # an ops incident.
+            raise
         except (TimeoutError, asyncio.TimeoutError, OSError,
-                AuthError, ValueError, RuntimeError) as e:
+                ValueError, RuntimeError) as e:
             # Wedged/unreachable VPS1 poll: serve the stale cache when
             # there is one, else an empty view — a source outage must
             # degrade the poll, never fail rows or abort the tick from
-            # any caller. (AuthError still surfaces via the production
-            # poller loop's dedicated backoff; here we just don't starve
-            # the scheduler/janitor behind one bad poll.)
+            # any caller.
             _stale = getattr(self, "_source_torrents_cache", None) or []
             log.warning("source poll failed (%s); using %s view: %s",
                         type(e).__name__,
@@ -1828,6 +1834,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     self.store.upsert(ts)
             except Exception:  # noqa: BLE001
                 pass
+        except AuthError as e:
+            # Source/dest credentials died mid-flight: never fail the row
+            # over an ops incident (bad creds never heal by failing rows,
+            # and hammering risks lockout). Leave the row untouched for
+            # the next tick; the poller/scheduler loops page loudly via
+            # their own AuthError arms.
+            log.error("worker: auth failure for %s (%s); leaving row for next tick",
+                      ts.source_infohash[:10], e)
+            return
         except Exception as e:  # noqa: BLE001
             # Backstop for the same abandonment race on every other path:
             # if the row is gone, any failure string would resurrect it.
