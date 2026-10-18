@@ -592,3 +592,42 @@ async def test_recheck_serialized_across_rows(tmp_path):
         assert coord2.dest_client.recheck.await_count == 1
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_check_timeout_keeps_ssd_bytes(tmp_path):
+    """Wedged MOVING hash check: fail the row but drop only the client
+    entry (delete_files=False) -- complete SSD bytes must survive."""
+    import time
+
+    coord, store = _moving_single(tmp_path, progress=1.0)
+    row = store.get("s" * 40)
+    # Client reports a hash check in flight...
+    coord.dest_client.list_torrents = AsyncMock(return_value=[
+        SimpleNamespace(state="checkingDL", progress=0.5)])
+    # ...that never advances: pre-seed a stale check-watch record so the
+    # shared clock trips terminal on this tick.
+    _now = time.monotonic()
+    coord._checking_track = {"s" * 40: [_now - 10000.0, 0.5, _now - 10000.0]}
+    with patch("racing_sync.coordinator.wipe_local_tree",
+               new_callable=AsyncMock) as mock_wipe:
+        await coord._do_moving(row)
+    assert store.get("s" * 40).state == State.FAILED
+    coord.dest_client.delete.assert_awaited_once_with(
+        "s" * 40, delete_files=False)
+    mock_wipe.assert_not_awaited()
+    assert (tmp_path / "ssd" / "Solo.mkv").exists()
+    store.close()
+
+
+@pytest.mark.anyio
+async def test_fail_downloading_row_defaults_to_corpse_cleanup(tmp_path):
+    """Pre-move callers keep delete_files=True: paused partials must not
+    leak dest entries that nothing else reaps."""
+    coord, store = _moving_single(tmp_path, progress=0.0)
+    row = store.get("s" * 40)
+    await coord._fail_downloading_row(row, "s" * 40, "tracker deleted it")
+    coord.dest_client.delete.assert_awaited_once_with(
+        "s" * 40, delete_files=True)
+    assert store.get("s" * 40).state == State.FAILED
+    store.close()

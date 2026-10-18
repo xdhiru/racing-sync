@@ -29,13 +29,19 @@ log = logging.getLogger("racing_sync.coordinator")
 class WatchdogMixin:
     """Tracker-death watchdog + sibling cascade (duck-typed ``self``)."""
 
-    async def _fail_downloading_row(self, ts: TorrentState, h: str, error: str) -> None:
+    async def _fail_downloading_row(self, ts: TorrentState, h: str, error: str,
+                                    *, delete_files: bool = True) -> None:
         """Fail a DOWNLOADING row terminally and free its slot.
 
         Releases the SSD reservation (a FAILED row holds no budget),
         records the error, and pages Telegram — a tracker-deleted or
         permanently stalled release needs operator eyes, not silent
         parking. Tolerates concurrent forget (abandoned row unwinds).
+
+        `delete_files` controls the corpse-entry cleanup: True for
+        pre-move rows (the dest entry is a paused partial, SSD scratch
+        only), False when the bytes are already complete (MOVING rows —
+        deleting the entry would destroy the only copy).
         """
         log.error("failing download for %s: %s", ts.source_name[:60], error[:200])
         # Abandoned first: a row forgotten while the worker ran must not
@@ -70,10 +76,11 @@ class WatchdogMixin:
         if _dh:
             # Remove the corpse entry: a paused partial would otherwise sit
             # on SSD forever (nothing reaps dest entries of FAILED rows).
-            # SSD scratch data only — never fuse/remote (DOWNLOADING rows
-            # are pre-move by construction).
+            # SSD scratch data only — never fuse/remote. Pre-move rows are
+            # partials by construction; callers pass delete_files=False
+            # when the bytes are already complete (MOVING rows).
             try:
-                await self.dest_client.delete(_dh, delete_files=True)
+                await self.dest_client.delete(_dh, delete_files=delete_files)
             except Exception as e:  # noqa: BLE001
                 log.warning("could not delete failed dest entry %s: %s",
                             _dh[:10], e)
