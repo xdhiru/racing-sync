@@ -170,6 +170,34 @@ async def test_verify_ready_no_state_change(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_verify_broken_fuse_cfg_fails_closed(tmp_path):
+    """Bytes on SSD but fuse config unreadable: verify must report not
+    ready, never stat the SSD dir as fuse (a false 'present' would pass
+    verification for data never seeded)."""
+    coord, ssd, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
+    blob = _blob()
+    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    (ssd / "Solo.mkv").write_bytes(b"x" * 500)
+
+    class _BrokenFuse:
+        def __getattr__(self, name):
+            raise RuntimeError("cfg broken")
+
+    coord.cfg.rclone.fuse = _BrokenFuse()
+    try:
+        coord.store.upsert(TorrentState(
+            source_infohash=H1, source_name=NAME, total_bytes=500,
+            state=State.WAITING_INDEXER))
+        resolved = await coord.injectfuse_resolve(H1)
+        verified = await coord.injectfuse_verify(resolved["members"])
+        assert verified["ready"] is False
+        assert any("no fuse target" in p for p in verified["problems"])
+        assert coord.store.get(H1).state == State.WAITING_INDEXER
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
 async def test_verify_missing_no_state_change(tmp_path):
     coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     blob = _blob()
