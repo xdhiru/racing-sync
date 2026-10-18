@@ -631,3 +631,40 @@ async def test_fail_downloading_row_defaults_to_corpse_cleanup(tmp_path):
         "s" * 40, delete_files=True)
     assert store.get("s" * 40).state == State.FAILED
     store.close()
+
+
+@pytest.mark.anyio
+async def test_mid_move_check_skips_incomplete_unlink(tmp_path):
+    """A check starting between the pre-move state read and the file list
+    dips progress: the file classifies incomplete, but the post-list
+    re-read sees checking and nothing is unlinked. Control phase proves
+    the same file IS unlinked when no check is running."""
+    from racing_sync.clients.abstract import TorrentFile
+
+    coord, store = _moving_single(tmp_path, progress=1.0)
+    # Complete per client, short on disk -> would classify incomplete.
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Solo.mkv", size_bytes=2000, progress=1.0,
+                    priority=1)])
+    _downloading = SimpleNamespace(state="downloading", progress=1.0)
+    _checking = SimpleNamespace(state="checkingDL", progress=0.5)
+
+    # Phase 1: check starts mid-move -> file survives.
+    coord.dest_client.list_torrents = AsyncMock(
+        side_effect=[[_downloading], [_checking]])
+    with patch("racing_sync.coordinator.wipe_local_tree",
+               new_callable=AsyncMock):
+        await coord._do_moving(store.get("s" * 40))
+    assert (tmp_path / "ssd" / "Solo.mkv").exists()
+
+    # Phase 2 (control): no check running -> true partial is unlinked
+    # (the pre-existing FileNotFoundError for vanished singles then
+    # surfaces downstream; what matters here is the file is gone).
+    coord.dest_client.list_torrents = AsyncMock(
+        side_effect=[[_downloading], [_downloading]])
+    with patch("racing_sync.coordinator.wipe_local_tree",
+               new_callable=AsyncMock):
+        with pytest.raises(FileNotFoundError):
+            await coord._do_moving(store.get("s" * 40))
+    assert not (tmp_path / "ssd" / "Solo.mkv").exists()
+    store.close()
