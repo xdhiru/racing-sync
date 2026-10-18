@@ -337,7 +337,10 @@ class MoveMixin:
             _terminal = self._register_checking_park(ts, _pre_prog)
             if _terminal is not None:
                 await self._fail_downloading_row(
-                    ts, h, f"{_terminal} ({_pre_state})")
+                    ts, h, f"{_terminal} ({_pre_state})",
+                    # MOVING bytes are complete on SSD: drop only the
+                    # client entry, never the data.
+                    delete_files=False)
                 return
             self._park_moving(
                 ts,
@@ -369,7 +372,10 @@ class MoveMixin:
                 if _terminal is not None:
                     await self._fail_downloading_row(
                         ts, h,
-                        f"{_terminal} ({pause_err.client_state})")
+                        f"{_terminal} ({pause_err.client_state})",
+                        # MOVING bytes are complete on SSD: drop only the
+                        # client entry, never the data.
+                        delete_files=False)
                     return
                 self._park_moving(
                     ts,
