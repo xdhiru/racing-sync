@@ -476,6 +476,14 @@ async def _forget_one(
     return result
 
 
+async def _stop_workers_best_effort(stop_workers, infohash, errors) -> None:
+    """Invoke the caller's worker-stop hook; failures land in errors."""
+    try:
+        await stop_workers(infohash)
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"stop workers {(infohash or '')[:10]}: {e}")
+
+
 async def forget_torrent(
     cfg,
     *,
@@ -486,6 +494,7 @@ async def forget_torrent(
     delete_files: bool = True,
     ignore: bool = False,
     hard: bool = False,
+    stop_workers=None,
 ) -> dict:
     """Plan (apply=False) or execute (apply=True) abandoning one torrent.
 
@@ -505,13 +514,25 @@ async def forget_torrent(
     or re-poll re-ingests from scratch like a new encounter. The caller
     must stop the row's workers first (else a stale upsert resurrects
     a zombie); paired rows inherit both flags.
+
+    `stop_workers`, when given, is an async callable taking an infohash.
+    It is invoked for the primary row and every paired row before their
+    deletes (a live worker's stale upsert would otherwise resurrect a
+    hard-deleted row as a zombie). Failures are recorded in `errors`,
+    never swallowed. Skipped entirely on dry-run.
     """
     row = resolve_row(store, target)
     paired = _paired_waiter_identities(store, cfg, row)
+    _stop_errors: list[str] = []
+    if apply and stop_workers is not None:
+        await _stop_workers_best_effort(
+            stop_workers, row.source_infohash, _stop_errors)
     result = await _forget_one(
         cfg, dest=dest, store=store, row=row,
         apply=apply, delete_files=delete_files, ignore=ignore, hard=hard,
     )
+    if _stop_errors:
+        result["errors"] = _stop_errors + list(result.get("errors") or [])
     result["paired_cancelled"] = []
     if not apply:
         result["paired_cancelled"] = [
@@ -528,6 +549,9 @@ async def forget_torrent(
             prow = None
         if prow is None:
             continue
+        if stop_workers is not None:
+            await _stop_workers_best_effort(
+                stop_workers, h, result["errors"])
         try:
             pres = await _forget_one(
                 cfg, dest=dest, store=store, row=prow,

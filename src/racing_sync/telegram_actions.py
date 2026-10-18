@@ -83,17 +83,16 @@ class ActionsMixin:
             detail_msg_id = None
         try:
             _stop = getattr(coord, "stop_workers_for", None)
-            if callable(_stop):
-                try:
-                    await _stop(infohash)
-                except Exception:
-                    pass
+            # Worker shutdown rides inside forget_torrent (primary + every
+            # pair, failures recorded in result errors) — never silent.
+            _stop_cb = _stop if callable(_stop) else None
             if _hold_ops_lock is not None:
                 async with _hold_ops_lock(coord):
                     result = await forget_torrent(
                         cfg, dest=dest, store=store, target=infohash,
                         apply=True, delete_files=delete_files,
                         ignore=remember, hard=not remember,
+                        stop_workers=_stop_cb,
                     )
                     try:
                         await coord._ssd_release(
@@ -105,6 +104,7 @@ class ActionsMixin:
                     cfg, dest=dest, store=store, target=infohash,
                     apply=True, delete_files=delete_files,
                     ignore=remember, hard=not remember,
+                    stop_workers=_stop_cb,
                 )
                 try:
                     await coord._ssd_release(

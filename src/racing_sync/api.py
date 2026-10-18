@@ -386,10 +386,12 @@ def build_app(coord: Coordinator) -> FastAPI:
             pass
         async with _hold_ops_lock(coord):
             try:
+                _api_stop = getattr(coord, "stop_workers_for", None)
                 result = await forget_torrent(
                     cfg, dest=coord.dest_client, store=coord.store,
                     target=normalized, apply=True, delete_files=delete_files,
                     ignore=ignore,
+                    stop_workers=_api_stop if callable(_api_stop) else None,
                 )
             except LookupError as e:
                 raise HTTPException(404, str(e)) from e

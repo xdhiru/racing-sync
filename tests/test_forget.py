@@ -748,3 +748,78 @@ async def test_forget_tombstones_row_and_blocks_reingest(tmp_path: Path):
     store.upsert(_row(save_path=str(ssd)))
     assert store.get("a" * 40) is None
     store.close()
+
+
+@pytest.mark.anyio
+async def test_forget_hard_stops_primary_and_pair_workers(tmp_path: Path):
+    """Hard forget must stop the primary AND paired workers before the
+    deletes, or a stale upsert resurrects a zombie. Dry-run stops none."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store, _owner, _waiters, _bystanders = _watch_pair_store(tmp_path)
+    dest = FakeDest()
+    dest.seed("a" * 40, str(ssd),
+              [TorrentFile(name="Shared/a.mkv", size_bytes=10)])
+
+    stopped: list[str] = []
+
+    async def _stop(h):
+        stopped.append(h.lower())
+
+    result = await forget_torrent(
+        _cfg(ssd), dest=dest, store=store, target="a" * 40,
+        apply=True, delete_files=True, ignore=False, hard=True,
+        stop_workers=_stop,
+    )
+
+    assert store.get("a" * 40) is None
+    assert store.get("b" * 40) is None
+    assert store.get("c" * 40) is None
+    assert sorted(stopped) == ["a" * 40, "b" * 40, "c" * 40]
+    assert result["errors"] == []
+    store.close()
+
+
+@pytest.mark.anyio
+async def test_forget_stop_failure_is_reported_not_swallowed(tmp_path: Path):
+    """A failing worker-stop hook lands in result errors; the forget
+    still proceeds so the operator sees both."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(_row(save_path=str(ssd)))
+    dest = FakeDest()
+
+    async def _flaky(h):
+        raise RuntimeError("nope")
+
+    result = await forget_torrent(
+        _cfg(ssd), dest=dest, store=store, target="a" * 40,
+        apply=True, delete_files=True, stop_workers=_flaky,
+    )
+
+    assert any("stop workers" in e for e in result["errors"])
+    store.close()
+
+
+@pytest.mark.anyio
+async def test_forget_dry_run_stops_no_workers(tmp_path: Path):
+    """Planning a forget must never touch live workers."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store, _owner, _waiters, _bystanders = _watch_pair_store(tmp_path)
+    dest = FakeDest()
+
+    stopped: list[str] = []
+
+    async def _stop(h):
+        stopped.append(h.lower())
+
+    await forget_torrent(
+        _cfg(ssd), dest=dest, store=store, target="a" * 40,
+        apply=False, delete_files=True, ignore=True, stop_workers=_stop,
+    )
+
+    assert stopped == []
+    assert store.get("a" * 40) is not None
+    store.close()
