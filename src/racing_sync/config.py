@@ -433,6 +433,17 @@ class TelegramConfig(BaseModel):
             chat = self.chat_id.strip()
             if not chat or chat.upper() in ("CHANGE_ME", "YOUR_CHAT_ID"):
                 raise ValueError("telegram.chat_id is required and cannot be a placeholder when enabled")
+        # Fail at startup, not at first tap: a bad allowlist entry makes
+        # _tg_actor_allowed fail closed for everyone (int() raises), so
+        # validate here. Telegram user ids are positive; duplicates are
+        # harmless but normalized away.
+        seen: list[int] = []
+        for uid in self.admin_user_ids:
+            if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
+                raise ValueError("telegram.admin_user_ids must hold positive Telegram user ids")
+            if uid not in seen:
+                seen.append(uid)
+        self.admin_user_ids = seen
         return self
 
 

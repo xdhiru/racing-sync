@@ -49,3 +49,28 @@ def test_trusted_proxies_unchecked_when_header_untrusted():
                     api_token="sekret-token-value",
                     trusted_proxies=["0.0.0.0/0"])
     assert cfg.trusted_proxies == ["0.0.0.0/0"]
+
+
+def _tg_cfg(**kw):
+    from racing_sync.config import TelegramConfig
+
+    base = dict(enabled=False)
+    base.update(kw)
+    return TelegramConfig(**base)
+
+
+def test_admin_ids_reject_non_positive():
+    """Zero/negative allowlist entries fail at load, not at first tap."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _tg_cfg(admin_user_ids=[123, 0])
+    with pytest.raises(ValidationError):
+        _tg_cfg(admin_user_ids=[-5])
+
+
+def test_admin_ids_deduped():
+    """Duplicates normalize away; order of first appearance wins."""
+    cfg = _tg_cfg(admin_user_ids=[123, 456, 123])
+    assert cfg.admin_user_ids == [123, 456]
+    assert _tg_cfg().admin_user_ids == []
