@@ -235,10 +235,16 @@ class InjectMixin:
             try:
                 kind = self._classify_blob_kind(blob)
                 try:
-                    fallback = Path(self.cfg.dest.save_path)
+                    fallback = Path(self.cfg.rclone.fuse.mount_unsorted)
                 except Exception:
                     fallback = Path(".")
                 target = self._target_mount_for_kind(kind, fallback)
+                if not self._save_path_is_on_fuse(str(target)):
+                    # Never stat the SSD dir as fuse: bytes present on SSD
+                    # are not on fuse, and a false "present" would pass
+                    # verification for data never seeded. Fail closed.
+                    raise ValueError(
+                        f"fuse target {target} not on a fuse mount")
             except Exception:
                 ready = False
                 problems.append(f"{name}: no fuse target")
