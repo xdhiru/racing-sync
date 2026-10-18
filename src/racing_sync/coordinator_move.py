@@ -479,7 +479,30 @@ class MoveMixin:
             )
 
         # 3. Clean up incomplete piece-boundary files so they are NOT moved to remote
-        for f in incomplete_files:
+        _post_checking = False
+        if incomplete_files:
+            # A hash check may have STARTED between the pre-move state read
+            # (step 0b) and the file list above: progress dips mid-check, so
+            # a complete file can now classify as incomplete and be unlinked
+            # below as a piece-boundary partial. Re-read the cheap
+            # state-only list; when checking, delete nothing individually
+            # this tick — the next tick classifies correctly once the check
+            # lands. Only paid when a delete is actually pending.
+            try:
+                _post = await rpc(
+                    self.dest_client.list_torrents(hashes=[h]),
+                    getattr(self, "cfg", None),
+                    "dest post-list checking state")
+                _post_state = str((_post[0].state if _post else "") or "")
+                _post_checking = _post_state.lower().startswith("check")
+            except Exception:
+                _post_checking = False
+            if _post_checking:
+                log.info(
+                    "client hash check started mid-move for %s; keeping %d "
+                    "incomplete file(s) this tick without deleting",
+                    h[:10], len(incomplete_files))
+        for f in ([] if _post_checking else incomplete_files):
             file_path = _safe_ssd_join(src_dir, f.name)
             if file_path is None:
                 continue
