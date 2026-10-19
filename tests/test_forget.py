@@ -823,3 +823,25 @@ async def test_forget_dry_run_stops_no_workers(tmp_path: Path):
     assert stopped == []
     assert store.get("a" * 40) is not None
     store.close()
+
+
+@pytest.mark.anyio
+async def test_forget_ignores_non_async_stop_hook(tmp_path: Path):
+    """Bare mock doubles are not awaitable: passing one must not record
+    a bogus 'stop workers' error on every forget."""
+    from unittest.mock import MagicMock
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(_row(save_path=str(ssd)))
+    dest = FakeDest()
+
+    result = await forget_torrent(
+        _cfg(ssd), dest=dest, store=store, target="a" * 40,
+        apply=True, delete_files=True, stop_workers=MagicMock(),
+    )
+
+    assert result["errors"] == []
+    assert store.get("a" * 40) is None
+    store.close()

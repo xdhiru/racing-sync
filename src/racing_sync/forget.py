@@ -524,9 +524,14 @@ async def forget_torrent(
     row = resolve_row(store, target)
     paired = _paired_waiter_identities(store, cfg, row)
     _stop_errors: list[str] = []
-    if apply and stop_workers is not None:
+    # Only a real async hook stops workers: bare MagicMock doubles (and
+    # sync callables) are not awaitable, and awaiting them would record a
+    # bogus "stop workers" error on every forget.
+    _stop_hook = (stop_workers
+                  if asyncio.iscoroutinefunction(stop_workers) else None)
+    if apply and _stop_hook is not None:
         await _stop_workers_best_effort(
-            stop_workers, row.source_infohash, _stop_errors)
+            _stop_hook, row.source_infohash, _stop_errors)
     result = await _forget_one(
         cfg, dest=dest, store=store, row=row,
         apply=apply, delete_files=delete_files, ignore=ignore, hard=hard,
@@ -549,9 +554,9 @@ async def forget_torrent(
             prow = None
         if prow is None:
             continue
-        if stop_workers is not None:
+        if _stop_hook is not None:
             await _stop_workers_best_effort(
-                stop_workers, h, result["errors"])
+                _stop_hook, h, result["errors"])
         try:
             pres = await _forget_one(
                 cfg, dest=dest, store=store, row=prow,
