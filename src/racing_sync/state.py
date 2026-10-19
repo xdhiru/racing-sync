@@ -384,8 +384,17 @@ class StateStore:
         except Exception:
             mode = ""
         if mode != "wal":
-            log.warning("state DB journal_mode is %r, not WAL; performance may degrade", journal_mode)
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+            # Without WAL, synchronous=NORMAL risks losing the last
+            # committed transaction on a crash/power cut — enforce FULL
+            # so every commit is durable. Loud because this usually means
+            # the DB sits on a filesystem without WAL support.
+            log.warning(
+                "state DB journal_mode is %r, not WAL; forcing "
+                "synchronous=FULL for durability (performance may degrade)",
+                journal_mode)
+            self._conn.execute("PRAGMA synchronous=FULL")
+        else:
+            self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=30000")
         # Bound WAL growth on long-lived coordinators doing per-tick upserts.
         try:
@@ -1181,7 +1190,9 @@ class StateStore:
     def append_log(self, level: str, message: str,
                    source_infohash: str | None = None) -> None:
         self._ensure_open()
-        with self._lock:
+        # Single transaction: a crash between INSERT and prune must never
+        # leave the table over cap (or a prune without its insert).
+        with self._write_tx():
             self._conn.execute(
                 "INSERT INTO run_log (ts, source_infohash, level, message) VALUES (?,?,?,?)",
                 (dt.datetime.now(dt.timezone.utc).isoformat(), source_infohash, level, message),

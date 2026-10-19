@@ -771,3 +771,70 @@ def test_get_many_batches(tmp_path: Path):
         assert store.get_many(None) == {}
     finally:
         store.close()
+
+
+def test_append_log_insert_and_prune_share_one_transaction(tmp_path: Path):
+    """append_log must run inside _write_tx (single BEGIN..COMMIT), so a
+    crash between INSERT and prune can never split the two."""
+    import contextlib
+
+    entered: list[bool] = []
+    real_tx = StateStore._write_tx
+
+    @contextlib.contextmanager
+    def _spy(self):
+        entered.append(True)
+        with real_tx(self):
+            yield
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        StateStore._write_tx = _spy  # type: ignore[method-assign]
+        try:
+            store.append_log("INFO", "hello")
+        finally:
+            StateStore._write_tx = real_tx  # type: ignore[method-assign]
+        assert entered == [True]
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM run_log WHERE message='hello'"
+        ).fetchone()[0] == 1
+    finally:
+        store.close()
+
+
+def test_append_log_prune_caps_table(tmp_path: Path):
+    """600 appends trip the prune counter; the table stays capped."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        for i in range(600):
+            store.append_log("INFO", f"m{i}")
+        n = store._conn.execute("SELECT COUNT(*) FROM run_log").fetchone()[0]
+        assert n == 600
+        # Force the prune path on the next append.
+        for i in range(5000):
+            store._conn.execute(
+                "INSERT INTO run_log (ts, level, message) VALUES (?,?,?)",
+                ("t", "INFO", f"pad{i}"))
+        store._log_append_counter = 499
+        store.append_log("INFO", "trip")
+        n = store._conn.execute("SELECT COUNT(*) FROM run_log").fetchone()[0]
+        assert n <= 5001
+    finally:
+        store.close()
+
+
+def test_non_wal_forces_synchronous_full(tmp_path: Path):
+    """:memory: DBs cannot use WAL: durability must be enforced via
+    synchronous=FULL, while file DBs keep NORMAL."""
+    mem = StateStore(Path(":memory:"))
+    try:
+        mode = mem._conn.execute("PRAGMA synchronous").fetchone()[0]
+        assert mode == 2  # FULL
+    finally:
+        mem.close()
+    disk = StateStore(tmp_path / "s.db")
+    try:
+        mode = disk._conn.execute("PRAGMA synchronous").fetchone()[0]
+        assert mode == 1  # NORMAL under WAL
+    finally:
+        disk.close()
