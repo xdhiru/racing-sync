@@ -572,3 +572,38 @@ async def test_re_add_success_points_save_path_at_fuse(tmp_path: Path):
     row = store.get(pub_hash)
     assert row.state == State.DONE
     assert row.save_path == str(fuse)
+
+
+@pytest.mark.anyio
+async def test_demote_false_done_keeps_concurrent_columns(tmp_path: Path):
+    """Demote must narrow-write save_path, not clobber a concurrent
+    narrow write (timer/display park) with a stale snapshot."""
+    from unittest.mock import AsyncMock, patch
+
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord.cfg = MagicMock()
+        coord.dest_client = AsyncMock()
+        coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+            TorrentFile(name="Solo.mkv", size_bytes=100, progress=1.0)])
+        store.upsert(TorrentState(
+            source_infohash="a" * 40, source_name="Solo",
+            dest_infohash="a" * 40, save_path=str(ssd),
+            state=State.DONE))
+        snap = store.get("a" * 40)
+        # Concurrent timer park lands after our snapshot.
+        store.update_columns("a" * 40, {"indexer_attempts": 7})
+        with patch("racing_sync.recovery.find_content_on_ssd",
+                   return_value=ssd):
+            await coord._demote_false_done_to_moving(snap)
+        row = store.get("a" * 40)
+        assert row.state == State.MOVING
+        assert row.save_path == str(ssd)
+        assert row.indexer_attempts == 7
+    finally:
+        store.close()

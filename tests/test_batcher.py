@@ -2963,3 +2963,26 @@ async def test_scheduler_skips_downloading_spawn_at_cap(tmp_path):
         assert "a" * 40 not in coord._running_infohashes
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_worker_skips_version_moved_row(tmp_path):
+    """A narrow write landing after the tick snapshot makes the worker
+    stand down instead of clobbering it with a stale whole-row write."""
+    from unittest.mock import AsyncMock
+
+    from racing_sync.state import StateStore, TorrentState, State
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        store.upsert(TorrentState(source_infohash="a" * 40,
+                                  source_name="A", state=State.DOWNLOADING))
+        snap = store.get("a" * 40)
+        store.update_columns("a" * 40, {"indexer_attempts": 3})
+        coord._process_torrent_inner = AsyncMock()
+        await coord._process_torrent(snap)
+        coord._process_torrent_inner.assert_not_awaited()
+        assert store.get("a" * 40).state == State.DOWNLOADING
+    finally:
+        store.close()
