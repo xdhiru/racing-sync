@@ -216,6 +216,9 @@ _STARTUP_BACKOFF_S = (2.0, 4.0, 8.0, 16.0)
 # stops grouping ghosts and upserting display names for a dead source.
 _SOURCE_STALE_EXPIRY_S = 300.0
 
+# Worker-stop join budget: cancel() cannot interrupt a to_thread body.
+_STOP_WORKERS_TIMEOUT_S = 30.0
+
 
 async def _start_with_backoff(label: str, factory, *,
                               attempts: int = _STARTUP_ATTEMPTS,
@@ -1171,6 +1174,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         wrapper unwinds through AbandonedError/quiet paths and its
         finally drops the live map. Best-effort and idempotent; unknown
         hashes (and bare test doubles) report False.
+
+        Bounded by _STOP_WORKERS_TIMEOUT_S: cancel() cannot interrupt a
+        worker wedged in a to_thread body (fuse/SFTP syscalls), so the
+        join must not hang the forget/API call behind a leaked thread.
         """
         try:
             h = (infohash or "").strip().lower()
@@ -1190,7 +1197,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 except Exception:
                     pass
             try:
-                await asyncio.gather(*_live, return_exceptions=True)
+                await asyncio.wait_for(
+                    asyncio.gather(*_live, return_exceptions=True),
+                    timeout=_STOP_WORKERS_TIMEOUT_S)
+            except (TimeoutError, asyncio.TimeoutError):
+                log.warning(
+                    "stop_workers_for %s timed out; %d worker(s) linger",
+                    h[:10], len(_live))
             except Exception:
                 pass
             return True
@@ -2524,6 +2537,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                             (ts.source_infohash or "")[:10])
                 self._park_for_indexer_retry(
                     ts, reason="source vanished from VPS1")
+                if ts.state == State.FAILED:
+                    # Max-age tripped inside the park: the row just failed.
+                    # Report plain None (parked/failed) — the caller must
+                    # not run a pseudo-source pick on a FAILED row.
+                    return None
                 return _SOURCE_GONE
             err = f"source torrent vanished from client: {ts.source_infohash[:10]}"
             log.warning(err)

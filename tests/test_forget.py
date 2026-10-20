@@ -649,6 +649,50 @@ async def test_stop_workers_for_cancels_live_task(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_stop_workers_for_times_out_on_wedged_worker(tmp_path, caplog):
+    """A worker refusing cancellation must trip the join timeout (not hang
+    the forget/API call); the timeout is logged."""
+    import asyncio
+    import time
+
+    import racing_sync.coordinator as _core
+    from conftest import make_coordinator
+
+    store = StateStore(tmp_path / "state.db")
+    real_timeout = _core._STOP_WORKERS_TIMEOUT_S
+    _core._STOP_WORKERS_TIMEOUT_S = 0.2
+    try:
+        coord = make_coordinator(store)
+
+        async def _wedged():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                await asyncio.sleep(3600)
+
+        task = asyncio.ensure_future(_wedged())
+        try:
+            for _ in range(10):  # let it reach the first sleep
+                await asyncio.sleep(0)
+                if not task.done():
+                    break
+            coord._worker_tasks = {"a" * 40: {task}}
+            start = time.monotonic()
+            assert await coord.stop_workers_for("a" * 40) is True
+            assert time.monotonic() - start < 5.0
+            assert "timed out" in caplog.text
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+    finally:
+        _core._STOP_WORKERS_TIMEOUT_S = real_timeout
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_spawn_worker_tracks_task_until_done(tmp_path: Path):
     """Spawned workers are tracked for stop_workers_for, then released."""
     import asyncio
