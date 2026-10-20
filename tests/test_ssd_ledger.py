@@ -367,3 +367,16 @@ async def test_wait_disk_retries_against_blob_batches(tmp_path):
         assert row.state == State.QUEUED  # transition mock sets in-memory
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_ledger_freeze_is_loud(tmp_path, caplog):
+    """5000+ ledger entries freeze admissions with an error log, never
+    a silent global stall."""
+    import logging
+
+    coord = _coord_with_cap(tmp_path, 10_000_000)
+    coord._ssd_reserved = {f"{i:040d}": 1 for i in range(5001)}
+    with caplog.at_level(logging.ERROR, logger="racing_sync.coordinator"):
+        assert await coord._ssd_try_reserve("f" * 40, 1) is False
+    assert "freezing admissions" in caplog.text
