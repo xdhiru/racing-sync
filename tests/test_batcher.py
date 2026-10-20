@@ -2941,3 +2941,25 @@ async def test_frozen_cap_freeze_keeps_transition_valid(tmp_path):
         assert store.get("c" * 40).state == State.DOWNLOADING
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_skips_downloading_spawn_at_cap(tmp_path):
+    """A workerless DOWNLOADING row over the download cap is not spawned:
+    spawning would only park inside _try_admit after burning a worker."""
+    from racing_sync.state import StateStore, TorrentState, State
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord.cfg.max_active_downloads = 1
+        coord.cfg.max_concurrent_moves = 1
+        store.upsert(TorrentState(source_infohash="a" * 40,
+                                  source_name="Idle", state=State.DOWNLOADING))
+        store.upsert(TorrentState(source_infohash="b" * 40,
+                                  source_name="Busy", state=State.DOWNLOADING))
+        coord._running_infohashes = {"b" * 40}
+        await coord._schedule_step()
+        assert "a" * 40 not in coord._running_infohashes
+    finally:
+        store.close()
