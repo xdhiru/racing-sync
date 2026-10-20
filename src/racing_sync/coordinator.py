@@ -179,6 +179,11 @@ def _sched_priority(ts) -> tuple[int, str]:
 _STARTUP_ATTEMPTS = 5
 _STARTUP_BACKOFF_S = (2.0, 4.0, 8.0, 16.0)
 
+# Stale source-cache expiry: a wedged VPS1 serves its last-known list for
+# a while (degraded but useful), then the view expires to empty so intake
+# stops grouping ghosts and upserting display names for a dead source.
+_SOURCE_STALE_EXPIRY_S = 300.0
+
 
 async def _start_with_backoff(label: str, factory, *,
                               attempts: int = _STARTUP_ATTEMPTS,
@@ -691,8 +696,21 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             # Wedged/unreachable VPS1 poll: serve the stale cache when
             # there is one, else an empty view — a source outage must
             # degrade the poll, never fail rows or abort the tick from
-            # any caller.
+            # any caller. But a dead source must expire: past
+            # _SOURCE_STALE_EXPIRY_S without a success, serve empty so
+            # intake stops grouping ghosts and upserting display names.
             _stale = getattr(self, "_source_torrents_cache", None) or []
+            try:
+                _stale_age = now_mono - float(
+                    getattr(self, "_source_last_success_mono", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                _stale_age = 0.0
+            if _stale and _stale_age > _SOURCE_STALE_EXPIRY_S:
+                log.error(
+                    "source poll failed (%s) for %ds; expiring stale "
+                    "view (%d torrent(s)): %s",
+                    type(e).__name__, int(_stale_age), len(_stale), e)
+                return []
             log.warning("source poll failed (%s); using %s view: %s",
                         type(e).__name__,
                         "stale cache" if _stale else "empty", e)
@@ -704,12 +722,18 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             time_now = time.time()
             filtered = []
             for t in all_torrents:
-                if t.added_on and (time_now - t.added_on) < min_age:
+                if not getattr(t, "added_on", 0):
+                    # Unknown age admits nothing: an autobrr burst with a
+                    # missing timestamp must wait for a real age, not skip
+                    # the maturity gate.
+                    continue
+                if (time_now - t.added_on) < min_age:
                     continue
                 filtered.append(t)
 
         self._source_torrents_cache = filtered
         self._source_torrents_cached_at = now_mono
+        self._source_last_success_mono = now_mono
         return list(filtered)
 
     def request_stop(self) -> None:

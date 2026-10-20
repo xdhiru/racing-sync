@@ -1,4 +1,4 @@
-"""Source-auth fail-fast: bad credentials surface loudly, rows survive."""
+﻿"""Source-auth fail-fast: bad credentials surface loudly, rows survive."""
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -55,3 +55,54 @@ async def test_worker_leaves_row_on_auth_error(tmp_path):
         assert store.get("a" * 40).state == State.DOWNLOADING
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_stale_source_expires_after_outage():
+    """A wedged source serves stale briefly, then expires to empty so
+    intake stops grouping ghosts for a dead VPS1."""
+    import time
+
+    from racing_sync.clients.abstract import Torrent
+
+    def _coord_with_cache(age_s):
+        coord = make_coordinator()
+        coord.source_client = MagicMock()
+        coord.source_client.list_torrents = AsyncMock(
+            side_effect=TimeoutError("wedged"))
+        coord.cfg.source.category = ""
+        coord._source_torrents_cache = [
+            Torrent(hash="a" * 40, name="Ghost", save_path="/x", category="", state="downloading", progress=0.0,
+                    size_bytes=10)]
+        coord._source_torrents_cached_at = 0.0
+        coord._source_last_success_mono = time.monotonic() - age_s
+        return coord
+
+    # Recent success: degraded stale view.
+    assert len(await _coord_with_cache(60)._list_source_torrents(
+        force_refresh=True)) == 1
+    # Dead for 10 minutes: expired to empty.
+    assert await _coord_with_cache(600)._list_source_torrents(
+        force_refresh=True) == []
+
+
+@pytest.mark.anyio
+async def test_unknown_age_fails_min_age_gate():
+    """Torrents with no added_on are excluded when min_age_seconds > 0."""
+    import time
+
+    from racing_sync.clients.abstract import Torrent
+
+    coord = make_coordinator()
+    now = time.time()
+    coord.source_client = MagicMock()
+    coord.source_client.list_torrents = AsyncMock(return_value=[
+        Torrent(hash="a" * 40, name="Known", save_path="/x", category="", state="downloading", progress=0.0,
+                size_bytes=10, added_on=now - 3600),
+        Torrent(hash="b" * 40, name="Unknown", save_path="/x", category="", state="downloading", progress=0.0,
+                size_bytes=10, added_on=0),
+    ])
+    coord.cfg.source.category = ""
+    coord.cfg.source.min_age_seconds = 60
+    got = await coord._list_source_torrents(force_refresh=True)
+    assert [t.infohash for t in got] == ["a" * 40]
