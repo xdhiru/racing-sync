@@ -508,11 +508,27 @@ class FuseMixin:
             return
         if ssd_root is None:
             return
+        # Narrow write, not whole-row upsert: a concurrent timer/display
+        # park between our read and this write must survive (upsert would
+        # clobber it with our stale snapshot). Re-read fresh for the
+        # transition guard below.
         try:
-            ts.save_path = str(ssd_root)
-            self.store.upsert(ts)
+            _rev = await asyncio.to_thread(
+                self.store.update_columns,
+                (ts.source_infohash or "").lower(),
+                {"save_path": str(ssd_root)})
         except Exception:  # noqa: BLE001
-            pass
+            return
+        if not _rev:
+            return
+        try:
+            ts = await asyncio.to_thread(
+                self.store.get,
+                (ts.source_infohash or "").lower())
+        except Exception:  # noqa: BLE001
+            return
+        if ts is None:
+            return
         try:
             self.transition(ts, State.MOVING)
             log.warning(

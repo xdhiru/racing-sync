@@ -1895,6 +1895,21 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                         ts.source_infohash[:10], ts.state.value, _fresh.state.value,
                     )
                     return
+                try:
+                    _fresh_v = int(getattr(_fresh, "version", 0) or 0)
+                    _snap_v = int(getattr(ts, "version", 0) or 0)
+                except (TypeError, ValueError, AttributeError):
+                    _fresh_v = _snap_v = 0
+                if _fresh_v != _snap_v:
+                    # A concurrent narrow write (timer/display park) landed
+                    # after the tick snapshot: our snapshot would clobber
+                    # it via a later whole-row upsert. Skip; the next tick
+                    # respawns with a fresh snapshot.
+                    log.info(
+                        "worker: %s version %d -> %d under us; skipping stale worker",
+                        ts.source_infohash[:10], _snap_v, _fresh_v,
+                    )
+                    return
             try:
                 await self._process_torrent_inner(ts)
             finally:
