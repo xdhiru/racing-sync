@@ -6,8 +6,31 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from conftest import make_coordinator
 
+from racing_sync.clients.abstract import Torrent
 from racing_sync.clients.http_base import AuthError
 from racing_sync.state import State, StateStore, TorrentState
+
+
+def _src(h, trackers=("https://alpha.cc/announce/xyz",)):
+    return Torrent(hash=h, name="Show", save_path="/x", category="",
+                   state="downloading", progress=0.0, size_bytes=10,
+                   trackers=list(trackers))
+
+
+def test_cached_source_lookup_shares_index_per_tick():
+    """One O(N) index build per cache version, shared across lookups."""
+    coord = make_coordinator()
+    coord._source_torrents_cache = [_src("a" * 40)]
+    assert coord._cached_source_torrent("a" * 40) is not None
+    assert coord._cached_source_torrent("b" * 40) is None
+    idx = coord._source_cache_index
+    assert coord._cached_source_torrent("a" * 40) is not None
+    assert coord._source_cache_index is idx
+    # Cache replaced on refresh: index rebuilds, old entry gone.
+    coord._source_torrents_cache = [_src("b" * 40)]
+    assert coord._cached_source_torrent("a" * 40) is None
+    assert coord._cached_source_torrent("b" * 40) is not None
+    assert coord._source_cache_index is not idx
 
 
 @pytest.mark.anyio

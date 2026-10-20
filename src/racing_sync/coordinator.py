@@ -149,22 +149,54 @@ _SCHED_STATE_PRIORITY = {
 }
 
 
-def _sched_priority(ts) -> tuple[int, str]:
+def _sched_priority(ts) -> tuple[int, dt.datetime]:
     """Worker-scheduling order key (lower first, then oldest first).
 
     all_active() ordering is DB-dependent; without an explicit priority,
     bulk NEW rows fill every worker slot each tick and starve the bounded
-    pipeline states behind them.
+    pipeline states behind them. Compares real timestamps: rows with no
+    (or unparsable) updated_at sort LAST, never first — broken rows must
+    not permanently prioritize themselves.
     """
+    _FAR = dt.datetime.max.replace(tzinfo=dt.timezone.utc)
     try:
         prio = _SCHED_STATE_PRIORITY.get(ts.state, 1)
     except Exception:
         prio = 1
     try:
-        updated = str(getattr(ts, "updated_at", "") or "")
+        updated = getattr(ts, "updated_at", None)
+        if updated is None:
+            return (prio, _FAR)
+        if isinstance(updated, str):
+            if not updated:
+                return (prio, _FAR)
+            updated = dt.datetime.fromisoformat(updated)
+        if isinstance(updated, dt.datetime):
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=dt.timezone.utc)
+            return (prio, updated)
     except Exception:
-        updated = ""
-    return (prio, updated)
+        pass
+    return (prio, _FAR)
+
+
+def _elect_primary_torrent(group: list) -> object:
+    """Elect ONE primary torrent for SSD download, deterministically.
+
+    Client list order is arbitrary across restarts, so the group is
+    sorted by (size, name, hash) first — the same election the picker
+    uses — then the first public copy wins, else the first private.
+    A nondeterministic primary flips source_infohash across restarts
+    and can SSD-pick a different copy than the row tracks.
+    """
+    ordered = sorted(
+        group,
+        key=lambda t: ((getattr(t, "size_bytes", 0) or 0),
+                       (getattr(t, "name", "") or ""),
+                       (getattr(t, "infohash", "") or "").lower()),
+    )
+    return next((t for t in ordered if _looks_public(t.trackers)),
+                ordered[0])
 
 
 # --------------------------------------------------------------------------- #
@@ -1271,7 +1303,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         # Elect ONE primary torrent for SSD download:
         # 1. Prefer public torrent if available (req #1)
         # 2. Otherwise pick first private torrent to query the download-target indexers (req #2)
-        primary = next((t for t in group if _looks_public(t.trackers)), group[0])
+        primary = _elect_primary_torrent(group)
         is_pub = _looks_public(primary.trackers)
 
         ts = TorrentState(
@@ -2232,23 +2264,43 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             cache = getattr(self, "_source_torrents_cache", None)
             if not cache:
                 return None
+            # Memoized infohash index: the list object is replaced on
+            # every refresh, so id() keys the index's lifetime. Per-tick
+            # callers (every worker, every tick) share one O(N) build
+            # instead of each paying an O(N) scan.
+            try:
+                _memo = getattr(self, "_source_cache_index", None)
+                if (not isinstance(_memo, tuple) or len(_memo) != 2
+                        or _memo[0] != id(cache)):
+                    _idx: dict[str, object] = {}
+                    for _st in cache:
+                        try:
+                            _ih = (getattr(_st, "infohash", "") or "").lower()
+                        except Exception:
+                            continue
+                        if _ih and _ih not in _idx:
+                            _idx[_ih] = _st
+                    self._source_cache_index = (id(cache), _idx)
+                    _memo = self._source_cache_index
+                st = _memo[1].get(want)
+            except Exception:
+                st = None
+            if st is None:
+                return None
             _is_deluge = isinstance(
                 getattr(self, "source_client", None), DelugeClient)
-            for st in cache:
+            try:
+                if _is_deluge:
+                    return st
                 try:
-                    if (getattr(st, "infohash", "") or "").lower() != want:
-                        continue
-                    if _is_deluge:
-                        return st
-                    try:
-                        _trs = getattr(st, "trackers", None) or []
-                    except Exception:
-                        _trs = []
-                    if any(bool(u and str(u).strip()) for u in _trs):
-                        return st
-                    return None
+                    _trs = getattr(st, "trackers", None) or []
                 except Exception:
-                    continue
+                    _trs = []
+                if any(bool(u and str(u).strip()) for u in _trs):
+                    return st
+                return None
+            except Exception:
+                return None
         except Exception:
             pass
         return None
