@@ -2720,6 +2720,54 @@ async def test_source_group_poison_does_not_skip_siblings(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_source_group_batches_lookups(tmp_path):
+    """One release group costs one get_many plus one find_by_name per
+    distinct name, not one blocking round-trip per member."""
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import StateStore
+
+    def _t(h):
+        return Torrent(hash=h, name="Batch.Show.S01E01.1080p",
+                       category="racing", save_path="/x",
+                       size_bytes=100, state="downloading", progress=0.1)
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        get_many_calls: list[list] = []
+        real_get_many = store.get_many
+        real_find = store.find_by_name
+        find_calls: list[str] = []
+
+        def _counting_get_many(hashes):
+            get_many_calls.append(list(hashes))
+            return real_get_many(hashes)
+
+        def _counting_find(name):
+            find_calls.append(name)
+            return real_find(name)
+
+        store.get_many = _counting_get_many
+        store.find_by_name = _counting_find
+        try:
+            await coord._poll_source_racing(
+                [_t("c" * 40), _t("d" * 40), _t("e" * 40)])
+        finally:
+            store.get_many = real_get_many
+            store.find_by_name = real_find
+        assert len(get_many_calls) == 1
+        assert sorted(get_many_calls[0]) == ["c" * 40, "d" * 40, "e" * 40]
+        assert find_calls == ["Batch.Show.S01E01.1080p"]
+        # One NEW row for the group (lowest-hash primary), rest untracked.
+        row = store.get("c" * 40, include_blob=False)
+        assert row is not None and row.state.value == "new"
+        for h in ("d" * 40, "e" * 40):
+            assert store.get(h, include_blob=False) is None
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_await_hash_survives_blip_then_finds():
     """A wedged WebUI degrades the lookup instead of wedging the worker."""
     from racing_sync.clients.abstract import Torrent
