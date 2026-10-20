@@ -1279,15 +1279,40 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             return None
         # Check if any torrent in this release group is already tracked in state store
         # (state.get normalizes case internally — one lookup suffices).
+        # One batched round-trip (off the loop) instead of a blocking
+        # get per member; first group member present wins, as before.
         existing_ts: TorrentState | None = None
+        try:
+            _hashes = [(_t.infohash or "").lower() for _t in group
+                       if (_t.infohash or "").strip()]
+            _by_hash = await asyncio.to_thread(
+                self.store.get_many, _hashes) if _hashes else {}
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A failed dedup lookup must not ingest a possible duplicate:
+            # skip the group this tick (the caller isolates groups); the
+            # next poll retries.
+            return None
         for t in group:
-            found_ts = self.store.get(t.infohash, include_blob=False)
+            found_ts = (_by_hash or {}).get((t.infohash or "").lower())
             if found_ts is not None:
                 existing_ts = found_ts
                 break
         if existing_ts is None:
+            # Group members usually share one release name: dedupe it so
+            # the fuzzy LIKE runs once per distinct name, off the loop.
+            _seen_names: set[str] = set()
             for t in group:
-                matches = self.store.find_by_name(t.name)
+                _nm = getattr(t, "name", "") or ""
+                if _nm in _seen_names:
+                    continue
+                _seen_names.add(_nm)
+                # Off the loop but still fatal to the group: a failed
+                # dedup lookup must not ingest a possible duplicate
+                # (the caller isolates groups; the next poll retries).
+                matches = await asyncio.to_thread(
+                    self.store.find_by_name, _nm)
                 if matches:
                     # find_by_name is a fuzzy LIKE: require the same
                     # normalized release AND (when both known) the same
@@ -1311,7 +1336,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             if group and group[0].name and group[0].name != existing_ts.source_name:
                 existing_ts.source_name = group[0].name
                 try:
-                    self.store.upsert(existing_ts)
+                    await asyncio.to_thread(self.store.upsert, existing_ts)
                 except Exception:  # noqa: BLE001
                     pass
             if existing_ts.state == State.DONE and self.cfg.cross_seed.inject_racing_torrents_to_fuse:
@@ -1332,7 +1357,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             source_announce_url=primary.trackers[0] if primary.trackers else "",
             state=State.NEW,
         )
-        self.store.upsert(ts)
+        await asyncio.to_thread(self.store.upsert, ts)
         log.info(
             "discovered racing release: %s (%s) [elected %s primary from %d duplicate(s)]",
             primary.name,
