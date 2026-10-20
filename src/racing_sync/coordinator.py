@@ -1651,8 +1651,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 if ts.readd_next_retry_at > now_utc:
                     continue
 
-            # Limit concurrent active qBittorrent additions / downloads on SSD
-            if ts.state == State.QUEUED and active_downloads >= self.cfg.max_active_downloads:
+            # Limit concurrent active qBittorrent additions / downloads on SSD.
+            # Both QUEUED and workerless DOWNLOADING rows consume a slot:
+            # spawning over cap just parks inside _try_admit after burning
+            # a worker plus a dest list_torrents storm.
+            if ts.state in (State.QUEUED, State.DOWNLOADING) and active_downloads >= self.cfg.max_active_downloads:
                 continue
 
             # Limit concurrent active rclone move commands
