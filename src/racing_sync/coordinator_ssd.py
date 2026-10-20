@@ -384,23 +384,35 @@ class SSDLedgerMixin:
             await self._ssd_prune_stale()
         except Exception:
             pass
+        # Ledger-cap pre-check without the lock (re-validated under it
+        # below); the physical disk stat likewise runs BEFORE acquire —
+        # a stat on a slow/dead mount must never stall all admissions
+        # behind the ledger lock.
+        try:
+            cap = self._ssd_global_cap()
+            if cap is not None and self._ssd_reserved_total() + amount > cap:
+                return False
+        except Exception:
+            pass
+        try:
+            from . import coordinator as _c
+
+            if not _c.ssd_has_room(self.cfg, amount):
+                return False
+        except Exception:
+            return False
         lk = await self._ssd_lock_for()
         if lk is not None:
             await lk.acquire()
         try:
             cap = self._ssd_global_cap()
-            if cap is not None:
-                if self._ssd_reserved_total() + amount > cap:
-                    return False
-                if len(getattr(self, "_ssd_reserved", {})) > 5000:
-                    return False
-            # Physical free check last (stable estimate first).
-            try:
-                from . import coordinator as _c
-
-                if not _c.ssd_has_room(self.cfg, amount):
-                    return False
-            except Exception:
+            if cap is not None and self._ssd_reserved_total() + amount > cap:
+                return False
+            if len(getattr(self, "_ssd_reserved", {})) > 5000:
+                log.error(
+                    "ssd ledger holds %d entries; freezing admissions "
+                    "until the prune catches up",
+                    len(getattr(self, "_ssd_reserved", {})))
                 return False
             try:
                 d = getattr(self, "_ssd_reserved", None)
@@ -456,32 +468,22 @@ class SSDLedgerMixin:
                 return False
         except Exception:
             return False
-        lk = await self._ssd_lock_for()
-        if lk is not None:
-            await lk.acquire()
+        # Pre-read the holding without the lock (re-validated under it
+        # below): the physical check for a grow must not run while
+        # holding the ledger lock.
         try:
-            d = getattr(self, "_ssd_reserved", None)
-            if not isinstance(d, dict):
-                try:
-                    d = {}
-                    self._ssd_reserved = d  # type: ignore[attr-defined]
-                except Exception:
-                    return True
-            old = int(d.get(key, 0) or 0)
-            if new_amount <= old:
-                d[key] = new_amount
-                return True
-            cap = self._ssd_global_cap()
-            if cap is not None and self._ssd_reserved_total() - old + new_amount > cap:
-                return False
+            _d0 = getattr(self, "_ssd_reserved", None)
+            _old_pre = int((_d0.get(key, 0) if isinstance(_d0, dict) else 0) or 0)
+        except Exception:
+            _old_pre = 0
+        if new_amount > _old_pre:
             # Grow: admission's physical check covered only the old
             # (smaller) estimate — the delta must fit the live disk now.
             # Fail-closed like rclone_ops.disk_free_bytes_at: when free
             # space is unmeasurable (unstatable path) refuse the grow —
             # an SSD row that can't prove room must wait, not overcommit
             # past ENOSPC. Test doubles opt out via ssd.path=None (which
-            # keeps the old permissive path). Offloaded: disk stat on a
-            # slow/dead mount must not stall the event loop.
+            # keeps the old permissive path).
             # (disk_free_bytes_at conflates unstatable with 0-free, so
             # probe statability directly first.)
             try:
@@ -497,11 +499,34 @@ class SSDLedgerMixin:
                     from .io_bounds import offload as _offload
 
                     await _offload(_shutil.disk_usage, str(_sp))
-                    _room_ok = _c.ssd_has_room(self.cfg, new_amount - old)
+                    _room_ok = _c.ssd_has_room(self.cfg, new_amount - _old_pre)
             except Exception as e:
                 log.warning("ssd grow physical check unavailable (%s); refusing grow", e)
                 _room_ok = False
             if not _room_ok:
+                return False
+        lk = await self._ssd_lock_for()
+        if lk is not None:
+            await lk.acquire()
+        try:
+            d = getattr(self, "_ssd_reserved", None)
+            if not isinstance(d, dict):
+                try:
+                    d = {}
+                    self._ssd_reserved = d  # type: ignore[attr-defined]
+                except Exception:
+                    return True
+            old = int(d.get(key, 0) or 0)
+            if old < _old_pre:
+                # The ledger moved under our lock-free check (concurrent
+                # shrink/release): the validated delta understates.
+                # Refuse; the caller rolls back and retries next tick.
+                return False
+            if new_amount <= old:
+                d[key] = new_amount
+                return True
+            cap = self._ssd_global_cap()
+            if cap is not None and self._ssd_reserved_total() - old + new_amount > cap:
                 return False
             d[key] = new_amount
             return True
