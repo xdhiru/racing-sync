@@ -1024,10 +1024,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             if not item_hash:
                 continue
             ingested = False
-            _existing = self.store.get(item_hash, include_blob=False)
+            # Sync store I/O rides a worker thread: a WAL stall must not
+            # block the poller loop behind the GIL.
+            _existing = await asyncio.to_thread(
+                self.store.get, item_hash, include_blob=False)
             if _existing is None:
                 try:
-                    _ignored = self.store.is_ignored(item_hash) is True
+                    _ignored = await asyncio.to_thread(
+                        self.store.is_ignored, item_hash) is True
                 except Exception:
                     _ignored = False
                 if _ignored:
@@ -1049,7 +1053,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     state=State.NEW,
                 )
                 ts._blob = item.torrent_bytes
-                self.store.upsert(ts)
+                await asyncio.to_thread(self.store.upsert, ts)
                 ingested = True
                 log.info(
                     "discovered watch-dir release: %s (%s, %d bytes) announce=%s",
@@ -1064,7 +1068,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 # retrying it by hand: revive into a fresh pipeline run
                 # (cancelled/ignored hashes stay ignored — unignore first).
                 try:
-                    self.revive_failed_row(
+                    await asyncio.to_thread(
+                        self.revive_failed_row,
                         infohash=item_hash, name=item.name,
                         size=item.size_bytes,
                         announce=item.announce_url or "",
@@ -1112,10 +1117,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 if ingested:
                     await self.watch.delete_picked_up(item)
                 else:
-                    try:
-                        existing = self.store.get(item_hash, include_blob=False)
-                    except Exception:
-                        existing = None
+                    # Reuse the loop-top snapshot: nothing in this tick
+                    # mutated a non-ingested item, so a second get is a
+                    # wasted round-trip (a concurrent DONE transition is
+                    # picked up on the next scan).
+                    existing = _existing
                     if existing is not None and existing.state == State.DONE:
                         log.info(
                             "watch-dir: %s (%s) already done; removing duplicate drop",

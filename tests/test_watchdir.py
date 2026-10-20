@@ -2274,3 +2274,45 @@ async def test_watch_redrop_ignored_stays(tmp_path: Path):
         assert (watch_dir / "ignored.torrent").exists()
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_scan_watch_done_duplicate_single_lookup(tmp_path: Path):
+    """A re-dropped duplicate of a DONE row is removed like a fresh
+    ingest, using the loop-top snapshot (no second store.get)."""
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    raw = _create_sample_torrent_data("Done.Release", 1000,
+                                      "http://tracker.example/announce")
+    from racing_sync.watchdir import _bencoded_info_hash as _bh2
+    infohash, _, _, _ = _bh2(raw)
+    (watch_dir / "dup.torrent").write_bytes(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(
+        source_infohash=infohash, source_name="Done.Release",
+        state=State.DONE))
+    calls: list[str] = []
+    real_get = store.get
+
+    def _counting(h, **kw):
+        calls.append(h)
+        return real_get(h, **kw)
+
+    store.get = _counting  # type: ignore[method-assign]
+    coord = make_coordinator()
+    coord.cfg = MagicMock()
+    coord.cfg.watch_dir = WatchDirConfig(path=watch_dir,
+                                         delete_after_pickup=True)
+    coord.store = store
+    coord.watch = WatchDirScanner(coord.cfg.watch_dir, prowlarr=None)
+    try:
+        items = await coord.scan_watch()
+        assert len(items) == 1
+        assert not (watch_dir / "dup.torrent").exists()
+        assert store.get(infohash).state == State.DONE
+        # Exactly one lookup during the scan (the second entry is the
+        # assert above): the DONE check reuses the loop-top snapshot.
+        assert calls == [infohash, infohash]
+    finally:
+        store.close()
