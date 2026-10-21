@@ -58,6 +58,17 @@ class AdmitMixin:
         A sticky per-row `force_direct` (Telegram /fetch_ or a previous
         prowlarr-timeout fallback) bypasses Prowlarr for every pick.
         """
+        # Grace-hold throttle: a held NEW row re-checks at most once per
+        # search interval (not every tick) — the full Prowlarr pick below
+        # is the most expensive call in the intake path.
+        try:
+            _gh = getattr(self, "_grace_hold_until", None)
+            _until = (_gh.get((ts.source_infohash or "").lower())
+                      if isinstance(_gh, dict) else None)
+            if _until is not None and time.monotonic() < float(_until):
+                return
+        except Exception:
+            pass
         if getattr(ts, "force_direct", 0):
             attempt_prowlarr = False
         # Patched in tests as racing_sync.coordinator.pick_ssd_source_for_racing:
@@ -145,11 +156,34 @@ class AdmitMixin:
             except Exception:
                 _hold = False
             if _hold:
+                _left = self._preferred_grace_left(ts)
                 log.info(
                     "holding %s for preferred copy (non-preferred direct, "
                     "%ds grace left)",
-                    ts.source_name[:60], self._preferred_grace_left(ts),
+                    ts.source_name[:60], _left,
                 )
+                # Throttle re-picks to the search cadence (watch-flow
+                # parity): re-check when grace ends or the next search is
+                # due, whichever comes first — not every tick.
+                try:
+                    _ri = float(getattr(
+                        getattr(self.cfg, "cross_seed", None),
+                        "prowlarr_retry_interval_seconds", 1800) or 1800)
+                except (TypeError, ValueError):
+                    _ri = 1800.0
+                try:
+                    _holds = getattr(self, "_grace_hold_until", None)
+                    if not isinstance(_holds, dict):
+                        _holds = {}
+                        self._grace_hold_until = _holds  # type: ignore[attr-defined]
+                    _holds[(ts.source_infohash or "").lower()] = (
+                        time.monotonic()
+                        + min(max(0.0, float(_left or 0)), max(60.0, _ri)))
+                    if len(_holds) > 5000:
+                        for _k in list(_holds.keys())[: len(_holds) - 5000]:
+                            _holds.pop(_k, None)
+                except Exception:
+                    pass
                 return
 
         ts.cross_seed_infohash = decision.infohash.lower()
