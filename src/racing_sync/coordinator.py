@@ -458,6 +458,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
 
     async def start(self) -> None:
         log.info("coordinator starting")
+        self._boot_mono = time.monotonic()
         # Build marker: proves which ordering-guarantee build a log file ran.
         # Bump when the fresh-DB / late-seed ordering rules change.
         log.info("build ordering-guard v3 active (move-before-inject, DONE->MOVING demotion)")

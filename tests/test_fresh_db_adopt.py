@@ -607,3 +607,25 @@ async def test_demote_false_done_keeps_concurrent_columns(tmp_path: Path):
         assert row.indexer_attempts == 7
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_late_seed_defers_unseen_rows_after_boot():
+    """Cold memo on restart: unseen DONE rows defer past the boot grace
+    (hash-jittered) instead of each firing a full check on poll one."""
+    import time
+    from unittest.mock import AsyncMock
+
+    coord = make_coordinator()
+    coord._boot_mono = time.monotonic()
+    coord.dest_client = AsyncMock()
+    coord.source_client = AsyncMock()
+    for h in ("a" * 40, "b" * 40):
+        ts = TorrentState(source_infohash=h, source_name="Show",
+                          state=State.DONE)
+        await coord._check_and_inject_late_cross_seeds(ts, [])
+    assert coord.dest_client.mock_calls == []
+    assert coord.source_client.mock_calls == []
+    ok_at = coord._late_seed_ok_at
+    assert set(ok_at) == {"a" * 40, "b" * 40}
+    assert all(v > time.monotonic() for v in ok_at.values())
