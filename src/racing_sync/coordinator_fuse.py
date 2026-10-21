@@ -28,6 +28,11 @@ from .state import State, TorrentState
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
 
+# Post-restart late-seed grace: unseen DONE rows defer their first check
+# past this window (plus hash jitter) so a cold memo doesn't fire one
+# full check per DONE row on the first poll.
+_LATE_SEED_BOOT_GRACE_S = 300.0
+
 
 class FuseMixin:
     """Late cross-seeds + fuse-entry management (duck-typed ``self``)."""
@@ -48,6 +53,38 @@ class FuseMixin:
         except Exception:
             pass
         self._late_seed_sweep()
+        # Post-restart burst guard: the memo is cold on boot, so every
+        # DONE row would otherwise run a full check (dest export + fuse
+        # stats) on the first poll. Unseen rows defer past a short grace
+        # window with hash jitter, spreading the burst over minutes.
+        try:
+            _boot = float(getattr(self, "_boot_mono", 0.0) or 0.0)
+        except Exception:
+            _boot = 0.0
+        if _boot and _row_key:
+            _age = time.monotonic() - _boot
+            if 0 <= _age < _LATE_SEED_BOOT_GRACE_S:
+                try:
+                    _failed = getattr(self, "_failed_late_cross_seeds", None)
+                    _seen = ((_ok_at is not None and _row_key in _ok_at)
+                             or (isinstance(_failed, dict) and _row_key in _failed))
+                except Exception:
+                    _seen = True
+                if not _seen:
+                    try:
+                        _jitter = float(int(_row_key[:8], 16) % 240)
+                    except Exception:
+                        _jitter = 0.0
+                    try:
+                        if not isinstance(_ok_at, dict):
+                            _ok_at = {}
+                            self._late_seed_ok_at = _ok_at
+                        _ok_at[_row_key] = (time.monotonic()
+                                            + (_LATE_SEED_BOOT_GRACE_S - _age)
+                                            + _jitter)
+                    except Exception:
+                        pass
+                    return
         _injected_before = ts.injected_private_hashes
         _save_before = ts.save_path
         # DONE row whose save_path is not on fuse *may* never have completed
