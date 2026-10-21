@@ -1339,6 +1339,36 @@ async def test_pick_and_admit_holds_nonpreferred_direct():
 
 
 @pytest.mark.anyio
+async def test_pick_and_admit_throttles_held_repick():
+    """A grace-held NEW row re-picks at most once per search interval,
+    not once per tick."""
+    from unittest.mock import AsyncMock, patch
+
+    from racing_sync.coordinator_content import SourceDecision
+
+    coord = _pick_coord()
+    coord.cfg.general.preferred_copy_grace_seconds = 3600
+    coord.cfg.prowlarr.download_indexers = [MagicMock()]
+    coord.cfg.prowlarr.is_download_indexer = MagicMock(return_value=False)
+    coord.prowlarr = None
+    decision = SourceDecision(
+        torrent_bytes=b"x", source_label="private-export-fallback",
+        name="Grace.Show", size_bytes=100, infohash="e" * 40,
+        preferred=False)
+    ts = TorrentState(source_infohash="e" * 40, source_name="Grace.Show",
+                      state=State.NEW)
+    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
+               AsyncMock(return_value=decision)) as mock_pick:
+        await coord._pick_and_admit(
+            ts, _grace_st("e" * 40, "https://unknown.example/announce"), [])
+        assert ts.state == State.NEW
+        await coord._pick_and_admit(
+            ts, _grace_st("e" * 40, "https://unknown.example/announce"), [])
+        assert ts.state == State.NEW
+        assert mock_pick.await_count == 1
+
+
+@pytest.mark.anyio
 async def test_pick_and_admit_exemption_and_preferred_proceed():
     """/prefer_ exemption and preferred direct commits skip the hold."""
     coord = _pick_coord()
