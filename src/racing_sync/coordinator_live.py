@@ -9,6 +9,7 @@ every exit path, and the Telegram bot reads the guarded snapshot maps.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from .io_bounds import chunked, rpc
@@ -22,19 +23,31 @@ class LiveStatusMixin:
     """In-flight download tracking (duck-typed ``self``)."""
 
     async def _refresh_live_status(self) -> None:
-        """Re-query VPS2 progress and update the live map."""
+        """Re-query VPS2 progress and update the live map.
+
+        Chunks fetch in parallel (4-wide, each RPC-bounded): 10k live
+        hashes no longer pay 100 serial round-trips per scheduler tick.
+        One chunk failing aborts the refresh like the old serial loop —
+        the next tick retries; partial rows are never applied.
+        """
         if not self._live:
             return
-        rows: list = []
-        try:
-            for _chunk in chunked(list(self._live.keys())):
-                rows.extend(await rpc(
+        _chunks = list(chunked(list(self._live.keys())))
+        _sem = asyncio.Semaphore(4)
+
+        async def _one(_chunk):
+            async with _sem:
+                return await rpc(
                     self.dest_client.list_torrents(hashes=_chunk),
                     getattr(self, "cfg", None), "dest live list_torrents",
-                ) or [])
+                ) or []
+
+        try:
+            _parts = await asyncio.gather(*(_one(c) for c in _chunks))
         except Exception as e:  # noqa: BLE001
             log.warning("list_torrents for live status failed: %s", e)
             return
+        rows = [t for _part in _parts for t in _part]
         for t in rows:
             item = self._live.get(t.hash.lower())
             if item is None:
