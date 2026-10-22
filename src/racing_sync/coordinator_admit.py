@@ -443,6 +443,12 @@ class AdmitMixin:
             h = (ts.source_infohash or "").lower()
             if not h:
                 return False
+            if self._fuse_sweep_covers(ts):
+                # The tick sweep already looked this workerless row up
+                # (no entry then): skip the redundant per-row RPC. Rows
+                # with live workers are never covered — the sweep skips
+                # them, so their own check still runs.
+                return False
             try:
                 existing = await rpc(
                     dest_client.list_torrents(hashes=[h]),
@@ -507,6 +513,7 @@ class AdmitMixin:
                 hashes.append(h)
                 candidates.append(ts)
             if not hashes:
+                self._note_fuse_sweep_covered()
                 return
             try:
                 # Chunked + RPC-bounded: >~100 hashes risks URL limits
@@ -521,6 +528,7 @@ class AdmitMixin:
                 log.warning("manual fuse sweep: dest lookup failed: %s", e)
                 return
             if not existing:
+                self._note_fuse_sweep_covered()
                 return
             by_hash = {}
             for t in existing or []:
@@ -561,8 +569,44 @@ class AdmitMixin:
                         return
 
             await asyncio.gather(*(_verify_one(ts) for ts in candidates))
+            self._note_fuse_sweep_covered()
         except Exception as e:  # noqa: BLE001
             log.warning("manual fuse sweep failed: %s", e)
+
+    def _note_fuse_sweep_covered(self) -> None:
+        """Stamp a completed fuse sweep: per-row adopt checks covered by
+        it may skip their own dest lookup until the next sweep."""
+        try:
+            self._last_fuse_sweep_mono = time.monotonic()
+        except Exception:
+            pass
+
+    def _fuse_sweep_covers(self, ts: TorrentState) -> bool:
+        """True when the last sweep already checked this row this tick.
+
+        Only workerless rows are covered: the sweep skips hashes with
+        live workers, so a row running its own _do_* check must still
+        look itself up.
+        """
+        try:
+            _at = float(getattr(self, "_last_fuse_sweep_mono", 0.0) or 0.0)
+            if time.monotonic() - _at <= 0:
+                return False
+            try:
+                _interval = float(getattr(
+                    getattr(getattr(self, "cfg", None), "general", None),
+                    "source_poll_interval", 30) or 30)
+            except (TypeError, ValueError):
+                _interval = 30.0
+            if time.monotonic() - _at > max(30.0, _interval):
+                return False
+            _running = getattr(self, "_running_infohashes", None)
+            if isinstance(_running, set) and (
+                    (ts.source_infohash or "").lower() in _running):
+                return False
+            return True
+        except Exception:
+            return False
 
     async def _do_new(self, ts: TorrentState) -> None:
         # Label-set check only (no blob-dir probe): at NEW time every watch

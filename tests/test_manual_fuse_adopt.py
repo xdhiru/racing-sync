@@ -283,3 +283,33 @@ async def test_tick_sweep_skips_live_workers(tmp_path: Path):
     # Skipped before any dest RPC.
     coord.dest_client.list_torrents.assert_not_called()
     assert store.get(ha).state == State.NEW
+
+
+@pytest.mark.anyio
+async def test_adopt_skipped_when_sweep_covered(tmp_path: Path):
+    """A workerless row checked by this tick's sweep skips its own dest
+    lookup; rows with live workers still check."""
+    store = StateStore(tmp_path / "state.db")
+    h = "f" * 40
+    store.upsert(TorrentState(source_infohash=h, source_name="Pack",
+                              state=State.NEW))
+    coord = make_coordinator()
+    coord.store = store
+    coord._running_infohashes = set()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    try:
+        ts = store.get(h)
+        # No sweep yet: lookup runs.
+        assert await coord._adopt_manual_fuse_if_present(ts) is False
+        assert coord.dest_client.list_torrents.await_count == 1
+        # Sweep covered workerless rows this tick: lookup skipped.
+        coord._note_fuse_sweep_covered()
+        assert await coord._adopt_manual_fuse_if_present(ts) is False
+        assert coord.dest_client.list_torrents.await_count == 1
+        # Live worker of its own: the sweep skips it, so it checks.
+        coord._running_infohashes = {h}
+        assert await coord._adopt_manual_fuse_if_present(ts) is False
+        assert coord.dest_client.list_torrents.await_count == 2
+    finally:
+        store.close()
