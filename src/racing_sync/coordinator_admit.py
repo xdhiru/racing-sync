@@ -109,9 +109,15 @@ class AdmitMixin:
                     # clock is spent, so a single SFTP blip at the deadline
                     # must not fail the row outright. Direct attempts run
                     # the normal interval until one full window passes.
+                    # The public-export clock resets with it: the row now
+                    # runs a direct phase, and a stale public schedule
+                    # would misroute its wakeups.
                     ts.force_direct = 1
                     ts.indexer_first_queried_at = dt.datetime.now(dt.timezone.utc)
                     ts.indexer_attempts = 0
+                    ts.public_export_first_attempted_at = None
+                    ts.public_export_attempts = 0
+                    ts.public_export_next_retry_at = None
                     self.store.upsert(ts)
                 except Exception:
                     pass

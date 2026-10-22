@@ -883,6 +883,33 @@ async def test_pick_and_admit_timeout_falls_back_to_racing():
 
 
 @pytest.mark.anyio
+async def test_pick_and_admit_timeout_resets_public_clock():
+    """The direct-phase fallback resets the public-export clock with the
+    indexer clock so later wakeups aren't misrouted."""
+    import datetime as dt
+    from unittest.mock import AsyncMock, patch
+
+    coord = _pick_coord(fallback_to_racing_torrent_on_prowlarr_timeout=True)
+    _now = dt.datetime.now(dt.timezone.utc)
+    ts = TorrentState(
+        source_infohash="d" * 40, state=State.WAITING_INDEXER,
+        indexer_first_queried_at=_past_max_age(coord.cfg),
+        indexer_attempts=40,
+        public_export_first_attempted_at=_now,
+        public_export_attempts=5,
+        public_export_next_retry_at=_now,
+    )
+    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
+               new_callable=AsyncMock) as pick:
+        pick.side_effect = [None, _decision()]
+        await coord._pick_and_admit(ts, _priv_st(), [])
+    assert ts.force_direct == 1
+    assert ts.public_export_first_attempted_at is None
+    assert ts.public_export_attempts == 0
+    assert ts.public_export_next_retry_at is None
+
+
+@pytest.mark.anyio
 async def test_pick_and_admit_timeout_without_flag_parks():
     from unittest.mock import AsyncMock, patch
 
