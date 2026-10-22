@@ -45,6 +45,10 @@ from .state import State, TorrentState
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
 
+# Live-content snapshot sharing window: _inflight_same_content callers
+# (workers + Telegram notes) share one all_active() scan per window.
+_INFLIGHT_SNAPSHOT_S = 30.0
+
 
 class AdmitMixin:
     async def _pick_and_admit(self, ts: TorrentState, st, others: list,
@@ -737,10 +741,14 @@ class AdmitMixin:
         Stays synchronous: the Telegram refresh loop calls this (via
         _watch_wait_note) inline, and it is one indexed SELECT — the
         heavy list scans live on offloaded paths instead.
+
+        The active-list snapshot is shared for _INFLIGHT_SNAPSHOT_S: N
+        invocations per tick (workers + Telegram notes) share one scan
+        instead of each paying O(rows).
         """
         try:
             me = (ts.source_infohash or "").lower()
-            rows = self.store.all_active()
+            rows = self._inflight_snapshot_rows()
         except Exception:
             return None
         try:
@@ -764,6 +772,22 @@ class AdmitMixin:
         except Exception:
             pass
         return None
+
+    def _inflight_snapshot_rows(self):
+        """all_active() snapshot shared for _INFLIGHT_SNAPSHOT_S seconds."""
+        try:
+            _memo = getattr(self, "_inflight_snapshot", None)
+            if (isinstance(_memo, tuple) and len(_memo) == 2
+                    and time.monotonic() - float(_memo[0]) < _INFLIGHT_SNAPSHOT_S):
+                return _memo[1]
+        except Exception:
+            _memo = None
+        rows = self.store.all_active()
+        try:
+            self._inflight_snapshot = (time.monotonic(), rows)
+        except Exception:
+            pass
+        return rows
 
     async def _adopt_ssd_entry(self, ts: TorrentState, entry) -> bool:
         """Adopt a complete SSD-resident dest entry; True when queued.

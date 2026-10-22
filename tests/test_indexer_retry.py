@@ -1510,6 +1510,41 @@ async def test_waiting_indexer_defers_to_inflight_same_content(tmp_path):
         store.close()
 
 
+def test_inflight_snapshot_shared_across_calls(tmp_path):
+    """N _inflight_same_content calls in one window share one scan;
+    an expired window re-scans."""
+    import time
+
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator()
+        coord.store = store
+        calls: list[bool] = []
+        real_all_active = store.all_active
+
+        def _counting():
+            calls.append(True)
+            return real_all_active()
+
+        store.all_active = _counting  # type: ignore[method-assign]
+        ts = TorrentState(source_infohash="w" * 40, source_name="Twin.Show",
+                          total_bytes=1000, state=State.WAITING_INDEXER)
+        try:
+            assert coord._inflight_same_content(ts) is None
+            assert coord._inflight_same_content(ts) is None
+            assert len(calls) == 1
+            coord._inflight_snapshot = (time.monotonic() - 60.0,
+                                        coord._inflight_snapshot[1])
+            assert coord._inflight_same_content(ts) is None
+            assert len(calls) == 2
+        finally:
+            store.all_active = real_all_active  # type: ignore[method-assign]
+    finally:
+        store.close()
+
+
 @pytest.mark.anyio
 async def test_waiting_indexer_proceeds_when_leader_settled(tmp_path):
     """DONE/FAILED siblings hold no SSD work: pick runs as before."""
