@@ -37,7 +37,7 @@ from .coordinator_errors import (
 )
 from .coordinator_paths import _left_on_disk, _safe_ssd_join, _watch_cross_seed_dir
 from .coordinator_paths import _watch_cross_seed_dir
-from .io_bounds import offload, rpc
+from .io_bounds import chunked, offload, rpc
 from .prowlarr import TorrentHit
 from .recovery import find_content_on_ssd
 from .state import State, TorrentState
@@ -330,7 +330,10 @@ class AdmitMixin:
             if not complete:
                 return False
             try:
-                fuse_files = await self.dest_client.get_torrent_files(ext.hash)
+                fuse_files = await rpc(
+                    self.dest_client.get_torrent_files(ext.hash),
+                    getattr(self, "cfg", None), "dest fuse get_torrent_files",
+                )
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "manual fuse check: could not list files for %s: %s",
@@ -437,7 +440,10 @@ class AdmitMixin:
             if not h:
                 return False
             try:
-                existing = await dest_client.list_torrents(hashes=[h])
+                existing = await rpc(
+                    dest_client.list_torrents(hashes=[h]),
+                    getattr(self, "cfg", None), "dest manual fuse lookup",
+                )
             except Exception as e:  # noqa: BLE001
                 log.warning("manual fuse check: dest lookup failed for %s: %s", h[:10], e)
                 return False
@@ -499,7 +505,14 @@ class AdmitMixin:
             if not hashes:
                 return
             try:
-                existing = await dest_client.list_torrents(hashes=hashes)
+                # Chunked + RPC-bounded: >~100 hashes risks URL limits
+                # downstream, and one hung lookup must not stall the tick.
+                _sweep_parts = await asyncio.gather(*(
+                    rpc(dest_client.list_torrents(hashes=_c),
+                        getattr(self, "cfg", None), "dest fuse sweep list")
+                    for _c in chunked(hashes)))
+                existing = [t for _part in _sweep_parts
+                            for t in (_part or [])]
             except Exception as e:  # noqa: BLE001
                 log.warning("manual fuse sweep: dest lookup failed: %s", e)
                 return
@@ -989,7 +1002,10 @@ class AdmitMixin:
                 return None
             h = ts.dest_infohash or ts.source_infohash
             try:
-                files = await self.dest_client.get_torrent_files(h)
+                files = await rpc(
+                    self.dest_client.get_torrent_files(h),
+                    getattr(self, "cfg", None), "dest remaining estimate",
+                )
             except Exception:
                 return None
             if not files:
@@ -2320,7 +2336,10 @@ class AdmitMixin:
             dest = getattr(self, "dest_client", None)
             if dest is None:
                 return []
-            found = await dest.list_torrents(hashes=sorted(want))
+            found = await rpc(
+                dest.list_torrents(hashes=sorted(want)),
+                getattr(self, "cfg", None), "dest entries lookup",
+            )
             out = []
             for t in found or []:
                 try:
@@ -2425,7 +2444,10 @@ class AdmitMixin:
         last_err: Exception | None = None
         for _ in range(4):
             try:
-                files = await self.dest_client.get_torrent_files(ts.dest_infohash or ts.source_infohash)
+                files = await rpc(
+                    self.dest_client.get_torrent_files(ts.dest_infohash or ts.source_infohash),
+                    getattr(self, "cfg", None), "dest setup files",
+                )
                 last_err = None
                 break
             except Exception as e:  # noqa: BLE001
@@ -2745,7 +2767,10 @@ class AdmitMixin:
         """
         h = ts.dest_infohash or ts.source_infohash
         try:
-            files = await self.dest_client.get_torrent_files(h)
+            files = await rpc(
+                self.dest_client.get_torrent_files(h),
+                getattr(self, "cfg", None), "dest batches files",
+            )
         except Exception as e:
             log.warning("could not get torrent files for batches: %s", e)
             return None
