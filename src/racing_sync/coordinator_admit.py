@@ -528,27 +528,39 @@ class AdmitMixin:
                     by_hash[(t.hash or "").lower()] = t
                 except Exception:
                     continue
-            for ts in candidates:
-                try:
-                    h = (ts.source_infohash or "").lower()
-                    ext = by_hash.get(h)
-                    if ext is None:
-                        continue
-                    # Re-read: a worker may have moved this row after the
-                    # snapshot above — never overwrite a fresh state.
+            # Verify candidates concurrently (4-wide): each verify is
+            # files + fuse stats + maybe re-inject, and sequential
+            # verification holds the poller tick for minutes at 50 rows.
+            # Per-candidate isolation is preserved (fresh-state re-read
+            # inside, broad catch outside).
+            _verify_sem = asyncio.Semaphore(4)
+
+            async def _verify_one(_ts):
+                async with _verify_sem:
                     try:
-                        fresh = store.get(ts.source_infohash, include_blob=False)
+                        h = (_ts.source_infohash or "").lower()
+                        ext = by_hash.get(h)
+                        if ext is None:
+                            return
+                        # Re-read: a worker may have moved this row after the
+                        # snapshot above — never overwrite a fresh state.
+                        try:
+                            fresh = await asyncio.to_thread(
+                                store.get, _ts.source_infohash,
+                                include_blob=False)
+                        except Exception:
+                            fresh = None
+                        if fresh is None or fresh.state != _ts.state:
+                            return
+                        if fresh.state not in (State.NEW, State.WAITING_INDEXER, State.WAITING_DISK):
+                            return
+                        if getattr(fresh, "skipped", 0):
+                            return
+                        await self._verify_and_adopt_manual_fuse(fresh, ext)
                     except Exception:
-                        fresh = None
-                    if fresh is None or fresh.state != ts.state:
-                        continue
-                    if fresh.state not in (State.NEW, State.WAITING_INDEXER, State.WAITING_DISK):
-                        continue
-                    if getattr(fresh, "skipped", 0):
-                        continue
-                    await self._verify_and_adopt_manual_fuse(fresh, ext)
-                except Exception:
-                    continue
+                        return
+
+            await asyncio.gather(*(_verify_one(ts) for ts in candidates))
         except Exception as e:  # noqa: BLE001
             log.warning("manual fuse sweep failed: %s", e)
 
