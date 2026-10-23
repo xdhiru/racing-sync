@@ -718,18 +718,32 @@ class AdmitMixin:
         )
 
         if elapsed >= max_age:
-            log.error(
-                "download-target indexers giving up on %s after %d attempts (%ds > %ds max)",
-                ts.source_name, ts.indexer_attempts,
-                int(elapsed.total_seconds()), int(max_age.total_seconds()),
-            )
-            # From WAITING_INDEXER → FAILED is legal (see ALLOWED).
-            self.transition(
-                ts, State.FAILED,
-                error=(f"Prowlarr cross-seed not found within "
-                       f"{int(max_age.total_seconds())}s"),
-            )
-            return
+            if reason == "source vanished from VPS1":
+                # Disappearance starts a new cross-seed situation: the
+                # earlier window may have leaned on the VPS1 copy, so an
+                # exhausted clock grants one fresh window for the vanished
+                # copy instead of failing instantly. Attempts keep
+                # counting, so this stays bounded.
+                log.warning(
+                    "source vanished after an exhausted indexer window; "
+                    "granting one fresh cross-seed window for %s",
+                    ts.source_name[:60],
+                )
+                ts.indexer_first_queried_at = now
+                elapsed = dt.timedelta(0)
+            else:
+                log.error(
+                    "download-target indexers giving up on %s after %d attempts (%ds > %ds max)",
+                    ts.source_name, ts.indexer_attempts,
+                    int(elapsed.total_seconds()), int(max_age.total_seconds()),
+                )
+                # From WAITING_INDEXER → FAILED is legal (see ALLOWED).
+                self.transition(
+                    ts, State.FAILED,
+                    error=(f"Prowlarr cross-seed not found within "
+                           f"{int(max_age.total_seconds())}s"),
+                )
+                return
 
         # If we're being called from _do_new (state is NEW), the
         # transition is legal. If we're being re-called from

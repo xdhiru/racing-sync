@@ -46,6 +46,38 @@ def test_retry_window_is_24_hours():
     assert cfg.cross_seed.prowlarr_retry_interval_seconds == 900
 
 
+@pytest.mark.anyio
+async def test_vanished_source_grants_fresh_window(tmp_path):
+    """A disappearance after an exhausted indexer window parks for one
+    fresh cross-seed window instead of failing instantly; a plain
+    indexer miss with the same clock still fails."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator()
+        coord.cfg = _cfg()
+        coord.store = store
+        _old = (dt.datetime.now(dt.timezone.utc)
+                - dt.timedelta(seconds=86400 + 60))
+        for h, reason, final in (
+            ("a" * 40, "source vanished from VPS1", State.WAITING_INDEXER),
+            ("b" * 40, "indexer miss", State.FAILED),
+        ):
+            ts = TorrentState(
+                source_infohash=h, source_name="Twin",
+                state=State.WAITING_INDEXER,
+                indexer_first_queried_at=_old, indexer_attempts=40)
+            store.upsert(ts)
+            coord._park_for_indexer_retry(store.get(h), reason=reason)
+            row = store.get(h)
+            assert row.state == final
+            if final == State.WAITING_INDEXER:
+                assert row.indexer_first_queried_at > _old
+    finally:
+        store.close()
+
+
 def test_expired_max_age_marks_failed():
     """If the first attempt was > 24 h ago, the next park should escalate
     to FAILED. We simulate by backdating indexer_first_queried_at."""
