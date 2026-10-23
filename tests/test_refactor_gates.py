@@ -23,6 +23,9 @@ def test_same_content_size_rule_matches_unknown():
     # Either unknown -> match (fail toward dedup, like watch election).
     assert same_content("Twin.Show", 0, "Twin.Show", 1000)
     assert same_content("Twin.Show", 1000, "Twin.Show", 0)
+    # Both unknown -> no match: distinct unsized releases must not
+    # mutually defer forever waiting on each other.
+    assert not same_content("Twin.Show", 0, "Twin.Show", 0)
     # Different names never match, even with unknown sizes.
     assert not same_content("A.Show", 0, "B.Show", 0)
 

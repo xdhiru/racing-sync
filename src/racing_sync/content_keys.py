@@ -57,7 +57,9 @@ def same_content(
 
     Mirrors legacy conditions:
       (not m.total_bytes or not t.size_bytes or m.total_bytes == t.size_bytes)
-    and the election/inflight size equality check.
+    and the election/inflight size equality check — except both-unknown:
+    two distinct releases with no size metadata would mutually defer
+    forever, so at least one side must carry a known size to match.
     """
     try:
         if _norm(a_name) != _norm(b_name):
@@ -72,6 +74,8 @@ def same_content(
         b_s = int(b_size or 0)
     except (TypeError, ValueError):
         b_s = 0
+    if not a_s and not b_s:
+        return False
     if not a_s or not b_s:
         return True
     return a_s == b_s
