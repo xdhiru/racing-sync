@@ -1419,11 +1419,32 @@ class AdmitMixin:
             getattr(self, "cfg", None), "dest queued list_torrents",
         )
         if existing:
-            ext = existing[0]
             fuse_mounts = [
                 str(self.cfg.rclone.fuse.mount).rstrip("/\\").replace("\\", "/"),
                 str(self.cfg.rclone.fuse.mount_unsorted).rstrip("/\\").replace("\\", "/"),
             ]
+            # Prefer fuse-complete > SSD-complete > first-listed: adopting
+            # an SSD partial while a fuse-complete copy exists strands the
+            # seed. Completeness here is client-side; the fuse branch
+            # re-verifies bytes before DONE.
+            def _rank(t):
+                try:
+                    _sp = (getattr(t, "save_path", "") or "").rstrip("/\\").replace("\\", "/")
+                    _on_fuse = any(_sp == fm or _sp.startswith(fm + "/")
+                                   for fm in fuse_mounts if fm)
+                except Exception:
+                    _on_fuse = False
+                try:
+                    _complete = bool(t.is_complete())
+                except Exception:
+                    _complete = False
+                return (0 if (_on_fuse and _complete)
+                        else (1 if _complete else 2))
+
+            try:
+                ext = min(existing, key=_rank)
+            except Exception:
+                ext = existing[0]
             save_path = ext.save_path.rstrip("/\\").replace("\\", "/")
             on_fuse = any(save_path == fm or save_path.startswith(fm + "/") for fm in fuse_mounts if fm)
             if on_fuse and ext.is_complete():

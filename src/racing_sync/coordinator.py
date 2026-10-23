@@ -2496,6 +2496,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 pass
         ts.last_error = ""
         ts.failed_retries = 0
+        # A stale dest pointer must not be adopted: the new run re-adds
+        # or adopts the live entry itself (a leftover hash here would
+        # attach the row to a stranger's entry).
+        ts.dest_infohash = ""
         ts.indexer_first_queried_at = None
         ts.indexer_next_retry_at = None
         ts.indexer_attempts = 0
