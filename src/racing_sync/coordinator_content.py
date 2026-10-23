@@ -366,6 +366,7 @@ def watch_election_winner(rows, ts: TorrentState, cfg) -> TorrentState | None:
                     if not _same_content(
                         p.source_name or "", p.total_bytes or 0,
                         ts.source_name or "", ts.total_bytes or 0,
+                        require_size=True,
                     ):
                         continue
                 else:

@@ -51,15 +51,20 @@ def same_release_name(a_name: str, b_name: str) -> bool:
 
 
 def same_content(
-    a_name: str, a_size: int, b_name: str, b_size: int
+    a_name: str, a_size: int, b_name: str, b_size: int,
+    *, require_size: bool = False,
 ) -> bool:
     """Watch/inflight rule: same normalized name AND same size when both known.
 
     Mirrors legacy conditions:
       (not m.total_bytes or not t.size_bytes or m.total_bytes == t.size_bytes)
-    and the election/inflight size equality check — except both-unknown:
-    two distinct releases with no size metadata would mutually defer
-    forever, so at least one side must carry a known size to match.
+    and the election/inflight size equality check.
+
+    `require_size=True` (deferral decisions only): two releases with no
+    size metadata on either side do NOT match — distinct unsized
+    releases would otherwise mutually defer forever. Display grouping
+    and dedup keep the default: an unsized row still belongs with its
+    same-name siblings.
     """
     try:
         if _norm(a_name) != _norm(b_name):
@@ -75,7 +80,7 @@ def same_content(
     except (TypeError, ValueError):
         b_s = 0
     if not a_s and not b_s:
-        return False
+        return not require_size
     if not a_s or not b_s:
         return True
     return a_s == b_s
