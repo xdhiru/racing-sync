@@ -1569,6 +1569,46 @@ async def test_waiting_indexer_defers_to_inflight_same_content(tmp_path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_ssd_downloading_quiet_park_keeps_public_schedule(tmp_path):
+    """A public-export row whose SSD entry is still downloading pushes
+    the public timer, not the indexer one."""
+    from unittest.mock import AsyncMock
+
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import StateStore
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator()
+        coord.cfg = _cfg()
+        coord.store = store
+        _now = dt.datetime.now(dt.timezone.utc)
+        ts = TorrentState(
+            source_infohash="w" * 40, source_name="Twin.Show",
+            total_bytes=1000, state=State.WAITING_INDEXER,
+            public_export_first_attempted_at=_now - dt.timedelta(seconds=100),
+            public_export_attempts=2,
+            public_export_next_retry_at=_now - dt.timedelta(seconds=1))
+        store.upsert(ts)
+        coord.dest_client = AsyncMock()
+        coord.dest_client.list_torrents = AsyncMock(return_value=[
+            Torrent(hash="w" * 40, name="Twin.Show", category="racing",
+                    save_path=str(ssd), size_bytes=1000, state="downloading",
+                    progress=0.5),
+        ])
+        before = ts.public_export_next_retry_at
+        await coord._do_waiting_indexer(store.get("w" * 40))
+        row = store.get("w" * 40)
+        assert row.state == State.WAITING_INDEXER
+        assert row.public_export_next_retry_at > before
+        assert row.indexer_next_retry_at is None
+    finally:
+        store.close()
+
+
 def test_inflight_snapshot_shared_across_calls(tmp_path):
     """N _inflight_same_content calls in one window share one scan;
     an expired window re-scans."""

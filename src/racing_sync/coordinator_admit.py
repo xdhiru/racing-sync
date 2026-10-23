@@ -992,9 +992,24 @@ class AdmitMixin:
                 if self._abandoned(ts):
                     raise AbandonedError(
                         f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}")
-                ts.indexer_next_retry_at = (
-                    dt.datetime.now(dt.timezone.utc)
-                    + dt.timedelta(seconds=_interval))
+                # Push the schedule this row is actually parked on (mirror
+                # the same-content deferral below): a public-export row
+                # must not gain an indexer timer — it would wake on the
+                # wrong schedule.
+                if (ts.public_export_next_retry_at
+                        and not ts.indexer_next_retry_at):
+                    try:
+                        _public_interval = max(60.0, float(
+                            self.cfg.cross_seed.public_export_retry_interval_seconds))
+                    except (TypeError, ValueError, AttributeError):
+                        _public_interval = 1800.0
+                    ts.public_export_next_retry_at = (
+                        dt.datetime.now(dt.timezone.utc)
+                        + dt.timedelta(seconds=_public_interval))
+                else:
+                    ts.indexer_next_retry_at = (
+                        dt.datetime.now(dt.timezone.utc)
+                        + dt.timedelta(seconds=_interval))
                 self.store.upsert(ts)
             except Exception:
                 pass
