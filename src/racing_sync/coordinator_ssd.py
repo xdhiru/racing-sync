@@ -180,12 +180,10 @@ class SSDLedgerMixin:
             if not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0:
                 return None
             try:
-                from .watchdir import extract_torrent_files_from_bencoded
+                parsed = self._cached_blob_files(blob, ts.source_infohash)
             except Exception:
                 return None
-            try:
-                parsed = extract_torrent_files_from_bencoded(bytes(blob))
-            except Exception:
+            if parsed is None:
                 return None
             names = [(f.name, f.size_bytes) for f in (parsed or [])
                      if getattr(f, "name", "")]
