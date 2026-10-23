@@ -1187,3 +1187,24 @@ async def test_verify_pass_demotes_ssd_backed_ghost(tmp_path: Path):
         store.close()
 
 
+def test_revive_clears_stale_dest_pointer(tmp_path):
+    """Revive drops the old dest_infohash: the new run re-adds or adopts
+    the live entry itself instead of attaching to a stranger's."""
+    from conftest import make_coordinator
+
+    from racing_sync.state import StateStore, TorrentState, State
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        store.upsert(TorrentState(
+            source_infohash="a" * 40, source_name="X",
+            dest_infohash="d" * 40, state=State.FAILED))
+        ts = coord.revive_failed_row(infohash="a" * 40)
+        assert ts.state == State.NEW
+        assert ts.dest_infohash == ""
+        assert store.get("a" * 40).dest_infohash == ""
+    finally:
+        store.close()
+
+

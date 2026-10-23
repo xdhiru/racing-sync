@@ -313,3 +313,45 @@ async def test_adopt_skipped_when_sweep_covered(tmp_path: Path):
         assert coord.dest_client.list_torrents.await_count == 2
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_queued_prefers_fuse_complete_over_ssd(tmp_path: Path):
+    """SSD+fuse duplicates: the fuse-complete entry wins adoption instead
+    of the first-listed SSD partial."""
+    from racing_sync.watchdir import _bencode
+
+    store = StateStore(tmp_path / "state.db")
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    h = "g" * 40
+    blob = bytes(_bencode({
+        b"info": {b"name": b"Pack.2026.mkv", b"length": 100},
+    }))
+    store.upsert(TorrentState(
+        source_infohash=h, source_name="Pack.2026", state=State.QUEUED,
+        cross_seed_blob=blob))
+
+    coord = make_coordinator()
+    coord.store = store
+    fuse = _fuse_cfg(tmp_path, coord)
+    (fuse / "Pack.2026.mkv").write_bytes(b"x" * 100)
+    coord.dest_client = AsyncMock()
+    # SSD entry listed first: must lose to the fuse-complete copy.
+    coord.dest_client.list_torrents = AsyncMock(return_value=[
+        Torrent(hash=h, name="Pack.2026", category="racing",
+                save_path=str(ssd), size_bytes=100,
+                state="seeding", progress=1.0),
+        _seeded_fuse_torrent(fuse, h, "Pack.2026"),
+    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[TorrentFile(name="Pack.2026.mkv", size_bytes=100,
+                                  progress=1.0)]
+    )
+    try:
+        await coord._do_queued(store.get(h))
+        row = store.get(h)
+        assert row.state == State.DONE
+        assert row.save_path == str(fuse)
+    finally:
+        store.close()
