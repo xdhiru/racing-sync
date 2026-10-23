@@ -78,6 +78,33 @@ async def test_vanished_source_grants_fresh_window(tmp_path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_public_retry_rotates_verbosity(tmp_path, caplog):
+    """Unbounded public-export schedule: first misses log loudly, the
+    long tail at debug instead of filling the log disk."""
+    import logging
+
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator()
+        coord.store = store
+        store.upsert(TorrentState(source_infohash="p" * 40,
+                                  source_name="Pub", state=State.NEW))
+        with caplog.at_level(logging.INFO,
+                             logger="racing_sync.coordinator"):
+            for _ in range(4):
+                coord._park_for_public_retry(store.get("p" * 40))
+        row = store.get("p" * 40)
+        assert row.state == State.WAITING_INDEXER
+        assert row.public_export_attempts == 4
+        assert row.public_export_next_retry_at is not None
+        assert caplog.text.count("source export miss") == 3
+    finally:
+        store.close()
+
+
 def test_expired_max_age_marks_failed():
     """If the first attempt was > 24 h ago, the next park should escalate
     to FAILED. We simulate by backdating indexer_first_queried_at."""

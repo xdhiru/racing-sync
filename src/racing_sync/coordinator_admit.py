@@ -782,11 +782,22 @@ class AdmitMixin:
             ts.public_export_first_attempted_at = now
         ts.public_export_attempts += 1
         ts.public_export_next_retry_at = now + dt.timedelta(seconds=interval)
-        log.info(
-            "source export miss #%d for %s; next retry at %s",
-            ts.public_export_attempts, ts.source_name,
-            ts.public_export_next_retry_at.isoformat(timespec="seconds"),
-        )
+        # Unbounded schedule by design (no max-age FAILED), so rotate
+        # verbosity: first misses log loudly, the long tail at debug —
+        # a wedged export must not fill the log disk with its own lines.
+        _n = ts.public_export_attempts
+        if _n <= 3 or _n % 50 == 0:
+            log.info(
+                "source export miss #%d for %s; next retry at %s",
+                _n, ts.source_name,
+                ts.public_export_next_retry_at.isoformat(timespec="seconds"),
+            )
+        else:
+            log.debug(
+                "source export miss #%d for %s; next retry at %s",
+                _n, ts.source_name,
+                ts.public_export_next_retry_at.isoformat(timespec="seconds"),
+            )
         if ts.state != State.WAITING_INDEXER:
             self.transition(ts, State.WAITING_INDEXER)
         else:
