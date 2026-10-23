@@ -1570,6 +1570,42 @@ async def test_waiting_indexer_defers_to_inflight_same_content(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_inflight_both_unknown_size_proceeds(tmp_path):
+    """Two unsized same-name rows must not mutually defer: with no size
+    on either side there is no proof of sameness, so the waiter picks
+    instead of parking on a phantom leader."""
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator()
+        coord.cfg = _cfg()
+        coord.store = store
+        now = dt.datetime.now(dt.timezone.utc)
+        store.upsert(TorrentState(
+            source_infohash="l" * 40, source_name="Twin.Show",
+            total_bytes=0, state=State.DOWNLOADING))
+        waiter = TorrentState(
+            source_infohash="w" * 40, source_name="Twin.Show",
+            total_bytes=0, state=State.WAITING_INDEXER,
+            indexer_attempts=3,
+            indexer_first_queried_at=now - dt.timedelta(seconds=100),
+            indexer_next_retry_at=now - dt.timedelta(seconds=1))
+        store.upsert(waiter)
+        coord.source_client = AsyncMock()
+        coord.source_client.get_torrent = AsyncMock(return_value=Torrent(
+            hash="w" * 40, name="Twin.Show", category="", save_path="",
+            size_bytes=0, state="seeding", progress=1.0, trackers=[]))
+        coord._list_source_torrents = AsyncMock(return_value=[])
+        coord._pick_and_admit = AsyncMock()
+        await coord._do_waiting_indexer(store.get("w" * 40))
+        coord._pick_and_admit.assert_awaited_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_ssd_downloading_quiet_park_keeps_public_schedule(tmp_path):
     """A public-export row whose SSD entry is still downloading pushes
     the public timer, not the indexer one."""

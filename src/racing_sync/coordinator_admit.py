@@ -847,10 +847,12 @@ class AdmitMixin:
                     # Single content-key rule (see content_keys.same_content):
                     # same normalized name + same size when both known.
                     # Unknown sizes match (fail toward dedup, like the watch
-                    # election) to avoid duplicate SSD downloads.
+                    # election) to avoid duplicate SSD downloads — except
+                    # both-unknown, which would mutually defer forever.
                     if _same_content_key(
                         r.source_name or "", r.total_bytes or 0,
                         ts.source_name or "", ts.total_bytes or 0,
+                        require_size=True,
                     ):
                         return r
                 except Exception:
