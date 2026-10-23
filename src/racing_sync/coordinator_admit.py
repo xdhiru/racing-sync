@@ -45,6 +45,10 @@ from .state import State, TorrentState
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
 
+# Blob-parse memo TTL: same infohash = same bytes, so expiry only bounds
+# memory across huge intakes, never correctness.
+_BLOB_PARSE_TTL_S = 300.0
+
 # Live-content snapshot sharing window: _inflight_same_content callers
 # (workers + Telegram notes) share one all_active() scan per window.
 _INFLIGHT_SNAPSHOT_S = 30.0
@@ -236,7 +240,8 @@ class AdmitMixin:
         leaked budget can never strand waiters.
         """
         try:
-            _fully_remote = await self._blob_fully_remote(blob)
+            _fully_remote = await self._blob_fully_remote(
+                blob, cache_key=ts.source_infohash)
         except Exception:
             _fully_remote = None
         if _fully_remote is True:
@@ -1591,7 +1596,8 @@ class AdmitMixin:
         # the SSD add entirely and go fuse-gated RE_ADDING, which
         # re-verifies before injecting. Fail-open: any doubt adds normally.
         try:
-            _fully_remote = await self._blob_fully_remote(blob)
+            _fully_remote = await self._blob_fully_remote(
+                blob, cache_key=ts.source_infohash)
         except Exception:
             _fully_remote = None
         if _fully_remote is True:
@@ -2494,7 +2500,52 @@ class AdmitMixin:
         except Exception:
             return None
 
-    async def _blob_fully_remote(self, blob: bytes | None) -> bool | None:
+    def _cached_blob_files(self, blob: bytes | None, key: str):
+        """extract_torrent_files_from_bencoded memoized per infohash.
+
+        One admit parses the same bytes up to 3× (remote check, batch
+        footprint, setup classify). Same infohash = same bytes by
+        construction, so the key is safe. Per-instance: tests reuse
+        fake hashes with different bytes across cases. Entries expire
+        after _BLOB_PARSE_TTL_S (memory bound, not correctness).
+        """
+        try:
+            if not blob or not isinstance(blob, (bytes, bytearray)):
+                return None
+            from .watchdir import extract_torrent_files_from_bencoded
+            _k = (key or "").lower()
+            if not _k:
+                # Unkeyed callers (tests, one-shots): parse, don't cache.
+                try:
+                    return extract_torrent_files_from_bencoded(bytes(blob))
+                except Exception:
+                    return None
+            _now = time.monotonic()
+            _cache = getattr(self, "_blob_parse_cache", None)
+            if not isinstance(_cache, dict):
+                _cache = {}
+                self._blob_parse_cache = _cache  # type: ignore[attr-defined]
+            _hit = _cache.get(_k)
+            if (isinstance(_hit, tuple) and len(_hit) == 2
+                    and _now - float(_hit[0]) < _BLOB_PARSE_TTL_S):
+                return _hit[1]
+            try:
+                parsed = extract_torrent_files_from_bencoded(bytes(blob))
+            except Exception:
+                parsed = None
+            try:
+                _cache[_k] = (_now, parsed)
+                if len(_cache) > 500:
+                    for _old in list(_cache.keys())[: len(_cache) - 500]:
+                        _cache.pop(_old, None)
+            except Exception:
+                pass
+            return parsed
+        except Exception:
+            return None
+
+    async def _blob_fully_remote(self, blob: bytes | None, *,
+                                 cache_key: str = "") -> bool | None:
         """True iff every file in the .torrent bytes already sits verified on fuse.
 
         Admit-time shortcut so already-remote content never queues behind
@@ -2509,10 +2560,8 @@ class AdmitMixin:
         try:
             if not blob or not isinstance(blob, (bytes, bytearray)):
                 return None
-            from .watchdir import extract_torrent_files_from_bencoded
-            try:
-                parsed = extract_torrent_files_from_bencoded(bytes(blob))
-            except Exception:
+            parsed = self._cached_blob_files(blob, cache_key)
+            if parsed is None:
                 return None
             names = [(f.name, f.size_bytes) for f in (parsed or [])
                      if getattr(f, "name", "")]

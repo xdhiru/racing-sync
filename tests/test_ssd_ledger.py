@@ -305,6 +305,29 @@ def test_blob_admit_footprint_is_max_batch(tmp_path):
     assert coord._blob_admit_footprint(ts, blob, 24_000) == 8000
 
 
+def test_blob_parse_memoized_per_infohash(tmp_path):
+    """Repeat admits for one infohash parse the bytes once, not 3×."""
+    import racing_sync.watchdir as _wd
+
+    coord = _coord_with_cap(tmp_path, 10_000)
+    ts = TorrentState(source_infohash="f" * 40, source_name="Pack",
+                      state=State.NEW)
+    blob = _pack_blob("Pack", [("a.bin", 8000), ("b.bin", 8000),
+                               ("c.bin", 8000)])
+    real_extract = _wd.extract_torrent_files_from_bencoded
+    calls: list[bytes] = []
+
+    def _counting(raw):
+        calls.append(bytes(raw))
+        return real_extract(raw)
+
+    with patch("racing_sync.watchdir.extract_torrent_files_from_bencoded",
+               side_effect=_counting):
+        assert coord._blob_admit_footprint(ts, blob, 24_000) == 8000
+        assert coord._blob_admit_footprint(ts, blob, 24_000) == 8000
+    assert len(calls) == 1
+
+
 def test_blob_admit_footprint_single_file_is_total(tmp_path):
     coord = _coord_with_cap(tmp_path, 10_000)
     coord.cfg.ssd.skip_movie_larger_than_bytes = 10 ** 12
