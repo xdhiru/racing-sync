@@ -578,6 +578,20 @@ class AdmitMixin:
         except Exception as e:  # noqa: BLE001
             log.warning("manual fuse sweep failed: %s", e)
 
+    def _note_grace_search(self, key: str) -> None:
+        """Stamp a grace-scope search so repeats wait out the interval."""
+        try:
+            _ls = getattr(self, "_last_grace_search", None)
+            if not isinstance(_ls, dict):
+                _ls = {}
+                self._last_grace_search = _ls  # type: ignore[attr-defined]
+            _ls[key] = time.monotonic()
+            if len(_ls) > 5000:
+                for _k in list(_ls.keys())[: len(_ls) - 5000]:
+                    _ls.pop(_k, None)
+        except Exception:
+            pass
+
     def _note_fuse_sweep_covered(self) -> None:
         """Stamp a completed fuse sweep: per-row adopt checks covered by
         it may skip their own dest lookup until the next sweep."""
@@ -2247,28 +2261,12 @@ class AdmitMixin:
             # Download-target indexer names (lowercase), in priority order —
             # the sacrificial pick below tries them in this order.
             download_idx_names: list[str] = []
-            if needs_sacrificial_copy and prefer_prowlarr:
-                try:
-                    for dl_idx in self.prowlarr.get_download_indexers():
-                        download_idx_names.append(dl_idx.name.lower())
-                        indexers_to_query.append(dl_idx)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("could not get download-target indexers: %s", e)
-
-            # Add all private indexers from tracker_map
-            seen_names = set(download_idx_names)
-            for name in self.cfg.prowlarr.tracker_map.entries.values():
-                idx = self.prowlarr.get_indexer_by_name(name)
-                if idx and idx.name.lower() not in seen_names and idx.enable:
-                    indexers_to_query.append(idx)
-                    seen_names.add(idx.name.lower())
-
-            hits_by_indexer: dict[str, list[TorrentHit]] = {}
             # Prowlarr search runs as normal (it is itself a preferred-source
             # finder): a sacrificial hit below releases the hold immediately.
             # While holding, repeats wait out prowlarr_retry_interval_seconds —
             # the same cadence as the WAITING_INDEXER retry loop — instead of
-            # hammering the indexers every tick.
+            # hammering the indexers every tick. Scope assembly AND search
+            # both wait when not due.
             _search_due = True
             if _hold_candidate:
                 _search_due = False
@@ -2283,6 +2281,24 @@ class AdmitMixin:
                     _search_due = _last is None or (time.monotonic() - float(_last)) >= _interval
                 except Exception:
                     _search_due = True
+            if _search_due:
+                if needs_sacrificial_copy and prefer_prowlarr:
+                    try:
+                        for dl_idx in self.prowlarr.get_download_indexers():
+                            download_idx_names.append(dl_idx.name.lower())
+                            indexers_to_query.append(dl_idx)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("could not get download-target indexers: %s", e)
+
+                # Add all private indexers from tracker_map
+                seen_names = set(download_idx_names)
+                for name in self.cfg.prowlarr.tracker_map.entries.values():
+                    idx = self.prowlarr.get_indexer_by_name(name)
+                    if idx and idx.name.lower() not in seen_names and idx.enable:
+                        indexers_to_query.append(idx)
+                        seen_names.add(idx.name.lower())
+
+            hits_by_indexer: dict[str, list[TorrentHit]] = {}
             if _search_due and indexers_to_query:
                 try:
                     hits_by_indexer = await self.prowlarr.search_indexers_parallel(
@@ -2291,17 +2307,11 @@ class AdmitMixin:
                 except Exception as e:
                     log.warning("watch-dir: prowlarr search failed for %s: %s", ts.source_name, e)
                     hits_by_indexer = {}
-                try:
-                    _ls = getattr(self, "_last_grace_search", None)
-                    if not isinstance(_ls, dict):
-                        _ls = {}
-                        self._last_grace_search = _ls  # type: ignore[attr-defined]
-                    _ls[_h] = time.monotonic()
-                    if len(_ls) > 5000:
-                        for _k in list(_ls.keys())[: len(_ls) - 5000]:
-                            _ls.pop(_k, None)
-                except Exception:
-                    pass
+                self._note_grace_search(_h)
+            elif _search_due:
+                # Empty scope: nothing to query — stamp anyway so the
+                # next tick doesn't rebuild the scope from scratch.
+                self._note_grace_search(_h)
 
             # 1. Sacrificial download torrent from the download-target
             # indexers, in priority order — first exact match wins.
