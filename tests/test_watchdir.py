@@ -1785,6 +1785,23 @@ async def test_watch_rank1_proceeds_despite_grace(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_watch_no_query_prowlarr_skips_hold(tmp_path: Path):
+    """query_prowlarr=False: no search will ever release a hold, so the
+    sacrificial drop admits immediately instead of waiting out grace."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        coord.cfg.watch_dir.query_prowlarr = False
+        ts = _watch_drop(store, "Grace.NoQuery.1080p", 5000, _PRIV_ANNOUNCE,
+                         16384)
+        await coord._do_new_watch_dir(ts)
+        assert coord.transitioned == [State.WAITING_DISK]
+        assert store.get(ts.source_infohash, include_blob=False).state == State.NEW
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_watch_fetch_skips_search_and_hold(tmp_path: Path):
     """A /fetch'd (force_direct) drop skips Prowlarr + grace, uses its bytes."""
     from types import SimpleNamespace
