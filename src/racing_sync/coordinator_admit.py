@@ -2414,11 +2414,12 @@ class AdmitMixin:
         # the dropped non-preferred bytes (a preferred drop may still
         # arrive, or a later search may hit). A secured sacrificial copy,
         # public/rank-1 rows, expired graces, /prefer_'d rows, /fetch'd
-        # rows and setups without download indexers proceed immediately.
-        # Nothing is reserved yet, so returning keeps the row NEW with no
-        # leakage.
-        if (_hold_candidate and not _found_preferred and not _forced
-                and self._in_preferred_grace(ts)):
+        # rows, setups without download indexers — and watch configs with
+        # query_prowlarr=False (no search will ever release the hold) —
+        # proceed immediately. Nothing is reserved yet, so returning keeps
+        # the row NEW with no leakage.
+        if (_hold_candidate and query_prowlarr and not _found_preferred
+                and not _forced and self._in_preferred_grace(ts)):
             log.info(
                 "watch-dir: holding %s for preferred copy (rank 2, %ds grace left)",
                 ts.source_name[:60], self._preferred_grace_left(ts),
