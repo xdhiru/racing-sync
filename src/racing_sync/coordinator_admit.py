@@ -2349,7 +2349,15 @@ class AdmitMixin:
                         # files, different announce) share one filename —
                         # the dropped blob already represents them.
                         if dl_h.lower() != ts.source_infohash.lower():
-                            await asyncio.to_thread((watch_cross_dir / f"{dl_h}.torrent").write_bytes, dl_blob)
+                            if watch_cross_dir is None:
+                                # No blob dir (refused hash): say so plainly
+                                # instead of masking it as a fetch failure
+                                # below — the bytes were fetched fine.
+                                log.warning(
+                                    "watch-dir: not persisting sacrificial copy %s (no blob dir)",
+                                    dl_h[:10])
+                            else:
+                                await asyncio.to_thread((watch_cross_dir / f"{dl_h}.torrent").write_bytes, dl_blob)
                         log.info(
                             "watch-dir: using sacrificial download torrent from %s (%s)",
                             best_dl.indexer, best_dl.title,
@@ -2378,7 +2386,11 @@ class AdmitMixin:
                             # shares one filename — first persisted wins
                             # (dropped blob, then sacrificial), so one file
                             # seeds it and variants can't clobber each other.
-                            if (watch_cross_dir / f"{cross_h}.torrent").exists():
+                            if watch_cross_dir is None:
+                                log.warning(
+                                    "watch-dir: not persisting cross-seed %s (no blob dir)",
+                                    cross_h[:10])
+                            elif (watch_cross_dir / f"{cross_h}.torrent").exists():
                                 log.debug(
                                     "watch-dir: cross-seed %s from %s shares infohash; keeping persisted copy",
                                     cross_h[:10], hit.indexer,
