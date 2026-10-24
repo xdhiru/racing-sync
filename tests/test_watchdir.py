@@ -402,6 +402,80 @@ async def test_do_new_watch_dir_with_prowlarr_search_and_cross_seeds(tmp_path: P
 
 
 @pytest.mark.anyio
+async def test_do_new_watch_dir_no_blob_dir_warns_plainly(tmp_path: Path, caplog):
+    """Refused blob dir: persist sites warn plainly instead of masking
+    the missing dir as fetch/download failures."""
+    import logging
+    from unittest.mock import patch
+
+    raw_data = _create_sample_torrent_data("Private.Movie.1080p", 5000, "http://alpha.cc/announce")
+    infohash, name, total, announce = _bencoded_info_hash(raw_data)
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    try:
+        coord = make_coordinator()
+        coord.cfg.dest.save_path = tmp_path / "downloads"
+        coord.cfg.ssd.path = tmp_path
+        coord.cfg.ssd.max_inflight_bytes = 100000000
+        coord.cfg.general.state_db = db_path
+        coord.cfg.general.disk_safety_margin_bytes = 1000
+        coord.cfg.prowlarr.enabled = True
+        coord.cfg.prowlarr.is_download_indexer = lambda url: "dl-indexer" in url
+        coord.cfg.prowlarr.should_skip_title.return_value = False
+        coord.cfg.prowlarr.tracker_map.entries = {"beta": "Beta"}
+        coord.store = store
+        coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+
+        dl_idx = Indexer(1, "Test Indexer (API)", "torrent", True, [])
+        bhd_idx = Indexer(2, "Beta", "torrent", True, [])
+
+        coord.prowlarr = MagicMock()
+        coord.prowlarr.get_download_indexers = MagicMock(return_value=[dl_idx])
+        coord.prowlarr.get_indexer_by_name = MagicMock(
+            side_effect=lambda n: bhd_idx if n == "Beta" else None)
+        dl_hit = TorrentHit(
+            title="Private.Movie.1080p", guid="1",
+            indexer="Test Indexer (API)", indexer_id=1, size_bytes=5000,
+            download_url="http://prowlarr/dl/1", magnet_url="",
+            info_url="", publish_date="")
+        bhd_hit = TorrentHit(
+            title="Private.Movie.1080p", guid="2", indexer="Beta",
+            indexer_id=2, size_bytes=5000,
+            download_url="http://prowlarr/dl/2", magnet_url="",
+            info_url="", publish_date="")
+        coord.prowlarr.search_indexers_parallel = AsyncMock(return_value={
+            "test indexer (api)": [dl_hit], "beta": [bhd_hit]})
+        dl_torrent_bytes = _create_sample_torrent_data(
+            "Private.Movie.1080p", 5000, "http://dl-indexer.example.net/announce",
+            piece_length=32768)
+        bhd_torrent_bytes = _create_sample_torrent_data(
+            "Private.Movie.1080p", 5000, "http://beta.me/announce",
+            piece_length=65536)
+
+        async def mock_dl(hit):
+            return dl_torrent_bytes if hit.indexer_id == 1 else bhd_torrent_bytes
+
+        coord.prowlarr.download_torrent = AsyncMock(side_effect=mock_dl)
+
+        ts = TorrentState(
+            source_infohash=infohash, source_name=name, total_bytes=total,
+            source_announce_url=announce, cross_seed_blob=raw_data,
+            cross_seed_source="watch-dir", state=State.NEW)
+
+        with patch("racing_sync.coordinator_admit._watch_cross_seed_dir",
+                         return_value=None):
+            with caplog.at_level(logging.WARNING,
+                                 logger="racing_sync.coordinator"):
+                await coord._do_new_watch_dir(ts)
+        assert "no blob dir" in caplog.text
+        assert "failed to fetch download indexer torrent" not in caplog.text
+        assert "could not download cross-seed" not in caplog.text
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_re_inject_watch_dir_torrents(tmp_path: Path):
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
