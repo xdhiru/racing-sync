@@ -1754,6 +1754,26 @@ async def test_watch_sacrificial_holds_preferred_grace(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_watch_empty_scope_stamps_search_throttle(tmp_path: Path):
+    """A held drop with no indexers to query stamps the throttle anyway:
+    the next tick must not rebuild the scope from scratch."""
+    from unittest.mock import MagicMock
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _grace_coord(tmp_path, store)
+        coord.prowlarr.get_download_indexers = MagicMock(return_value=[])
+        ts = _watch_drop(store, "Grace.Empty.1080p", 5000, _PRIV_ANNOUNCE,
+                         16384)
+        await coord._do_new_watch_dir(ts)
+        assert store.get(ts.source_infohash, include_blob=False).state == State.NEW
+        await coord._do_new_watch_dir(ts)
+        assert coord.prowlarr.get_download_indexers.call_count == 1
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_watch_sacrificial_proceeds_after_grace(tmp_path: Path):
     """An aged rank-2 drop proceeds (no indefinite hold)."""
     import datetime as dt
