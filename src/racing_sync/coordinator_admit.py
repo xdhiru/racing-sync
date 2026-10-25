@@ -3036,6 +3036,13 @@ class AdmitMixin:
     async def _await_hash_for_name(self, name: str, *, timeout_s: float = 60) -> str | None:
         deadline = time.monotonic() + timeout_s
         _gap = 2.0
+        # Normalized fallback: the client may report a differently-cased
+        # or punctuated name for the just-added torrent — exact match
+        # first, normalized second, per poll.
+        try:
+            _want_norm = normalize_content_name(name or "")
+        except Exception:
+            _want_norm = ""
         while time.monotonic() < deadline:
             if getattr(self, "_stop", False):
                 return None
@@ -3058,6 +3065,13 @@ class AdmitMixin:
                         return t.hash.lower()
                 except Exception:
                     continue
+            if _want_norm:
+                for t in rows or []:
+                    try:
+                        if normalize_content_name(getattr(t, "name", "") or "") == _want_norm:
+                            return t.hash.lower()
+                    except Exception:
+                        continue
             await asyncio.sleep(_gap)
             _gap = min(10.0, _gap * 1.5)
         return None

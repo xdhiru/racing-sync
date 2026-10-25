@@ -2796,6 +2796,22 @@ async def test_await_hash_none_on_deadline():
     assert await coord._await_hash_for_name("Missing", timeout_s=0.05) is None
 
 
+@pytest.mark.anyio
+async def test_await_hash_normalized_fallback():
+    """A differently-cased client name still resolves via normalization."""
+    from racing_sync.clients.abstract import Torrent
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.cfg = MagicMock()
+    hit = Torrent(hash="H" * 40, name="wanted", category="racing",
+                  save_path="/s", size_bytes=1, state="downloading",
+                  progress=0.5)
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[hit])
+    assert await coord._await_hash_for_name("Wanted", timeout_s=5) == "h" * 40
+
+
 def _batch_pack_coordinator(tmp_path, ssd_cap=10_000):
     """Coordinator + SSD client doubles for a 3-file Pack (batches [a,b],[c])."""
     from racing_sync.clients.abstract import TorrentFile
