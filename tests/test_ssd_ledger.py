@@ -454,3 +454,26 @@ async def test_prune_throttles_db_round_trips(tmp_path):
             store.get_many = real_get_many  # type: ignore[method-assign]
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_estimate_cached_per_cursor():
+    """Repeat estimates for one cursor compute once; a cursor move
+    recomputes."""
+    coord = make_coordinator()
+    ts = TorrentState(source_infohash="e" * 40, source_name="E",
+                      state=State.WAITING_DISK,
+                      batches_total=3, batch_index=1)
+    calls: list[bool] = []
+
+    async def _fake(_ts):
+        calls.append(True)
+        return 123
+
+    coord._estimate_remaining_bytes_uncached = _fake  # type: ignore[method-assign]
+    assert await coord._estimate_remaining_bytes(ts) == 123
+    assert await coord._estimate_remaining_bytes(ts) == 123
+    assert len(calls) == 1
+    ts.batch_index = 2
+    assert await coord._estimate_remaining_bytes(ts) == 123
+    assert len(calls) == 2
