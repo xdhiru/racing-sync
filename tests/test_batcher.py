@@ -2382,6 +2382,54 @@ async def test_setup_footprint_zero_when_fully_remote(tmp_path):
     coord.dest_client.resume.assert_not_called()  # nothing needs downloading
 
 @pytest.mark.anyio
+async def test_setup_corpse_delete_drops_entry_only(tmp_path):
+    """All-remote corpse removal drops the client entry without files:
+    the entry never downloaded, so bytes at those paths belong to
+    someone else (shared save_path)."""
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+    (fuse / "Show.S01E01.mkv").write_bytes(b"x" * 100)
+    (fuse / "Show.S01E02.mkv").write_bytes(b"x" * 100)
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.ssd.max_inflight_bytes = 100_000
+    coord.cfg.rclone.fuse.mount = fuse
+    coord.cfg.rclone.fuse.mount_unsorted = fuse
+    coord._batch_cap_cache = {}
+    coord._ssd_reserved = {}
+    coord._ssd_lock = None
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=1.0),
+        TorrentFile(name="Show.S01E02.mkv", size_bytes=100, progress=1.0),
+    ])
+    coord.dest_client.set_file_priorities = AsyncMock()
+    coord.dest_client.resume = AsyncMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(source_infohash="z" * 40, source_name="Show.S01",
+                      dest_infohash="z" * 40, save_path=str(ssd),
+                      total_bytes=200, state=State.QUEUED)
+    coord._ssd_reserved["z" * 40] = 200
+
+    await coord._setup_queued_download(ts, b"blob")
+
+    assert ts.state == State.RE_ADDING
+    coord.dest_client.delete.assert_awaited_once_with(
+        "z" * 40, delete_files=False)
+
+@pytest.mark.anyio
 async def test_download_loop_tightens_reservation_per_batch(tmp_path):
     """Completed batches must stop blocking waiters mid-season.
 
