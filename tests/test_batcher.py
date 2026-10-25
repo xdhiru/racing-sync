@@ -2244,7 +2244,7 @@ async def test_queued_existing_entry_parks_when_full(tmp_path):
     ])
     coord.dest_client.resume = AsyncMock()
 
-    # One DOWNLOADING row already fills the single slot.
+    # One LIVE downloading worker already fills the single slot.
     coord.store.upsert(TorrentState(source_infohash="d" * 40, source_name="Busy",
                                     state=State.DOWNLOADING))
     ts = TorrentState(source_infohash="e" * 40, source_name="Show",
@@ -2253,7 +2253,7 @@ async def test_queued_existing_entry_parks_when_full(tmp_path):
                       state=State.QUEUED)
     coord.store.upsert(ts)
 
-    coord._running_infohashes.add("e" * 40)
+    coord._running_infohashes.update(("d" * 40, "e" * 40))
     await coord._do_queued(coord.store.get("e" * 40))
 
     row = coord.store.get("e" * 40)
@@ -2268,14 +2268,15 @@ async def test_queued_existing_entry_parks_when_full(tmp_path):
     coord.dest_client.resume.assert_awaited_once()
 
 
-def test_queued_gate_ignores_non_int_configs():
+@pytest.mark.anyio
+async def test_queued_gate_ignores_non_int_configs():
     """MagicMock test doubles must never report a full cap."""
     from unittest.mock import MagicMock
 
     coord = make_coordinator()
     coord.cfg = MagicMock()  # max_active_downloads is a MagicMock
-    assert coord._try_admit_download(MagicMock()) is True
-    assert coord._park_queued_for_download_slot(MagicMock()) is False
+    assert await coord._try_admit_download(MagicMock()) is True
+    assert await coord._park_queued_for_download_slot(MagicMock()) is False
 
 @pytest.mark.anyio
 async def test_setup_footprint_excludes_remote_skipped_bytes(tmp_path):

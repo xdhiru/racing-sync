@@ -403,3 +403,28 @@ async def test_ledger_freeze_is_loud(tmp_path, caplog):
     with caplog.at_level(logging.ERROR, logger="racing_sync.coordinator"):
         assert await coord._ssd_try_reserve("f" * 40, 1) is False
     assert "freezing admissions" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_wait_disk_skips_reserve_when_downloads_full(tmp_path):
+    """Promotion checks the download cap before the SSD ledger: no
+    reserve/release churn while downloads are full."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _coord_with_cap(tmp_path, 10_000)
+        coord.store = store
+        coord.cfg.max_active_downloads = 1
+        store.upsert(TorrentState(source_infohash="b" * 40,
+                                  source_name="Busy",
+                                  state=State.DOWNLOADING))
+        store.upsert(TorrentState(source_infohash="w" * 40,
+                                  source_name="Wait", total_bytes=100,
+                                  state=State.WAITING_DISK))
+        coord._running_infohashes = {"b" * 40}
+        with patch.object(coord, "_ssd_try_reserve",
+                          AsyncMock(return_value=True)) as reserve:
+            await coord._wait_disk_then_queue(store.get("w" * 40))
+        reserve.assert_not_called()
+        assert store.get("w" * 40).state == State.WAITING_DISK
+    finally:
+        store.close()
