@@ -2879,10 +2879,12 @@ class AdmitMixin:
 
                 if not _coordinator.ssd_has_room(self.cfg, min(total_ep, ts.total_bytes or total_ep)):
                     log.info("ssd cap in use; parking %s", ts.source_name)
+                    # Keep the paused entry for the retry (existing-entry
+                    # adopt path) — see the grow-fail park below.
                     try:
                         _h = ts.dest_infohash or ts.source_infohash
                         if _h:
-                            await self.dest_client.delete(_h, delete_files=True)
+                            await self.dest_client.delete(_h, delete_files=False)
                     except Exception:
                         pass
                     self.transition(ts, State.WAITING_DISK)
@@ -2979,12 +2981,13 @@ class AdmitMixin:
             # Safety net for the admit-race (bytes landed on fuse between
             # the _do_queued shortcut check and this classification): the
             # SSD entry was just added with all files deselected (0-file
-            # corpse). Remove it now so RE_ADDING injects fresh — never
-            # leave a 0-file entry for the replace path to inherit.
+            # corpse). Drop the entry WITHOUT files: it never downloaded,
+            # so any bytes at those paths belong to someone else (shared
+            # save_path) — a metadata-driven wipe could take sibling data.
             try:
                 _h = ts.dest_infohash or ts.source_infohash
                 if _h:
-                    await self.dest_client.delete(_h, delete_files=True)
+                    await self.dest_client.delete(_h, delete_files=False)
             except Exception as e:  # noqa: BLE001
                 log.debug("could not delete fully-remote SSD corpse %s: %s",
                           (ts.dest_infohash or ts.source_infohash or "")[:10], e)
@@ -3013,10 +3016,13 @@ class AdmitMixin:
                 int(_real_footprint or 0) // (1024 * 1024),
                 self._ssd_reserved_total() // (1024 * 1024), ts.source_name,
             )
+            # Keep the paused entry (delete_files=False): the retry adopts
+            # it via the existing-entry path instead of re-adding, and a
+            # metadata-driven wipe could take shared-dir sibling data.
             try:
                 _h = ts.dest_infohash or ts.source_infohash
                 if _h:
-                    await self.dest_client.delete(_h, delete_files=True)
+                    await self.dest_client.delete(_h, delete_files=False)
             except Exception:
                 pass
             self.transition(ts, State.WAITING_DISK)
