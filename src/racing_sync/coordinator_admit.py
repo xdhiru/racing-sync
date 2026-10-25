@@ -1131,7 +1131,43 @@ class AdmitMixin:
         batches, not its full total (a 32 GB pack with 20 GB already remote
         must not block a 16 GB waiter on phantom bytes). Best-effort: any
         failure returns None and the caller stays parked.
+
+        Memoized per (infohash, batch_index, batches_total) for 60s: the
+        estimate only moves with the cursor, and a stale-high value fails
+        safe (over-reserve → park, never over-admit).
         """
+        try:
+            _ekey = ((ts.source_infohash or "").lower(),
+                     int(getattr(ts, "batch_index", 0) or 0),
+                     int(getattr(ts, "batches_total", 0) or 0))
+        except (TypeError, ValueError, AttributeError):
+            _ekey = None
+        _ecache = None
+        if _ekey is not None:
+            try:
+                _ecache = getattr(self, "_estimate_cache", None)
+                if not isinstance(_ecache, dict):
+                    _ecache = {}
+                    self._estimate_cache = _ecache  # type: ignore[attr-defined]
+                _hit = _ecache.get(_ekey)
+                if (isinstance(_hit, tuple) and len(_hit) == 2
+                        and time.monotonic() - float(_hit[0]) < 60.0):
+                    return _hit[1]
+            except Exception:
+                _ecache = None
+        _res = await self._estimate_remaining_bytes_uncached(ts)
+        if _ekey is not None and _ecache is not None and _res is not None:
+            try:
+                _ecache[_ekey] = (time.monotonic(), _res)
+                if len(_ecache) > 500:
+                    for _old in list(_ecache.keys())[: len(_ecache) - 500]:
+                        _ecache.pop(_old, None)
+            except Exception:
+                pass
+        return _res
+
+    async def _estimate_remaining_bytes_uncached(self, ts: TorrentState) -> int | None:
+        """Uncached estimate body (see _estimate_remaining_bytes)."""
         try:
             if not hasattr(self, "dest_client"):
                 return None
