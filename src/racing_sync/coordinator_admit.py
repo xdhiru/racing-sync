@@ -1228,6 +1228,32 @@ class AdmitMixin:
                 pass
             self.transition(ts, State.QUEUED)
             return
+        # Cap before reserve: a promotion that can't download yet must not
+        # churn the ledger (reserve → find full → release) every quiet
+        # window. Live-worker count, off-loop. Non-int configs skip.
+        try:
+            _pre_max_raw = getattr(self.cfg, "max_active_downloads", 0)
+            _pre_max = (int(_pre_max_raw or 0)
+                        if isinstance(_pre_max_raw, (int, float))
+                        and not isinstance(_pre_max_raw, bool) else 0)
+        except (TypeError, ValueError):
+            _pre_max = 0
+        if _pre_max > 0 and await self._live_download_count() >= _pre_max:
+            try:
+                _wd0 = getattr(self, "_waiting_disk_next_check", None)
+                if _wd0 is None:
+                    _wd0 = {}
+                    self._waiting_disk_next_check = _wd0  # type: ignore[attr-defined]
+                _wd0[(ts.source_infohash or "").lower()] = (
+                    time.monotonic() + self.WAITING_DISK_RECHECK_SECONDS
+                )
+            except Exception:
+                pass
+            log.debug(
+                "downloads full (%d/%d); %s stays waiting_disk (no reserve churn)",
+                _pre_max, _pre_max, ts.source_name[:60],
+            )
+            return
         needed = self._ssd_estimate_for_new(ts.total_bytes)
         admitted = await self._ssd_try_reserve(ts.source_infohash, needed)
         if not admitted:
@@ -1293,12 +1319,10 @@ class AdmitMixin:
             else:
                 _max_dl = int(_max_dl_raw or 0)
             if _max_dl > 0:
-                try:
-                    _active_dl = len(await offload(
-                        self.store.list_by_state,
-                        State.QUEUED, State.DOWNLOADING))
-                except Exception:
-                    _active_dl = 0
+                # Live workers only: parked DB rows with no worker must
+                # not pin the cap (they already survived the pre-reserve
+                # check above; this re-check closes the reserve race).
+                _active_dl = await self._live_download_count()
                 if _active_dl >= _max_dl:
                     # Downloads full: release the just-made reservation and
                     # stay parked (never FAILED — space, not an error).
@@ -1350,15 +1374,33 @@ class AdmitMixin:
 
     # ---- state: QUEUED ----
 
-    def _try_admit_download(self, ts: TorrentState) -> bool:
+    async def _live_download_count(self) -> int:
+        """Live DOWNLOADING workers (DB DOWNLOADING ∩ running set).
+
+        One offloaded round-trip plus an in-memory intersect: parked
+        rows with no worker (stalled, forgotten mid-flight) never pin
+        the cap. Never raises.
+        """
+        try:
+            running = getattr(self, "_running_infohashes", None)
+            if not isinstance(running, set) or not running:
+                return 0
+            rows = await offload(self.store.list_by_state, State.DOWNLOADING)
+            return sum(1 for t in rows or ()
+                       if (t.source_infohash or "").lower() in running)
+        except Exception:
+            return 0
+
+    async def _try_admit_download(self, ts: TorrentState) -> bool:
         """Admit one QUEUED row into downloading; False parks it (stay QUEUED).
 
         The tick loop only gates rows that are QUEUED at snapshot time, so a
         fresh-start burst of NEW workers can sail past it into DOWNLOADING
         (live incident: 5 concurrent against max 3). This edge check closes
-        it. Admission is atomic in the event loop (sync check+record, no
+        it.         Admission is atomic in the event loop (sync check+record, no
         await between), so same-tick workers racing through slow RPCs can't
-        all read a stale count. Rows already DOWNLOADING are grandfathered
+        all read a stale count; the live-worker count itself is refreshed
+        off-loop just before. Rows already DOWNLOADING are grandfathered
         (they drain; only new admissions wait). The client entry (if any)
         is left paused as-is and the SSD reservation stays held — the next
         tick retries through the same path with no delete/re-add churn and
@@ -1384,10 +1426,7 @@ class AdmitMixin:
                 # Drop admissions whose worker is gone (cancelled/shutdown):
                 # only live workers pin slots.
                 adm.intersection_update(running)
-            try:
-                n_down = len(self.store.list_by_state(State.DOWNLOADING))
-            except Exception:
-                n_down = 0
+            n_down = await self._live_download_count()
             others = len(adm - {key}) if key else len(adm)
             if n_down + others >= max_dl:
                 log.info("downloads full (%d/%d); %s stays queued",
@@ -1407,10 +1446,10 @@ class AdmitMixin:
         except Exception:
             return True
 
-    def _park_queued_for_download_slot(self, ts: TorrentState) -> bool:
+    async def _park_queued_for_download_slot(self, ts: TorrentState) -> bool:
         """Stay QUEUED when the download cap is full; True when parked."""
         try:
-            return not self._try_admit_download(ts)
+            return not await self._try_admit_download(ts)
         except Exception:
             return False
 
@@ -1515,7 +1554,7 @@ class AdmitMixin:
                         )
                         ts.dest_infohash = ext.hash.lower()
                         ts.save_path = str(ssd_root)
-                        if self._park_queued_for_download_slot(ts):
+                        if await self._park_queued_for_download_slot(ts):
                             return
                         self.transition(ts, State.DOWNLOADING)
                         return
@@ -1589,7 +1628,7 @@ class AdmitMixin:
             )
             ts.dest_infohash = ext.hash.lower()
             ts.save_path = ext.save_path
-            if self._park_queued_for_download_slot(ts):
+            if await self._park_queued_for_download_slot(ts):
                 return
             # Batch-priority re-verify before resume: this entry may predate
             # its priorities (setup-transient park, restart between add and
@@ -1625,7 +1664,7 @@ class AdmitMixin:
         # Brand-new entry: gate before adding so a fresh-start burst of NEW
         # workers can't sail past the tick's snapshot-QUEUED-only cap into
         # concurrent DOWNLOADING (live incident: 5 at once against max 3).
-        if self._park_queued_for_download_slot(ts):
+        if await self._park_queued_for_download_slot(ts):
             return
         # Fully-remote shortcut: every byte already sits verified on fuse,
         # so adding an SSD entry just to deselect all its files (0-file
@@ -2913,7 +2952,7 @@ class AdmitMixin:
         # resumes on reaching the first batch with work). Gate first: setup
         # (add + prioritize) already ran, so park with the paused entry
         # intact — the next tick resumes through the existing-entry path.
-        if self._park_queued_for_download_slot(ts):
+        if await self._park_queued_for_download_slot(ts):
             return
         if first_need is None or first_need:
             await self.dest_client.resume(ts.dest_infohash or ts.source_infohash)
