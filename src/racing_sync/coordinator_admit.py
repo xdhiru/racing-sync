@@ -1513,6 +1513,39 @@ class AdmitMixin:
         finally:
             await _sem.acquire()
 
+    async def _drop_failed_entry(self, h: str, ts, files, why: str) -> None:
+        """Drop a FAILED row's just-added entry without sibling damage.
+
+        The entry never downloaded, but the client preallocates shells at
+        add time: drop the entry (delete_files=False) and unlink exactly
+        the fetched file list, each contained to the row's save dir (files
+        only — never dirs, never through symlinks). A metadata-driven
+        wipe could take shared-dir sibling data (same normalized top,
+        different hash). Best-effort: failures only log.
+        """
+        try:
+            if h:
+                await self.dest_client.delete(h, delete_files=False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("failed to drop entry %s: %s", (h or "")[:10], e)
+        try:
+            _base = Path(ts.save_path or "")
+        except Exception:
+            return
+        for _f in files or []:
+            try:
+                _nm = getattr(_f, "name", "") or ""
+                _p = _safe_ssd_join(_base, _nm)
+                if _p is None or _p.is_symlink():
+                    continue
+                if _p.is_file():
+                    _p.unlink()
+                    log.info("removed preallocated shell %s (%s)", _nm, why)
+            except OSError:
+                continue
+            except Exception:
+                continue
+
     async def _do_queued(self, ts: TorrentState, *,
                          _holds_download_slot: bool = False) -> None:
         blob: bytes = ts._blob or ts.cross_seed_blob
@@ -2815,10 +2848,7 @@ class AdmitMixin:
             # Remove the paused torrent from VPS2 so it does not leak as an orphan
             h = ts.dest_infohash or ts.source_infohash
             if h:
-                try:
-                    await self.dest_client.delete(h, delete_files=True)
-                except Exception as e:
-                    log.warning("failed to delete skipped oversize content %s: %s", h[:10], e)
+                await self._drop_failed_entry(h, ts, files, "oversize")
             self.transition(
                 ts, State.FAILED, error=f"single file larger than skip threshold: {too_big}",
             )
@@ -2854,10 +2884,7 @@ class AdmitMixin:
                 # Remove the paused torrent from VPS2 so it does not leak as an orphan
                 h = ts.dest_infohash or ts.source_infohash
                 if h:
-                    try:
-                        await self.dest_client.delete(h, delete_files=True)
-                    except Exception as e:
-                        log.warning("failed to delete over-cap content %s: %s", h[:10], e)
+                    await self._drop_failed_entry(h, ts, files, "over-cap")
                 self.transition(
                     ts, State.FAILED,
                     error=f"single file larger than batch cap ({_fit_cap} B): {_too_big_for_cap}",

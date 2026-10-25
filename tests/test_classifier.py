@@ -177,10 +177,18 @@ async def test_do_queued_deletes_torrent_when_oversize_movie_skipped(tmp_path: P
     )
     coord.transition = lambda t, s, error=None: setattr(t, "state", s)
 
+    # Preallocated shell from our own add + an unrelated sibling file.
+    (tmp_path / "BigMovie.2024.1080p.mkv").write_bytes(b"\0" * 16)
+    (tmp_path / "Sibling.2024.1080p.mkv").write_bytes(b"x" * 16)
+
     await coord._do_queued(ts)
 
     assert ts.state == State.FAILED
-    coord.dest_client.delete.assert_awaited_once_with("moviehash", delete_files=True)
+    # Entry dropped without files; our shell unlinked file-scoped.
+    coord.dest_client.delete.assert_awaited_once_with(
+        "moviehash", delete_files=False)
+    assert not (tmp_path / "BigMovie.2024.1080p.mkv").exists()
+    assert (tmp_path / "Sibling.2024.1080p.mkv").exists()
 
 
 @pytest.mark.anyio
