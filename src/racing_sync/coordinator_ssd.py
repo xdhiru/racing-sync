@@ -26,6 +26,10 @@ import threading as _threading
 
 _SSD_LOCK_GUARD = _threading.Lock()
 
+# Prune throttle: one batched DB round-trip per window across all
+# admission attempts (50 admits/tick must not mean 50 scans).
+_PRUNE_THROTTLE_S = 10.0
+
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
 
@@ -258,12 +262,22 @@ class SSDLedgerMixin:
 
         Covers the SSD ledger plus the quiet-wait and MOVING-park maps,
         whose transition-time pops are bypassed by forget/cancel (CLI or
-        API). Runs on every admission attempt — cheap fast path when the
-        maps are small.
+        API). Runs on every admission attempt — throttled to one DB
+        round-trip per _PRUNE_THROTTLE_S (cheap fast path when the maps
+        are small or freshly pruned).
 
         DB reads run batched in one worker thread: per-entry sync gets on
         the loop stall admissions under a slow disk/WAL lock.
         """
+        try:
+            import time as _time
+
+            _last = float(getattr(self, "_ssd_prune_at", 0.0) or 0.0)
+            if _time.monotonic() - _last < _PRUNE_THROTTLE_S:
+                return
+            self._ssd_prune_at = _time.monotonic()
+        except Exception:
+            pass
         try:
             store = getattr(self, "store", None)
             if store is None or not hasattr(store, "get"):

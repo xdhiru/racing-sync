@@ -428,3 +428,29 @@ async def test_wait_disk_skips_reserve_when_downloads_full(tmp_path):
         assert store.get("w" * 40).state == State.WAITING_DISK
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_prune_throttles_db_round_trips(tmp_path):
+    """Repeat admissions within the window share one prune scan."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = _coord_with_cap(tmp_path, 10_000_000)
+        coord.store = store
+        coord._ssd_reserved = {"z" * 40: 1}  # stale entry forces a real scan
+        calls: list[bool] = []
+        real_get_many = store.get_many
+
+        def _counting(hashes, **kw):
+            calls.append(True)
+            return real_get_many(hashes, **kw)
+
+        store.get_many = _counting  # type: ignore[method-assign]
+        try:
+            await coord._ssd_prune_stale()
+            await coord._ssd_prune_stale()
+            assert len(calls) == 1
+        finally:
+            store.get_many = real_get_many  # type: ignore[method-assign]
+    finally:
+        store.close()
