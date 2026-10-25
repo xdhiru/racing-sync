@@ -1489,7 +1489,32 @@ class AdmitMixin:
         except Exception:
             return False
 
-    async def _do_queued(self, ts: TorrentState) -> None:
+    async def _run_outside_download_slot(self, coro, holds: bool):
+        """Run `coro` with the caller's download_sem slot released.
+
+        `_do_queued` runs under download_sem (QUEUED admission), but fuse
+        re-injects are minutes of SFTP/Prowlarr/RPCs that download nothing:
+        holding the slot starves real QUEUED setups behind them. Balanced
+        release/re-acquire around the inject only; anything else (and
+        callers holding no slot) runs inline. Never raises by itself —
+        coro errors propagate to the caller.
+        """
+        if not holds:
+            return await coro
+        try:
+            _sem = self.download_sem
+        except Exception:
+            return await coro
+        if _sem is None:
+            return await coro
+        _sem.release()
+        try:
+            return await coro
+        finally:
+            await _sem.acquire()
+
+    async def _do_queued(self, ts: TorrentState, *,
+                         _holds_download_slot: bool = False) -> None:
         blob: bytes = ts._blob or ts.cross_seed_blob
         if not blob:
             blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
@@ -1645,7 +1670,9 @@ class AdmitMixin:
                         # flavour label, which sacrificial/public rows
                         # overwrite) decides the injection set.
                         try:
-                            await self._re_inject_watch_dir_torrents(ts)
+                            await self._run_outside_download_slot(
+                                self._re_inject_watch_dir_torrents(ts),
+                                _holds_download_slot)
                         except Exception as e:  # noqa: BLE001
                             if not is_retryable_client_error(e):
                                 # Fatal disk/permission errors (ENOSPC,
@@ -1661,7 +1688,9 @@ class AdmitMixin:
                                 pass
                             return
                     else:
-                        await self._re_inject_racing_torrents(ts)
+                        await self._run_outside_download_slot(
+                            self._re_inject_racing_torrents(ts),
+                            _holds_download_slot)
                 self.transition(ts, State.DONE)
                 return
 
