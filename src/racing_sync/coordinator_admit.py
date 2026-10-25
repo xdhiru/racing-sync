@@ -1733,14 +1733,12 @@ class AdmitMixin:
             self.transition(ts, State.DOWNLOADING)
             return
 
-        # Brand-new entry: gate before adding so a fresh-start burst of NEW
-        # workers can't sail past the tick's snapshot-QUEUED-only cap into
-        # concurrent DOWNLOADING (live incident: 5 at once against max 3).
-        if await self._park_queued_for_download_slot(ts):
-            return
-        # Fully-remote shortcut: every byte already sits verified on fuse,
-        # so adding an SSD entry just to deselect all its files (0-file
-        # corpse) and delete/replace it in RE_ADDING is pure churn. Skip
+        # Fully-remote shortcut FIRST: every byte already sits verified on
+        # fuse, so adding an SSD entry just to deselect all its files
+        # (0-file corpse) and delete/replace it in RE_ADDING is pure churn.
+        # It also must precede the slot-park below — a remote row consumes
+        # no download slot, and parking it first would record a bogus
+        # admission that pins the cap for rows that really download. Skip
         # the SSD add entirely and go fuse-gated RE_ADDING, which
         # re-verifies before injecting. Fail-open: any doubt adds normally.
         try:
@@ -1754,6 +1752,11 @@ class AdmitMixin:
                 ts.source_name[:60],
             )
             self.transition(ts, State.RE_ADDING)
+            return
+        # Brand-new entry: gate before adding so a fresh-start burst of NEW
+        # workers can't sail past the tick's snapshot-QUEUED-only cap into
+        # concurrent DOWNLOADING (live incident: 5 at once against max 3).
+        if await self._park_queued_for_download_slot(ts):
             return
         result = await self.dest_client.add_torrent(
             torrent_files=[blob],
