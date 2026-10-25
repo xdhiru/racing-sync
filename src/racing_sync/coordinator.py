@@ -2246,8 +2246,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             # download_sem guards QUEUED admission only (_do_queued is
             # short: add + prioritize). The multi-hour _do_downloading
             # below runs outside the semaphore so slots are not pinned.
+            # _do_queued releases the slot itself around fuse re-injects
+            # (minutes of non-download RPCs) via _holds_download_slot.
             async with self.download_sem:
-                await self._do_queued(ts)
+                await self._do_queued(ts, _holds_download_slot=True)
             if ts.state == State.DOWNLOADING:
                 await self._do_downloading(ts)
         elif ts.state == State.DOWNLOADING:

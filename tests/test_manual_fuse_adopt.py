@@ -355,3 +355,51 @@ async def test_queued_prefers_fuse_complete_over_ssd(tmp_path: Path):
         assert row.save_path == str(fuse)
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_queued_reinject_releases_download_slot(tmp_path: Path):
+    """Fuse re-inject runs with the download slot released (it downloads
+    nothing); the slot is re-acquired before DONE."""
+    import asyncio
+
+    from racing_sync.watchdir import _bencode
+
+    store = StateStore(tmp_path / "state.db")
+    h = "r" * 40
+    blob = bytes(_bencode({
+        b"info": {b"name": b"Pack.2026.mkv", b"length": 100},
+    }))
+    store.upsert(TorrentState(
+        source_infohash=h, source_name="Pack.2026", state=State.QUEUED,
+        cross_seed_blob=blob))
+
+    coord = make_coordinator()
+    coord.store = store
+    fuse = _fuse_cfg(tmp_path, coord)
+    (fuse / "Pack.2026.mkv").write_bytes(b"x" * 100)
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[_seeded_fuse_torrent(fuse, h, "Pack.2026")])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[TorrentFile(name="Pack.2026.mkv", size_bytes=100,
+                                  progress=1.0)]
+    )
+    sem = asyncio.Semaphore(1)
+    coord._download_sem = sem
+    await sem.acquire()  # caller holds the only slot
+    seen: dict[str, int] = {}
+
+    async def _inject(_ts):
+        seen["value"] = sem._value
+
+    coord._re_inject_racing_torrents = AsyncMock(side_effect=_inject)
+    try:
+        await coord._do_queued(store.get(h), _holds_download_slot=True)
+        assert seen["value"] == 1  # slot freed during inject
+        assert sem._value == 0  # re-acquired after
+        assert store.get(h).state == State.DONE
+    finally:
+        sem.release()
+        store.close()
