@@ -822,3 +822,57 @@ async def test_do_queued_happy_path():
     coord.dest_client.add_torrent.assert_awaited_once()
     assert ts.dest_infohash == "dest_h1"
     coord.transition.assert_called_once_with(ts, State.DOWNLOADING)
+
+
+@pytest.mark.anyio
+async def test_do_queued_remote_first_skips_slot_park(tmp_path):
+    """A fully-remote QUEUED row goes RE_ADDING even with downloads full —
+    and records no download admission it will never use."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from conftest import make_coordinator
+    from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, StateStore, TorrentState
+    from racing_sync.watchdir import _bencode
+
+    fuse = tmp_path / "fuse"
+    (fuse / "unsorted").mkdir(parents=True)
+    (fuse / "Remote.mkv").write_bytes(b"x" * 100)
+    (fuse / "unsorted" / "Remote.mkv").write_bytes(b"x" * 100)
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord.cfg.rclone.fuse.mount = fuse
+        coord.cfg.rclone.fuse.mount_unsorted = fuse / "unsorted"
+        coord.cfg.classifier._episode_re = None
+        coord.cfg.ssd.skip_movie_larger_than_bytes = 10_000_000_000
+        coord.cfg.max_active_downloads = 1
+        # One live download fills the single slot.
+        store.upsert(TorrentState(source_infohash="b" * 40,
+                                  source_name="Busy",
+                                  state=State.DOWNLOADING))
+        coord._running_infohashes = {"b" * 40}
+
+        blob = bytes(_bencode({
+            b"info": {b"name": b"Remote.mkv", b"length": 100},
+        }))
+        ts = TorrentState(source_infohash="q" * 40, source_name="Remote",
+                          state=State.QUEUED, save_path=str(tmp_path),
+                          cross_seed_blob=blob)
+        store.upsert(ts)
+
+        coord.dest_client = MagicMock()
+        coord.dest_client.list_torrents = AsyncMock(return_value=[])
+        coord.dest_client.add_torrent = AsyncMock()
+        coord.transition = MagicMock(
+            side_effect=lambda t, s, **k: setattr(t, "state", s))
+
+        await coord._do_queued(store.get("q" * 40))
+
+        coord.transition.assert_called_once()
+        assert coord.transition.call_args[0][1] == State.RE_ADDING
+        coord.dest_client.add_torrent.assert_not_called()
+        assert getattr(coord, "_download_admissions", set()) == set()
+    finally:
+        store.close()
