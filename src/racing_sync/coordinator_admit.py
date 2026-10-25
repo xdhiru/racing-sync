@@ -1535,7 +1535,14 @@ class AdmitMixin:
             except Exception:
                 ext = existing[0]
             save_path = ext.save_path.rstrip("/\\").replace("\\", "/")
-            on_fuse = any(save_path == fm or save_path.startswith(fm + "/") for fm in fuse_mounts if fm)
+            # Single on-fuse implementation (case-folded, mount-aware):
+            # an SSD-pointing entry must never have its bytes statted
+            # as fuse — data never seeded would verify as present.
+            try:
+                on_fuse = bool(self._save_path_is_on_fuse(
+                    getattr(ext, "save_path", "")))
+            except Exception:
+                on_fuse = False
             if on_fuse and ext.is_complete():
                 # Verify the bytes are really behind the fuse path: a torrent
                 # added with skip_check=True reports complete even when its
