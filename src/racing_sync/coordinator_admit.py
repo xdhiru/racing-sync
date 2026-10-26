@@ -3267,10 +3267,12 @@ class AdmitMixin:
 
         Re-reads the entry after each pause RPC: without verification a
         resume in the gap (auto-manage, operator) leaves qB writing while
-        rclone moves. A failed verification read still counts the pause
-        itself as success. A hash-checking entry short-circuits immediately
-        (no pause storm against an in-progress check): callers wait it out
-        via TorrentCheckingError instead of fighting it.
+        rclone moves. A failed verification read fails CLOSED (park and
+        retry next tick) — the pause may not have landed, and moving
+        under a writing client corrupts the remote. A hash-checking entry
+        short-circuits immediately (no pause storm against an in-progress
+        check): callers wait it out via TorrentCheckingError instead of
+        fighting it.
         """
         err: Exception | None = None
         for attempt in range(3):
@@ -3303,8 +3305,12 @@ class AdmitMixin:
                             progress=_prog,
                         )
                     err = RuntimeError(f"client still reports state={state!r} after pause")
-                except Exception:
-                    return True, None
+                except Exception as e:
+                    # Verification read failed: the pause may not have
+                    # landed — fail closed (retry the pause, then park)
+                    # instead of moving under a writing client.
+                    err = RuntimeError(
+                        f"could not verify pause for {h[:10]}: {e}")
             except Exception as e:  # noqa: BLE001
                 err = e
             if attempt < 2:

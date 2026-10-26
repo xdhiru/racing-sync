@@ -668,3 +668,18 @@ async def test_mid_move_check_skips_incomplete_unlink(tmp_path):
             await coord._do_moving(store.get("s" * 40))
     assert not (tmp_path / "ssd" / "Solo.mkv").exists()
     store.close()
+
+
+@pytest.mark.anyio
+async def test_pause_verified_fails_closed_on_read_error():
+    """An unverifiable pause is not a success: callers must park, never
+    move under a possibly-writing client."""
+    coord = make_coordinator()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.get_torrent = AsyncMock(
+        side_effect=TimeoutError("wedged"))
+    ok, err = await coord._pause_verified("a" * 40)
+    assert ok is False
+    assert err is not None
+    assert coord.dest_client.pause.await_count == 3
