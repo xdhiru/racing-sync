@@ -3051,3 +3051,26 @@ async def test_worker_skips_version_moved_row(tmp_path):
         assert store.get("a" * 40).state == State.DOWNLOADING
     finally:
         store.close()
+
+
+def test_resolve_batches_reuses_caller_episodes():
+    """Caller-supplied episodes skip the internal re-classify: mid-flight
+    drift must not re-derive a different episode list under pinned kind."""
+    from unittest.mock import MagicMock, patch
+
+    from racing_sync.classifier import Episode
+    from racing_sync.clients.abstract import TorrentFile
+
+    coord = make_coordinator()
+    coord.cfg = MagicMock()
+    files = [TorrentFile(name="s01e01.mkv", size_bytes=100),
+             TorrentFile(name="s01e02.mkv", size_bytes=100)]
+    eps = [Episode(file_name="s01e01.mkv", season=1, episode=1,
+                   size_bytes=100),
+           Episode(file_name="s01e02.mkv", season=1, episode=2,
+                   size_bytes=100)]
+    with patch("racing_sync.coordinator.classify",
+               side_effect=AssertionError("must not re-classify")):
+        batches = coord._resolve_batches(files, "season", 1000, episodes=eps)
+    assert [e.file_name for b in batches for e in b.episodes] == [
+        "s01e01.mkv", "s01e02.mkv"]
