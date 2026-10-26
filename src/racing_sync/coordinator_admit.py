@@ -1191,11 +1191,16 @@ class AdmitMixin:
             from . import coordinator as _coordinator
 
             cls = _coordinator.classify(files, self.cfg)
-            kind = cls.kind or ts.classification_kind or "unknown"
+            # Pinned kind wins over a fresh re-derive: a mid-flight sidecar
+            # must not flip season->mixed under the routed batches.
+            _pinned = ts.classification_kind or ""
+            kind = ((_pinned if _pinned not in ("", "unknown") else "")
+                    or cls.kind or "unknown")
             cap = self._frozen_batch_cap(ts)
             if cap <= 0:
                 return None
-            batches = self._resolve_batches(files, kind, cap)
+            batches = self._resolve_batches(files, kind, cap,
+                                            episodes=cls.episodes)
             if not batches:
                 return None
             try:
@@ -3111,7 +3116,8 @@ class AdmitMixin:
 
     # ---- state: DOWNLOADING ----
 
-    def _resolve_batches(self, files: list[TorrentFile], kind: str, cap_bytes: int) -> list[Batch]:
+    def _resolve_batches(self, files: list[TorrentFile], kind: str, cap_bytes: int,
+                           episodes=None) -> list[Batch]:
         """Episode batches for seasons, file-group batches otherwise.
 
         Single shared rule used at QUEUED time and re-resolved during the
@@ -3119,13 +3125,19 @@ class AdmitMixin:
         episode, movie/unknown multi-file content splits name-sorted file
         groups. Single files, single episodes and empty lists yield no
         batches (full-torrent flow).
+
+        `episodes` (when the caller already classified) skips the internal
+        re-classify: a mid-flight sidecar must not re-derive a different
+        episode list — or flip the kind — under a pinned classification.
         """
         if kind in ("season", "mixed"):
             try:
-                # Same patch-target treatment as above (classify).
-                from . import coordinator as _coordinator
+                if episodes is None:
+                    # Same patch-target treatment as above (classify).
+                    from . import coordinator as _coordinator
 
-                eps = list(_coordinator.classify(files, self.cfg).episodes)
+                    episodes = _coordinator.classify(files, self.cfg).episodes
+                eps = list(episodes or [])
             except Exception:
                 return []
             if not eps:
@@ -3151,13 +3163,17 @@ class AdmitMixin:
             log.warning("could not get torrent files for batches: %s", e)
             return None
         # Same rule as _do_queued so batch counts stay consistent across
-        # the download loop.
+        # the download loop. Pinned kind wins; a fresh classify only fills
+        # in unknown — and its episodes are reused so one parse serves both.
         kind = ts.classification_kind
+        _eps = None
         if not kind or kind == "unknown":
             try:
                 from . import coordinator as _coordinator
 
-                kind = _coordinator.classify(files, self.cfg).kind
+                _cls = _coordinator.classify(files, self.cfg)
+                kind = _cls.kind
+                _eps = _cls.episodes
             except Exception as e:
                 log.warning("could not classify files for batches: %s", e)
                 return None
@@ -3165,7 +3181,7 @@ class AdmitMixin:
         if cap <= 0:
             cap = sum(f.size_bytes for f in files) or 1
         try:
-            return self._resolve_batches(files, kind, cap)
+            return self._resolve_batches(files, kind, cap, episodes=_eps)
         except Exception as e:
             log.warning("could not make batches for %s: %s", ts.source_name, e)
             return None

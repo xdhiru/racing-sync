@@ -208,11 +208,16 @@ class SSDLedgerMixin:
             except Exception:
                 return None
             try:
-                kind = _classify(parsed, self.cfg).kind
+                _cls = _classify(parsed, self.cfg)
+                # Pinned kind wins over a fresh re-derive (see _resolve_batches).
+                _pinned = ts.classification_kind or ""
+                kind = ((_pinned if _pinned not in ("", "unknown") else "")
+                        or _cls.kind or "unknown")
+                _eps = _cls.episodes
             except Exception:
                 return None
             try:
-                batches = self._resolve_batches(parsed, kind, cap)
+                batches = self._resolve_batches(parsed, kind, cap, episodes=_eps)
             except Exception:
                 return None
             if not batches:

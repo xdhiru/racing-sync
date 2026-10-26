@@ -634,12 +634,17 @@ class DownloadMixin:
                 raise RuntimeError(f"batch files unlistable for {ts.source_name}: {e}") from e
             return None
         try:
-            kind = classify(files, self.cfg).kind
+            cls = classify(files, self.cfg)
         except Exception as e:
             log.warning("could not classify files for next batch: %s", e)
             if strict:
                 raise RuntimeError(f"batch classify failed for {ts.source_name}: {e}") from e
             return None
+        # Pinned kind wins over a fresh re-derive: a mid-flight sidecar
+        # must not flip season->mixed under the routed batches.
+        _pinned = ts.classification_kind or ""
+        kind = ((_pinned if _pinned not in ("", "unknown") else "")
+                or cls.kind or "unknown")
         cap = self._frozen_batch_cap(ts)
         if cap <= 0:
             try:
@@ -647,7 +652,8 @@ class DownloadMixin:
             except Exception:
                 cap = 1
         try:
-            batches = self._resolve_batches(files, kind, cap)
+            batches = self._resolve_batches(files, kind, cap,
+                                            episodes=cls.episodes)
         except Exception as e:
             log.warning("could not make batches for next batch: %s", e)
             if strict:
