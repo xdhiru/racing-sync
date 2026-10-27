@@ -148,6 +148,11 @@ _SCHED_STATE_PRIORITY = {
     State.FAILED: 3,
 }
 
+# Misc worker budget: NEW intake, WAITING_DISK checks, RE_ADDING and
+# DONE/FAILED drains share this (downloads/moves have their own caps).
+# Bounds intake bursts without letting long downloads/moves starve them.
+_MISC_WORKER_BUDGET = 12
+
 
 def _sched_priority(ts) -> tuple[int, dt.datetime]:
     """Worker-scheduling order key (lower first, then oldest first).
@@ -1598,7 +1603,6 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             )
         except (TypeError, ValueError, AttributeError):
             max_concurrent_workers = 12
-        available_slots = max(0, max_concurrent_workers - len(self._tasks))
 
         active_downloads = sum(
             1 for t in active
@@ -1610,9 +1614,19 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             if (t.source_infohash or "").lower() in self._running_infohashes
             and t.state == State.MOVING
         )
+        # Per-phase worker budgets: a handful of multi-hour DOWNLOADING /
+        # MOVING workers must not starve every other state via the global
+        # slot pool. Downloads/moves gate on their live counts above;
+        # intake, checks and re-adds share a bounded misc budget; the
+        # global worker count stays only as a backstop.
+        live_misc = sum(
+            1 for t in active
+            if (t.source_infohash or "").lower() in self._running_infohashes
+            and t.state not in (State.QUEUED, State.DOWNLOADING, State.MOVING)
+        )
 
         for ts in active:
-            if available_slots <= 0:
+            if len(self._tasks) >= max_concurrent_workers:
                 break
             _tkey = (ts.source_infohash or "").lower()
             if _tkey in self._running_infohashes:
@@ -1663,6 +1677,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             if ts.state == State.MOVING and active_moves >= self.cfg.max_concurrent_moves:
                 continue
 
+            # All other states (NEW intake, WAITING_DISK checks, RE_ADDING,
+            # DONE/FAILED drains) share the misc budget: unbounded intake
+            # bursts must not flood the loop with Prowlarr picks either.
+            if (ts.state not in (State.QUEUED, State.DOWNLOADING, State.MOVING)
+                    and live_misc >= _MISC_WORKER_BUDGET):
+                continue
+
             try:
                 self._spawn_worker(ts)
             except asyncio.CancelledError:
@@ -1676,11 +1697,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 active_downloads += 1
             elif ts.state == State.MOVING:
                 active_moves += 1
+            else:
+                live_misc += 1
 
             scheduled += 1
             if ts.state == State.WAITING_DISK:
                 scheduled_waiting_disk += 1
-            available_slots -= 1
         if scheduled:
             # Quiet-wait: a tick that only re-checked parked WAITING_DISK
             # rows is routine while batches drain — debug, not info, so a
