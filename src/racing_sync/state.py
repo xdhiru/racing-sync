@@ -14,6 +14,7 @@ import logging
 import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -361,6 +362,10 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = (
 # day (covers in-flight workers, retries and re-discovery), then GC.
 _TOMBSTONE_TTL_SECONDS = 24 * 3600
 
+# Display-list sharing window (seconds): Telegram taps/scrapes without an
+# intervening row write share one active-tasks scan.
+_DISPLAY_CACHE_S = 10.0
+
 
 class StateStore:
     """SQLite-backed persistent store for TorrentState records.
@@ -473,6 +478,18 @@ class StateStore:
             # loud, so the shutdown ordering bug gets fixed, not masked.
             log.warning("StateStore used after close (post-shutdown drain?)")
             raise RuntimeError("StateStore is closed")
+
+    def _invalidate_display(self) -> None:
+        """Drop the cached active-tasks list after any row write.
+
+        list_active_inflight() is display-only (Telegram renders); every
+        structural write invalidates so taps never render pre-mutation
+        rows, while tap bursts without intervening writes share one scan.
+        """
+        try:
+            self._display_cache = None
+        except Exception:
+            pass
 
     @contextlib.contextmanager
     def _write_tx(self):
@@ -669,6 +686,7 @@ class StateStore:
                 f"ON CONFLICT(source_infohash) DO UPDATE SET {updates_str}",
                 tuple(row.values()),
             )
+            self._invalidate_display()
             # Sync the revision back: an upsert-then-transition sequence on
             # the same object must not trip the transition version guard
             # below (only *other* writers invalidate this snapshot).
@@ -739,15 +757,33 @@ class StateStore:
 
         Excludes DONE and FAILED — those have a settled detail message in
         chat history and should not clutter the live list.
+
+        Display path: results are shared for _DISPLAY_CACHE_S across taps
+        without an intervening row write (every structural write
+        invalidates), so tap storms and scrapes don't each pay a full
+        table scan + ORDER BY. Scheduler/worker paths use all_active()
+        uncached — they must see fresh rows.
         """
         self._ensure_open()
+        try:
+            _mc = getattr(self, "_display_cache", None)
+            if (isinstance(_mc, tuple) and len(_mc) == 2
+                    and time.monotonic() - float(_mc[0]) < _DISPLAY_CACHE_S):
+                return list(_mc[1])
+        except Exception:
+            pass
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT {_TORRENT_STATE_COLUMNS_NO_BLOB} FROM torrent_state WHERE state NOT IN ('done','failed') "
                 "AND deleted_at = '' "
                 "ORDER BY updated_at DESC"
             ).fetchall()
-            return [_row_to_state(r) for r in rows]
+            out = [_row_to_state(r) for r in rows]
+        try:
+            self._display_cache = (time.monotonic(), out)
+        except Exception:
+            pass
+        return out
 
     def get_telegram_message_id(self, source_infohash: str) -> int | None:
         self._ensure_open()
@@ -872,6 +908,7 @@ class StateStore:
             self._conn.execute(
                 "DELETE FROM torrent_state WHERE source_infohash = ?", (norm,)
             )
+            self._invalidate_display()
 
     def hard_delete(self, source_infohash: str) -> bool:
         """Delete a row outright, tombstone or not; True when one was removed.
@@ -890,6 +927,8 @@ class StateStore:
             cur = self._conn.execute(
                 "DELETE FROM torrent_state WHERE source_infohash = ?", (norm,)
             )
+            if (cur.rowcount or 0) > 0:
+                self._invalidate_display()
             return (cur.rowcount or 0) > 0
 
     def tombstone(self, source_infohash: str) -> bool:
@@ -913,6 +952,7 @@ class StateStore:
                 (now, now, norm),
             )
             if (cur.rowcount or 0) > 0:
+                self._invalidate_display()
                 return True
             # Already tombstoned: refresh the stamp (extends the TTL) but
             # report False — no live row was stamped by this call.
@@ -922,6 +962,7 @@ class StateStore:
                 "WHERE source_infohash = ?",
                 (now, now, norm),
             )
+            self._invalidate_display()
             return False
 
     def clear_tombstone(self, source_infohash: str) -> bool:
@@ -943,6 +984,8 @@ class StateStore:
                 "WHERE source_infohash = ? AND deleted_at != ''",
                 (dt.datetime.now(dt.timezone.utc).isoformat(), norm),
             )
+            if (cur.rowcount or 0) > 0:
+                self._invalidate_display()
             return (cur.rowcount or 0) > 0
 
     def gc_tombstones(self, ttl_seconds: int = _TOMBSTONE_TTL_SECONDS) -> int:
@@ -958,6 +1001,8 @@ class StateStore:
                 "DELETE FROM torrent_state WHERE deleted_at != '' AND deleted_at <= ?",
                 (cutoff,),
             )
+            if (cur.rowcount or 0) > 0:
+                self._invalidate_display()
             return cur.rowcount or 0
 
     # ---- ignore list (cancelled releases) ----
@@ -1228,6 +1273,7 @@ class StateStore:
                 f"{(ts.source_infohash or '')[:10]}; "
                 f"refusing {src.value} -> {ts.state.value}"
             )
+        self._invalidate_display()
 
     def _wal_checkpoint(self) -> None:
         """Best-effort TRUNCATE checkpoint after heavy log prunes: bounds
@@ -1450,6 +1496,12 @@ class StateStore:
             )
             if (cur.rowcount or 0) <= 0:
                 return 0
+            if bump:
+                # Advisory-only parks skip invalidation too (like the
+                # version bump): the 10s display TTL bounds their
+                # staleness, and per-tick timer churn must not nuke the
+                # shared scan.
+                self._invalidate_display()
             row = self._conn.execute(
                 "SELECT version FROM torrent_state WHERE source_infohash = ?",
                 (norm,),
