@@ -1328,3 +1328,94 @@ async def test_find_release_refusals():
     prow._cfg.should_skip_title = MagicMock(return_value=False)
     with pytest.raises(LookupError, match="No download-target"):
         await coord.find_release("Show.S01")
+
+
+def _pick_cfg(**kw):
+    cfg = MagicMock()
+    cfg.cross_seed.allow_ssh_export = True
+    cfg.cross_seed.refetch_public_via_prowlarr = False
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+    cfg.prowlarr.download_indexers = [MagicMock()]
+    cfg.prowlarr.is_download_indexer = lambda url: "dl-indexer" in (url or "")
+    cfg.prowlarr.should_skip_title = MagicMock(return_value=False)
+    for k, v in kw.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def _pick_torrent(h, trackers, size=1000, name="Show"):
+    return Torrent(hash=h, name=name, category="", save_path="",
+                   size_bytes=size, state="seeding", progress=1.0,
+                   trackers=trackers)
+
+
+@pytest.mark.anyio
+async def test_public_unreachable_falls_through_to_direct():
+    """Unreachable public bytes reuse the direct-export fallback: a
+    same-content download-indexer sibling supplies VPS2-leechable bytes
+    instead of parking with options unspent."""
+    cfg = _pick_cfg()
+    pub = _pick_torrent(
+        "p" * 40, ["udp://tracker.opentrackr.org:1337/announce"])
+    sib = _pick_torrent(
+        "d" * 40, ["https://dl-indexer.example.net/announce"])
+    sftp = MagicMock()
+    sftp.fetch_torrent = MagicMock(return_value=None)
+    source_client = AsyncMock()
+
+    async def _export(h):
+        return None if h == "p" * 40 else b"d8:announce...e"
+
+    source_client.export_torrent = AsyncMock(side_effect=_export)
+
+    dec = await pick_ssd_source_for_racing(
+        cfg=cfg, source_torrent=pub, other_source_torrents=[sib],
+        prowlarr=MagicMock(), sftp=sftp, source_client=source_client)
+    assert dec is not None
+    assert dec.infohash == "d" * 40
+    assert dec.preferred is True
+
+
+@pytest.mark.anyio
+async def test_direct_sibling_size_mismatch_falls_back():
+    """A same-name repack of a different size must not supply bytes."""
+    cfg = _pick_cfg()
+    pub = _pick_torrent(
+        "p" * 40, ["udp://tracker.opentrackr.org:1337/announce"])
+    sib = _pick_torrent(
+        "d" * 40, ["https://dl-indexer.example.net/announce"], size=2000)
+    sftp = MagicMock()
+    sftp.fetch_torrent = MagicMock(return_value=None)
+    source_client = AsyncMock()
+    source_client.export_torrent = AsyncMock(return_value=None)
+
+    dec = await pick_ssd_source_for_racing(
+        cfg=cfg, source_torrent=pub, other_source_torrents=[sib],
+        prowlarr=MagicMock(), sftp=sftp, source_client=source_client)
+    assert dec is None
+
+
+@pytest.mark.anyio
+async def test_picker_deadline_parks():
+    """A wedged transport tree parks via the overall deadline instead of
+    pinning the worker slot."""
+    import asyncio
+    from unittest.mock import patch
+
+    import racing_sync.coordinator_picker as _picker
+    from types import SimpleNamespace
+
+    real = _picker._PICKER_DEADLINE_S
+    _picker._PICKER_DEADLINE_S = 0.1
+    try:
+        async def _hang(**kw):
+            await asyncio.sleep(3600)
+
+        with patch.object(_picker, "_pick_ssd_source_inner", new=_hang):
+            dec = await _picker.pick_ssd_source_for_racing(
+                cfg=MagicMock(), source_torrent=SimpleNamespace(name="X"),
+                other_source_torrents=[], prowlarr=None, sftp=None,
+                source_client=MagicMock())
+        assert dec is None
+    finally:
+        _picker._PICKER_DEADLINE_S = real

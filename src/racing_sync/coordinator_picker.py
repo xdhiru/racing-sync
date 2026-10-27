@@ -27,7 +27,7 @@ from .sftp_source import SFTPExporter
 log = logging.getLogger("racing_sync.coordinator")
 
 
-async def pick_ssd_source_for_racing(
+async def _pick_ssd_source_inner(
     *,
     cfg: AppConfig,
     source_torrent: Torrent,
@@ -127,17 +127,19 @@ async def pick_ssd_source_for_racing(
         # source_infohash), try the source client's own export endpoint
         # (qBittorrent /torrents/export; Deluge daemons have no equivalent
         # RPC, so a failure there after an SFTP miss is routine).
-        try:
-            blob = await asyncio.wait_for(
-                source_client.export_torrent(chosen.infohash),
-                timeout=15.0,
-            )
-        except AttributeError:
+        _export = getattr(source_client, "export_torrent", None)
+        if not callable(_export):
             blob = None
-        except Exception as e:  # noqa: BLE001
-            log.warning("source export_torrent failed for %s: %s",
-                        chosen.infohash[:10], e)
-            blob = None
+        else:
+            try:
+                blob = await asyncio.wait_for(
+                    _export(chosen.infohash),
+                    timeout=15.0,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("source export_torrent failed for %s: %s",
+                            chosen.infohash[:10], e)
+                blob = None
         if blob:
             log.info(
                 "public racing torrent present; "
@@ -222,13 +224,19 @@ async def pick_ssd_source_for_racing(
                     announce_url=announce or (chosen.trackers[0] if chosen.trackers else ""),
                 )
 
+        # Unreachable public bytes: reuse the direct-export fallback
+        # below (a same-content download-indexer sibling may still supply
+        # VPS2-leechable bytes) by disabling the Prowlarr query public rows
+        # never run — instead of parking on the public-export schedule
+        # with options unspent.
         log.warning(
-            "public torrent present but could not export .torrent for %s (sftp=%s, qb=%s)",
+            "public torrent present but could not export .torrent for %s (sftp=%s, qb=%s); "
+            "trying direct-export fallback",
             chosen.name,
             cfg.cross_seed.allow_ssh_export and sftp is not None,
             source_client is not None,
         )
-        return None
+        attempt_prowlarr = False
 
     # All torrents are private. Preferred SSD source is a cross-seed from the
     # configured download-target indexers (tried in priority order) — unless
@@ -328,6 +336,10 @@ async def pick_ssd_source_for_racing(
     try:
         _entries = getattr(getattr(cfg, "prowlarr", None), "download_indexers", None)
         if _entries:
+            try:
+                _want_size = int(getattr(source_torrent, "size_bytes", 0) or 0)
+            except (TypeError, ValueError):
+                _want_size = 0
             for _t in [source_torrent, *(other_source_torrents or [])]:
                 try:
                     _urls = getattr(_t, "trackers", None) or []
@@ -335,6 +347,14 @@ async def pick_ssd_source_for_racing(
                     continue
                 try:
                     if any(cfg.prowlarr.is_download_indexer(u or "") for u in _urls):
+                        # Same-name repacks must not supply mismatched
+                        # bytes: sizes must agree when both are known.
+                        try:
+                            _got_size = int(getattr(_t, "size_bytes", 0) or 0)
+                        except (TypeError, ValueError):
+                            _got_size = 0
+                        if _want_size and _got_size and _got_size != _want_size:
+                            continue
                         direct_t = _t
                         break
                 except Exception:
@@ -391,21 +411,23 @@ async def pick_ssd_source_for_racing(
             # qBittorrent sources expose every torrent via /torrents/export;
             # Deluge sources rely on SFTP (their RPC has no torrent-file
             # method), so a failure here after an SFTP miss is routine.
-            try:
-                blob = await asyncio.wait_for(
-                    source_client.export_torrent(direct_t.infohash),
-                    timeout=15.0,
-                )
-            except AttributeError:
+            _export2 = getattr(source_client, "export_torrent", None)
+            if not callable(_export2):
                 blob = None
-            except Exception as e:  # noqa: BLE001
-                if sftp is not None and isinstance(source_client, DelugeClient):
-                    log.debug("private export fallback unavailable for %s: %s",
-                              direct_t.infohash[:10], e)
-                else:
-                    log.warning("private export fallback fetch %s failed: %s",
-                                direct_t.infohash[:10], e)
-                blob = None
+            else:
+                try:
+                    blob = await asyncio.wait_for(
+                        _export2(direct_t.infohash),
+                        timeout=15.0,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    if sftp is not None and isinstance(source_client, DelugeClient):
+                        log.debug("private export fallback unavailable for %s: %s",
+                                  direct_t.infohash[:10], e)
+                    else:
+                        log.warning("private export fallback fetch %s failed: %s",
+                                    direct_t.infohash[:10], e)
+                    blob = None
             if blob:
                 label = "private-export-fallback"
         if blob:
@@ -423,10 +445,52 @@ async def pick_ssd_source_for_racing(
             )
 
     log.warning(
-        "no public torrent and no download-target indexer cross-seed available for %s",
+        "no SSD source available for %s "
+        "(no public bytes, no download-target cross-seed, no direct export)",
         source_torrent.name,
     )
     return None
+
+
+# Overall picker deadline: the sum of per-RPC budgets (SFTP retries,
+# Prowlarr search+fetch, exports) must never wedge a worker slot past
+# this, no matter how the transports misbehave.
+_PICKER_DEADLINE_S = 300.0
+
+
+async def pick_ssd_source_for_racing(
+    *,
+    cfg: AppConfig,
+    source_torrent: Torrent,
+    other_source_torrents: list[Torrent],
+    prowlarr: ProwlarrClient | None,
+    sftp: SFTPExporter | None,
+    source_client: TorrentClient,
+    attempt_prowlarr: bool = True,
+) -> SourceDecision | None:
+    """Decide which .torrent bytes to feed VPS2 SSD (overall deadline).
+
+    Same contract as the inner pick; the whole decision (all transports)
+    is bounded by _PICKER_DEADLINE_S so one wedged dependency can't pin
+    a worker slot. Timeout parks (None) like any miss.
+    """
+    try:
+        return await asyncio.wait_for(
+            _pick_ssd_source_inner(
+                cfg=cfg,
+                source_torrent=source_torrent,
+                other_source_torrents=other_source_torrents,
+                prowlarr=prowlarr,
+                sftp=sftp,
+                source_client=source_client,
+                attempt_prowlarr=attempt_prowlarr,
+            ),
+            timeout=_PICKER_DEADLINE_S,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        log.warning("picker exceeded %ds overall deadline for %s; parking",
+                    _PICKER_DEADLINE_S, (source_torrent.name or "")[:60])
+        return None
 
 
 __all__ = ["pick_ssd_source_for_racing"]

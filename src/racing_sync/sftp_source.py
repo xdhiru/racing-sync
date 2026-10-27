@@ -36,6 +36,11 @@ _POOL_SIZE_DEFAULT: int = 3
 _POOL_SIZE_MIN: int = 1
 _POOL_SIZE_MAX: int = 8
 
+# Bound for every SFTP file read on a connected channel (seconds): without
+# it a wedged transport stalls fetch_torrent forever, and the caller's
+# wait_for abandon leaves the thread holding the member lock.
+_SFTP_IO_TIMEOUT_S: float = 15.0
+
 
 def _coerce_pool_size(raw: object) -> int:
     """Clamp pool size to [_POOL_SIZE_MIN, _POOL_SIZE_MAX]; default on garbage."""
@@ -233,6 +238,12 @@ class _SFTPConnection:
                 kwargs["sock"] = sock
                 self._client.connect(**kwargs)
                 self._sftp = self._client.open_sftp()
+                try:
+                    _chan = self._sftp.get_channel()
+                    if _chan is not None:
+                        _chan.settimeout(_SFTP_IO_TIMEOUT_S)
+                except Exception:
+                    pass
                 log.info("sftp connected to %s:%d", self._cfg.ssh_host, self._cfg.ssh_port)
             except BaseException:
                 # BaseException on purpose: CancelledError/KeyboardInterrupt
