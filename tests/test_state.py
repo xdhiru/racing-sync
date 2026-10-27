@@ -927,3 +927,35 @@ def test_active_index_exists(tmp_path: Path):
         assert "ix_active_updated" in names
     finally:
         store.close()
+
+
+def test_display_list_shared_until_write(tmp_path: Path):
+    """Tap bursts without intervening writes share one scan; any row
+    write invalidates."""
+    import datetime as _dt
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A",
+                                  state=State.NEW))
+        assert [t.source_infohash
+                for t in store.list_active_inflight()] == ["a" * 40]
+        assert store._display_cache is not None
+        # Sneak a row past the write API: the cached tap still shows
+        # the old list (staleness requires a real write to lift).
+        _now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        store._conn.execute(
+            "INSERT INTO torrent_state (source_infohash, source_name, "
+            "state, deleted_at, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?)",
+            ("b" * 40, "B", "new", "", _now_iso, _now_iso))
+        assert [t.source_infohash
+                for t in store.list_active_inflight()] == ["a" * 40]
+        # A real write invalidates: the next tap rescans.
+        store.upsert(TorrentState(source_infohash="c" * 40, source_name="C",
+                                  state=State.NEW))
+        assert {t.source_infohash
+                for t in store.list_active_inflight()} == {
+                    "a" * 40, "b" * 40, "c" * 40}
+    finally:
+        store.close()
