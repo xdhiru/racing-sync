@@ -338,6 +338,8 @@ CREATE INDEX IF NOT EXISTS ix_indexer_retry
 CREATE INDEX IF NOT EXISTS ix_public_export_retry
     ON torrent_state(state, public_export_next_retry_at);
 CREATE INDEX IF NOT EXISTS ix_source_name ON torrent_state(source_name);
+CREATE INDEX IF NOT EXISTS ix_active_updated ON torrent_state(updated_at)
+    WHERE deleted_at = '';
 """
 
 SCHEMA = SCHEMA_TABLES + SCHEMA_INDEXES
@@ -370,6 +372,7 @@ class StateStore:
 
     def __init__(self, db_path: Path):
         self._lock = threading.RLock()
+        self._tx_local = threading.local()
         self._log_append_counter = 0
         self._db_path = db_path
         self._closed = False
@@ -428,8 +431,11 @@ class StateStore:
         ):
             try:
                 self._conn.execute(f"ALTER TABLE torrent_state {_ddl}")
-            except Exception:
-                pass
+            except Exception as e:
+                # Duplicate-column is the expected rerun path; anything
+                # else (readonly, full-disk, corrupt) must be loud.
+                if "duplicate column" not in str(e).lower():
+                    log.warning("state DB migration %r failed: %s", _ddl, e)
         # Retired states: QUERYING was folded into WAITING_INDEXER (the
         # wakeup hop that created it is gone; workers handle timer-elapsed
         # WAITING_INDEXER rows directly). A pre-upgrade row parked there
@@ -447,9 +453,25 @@ class StateStore:
                          "'waiting_indexer'", _cur.rowcount)
         except Exception:
             pass
+        # Single deleted_at sentinel: legacy NULL rows are writable but
+        # invisible (every read requires ''), so normalize once at open.
+        # A real tombstone is always a timestamp string, never NULL.
+        try:
+            _normed = self._conn.execute(
+                "UPDATE torrent_state SET deleted_at = '' "
+                "WHERE deleted_at IS NULL"
+            ).rowcount or 0
+        except Exception:
+            _normed = 0
+        if _normed:
+            log.warning("state DB: normalized %d legacy NULL deleted_at "
+                        "row(s) to ''", _normed)
 
     def _ensure_open(self) -> None:
         if self._closed:
+            # Post-shutdown drains surface here (500s / frozen cards):
+            # loud, so the shutdown ordering bug gets fixed, not masked.
+            log.warning("StateStore used after close (post-shutdown drain?)")
             raise RuntimeError("StateStore is closed")
 
     @contextlib.contextmanager
@@ -465,15 +487,22 @@ class StateStore:
         """
         self._ensure_open()
         with self._lock:
-            depth = getattr(self, "_tx_depth", 0) or 0
+            _local = getattr(self, "_tx_local", None)
+            if _local is None:
+                _local = threading.local()
+                try:
+                    self._tx_local = _local
+                except Exception:
+                    pass
+            depth = getattr(_local, "depth", 0) or 0
             if depth:
                 yield
                 return
-            self._tx_depth = 1
+            _local.depth = 1
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
             except Exception:
-                self._tx_depth = 0
+                _local.depth = 0
                 raise
             try:
                 yield
@@ -486,15 +515,17 @@ class StateStore:
             else:
                 self._conn.execute("COMMIT")
             finally:
-                self._tx_depth = 0
+                _local.depth = 0
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
             try:
-                self._conn.close()
+                if self._conn is not None:
+                    self._conn.close()
             finally:
+                self._conn = None
                 self._closed = True
 
     def __enter__(self) -> StateStore:
@@ -527,13 +558,15 @@ class StateStore:
         """
         self._ensure_open()
         try:
-            wanted = []
+            wanted: list[str] = []
+            seen: set[str] = set()
             for h in hashes or []:
                 try:
                     n = (h or "").strip().lower()
                 except Exception:
                     continue
-                if n and n not in wanted:
+                if n and n not in seen:
+                    seen.add(n)
                     wanted.append(n)
         except Exception:
             return {}
@@ -552,7 +585,12 @@ class StateStore:
                         "AND deleted_at = ''",
                         chunk,
                     ).fetchall()
-                except Exception:
+                except Exception as e:
+                    # Explicit signal, not a silent partial map: the only
+                    # caller (SSD-prune sweep) treats missing as absent, so
+                    # the contract stays fail-open — but it must be loud.
+                    log.warning("get_many chunk failed (%d hashes): %s",
+                                len(chunk), e)
                     continue
                 for r in rows or []:
                     try:
@@ -578,20 +616,18 @@ class StateStore:
     def _is_tombstoned(self, source_infohash: str) -> bool:
         """True when the hash carries a live forget tombstone.
 
-        Fail-open (False) on any store error: a transient DB blip must
-        never divert live work, and the coordinator-level _abandoned()
-        re-check bounds the race anyway.
+        Fail-CLOSED: a store error propagates instead of returning False —
+        both callers (upsert, transition) run it inside a write txn where
+        the follow-up read/write would fail the same way, so swallowing
+        here could only resurrect a forgotten row, never save real work.
         """
-        try:
-            norm = (source_infohash or "").strip().lower()
-            with self._lock:
-                row = self._conn.execute(
-                    "SELECT deleted_at FROM torrent_state WHERE source_infohash = ?",
-                    (norm,),
-                ).fetchone()
-            return bool(row and row["deleted_at"])
-        except Exception:
-            return False
+        norm = (source_infohash or "").strip().lower()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT deleted_at FROM torrent_state WHERE source_infohash = ?",
+                (norm,),
+            ).fetchone()
+        return bool(row and row["deleted_at"])
 
     def upsert(self, ts: TorrentState) -> None:
         self._ensure_open()
@@ -793,7 +829,13 @@ class StateStore:
             if clean_name.lower().endswith(ext):
                 clean_name = clean_name[:-len(ext)].strip()
                 break
+        if not clean_name:
+            # ".mkv" alone strips to nothing — same '%' hazard.
+            return []
         stripped_name = re.sub(r"\s*\[[^\]]+\]\s*$", "", clean_name).strip()
+        if not stripped_name:
+            # "[FL]" alone strips to nothing — same '%' hazard.
+            return []
 
         def _escape_like(s: str) -> str:
             # Escape LIKE wildcards so `100%` / `S01_E01` match literally.
@@ -805,7 +847,7 @@ class StateStore:
                 "WHERE deleted_at = '' AND (source_name = ? OR source_name = ? "
                 "OR source_name = ? OR source_name LIKE ? ESCAPE '\\' "
                 "OR source_name LIKE ? ESCAPE '\\') "
-                "ORDER BY updated_at DESC",
+                "ORDER BY updated_at DESC LIMIT 200",
                 (
                     source_name,
                     clean_name,
@@ -1175,7 +1217,7 @@ class StateStore:
         cur = self._conn.execute(
             f"UPDATE torrent_state SET {', '.join(sets)} "
             "WHERE source_infohash = ? AND state = ? AND version = ? "
-            "AND (deleted_at IS NULL OR deleted_at = '')",
+            "AND deleted_at = ''",
             (*params,
              (ts.source_infohash or "").strip().lower(),
              src.value, expected_version),
@@ -1187,11 +1229,21 @@ class StateStore:
                 f"refusing {src.value} -> {ts.state.value}"
             )
 
+    def _wal_checkpoint(self) -> None:
+        """Best-effort TRUNCATE checkpoint after heavy log prunes: bounds
+        WAL growth on long-lived coordinators doing per-tick upserts."""
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+
     def append_log(self, level: str, message: str,
                    source_infohash: str | None = None) -> None:
         self._ensure_open()
         # Single transaction: a crash between INSERT and prune must never
         # leave the table over cap (or a prune without its insert).
+        # The checkpoint runs after COMMIT — never inside the txn.
+        _pruned = False
         with self._write_tx():
             self._conn.execute(
                 "INSERT INTO run_log (ts, source_infohash, level, message) VALUES (?,?,?,?)",
@@ -1203,6 +1255,9 @@ class StateStore:
                 self._conn.execute(
                     "DELETE FROM run_log WHERE id NOT IN (SELECT id FROM run_log ORDER BY id DESC LIMIT 5000)"
                 )
+                _pruned = True
+        if _pruned:
+            self._wal_checkpoint()
 
     def prune_logs(self, max_records: int = 5000) -> None:
         self._ensure_open()
@@ -1218,6 +1273,7 @@ class StateStore:
                 "DELETE FROM run_log WHERE id NOT IN (SELECT id FROM run_log ORDER BY id DESC LIMIT ?)",
                 (max_records,),
             )
+            self._wal_checkpoint()
 
     def iter_logs(self, limit: int = 200) -> list[sqlite3.Row]:
         self._ensure_open()
@@ -1258,7 +1314,8 @@ class StateStore:
         """Stamp/clear the fuse-verified flag; True when a row was updated.
 
         Narrow UPDATE so a verification probe never clobbers concurrent
-        worker mutations to the rest of the row.
+        worker mutations to the rest of the row. Advisory-only: no
+        version bump (see update_columns).
         """
         self._ensure_open()
         norm = (source_infohash or "").strip().lower()
@@ -1266,8 +1323,7 @@ class StateStore:
             return False
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE torrent_state SET fuse_verified = ?, updated_at = ?, "
-                "version = version + 1 "
+                "UPDATE torrent_state SET fuse_verified = ?, updated_at = ? "
                 "WHERE source_infohash = ? AND deleted_at = ''",
                 (1 if verified else 0,
                  dt.datetime.now(dt.timezone.utc).isoformat(), norm),
@@ -1278,6 +1334,9 @@ class StateStore:
         """Persist fetched .torrent bytes; True when a row was updated.
 
         Refuses empty blobs (never wipe a good cached copy with nothing).
+        No version bump: bytes are content-addressed (same infohash means
+        identical bytes), so a concurrent transition snapshot holds the
+        same content and must not fail over it.
         """
         self._ensure_open()
         norm = (source_infohash or "").strip().lower()
@@ -1285,8 +1344,7 @@ class StateStore:
             return False
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE torrent_state SET cross_seed_blob = ?, updated_at = ?, "
-                "version = version + 1 "
+                "UPDATE torrent_state SET cross_seed_blob = ?, updated_at = ? "
                 "WHERE source_infohash = ? AND deleted_at = ''",
                 (bytes(blob), dt.datetime.now(dt.timezone.utc).isoformat(),
                  norm),
@@ -1310,6 +1368,22 @@ class StateStore:
         "telegram_message_id", "updated_at",
     })
 
+    # Narrow writes touching only advisory/display columns below skip the
+    # version bump: a background timer/display park must not invalidate
+    # an in-flight transition snapshot (spurious AbandonedError → 409 /
+    # worker unwind). The loss direction is harmless — advisory columns
+    # are refreshed every tick, while a transition clobbering them loses
+    # nothing durable. Everything else (routing, cursors, operator
+    # intent, state) keeps the bump so concurrent moves still fail loud.
+    _UNVERSIONED_COLUMNS = frozenset({
+        "vps1_last_activity_at", "fuse_verified", "telegram_message_id",
+        "indexer_first_queried_at", "indexer_next_retry_at",
+        "indexer_attempts", "public_export_first_attempted_at",
+        "public_export_next_retry_at", "public_export_attempts",
+        "readd_first_attempted_at", "readd_next_retry_at",
+        "readd_attempts", "readd_cycles", "completed_at",
+    })
+
     def update_columns(
         self, source_infohash: str, mapping: dict | None = None,
         *, expected_state: State | None = None,
@@ -1322,6 +1396,10 @@ class StateStore:
         preserved (optionally enforced via expected_state/version, which
         turn a lost race into 0 instead of a clobber). Tombstoned rows
         never match. Datetimes serialize to ISO, States to values.
+
+        The revision bumps only when a state-affecting column is written
+        (see _VERSIONED_COLUMNS vs _UNVERSIONED_COLUMNS): advisory-only
+        parks must not invalidate in-flight transition snapshots.
         """
         self._ensure_open()
         norm = (source_infohash or "").strip().lower()
@@ -1329,6 +1407,7 @@ class StateStore:
             return 0
         sets: list[str] = []
         params: list = []
+        bump = False
         for k, v in mapping.items():
             # updated_at/version are managed by this method itself —
             # accepting them would duplicate the SET column.
@@ -1345,6 +1424,8 @@ class StateStore:
                 continue
             sets.append(f"{k} = ?")
             params.append(v)
+            if k not in self._UNVERSIONED_COLUMNS:
+                bump = True
         if not sets:
             return 0
         clauses = ["source_infohash = ?", "deleted_at = ''"]
@@ -1359,10 +1440,11 @@ class StateStore:
             except (TypeError, ValueError):
                 return 0
         now = dt.datetime.now(dt.timezone.utc).isoformat()
+        _ver = ", version = version + 1" if bump else ""
         with self._lock:
             cur = self._conn.execute(
                 f"UPDATE torrent_state SET {', '.join(sets)}, "
-                f"updated_at = ?, version = version + 1 "
+                f"updated_at = ?{_ver} "
                 f"WHERE {' AND '.join(clauses)}",
                 (*params[:len(sets)], now, *params[len(sets):]),
             )
@@ -1382,7 +1464,9 @@ class StateStore:
         """Stamp swarm-activity observation; True when a row was updated.
 
         Narrow UPDATE so the janitor's activity bump never clobbers
-        concurrent worker mutations to the rest of the row.
+        concurrent worker mutations to the rest of the row. Advisory-only:
+        no version bump, so background stamps never invalidate in-flight
+        transition snapshots.
         """
         self._ensure_open()
         norm = (source_infohash or "").strip().lower()
@@ -1395,7 +1479,7 @@ class StateStore:
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE torrent_state SET vps1_last_activity_at = ?, "
-                "updated_at = ?, version = version + 1 "
+                "updated_at = ? "
                 "WHERE source_infohash = ? AND deleted_at = ''",
                 (stamp, dt.datetime.now(dt.timezone.utc).isoformat(), norm),
             )

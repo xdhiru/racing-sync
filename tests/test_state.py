@@ -838,3 +838,92 @@ def test_non_wal_forces_synchronous_full(tmp_path: Path):
         assert mode == 1  # NORMAL under WAL
     finally:
         disk.close()
+
+
+def test_upsert_refuses_write_when_tombstone_probe_fails(tmp_path: Path):
+    """Fail-closed tombstone probe: a store error refuses the write
+    instead of risking a forgotten-row resurrection."""
+    from unittest.mock import MagicMock
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A",
+                                  state=State.NEW))
+        store._is_tombstoned = MagicMock(side_effect=RuntimeError("disk gone"))
+        with pytest.raises(RuntimeError, match="disk gone"):
+            store.upsert(TorrentState(source_infohash="a" * 40,
+                                      source_name="B", state=State.NEW))
+        del store._is_tombstoned  # restore the bound method
+        assert store.get("a" * 40).source_name == "A"
+    finally:
+        store.close()
+
+
+def test_find_by_name_rejects_degenerate_patterns(tmp_path: Path):
+    """Post-strip empties never degrade to LIKE '%' (match everything)."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A",
+                                  state=State.NEW))
+        assert store.find_by_name(".mkv") == []
+        assert store.find_by_name("[FL]") == []
+        assert store.find_by_name("   ") == []
+        assert store.get("a" * 40) is not None
+    finally:
+        store.close()
+
+
+def test_find_by_name_caps_results(tmp_path: Path):
+    """Fuzzy name search is LIMIT-bounded, never a full-table dump."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        for i in range(250):
+            store.upsert(TorrentState(
+                source_infohash=f"{i:040d}", source_name="Same.Show",
+                state=State.NEW))
+        assert len(store.find_by_name("Same.Show")) <= 200
+    finally:
+        store.close()
+
+
+def test_close_nulls_connection(tmp_path: Path):
+    """Post-shutdown use raises loudly; double close is safe."""
+    store = StateStore(tmp_path / "s.db")
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="A",
+                              state=State.NEW))
+    store.close()
+    assert store._conn is None
+    store.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        store.get("a" * 40)
+
+
+def test_advisory_narrow_write_skips_version_bump(tmp_path: Path):
+    """Timer/display parks must not invalidate in-flight transition
+    snapshots; state-affecting columns still bump."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A",
+                                  state=State.NEW))
+        assert store.get("a" * 40).version == 0
+        assert store.update_columns("a" * 40, {"indexer_attempts": 3}) == 0
+        assert store.get("a" * 40).version == 0
+        assert store.get("a" * 40).indexer_attempts == 3
+        assert store.set_vps1_activity("a" * 40) is True
+        assert store.set_fuse_verified("a" * 40) is True
+        assert store.get("a" * 40).version == 0
+        assert store.update_columns("a" * 40, {"last_error": "x"}) == 1
+        assert store.get("a" * 40).version == 1
+    finally:
+        store.close()
+
+
+def test_active_index_exists(tmp_path: Path):
+    """The active-list partial index serves state-filtered recency scans."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        names = {r["name"] for r in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+        assert "ix_active_updated" in names
+    finally:
+        store.close()
