@@ -96,9 +96,18 @@ class AdmitMixin:
         if decision is None:
             # No SSD source right now → park and retry.
             if park_reason is None:
+                try:
+                    _skip_title = (
+                        self.cfg.prowlarr.should_skip_title(st.name) is True)
+                except Exception:
+                    _skip_title = False
+                # Skipped titles park on the public (max-age-free) schedule:
+                # no query will ever run for them, so the indexer max-age
+                # clock must not FAILED them for it.
                 park_reason = (
                     "source export miss"
-                    if any(_looks_public(t.trackers) for t in [st, *others])
+                    if (any(_looks_public(t.trackers) for t in [st, *others])
+                        or _skip_title)
                     else "indexer miss"
                 )
             if (park_reason == "indexer miss" and not getattr(ts, "force_direct", 0)

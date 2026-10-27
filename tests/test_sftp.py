@@ -618,3 +618,43 @@ def test_pool_connect_timeout(monkeypatch):
     assert time.monotonic() - t0 < 10
     member.close.assert_called()
 
+
+def test_connect_sets_sftp_channel_timeout():
+    """Every SFTP read on a connected channel is bounded: a wedged
+    transport surfaces as an error, never an infinite stall."""
+    from unittest.mock import MagicMock, patch
+
+    from racing_sync.sftp_source import _SFTPConnection, _SFTP_IO_TIMEOUT_S
+
+    exporter = _SFTPConnection(_sftp_cfg())
+    with patch("racing_sync.sftp_source._ipv4_socket"), \
+         patch("paramiko.SSHClient") as mock_ssh_cls:
+        new_client = MagicMock()
+        mock_ssh_cls.return_value = new_client
+        sftp = MagicMock()
+        new_client.open_sftp.return_value = sftp
+
+        exporter.connect()
+
+        sftp.get_channel.return_value.settimeout.assert_called_once_with(
+            _SFTP_IO_TIMEOUT_S)
+
+
+def test_connect_survives_channel_timeout_failure():
+    """A client without get_channel must not break connect()."""
+    from unittest.mock import MagicMock, patch
+
+    from racing_sync.sftp_source import _SFTPConnection
+
+    exporter = _SFTPConnection(_sftp_cfg())
+    with patch("racing_sync.sftp_source._ipv4_socket"), \
+         patch("paramiko.SSHClient") as mock_ssh_cls:
+        new_client = MagicMock()
+        mock_ssh_cls.return_value = new_client
+        sftp = MagicMock()
+        sftp.get_channel.side_effect = RuntimeError("no channel")
+        new_client.open_sftp.return_value = sftp
+
+        exporter.connect()  # must not raise
+        assert exporter._sftp is sftp
+

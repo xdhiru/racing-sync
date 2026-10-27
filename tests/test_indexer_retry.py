@@ -684,7 +684,7 @@ async def test_wait_disk_then_queue_transitions_to_queued_under_download_sem():
         await coord._process_torrent_inner(ts)
 
     assert coord.transition.call_args_list[0][0][1] == State.QUEUED
-    coord._do_queued.assert_awaited_once_with(ts)
+    coord._do_queued.assert_awaited_once_with(ts, _holds_download_slot=True)
 
 
 @pytest.mark.anyio
@@ -898,6 +898,26 @@ async def test_pick_and_admit_force_direct_bypasses_prowlarr():
     coord.transition.assert_called_once()
     assert coord.transition.call_args[0][1] == State.QUEUED
     coord._park_for_indexer_retry.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_skipped_title_parks_public_schedule():
+    """A skipped title with no direct bytes parks max-age-free: no query
+    will ever run for it, so the indexer clock must not FAILED it."""
+    from unittest.mock import AsyncMock, patch
+
+    coord = _pick_coord()
+    coord.cfg.prowlarr.should_skip_title = MagicMock(return_value=True)
+    ts = TorrentState(source_infohash="d" * 40, source_name="Skipped.Show",
+                      state=State.NEW)
+    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
+               new_callable=AsyncMock) as pick:
+        pick.return_value = None
+        await coord._pick_and_admit(ts, _priv_st(), [])
+    pick.assert_awaited_once()
+    coord._park_for_indexer_retry.assert_called_once()
+    assert (coord._park_for_indexer_retry.call_args.kwargs["reason"]
+            == "source export miss")
 
 
 @pytest.mark.anyio
