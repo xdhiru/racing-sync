@@ -3074,3 +3074,42 @@ def test_resolve_batches_reuses_caller_episodes():
         batches = coord._resolve_batches(files, "season", 1000, episodes=eps)
     assert [e.file_name for b in batches for e in b.episodes] == [
         "s01e01.mkv", "s01e02.mkv"]
+
+
+@pytest.mark.anyio
+async def test_scheduler_budgets_phases_independently(tmp_path):
+    """Stuck MOVING workers must not starve NEW intake or free download
+    slots; the move budget still holds."""
+    import asyncio
+
+    from racing_sync.state import StateStore, TorrentState, State
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord.cfg.max_active_downloads = 1
+        coord.cfg.max_concurrent_moves = 1
+        for h, st in (("a" * 40, State.MOVING), ("b" * 40, State.MOVING),
+                      ("c" * 40, State.NEW),
+                      ("d" * 40, State.DOWNLOADING)):
+            store.upsert(TorrentState(source_infohash=h, source_name=st.value,
+                                      state=st))
+        coord._running_infohashes = {"a" * 40}
+        gate = asyncio.Event()
+
+        async def _parked(_ts):
+            await gate.wait()
+
+        coord._process_torrent = _parked
+        try:
+            await coord._schedule_step()
+            running = set(coord._running_infohashes)
+            assert "a" * 40 in running  # pre-existing live move
+            assert "c" * 40 in running  # intake proceeds (misc budget)
+            assert "d" * 40 in running  # download slot free
+            assert "b" * 40 not in running  # move budget full
+        finally:
+            gate.set()
+            await asyncio.sleep(0)
+    finally:
+        store.close()
