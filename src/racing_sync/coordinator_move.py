@@ -362,8 +362,9 @@ class MoveMixin:
                 getattr(self, "cfg", None), "dest pre-move state")
             _pre_state = _pre[0].state if _pre else ""
         except Exception:
+            _pre = None
             _pre_state = ""
-        if not _pre:
+        if _pre is not None and not _pre:
             # Empty list (not an error): the entry may be registering —
             # but proceeding to pause a ghost entry is wrong. Park for
             # the next tick instead of pausing nothing.
@@ -455,7 +456,7 @@ class MoveMixin:
         incomplete_files: list[TorrentFile] = []
         uncertain_files: list[TorrentFile] = []
 
-        missing_on_disk: list[str] = []
+        missing_on_disk: list[tuple[str, int, bool, object]] = []
         for f in cls_files:
             file_path = _safe_ssd_join(src_dir, f.name)
             if file_path is None:
@@ -463,8 +464,18 @@ class MoveMixin:
             if not file_path.exists():
                 # Not in any set below: record loudly so a desynced piece map
                 # (files deleted from disk, client still complete) can't slip
-                # silently into wipe + RE_ADDING.
-                missing_on_disk.append(f.name)
+                # silently into wipe + RE_ADDING. The client-complete flag
+                # and priority drive the pre-wipe desync gate below.
+                try:
+                    _complete = (f.progress or 0.0) >= 0.999
+                except (TypeError, ValueError, AttributeError):
+                    _complete = False
+                try:
+                    _size = int(f.size_bytes or 0)
+                except (TypeError, ValueError):
+                    _size = 0
+                missing_on_disk.append(
+                    (f.name, _size, _complete, getattr(f, "priority", None)))
                 continue
             # Client-verified complete AND present on disk at full size: the
             # ONLY set ever moved to remote.
@@ -522,7 +533,7 @@ class MoveMixin:
             log.warning(
                 "move found %d file(s) missing on SSD (e.g. %s); they move nowhere "
                 "and the fuse gate must still pass before re-add",
-                len(missing_on_disk), missing_on_disk[0],
+                len(missing_on_disk), missing_on_disk[0][0],
             )
 
         # 3. Clean up incomplete piece-boundary files so they are NOT moved to remote
@@ -1346,6 +1357,82 @@ class MoveMixin:
             await self.dest_client.delete(h, delete_files=False)
         except Exception as e:  # noqa: BLE001
             log.warning("could not delete old torrent from client after move: %s", e)
+
+        # 7b. Missing-but-client-complete gate: files the client calls
+        # complete yet absent from SSD must not be wiped past silently —
+        # the fuse gate would park forever on unseedable bytes. Expected
+        # absences are excluded first: files in already-moved batches
+        # (batch moves delete from SSD immediately) and, when batch
+        # resolution fails, deselected files of multi-batch rows (moved
+        # batches ride priority 0); then anything already verified on
+        # the fuse remote. The remainder is desync: fail loudly with
+        # bytes kept instead of wiping toward a hopeless RE_ADDING.
+        _complete_missing: list[tuple[str, int, object]] = []
+        try:
+            for _mn, _ms, _mc, _mp in missing_on_disk:
+                if _mc:
+                    _complete_missing.append((_mn, _ms, _mp))
+        except Exception:
+            _complete_missing = []
+        _desync: list[tuple[str, int]] = [
+            (n, s) for (n, s, _p) in _complete_missing]
+        if _desync and (ts.batches_total or 0) > 1:
+            _moved: set[str] = set()
+            try:
+                _cap = self._frozen_batch_cap(ts)
+                _batches = self._resolve_batches(
+                    cls_files, branch_kind, _cap,
+                    episodes=getattr(cls, "episodes", None))
+                for _b in (_batches or [])[:max(0, int(ts.batch_index or 0))]:
+                    for _ep in (getattr(_b, "episodes", None) or []):
+                        _enm = getattr(_ep, "file_name", "") or ""
+                        if _enm:
+                            _moved.add(_enm.replace("\\", "/"))
+            except Exception:
+                pass
+
+            def _deselected(_p) -> bool:
+                try:
+                    if _p is None:
+                        return False
+                    if isinstance(_p, bool):
+                        return not _p
+                    return int(_p) == 0
+                except (TypeError, ValueError):
+                    return False
+
+            _desync = [(n, s) for (n, s, p) in _complete_missing
+                       if n.replace("\\", "/") not in _moved
+                       and not _deselected(p)]
+        if _desync:
+            try:
+                _mounts = []
+                for _ms in self._fuse_mount_strs():
+                    try:
+                        if _ms:
+                            _mounts.append(Path(_ms))
+                    except Exception:
+                        continue
+            except Exception:
+                _mounts = []
+            for _mt in _mounts:
+                if not _desync:
+                    break
+                try:
+                    _still = await self._missing_fuse_files(_mt, _desync)
+                except Exception:
+                    continue
+                if _still and str(_still[0]).startswith("<"):
+                    continue  # mount unverifiable: keep as desync
+                _stillset = set(_still or [])
+                _desync = [(n, s) for (n, s) in _desync if n in _stillset]
+        if _desync:
+            await self._fail_downloading_row(
+                ts, h,
+                f"{len(_desync)} client-complete file(s) missing on SSD "
+                f"(e.g. {_desync[0][0]}); data lost, not wiping",
+                delete_files=False)
+            return
 
         # 8. Delete local content folder on SSD after move
         # (wipe resolves through the coordinator namespace: patched in

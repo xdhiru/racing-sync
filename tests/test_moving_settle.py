@@ -718,3 +718,76 @@ async def test_moving_empty_prelist_parks_without_pause(tmp_path):
         coord.dest_client.pause.assert_not_called()
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_desync_fails_without_wipe(tmp_path):
+    """A client-complete file absent from SSD (and not moved, not on
+    fuse) fails loudly with bytes kept — never wiped toward a hopeless
+    RE_ADDING."""
+    from types import SimpleNamespace
+
+    from unittest.mock import patch
+
+    ssd = tmp_path / "ssd"
+    top = ssd / "Big.Show.S01"
+    top.mkdir(parents=True)
+    (top / "Big.Show.S01E02.mkv").write_bytes(b"y" * 100)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = make_coordinator(store)
+    coord._stop = False
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = ssd / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
+    coord.dest_client = MagicMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[
+        SimpleNamespace(state="downloading", progress=1.0)])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Big.Show.S01/Big.Show.S01E01.mkv", size_bytes=100,
+                    progress=1.0, priority=1),
+        TorrentFile(name="Big.Show.S01/Big.Show.S01E02.mkv", size_bytes=100,
+                    progress=1.0, priority=1),
+    ])
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=SimpleNamespace(state="pausedDL", progress=1.0))
+    coord.dest_client.delete = AsyncMock()
+
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None,
+                         extra=None):
+        for name in files_from or []:
+            p = ssd / name
+            if p.is_file():
+                p.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
+
+    ts = TorrentState(
+        source_infohash="d" * 40,
+        source_name="Big.Show.S01",
+        classification_kind="season",
+        batches_total=1,
+        batch_index=0,
+        state=State.MOVING,
+    )
+    ts._blob = b"blob"
+    store.upsert(ts)
+    try:
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe:
+            await coord._do_moving(store.get("d" * 40))
+        row = store.get("d" * 40)
+        assert row.state == State.FAILED
+        assert "missing on SSD" in (row.last_error or "")
+        coord.dest_client.delete.assert_awaited_once_with(
+            "d" * 40, delete_files=False)
+        mock_wipe.assert_not_called()
+    finally:
+        store.close()
