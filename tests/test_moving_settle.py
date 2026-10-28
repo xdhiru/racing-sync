@@ -683,3 +683,38 @@ async def test_pause_verified_fails_closed_on_read_error():
     assert ok is False
     assert err is not None
     assert coord.dest_client.pause.await_count == 3
+
+
+@pytest.mark.anyio
+async def test_moving_errno_none_fails_after_parks(tmp_path):
+    """Unreadable-mount OSErrors (errno None) never heal: bounded parks,
+    then FAILED with bytes intact (entry dropped, data kept)."""
+    coord, store = _moving_single(tmp_path, progress=1.0)
+    coord.dest_client.get_torrent_files = AsyncMock(
+        side_effect=OSError("wedged mount"))
+    try:
+        for _ in range(9):
+            await coord._do_moving(store.get("s" * 40))
+            assert store.get("s" * 40).state == State.MOVING
+        await coord._do_moving(store.get("s" * 40))
+        assert store.get("s" * 40).state == State.FAILED
+        coord.dest_client.delete.assert_awaited_once_with(
+            "s" * 40, delete_files=False)
+        assert (tmp_path / "ssd" / "Solo.mkv").exists()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_empty_prelist_parks_without_pause(tmp_path):
+    """An unlisted entry parks for the next tick instead of pausing a
+    ghost entry."""
+    coord, store = _moving_single(tmp_path, progress=1.0)
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    coord.dest_client.pause = AsyncMock()
+    try:
+        await coord._do_moving(store.get("s" * 40))
+        assert store.get("s" * 40).state == State.MOVING
+        coord.dest_client.pause.assert_not_called()
+    finally:
+        store.close()

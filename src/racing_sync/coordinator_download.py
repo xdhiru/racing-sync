@@ -35,6 +35,13 @@ from .io_bounds import rpc
 from .rclone_ops import RcloneTimeoutError
 from .state import State, TorrentState
 
+# Explicit test seam for the download loop: unit tests drive
+# _do_downloading with a mocked move step (or no dest client) and
+# expect the batch index to advance without any download. Production
+# must never take these branches — a missing/unusable client there is
+# a broken invariant (fail loudly), not a shortcut.
+_TESTING = False
+
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
 
@@ -462,12 +469,12 @@ class DownloadMixin:
                                     ts.source_infohash, int(_rem))
                         except Exception:
                             pass
-                elif hasattr(self, "_move_and_clean_batch") and hasattr(self._move_and_clean_batch, "mock_calls"):
+                elif _TESTING and hasattr(self, "_move_and_clean_batch") and hasattr(self._move_and_clean_batch, "mock_calls"):
                     # Mock in unit test (e.g. AsyncMock)
                     await self._move_and_clean_batch(ts, None)  # type: ignore[arg-type]
                     ts.batch_index += 1
                     self.store.upsert(ts)
-                elif not hasattr(self, "dest_client"):
+                elif _TESTING and not hasattr(self, "dest_client"):
                     # Test dummy without dest_client attached
                     ts.batch_index += 1
                     self.store.upsert(ts)
@@ -503,6 +510,7 @@ class DownloadMixin:
         last_progress_time = time.monotonic()
         last_stall_warn = 0.0
         poll_n = 0
+        empty_streak = 0
         stall_timeout = (
             getattr(self.cfg.general, "download_stall_timeout_seconds", 0)
             if hasattr(self, "cfg") and hasattr(self.cfg, "general")
@@ -572,17 +580,25 @@ class DownloadMixin:
                               (ts.source_infohash or "")[:10], e)
 
             if expected_files is not None:
-                files = await self.dest_client.get_torrent_files(h)
+                files = await rpc(self.dest_client.get_torrent_files(h),
+                                  getattr(self, "cfg", None), "dest wait files")
                 f_map = {f.name: f for f in files}
                 missing_files = [fn for fn in expected_files if fn not in f_map]
                 if missing_files:
-                    # No `and files` guard: an empty file list this far into
-                    # DOWNLOADING is pathological (registration lag only
-                    # applies right after add) — fail fast instead of polling
-                    # a torrent whose file list can never satisfy the batch.
+                    # No `and files` guard, but registration lag and client
+                    # restarts serve transient empties: park (TimeoutError,
+                    # no escalation) until the list stays empty — only a
+                    # persistent empty fails the row.
+                    empty_streak = empty_streak + 1 if not files else 0
+                    if not files and empty_streak < 3:
+                        raise TimeoutError(
+                            f"file list empty for {ts.source_name} "
+                            f"({empty_streak}/3); retrying"
+                        )
                     raise RuntimeError(
                         f"expected batch files missing from torrent {ts.source_name}: {missing_files}"
                     )
+                empty_streak = 0
                 batch_files = [f_map[fn] for fn in expected_files if fn in f_map]
                 total_sz = sum(f.size_bytes for f in batch_files)
                 done_sz = sum(f.size_bytes * f.progress for f in batch_files)
@@ -625,7 +641,7 @@ class DownloadMixin:
                 )
                 last_log = now
 
-            if prog > last_progress:
+            if prog > last_progress + 1e-9:
                 last_progress = prog
                 last_progress_time = now
             elif prog < 0.999:
@@ -670,7 +686,8 @@ class DownloadMixin:
         """
         h = ts.dest_infohash or ts.source_infohash
         try:
-            files = await self.dest_client.get_torrent_files(h)
+            files = await rpc(self.dest_client.get_torrent_files(h),
+                              getattr(self, "cfg", None), "dest next-batch files")
         except Exception as e:
             log.warning("could not get torrent files for next batch: %s", e)
             if strict:
@@ -694,6 +711,11 @@ class DownloadMixin:
                 cap = sum(f.size_bytes for f in files) or 1
             except Exception:
                 cap = 1
+            if not files and strict:
+                # Unknowable under strict (empty list + no cap): the
+                # fallback below would silently single-flow.
+                raise RuntimeError(
+                    f"batch cap unknowable for {ts.source_name}")
         try:
             batches = self._resolve_batches(files, kind, cap,
                                             episodes=cls.episodes)
@@ -708,9 +730,16 @@ class DownloadMixin:
             if strict:
                 # Cursor drift (grouping shrank under a persisted index):
                 # heal like the download loop instead of resuming blind.
+                # Narrow write + revision sync: a whole-row upsert here
+                # would trip the worker's own version guard below.
                 try:
                     ts.batch_index = max(0, len(batches) - 1)
-                    self.store.upsert(ts)
+                    _rev = await asyncio.to_thread(
+                        self.store.update_columns,
+                        ts.source_infohash,
+                        {"batch_index": ts.batch_index})
+                    if _rev:
+                        ts.version = _rev
                 except Exception:
                     pass
             else:
@@ -753,10 +782,13 @@ class DownloadMixin:
         # Fresh file list (registration/transient lag tolerated): the
         # priority map below must name every file, or an unnamed file
         # keeps its old (selected) priority and downloads past the cap.
+        # Each fetch is RPC-bounded — 4 unbounded fetches + sleeps wedge
+        # the worker 8s+ per flip on a hung client.
         files: list[TorrentFile] = []
         for _ in range(4):
             try:
-                files = await self.dest_client.get_torrent_files(h)
+                files = await rpc(self.dest_client.get_torrent_files(h),
+                                  getattr(self, "cfg", None), "dest flip files")
                 if files:
                     break
             except Exception:
@@ -773,8 +805,10 @@ class DownloadMixin:
         except Exception:
             kind = ts.classification_kind or "unknown"
         cap = self._frozen_batch_cap(ts)
+        _cap_fallback = False
         if cap <= 0:
             cap = sum(f.size_bytes for f in files) or 1
+            _cap_fallback = True
         try:
             batches = self._resolve_batches(files, kind, cap)
         except Exception as e:  # noqa: BLE001
@@ -790,36 +824,71 @@ class DownloadMixin:
             # Grouping shrank under us (kind flip / sidecar change) and the
             # requested batch no longer exists: everything resolvable is done.
             # Reconcile cursors to finished instead of parking forever.
+            # Return-only: the caller persists (single writer) — this
+            # function never upserts, so a crash mid-flip replays the
+            # already-moved batch as a no-op via _fuse_skipped.
             log.warning(
                 "batch flip: grouping shrank to %d batches for %s; finishing",
                 len(batches), ts.source_name,
             )
             ts.batches_total = len(batches)
             ts.batch_index = len(batches)
-            try:
-                self.store.upsert(ts)
-            except Exception:
-                pass
             return len(batches)
         nxt = batches[next_index]
+        if _cap_fallback:
+            # Unbudgeted fallback cap: refuse a next batch that doesn't
+            # fit live free space instead of selecting an un-downloadable
+            # batch. Fail-closed like the setup path.
+            try:
+                _need = await self._remaining_batch_footprint([nxt], kind)
+            except Exception:
+                _need = None
+            if _need is None:
+                try:
+                    _need = sum(int(getattr(e, "size_bytes", 0) or 0)
+                                for e in (nxt.episodes or []))
+                except (TypeError, ValueError):
+                    _need = 0
+            if _need > 0:
+                try:
+                    from . import coordinator as _coordinator
+
+                    if not _coordinator.ssd_has_room(self.cfg, _need):
+                        log.warning(
+                            "batch flip: next batch ~%d MB exceeds free space for %s; retry next tick",
+                            _need // (1024 * 1024), ts.source_name)
+                        return False
+                except Exception:
+                    pass
         try:
             skip = await self._fuse_skipped(
                 [(e.file_name, e.size_bytes) for e in nxt.episodes], kind,
             )
-        except Exception:
-            skip = set()
+        except Exception as e:
+            # Fail closed: an unknown remote set must park, never
+            # re-download bytes the remote may already hold (SSD waste
+            # + double reseed). Retries next tick.
+            log.warning("batch flip: fuse skip check failed for %s (%s); retry next tick",
+                        ts.source_name, e)
+            return False
         wanted = {e.file_name for e in nxt.episodes} - skip
         prio_map = {f.name: (1 if f.name in wanted else 0) for f in files}
         try:
-            await self.dest_client.set_file_priorities(h, prio_map)
+            await rpc(self.dest_client.set_file_priorities(h, prio_map),
+                      getattr(self, "cfg", None), "dest flip priorities")
         except Exception as e:  # noqa: BLE001
             if is_fatal_os_error(e):
                 raise
             log.warning("batch flip: priority set failed for %s: %s", ts.source_name, e)
             return False
         if wanted:
+            # Resume-fail parks with next-batch priorities applied but the
+            # index not advanced: safe only because the priorities select
+            # exactly the next batch — replaying this batch is a no-op via
+            # _fuse_skipped, and the index advances solely on flip success.
             try:
-                await self.dest_client.resume(h)
+                await rpc(self.dest_client.resume(h),
+                          getattr(self, "cfg", None), "dest flip resume")
             except Exception as e:  # noqa: BLE001
                 if is_fatal_os_error(e):
                     raise
