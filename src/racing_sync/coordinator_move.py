@@ -41,6 +41,10 @@ from .state import State, TorrentState
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
 
+# Unreadable-mount parks before a MOVING row fails for operator
+# attention (errno-None OSErrors never heal by retrying).
+_MOVE_ERRNO_FAIL_PARKS = 10
+
 
 class MoveMixin:
     """Verified-move execution (duck-typed ``self``)."""
@@ -271,6 +275,34 @@ class MoveMixin:
                 # Fatal disk/permission errors must fail loudly, never
                 # park a fully-downloaded row on an unhealing error.
                 raise
+            if isinstance(e, OSError) and getattr(e, "errno", None) is None:
+                # Unreadable-mount shape (broken mount, wedged FS): retrying
+                # never heals it — fail after a bounded run of parks
+                # instead of ERROR-logging forever. Bytes stay on SSD
+                # (delete_files=False).
+                try:
+                    _emp = getattr(self, "_move_errno_parks", None)
+                    if not isinstance(_emp, dict):
+                        _emp = {}
+                        self._move_errno_parks = _emp  # type: ignore[attr-defined]
+                    _n = int(_emp.get(h.lower(), 0) or 0) + 1
+                    _emp[h.lower()] = _n
+                    if len(_emp) > 5000:
+                        for _k in list(_emp.keys())[: len(_emp) - 5000]:
+                            _emp.pop(_k, None)
+                except Exception:
+                    _n = 0
+                if _n >= _MOVE_ERRNO_FAIL_PARKS:
+                    try:
+                        _emp.pop(h.lower(), None)
+                    except Exception:
+                        pass
+                    await self._fail_downloading_row(
+                        ts, h,
+                        f"repeated unreadable-mount errors ({e}); failing "
+                        f"for operator attention",
+                        delete_files=False)
+                    return
             # Every other phase parks on transient client trouble; a single
             # qB timeout here must not fail a fully-downloaded row.
             self._park_moving(
@@ -279,6 +311,12 @@ class MoveMixin:
                 f"({e}); will retry on next tick",
             )
             return
+        try:
+            _emp_ok = getattr(self, "_move_errno_parks", None)
+            if isinstance(_emp_ok, dict):
+                _emp_ok.pop(h.lower(), None)
+        except Exception:
+            pass
         # Patched in tests as racing_sync.coordinator.classify: resolve
         # through the coordinator namespace (ssd-precedent lazy lookup).
         from . import coordinator as _coordinator
@@ -325,6 +363,15 @@ class MoveMixin:
             _pre_state = _pre[0].state if _pre else ""
         except Exception:
             _pre_state = ""
+        if not _pre:
+            # Empty list (not an error): the entry may be registering —
+            # but proceeding to pause a ghost entry is wrong. Park for
+            # the next tick instead of pausing nothing.
+            self._park_moving(
+                ts,
+                "dest entry not listed before move; will retry on next tick",
+            )
+            return
         try:
             _pre_checking = str(_pre_state or "").lower().startswith("check")
         except Exception:
@@ -695,10 +742,17 @@ class MoveMixin:
                 elif _src_top is not None and _src_top.exists():
                     local = _src_top
                 else:
-                    raise FileNotFoundError(
-                        f"completed {cls.kind} content not found on SSD: "
-                        f"neither {folder} nor {src_dir}/{ts.source_name} exists"
+                    # Multi-top torrent (files under several top dirs, no
+                    # shared folder on disk): no folder-level move — the
+                    # verified-complete files move individually below
+                    # (local=None disables the top filter; the
+                    # nothing-verified branch resumes + parks).
+                    log.info(
+                        "multi-top content for %s has no shared folder on SSD; "
+                        "moving verified-complete files individually",
+                        ts.source_name,
                     )
+                    local = None
                 # Verified-complete per-file move (same guarantee as the sweep
                 # above): a bare `<top>/**` move would also upload
                 # preallocated-but-incomplete boundary files of content that

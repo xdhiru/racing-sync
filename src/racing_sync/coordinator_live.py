@@ -71,7 +71,11 @@ class LiveStatusMixin:
         report no progress.
         """
         out: dict[str, float] = {}
-        for h, item in self._live.items():
+        try:
+            _items = list((getattr(self, "_live", None) or {}).items())
+        except Exception:
+            return out
+        for h, item in _items:
             try:
                 out[h.lower()] = item.progress
                 _src = (getattr(item, "source_infohash", "") or "").lower()
@@ -89,7 +93,11 @@ class LiveStatusMixin:
         the Telegram active-tasks speed/ETA display.
         """
         out: dict[str, int] = {}
-        for h, item in self._live.items():
+        try:
+            _items = list((getattr(self, "_live", None) or {}).items())
+        except Exception:
+            return out
+        for h, item in _items:
             try:
                 speed = int(getattr(item, "dlspeed_bps", 0) or 0)
             except (TypeError, ValueError):
