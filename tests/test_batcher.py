@@ -10,6 +10,13 @@ from racing_sync.coordinator_errors import AbandonedError
 from racing_sync.state import State, StateStore, TorrentState
 
 
+def _paused_torrent():
+    """Awaitable paused-state double for _pause_verified."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(state="pausedDL", progress=1.0)
+
+
 @pytest.mark.anyio
 async def test_fail_downloading_row_abandoned_first(tmp_path):
     """A forgotten row must not lose its dest entry to corpse cleanup."""
@@ -233,6 +240,7 @@ async def test_batch_interleaved_download_move_and_clean(tmp_path):
     coord._rclone_move = AsyncMock(side_effect=_fake_move)
     coord.dest_client = MagicMock()
     coord.dest_client.pause = AsyncMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=_paused_torrent())
     coord.dest_client.resume = AsyncMock()
 
     # Create dummy files on disk in tmp_path
@@ -1154,6 +1162,7 @@ async def test_do_moving_skips_move_when_already_batched(tmp_path):
     coord.dest_client = MagicMock()
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
     coord.dest_client.pause = AsyncMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=_paused_torrent())
     coord.dest_client.delete = AsyncMock()
     coord._rclone_move = AsyncMock()
 
@@ -1212,6 +1221,7 @@ async def test_do_moving_purges_only_own_temp_files_when_no_season_folder(tmp_pa
     )
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[cls_file])
     coord.dest_client.pause = AsyncMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=_paused_torrent())
     coord.dest_client.delete = AsyncMock()
 
     async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
@@ -1334,6 +1344,7 @@ async def test_do_moving_moves_remaining_files_when_batches_incomplete(tmp_path)
     )
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[cls_file])
     coord.dest_client.pause = AsyncMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=_paused_torrent())
     coord.dest_client.delete = AsyncMock()
 
     async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
@@ -1400,6 +1411,7 @@ async def test_do_moving_preserves_top_folder_on_remote(tmp_path):
     )
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[cls_file])
     coord.dest_client.pause = AsyncMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=_paused_torrent())
     coord.dest_client.delete = AsyncMock()
 
     async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
@@ -1475,6 +1487,7 @@ async def test_do_moving_fallback_never_bare_moves_folder(tmp_path):
     )
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[cls_file])
     coord.dest_client.pause = AsyncMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=_paused_torrent())
     coord.dest_client.delete = AsyncMock()
 
     async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
@@ -3032,8 +3045,9 @@ async def test_scheduler_skips_downloading_spawn_at_cap(tmp_path):
 
 @pytest.mark.anyio
 async def test_worker_skips_version_moved_row(tmp_path):
-    """A narrow write landing after the tick snapshot makes the worker
-    stand down instead of clobbering it with a stale whole-row write."""
+    """A state-affecting write landing after the tick snapshot makes the
+    worker stand down instead of clobbering it with a stale whole-row
+    write. Advisory-only parks (timers) don't trip the guard."""
     from unittest.mock import AsyncMock
 
     from racing_sync.state import StateStore, TorrentState, State
@@ -3044,9 +3058,16 @@ async def test_worker_skips_version_moved_row(tmp_path):
         store.upsert(TorrentState(source_infohash="a" * 40,
                                   source_name="A", state=State.DOWNLOADING))
         snap = store.get("a" * 40)
+        # Advisory park: no revision bump, worker proceeds.
         store.update_columns("a" * 40, {"indexer_attempts": 3})
         coord._process_torrent_inner = AsyncMock()
         await coord._process_torrent(snap)
+        coord._process_torrent_inner.assert_awaited_once()
+        # State-affecting write: worker stands down.
+        snap2 = store.get("a" * 40)
+        store.update_columns("a" * 40, {"last_error": "x"})
+        coord._process_torrent_inner.reset_mock()
+        await coord._process_torrent(snap2)
         coord._process_torrent_inner.assert_not_awaited()
         assert store.get("a" * 40).state == State.DOWNLOADING
     finally:
