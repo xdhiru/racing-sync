@@ -1154,7 +1154,8 @@ async def test_do_queued_fails_single_oversize_member_not_total(tmp_path: Path):
     assert ts.state == State.FAILED
     assert "skip threshold" in ts.last_error
     assert "Pack/huge.bin" in ts.last_error
-    coord.dest_client.delete.assert_awaited_once_with("dd" * 20, delete_files=True)
+    coord.dest_client.delete.assert_awaited_once_with("dd" * 20,
+                                                      delete_files=False)
 
 
 @pytest.mark.anyio
