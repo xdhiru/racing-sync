@@ -32,6 +32,7 @@ _FATAL_OS_ERRNOS = frozenset({
     _errno.EPERM,
     _errno.EROFS,
     _errno.EFBIG,
+    _errno.ENOENT,
     getattr(_errno, "EDQUOT", 122),
 })
 
