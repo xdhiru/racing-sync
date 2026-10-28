@@ -135,14 +135,13 @@ class DownloadMixin:
             try:
                 _pre_batches = await self._prepare_next_batch(ts, strict=True)
             except Exception as e:  # noqa: BLE001
-                # Unverifiable selection: park this tick rather than
-                # falling through to a fresh resolve that may degrade to
-                # a full-torrent wait past the SSD cap. Retries next tick.
-                log.warning("batch priorities not verified for %s (%s); parking",
+                # Unverifiable selection: fall back to the fresh resolve
+                # below (which parks on transient failure and degrades to
+                # single-flow only when genuinely unresolvable — the
+                # designed full-move fallback, not a blind cap breach).
+                log.warning("batch priorities not verified for %s (%s); proceeding",
                             ts.source_infohash[:10], e)
-                self.store.upsert(ts)
-                self._live.pop(h.lower(), None)
-                return
+                _pre_batches = None
 
         while not self._stop:
             # Fresh-state re-guard: this loop runs for hours across batch
@@ -289,19 +288,29 @@ class DownloadMixin:
                     _cur_prog = 0.0
                 try:
                     _rec = _parks.get(_key)
-                    _old_prog = float(_rec[0]) if isinstance(_rec, (list, tuple)) else -1.0
-                    _old_n = int(_rec[1]) if isinstance(_rec, (list, tuple)) else 0
+                    if isinstance(_rec, (list, tuple)) and len(_rec) == 2:
+                        _old_prog = (float(_rec[0]) if _rec[0] is not None
+                                     else None)
+                        _old_n = int(_rec[1])
+                    else:
+                        _old_prog, _old_n = None, 0
                 except (TypeError, ValueError):
-                    _old_prog, _old_n = -1.0, 0
-                if _cur_prog > _old_prog + 1e-9:
-                    _n = 1
+                    _old_prog, _old_n = None, 0
+                if _old_prog is None or _cur_prog > _old_prog + 1e-9:
+                    # Baseline (first sighting) or real progress: (re)start
+                    # the stagnant count instead of counting the first
+                    # sighting as a stall.
+                    _n = 0
                 else:
                     _n = _old_n + 1
                 try:
                     _parks[_key] = [_cur_prog, _n]
+                    if len(_parks) > 5000:
+                        for _k in list(_parks.keys())[: len(_parks) - 5000]:
+                            _parks.pop(_k, None)
                 except Exception:
                     pass
-                if _n > max(1, _max_parks):
+                if _n >= max(1, _max_parks):
                     await self._fail_downloading_row(
                         ts, h,
                         f"stalled with no progress for {_n} consecutive "
@@ -312,9 +321,12 @@ class DownloadMixin:
                 self.store.upsert(ts)
                 return
             except TimeoutError as e:
-                # Stalled swarm, not a dead torrent: park in DOWNLOADING for
-                # retry instead of FAILED (transient lulls heal; the stall
-                # baseline restarts next tick for a fresh window).
+                # Transport/outage park, deliberately NOT counted in the
+                # stall escalation above: an outage heals on recovery (no
+                # escalation needed), while genuinely dead swarms surface
+                # as DownloadStalledError (counted) or via the tracker's
+                # watchdog (unregistered → FAILED). Counting outages here
+                # would fail rows over a client restart.
                 log.warning("download stalled for %s (%s); parking", ts.source_name, e)
                 self.store.upsert(ts)
                 return
@@ -344,27 +356,17 @@ class DownloadMixin:
                                 self.store.upsert(ts)
                                 self._live.pop(h.lower(), None)
                                 return
-                            # Never move while qB is still writing — retry
-                            # shortly instead of corrupting the remote.
-                            # Bound per-tick retries so one wedged torrent
-                            # cannot pin this worker (and its tick) forever;
-                            # state stays DOWNLOADING for retry next tick.
-                            consecutive_batch_failures += 1
+                            # Never move while qB is still writing — park at once
+                            # instead of holding the worker on sleep(5)
+                            # retries; the next tick resumes. State stays
+                            # DOWNLOADING.
                             log.warning(
-                                "could not pause torrent %s before batch move (%s); retrying shortly (%d/%d)",
+                                "could not pause torrent %s before batch move (%s); parking",
                                 h[:10], pause_err,
-                                consecutive_batch_failures, max_batch_failures_per_tick,
                             )
-                            if consecutive_batch_failures >= max_batch_failures_per_tick:
-                                log.warning(
-                                    "parking %s in DOWNLOADING after %d batch-pause failures",
-                                    ts.source_name, consecutive_batch_failures,
-                                )
-                                self.store.upsert(ts)
-                                self._live.pop(h.lower(), None)
-                                return
-                            await asyncio.sleep(5)
-                            continue
+                            self.store.upsert(ts)
+                            self._live.pop(h.lower(), None)
+                            return
                     try:
                         await self._move_and_clean_batch(ts, cur_batch, skip=cur_skip)
                     except RcloneTimeoutError as e:
@@ -427,6 +429,15 @@ class DownloadMixin:
                             self._live.pop(h.lower(), None)
                             return
                         if flip_pos is False or flip_pos is None:
+                            # A perpetually failing flip (priority RPC down)
+                            # must not park silently forever: count it like
+                            # any batch failure so it surfaces in the logs.
+                            consecutive_batch_failures += 1
+                            log.warning(
+                                "batch flip failed for %s (%d consecutive); parking",
+                                ts.source_name[:60],
+                                consecutive_batch_failures,
+                            )
                             self.store.upsert(ts)
                             self._live.pop(h.lower(), None)
                             return
