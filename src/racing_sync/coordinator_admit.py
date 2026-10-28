@@ -1424,20 +1424,23 @@ class AdmitMixin:
 
     # ---- state: QUEUED ----
 
-    async def _live_download_count(self) -> int:
+    async def _live_download_count(self, *, exclude: str = "") -> int:
         """Live DOWNLOADING workers (DB DOWNLOADING ∩ running set).
 
         One offloaded round-trip plus an in-memory intersect: parked
         rows with no worker (stalled, forgotten mid-flight) never pin
-        the cap. Never raises.
+        the cap. `exclude` (a row judging its own admission) is not
+        counted — a row must never pin its own slot. Never raises.
         """
         try:
             running = getattr(self, "_running_infohashes", None)
             if not isinstance(running, set) or not running:
                 return 0
+            _ex = (exclude or "").lower()
             rows = await offload(self.store.list_by_state, State.DOWNLOADING)
             return sum(1 for t in rows or ()
-                       if (t.source_infohash or "").lower() in running)
+                       if (t.source_infohash or "").lower() in running
+                       and (t.source_infohash or "").lower() != _ex)
         except Exception:
             return 0
 
@@ -1476,7 +1479,7 @@ class AdmitMixin:
                 # Drop admissions whose worker is gone (cancelled/shutdown):
                 # only live workers pin slots.
                 adm.intersection_update(running)
-            n_down = await self._live_download_count()
+            n_down = await self._live_download_count(exclude=key)
             others = len(adm - {key}) if key else len(adm)
             if n_down + others >= max_dl:
                 log.info("downloads full (%d/%d); %s stays queued",
