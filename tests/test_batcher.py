@@ -183,7 +183,7 @@ async def test_moving_empty_episodes_raises_and_prevents_wipe(tmp_path):
 
 @pytest.mark.anyio
 async def test_do_downloading_iterates_batches():
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import AsyncMock, MagicMock, patch
     from racing_sync.state import TorrentState, State
 
     coord = make_coordinator()
@@ -201,7 +201,8 @@ async def test_do_downloading_iterates_batches():
         state=State.DOWNLOADING,
     )
 
-    await coord._do_downloading(ts)
+    with patch("racing_sync.coordinator_download._TESTING", True):
+        await coord._do_downloading(ts)
 
     # _wait_for_completion called 3 times (once per batch)
     assert coord._wait_for_completion.await_count == 3
@@ -779,7 +780,9 @@ async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
     gone_locally = "Big.Show.S01/Big.Show.S01E01.mkv"  # moved by its batch
 
     cls_files = [
-        TorrentFile(name=gone_locally, size_bytes=500, progress=1.0),
+        # Moved by its batch (rides deselected, like the flip leaves it).
+        TorrentFile(name=gone_locally, size_bytes=500, progress=1.0,
+                    priority=0),
         # Deselected batch file (priority 0, as _prepare_next_batch leaves
         # non-current-batch files): preallocated shell, wiped as today.
         TorrentFile(name="Big.Show.S01/Big.Show.S01E04.mkv", size_bytes=500, progress=0.4,
@@ -3157,3 +3160,66 @@ async def test_scheduler_budgets_phases_independently(tmp_path):
             await asyncio.sleep(0)
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_do_moving_multi_top_moves_files_individually(tmp_path):
+    """Files under several top dirs (no shared folder): verified files
+    move per-file instead of raising FileNotFoundError."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    (tmp_path / "TopA").mkdir()
+    (tmp_path / "TopB").mkdir()
+    (tmp_path / "TopA" / "a.mkv").write_bytes(b"x" * 100)
+    (tmp_path / "TopB" / "b.mkv").write_bytes(b"y" * 100)
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda t, s: setattr(t, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = tmp_path / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-unsorted"
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
+    coord.dest_client = MagicMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[
+        SimpleNamespace(state="downloading", progress=1.0)])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="TopA/a.mkv", size_bytes=100, progress=1.0),
+        TorrentFile(name="TopB/b.mkv", size_bytes=100, progress=1.0),
+    ])
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=SimpleNamespace(state="pausedDL", progress=1.0))
+    coord._rclone_move = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="m" * 40,
+        source_name="Multi.Top",
+        classification_kind="season",
+        batches_total=1,
+        batch_index=0,
+        state=State.MOVING,
+    )
+
+    with patch("racing_sync.coordinator.classify") as mock_classify:
+        mock_cls = MagicMock()
+        mock_cls.kind = "season"
+        mock_cls.single_file = None
+        mock_classify.return_value = mock_cls
+        await coord._do_moving(ts)
+
+    # No folder move possible, so both verified files move per-file;
+    # the mocked move transfers nothing, so the row parks (no wipe).
+    assert coord._rclone_move.await_count == 1
+    _, kwargs = coord._rclone_move.call_args
+    assert set(kwargs["files_from"]) == {"TopA/a.mkv", "TopB/b.mkv"}
+    assert ts.state == State.MOVING
+    assert (tmp_path / "TopA" / "a.mkv").exists()
