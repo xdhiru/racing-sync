@@ -57,6 +57,7 @@ class DownloadMixin:
 
     async def _do_downloading(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
+        _adopted = ts.batches_total <= 0
         if ts.batches_total <= 0 and hasattr(self, "dest_client"):
             batches = await self._get_batches_for_torrent(ts)
             if batches is None:
@@ -68,8 +69,14 @@ class DownloadMixin:
                 return
             ts.batches_total = len(batches)
             # Clamp a stale index (e.g. file list shrank since the cursors
-            # were persisted) instead of degrading to full-torrent flow.
-            if ts.batch_index >= len(batches) and batches:
+            # were persisted) instead of degrading to full-torrent flow;
+            # an empty resolution clears the cursor to single-flow zero.
+            if not batches:
+                if ts.batch_index != 0:
+                    log.warning("clearing stale batch_index %d (no batches) for %s",
+                                ts.batch_index, ts.source_name)
+                    ts.batch_index = 0
+            elif ts.batch_index >= len(batches):
                 log.warning("clamping stale batch_index %d to %d for %s",
                             ts.batch_index, len(batches) - 1, ts.source_name)
                 ts.batch_index = len(batches) - 1
@@ -90,6 +97,19 @@ class DownloadMixin:
                 await self.dest_client.resume(h)
             except Exception as e:  # noqa: BLE001
                 log.warning("could not resume adopted torrent %s: %s", h[:10], e)
+
+        if _adopted:
+            # Adopted rows skip QUEUED setup (no batch was ever prioritized
+            # and no admission recorded): a restart burst of them would
+            # sail past max_active_downloads. Gate here — parking keeps
+            # the row DOWNLOADING for the next tick, no state churn.
+            try:
+                if await self._park_queued_for_download_slot(ts):
+                    self.store.upsert(ts)
+                    self._live.pop(h.lower(), None)
+                    return
+            except Exception:
+                pass
 
         is_batched = ts.batches_total > 1
         consecutive_batch_failures = 0
@@ -115,9 +135,14 @@ class DownloadMixin:
             try:
                 _pre_batches = await self._prepare_next_batch(ts, strict=True)
             except Exception as e:  # noqa: BLE001
-                log.warning("batch priorities not verified for %s (%s); proceeding",
+                # Unverifiable selection: park this tick rather than
+                # falling through to a fresh resolve that may degrade to
+                # a full-torrent wait past the SSD cap. Retries next tick.
+                log.warning("batch priorities not verified for %s (%s); parking",
                             ts.source_infohash[:10], e)
-                _pre_batches = None
+                self.store.upsert(ts)
+                self._live.pop(h.lower(), None)
+                return
 
         while not self._stop:
             # Fresh-state re-guard: this loop runs for hours across batch
@@ -147,11 +172,18 @@ class DownloadMixin:
                 return
             # Live tracking, keyed by dest hash for client polling; the
             # source hash is recorded inside for progress-map aliasing.
+            # Preserve the poll-updated progress across loop iterations
+            # instead of flickering to 0 on every batch flip.
+            try:
+                _prev_item = self._live.get(h.lower())
+                _prev_prog = float(getattr(_prev_item, "progress", 0.0) or 0.0)
+            except (TypeError, ValueError, AttributeError):
+                _prev_prog = 0.0
             self._live[h.lower()] = LiveItem(
                 source_infohash=(ts.source_infohash or "").lower(),
                 name=ts.source_name,
                 state="downloading",
-                progress=0.0,
+                progress=_prev_prog,
                 size_mb=ts.total_bytes / (1024 * 1024),
             )
 

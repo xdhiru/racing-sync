@@ -2292,6 +2292,29 @@ async def test_queued_gate_ignores_non_int_configs():
     assert await coord._park_queued_for_download_slot(MagicMock()) is False
 
 @pytest.mark.anyio
+async def test_try_admit_excludes_self(tmp_path):
+    """A DOWNLOADING row judging its own (adopted) admission must not
+    count itself toward the cap."""
+    from racing_sync.state import StateStore, TorrentState, State
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord.cfg.max_active_downloads = 1
+        store.upsert(TorrentState(source_infohash="a" * 40,
+                                  source_name="A", state=State.DOWNLOADING))
+        coord._running_infohashes = {"a" * 40}
+        assert await coord._try_admit_download(
+            store.get("a" * 40)) is True
+        store.upsert(TorrentState(source_infohash="b" * 40,
+                                  source_name="B", state=State.DOWNLOADING))
+        coord._running_infohashes = {"a" * 40, "b" * 40}
+        assert await coord._try_admit_download(
+            store.get("a" * 40)) is False
+    finally:
+        store.close()
+
+@pytest.mark.anyio
 async def test_setup_footprint_excludes_remote_skipped_bytes(tmp_path):
     """Reservation must cover remaining work, not the full torrent.
 
