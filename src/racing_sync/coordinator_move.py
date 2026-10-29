@@ -33,7 +33,7 @@ from .coordinator_errors import (
     is_retryable_client_error,
     is_transient_rclone_stderr,
 )
-from .coordinator_paths import _left_on_disk, _safe_ssd_join
+from .coordinator_paths import _safe_ssd_join, left_on_disk_many
 from .io_bounds import rpc
 from .rclone_ops import move_local_to_remote
 from .state import State, TorrentState
@@ -455,6 +455,11 @@ class MoveMixin:
         completed_files: list[TorrentFile] = []
         incomplete_files: list[TorrentFile] = []
         uncertain_files: list[TorrentFile] = []
+        # Bigger-than-metadata bytes are foreign until proven otherwise
+        # (shared save_path collision: same normalized top, another hash).
+        # They never move, never block the wipe as _blockers, and the
+        # folder wipe below spares them (per-file wipe instead).
+        oversized_names: set[str] = set()
 
         missing_on_disk: list[tuple[str, int, bool, object]] = []
         for f in cls_files:
@@ -501,6 +506,14 @@ class MoveMixin:
                     # Bigger than the torrent metadata says: foreign bytes
                     # (shared save_path collision), never move nor delete
                     # individually — same handling as preallocated partials.
+                    # Tracked separately (see oversized_names): not a wipe
+                    # blocker, spared by the folder wipe.
+                    try:
+                        _onorm = str(file_path.relative_to(src_dir)).replace("\\", "/")
+                    except ValueError:
+                        _onorm = ""
+                    if _onorm:
+                        oversized_names.add(_onorm)
                     log.warning(
                         "file %s oversized on SSD (%d/%d B); leaving for folder wipe, never moving",
                         f.name, max(_on_disk, 0), f.size_bytes,
@@ -589,32 +602,40 @@ class MoveMixin:
                 except OSError as e:
                     log.warning("failed removing incomplete file %s: %s", f.name, e)
 
-        # Also purge any leftover temporary extension files like .!qB or .parts for this torrent
-        if folder and folder.exists() and folder.resolve() != src_dir.resolve():
-            for temp_file in list(folder.glob("**/*.!qB")) + list(folder.glob("**/*.parts")):
-                try:
-                    temp_file.unlink()
-                except OSError:
-                    pass
-        else:
-            # Scoped to torrent-owned files only to avoid deleting concurrent downloads in shared save_path
-            for f in cls_files:
-                base_file = _safe_ssd_join(src_dir, f.name)
-                if base_file is None:
-                    continue
-                for ext in (".!qB", ".parts"):
-                    temp_file = base_file.parent / f"{base_file.name}{ext}"
+        # Also purge any leftover temporary extension files like .!qB or .parts for this torrent.
+        # Offloaded: directory walks + per-file resolves must not block the
+        # loop on big seasons.
+        def _purge_temps() -> None:
+            if folder and folder.exists() and folder.resolve() != src_dir.resolve():
+                for temp_file in list(folder.glob("**/*.!qB")) + list(folder.glob("**/*.parts")):
                     try:
-                        resolved_tmp = temp_file.resolve()
-                        if resolved_tmp != src_dir.resolve() and not resolved_tmp.is_relative_to(src_dir.resolve()):
-                            continue
+                        temp_file.unlink()
                     except OSError:
+                        pass
+            else:
+                # Scoped to torrent-owned files only to avoid deleting concurrent downloads in shared save_path
+                for f in cls_files:
+                    base_file = _safe_ssd_join(src_dir, f.name)
+                    if base_file is None:
                         continue
-                    if temp_file.exists():
+                    for ext in (".!qB", ".parts"):
+                        temp_file = base_file.parent / f"{base_file.name}{ext}"
                         try:
-                            temp_file.unlink()
+                            resolved_tmp = temp_file.resolve()
+                            if resolved_tmp != src_dir.resolve() and not resolved_tmp.is_relative_to(src_dir.resolve()):
+                                continue
                         except OSError:
-                            pass
+                            continue
+                        if temp_file.exists():
+                            try:
+                                temp_file.unlink()
+                            except OSError:
+                                pass
+
+        try:
+            await asyncio.to_thread(_purge_temps)
+        except Exception:
+            pass
 
         # 4. Decide target remote from the PINNED kind (see above): batches
         # were moved under it, so the sweep must land beside them even if the
@@ -635,13 +656,19 @@ class MoveMixin:
             if local_folder and local_folder.exists() and local_folder.resolve() != src_dir.resolve():
                 # Bounded, symlink-safe walk: rglob follows directory symlinks
                 # (escape + loop risk), so skip links, contain results to
-                # the folder, and cap the listing.
+                # the folder, and cap the listing. Filter during iteration:
+                # a 100k-file folder must not materialize 100k Paths before
+                # the cap applies.
                 try:
-                    # Iterate + early-break: a 100k-file folder must not
-                    # materialize 100k Paths before the cap applies.
-                    _scan_iter = local_folder.rglob("*")
                     _scan: list = []
-                    for _p in _scan_iter:
+                    for _p in local_folder.rglob("*"):
+                        try:
+                            if _p.is_symlink():
+                                continue
+                            if not _p.is_file() or _p.name.endswith((".!qB", ".parts")):
+                                continue
+                        except OSError:
+                            continue
                         _scan.append(_p)
                         if len(_scan) >= 100000:
                             break
@@ -651,10 +678,6 @@ class MoveMixin:
                     _folder_real = None
                 for p in _scan:
                     try:
-                        if p.is_symlink():
-                            continue
-                        if not p.is_file() or p.name.endswith((".!qB", ".parts")):
-                            continue
                         if _folder_real is not None and p.resolve().is_relative_to(_folder_real):
                             remaining_payload.append(p)
                     except OSError:
@@ -673,6 +696,23 @@ class MoveMixin:
                         top = top_rel.parts[0] if top_rel.parts else ""
                     except Exception:
                         top = ""
+                    if not top:
+                        # Indeterminate scope (symlink escape — local_folder
+                        # is guarded to be inside src_dir, so an empty top
+                        # means the layout can't be scoped): refuse to move
+                        # an unfiltered set. Park loud, don't fail a row
+                        # whose layout may heal.
+                        log.error(
+                            "cannot scope leftover move for %s under %s; "
+                            "staying in MOVING without moving",
+                            ts.source_name, src_dir,
+                        )
+                        self._park_moving(
+                            ts,
+                            "leftover move scope indeterminate; staying in "
+                            "MOVING without moving",
+                        )
+                        return
                     leftover_names: list[str] = []
                     for f in completed_files:
                         joined = _safe_ssd_join(src_dir, f.name or "")
@@ -706,7 +746,8 @@ class MoveMixin:
                         # Same 0-transfer hazard as batch moves (rclone exits 0
                         # even when it transferred nothing): proceeding to the
                         # folder wipe below would destroy unmoved data. Stay MOVING.
-                        stuck = [n for n in leftover_files if _left_on_disk(src_dir, n)]
+                        stuck = await asyncio.to_thread(
+                            left_on_disk_many, src_dir, leftover_files)
                         if stuck:
                             self._park_moving(
                                 ts,
@@ -793,7 +834,8 @@ class MoveMixin:
                 if folder_names:
                     await self._rclone_move(src_dir, remote, ts, files_from=folder_names)
                     # A 0-transfer folder move must not proceed to the wipe below.
-                    stuck = [n for n in folder_names if _left_on_disk(src_dir, n)]
+                    stuck = await asyncio.to_thread(
+                        left_on_disk_many, src_dir, folder_names)
                     if stuck:
                         self._park_moving(
                             ts,
@@ -1153,8 +1195,8 @@ class MoveMixin:
                         )
                         await self._rclone_move(
                             src_dir, remote, ts, files_from=_wrapped_names)
-                        _wrapped_stuck = [n for n in _wrapped_names
-                                          if _left_on_disk(src_dir, n)]
+                        _wrapped_stuck = await asyncio.to_thread(
+                            left_on_disk_many, src_dir, _wrapped_names)
                         if _wrapped_stuck:
                             self._park_moving(
                                 ts,
@@ -1221,8 +1263,8 @@ class MoveMixin:
                         )
                         await self._rclone_move(
                             src_dir, remote, ts, files_from=_sib_names)
-                        _sib_stuck = [n for n in _sib_names
-                                      if _left_on_disk(src_dir, n)]
+                        _sib_stuck = await asyncio.to_thread(
+                            left_on_disk_many, src_dir, _sib_names)
                         if _sib_stuck:
                             self._park_moving(
                                 ts,
@@ -1271,7 +1313,8 @@ class MoveMixin:
                     files_from=names,
                     extra=self.cfg.rclone.batch_move_extra_flags,
                 )
-                stuck = [n for n in names if _left_on_disk(src_dir, n)]
+                stuck = await asyncio.to_thread(
+                    left_on_disk_many, src_dir, names)
                 if stuck:
                     self._park_moving(
                         ts,
@@ -1305,8 +1348,18 @@ class MoveMixin:
                     _prio = int(_prio)
                 except (TypeError, ValueError):
                     _prio = 1
-                if _prio > 0 and getattr(_uf, "name", ""):
-                    _blockers.append(_uf)
+                if _prio <= 0 or not getattr(_uf, "name", ""):
+                    continue
+                # Oversized (foreign) bytes never block: they belong to a
+                # sibling collision, and stalling this row on them both
+                # wedges the pipeline and risks their deletion below.
+                try:
+                    _unorm = str((_safe_ssd_join(src_dir, _uf.name) or "").relative_to(src_dir)).replace("\\", "/")
+                except (ValueError, AttributeError):
+                    continue
+                if _unorm in oversized_names:
+                    continue
+                _blockers.append(_uf)
         except Exception:
             _blockers = []
         if _blockers:
@@ -1480,24 +1533,29 @@ class MoveMixin:
         # (wipe resolves through the coordinator namespace: patched in
         # tests as racing_sync.coordinator.wipe_local_tree.)
         if folder and folder.resolve() != src_dir.resolve() and folder.exists():
-            log.info("deleting content folder after move: %s", folder)
-            from . import coordinator as _coordinator
+            if oversized_names:
+                # Foreign bytes share this folder: wipe per-file, sparing
+                # them (and their parent dirs), so sibling data survives.
+                await self._wipe_folder_except(folder, oversized_names, src_dir)
+            else:
+                log.info("deleting content folder after move: %s", folder)
+                from . import coordinator as _coordinator
 
-            try:
-                await _coordinator.wipe_local_tree(
-                    folder,
-                    base_dir=[self.cfg.ssd.path, Path(self.cfg.dest.save_path)],
-                )
-            except OSError as e:
-                # Cleanup failure after a verified move: park, don't fail
-                # the fully-moved row (retry converges when the handle
-                # releases; the ERROR escalation pages if it never does).
-                self._park_moving(
-                    ts,
-                    f"folder wipe failed after move ({e}); staying in "
-                    f"MOVING without advancing",
-                )
-                return
+                try:
+                    await _coordinator.wipe_local_tree(
+                        folder,
+                        base_dir=[self.cfg.ssd.path, Path(self.cfg.dest.save_path)],
+                    )
+                except OSError as e:
+                    # Cleanup failure after a verified move: park, don't fail
+                    # the fully-moved row (retry converges when the handle
+                    # releases; the ERROR escalation pages if it never does).
+                    self._park_moving(
+                        ts,
+                        f"folder wipe failed after move ({e}); staying in "
+                        f"MOVING without advancing",
+                    )
+                    return
 
         try:
             _csd = getattr(self, "_checking_track", None)
@@ -1513,6 +1571,52 @@ class MoveMixin:
         except Exception:
             pass
         self.transition(ts, State.RE_ADDING)
+
+    async def _wipe_folder_except(self, folder: Path, keep: set[str],
+                                    src_dir: Path) -> None:
+        """Wipe a moved folder but spare foreign (oversized) files.
+
+        Deletes every file under `folder` except the keep set (SSD-relative
+        posix names, matched exactly or as a parent dir), then removes dirs
+        left empty. Best-effort and off-loop; failures only warn — the row
+        already completed its move.
+        """
+        log.info("wiping moved folder except %d foreign file(s): %s",
+                 len(keep), folder)
+
+        def _sweep() -> None:
+            try:
+                _paths = sorted(folder.rglob("*"), reverse=True)
+            except OSError:
+                return
+            for _p in _paths:
+                try:
+                    if _p.is_symlink():
+                        continue
+                    try:
+                        _rel = str(_p.relative_to(src_dir)).replace("\\", "/")
+                    except ValueError:
+                        continue
+                    if not _rel or _rel == ".":
+                        continue
+                    _kept = any(_rel == _k or _k.startswith(_rel + "/")
+                                for _k in keep)
+                    if _kept:
+                        continue
+                    if _p.is_file():
+                        _p.unlink()
+                    elif _p.is_dir():
+                        try:
+                            _p.rmdir()
+                        except OSError:
+                            pass
+                except OSError:
+                    continue
+
+        try:
+            await asyncio.to_thread(_sweep)
+        except Exception as e:  # noqa: BLE001
+            log.warning("per-file wipe of %s failed: %s", folder, e)
 
     async def _rclone_move(
         self,
