@@ -722,6 +722,121 @@ async def test_moving_empty_prelist_parks_without_pause(tmp_path):
         store.close()
 
 
+def _moved_season_row(tmp_path):
+    """Season MOVING row whose folder move succeeds (mock deletes)."""
+    from types import SimpleNamespace
+
+    ssd = tmp_path / "ssd"
+    top = ssd / "Show.S01"
+    top.mkdir(parents=True, exist_ok=True)
+    (top / "Show.S01E01.mkv").write_bytes(b"x" * 100)
+    store = StateStore(tmp_path / "state.db")
+    coord = make_coordinator(store)
+    coord._stop = False
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = ssd / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
+    coord.dest_client = MagicMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[
+        SimpleNamespace(state="downloading", progress=1.0)])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Show.S01/Show.S01E01.mkv", size_bytes=100,
+                    progress=1.0),
+    ])
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=SimpleNamespace(state="pausedDL", progress=1.0))
+    coord.dest_client.delete = AsyncMock()
+
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None,
+                         extra=None):
+        for name in files_from or []:
+            p = ssd / name
+            if p.is_file():
+                p.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
+    ts = TorrentState(
+        source_infohash="w" * 40,
+        source_name="Show.S01",
+        dest_infohash="w" * 40,
+        save_path=str(ssd),
+        classification_kind="season",
+        batches_total=1,
+        batch_index=0,
+        state=State.MOVING,
+    )
+    ts._blob = b"blob"
+    store.upsert(ts)
+    return coord, store, ssd
+
+
+@pytest.mark.anyio
+async def test_moving_delete_fail_parks_without_wipe(tmp_path):
+    """Post-move entry-delete failure parks (no wipe): the next tick
+    retries instead of advancing past a mismatched client state."""
+    from unittest.mock import patch
+
+    coord, store, _ssd = _moved_season_row(tmp_path)
+    coord.dest_client.delete = AsyncMock(side_effect=OSError("gone"))
+    try:
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe:
+            await coord._do_moving(store.get("w" * 40))
+        assert store.get("w" * 40).state == State.MOVING
+        mock_wipe.assert_not_called()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_wipe_fail_parks_fully_moved_row(tmp_path):
+    """A failing folder wipe (open handle) parks the fully-moved row
+    instead of FAILED."""
+    from unittest.mock import patch
+
+    coord, store, _ssd = _moved_season_row(tmp_path)
+    try:
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe:
+            mock_wipe.side_effect = PermissionError("open handle")
+            await coord._do_moving(store.get("w" * 40))
+        assert store.get("w" * 40).state == State.MOVING
+        mock_wipe.assert_awaited_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_rclone_move_error_carries_headline_and_tail(tmp_path):
+    """Move failures report rclone's headline and tail, not just the tail."""
+    import asyncio
+    from unittest.mock import patch
+
+    from racing_sync.rclone_ops import RcloneResult
+
+    coord = make_coordinator()
+    coord._move_sem = asyncio.Semaphore(1)
+    coord.cfg = MagicMock()
+    ts = TorrentState(source_infohash="r" * 40, source_name="R",
+                      state=State.MOVING)
+    res = RcloneResult(returncode=1, stdout="",
+                       stderr="NOTICE: headline here\nline2\nERROR: tail detail",
+                       duration=1.0)
+    with patch("racing_sync.coordinator_move.move_local_to_remote",
+               AsyncMock(return_value=res)):
+        with pytest.raises(RuntimeError) as exc:
+            await coord._rclone_move(tmp_path, "remote:x", ts)
+    assert "headline here" in str(exc.value)
+    assert "tail detail" in str(exc.value)
+
+
 @pytest.mark.anyio
 async def test_moving_desync_fails_without_wipe(tmp_path):
     """A client-complete file absent from SSD (and not moved, not on
