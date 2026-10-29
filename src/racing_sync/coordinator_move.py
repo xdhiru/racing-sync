@@ -1364,7 +1364,11 @@ class MoveMixin:
             export_fn = getattr(self.dest_client, "export_torrent", None)
             if callable(export_fn):
                 try:
-                    exported = await export_fn(h)
+                    from .io_bounds import bounded as _bounded
+
+                    exported = await _bounded(
+                        export_fn(h), timeout=15.0,
+                        label="dest pre-delete export")
                     if isinstance(exported, (bytes, bytearray)) and exported:
                         ts.cross_seed_blob = bytes(exported)
                         ts._blob = bytes(exported)
@@ -1379,11 +1383,22 @@ class MoveMixin:
             except Exception as e:  # noqa: BLE001
                 log.warning("could not persist cross-seed blob for %s: %s", h[:10], e)
 
-        # 7. Delete old torrent from VPS2 client (delete_files=False) before re-adding to FUSE
+        # 7. Delete old torrent from VPS2 client (delete_files=False) before re-adding to FUSE.
+        # A failed delete parks (no wipe): the entry still exists, so the
+        # next tick retries instead of wiping toward a row whose client
+        # state no longer matches. Same for a failing folder wipe below —
+        # a fully-moved row must not FAILED over a releasable handle
+        # (Windows open-handle): park and retry.
         try:
             await self.dest_client.delete(h, delete_files=False)
         except Exception as e:  # noqa: BLE001
             log.warning("could not delete old torrent from client after move: %s", e)
+            self._park_moving(
+                ts,
+                f"client entry delete failed after move ({e}); staying in "
+                f"MOVING without wiping",
+            )
+            return
 
         # 7b. Missing-but-client-complete gate: files the client calls
         # complete yet absent from SSD must not be wiped past silently —
@@ -1468,10 +1483,21 @@ class MoveMixin:
             log.info("deleting content folder after move: %s", folder)
             from . import coordinator as _coordinator
 
-            await _coordinator.wipe_local_tree(
-                folder,
-                base_dir=[self.cfg.ssd.path, Path(self.cfg.dest.save_path)],
-            )
+            try:
+                await _coordinator.wipe_local_tree(
+                    folder,
+                    base_dir=[self.cfg.ssd.path, Path(self.cfg.dest.save_path)],
+                )
+            except OSError as e:
+                # Cleanup failure after a verified move: park, don't fail
+                # the fully-moved row (retry converges when the handle
+                # releases; the ERROR escalation pages if it never does).
+                self._park_moving(
+                    ts,
+                    f"folder wipe failed after move ({e}); staying in "
+                    f"MOVING without advancing",
+                )
+                return
 
         try:
             _csd = getattr(self, "_checking_track", None)
@@ -1512,7 +1538,10 @@ class MoveMixin:
                                              files_from=files_from, extra=extra)
             if not res.ok:
                 err = res.stderr.strip()
-                last_err = [ln.strip() for ln in err.splitlines() if ln.strip()][-1] if err else f"rc={res.returncode}"
+                # Headline first: rclone puts the summary up top and the
+                # detail at the bottom — keep both ends, not just the tail.
+                _lines = [ln.strip() for ln in err.splitlines() if ln.strip()]
+                last_err = f"{_lines[0]} [...] {_lines[-1]}" if len(_lines) > 1 else (_lines[0] if _lines else f"rc={res.returncode}")
                 if is_transient_rclone_stderr(err):
                     raise RcloneTransientError(
                         f"rclone transient failure (rc={res.returncode}): {last_err}")
