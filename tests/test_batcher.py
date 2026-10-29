@@ -845,14 +845,14 @@ async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_do_moving_parks_on_lagging_selected_file(tmp_path):
-    """Per-file progress lag must park the move, never wipe real bytes.
+async def test_do_moving_hands_lagging_selected_file_to_downloading(tmp_path):
+    """Per-file progress lag must hand back to DOWNLOADING, never wipe real bytes.
 
     Regression (President.Curtis): overall 100% with two episodes at
     99.x% per-file progress (qB flush lag / rounding). The old code moved
-    the 8 verified files, then folder-wiped the 2 lagging-but-real ones —
+    the 8 verified files, then folder-wiped the 2 lagging-but-real ones -
     bytes lost on both ends, fuse gate parking forever after. Now the row
-    stays MOVING (resumed, nothing wiped) until the files verify.
+    resumes into DOWNLOADING (no flap, nothing wiped) until the files verify.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
     from racing_sync.state import StateStore, TorrentState, State
@@ -921,10 +921,9 @@ async def test_do_moving_parks_on_lagging_selected_file(tmp_path):
     with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock) as mock_wipe:
         await coord._do_moving(row)
 
-    # Parked in MOVING (not RE_ADDING): nothing wiped, resume requested so
-    # the lagging bytes finish and next tick moves them.
-    assert row.state == State.MOVING
-    assert "unverified" in (row.last_error or "")
+    # Resumed lagging bytes hand back to the download loop (no flap);
+    # nothing wiped, resume requested so the bytes finish.
+    assert row.state == State.DOWNLOADING
     mock_wipe.assert_not_awaited()
     coord.dest_client.resume.assert_awaited()
     # The verified files moved; the lagging file is still on SSD.
