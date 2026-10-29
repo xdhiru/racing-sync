@@ -3222,3 +3222,72 @@ async def test_do_moving_multi_top_moves_files_individually(tmp_path):
     assert set(kwargs["files_from"]) == {"TopA/a.mkv", "TopB/b.mkv"}
     assert ts.state == State.MOVING
     assert (tmp_path / "TopA" / "a.mkv").exists()
+
+
+@pytest.mark.anyio
+async def test_do_moving_oversized_sibling_survives_wipe(tmp_path):
+    """Bigger-than-metadata bytes are foreign: they never block the wipe
+    as _blockers, and the folder wipe spares them."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    top = ssd / "Show.S01"
+    top.mkdir(parents=True)
+    (top / "Show.S01E01.mkv").write_bytes(b"x" * 100)
+    (top / "Show.S01E02.mkv").write_bytes(b"y" * 500)  # meta says 100
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda t, s: setattr(t, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = ssd / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
+    coord.dest_client = MagicMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[
+        SimpleNamespace(state="downloading", progress=1.0)])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Show.S01/Show.S01E01.mkv", size_bytes=100,
+                    progress=1.0, priority=1),
+        TorrentFile(name="Show.S01/Show.S01E02.mkv", size_bytes=100,
+                    progress=1.0, priority=1),
+    ])
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=SimpleNamespace(state="pausedDL", progress=1.0))
+    coord.dest_client.delete = AsyncMock()
+
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None,
+                         extra=None):
+        for name in files_from or []:
+            p = ssd / name
+            if p.is_file():
+                p.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
+
+    ts = TorrentState(
+        source_infohash="o" * 40,
+        source_name="Show.S01",
+        classification_kind="season",
+        batches_total=1,
+        batch_index=0,
+        state=State.MOVING,
+    )
+    ts._blob = b"blob"
+
+    await coord._do_moving(ts)
+
+    # E01 moved; the oversized sibling neither blocked nor got wiped.
+    assert ts.state == State.RE_ADDING
+    assert (top / "Show.S01E02.mkv").exists()
+    assert (top / "Show.S01E02.mkv").stat().st_size == 500
+    assert not (top / "Show.S01E01.mkv").exists()
