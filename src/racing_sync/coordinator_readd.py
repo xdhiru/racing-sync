@@ -28,9 +28,9 @@ from .coordinator_errors import (
 )
 from .coordinator_inject import _group_is_ignored
 from .coordinator_paths import (
-    _left_on_disk,
     _safe_ssd_join,
     _watch_cross_seed_dir,
+    left_on_disk_many,
 )
 from .io_bounds import rpc
 from .state import _MAX_READD_CYCLES, State, TorrentState
@@ -392,7 +392,8 @@ class ReaddMixin:
             except Exception:
                 return False
             try:
-                await self._rclone_move(ssd_base, remote, ts, files_from=heal_names)
+                await self._rclone_move(ssd_base, remote, ts, files_from=heal_names,
+                                        heal=True)
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "re-add heal: move failed for %s: %s",
@@ -403,7 +404,8 @@ class ReaddMixin:
                 except Exception:
                     pass
                 return False
-            stuck = [n for n in heal_names if _left_on_disk(ssd_base, n)]
+            stuck = await asyncio.to_thread(
+                left_on_disk_many, ssd_base, heal_names)
             if stuck:
                 log.warning(
                     "re-add heal: move left %d file(s) on disk for %s "

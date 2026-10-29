@@ -3291,3 +3291,161 @@ async def test_do_moving_oversized_sibling_survives_wipe(tmp_path):
     assert (top / "Show.S01E02.mkv").exists()
     assert (top / "Show.S01E02.mkv").stat().st_size == 500
     assert not (top / "Show.S01E01.mkv").exists()
+
+
+@pytest.mark.anyio
+async def test_do_moving_flat_single_cleans_shells(tmp_path):
+    """Flat singles have no folder to wipe: deselected leftover shells
+    are unlinked file-scoped instead of leaking on SSD forever."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.state import TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    (ssd / "Solo.mkv").write_bytes(b"x" * 100)
+    (ssd / "shell.bin").write_bytes(b"y" * 500)
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda t, s: setattr(t, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = ssd / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
+    coord.dest_client = MagicMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[
+        SimpleNamespace(state="downloading", progress=1.0)])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Solo.mkv", size_bytes=100, progress=1.0,
+                    priority=1),
+        TorrentFile(name="shell.bin", size_bytes=500, progress=0.0,
+                    priority=0),
+    ])
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=SimpleNamespace(state="pausedDL", progress=1.0))
+    coord.dest_client.delete = AsyncMock()
+
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None,
+                         extra=None):
+        for name in files_from or []:
+            p = ssd / name
+            if p.is_file():
+                p.unlink()
+        else:
+            if isinstance(local, Path) and local.is_file():
+                local.unlink()
+
+    coord._rclone_move = AsyncMock(side_effect=_fake_move)
+
+    ts = TorrentState(
+        source_infohash="f" * 40,
+        source_name="Solo",
+        classification_kind="movie",
+        batches_total=1,
+        batch_index=0,
+        state=State.MOVING,
+    )
+    ts._blob = b"blob"
+
+    with patch("racing_sync.coordinator.classify") as mock_classify:
+        mock_cls = MagicMock()
+        mock_cls.kind = "movie"
+        mock_cls.single_file = "Solo.mkv"
+        mock_classify.return_value = mock_cls
+        await coord._do_moving(ts)
+
+    assert ts.state == State.RE_ADDING
+    assert not (ssd / "Solo.mkv").exists()
+    assert not (ssd / "shell.bin").exists()
+
+
+@pytest.mark.anyio
+async def test_do_moving_mixed_loop_keeps_cursor_in_memory(tmp_path):
+    """A mid-loop park must not persist a half-advanced cursor: the next
+    tick re-derives batches fresh, and a stale persisted index would
+    point at different episodes."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.classifier import Episode
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    (ssd / "E01.mkv").write_bytes(b"a" * 100)
+    (ssd / "E02.mkv").write_bytes(b"b" * 100)
+    (ssd / "E03.mkv").write_bytes(b"c" * 100)
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord._stop = False
+        coord.cfg = MagicMock()
+        coord.cfg.dest.save_path = ssd
+        coord.cfg.ssd.path = ssd
+        coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+        coord.cfg.rclone.remote.default = "remote:media"
+        coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+        coord.cfg.rclone.fuse.mount = ssd / "fuse"
+        coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+        coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
+        coord.dest_client = MagicMock()
+        coord.dest_client.list_torrents = AsyncMock(return_value=[
+            SimpleNamespace(state="downloading", progress=1.0)])
+        coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+            TorrentFile(name="E01.mkv", size_bytes=100, progress=1.0),
+            TorrentFile(name="E02.mkv", size_bytes=100, progress=1.0),
+            TorrentFile(name="E03.mkv", size_bytes=100, progress=1.0),
+        ])
+        coord.dest_client.pause = AsyncMock()
+        coord.dest_client.get_torrent = AsyncMock(
+            return_value=SimpleNamespace(state="pausedDL", progress=1.0))
+        coord.dest_client.delete = AsyncMock()
+        coord.dest_client.set_file_priorities = AsyncMock()
+        # One batch per episode: cap 100 splits the 3x100 season in 3.
+        coord._batch_cap_cache = {"x" * 40: 100}
+        # Batch 0 already remote (fuse-skipped); batch 1+ move then stick.
+        coord._rclone_move = AsyncMock()
+        eps = [Episode(file_name="E01.mkv", season=1, episode=1,
+                       size_bytes=100),
+               Episode(file_name="E02.mkv", season=1, episode=2,
+                       size_bytes=100),
+               Episode(file_name="E03.mkv", season=1, episode=3,
+                       size_bytes=100)]
+
+        ts = TorrentState(
+            source_infohash="x" * 40,
+            source_name="Mixed",
+            classification_kind="mixed",
+            batches_total=1,
+            batch_index=0,
+            state=State.MOVING,
+        )
+        ts._blob = b"blob"
+        store.upsert(ts)
+
+        with patch("racing_sync.coordinator.classify") as mock_classify:
+            mock_cls = MagicMock()
+            mock_cls.kind = "mixed"
+            mock_cls.single_file = None
+            mock_cls.episodes = eps
+            mock_classify.return_value = mock_cls
+            with patch.object(
+                    type(coord), "_fuse_skipped",
+                    AsyncMock(return_value={"E01.mkv"})):
+                await coord._do_moving(store.get("x" * 40))
+        # Parked on the stuck batch-1 move; the persisted cursor is
+        # untouched (no half-advanced index baked in).
+        assert store.get("x" * 40).state == State.MOVING
+        assert store.get("x" * 40).batch_index == 0
+    finally:
+        store.close()
