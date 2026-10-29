@@ -3334,7 +3334,10 @@ class AdmitMixin:
 
         Offloaded to a thread (fuse-adjacent stat can block). A truncated or
         preallocated-but-incomplete file reads as missing — the caller keeps
-        polling so the client re-fetches instead of moving air.
+        polling so the client re-fetches instead of moving air. Zero-size
+        files skip the disk gate: they carry no bytes, so client-complete
+        is completion for them (a not-yet-created empty file must not poll
+        forever here — the move path verifies presence before moving).
         """
         try:
             base = Path(ts.save_path) if ts.save_path else Path(self.cfg.dest.save_path)
@@ -3346,10 +3349,12 @@ class AdmitMixin:
                 try:
                     name = getattr(f, "name", "") or ""
                     want = getattr(f, "size_bytes", 0) or 0
+                    if not want:
+                        continue
                     p = _safe_ssd_join(base, name)
                     if p is None or not p.is_file():
                         return False
-                    if want and p.stat().st_size < want:
+                    if p.stat().st_size < want:
                         return False
                 except OSError:
                     return False
