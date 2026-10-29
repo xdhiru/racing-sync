@@ -908,3 +908,35 @@ async def test_moving_desync_fails_without_wipe(tmp_path):
         mock_wipe.assert_not_called()
     finally:
         store.close()
+
+
+def test_recheck_holder_release_and_heartbeat():
+    """Stale-holder release clears only our own hold; heartbeat refreshes
+    a live hold (forgotten rows can't heartbeat, so age-out still reaps)."""
+    coord = make_coordinator()
+    ts = TorrentState(source_infohash="a" * 40, source_name="A",
+                      state=State.MOVING)
+    coord._recheck_in_flight = ["a" * 40, 123.0]
+    coord._heartbeat_recheck_holder(ts)
+    assert coord._recheck_in_flight[0] == "a" * 40
+    assert coord._recheck_in_flight[1] != 123.0
+    coord._release_recheck_holder(ts)
+    assert coord._recheck_in_flight is None
+    coord._recheck_in_flight = ["b" * 40, 1.0]
+    coord._release_recheck_holder(ts)
+    assert coord._recheck_in_flight == ["b" * 40, 1.0]
+
+
+@pytest.mark.anyio
+async def test_settle_rechecked_evicts_bounded(tmp_path):
+    """The once-per-row set evicts instead of wipe-clearing at cap."""
+    coord, store = _moving_single(tmp_path, progress=0.0)
+    coord._settle_rechecked = {f"{i:040d}" for i in range(5000)}
+    try:
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock):
+            await coord._do_moving(store.get("s" * 40))
+        assert len(coord._settle_rechecked) <= 5001
+        assert "s" * 40 in coord._settle_rechecked
+    finally:
+        store.close()
