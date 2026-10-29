@@ -817,21 +817,30 @@ class MoveMixin:
                                 "could not resume incomplete folder %s for %s: %s",
                                 local, ts.source_name, e,
                             )
+                        if resumed:
+                            # Bytes still downloading: hand back to the
+                            # download loop instead of flapping pause/resume
+                            # in MOVING every tick.
+                            log.warning(
+                                "folder %s for %s not verified complete; "
+                                "resumed to finish downloading",
+                                local, ts.source_name,
+                            )
+                            self.transition(ts, State.DOWNLOADING)
+                            return
                         log.warning(
                             "folder %s for %s has no verified-complete files "
-                            "(%d incomplete, %d unverified); %s staying in "
-                            "MOVING without moving",
+                            "(%d incomplete, %d unverified); resume failed, "
+                            "staying in MOVING without moving",
                             local, ts.source_name,
                             len(incomplete_files), len(uncertain_files),
-                            "resumed to finish downloading," if resumed else "resume failed,",
                         )
                         self._park_moving(
                             ts,
                             f"folder {ts.source_name} not verified complete "
                             f"({len(incomplete_files)} incomplete, "
                             f"{len(uncertain_files)} unverified); "
-                            f"{'resumed to finish, ' if resumed else ''}"
-                            f"staying in MOVING without moving",
+                            f"resume failed, staying in MOVING without moving",
                         )
                         return
                     log.info(
@@ -1033,6 +1042,16 @@ class MoveMixin:
                         resumed = False
                         _resume_note = ("not resumed (bytes present; hash check "
                                         "will verify),")
+                    if resumed:
+                        # Bytes still downloading: hand back to the download
+                        # loop instead of flapping pause/resume in MOVING.
+                        log.warning(
+                            "single file %s for %s is not client-verified complete%s; "
+                            "resumed to finish downloading",
+                            cls.single_file, ts.source_name, detail,
+                        )
+                        self.transition(ts, State.DOWNLOADING)
+                        return
                     try:
                         _mp = getattr(self, "_moving_parks", None)
                         _pn = int((_mp.get((ts.source_infohash or "").lower(), 0) or 0)) \
@@ -1305,17 +1324,25 @@ class MoveMixin:
                 _eg = str(_blockers[0].name or "")
             except Exception:
                 pass
+            if resumed:
+                # Bytes still downloading: hand back to the download loop
+                # instead of flapping pause/resume in MOVING every tick.
+                log.warning(
+                    "folder %s for %s has %d unverified selected file(s) "
+                    "(e.g. %s); resumed to finish downloading",
+                    folder or src_dir, ts.source_name, len(_blockers), _eg,
+                )
+                self.transition(ts, State.DOWNLOADING)
+                return
             log.warning(
                 "folder %s for %s has %d unverified selected file(s) "
-                "(e.g. %s); %s staying in MOVING without wiping",
+                "(e.g. %s); resume failed, staying in MOVING without wiping",
                 folder or src_dir, ts.source_name, len(_blockers), _eg,
-                "resumed to finish downloading," if resumed else "resume failed,",
             )
             self._park_moving(
                 ts,
                 f"folder {ts.source_name} has {len(_blockers)} unverified "
-                f"selected file(s) (e.g. {_eg}); "
-                f"{'resumed to finish, ' if resumed else ''}"
+                f"selected file(s) (e.g. {_eg}); resume failed, "
                 f"staying in MOVING without wiping",
             )
             return

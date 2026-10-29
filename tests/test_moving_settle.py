@@ -47,7 +47,7 @@ def _moving_single(tmp_path, *, progress=0.0):
 
 
 @pytest.mark.anyio
-async def test_settle_recheck_fires_once_then_parks(tmp_path):
+async def test_settle_recheck_fires_once_then_hands_to_downloading(tmp_path):
     """Full bytes + lagging progress: one force recheck, then park (no wipe)."""
     coord, store = _moving_single(tmp_path, progress=0.0)
     row = store.get("s" * 40)
@@ -58,10 +58,12 @@ async def test_settle_recheck_fires_once_then_parks(tmp_path):
         coord.dest_client.recheck.assert_awaited_once_with("s" * 40)
         mock_wipe.assert_not_awaited()
         assert (tmp_path / "ssd" / "Solo.mkv").exists()
-        # Second tick: no second recheck (once per row), still parked.
+        # Second tick: no second recheck (once per row); resumed bytes
+        # hand back to the download loop instead of flapping in MOVING.
         await coord._do_moving(store.get("s" * 40))
         assert coord.dest_client.recheck.await_count == 1
-        assert store.get("s" * 40).state == State.MOVING
+        assert store.get("s" * 40).state == State.DOWNLOADING
+        mock_wipe.assert_not_awaited()
     store.close()
 
 
