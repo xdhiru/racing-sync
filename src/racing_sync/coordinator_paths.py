@@ -169,5 +169,19 @@ def _left_on_disk(src_dir: Path, name: str) -> bool:
         return True
 
 
+def left_on_disk_many(src_dir: Path, names) -> list[str]:
+    """Batch 0-transfer check: names from `names` still on disk.
+
+    Sync (per-file stats); callers offload the whole batch to one worker
+    thread instead of statting hundreds of files on the event loop.
+    `_left_on_disk` never raises, so neither does this.
+    """
+    try:
+        return [_n for _n in (names or []) if _left_on_disk(src_dir, _n)]
+    except Exception:
+        return list(names or [])
+
+
 __all__ = ["_safe_ssd_join", "_watch_cross_seed_dir", "fuse_stat_cached",
-           "fuse_stat_invalidate", "FUSE_STAT_TTL_S", "_left_on_disk"]
+           "fuse_stat_invalidate", "FUSE_STAT_TTL_S", "_left_on_disk",
+           "left_on_disk_many"]
