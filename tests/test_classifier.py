@@ -124,9 +124,12 @@ def test_coordinator_target_mount_routing():
 
 
 @pytest.mark.anyio
-async def test_do_moving_raises_if_season_folder_missing(tmp_path: Path):
+async def test_do_moving_missing_content_goes_readding(tmp_path: Path):
+    """A season with no shared folder and nothing verified must not raise:
+    per-file handling finds nothing to move and the row goes RE_ADDING
+    (recovery re-fetches) instead of FAILED."""
     from unittest.mock import AsyncMock
-    from racing_sync.state import TorrentState
+    from racing_sync.state import TorrentState, State
 
     cfg = _cfg()
     coord = make_coordinator()
@@ -145,8 +148,10 @@ async def test_do_moving_raises_if_season_folder_missing(tmp_path: Path):
         save_path=str(tmp_path),
     )
 
-    with pytest.raises(FileNotFoundError, match="completed season content not found"):
-        await coord._do_moving(ts)
+    await coord._do_moving(ts)
+
+    assert coord.store.transition.called
+    assert coord.store.transition.call_args[0][1] == State.RE_ADDING
 
 
 @pytest.mark.anyio
