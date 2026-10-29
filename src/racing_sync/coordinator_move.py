@@ -1337,9 +1337,13 @@ class MoveMixin:
                     f"cannot move torrent {ts.source_name}: batching produced 0 batches for {len(episodes)} episodes"
                 )
             for i, batch in enumerate(batches):
+                # In-memory cursor only: persisting a mid-loop index here
+                # would let the next tick re-derive batches fresh (cap or
+                # file list may have shifted) under a stale index pointing
+                # at different episodes. The loop replays idempotently —
+                # moved batches skip via fuse — so a park loses no progress.
                 ts.batch_index = i
                 ts.batches_total = len(batches)
-                self.store.upsert(ts)
                 skip = await self._fuse_skipped(
                     [(e.file_name, e.size_bytes) for e in batch.episodes], branch_kind,
                 )
@@ -1602,6 +1606,29 @@ class MoveMixin:
                         f"MOVING without advancing",
                     )
                     return
+        elif uncertain_files:
+            # Flat/single layouts have no folder to wipe: leftover shells
+            # (deselected preallocated data, never moved) would leak on SSD
+            # forever. Unlink this torrent's own uncertain files (files
+            # only, save-path-contained, never oversized-foreign).
+            for _uf in uncertain_files:
+                try:
+                    _unm = getattr(_uf, "name", "") or ""
+                    _up = _safe_ssd_join(src_dir, _unm)
+                    if _up is None:
+                        continue
+                    try:
+                        _urel = str(_up.relative_to(src_dir)).replace("\\", "/")
+                    except ValueError:
+                        continue
+                    if _urel in oversized_names:
+                        continue
+                    if _up.is_symlink() or not _up.is_file():
+                        continue
+                    _up.unlink()
+                    log.info("removed leftover shell %s after single move", _unm)
+                except OSError:
+                    continue
 
         try:
             _csd = getattr(self, "_checking_track", None)
@@ -1667,8 +1694,13 @@ class MoveMixin:
         include: list[str] | None = None,
         files_from: list[str] | None = None,
         extra: list[str] | None = None,
+        heal: bool = False,
     ) -> None:
-        async with self.move_sem:
+        # Heals ride the reserved heal slot (seconds-long repairs must not
+        # queue behind bulk multi-hour moves); everything else shares
+        # move_sem.
+        _sem = self.heal_move_sem if heal else self.move_sem
+        async with _sem:
             if files_from is not None:
                 preview = ", ".join(files_from[:3]) + ("…" if len(files_from) > 3 else "")
                 log.info("rclone move %s -> %s (files=%d, e.g. %s)",

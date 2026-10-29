@@ -940,3 +940,35 @@ async def test_settle_rechecked_evicts_bounded(tmp_path):
         assert "s" * 40 in coord._settle_rechecked
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_heal_move_bypasses_bulk_semaphore(tmp_path):
+    """Seconds-long heals ride the reserved slot instead of queueing
+    behind bulk multi-hour moves; bulk still waits its turn."""
+    import asyncio
+    from unittest.mock import patch
+
+    from racing_sync.rclone_ops import RcloneResult
+
+    coord = make_coordinator()
+    coord.cfg = MagicMock()
+    coord._move_sem = asyncio.Semaphore(1)
+    coord._heal_move_sem = asyncio.Semaphore(1)
+    await coord._move_sem.acquire()  # bulk slots exhausted
+    ts = TorrentState(source_infohash="h" * 40, source_name="H",
+                      state=State.RE_ADDING)
+    res = RcloneResult(returncode=0, stdout="", stderr="", duration=0.1)
+    try:
+        with patch("racing_sync.coordinator_move.move_local_to_remote",
+                   AsyncMock(return_value=res)):
+            await asyncio.wait_for(
+                coord._rclone_move(tmp_path, "remote:x", ts, heal=True),
+                timeout=5)
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(
+                    coord._rclone_move(tmp_path, "remote:x", ts,
+                                       heal=False),
+                    timeout=0.2)
+    finally:
+        coord._move_sem.release()

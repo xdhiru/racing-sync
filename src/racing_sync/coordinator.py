@@ -308,6 +308,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
     _running_infohashes: set[str] = field(default_factory=set, init=False)
     _download_sem: asyncio.Semaphore | None = field(default=None, init=False)
     _move_sem: asyncio.Semaphore | None = field(default=None, init=False)
+    _heal_move_sem: asyncio.Semaphore | None = field(default=None, init=False)
     _coordinator_started: bool = field(default=False, init=False)
     _shutdown_done: bool = field(default=False, init=False)
     _source_torrents_cache: list[Torrent] = field(default_factory=list, init=False)
@@ -390,6 +391,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         if self._move_sem is None:
             self._move_sem = asyncio.Semaphore(self.cfg.max_concurrent_moves)
         return self._move_sem
+
+    @property
+    def heal_move_sem(self) -> asyncio.Semaphore:
+        # Reserved single slot for re-add heals (seconds-long, operator-
+        # visible repairs): they must not queue for hours behind bulk
+        # multi-GB season moves sharing move_sem.
+        if self._heal_move_sem is None:
+            self._heal_move_sem = asyncio.Semaphore(1)
+        return self._heal_move_sem
 
     # ---- lifecycle ----
 
