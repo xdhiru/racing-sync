@@ -59,6 +59,12 @@ class WatchdogMixin:
         except Exception:
             pass
         try:
+            _release = getattr(self, "_release_recheck_holder", None)
+            if callable(_release):
+                _release(ts)
+        except Exception:
+            pass
+        try:
             _ri = getattr(self, "_recheck_in_flight", None)
             if (isinstance(_ri, (list, tuple)) and len(_ri) == 2
                     and _ri[0] == (ts.source_infohash or "").lower()):

@@ -179,6 +179,39 @@ class MoveMixin:
         except OSError:
             return False
 
+    def _release_recheck_holder(self, ts) -> None:
+        """Clear the global settle-recheck hold when it is this row.
+
+        A holder that moves on (moved, failed, resumed to DOWNLOADING,
+        forgotten) must not serialize all other singles behind a stale
+        30-minute age-out.
+        """
+        try:
+            _ri = getattr(self, "_recheck_in_flight", None)
+            if (isinstance(_ri, (list, tuple)) and len(_ri) == 2
+                    and _ri[0] == (ts.source_infohash or "").lower()):
+                self._recheck_in_flight = None
+        except Exception:
+            pass
+
+    def _heartbeat_recheck_holder(self, ts) -> None:
+        """Refresh our global settle-recheck hold while our check runs.
+
+        A live holder must not be stolen at age-out by a waiter: slow
+        storage legitimately checks for tens of minutes. Forgotten rows
+        run no worker, so they can't heartbeat — the age-out still
+        reaps them. Bounded above by the shared check-wait clock, which
+        fails a never-finishing check loudly.
+        """
+        try:
+            _key = (ts.source_infohash or "").lower()
+            _ri = getattr(self, "_recheck_in_flight", None)
+            if (isinstance(_ri, (list, tuple)) and len(_ri) == 2
+                    and _key and _ri[0] == _key):
+                self._recheck_in_flight = [_key, time.monotonic()]
+        except Exception:
+            pass
+
     def _register_checking_park(self, ts: TorrentState,
                                   progress: float = 0.0) -> str | None:
         """Record a checking park against the check-progress watchdog.
@@ -390,6 +423,7 @@ class MoveMixin:
                     # client entry, never the data.
                     delete_files=False)
                 return
+            self._heartbeat_recheck_holder(ts)
             self._park_moving(
                 ts,
                 f"client hash check running ({_pre_state}); "
@@ -425,6 +459,7 @@ class MoveMixin:
                         # client entry, never the data.
                         delete_files=False)
                     return
+                self._heartbeat_recheck_holder(ts)
                 self._park_moving(
                     ts,
                     f"client hash check running ({pause_err.client_state}); "
@@ -868,6 +903,7 @@ class MoveMixin:
                                 "resumed to finish downloading",
                                 local, ts.source_name,
                             )
+                            self._release_recheck_holder(ts)
                             self.transition(ts, State.DOWNLOADING)
                             return
                         log.warning(
@@ -978,6 +1014,7 @@ class MoveMixin:
                     except Exception:
                         _check_now = False
                     if _check_now:
+                        self._heartbeat_recheck_holder(ts)
                         self._park_moving(
                             ts,
                             f"client hash check running ({_check_state_now}); "
@@ -1044,9 +1081,16 @@ class MoveMixin:
                         if _recheck_ok:
                             _rechecked_now = True
                             try:
+                                if len(_rc) >= 5000:
+                                    # Bounded once-per-row memory: evict an
+                                    # arbitrary half BEFORE adding (evicting
+                                    # after could drop this very row, making
+                                    # it recheck again next tick). A repeat
+                                    # recheck is harmless; unbounded growth
+                                    # is not.
+                                    for _k in list(_rc)[:2500]:
+                                        _rc.discard(_k)
                                 _rc.add(_rh)
-                                if len(_rc) > 5000:
-                                    _rc.clear()
                             except Exception:
                                 pass
                             try:
@@ -1092,6 +1136,7 @@ class MoveMixin:
                             "resumed to finish downloading",
                             cls.single_file, ts.source_name, detail,
                         )
+                        self._release_recheck_holder(ts)
                         self.transition(ts, State.DOWNLOADING)
                         return
                     try:
@@ -1385,6 +1430,7 @@ class MoveMixin:
                     "(e.g. %s); resumed to finish downloading",
                     folder or src_dir, ts.source_name, len(_blockers), _eg,
                 )
+                self._release_recheck_holder(ts)
                 self.transition(ts, State.DOWNLOADING)
                 return
             log.warning(
@@ -1563,13 +1609,7 @@ class MoveMixin:
                 _csd.pop((ts.source_infohash or "").lower(), None)
         except Exception:
             pass
-        try:
-            _ri = getattr(self, "_recheck_in_flight", None)
-            if (isinstance(_ri, (list, tuple)) and len(_ri) == 2
-                    and _ri[0] == (ts.source_infohash or "").lower()):
-                self._recheck_in_flight = None
-        except Exception:
-            pass
+        self._release_recheck_holder(ts)
         self.transition(ts, State.RE_ADDING)
 
     async def _wipe_folder_except(self, folder: Path, keep: set[str],
