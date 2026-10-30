@@ -12,6 +12,7 @@ re-exports it so existing import sites keep working.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -196,74 +197,92 @@ class InjectMixin:
             "ignored": ignored,
         }
 
+    async def _injectfuse_verify_one(
+        self, t,
+    ) -> tuple[str, bytes | None, list[str]]:
+        """Verify one group member: fetchable bytes + fuse presence.
+
+        Pure check, no state change. Split out so the group verify can
+        run members concurrently (each member pays an SFTP/export fetch
+        plus a fuse stat; serial groups stall the confirm round-trip).
+        """
+        try:
+            h = (getattr(t, "infohash", "") or "").lower()
+            name = (getattr(t, "name", "") or h[:10])[:50]
+        except Exception:
+            return "", None, []
+        if not h:
+            return "", None, []
+        try:
+            blob = await self._fetch_racing_torrent_bytes(h)
+        except Exception as e:  # noqa: BLE001
+            blob = None
+            log.debug("injectfuse: fetch %s failed: %s", h[:10], e)
+        if not blob:
+            return h, None, [f"{name}: no .torrent bytes (retry later)"]
+        blobs = {h: bytes(blob)}
+        try:
+            expected = self._expected_fuse_files(blob)
+        except Exception:
+            expected = None
+        if not expected:
+            return h, None, [f"{name}: undecodable .torrent"]
+        try:
+            kind = self._classify_blob_kind(blob)
+            try:
+                fallback = Path(self.cfg.rclone.fuse.mount_unsorted)
+            except Exception:
+                fallback = Path(".")
+            target = self._target_mount_for_kind(kind, fallback)
+            if not self._save_path_is_on_fuse(str(target)):
+                # Never stat the SSD dir as fuse: bytes present on SSD
+                # are not on fuse, and a false "present" would pass
+                # verification for data never seeded. Fail closed.
+                raise ValueError(
+                    f"fuse target {target} not on a fuse mount")
+        except Exception:
+            return h, None, [f"{name}: no fuse target"]
+        try:
+            missing = await self._missing_fuse_files(target, expected)
+        except Exception as e:  # noqa: BLE001
+            return h, None, [f"{name}: fuse check failed ({e})"]
+        if missing:
+            if len(missing) == 1 and not str(missing[0]).startswith("<"):
+                return h, None, [f"{name}: missing {missing[0]}"]
+            shown = ", ".join(str(m)[:60] for m in missing[:3])
+            if len(missing) > 3:
+                shown += f" (+{len(missing) - 3} more)"
+            return h, None, [
+                f"{name}: {len(missing)} missing at {target} (e.g. {shown})"]
+        return h, blobs[h], []
+
     async def injectfuse_verify(self, members: list) -> dict:
         """All-or-nothing fuse readiness for a group. No state change.
 
         Every member needs fetchable .torrent bytes AND zero missing /
-        size-mismatched files at its blob-derived target mount. Returns
-        {"ready", "blobs", "problems"} — problems lists "name: reason".
+        size-mismatched files at its blob-derived target mount. Members
+        verify concurrently (4-wide); results merge in member order so
+        the problem list is stable. Returns {"ready", "blobs",
+        "problems"} — problems lists "name: reason".
         """
+        members = list(members or [])
+        _sem = asyncio.Semaphore(4)
+
+        async def _one(t):
+            async with _sem:
+                return await self._injectfuse_verify_one(t)
+
+        _results = await asyncio.gather(*(_one(t) for t in members))
         problems: list[str] = []
         blobs: dict[str, bytes] = {}
         ready = True
-        for t in members or []:
-            try:
-                h = (getattr(t, "infohash", "") or "").lower()
-                name = (getattr(t, "name", "") or h[:10])[:50]
-            except Exception:
-                continue
-            if not h:
-                continue
-            try:
-                blob = await self._fetch_racing_torrent_bytes(h)
-            except Exception as e:  # noqa: BLE001
-                blob = None
-                log.debug("injectfuse: fetch %s failed: %s", h[:10], e)
-            if not blob:
+        for h, blob, probs in _results:
+            if probs:
                 ready = False
-                problems.append(f"{name}: no .torrent bytes (retry later)")
+                problems.extend(probs)
                 continue
-            blobs[h] = bytes(blob)
-            try:
-                expected = self._expected_fuse_files(blob)
-            except Exception:
-                expected = None
-            if not expected:
-                ready = False
-                problems.append(f"{name}: undecodable .torrent")
-                continue
-            try:
-                kind = self._classify_blob_kind(blob)
-                try:
-                    fallback = Path(self.cfg.rclone.fuse.mount_unsorted)
-                except Exception:
-                    fallback = Path(".")
-                target = self._target_mount_for_kind(kind, fallback)
-                if not self._save_path_is_on_fuse(str(target)):
-                    # Never stat the SSD dir as fuse: bytes present on SSD
-                    # are not on fuse, and a false "present" would pass
-                    # verification for data never seeded. Fail closed.
-                    raise ValueError(
-                        f"fuse target {target} not on a fuse mount")
-            except Exception:
-                ready = False
-                problems.append(f"{name}: no fuse target")
-                continue
-            try:
-                missing = await self._missing_fuse_files(target, expected)
-            except Exception as e:  # noqa: BLE001
-                ready = False
-                problems.append(f"{name}: fuse check failed ({e})")
-                continue
-            if missing:
-                ready = False
-                if len(missing) == 1 and not str(missing[0]).startswith("<"):
-                    problems.append(f"{name}: missing {missing[0]}")
-                else:
-                    shown = ", ".join(str(m)[:60] for m in missing[:3])
-                    if len(missing) > 3:
-                        shown += f" (+{len(missing) - 3} more)"
-                    problems.append(f"{name}: {len(missing)} missing at {target} (e.g. {shown})")
+            if h and blob:
+                blobs[h] = blob
         return {"ready": ready and bool(members), "blobs": blobs,
                 "problems": problems}
 
