@@ -19,7 +19,7 @@ from pathlib import Path
 from .clients.abstract import Torrent
 from .content_keys import same_content as _same_content_key
 from .coordinator_content import _looks_public
-from .io_bounds import rpc
+from .io_bounds import chunked, rpc
 from .state import State, TorrentState
 
 # Keep the historic logger name so log output is unchanged by the split.
@@ -377,30 +377,45 @@ class InjectMixin:
         if not hashes:
             return
         try:
-            entries = await dest.list_torrents(hashes=hashes) or []
+            _parts = await asyncio.gather(*(
+                rpc(dest.list_torrents(hashes=_chunk),
+                    getattr(self, "cfg", None),
+                    "injectfuse preempt list")
+                for _chunk in chunked(hashes)
+            ))
         except Exception as e:  # noqa: BLE001
             log.debug("injectfuse: preempt list failed for %s: %s",
                       (row.source_infohash or "")[:10], e)
             return
-        if not isinstance(entries, list):
+        entries: list = []
+        for _part in _parts or []:
+            if isinstance(_part, list):
+                entries.extend(_part)
+        if not entries:
             return
-        for entry in entries:
-            try:
-                h = (getattr(entry, "hash", "") or "").lower()
-                if not h:
-                    continue
-                on_fuse = False
+        _sem = asyncio.Semaphore(4)
+
+        async def _drop(entry) -> None:
+            async with _sem:
                 try:
-                    on_fuse = bool(self._save_path_is_on_fuse(
-                        getattr(entry, "save_path", "") or ""))
-                except Exception:
+                    h = (getattr(entry, "hash", "") or "").lower()
+                    if not h:
+                        return
                     on_fuse = False
-                await dest.delete(h, delete_files=not on_fuse)
-                log.info("injectfuse: preempt removed SSD entry %s (delete_files=%s)",
-                         h[:10], not on_fuse)
-            except Exception as e:  # noqa: BLE001
-                log.debug("injectfuse: preempt delete failed: %s", e)
-                continue
+                    try:
+                        on_fuse = bool(self._save_path_is_on_fuse(
+                            getattr(entry, "save_path", "") or ""))
+                    except Exception:
+                        on_fuse = False
+                    await rpc(dest.delete(h, delete_files=not on_fuse),
+                              getattr(self, "cfg", None),
+                              "injectfuse preempt delete")
+                    log.info("injectfuse: preempt removed SSD entry %s (delete_files=%s)",
+                             h[:10], not on_fuse)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("injectfuse: preempt delete failed: %s", e)
+
+        await asyncio.gather(*(_drop(e) for e in entries))
 
     def _injectfuse_verified_blob(self, resolved: dict, blobs: dict) -> bytes | None:
         """Primary verified .torrent bytes (fallback: first available)."""

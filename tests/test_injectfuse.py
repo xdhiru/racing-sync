@@ -649,3 +649,31 @@ async def test_verify_members_run_concurrently(tmp_path):
         assert peak == 2
     finally:
         coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_preempt_deletes_ssd_entry_under_rpc_budget(tmp_path):
+    """Preempt lists + deletes under the RPC budget; SSD entry is dropped."""
+    dest_h = "d" * 40
+    coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
+    blob = _blob()
+    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    coord.dest_client.list_torrents = AsyncMock(return_value=[
+        _torrent(dest_h, TRACKER1),
+    ])
+    coord.dest_client.delete = AsyncMock()
+    try:
+        coord.store.upsert(TorrentState(
+            source_infohash=H1, source_name=NAME, total_bytes=500,
+            state=State.DOWNLOADING, dest_infohash=dest_h))
+        out = await coord.injectfuse_confirmed([H1])
+        assert out.startswith("injecting")
+        coord.dest_client.list_torrents.assert_awaited_once()
+        coord.dest_client.delete.assert_awaited_once()
+        _args, _kw = coord.dest_client.delete.call_args
+        assert _args[0] == dest_h
+        # /vps1 is not a fuse mount: the SSD partial goes with files.
+        assert _kw.get("delete_files") is True
+    finally:
+        coord.store.close()
