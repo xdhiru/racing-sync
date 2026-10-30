@@ -19,7 +19,7 @@ from pathlib import Path
 from .clients.abstract import Torrent
 from .content_keys import same_content as _same_content_key
 from .coordinator_content import _looks_public
-from .io_bounds import chunked, rpc
+from .io_bounds import chunked, offload, rpc
 from .state import State, TorrentState
 
 # Keep the historic logger name so log output is unchanged by the split.
@@ -438,15 +438,13 @@ class InjectMixin:
                 pass
         return None
 
-    def _injectfuse_ensure_blob(self, row, resolved: dict, blobs: dict) -> bool:
-        """Carry the verified blob onto a tracked row (in-memory).
+    async def _injectfuse_blob_available(self, row, resolved: dict, blobs: dict) -> bool:
+        """True when a blob is on hand for the row (no mutation).
 
-        The fuse gate reads `ts._blob or cross_seed_blob or store blob`:
-        a tracked row driven without one parks forever on "missing blob".
-        Only fills when the DB has nothing (never overwrites a good
-        prowlarr/SFTP blob); the following transition write persists it
-        in the same guarded UPDATE, so no version race. True when the row
-        now carries blob bytes.
+        Pre-flight for destructive steps: verify-first means the SSD
+        preempt never runs when the drive would fail on missing bytes
+        right after. Dest entries are only deleted once the follow-up
+        ensure is known to succeed.
         """
         try:
             if getattr(row, "_blob", None) or getattr(row, "cross_seed_blob", None):
@@ -456,7 +454,35 @@ class InjectMixin:
         try:
             store = getattr(self, "store", None)
             if store is not None and hasattr(store, "get_blob"):
-                if store.get_blob(row.source_infohash or ""):
+                if await offload(store.get_blob, row.source_infohash or ""):
+                    return True
+        except Exception:
+            pass
+        try:
+            return bool(self._injectfuse_verified_blob(resolved, blobs))
+        except Exception:
+            return False
+
+    async def _injectfuse_ensure_blob(self, row, resolved: dict, blobs: dict) -> bool:
+        """Carry the verified blob onto a tracked row (in-memory).
+
+        The fuse gate reads `ts._blob or cross_seed_blob or store blob`:
+        a tracked row driven without one parks forever on "missing blob".
+        Only fills when the DB has nothing (never overwrites a good
+        prowlarr/SFTP blob); the following transition write persists it
+        in the same guarded UPDATE, so no version race. True when the row
+        now carries blob bytes. The store read is sync SQLite, offloaded
+        so a slow disk never stalls the event loop.
+        """
+        try:
+            if getattr(row, "_blob", None) or getattr(row, "cross_seed_blob", None):
+                return True
+        except Exception:
+            pass
+        try:
+            store = getattr(self, "store", None)
+            if store is not None and hasattr(store, "get_blob"):
+                if await offload(store.get_blob, row.source_infohash or ""):
                     return True
         except Exception:
             pass
@@ -504,6 +530,8 @@ class InjectMixin:
                         "(fuse gate runs next tick)")
             if row.state in self._INJECTFUSE_ACTIVE:
                 prev = row.state.value
+                if not await self._injectfuse_blob_available(row, resolved, blobs):
+                    raise LookupError("primary .torrent bytes missing; run again")
                 await self._injectfuse_preempt_ssd(row)
                 try:
                     fresh2 = self.store.get(row.source_infohash, include_blob=False)
@@ -512,7 +540,7 @@ class InjectMixin:
                 except Exception:
                     pass
                 self._injectfuse_unhold(row)
-                if not self._injectfuse_ensure_blob(row, resolved, blobs):
+                if not await self._injectfuse_ensure_blob(row, resolved, blobs):
                     raise LookupError("primary .torrent bytes missing; run again")
                 self.transition(row, State.RE_ADDING)
                 return (f"injecting {len(members)} torrent(s) for {title} "
@@ -523,7 +551,7 @@ class InjectMixin:
                     f"{title} is {row.state.value}; manual inject needs "
                     "a waiting/failed row")
             self._injectfuse_unhold(row)
-            if not self._injectfuse_ensure_blob(row, resolved, blobs):
+            if not await self._injectfuse_ensure_blob(row, resolved, blobs):
                 raise LookupError("primary .torrent bytes missing; run again")
             self.transition(row, State.RE_ADDING)
             return (f"injecting {len(members)} torrent(s) for {title} "
