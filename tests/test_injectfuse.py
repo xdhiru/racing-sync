@@ -6,6 +6,7 @@ tracked rows keep their prior state, untracked groups gain no row.
 """
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -612,5 +613,39 @@ async def test_group_question_falls_back_when_vps1_gone(tmp_path):
                  _kwargs["reply_markup"].inline_keyboard for b in r]
         assert f"inject:{H1}:yes" in _data
         assert coord.store.get(H1).state == State.WAITING_INDEXER
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_verify_members_run_concurrently(tmp_path):
+    """Group members verify in parallel, not one fetch+stat at a time."""
+    coord, _, fuse = _coord(
+        tmp_path, [_torrent(H1, TRACKER1), _torrent(H2, TRACKER2)])
+    blob = _blob()
+    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    in_flight = 0
+    peak = 0
+    real_fetch = coord._fetch_racing_torrent_bytes
+
+    async def _counting(h):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await asyncio.sleep(0.05)
+            return await real_fetch(h)
+        finally:
+            in_flight -= 1
+
+    coord._fetch_racing_torrent_bytes = _counting
+    try:
+        resolved = await coord.injectfuse_resolve(H1)
+        assert len(resolved["members"]) == 2
+        verified = await coord.injectfuse_verify(resolved["members"])
+        assert verified["ready"] is True
+        assert set(verified["blobs"]) == {H1, H2}
+        assert peak == 2
     finally:
         coord.store.close()
