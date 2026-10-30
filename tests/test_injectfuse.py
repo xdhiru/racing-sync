@@ -677,3 +677,21 @@ async def test_preempt_deletes_ssd_entry_under_rpc_budget(tmp_path):
         assert _kw.get("delete_files") is True
     finally:
         coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_apply_active_row_without_blob_preempts_nothing(tmp_path):
+    """Verify-first: an SSD-active row with no blob on hand keeps its partial."""
+    coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
+    coord.dest_client.delete = AsyncMock()
+    try:
+        coord.store.upsert(TorrentState(
+            source_infohash=H1, source_name=NAME, total_bytes=500,
+            state=State.DOWNLOADING))
+        resolved = await coord.injectfuse_resolve(H1)
+        with pytest.raises(LookupError):
+            await coord.injectfuse_apply(resolved, {})
+        coord.dest_client.delete.assert_not_called()
+        assert coord.store.get(H1).state == State.DOWNLOADING
+    finally:
+        coord.store.close()
