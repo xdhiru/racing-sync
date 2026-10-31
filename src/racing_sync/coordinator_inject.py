@@ -584,14 +584,38 @@ class InjectMixin:
             cross_seed_blob=bytes(blob),
             classification_kind="unknown",
             save_path=base,
-            state=State.RE_ADDING,
+            state=State.NEW,
         )
         try:
             ts._blob = bytes(blob)
         except Exception:
             pass
         try:
+            # NEW + transition (not a bare RE_ADDING upsert): the insert
+            # is the standard ingestion edge, then the guarded transition
+            # refuses tombstoned/concurrent rows and runs the log +
+            # Telegram + SSD-cleanup hooks like every other drive.
+            # (coordinator.transition itself refuses brand-new rows via
+            # the abandoned-row guard, so the NEW insert comes first.)
             self.store.upsert(ts)
+        except Exception as e:  # noqa: BLE001
+            raise LookupError(f"could not track group: {e}") from e
+        try:
+            fresh = self.store.get(p_hash, include_blob=False)
+        except Exception:
+            fresh = None
+        if fresh is None:
+            raise LookupError("could not track group: row vanished after insert")
+        try:
+            fresh.cross_seed_blob = bytes(blob)
+        except Exception:
+            pass
+        try:
+            fresh._blob = bytes(blob)
+        except Exception:
+            pass
+        try:
+            self.transition(fresh, State.RE_ADDING)
         except Exception as e:  # noqa: BLE001
             raise LookupError(f"could not track group: {e}") from e
         try:

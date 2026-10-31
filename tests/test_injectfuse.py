@@ -695,3 +695,28 @@ async def test_apply_active_row_without_blob_preempts_nothing(tmp_path):
         assert coord.store.get(H1).state == State.DOWNLOADING
     finally:
         coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_confirmed_untracked_routes_via_new_and_transition(tmp_path):
+    """Untracked adoption inserts NEW then drives via transition hooks."""
+    coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
+    blob = _blob()
+    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    calls = []
+    real_transition = coord.transition
+
+    def _spy(ts, dst, **kw):
+        calls.append((ts.state, dst))
+        return real_transition(ts, dst, **kw)
+
+    coord.transition = _spy
+    try:
+        assert coord.store.get(H1) is None
+        out = await coord.injectfuse_confirmed([H1])
+        assert out.startswith("injecting")
+        assert (State.NEW, State.RE_ADDING) in calls
+        assert coord.store.get(H1).state == State.RE_ADDING
+    finally:
+        coord.store.close()
