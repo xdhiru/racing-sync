@@ -626,6 +626,6 @@ async def test_late_seed_defers_unseen_rows_after_boot():
         await coord._check_and_inject_late_cross_seeds(ts, [])
     assert coord.dest_client.mock_calls == []
     assert coord.source_client.mock_calls == []
-    ok_at = coord._late_seed_ok_at
-    assert set(ok_at) == {"a" * 40, "b" * 40}
-    assert all(v > time.monotonic() for v in ok_at.values())
+    memo = coord._fuse_healthy_until
+    assert set(memo) == {f"late:{'a' * 40}", f"late:{'b' * 40}"}
+    assert all(v > time.monotonic() for v in memo.values())

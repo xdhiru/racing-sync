@@ -314,9 +314,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
     _source_torrents_cache: list[Torrent] = field(default_factory=list, init=False)
     _source_torrents_cached_at: float = field(default=0.0, init=False)
     _failed_late_cross_seeds: dict[str, dt.datetime] = field(default_factory=dict, init=False)
-    # Proven-healthy original fuse entries (entry-hash -> next re-probe
+    # Proven-healthy fuse verdicts (entry-hash -> next re-probe
     # monotonic): skips the per-tick export + stats for healthy DONE rows.
-    _original_healthy_at: dict[str, float] = field(default_factory=dict, init=False)
+    _fuse_healthy_until: dict[str, float] = field(default_factory=dict, init=False)
     # VPS1 cleanup janitor ([cleanup]): monotonic timestamp of the last run
     # plus one monotonic timestamp per newly discovered racing release
     # (rolling intake-velocity signal for spam-burst grace shortening).

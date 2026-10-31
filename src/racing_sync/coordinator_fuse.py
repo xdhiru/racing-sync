@@ -32,6 +32,10 @@ log = logging.getLogger("racing_sync.coordinator")
 # past this window (plus hash jitter) so a cold memo doesn't fire one
 # full check per DONE row on the first poll.
 _LATE_SEED_BOOT_GRACE_S = 300.0
+# Proven-healthy verdict window + cap for the unified fuse memo
+# (`late:<row>` row checks + `orig:<hash>` original entry checks).
+_FUSE_HEALTHY_TTL_S = 1800.0
+_FUSE_HEALTHY_CAP = 5000
 
 
 class FuseMixin:
@@ -44,14 +48,9 @@ class FuseMixin:
         if not hasattr(self, "_failed_late_cross_seeds"):
             self._failed_late_cross_seeds = {}
         _row_key = (ts.source_infohash or "").lower()
-        try:
-            _ok_at = getattr(self, "_late_seed_ok_at", None)
-            if isinstance(_ok_at, dict) and _row_key:
-                _next_ok = _ok_at.get(_row_key)
-                if _next_ok is not None and time.monotonic() < float(_next_ok):
-                    return
-        except Exception:
-            pass
+        _late_key = f"late:{_row_key}" if _row_key else ""
+        if _late_key and self._fuse_healthy_fresh(_late_key):
+            return
         self._late_seed_sweep()
         # Post-restart burst guard: the memo is cold on boot, so every
         # DONE row would otherwise run a full check (dest export + fuse
@@ -66,7 +65,7 @@ class FuseMixin:
             if 0 <= _age < _LATE_SEED_BOOT_GRACE_S:
                 try:
                     _failed = getattr(self, "_failed_late_cross_seeds", None)
-                    _seen = ((_ok_at is not None and _row_key in _ok_at)
+                    _seen = (self._fuse_healthy_fresh(_late_key)
                              or (isinstance(_failed, dict) and _row_key in _failed))
                 except Exception:
                     _seen = True
@@ -76,12 +75,10 @@ class FuseMixin:
                     except Exception:
                         _jitter = 0.0
                     try:
-                        if not isinstance(_ok_at, dict):
-                            _ok_at = {}
-                            self._late_seed_ok_at = _ok_at
-                        _ok_at[_row_key] = (time.monotonic()
-                                            + (_LATE_SEED_BOOT_GRACE_S - _age)
-                                            + _jitter)
+                        self._fuse_healthy_store()[_late_key] = (
+                            time.monotonic()
+                            + (_LATE_SEED_BOOT_GRACE_S - _age)
+                            + _jitter)
                     except Exception:
                         pass
                     return
@@ -298,41 +295,81 @@ class FuseMixin:
         except Exception:
             pass
 
+    def _fuse_healthy_store(self) -> dict:
+        """The one proven-healthy memo (row + entry verdicts, namespaced).
+
+        Late-seed row checks (`late:<source-hash>`) and original entry
+        checks (`orig:<entry-hash>`) shared one TTL, one cap and one sweep
+        instead of two parallel dicts with duplicated expiry logic.
+        """
+        try:
+            d = getattr(self, "_fuse_healthy_until", None)
+            if not isinstance(d, dict):
+                d = {}
+                self._fuse_healthy_until = d  # type: ignore[attr-defined]
+            return d
+        except Exception:
+            return {}
+
+    def _fuse_healthy_fresh(self, key: str) -> bool:
+        """True when `key` holds an unexpired healthy verdict."""
+        try:
+            if not key:
+                return False
+            nxt = self._fuse_healthy_store().get(key)
+            return nxt is not None and time.monotonic() < float(nxt)
+        except Exception:
+            return False
+
+    def _fuse_healthy_note(self, key: str) -> None:
+        """Record a healthy verdict for the shared TTL window."""
+        try:
+            if not key:
+                return
+            d = self._fuse_healthy_store()
+            d[key] = time.monotonic() + _FUSE_HEALTHY_TTL_S
+            if len(d) > _FUSE_HEALTHY_CAP:
+                for _k in list(d.keys())[: len(d) - _FUSE_HEALTHY_CAP]:
+                    d.pop(_k, None)
+        except Exception:
+            pass
+
     def _late_seed_sweep(self) -> None:
-        """Bound the late-seed failure/success maps (30m TTL, 5000 cap).
+        """Bound the late-seed failure map + healthy memo (30m TTL, 5000 cap).
 
         Called at the top of every late-seed check; cheap fast path unless a
         map grew large. Restart-wiped maps simply re-warm (thundering herd
         bounded by one full scan per DONE row, then memoized).
         """
         try:
-            for attr in ("_failed_late_cross_seeds", "_late_seed_ok_at",
-                         "_original_healthy_at"):
-                d = getattr(self, attr, None)
-                if not isinstance(d, dict) or len(d) <= 2000:
-                    continue
-                if attr in ("_late_seed_ok_at", "_original_healthy_at"):
-                    now_m = time.monotonic()
-                    for k in list(d.keys()):
-                        try:
-                            if now_m >= float(d[k]):
-                                d.pop(k, None)
-                        except Exception:
-                            d.pop(k, None)
-                else:
+            d = getattr(self, "_fuse_healthy_until", None)
+            if isinstance(d, dict) and len(d) > 2000:
+                now_m = time.monotonic()
+                for k in list(d.keys()):
                     try:
-                        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=30)
-                    except Exception:
-                        continue
-                    for k in list(d.keys()):
-                        try:
-                            if d[k] < cutoff:
-                                d.pop(k, None)
-                        except Exception:
+                        if now_m >= float(d[k]):
                             d.pop(k, None)
+                    except Exception:
+                        d.pop(k, None)
                 if len(d) > 5000:
                     for k in list(d.keys())[: len(d) - 5000]:
                         d.pop(k, None)
+            fm = getattr(self, "_failed_late_cross_seeds", None)
+            if not isinstance(fm, dict) or len(fm) <= 2000:
+                return
+            try:
+                cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=30)
+            except Exception:
+                return
+            for k in list(fm.keys()):
+                try:
+                    if fm[k] < cutoff:
+                        fm.pop(k, None)
+                except Exception:
+                    fm.pop(k, None)
+            if len(fm) > 5000:
+                for k in list(fm.keys())[: len(fm) - 5000]:
+                    fm.pop(k, None)
         except Exception:
             pass
 
@@ -346,11 +383,7 @@ class FuseMixin:
                 return
             if ts.injected_private_hashes != injected_before or ts.save_path != save_before:
                 return
-            d = getattr(self, "_late_seed_ok_at", None)
-            if not isinstance(d, dict):
-                d = {}
-                self._late_seed_ok_at = d  # type: ignore[attr-defined]
-            d[row_key] = time.monotonic() + 1800.0
+            self._fuse_healthy_note(f"late:{row_key}")
         except Exception:
             pass
 
@@ -667,23 +700,14 @@ class FuseMixin:
         # free of extra source calls. Unavailable => skip repair; new seeds
         # stay protected by their own per-torrent fuse gate.
         #
-        # Healthy memo (30m, same window as the failure backoff above): a
-        # proven-healthy entry must not pay export + stats every tick —
-        # that was an INFO line plus qB/fuse round-trips per DONE row per
-        # poll. Only verified health memoizes; every defer/fail path
-        # re-probes next tick as before.
-        try:
-            _healthy = getattr(self, "_original_healthy_at", None)
-            if isinstance(_healthy, dict) and h:
-                _next = _healthy.get(h)
-                try:
-                    _fresh = _next is not None and time.monotonic() < float(_next)
-                except (TypeError, ValueError):
-                    _fresh = False
-                if _fresh:
-                    return
-        except Exception:
-            pass
+        # Healthy memo (unified fuse memo, same window as the failure
+        # backoff above): a proven-healthy entry must not pay export +
+        # stats every tick — that was an INFO line plus qB/fuse round-trips
+        # per DONE row per poll. Only verified health memoizes; every
+        # defer/fail path re-probes next tick as before.
+        _orig_key = f"orig:{h}" if h else ""
+        if _orig_key and self._fuse_healthy_fresh(_orig_key):
+            return
         blob: bytes | None = None
         try:
             export_fn = getattr(self.dest_client, "export_torrent", None)
@@ -729,17 +753,7 @@ class FuseMixin:
                         _failed6.pop(h, None)
                 except Exception:
                     pass
-                try:
-                    _hm = getattr(self, "_original_healthy_at", None)
-                    if not isinstance(_hm, dict):
-                        _hm = {}
-                        self._original_healthy_at = _hm  # type: ignore[attr-defined]
-                    _hm[h] = time.monotonic() + 1800.0
-                    if len(_hm) > 5000:
-                        for _k in list(_hm.keys())[: len(_hm) - 5000]:
-                            _hm.pop(_k, None)
-                except Exception:
-                    pass
+                self._fuse_healthy_note(f"orig:{h}" if h else "")
         except Exception as e:  # noqa: BLE001
             log.warning("late cross-seed: original %s fuse repair failed: %s", h[:10], e)
             self._late_seed_defer(h)
