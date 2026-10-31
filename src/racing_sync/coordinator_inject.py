@@ -630,11 +630,12 @@ class InjectMixin:
     async def injectfuse_confirmed(self, hashes: list[str]) -> str:
         """Execute a confirmed /injectfuse: resolve live, verify, drive.
 
-        All-or-nothing: any verification problem reports WITHOUT changing
-        state (tracked rows keep their prior state; untracked groups gain
-        no row). The live VPS1 group at confirm time governs (frozen
-        question hashes only seed the lookup). Short strings — Telegram
-        truncates for chat.
+        All-or-nothing per group: any verification problem reports WITHOUT
+        changing state (tracked rows keep their prior state; untracked
+        groups gain no row). Every confirmed hash is resolved and driven
+        (hashes landing in one content group drive once); the live VPS1
+        group at confirm time governs (frozen question hashes only seed
+        the lookup). Short strings — Telegram truncates for chat.
         """
         clean: list[str] = []
         for h in hashes or []:
@@ -648,32 +649,49 @@ class InjectMixin:
                 clean.append(n)
         if not clean:
             return "Not injected — nothing to verify (expired?)."
-        try:
-            resolved = await self.injectfuse_resolve(clean[0])
-        except (LookupError, ValueError) as e:
-            return f"Not injected — {e}"
-        except Exception as e:  # noqa: BLE001
-            return f"Not injected — verify failed ({e})"
-        try:
-            verified = await self.injectfuse_verify(
-                resolved.get("members") or [])
-        except Exception as e:  # noqa: BLE001
-            return f"Not injected — verify failed ({e})"
-        if not verified.get("ready"):
-            suffix = ""
+        outs: list[str] = []
+        driven: set[str] = set()
+        for h in clean:
             try:
-                row = resolved.get("row")
-                if row is not None and getattr(row, "state", None) is not None:
-                    suffix = f" — still {row.state.value}"
+                resolved = await self.injectfuse_resolve(h)
+            except (LookupError, ValueError) as e:
+                outs.append(f"Not injected — {e}")
+                continue
+            except Exception as e:  # noqa: BLE001
+                outs.append(f"Not injected — verify failed ({e})")
+                continue
+            try:
+                _primary = resolved.get("primary")
+                _p_hash = (getattr(_primary, "infohash", "") or "").lower()
             except Exception:
+                _p_hash = ""
+            if _p_hash and _p_hash in driven:
+                continue
+            if _p_hash:
+                driven.add(_p_hash)
+            try:
+                verified = await self.injectfuse_verify(
+                    resolved.get("members") or [])
+            except Exception as e:  # noqa: BLE001
+                outs.append(f"Not injected — verify failed ({e})")
+                continue
+            if not verified.get("ready"):
                 suffix = ""
-            probs = list(verified.get("problems") or ["unverifiable"])
-            extra = f" (+{len(probs) - 3} more)" if len(probs) > 3 else ""
-            return f"Not injected{suffix}: " + "; ".join(probs[:3]) + extra
-        try:
-            return await self.injectfuse_apply(
-                resolved, verified.get("blobs") or {})
-        except (LookupError, ValueError) as e:
-            return f"Not injected — {e}"
-        except Exception as e:  # noqa: BLE001
-            return f"Not injected — {e}"
+                try:
+                    row = resolved.get("row")
+                    if row is not None and getattr(row, "state", None) is not None:
+                        suffix = f" — still {row.state.value}"
+                except Exception:
+                    suffix = ""
+                probs = list(verified.get("problems") or ["unverifiable"])
+                extra = f" (+{len(probs) - 3} more)" if len(probs) > 3 else ""
+                outs.append(f"Not injected{suffix}: " + "; ".join(probs[:3]) + extra)
+                continue
+            try:
+                outs.append(await self.injectfuse_apply(
+                    resolved, verified.get("blobs") or {}))
+            except (LookupError, ValueError) as e:
+                outs.append(f"Not injected — {e}")
+            except Exception as e:  # noqa: BLE001
+                outs.append(f"Not injected — {e}")
+        return "\n".join(outs) if outs else "Not injected — nothing to verify (expired?)."

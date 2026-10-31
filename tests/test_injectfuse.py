@@ -720,3 +720,43 @@ async def test_confirmed_untracked_routes_via_new_and_transition(tmp_path):
         assert coord.store.get(H1).state == State.RE_ADDING
     finally:
         coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_confirmed_drives_every_hash(tmp_path):
+    """Two distinct confirmed groups both drive (no silent clean[0] drop)."""
+    t1 = Torrent(hash=H1, name="First.Release.1080p", category="",
+                 save_path="/vps1", size_bytes=500, state="seeding",
+                 progress=1.0, trackers=[TRACKER1], files=[])
+    t2 = Torrent(hash=H2, name="Second.Release.1080p", category="",
+                 save_path="/vps1", size_bytes=500, state="seeding",
+                 progress=1.0, trackers=[TRACKER2], files=[])
+    coord, _, fuse = _coord(tmp_path, [t1, t2])
+    blob = _blob()
+    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    try:
+        out = await coord.injectfuse_confirmed([H1, H2])
+        lines = [ln for ln in out.splitlines() if ln.startswith("injecting")]
+        assert len(lines) == 2
+        assert coord.store.get(H1).state == State.RE_ADDING
+        assert coord.store.get(H2).state == State.RE_ADDING
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_confirmed_same_group_drives_once(tmp_path):
+    """Two hashes in one content group drive once, not twice."""
+    coord, _, fuse = _coord(
+        tmp_path, [_torrent(H1, TRACKER1), _torrent(H2, TRACKER2)])
+    blob = _blob()
+    coord.source_client.export_torrent = AsyncMock(return_value=blob)
+    (fuse / "Solo.mkv").write_bytes(b"x" * 500)
+    try:
+        out = await coord.injectfuse_confirmed([H1, H2])
+        assert out.startswith("injecting")
+        assert "\n" not in out.strip()
+        assert coord.store.get(H1).state == State.RE_ADDING
+    finally:
+        coord.store.close()
