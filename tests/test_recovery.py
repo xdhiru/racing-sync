@@ -1208,3 +1208,107 @@ def test_revive_clears_stale_dest_pointer(tmp_path):
         store.close()
 
 
+def _fuse_coord(tmp_path):
+    """Real-store coordinator with SSD + fuse mounts for late-seed tests."""
+    from racing_sync.watchdir import _bencode
+
+    ssd = tmp_path / "ssd"
+    fuse = tmp_path / "fuse"
+    fuse_u = tmp_path / "fuse-unsorted"
+    ssd.mkdir(exist_ok=True)
+    fuse.mkdir(exist_ok=True)
+    fuse_u.mkdir(exist_ok=True)
+    store = StateStore(tmp_path / "late.db")
+    coord = make_coordinator(store)
+    coord._stop = False
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.fuse.mount = fuse
+    coord.cfg.rclone.fuse.mount_unsorted = fuse_u
+    coord.cfg.classifier._episode_re = None
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
+    coord.dest_client = AsyncMock()
+    coord.source_client = AsyncMock()
+    coord.source_client.list_torrents = AsyncMock(return_value=[])
+    coord.sftp = None
+    return coord, store, ssd, fuse, fuse_u
+
+
+@pytest.mark.anyio
+async def test_stale_done_rebuilds_lost_entry_instead_of_demoting(tmp_path: Path):
+    """Bytes verified on fuse + entry lost: re-inject, stay DONE.
+
+    Demoting the whole row to MOVING would re-run a move for bytes that
+    already moved. Only the row blob's own hash is rebuilt (late-seed
+    hashes with unknown blobs still refuse).
+    """
+    from racing_sync.clients.abstract import AddResult
+    from racing_sync.watchdir import _bencode, _bencoded_info_hash
+
+    coord, store, ssd, fuse, _fuse_u = _fuse_coord(tmp_path)
+    blob = _bencode({
+        b"info": {b"name": b"Repair.Movie.2026.mkv", b"length": 100},
+    })
+    blob_hash, _, _, _ = _bencoded_info_hash(blob)
+    target = coord._target_mount_for_blob(
+        blob, fuse)
+    (Path(target) / "Repair.Movie.2026.mkv").write_bytes(b"r" * 100)
+    entry = Torrent(
+        hash=blob_hash, name="Repair.Movie.2026", category="racing",
+        save_path=str(target), size_bytes=100, state="seeding", progress=1.0,
+    )
+    coord.dest_client.list_torrents = AsyncMock(side_effect=[[], [entry]])
+    coord.dest_client.get_torrent = AsyncMock(return_value=entry)
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash=blob_hash, accepted=True, detail="Ok."))
+    try:
+        store.upsert(TorrentState(
+            source_infohash="s" * 40, source_name="Repair.Movie.2026",
+            cross_seed_infohash=blob_hash, cross_seed_blob=blob,
+            save_path=str(ssd), state=State.DONE))
+        await coord._check_and_inject_late_cross_seeds(
+            store.get("s" * 40), [])
+        row = store.get("s" * 40)
+        assert row.state == State.DONE
+        assert row.save_path == str(target)
+        coord.dest_client.add_torrent.assert_awaited_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_demote_false_done_single_guarded_write(tmp_path: Path):
+    """Unverifiable stale DONE + SSD bytes: one transition, no narrow write."""
+    from racing_sync.clients.abstract import TorrentFile
+
+    coord, store, ssd, _fuse, _fuse_u = _fuse_coord(tmp_path)
+    (ssd / "Stranded.Movie.2026.mkv").write_bytes(b"s" * 100)
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Stranded.Movie.2026.mkv", size_bytes=100, progress=1.0),
+    ])
+    narrow_writes = []
+    real_update = store.update_columns
+
+    def _spy(h, cols):
+        narrow_writes.append(cols)
+        return real_update(h, cols)
+
+    store.update_columns = _spy
+    try:
+        store.upsert(TorrentState(
+            source_infohash="s" * 40, source_name="Stranded.Movie.2026",
+            dest_infohash="d" * 40, save_path="/elsewhere",
+            state=State.DONE))
+        await coord._check_and_inject_late_cross_seeds(
+            store.get("s" * 40), [])
+        row = store.get("s" * 40)
+        assert row.state == State.MOVING
+        assert row.save_path == str(ssd)
+        assert narrow_writes == []
+    finally:
+        store.close()
+
+
