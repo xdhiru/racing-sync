@@ -465,14 +465,72 @@ class FuseMixin:
         self.store.upsert(ts)
         self._failed_late_cross_seeds.pop(source_low, None)
 
+    async def _dest_entries_for_hashes(self, hashes: set[str]) -> list | None:
+        """Dest entries for recorded hashes (chunked, RPC-bounded).
+
+        None on transport failure (fail-closed: callers treat unknown as
+        unverified, never as healthy).
+        """
+        try:
+            present: list = []
+            for _chunk in chunked(sorted(hashes)):
+                present.extend(await rpc(
+                    self.dest_client.list_torrents(hashes=_chunk),
+                    getattr(self, "cfg", None), "dest verify list_torrents",
+                ) or [])
+            return present
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _reinject_missing_done_entries(
+        self, ts: TorrentState, missing: set[str],
+        blob: bytes | None, target: Path,
+    ) -> bool:
+        """Re-inject lost dest entries whose bytes verify at the target.
+
+        A client restart (or manual delete) can drop the entry while the
+        bytes sit verified on fuse: rebuilding the entry is cheaper and
+        safer than demoting the whole row to MOVING (the bytes already
+        moved — a move would find nothing). Only hashes matching the row
+        blob's own infohash are rebuilt; anything else (late seeds with
+        unknown blobs) refuses so a wrong blob can never seed under a
+        stranger's hash. True only when every missing entry rebuilt.
+        """
+        if not blob or not missing:
+            return False
+        try:
+            from .watchdir import _bencoded_info_hash
+
+            own_hash, _, _, _ = _bencoded_info_hash(bytes(blob))
+            own_hash = (own_hash or "").lower()
+        except Exception:
+            return False
+        if not own_hash:
+            return False
+        for mh in sorted(missing):
+            if mh != own_hash:
+                return False
+            try:
+                ok, _ = await self._ensure_fuse_entry(
+                    blob=bytes(blob), infohash=mh, target_mount=target,
+                    label="missing entry (repair)",
+                )
+            except Exception:  # noqa: BLE001
+                return False
+            if not ok:
+                return False
+        return True
+
     async def _verified_fuse_mount_for_done_row(self, ts: TorrentState) -> Path | None:
         """Prove a DONE row really seeds from fuse; return the mount or None.
 
         Checks both halves of "seeding from fuse": every recorded hash has a
         live dest entry AND the torrent bytes are present under the fuse
         target. Entries alone are not proof (a skip_check entry reports
-        complete with zero bytes). None means unverifiable — callers must
-        take the fail-closed path (demote/defer), never assume health.
+        complete with zero bytes). Entries lost while bytes verify are
+        rebuilt in place (same blob, same hash) instead of demoting the
+        row. None means unverifiable — callers must take the fail-closed
+        path (demote/defer), never assume health.
         """
         hashes = {
             h.lower() for h in (
@@ -483,18 +541,10 @@ class FuseMixin:
         }
         if not hashes:
             return None
-        try:
-            present: list = []
-            for _chunk in chunked(sorted(hashes)):
-                present.extend(await rpc(
-                    self.dest_client.list_torrents(hashes=_chunk),
-                    getattr(self, "cfg", None), "dest verify list_torrents",
-                ) or [])
-        except Exception:  # noqa: BLE001
+        present = await self._dest_entries_for_hashes(hashes)
+        if present is None:
             return None
         have = {t.hash.lower() for t in (present or [])}
-        if hashes - have:
-            return None
         blob = ts._blob or ts.cross_seed_blob
         if not blob and getattr(self, "store", None) is not None:
             try:
@@ -508,6 +558,17 @@ class FuseMixin:
             target = self._target_mount_for_blob(blob, self._target_mount_for(ts))
         except Exception:  # noqa: BLE001
             return None
+        missing_entries = hashes - have
+        if missing_entries:
+            if not await self._reinject_missing_done_entries(
+                    ts, missing_entries, blob, target):
+                return None
+            present = await self._dest_entries_for_hashes(hashes)
+            if present is None:
+                return None
+            have = {t.hash.lower() for t in (present or [])}
+            if hashes - have:
+                return None
         try:
             missing = await self._missing_fuse_files(target, expected)
         except Exception:  # noqa: BLE001
@@ -521,7 +582,10 @@ class FuseMixin:
         (stale save_path, pre-fix DB). The rclone move must run before any
         fuse injection, so move the row back to MOVING when the SSD bytes
         are still present. When the bytes cannot be confirmed, leave the row
-        alone (late seeds stay deferred by the caller).
+        alone (late seeds stay deferred by the caller). Single guarded
+        write: save_path rides the transition UPDATE on a fresh re-read
+        (state+version guard refuses concurrent moves loudly) instead of
+        a narrow write plus a second write.
         """
         h = (ts.dest_infohash or ts.source_infohash or "").lower()
         if not h:
@@ -545,29 +609,17 @@ class FuseMixin:
             return
         if ssd_root is None:
             return
-        # Narrow write, not whole-row upsert: a concurrent timer/display
-        # park between our read and this write must survive (upsert would
-        # clobber it with our stale snapshot). Re-read fresh for the
-        # transition guard below.
         try:
-            _rev = await asyncio.to_thread(
-                self.store.update_columns,
-                (ts.source_infohash or "").lower(),
-                {"save_path": str(ssd_root)})
-        except Exception:  # noqa: BLE001
-            return
-        if not _rev:
-            return
-        try:
-            ts = await asyncio.to_thread(
+            fresh = await asyncio.to_thread(
                 self.store.get,
                 (ts.source_infohash or "").lower())
         except Exception:  # noqa: BLE001
             return
-        if ts is None:
+        if fresh is None:
             return
+        fresh.save_path = str(ssd_root)
         try:
-            self.transition(ts, State.MOVING)
+            self.transition(fresh, State.MOVING)
             log.warning(
                 "late cross-seed: demoted %s from DONE to MOVING; "
                 "SSD content at %s will move before fuse injection",
