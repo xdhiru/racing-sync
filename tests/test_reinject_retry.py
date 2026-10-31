@@ -1468,9 +1468,9 @@ async def test_original_healthy_memo_skips_reprobe(tmp_path: Path):
     # Second tick: memo fresh, no export, no stats, no inject attempt.
     await coord._ensure_original_fuse_entry(ts, fuse_dir)
     assert coord.dest_client.export_torrent.await_count == 1
-    assert time.monotonic() < coord._original_healthy_at[h]
+    assert time.monotonic() < coord._fuse_healthy_until[f"orig:{h}"]
     # Aged out: re-probes.
-    coord._original_healthy_at[h] = time.monotonic() - 1.0
+    coord._fuse_healthy_until[f"orig:{h}"] = time.monotonic() - 1.0
     await coord._ensure_original_fuse_entry(ts, fuse_dir)
     assert coord.dest_client.export_torrent.await_count == 2
 
@@ -1488,7 +1488,7 @@ async def test_original_defer_never_memoizes(tmp_path: Path):
 
     await coord._ensure_original_fuse_entry(ts, fuse_dir)
     assert coord.dest_client.export_torrent.await_count == 1
-    assert h not in getattr(coord, "_original_healthy_at", {})
+    assert f"orig:{h}" not in getattr(coord, "_fuse_healthy_until", {})
     await coord._ensure_original_fuse_entry(ts, fuse_dir)
     assert coord.dest_client.export_torrent.await_count == 2
 
