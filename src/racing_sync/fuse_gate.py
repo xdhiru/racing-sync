@@ -53,20 +53,35 @@ def _join(mount: Path, name: str):
 
 
 async def missing_under(
-    mount: Path | str, expected: list[tuple[str, int]]
+    mount: Path | str, expected: list[tuple[str, int]], *, fresh: bool = False
 ) -> list[str] | None:
     """Files absent/size-mismatched under mount, None when unstatable.
 
     None = fail-closed unknowable (dead mount, stat error). Callers must
-    park, never mark DONE on None. Empty list = fully present.
+    park, never mark DONE on None. Empty list = fully present. With
+    fresh=True the cached stats for the mount + targets are invalidated
+    first, so a stale cached absence (rclone dir-cache lag resolving the
+    other way) is re-probed instead of trusted.
     """
     try:
-        from .coordinator_paths import fuse_stat_cached
+        from .coordinator_paths import fuse_stat_cached, fuse_stat_invalidate
 
         m = Path(mount)
 
         def _check() -> list[str] | None:
             try:
+                if fresh:
+                    try:
+                        fuse_stat_invalidate(m)
+                    except Exception:
+                        pass
+                    for _name, _want in expected or []:
+                        _t = _join(m, _name or "")
+                        if _t is not None:
+                            try:
+                                fuse_stat_invalidate(_t)
+                            except Exception:
+                                pass
                 mount_ok, _ = fuse_stat_cached(m)
             except Exception:
                 return None

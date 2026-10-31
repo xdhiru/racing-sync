@@ -1492,3 +1492,27 @@ async def test_original_defer_never_memoizes(tmp_path: Path):
     await coord._ensure_original_fuse_entry(ts, fuse_dir)
     assert coord.dest_client.export_torrent.await_count == 2
 
+
+@pytest.mark.anyio
+async def test_stale_cache_miss_reprobed_fresh_no_backoff(tmp_path: Path):
+    """A cached-only absence the mount already resolved must not back off.
+
+    The shared 60s stat cache can report missing for bytes that just
+    landed; the gate re-probes fresh once and repairs instead of writing
+    a 30m deferral.
+    """
+    from racing_sync import coordinator_paths as _cp
+
+    blob = _single_file_torrent_bytes("Orig.Movie.2026.mkv", 100)
+    coord, fuse_dir = _original_coord(tmp_path, blob)
+    target = fuse_dir / "Orig.Movie.2026.mkv"
+    # Prime the shared cache with an absence, then land the bytes.
+    assert _cp.fuse_stat_cached(target) == (False, -1)
+    coord._ensure_fuse_entry = AsyncMock(return_value=(True, "already added"))
+    ts = _original_row(fuse_dir)
+    h = (ts.dest_infohash or "").lower()
+    assert _cp.fuse_stat_cached(target) == (False, -1)  # still stale
+    await coord._ensure_original_fuse_entry(ts, fuse_dir)
+    coord._ensure_fuse_entry.assert_awaited_once()
+    assert h not in getattr(coord, "_failed_late_cross_seeds", {})
+
