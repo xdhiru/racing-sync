@@ -225,7 +225,7 @@ class FuseMixin:
                 )
                 self._failed_late_cross_seeds[h_low] = now_utc
                 continue
-            late_missing = await self._missing_fuse_files(target_mount, late_expected)
+            late_missing = await self._confirmed_fuse_missing(target_mount, late_expected)
             if late_missing:
                 log.warning(
                     "late cross-seed: fuse content missing for %s (%s) at %s (%d files); deferring injection",
@@ -459,7 +459,7 @@ class FuseMixin:
             self._failed_late_cross_seeds[source_low] = now_utc
             return
         try:
-            missing = await self._missing_fuse_files(target_mount, expected)
+            missing = await self._confirmed_fuse_missing(target_mount, expected)
         except Exception:  # noqa: BLE001
             self._failed_late_cross_seeds[source_low] = now_utc
             return
@@ -603,7 +603,7 @@ class FuseMixin:
             if hashes - have:
                 return None
         try:
-            missing = await self._missing_fuse_files(target, expected)
+            missing = await self._confirmed_fuse_missing(target, expected)
         except Exception:  # noqa: BLE001
             return None
         return target if not missing else None
@@ -728,7 +728,7 @@ class FuseMixin:
             self._late_seed_defer(h)
             return
         try:
-            missing = await self._missing_fuse_files(target, expected)
+            missing = await self._confirmed_fuse_missing(target, expected)
         except Exception:  # noqa: BLE001
             self._late_seed_defer(h)
             return
@@ -757,6 +757,33 @@ class FuseMixin:
         except Exception as e:  # noqa: BLE001
             log.warning("late cross-seed: original %s fuse repair failed: %s", h[:10], e)
             self._late_seed_defer(h)
+
+    async def _confirmed_fuse_missing(
+        self, target_mount: Path, files: list[tuple[str, int]]
+    ) -> list[str]:
+        """Cached miss confirm: re-probe fresh once before reporting absent.
+
+        The shared stat cache (60s) can report an absence the mount has
+        already resolved: a cached-only miss no longer earns a 30m
+        backoff — only a fresh-confirmed miss defers. Outage markers
+        (`<...>`) pass through untouched; callers split dead-mount from
+        content-miss handling.
+        """
+        missing = await self._missing_fuse_files(target_mount, files)
+        if not missing:
+            return []
+        if any(str(m).startswith("<") for m in missing):
+            return missing
+        try:
+            from .fuse_gate import missing_under as _missing_under
+
+            fresh_missing = await _missing_under(
+                target_mount, files, fresh=True)
+        except Exception:  # noqa: BLE001
+            return missing
+        if fresh_missing is None:
+            return missing
+        return fresh_missing
 
     async def _fetch_racing_torrent_bytes(self, infohash: str) -> bytes | None:
         """Fetch the raw .torrent bytes for a racing-client infohash.
