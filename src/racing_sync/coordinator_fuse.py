@@ -236,10 +236,14 @@ class FuseMixin:
                 # (abrupt-stop leftover, or a fuse-pointing entry whose bytes
                 # never moved) must go through MOVING first — never inject
                 # around it. Best-effort; a failed SSD probe just defers.
+                # Off-loop: exists()+iterdir() over SSD stalls the loop on
+                # a slow disk.
                 try:
                     from .recovery import find_content_on_ssd
 
-                    if find_content_on_ssd(self.cfg, late_expected) is not None:
+                    _ssd_hit = await asyncio.to_thread(
+                        find_content_on_ssd, self.cfg, late_expected)
+                    if _ssd_hit is not None:
                         log.warning(
                             "late cross-seed: %s missing on fuse but present on SSD; "
                             "demoting %s to MOVING",
@@ -637,7 +641,8 @@ class FuseMixin:
         try:
             from .recovery import find_content_on_ssd
 
-            ssd_root = find_content_on_ssd(self.cfg, expected)
+            ssd_root = await asyncio.to_thread(
+                find_content_on_ssd, self.cfg, expected)
         except Exception:  # noqa: BLE001
             return
         if ssd_root is None:

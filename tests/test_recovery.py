@@ -1312,3 +1312,39 @@ async def test_demote_false_done_single_guarded_write(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_demote_ssd_probe_runs_off_loop(tmp_path: Path):
+    """The SSD content probe must not stall the event loop on slow disks."""
+    import threading
+    from unittest.mock import patch
+    from racing_sync.clients.abstract import TorrentFile
+
+    coord, store, ssd, _fuse, _fuse_u = _fuse_coord(tmp_path)
+    (ssd / "Stranded.Movie.2026.mkv").write_bytes(b"s" * 100)
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="Stranded.Movie.2026.mkv", size_bytes=100, progress=1.0),
+    ])
+    import racing_sync.recovery as _rec
+
+    real = _rec.find_content_on_ssd
+    seen = {}
+
+    def _spy(cfg, expected):
+        seen["thread"] = threading.current_thread()
+        return real(cfg, expected)
+
+    try:
+        store.upsert(TorrentState(
+            source_infohash="s" * 40, source_name="Stranded.Movie.2026",
+            dest_infohash="d" * 40, save_path="/elsewhere",
+            state=State.DONE))
+        with patch.object(_rec, "find_content_on_ssd", side_effect=_spy):
+            await coord._check_and_inject_late_cross_seeds(
+                store.get("s" * 40), [])
+        assert seen["thread"] is not threading.main_thread()
+        assert store.get("s" * 40).state == State.MOVING
+    finally:
+        store.close()
+
+
