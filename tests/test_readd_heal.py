@@ -248,3 +248,52 @@ async def test_heal_happy_path_selective(tmp_path):
         assert coord._readd_heal_track["c" * 40][2] >= 3
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_heal_truncated_file_still_heals(tmp_path):
+    """A truncated-but-regular file at the target is still missing: heal fires."""
+    coord, store, blob, blob_hash, ssd, fuse = _scaffold(tmp_path)
+    try:
+        _track(coord, "c" * 40, 10800, (MISSING,))
+        # Truncated copy: regular file, wrong size — must not pass as present.
+        (Path(coord.cfg.rclone.fuse.mount_unsorted) / TOP / "ep04v2.mkv").write_bytes(
+            b"t" * (MISSING_SIZE - 50))
+
+        async def _files(h):
+            if not hasattr(_files, "n"):
+                _files.n = 0
+            _files.n += 1
+            if _files.n == 1:
+                # Priority-listing call: nothing complete yet.
+                return [
+                    TorrentFile(name=PRESENT, size_bytes=PRESENT_SIZE, progress=0.0),
+                    TorrentFile(name=MISSING, size_bytes=MISSING_SIZE, progress=0.0),
+                ]
+            # Completion poll: the mock "download" lands the bytes.
+            (ssd / TOP).mkdir(exist_ok=True)
+            (ssd / TOP / "ep04v2.mkv").write_bytes(b"y" * MISSING_SIZE)
+            return [
+                TorrentFile(name=PRESENT, size_bytes=PRESENT_SIZE, progress=1.0),
+                TorrentFile(name=MISSING, size_bytes=MISSING_SIZE, progress=1.0),
+            ]
+
+        coord.dest_client.get_torrent_files = AsyncMock(side_effect=_files)
+        coord.dest_client.add_torrent = AsyncMock(
+            return_value=AddResult(hash=blob_hash, accepted=True, detail="Ok."))
+
+        async def _move(local, remote, ts, files_from=None, **kw):
+            for n in files_from or []:
+                p = Path(local, *n.split("/"))
+                if p.is_file():
+                    p.unlink()
+
+        coord._rclone_move = AsyncMock(side_effect=_move)
+
+        await coord._do_re_add(store.get("c" * 40))
+
+        # Heal fired despite a regular file existing at the target.
+        coord.dest_client.add_torrent.assert_awaited_once()
+        coord.dest_client.resume.assert_awaited()
+    finally:
+        store.close()
