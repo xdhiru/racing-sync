@@ -177,8 +177,18 @@ class ReaddMixin:
             )
             return False
 
+        # Sizes from the blob expectation (the fuse gate's own source):
+        # authoritative per-file sizes for the fresh check below.
+        try:
+            want_map = {n: int(s or 0) for n, s in (self._expected_fuse_files(gate_blob) or []) if n}
+        except Exception:
+            return False
+        if not set(missing_key).issubset(set(want_map)):
+            return False
+
         # Fresh uncached confirm (bypasses the 60s fuse_stat_cached): a
-        # stale cache entry must never trigger a re-download.
+        # stale cache entry must never trigger a re-download. Compares
+        # sizes too: a truncated-but-regular file is still missing.
         def _fresh_check() -> list[str]:
             still: list[str] = []
             for name in missing_key:
@@ -194,6 +204,13 @@ class ReaddMixin:
                         continue
                     if not stat.S_ISREG(st.st_mode):
                         still.append(name)
+                        continue
+                    try:
+                        want = int(want_map.get(name, 0) or 0)
+                    except (TypeError, ValueError):
+                        want = 0
+                    if want and int(st.st_size) != want:
+                        still.append(f"{name} (size {st.st_size}!={want})")
                         continue
                 except OSError:
                     still.append(name)
@@ -213,9 +230,14 @@ class ReaddMixin:
             except Exception:
                 pass
             return False
-        if tuple(sorted(confirmed)) != missing_key:
+        try:
+            confirmed_key = tuple(sorted(
+                n for n in (_base_name(c) for c in confirmed) if n))
+        except Exception:
+            return False
+        if confirmed_key != missing_key:
             try:
-                track[key] = [now_m, tuple(sorted(confirmed)), attempts]
+                track[key] = [now_m, confirmed_key, attempts]
             except Exception:
                 pass
             return False
@@ -223,38 +245,44 @@ class ReaddMixin:
         heal_set = set(heal_names)
 
         # SSD-side absent check: bytes still local means fuse lag, not data
-        # loss — re-downloading would duplicate them.
+        # loss — re-downloading would duplicate them. Sync exists() loop,
+        # offloaded so slow SSD stats never stall the event loop.
         try:
             ssd_base = Path(ts.save_path) if ts.save_path else None
             if ssd_base is None or self._save_path_is_on_fuse(str(ssd_base)):
                 ssd_base = Path(self.cfg.dest.save_path)
         except Exception:
             return False
-        try:
+
+        def _ssd_has_any() -> str | None:
+            """First heal name still on SSD; "" when unverifiable; None when clear."""
             for name in heal_names:
-                p = _safe_ssd_join(ssd_base, name)
+                try:
+                    p = _safe_ssd_join(ssd_base, name)
+                except Exception:
+                    return ""
                 if p is None:
-                    return False
+                    return ""
                 try:
                     if p.exists():
-                        log.info(
-                            "re-add heal: %s still on SSD for %s "
-                            "(fuse lag, not loss); not re-downloading",
-                            name, ts.source_name[:50],
-                        )
-                        return False
+                        return name
                 except OSError:
-                    return False
+                    return ""
+            return None
+
+        try:
+            _ssd_hit = await asyncio.to_thread(_ssd_has_any)
         except Exception:
+            return False
+        if _ssd_hit is not None:
+            if _ssd_hit:
+                log.info(
+                    "re-add heal: %s still on SSD for %s "
+                    "(fuse lag, not loss); not re-downloading",
+                    _ssd_hit, ts.source_name[:50],
+                )
             return False
 
-        # Sizes from the blob expectation (the fuse gate's own source).
-        try:
-            want_map = {n: int(s or 0) for n, s in (self._expected_fuse_files(gate_blob) or []) if n}
-        except Exception:
-            return False
-        if not heal_set.issubset(set(want_map)):
-            return False
         footprint = sum(max(0, want_map.get(n, 0)) for n in heal_names)
 
         reserved = False
