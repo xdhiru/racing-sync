@@ -36,6 +36,33 @@ _LATE_SEED_BOOT_GRACE_S = 300.0
 # (`late:<row>` row checks + `orig:<hash>` original entry checks).
 _FUSE_HEALTHY_TTL_S = 1800.0
 _FUSE_HEALTHY_CAP = 5000
+#: Cap on recorded injected hashes per row. Long-lived series rows would
+#: otherwise grow the CSV without bound; a trimmed hash re-injects at
+#: worst as a duplicate ("already added"), never as new bytes.
+_INJECTED_HASHES_KEEP = 50
+
+
+def _record_injected_hash(ts: TorrentState, h_low: str) -> bool:
+    """Append `h_low` to the row's injected CSV, trimmed to the last 50.
+
+    True when the set changed. Shared with the re-add/watch injectors
+    so every writer enforces the same cap.
+    """
+    try:
+        h_low = (h_low or "").lower()
+        if not h_low:
+            return False
+        current = [h for h in (ts.injected_private_hashes or "").split(",") if h]
+    except Exception:
+        return False
+    if h_low in current:
+        return False
+    current.append(h_low)
+    try:
+        ts.injected_private_hashes = ",".join(current[-_INJECTED_HASHES_KEEP:])
+    except Exception:
+        return False
+    return True
 
 
 class FuseMixin:
@@ -182,8 +209,6 @@ class FuseMixin:
             return
 
         ts_fallback_mount = self._target_mount_for(ts)
-        current_injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
-        current_injected_set = set(current_injected)
         changed = False
 
         for t in new_torrents:
@@ -265,9 +290,8 @@ class FuseMixin:
                         "auto-injected late cross-seed %s (%s) onto fuse (%s)",
                         t.infohash[:10], t.name[:40], target_mount,
                     )
-                    current_injected.append(h_low)
-                    current_injected_set.add(h_low)
-                    changed = True
+                    if _record_injected_hash(ts, h_low):
+                        changed = True
                     self._failed_late_cross_seeds.pop(h_low, None)
                 else:
                     log.warning(
@@ -285,7 +309,6 @@ class FuseMixin:
                 self._failed_late_cross_seeds[h_low] = now_utc
 
         if changed:
-            ts.injected_private_hashes = ",".join(dict.fromkeys(current_injected))
             self.store.upsert(ts)
         elif not _late_pending():
             self._late_seed_memoize(_row_key, _injected_before, _save_before, ts, changed=False)
@@ -495,10 +518,7 @@ class FuseMixin:
             "auto-injected missing racing torrent %s (%s) onto fuse (%s) (repair)",
             source_low[:10], (src_entry.name or "")[:40], target_mount,
         )
-        current = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
-        if source_low not in current:
-            current.append(source_low)
-        ts.injected_private_hashes = ",".join(dict.fromkeys(current))
+        _record_injected_hash(ts, source_low)
         self.store.upsert(ts)
         self._failed_late_cross_seeds.pop(source_low, None)
 
