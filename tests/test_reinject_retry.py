@@ -1501,6 +1501,23 @@ async def test_original_defer_never_memoizes(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_original_blobless_export_short_backoff(tmp_path: Path):
+    """No blob bytes: short defer, not an export every tick (nor a 30m ban)."""
+    import time
+
+    coord, fuse_dir = _original_coord(tmp_path, None)
+    ts = _original_row(fuse_dir)
+    h = (ts.dest_infohash or "").lower()
+
+    await coord._ensure_original_fuse_entry(ts, fuse_dir)
+    assert coord.dest_client.export_torrent.await_count == 1
+    assert h not in getattr(coord, "_failed_late_cross_seeds", {})
+    assert coord._fuse_outage_until.get(h, 0) > time.monotonic()
+    await coord._ensure_original_fuse_entry(ts, fuse_dir)
+    assert coord.dest_client.export_torrent.await_count == 1
+
+
+@pytest.mark.anyio
 async def test_stale_cache_miss_reprobed_fresh_no_backoff(tmp_path: Path):
     """A cached-only absence the mount already resolved must not back off.
 
