@@ -44,6 +44,8 @@ def _coord(pause_flag: bool, fuse: Path):
     coord._save_path_points_at_target = lambda _sp, _tm: True  # noqa: E731
     coord.dest_client = AsyncMock()
     coord.dest_client.pause = AsyncMock()
+    # Bytes verified at the target before the add (production pre-add gate).
+    (fuse / "Show.S01E01.mkv").write_bytes(b"x" * 100)
     return coord
 
 
