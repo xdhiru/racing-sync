@@ -1517,6 +1517,53 @@ async def test_original_blobless_export_short_backoff(tmp_path: Path):
     assert coord.dest_client.export_torrent.await_count == 1
 
 
+def test_blob_kind_and_announce_cached_per_blob(tmp_path: Path):
+    """Repeat blob decodes collapse to one classify + one info-hash parse."""
+    import os
+    from unittest.mock import patch
+    from racing_sync.watchdir import _bencode
+
+    blob = _bencode({
+        b"announce": b"http://tracker.example/announce",
+        b"info": {
+            # Unique name: no other test shares this cache key.
+            b"name": f"Cache.Probe.{os.getpid()}.mkv".encode(),
+            b"length": 100,
+        },
+    })
+    coord, _ = _original_coord(tmp_path, blob)
+    import racing_sync.coordinator_fuse as _fuse
+
+    real = _fuse.classify
+    calls = []
+
+    def _counting(files, cfg):
+        calls.append(1)
+        return real(files, cfg)
+
+    with patch("racing_sync.coordinator_fuse.classify",
+               side_effect=_counting):
+        first = coord._classify_blob_kind(blob)
+        second = coord._classify_blob_kind(blob)
+    assert first == second == "movie"
+    assert len(calls) == 1
+    import racing_sync.watchdir as _wd
+
+    parses = []
+    real_parse = _wd._bencoded_info_hash
+
+    def _counting_parse(b):
+        parses.append(1)
+        return real_parse(b)
+
+    coord.cfg.cross_seed.pause_public_torrents_on_fuse = True
+    with patch("racing_sync.watchdir._bencoded_info_hash",
+               side_effect=_counting_parse):
+        coord._should_pause_public_on_fuse(blob)
+        coord._should_pause_public_on_fuse(blob)
+    assert len(parses) == 1
+
+
 @pytest.mark.anyio
 async def test_stale_cache_miss_reprobed_fresh_no_backoff(tmp_path: Path):
     """A cached-only absence the mount already resolved must not back off.

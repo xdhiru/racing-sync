@@ -45,6 +45,35 @@ _INJECTED_HASHES_KEEP = 50
 #: content-miss backoff — a flapping mount would otherwise silence rows
 #: for half an hour at a time.
 _FUSE_OUTAGE_TTL_S = 300.0
+#: Cap on cached per-blob decodes below (kind + announce). One bdecode is
+#: microseconds, but the late tick re-decoded the same blobs per row per
+#: poll; the cache collapses repeats. Oldest-first eviction past the cap.
+_BLOB_DECODE_CACHE_CAP = 500
+_BLOB_KIND_CACHE: dict[str, str] = {}
+_BLOB_ANNOUNCE_CACHE: dict[str, str] = {}
+
+
+def _blob_cache_key(blob: bytes | None) -> str:
+    """sha1 key for per-blob decode caches ("" when unhashable)."""
+    try:
+        if not blob or not isinstance(blob, (bytes, bytearray)):
+            return ""
+        import hashlib
+
+        return hashlib.sha1(bytes(blob)).hexdigest()
+    except Exception:
+        return ""
+
+
+def _blob_cache_put(cache: dict[str, str], key: str, value: str) -> None:
+    try:
+        if not key:
+            return
+        cache[key] = value
+        while len(cache) > _BLOB_DECODE_CACHE_CAP:
+            cache.pop(next(iter(cache)), None)
+    except Exception:
+        pass
 
 
 def _split_fuse_outage(missing: list[str]) -> tuple[list[str], list[str]]:
@@ -1032,17 +1061,34 @@ class FuseMixin:
         return False
 
     def _classify_blob_kind(self, blob: bytes | None) -> str:
-        """Classify .torrent bytes; "unknown" when undecodable or cfg broken."""
+        """Classify .torrent bytes; "unknown" when undecodable or cfg broken.
+
+        Decodes are cached per blob sha1 (bounded): the late tick derives
+        the mount from the blob per row per poll, and re-bdecoding the
+        same bytes every tick is pure waste. A single fresh bdecode stays
+        on-loop (microseconds for torrent metainfo) — no thread hop for
+        a cache miss.
+        """
         try:
             if not blob or not isinstance(blob, (bytes, bytearray)):
                 return "unknown"
+            _key = _blob_cache_key(blob)
+            if _key:
+                try:
+                    hit = _BLOB_KIND_CACHE.get(_key)
+                except Exception:
+                    hit = None
+                if hit in ("movie", "season", "episode", "mixed", "unknown"):
+                    return hit
             from .watchdir import extract_torrent_files_from_bencoded
 
             files = extract_torrent_files_from_bencoded(bytes(blob))
             if not files:
                 return "unknown"
             kind = classify(files, self.cfg).kind
-            return kind if kind in ("movie", "season", "episode", "mixed", "unknown") else "unknown"
+            kind = kind if kind in ("movie", "season", "episode", "mixed", "unknown") else "unknown"
+            _blob_cache_put(_BLOB_KIND_CACHE, _key, kind)
+            return kind
         except Exception:
             return "unknown"
 
@@ -1100,9 +1146,19 @@ class FuseMixin:
         try:
             if not blob or not isinstance(blob, (bytes, bytearray)):
                 return False
-            from .watchdir import _bencoded_info_hash
+            _key = _blob_cache_key(blob)
+            announce = None
+            if _key:
+                try:
+                    if _key in _BLOB_ANNOUNCE_CACHE:
+                        announce = _BLOB_ANNOUNCE_CACHE[_key]
+                except Exception:
+                    announce = None
+            if announce is None:
+                from .watchdir import _bencoded_info_hash
 
-            _, _, _, announce = _bencoded_info_hash(bytes(blob))
+                _, _, _, announce = _bencoded_info_hash(bytes(blob))
+                _blob_cache_put(_BLOB_ANNOUNCE_CACHE, _key, announce or "")
         except Exception:
             return False
         try:
