@@ -299,6 +299,13 @@ class ReaddMixin:
                 return False
 
             # Blob hash = helper entry hash (same torrent as the SSD download).
+            # Snapshot the pre-heal dest pointer: the helper overwrite below
+            # is transient (retry continuity while it exists); success deletes
+            # the helper, so the pointer is restored instead of dangling.
+            try:
+                orig_dest_infohash = ts.dest_infohash or ""
+            except Exception:
+                orig_dest_infohash = ""
             helper_h = ((ts.dest_infohash or ts.source_infohash) or "").lower()
             try:
                 from .watchdir import _bencoded_info_hash
@@ -452,6 +459,16 @@ class ReaddMixin:
                     "re-add heal: helper delete failed for %s: %s",
                     ts.source_name[:50], e,
                 )
+            # Restore the pre-heal dest pointer: the helper entry is gone,
+            # so its hash would dangle. Next tick re-derives from the blob.
+            # (Failure paths above keep the helper pointer deliberately —
+            # the entry still exists for retry continuity.)
+            try:
+                if ts.dest_infohash != orig_dest_infohash:
+                    ts.dest_infohash = orig_dest_infohash
+                    self.store.upsert(ts)
+            except Exception:
+                pass
             log.warning(
                 "re-add heal: recovered %d file(s) for %s "
                 "(selective re-download + move); gate re-checks next tick",

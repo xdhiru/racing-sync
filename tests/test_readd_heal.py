@@ -297,3 +297,61 @@ async def test_heal_truncated_file_still_heals(tmp_path):
         coord.dest_client.resume.assert_awaited()
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_heal_restores_preheal_dest_pointer(tmp_path):
+    """Helper overwrite is transient: success restores the dest pointer.
+
+    The helper entry is deleted on success, so its hash would dangle;
+    the pre-heal pointer is restored and next tick re-derives from blob.
+    """
+    coord, store, blob, blob_hash, ssd, fuse = _scaffold(tmp_path)
+    try:
+        store.upsert(TorrentState(
+            source_infohash="e" * 40, source_name="Show.Batch",
+            dest_infohash="d" * 40, save_path=str(ssd),
+            classification_kind="movie",
+            cross_seed_blob=blob,
+            state=State.RE_ADDING,
+            readd_attempts=1,
+        ))
+        _track(coord, "e" * 40, 10800, (MISSING,))
+
+        async def _files(h):
+            if not hasattr(_files, "n"):
+                _files.n = 0
+            _files.n += 1
+            if _files.n == 1:
+                return [
+                    TorrentFile(name=PRESENT, size_bytes=PRESENT_SIZE, progress=0.0),
+                    TorrentFile(name=MISSING, size_bytes=MISSING_SIZE, progress=0.0),
+                ]
+            (ssd / TOP).mkdir(exist_ok=True)
+            (ssd / TOP / "ep04v2.mkv").write_bytes(b"y" * MISSING_SIZE)
+            return [
+                TorrentFile(name=PRESENT, size_bytes=PRESENT_SIZE, progress=1.0),
+                TorrentFile(name=MISSING, size_bytes=MISSING_SIZE, progress=1.0),
+            ]
+
+        coord.dest_client.get_torrent_files = AsyncMock(side_effect=_files)
+        coord.dest_client.add_torrent = AsyncMock(
+            return_value=AddResult(hash=blob_hash, accepted=True, detail="Ok."))
+
+        async def _move(local, remote, ts, files_from=None, **kw):
+            for n in files_from or []:
+                p = Path(local, *n.split("/"))
+                if p.is_file():
+                    p.unlink()
+
+        coord._rclone_move = AsyncMock(side_effect=_move)
+
+        await coord._do_re_add(store.get("e" * 40))
+
+        row = store.get("e" * 40)
+        assert row.state == State.RE_ADDING
+        assert row.dest_infohash == "d" * 40
+        coord.dest_client.delete.assert_awaited_once_with(
+            blob_hash, delete_files=False)
+    finally:
+        store.close()
