@@ -833,15 +833,21 @@ class FuseMixin:
         try:
             export_fn = getattr(self.dest_client, "export_torrent", None)
             if callable(export_fn):
-                candidate = await export_fn(h)
+                candidate = await rpc(
+                    export_fn(h),
+                    getattr(self, "cfg", None), "dest original export")
                 if isinstance(candidate, (bytes, bytearray)) and candidate:
                     blob = bytes(candidate)
         except Exception:  # noqa: BLE001
-            # Transport flap (dest down): silent return, no deferral — the
-            # outage already backs everything else off, and a stable miss
-            # must not be confused with a down client.
+            # Transport flap (dest down): no deferral from the error
+            # itself — the outage note below already backs everything
+            # else off, and a stable miss must not be confused with a
+            # down client.
             blob = None
         if not blob:
+            # Unverifiable right now (not provably missing): short defer
+            # instead of paying an export every tick.
+            self._note_fuse_outage(h)
             return
         target = self._target_mount_for_blob(blob, fallback_mount)
         expected = self._expected_fuse_files(blob)
