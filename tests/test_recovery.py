@@ -1348,3 +1348,41 @@ async def test_demote_ssd_probe_runs_off_loop(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_injected_hashes_capped_at_fifty(tmp_path: Path):
+    """Long-lived rows trim recorded injects to the last 50 (no unbounded CSV)."""
+    from racing_sync.clients.abstract import AddResult
+    from racing_sync.watchdir import _bencode
+
+    coord, store, _ssd, fuse, _fuse_u = _fuse_coord(tmp_path)
+    blob = _bencode({b"info": {b"name": b"Late.Arrival.mkv", b"length": 100}})
+    target = coord._target_mount_for_blob(blob, fuse)
+    (Path(target) / "Late.Arrival.mkv").write_bytes(b"l" * 100)
+    new_h = "n" * 40
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash=new_h, accepted=True, detail="Ok."))
+    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
+        hash=new_h, name="Late.Arrival", category="racing",
+        save_path=str(target), size_bytes=100, state="seeding", progress=1.0))
+    old = [f"{i:040x}" for i in range(60)]
+    try:
+        store.upsert(TorrentState(
+            source_infohash="s" * 40, source_name="Late.Arrival",
+            cross_seed_infohash="c" * 40,
+            injected_private_hashes=",".join(old),
+            save_path=str(target), state=State.DONE))
+        group = [Torrent(
+            hash=new_h, name="Late.Arrival", category="racing", save_path="",
+            size_bytes=100, state="", progress=1.0)]
+        await coord._check_and_inject_late_cross_seeds(
+            store.get("s" * 40), group)
+        kept = store.get("s" * 40).injected_private_hashes.split(",")
+        assert len(kept) == 50
+        assert kept[-1] == new_h
+        assert old[0] not in kept
+        assert new_h in kept
+    finally:
+        store.close()
+
+
