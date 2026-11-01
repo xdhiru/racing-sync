@@ -940,9 +940,16 @@ async def test_late_cross_seeds_defer_when_fuse_content_missing(tmp_path: Path):
     """
     fuse_dir = tmp_path / "fuse"
     fuse_dir.mkdir()
+    # Episode blobs route to the unsorted mount: it must exist (empty) so
+    # the test observes content-miss backoff, not dead-mount outage.
+    (fuse_dir / "unsorted").mkdir()
 
     coord = make_coordinator()
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
+    coord.cfg.rclone.fuse.mount = fuse_dir
+    coord.cfg.rclone.fuse.mount_unsorted = fuse_dir / "unsorted"
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.classifier._episode_re = None
     coord.dest_client = AsyncMock()
     coord.dest_client.add_torrent = AsyncMock(
         return_value=AddResult(hash=None, accepted=True, detail="Ok.")

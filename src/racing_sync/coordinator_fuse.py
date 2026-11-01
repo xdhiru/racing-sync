@@ -40,6 +40,26 @@ _FUSE_HEALTHY_CAP = 5000
 #: otherwise grow the CSV without bound; a trimmed hash re-injects at
 #: worst as a duplicate ("already added"), never as new bytes.
 _INJECTED_HASHES_KEEP = 50
+#: Short defer window for fuse outages (dead mount / failed check).
+#: Outages prove nothing about content, so they must never earn the 30m
+#: content-miss backoff — a flapping mount would otherwise silence rows
+#: for half an hour at a time.
+_FUSE_OUTAGE_TTL_S = 300.0
+
+
+def _split_fuse_outage(missing: list[str]) -> tuple[list[str], list[str]]:
+    """Split `(outage_markers, real_missing)` from a fuse-miss list.
+
+    `<...>` entries (dead mount, failed availability check) prove nothing
+    about the bytes: callers short-defer those and reserve the 30m
+    content-miss backoff for verified-absent files.
+    """
+    try:
+        outage = [m for m in missing or [] if str(m).startswith("<")]
+        real = [m for m in missing or [] if not str(m).startswith("<")]
+        return outage, real
+    except Exception:
+        return [], list(missing or [])
 
 
 def _record_injected_hash(ts: TorrentState, h_low: str) -> bool:
@@ -150,9 +170,6 @@ class FuseMixin:
         def _late_pending() -> bool:
             """Any unexpired deferral for this row's hashes or group members."""
             try:
-                fm = getattr(self, "_failed_late_cross_seeds", None)
-                if not isinstance(fm, dict) or not fm:
-                    return False
                 rel: set[str] = set(known_hashes)
                 try:
                     for t in group or []:
@@ -161,6 +178,21 @@ class FuseMixin:
                             rel.add(_gh)
                 except Exception:
                     pass
+                try:
+                    _out = getattr(self, "_fuse_outage_until", None)
+                    if isinstance(_out, dict) and _out:
+                        _now_m = time.monotonic()
+                        for k in rel:
+                            try:
+                                if _now_m < float(_out.get(k, 0.0)):
+                                    return True
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+                fm = getattr(self, "_failed_late_cross_seeds", None)
+                if not isinstance(fm, dict) or not fm:
+                    return False
                 _now = dt.datetime.now(dt.timezone.utc)
                 for k, v in fm.items():
                     if k in rel:
@@ -216,6 +248,8 @@ class FuseMixin:
             failed_at = self._failed_late_cross_seeds.get(h_low)
             if failed_at and (now_utc - failed_at).total_seconds() < 1800:
                 continue
+            if self._fuse_outage_active(h_low):
+                continue
 
             log.info(
                 "detected late cross-seed for completed content '%s': %s (%s)",
@@ -252,9 +286,20 @@ class FuseMixin:
                 continue
             late_missing = await self._confirmed_fuse_missing(target_mount, late_expected)
             if late_missing:
+                _outage, _real = _split_fuse_outage(late_missing)
+                if not _real:
+                    # Dead mount / failed check proves nothing about the
+                    # bytes: short outage defer, never the 30m content-miss
+                    # backoff (and no SSD-probe demote off an unproven miss).
+                    log.warning(
+                        "late cross-seed: fuse unavailable for %s at %s (%s); short defer",
+                        t.infohash[:10], target_mount, _outage[0] if _outage else "unknown",
+                    )
+                    self._note_fuse_outage(h_low)
+                    continue
                 log.warning(
                     "late cross-seed: fuse content missing for %s (%s) at %s (%d files); deferring injection",
-                    t.infohash[:10], t.name[:40], target_mount, len(late_missing),
+                    t.infohash[:10], t.name[:40], target_mount, len(_real),
                 )
                 self._failed_late_cross_seeds[h_low] = now_utc
                 # Self-heal: content missing on fuse but still sitting on SSD
@@ -321,6 +366,35 @@ class FuseMixin:
                 d[h_low] = dt.datetime.now(dt.timezone.utc)
         except Exception:
             pass
+
+    def _note_fuse_outage(self, key: str) -> None:
+        """Short-defer `key` past a fuse outage (dead mount / failed check).
+
+        Outages must not touch the 30m content-miss map: the mount may be
+        back in seconds, and the bytes were never proven absent.
+        """
+        try:
+            if not key:
+                return
+            d = getattr(self, "_fuse_outage_until", None)
+            if not isinstance(d, dict):
+                d = {}
+                self._fuse_outage_until = d  # type: ignore[attr-defined]
+            d[key] = time.monotonic() + _FUSE_OUTAGE_TTL_S
+        except Exception:
+            pass
+
+    def _fuse_outage_active(self, key: str) -> bool:
+        """True while `key` sits inside a short outage deferral."""
+        try:
+            if not key:
+                return False
+            d = getattr(self, "_fuse_outage_until", None)
+            if not isinstance(d, dict):
+                return False
+            return time.monotonic() < float(d.get(key, 0.0))
+        except Exception:
+            return False
 
     def _fuse_healthy_store(self) -> dict:
         """The one proven-healthy memo (row + entry verdicts, namespaced).
@@ -397,6 +471,15 @@ class FuseMixin:
             if len(fm) > 5000:
                 for k in list(fm.keys())[: len(fm) - 5000]:
                     fm.pop(k, None)
+            ou = getattr(self, "_fuse_outage_until", None)
+            if isinstance(ou, dict) and len(ou) > 2000:
+                now_m = time.monotonic()
+                for k in list(ou.keys()):
+                    try:
+                        if now_m >= float(ou[k]):
+                            ou.pop(k, None)
+                    except Exception:
+                        ou.pop(k, None)
         except Exception:
             pass
 
@@ -455,6 +538,8 @@ class FuseMixin:
         failed_at = self._failed_late_cross_seeds.get(source_low)
         if failed_at and (now_utc - failed_at).total_seconds() < 1800:
             return
+        if self._fuse_outage_active(source_low):
+            return
         log.info(
             "late cross-seed: racing torrent %s (%s) never injected for %s; repairing",
             source_low[:10], (src_entry.name or "")[:40], ts.source_name[:40],
@@ -491,10 +576,19 @@ class FuseMixin:
             self._failed_late_cross_seeds[source_low] = now_utc
             return
         if missing:
+            _outage, _real = _split_fuse_outage(missing)
+            if not _real:
+                log.warning(
+                    "late cross-seed: repair of racing torrent %s deferred "
+                    "(fuse unavailable at %s; short defer)",
+                    source_low[:10], target_mount,
+                )
+                self._note_fuse_outage(source_low)
+                return
             log.warning(
                 "late cross-seed: repair of racing torrent %s deferred "
                 "(fuse content missing at %s, %d files)",
-                source_low[:10], target_mount, len(missing),
+                source_low[:10], target_mount, len(_real),
             )
             self._failed_late_cross_seeds[source_low] = now_utc
             return
@@ -733,6 +827,8 @@ class FuseMixin:
         _orig_key = f"orig:{h}" if h else ""
         if _orig_key and self._fuse_healthy_fresh(_orig_key):
             return
+        if self._fuse_outage_active(h):
+            return
         blob: bytes | None = None
         try:
             export_fn = getattr(self.dest_client, "export_torrent", None)
@@ -758,6 +854,10 @@ class FuseMixin:
             self._late_seed_defer(h)
             return
         if missing:
+            _outage, _real = _split_fuse_outage(missing)
+            if not _real:
+                self._note_fuse_outage(h)
+                return
             self._late_seed_defer(h)
             return
         try:
