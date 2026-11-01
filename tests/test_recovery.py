@@ -1386,3 +1386,60 @@ async def test_injected_hashes_capped_at_fifty(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_fuse_outage_short_defers_never_30m_backoff(tmp_path: Path):
+    """Dead mount: 5m outage defer, never the 30m content-miss backoff.
+
+    Bytes unproven-absent must inject as soon as the mount is back
+    (past the short window), not wait out a backoff they never earned.
+    """
+    import shutil
+    import time
+    from racing_sync import coordinator_paths as _cp
+    from racing_sync.clients.abstract import AddResult
+    from racing_sync.watchdir import _bencode
+
+    coord, store, _ssd, fuse, _fuse_u = _fuse_coord(tmp_path)
+    blob = _bencode({b"info": {b"name": b"Outage.Arrival.mkv", b"length": 100}})
+    target = coord._target_mount_for_blob(blob, fuse)
+    (Path(target) / "Outage.Arrival.mkv").write_bytes(b"o" * 100)
+    new_h = "e" * 40
+    coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash=new_h, accepted=True, detail="Ok."))
+    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
+        hash=new_h, name="Outage.Arrival", category="racing",
+        save_path=str(target), size_bytes=100, state="seeding", progress=1.0))
+    group = [Torrent(
+        hash=new_h, name="Outage.Arrival", category="racing", save_path="",
+        size_bytes=100, state="", progress=1.0)]
+    try:
+        store.upsert(TorrentState(
+            source_infohash="s" * 40, source_name="Outage.Arrival",
+            cross_seed_infohash="c" * 40,
+            save_path=str(target), state=State.DONE))
+        shutil.rmtree(target)
+        await coord._check_and_inject_late_cross_seeds(
+            store.get("s" * 40), group)
+        # No inject, no 30m poison — only the short outage note.
+        coord.dest_client.add_torrent.assert_not_called()
+        assert new_h not in getattr(coord, "_failed_late_cross_seeds", {})
+        assert coord._fuse_outage_until.get(new_h, 0) > time.monotonic()
+        # Mount back: outage window still active, so the tick stays cheap.
+        Path(target).mkdir(parents=True, exist_ok=True)
+        (Path(target) / "Outage.Arrival.mkv").write_bytes(b"o" * 100)
+        _cp.fuse_stat_invalidate(target)
+        _cp.fuse_stat_invalidate(Path(target) / "Outage.Arrival.mkv")
+        await coord._check_and_inject_late_cross_seeds(
+            store.get("s" * 40), group)
+        coord.dest_client.add_torrent.assert_not_called()
+        # Past the short window with no 30m entry: injects immediately.
+        coord._fuse_outage_until[new_h] = time.monotonic() - 1.0
+        await coord._check_and_inject_late_cross_seeds(
+            store.get("s" * 40), group)
+        coord.dest_client.add_torrent.assert_awaited_once()
+        assert new_h in store.get("s" * 40).injected_private_hashes
+    finally:
+        store.close()
+
+
