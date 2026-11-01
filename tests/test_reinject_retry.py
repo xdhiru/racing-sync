@@ -1179,6 +1179,8 @@ async def test_ensure_fuse_entry_retries_delayed_visibility_after_replace(tmp_pa
 
     blob = _single_file_torrent_bytes("Lag.Movie.2026.mkv", 80)
     real_hash = _bencoded_info_hash(blob)[0].lower()
+    # Bytes verified at the target before the add (production pre-add gate).
+    (fuse_dir / "Lag.Movie.2026.mkv").write_bytes(b"g" * 80)
 
     coord = make_coordinator()
     coord.dest_client = AsyncMock()
@@ -1208,6 +1210,39 @@ async def test_ensure_fuse_entry_retries_delayed_visibility_after_replace(tmp_pa
 
     assert ok is True
     coord.dest_client.delete.assert_awaited_once_with(real_hash, delete_files=False)
+
+
+@pytest.mark.anyio
+async def test_ensure_fuse_entry_refuses_when_bytes_vanished_post_add(tmp_path: Path):
+    """Entry visible at target but bytes gone (gate-to-add race): park, not inject.
+
+    The post-add byte re-verify closes the TOCTOU between pre-add
+    verification and injection.
+    """
+    from unittest.mock import patch
+    from racing_sync.watchdir import _bencoded_info_hash
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+
+    blob = _single_file_torrent_bytes("Gone.Movie.2026.mkv", 80)
+    real_hash = _bencoded_info_hash(blob)[0].lower()
+
+    coord = make_coordinator()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash=real_hash, accepted=True, detail="Ok."))
+    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
+        hash=real_hash, name="Gone.Movie.2026", category="racing",
+        save_path=str(fuse_dir), size_bytes=80, state="seeding", progress=1.0))
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        ok, _ = await coord._ensure_fuse_entry(
+            blob=blob, infohash=real_hash, target_mount=fuse_dir,
+            label="cross-seed torrent",
+        )
+
+    assert ok is False
 
 
 @pytest.mark.anyio

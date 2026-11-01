@@ -114,6 +114,21 @@ def _record_injected_hash(ts: TorrentState, h_low: str) -> bool:
     return True
 
 
+def _is_duplicate_add_detail(detail: object) -> bool:
+    """True when an add rejection only means 'already there'.
+
+    qB answers duplicate adds with "Fails." and Deluge echoes "already
+    ...". AddResult carries no machine-readable code (a client overhaul
+    may add one), so the verdict lives in exactly this helper — never as
+    inline string checks scattered across callers.
+    """
+    try:
+        d = detail if isinstance(detail, str) else ""
+        return d == "Fails." or "already" in d.lower()
+    except Exception:
+        return False
+
+
 class FuseMixin:
     """Late cross-seeds + fuse-entry management (duck-typed ``self``)."""
 
@@ -1013,6 +1028,26 @@ class FuseMixin:
         except Exception:
             return None
 
+    async def _fuse_entry_bytes_ok(
+        self, blob: bytes | None, target_mount: Path
+    ) -> bool:
+        """Post-add byte re-verify: entry placed AND bytes still at target.
+
+        Guards the gate→add TOCTOU (bytes moved between verification and
+        injection): an entry pointing at the target while the bytes are
+        gone parks/retries instead of marking injected. Cached stats, so
+        the re-stat is cheap. Undecodable blobs yield no expectation —
+        nothing to re-verify, so they pass (the pre-add gate owns that
+        legacy path explicitly). False on any other doubt.
+        """
+        try:
+            expected = self._expected_fuse_files(blob)
+            if not expected:
+                return True
+            return not await self._missing_fuse_files(target_mount, expected)
+        except Exception:  # noqa: BLE001
+            return False
+
     async def _missing_fuse_files(
         self, target_mount: Path, files: list[tuple[str, int]]
     ) -> list[str]:
@@ -1276,7 +1311,7 @@ class FuseMixin:
         res = await rpc(self.dest_client.add_torrent(**add_kwargs),  # type: ignore[arg-type]
                         getattr(self, "cfg", None), "dest fuse add_torrent")
         detail = res.detail if isinstance(res.detail, str) else ""
-        if res.accepted and "already" not in detail.lower():
+        if res.accepted and not _is_duplicate_add_detail(detail):
             # Verify the entry actually landed where asked: the fuse index
             # can lag (rclone busy with another move), and an accepted-but-
             # invisible entry must park/retry — never mark DONE, never touch
@@ -1292,6 +1327,12 @@ class FuseMixin:
                     getattr(_st, "save_path", ""), target_mount
                 ):
                     log.info("re-injected %s %s on fuse (%s)", label, h_low[:10], target_mount)
+                    if not await self._fuse_entry_bytes_ok(blob, target_mount):
+                        log.warning(
+                            "%s %s entry visible but bytes unverifiable at %s; parking re-add",
+                            label, h_low[:10], target_mount,
+                        )
+                        return False, _NOT_VISIBLE_DETAIL
                     if not await self._select_all_fuse_files(h_low, label=label):
                         return False, _NOT_VISIBLE_DETAIL
                     if pause_public:
@@ -1303,7 +1344,7 @@ class FuseMixin:
                 label, h_low[:10], target_mount,
             )
             return False, _NOT_VISIBLE_DETAIL
-        if not (detail == "Fails." or "already" in detail.lower()):
+        if not _is_duplicate_add_detail(detail):
             return False, detail
         # Possible duplicate: inspect what's actually there.
         try:
@@ -1317,6 +1358,12 @@ class FuseMixin:
             getattr(dest_st, "save_path", ""), target_mount
         ):
             log.info("%s %s already on fuse; marking as injected", label, h_low[:10])
+            if not await self._fuse_entry_bytes_ok(blob, target_mount):
+                log.warning(
+                    "%s %s entry on fuse but bytes unverifiable at %s; parking re-add",
+                    label, h_low[:10], target_mount,
+                )
+                return False, _NOT_VISIBLE_DETAIL
             if not await self._select_all_fuse_files(h_low, label=label):
                 return False, _NOT_VISIBLE_DETAIL
             if pause_public:
@@ -1327,6 +1374,14 @@ class FuseMixin:
                 "%s %s exists at %s (not the fuse target %s); replacing with fuse entry",
                 label, h_low[:10], getattr(dest_st, "save_path", "?"), target_mount,
             )
+            # Files kept deliberately: deleting with files here would destroy
+            # bytes the fuse gate verified. The leftover SSD bytes are not
+            # reclaimed automatically (no row references SSD past this
+            # point; only a manual SSD clear reaps them) — the accepted
+            # cost of never deleting verified data on a hunch. The row
+            # already holds no SSD reservation, so admission accounting
+            # treats the space as free; a truly full disk still parks via
+            # the ssd_has_room stat gate.
             try:
                 await rpc(self.dest_client.delete(h_low, delete_files=False),
                           getattr(self, "cfg", None), "dest fuse delete")
@@ -1335,7 +1390,7 @@ class FuseMixin:
             res2 = await rpc(self.dest_client.add_torrent(**add_kwargs),  # type: ignore[arg-type]
                              getattr(self, "cfg", None), "dest fuse add_torrent")
             detail2 = res2.detail if isinstance(res2.detail, str) else ""
-            if res2.accepted or detail2 == "Fails." or "already" in detail2.lower():
+            if res2.accepted or _is_duplicate_add_detail(detail2):
                 dest_st2 = None
                 for _ in range(4):
                     try:
