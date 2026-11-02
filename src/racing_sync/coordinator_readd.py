@@ -1190,6 +1190,10 @@ class ReaddMixin:
     # opportunistic, not urgent — one search per row per window, while
     # VPS1 late arrivals are still checked every tick by the caller.
     _SUPPLEMENT_RETRY_S = 21600.0
+    # Failed/empty searches re-run soon (a new release under a new hash
+    # may appear at any time); only a search that fetched ≥1 usable blob
+    # earns the long suppress window.
+    _SUPPLEMENT_FAIL_S = 300.0
 
     async def _re_inject_tracker_map_supplements(self, ts: TorrentState) -> None:
         """Inject same-release torrents from tracker_map indexers to fuse.
@@ -1285,14 +1289,11 @@ class ReaddMixin:
             except Exception as e:  # noqa: BLE001
                 log.warning("supplement search failed for %s: %s",
                             ts.source_name[:60], e)
+                try:
+                    memo[row_key] = time.monotonic() + self._SUPPLEMENT_FAIL_S
+                except Exception:
+                    pass
                 return
-            try:
-                memo[row_key] = time.monotonic() + self._SUPPLEMENT_RETRY_S
-                if len(memo) > 5000:
-                    for _k in list(memo.keys())[: len(memo) - 5000]:
-                        memo.pop(_k, None)
-            except Exception:
-                pass
             try:
                 known = {
                     (h or "").lower() for h in (
@@ -1308,105 +1309,145 @@ class ReaddMixin:
             except Exception:
                 return
             added = 0
-            for idx_hits in (hits_by_indexer or {}).values():
-                for hit in idx_hits or []:
-                    try:
-                        ht = getattr(hit, "title", "") or ""
-                        hs = int(getattr(hit, "size_bytes", 0) or 0)
-                    except (TypeError, ValueError):
+            fetched = 0
+            changed = False
+
+            async def _fetch_hit(hit):
+                """Download + verify one supplement hit (no state change)."""
+                try:
+                    ht = getattr(hit, "title", "") or ""
+                    hs = int(getattr(hit, "size_bytes", 0) or 0)
+                except (TypeError, ValueError):
+                    return None
+                try:
+                    if not _matches_release(
+                            ht, hs, ts.source_name or "",
+                            int(ts.total_bytes or 0)):
+                        return None
+                except Exception:
+                    return None
+                try:
+                    blob = await asyncio.wait_for(
+                        prowlarr.download_torrent(hit), timeout=30.0)
+                except (asyncio.CancelledError, AbandonedError):
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    log.debug("supplement fetch failed for %s: %s",
+                              ht[:50], e)
+                    return None
+                try:
+                    verified = _verified_cross_seed_blob(
+                        blob, target_name=ts.source_name or "",
+                        target_size=int(ts.total_bytes or 0),
+                        hit_title=ht)
+                except Exception:
+                    return None
+                if verified is None:
+                    return None
+                _blob, real_hash, _ann = verified
+                try:
+                    h_low = (real_hash or "").lower()
+                except Exception:
+                    return None
+                if not h_low:
+                    return None
+                return (hit, _blob, h_low)
+
+            try:
+                _all_hits = [hit for idx_hits in (hits_by_indexer or {}).values()
+                             for hit in (idx_hits or [])]
+                _sem = asyncio.Semaphore(4)
+
+                async def _one(_hit):
+                    async with _sem:
+                        return await _fetch_hit(_hit)
+
+                _downloads = await asyncio.gather(
+                    *(_one(h) for h in _all_hits))
+            except (asyncio.CancelledError, AbandonedError):
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.debug("supplement fetch phase failed for %s: %s",
+                          ts.source_name[:60], e)
+                _downloads = []
+            for _item in _downloads:
+                if _item is None:
+                    continue
+                hit, _blob, h_low = _item
+                fetched += 1
+                if h_low in known:
+                    continue
+                try:
+                    ht = getattr(hit, "title", "") or ""
+                except Exception:
+                    ht = ""
+                try:
+                    if self._abandoned(ts):
+                        raise AbandonedError(
+                            f"row gone for {(ts.source_infohash or '')[:10]}")
+                except AbandonedError:
+                    raise
+                except Exception:
+                    pass
+                try:
+                    if getattr(self, "store", None) is not None and callable(
+                            getattr(self.store, "is_ignored", None)) \
+                            and self.store.is_ignored(h_low) is True:
+                        log.info("supplement: skipping cancelled torrent %s",
+                                 h_low[:10])
+                        known.add(h_low)
                         continue
-                    try:
-                        if not _matches_release(
-                                ht, hs, ts.source_name or "",
-                                int(ts.total_bytes or 0)):
-                            continue
-                    except Exception:
-                        continue
-                    try:
-                        blob = await asyncio.wait_for(
-                            prowlarr.download_torrent(hit), timeout=30.0)
-                    except (asyncio.CancelledError, AbandonedError):
-                        raise
-                    except Exception as e:  # noqa: BLE001
-                        log.debug("supplement fetch failed for %s: %s",
-                                  ht[:50], e)
-                        continue
-                    try:
-                        verified = _verified_cross_seed_blob(
-                            blob, target_name=ts.source_name or "",
-                            target_size=int(ts.total_bytes or 0),
-                            hit_title=ht)
-                    except Exception:
-                        continue
-                    if verified is None:
-                        continue
-                    _blob, real_hash, _ann = verified
-                    try:
-                        h_low = (real_hash or "").lower()
-                    except Exception:
-                        continue
-                    if not h_low or h_low in known:
-                        continue
-                    try:
-                        if self._abandoned(ts):
-                            raise AbandonedError(
-                                f"row gone for {(ts.source_infohash or '')[:10]}")
-                    except AbandonedError:
-                        raise
-                    except Exception:
-                        pass
-                    try:
-                        if getattr(self, "store", None) is not None and callable(
-                                getattr(self.store, "is_ignored", None)) \
-                                and self.store.is_ignored(h_low) is True:
-                            log.info("supplement: skipping cancelled torrent %s",
-                                     h_low[:10])
-                            known.add(h_low)
-                            continue
-                    except Exception:
-                        pass
-                    try:
-                        match_expected = self._expected_fuse_files(_blob)
-                    except Exception:
-                        match_expected = None
-                    if not match_expected:
-                        continue
-                    try:
-                        match_mount = self._target_mount_for_blob(
-                            _blob, ts_fallback_mount)
-                        match_missing = await self._missing_fuse_files(
-                            match_mount, match_expected)
-                    except Exception:
-                        continue
-                    if match_missing:
-                        continue
-                    try:
-                        ok, _detail = await self._ensure_fuse_entry(
-                            blob=_blob, infohash=h_low,
-                            target_mount=match_mount,
-                            label="tracker_map supplement")
-                    except (asyncio.CancelledError, AbandonedError):
-                        raise
-                    except Exception as e:  # noqa: BLE001
-                        log.debug("supplement inject failed for %s: %s",
-                                  h_low[:10], e)
-                        continue
-                    if not ok:
-                        continue
-                    try:
-                        cur = ts.injected_private_hashes or ""
-                        parts = [p for p in cur.split(",") if p]
-                        if h_low not in parts:
-                            parts.append(h_low)
-                            ts.injected_private_hashes = ",".join(parts)
-                    except Exception:
-                        pass
-                    known.add(h_low)
-                    added += 1
-                    log.info("supplement: injected %s for %s from %s",
-                             h_low[:10], ts.source_name[:60],
-                             getattr(hit, "indexer", "?"))
-            if added:
+                except Exception:
+                    pass
+                try:
+                    match_expected = self._expected_fuse_files(_blob)
+                except Exception:
+                    match_expected = None
+                if not match_expected:
+                    continue
+                try:
+                    match_mount = self._target_mount_for_blob(
+                        _blob, ts_fallback_mount)
+                    match_missing = await self._missing_fuse_files(
+                        match_mount, match_expected)
+                except Exception:
+                    continue
+                if match_missing:
+                    continue
+                try:
+                    ok, _detail = await self._ensure_fuse_entry(
+                        blob=_blob, infohash=h_low,
+                        target_mount=match_mount,
+                        label="tracker_map supplement")
+                except (asyncio.CancelledError, AbandonedError):
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    log.debug("supplement inject failed for %s: %s",
+                              h_low[:10], e)
+                    continue
+                if not ok:
+                    continue
+                if _record_injected_hash(ts, h_low):
+                    changed = True
+                known.add(h_low)
+                added += 1
+                log.info("supplement: injected %s for %s from %s",
+                         h_low[:10], ts.source_name[:60],
+                         getattr(hit, "indexer", "?"))
+            # Memo only after ≥1 usable fetch: a search that yielded
+            # nothing (or only known/cancelled hits) re-runs soon instead
+            # of suppressing 6h. Failures already memoize short above.
+            try:
+                if fetched or added:
+                    memo[row_key] = time.monotonic() + self._SUPPLEMENT_RETRY_S
+                else:
+                    memo[row_key] = time.monotonic() + self._SUPPLEMENT_FAIL_S
+                if len(memo) > 5000:
+                    for _k in list(memo.keys())[: len(memo) - 5000]:
+                        memo.pop(_k, None)
+            except Exception:
+                pass
+            if changed:
                 try:
                     self.store.upsert(ts)
                 except Exception:
