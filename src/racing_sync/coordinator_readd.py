@@ -491,6 +491,8 @@ class ReaddMixin:
             # cannot trigger a second re-download: further parks either
             # resolve via indexing or fall through to the max-age FAIL.
             # The gate-pass path clears the record when files appear.
+            # Deliberately NOT popped here: clearing would restart the
+            # clock and allow a second re-download while fuse indexes.
             try:
                 track[key] = [time.monotonic(), missing_key, 3]
             except Exception:
