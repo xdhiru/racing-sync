@@ -39,6 +39,21 @@ from .state import _MAX_READD_CYCLES, State, TorrentState
 log = logging.getLogger("racing_sync.coordinator")
 
 
+def _readd_gap_seconds(raw: object, default: float) -> float:
+    """Bool-safe numeric gap (config `True` is 1s of nonsense, not 1s).
+
+    Mirrors `_readd_heal_after_seconds`: a `bool` is an `int` subclass,
+    so plain `isinstance(raw, (int, float))` would accept `True` as a
+    1-second max-age / gap. Reject bools and non-numerics to the default.
+    """
+    try:
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return default
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 class ReaddMixin:
     """RE_ADDING drive + heal (duck-typed ``self``)."""
 
@@ -536,29 +551,28 @@ class ReaddMixin:
             if store is not None:
                 store.upsert(ts)
 
-        delay = self.cfg.fuse_reinject_delay_seconds
+        delay = _readd_gap_seconds(
+            getattr(self.cfg, "fuse_reinject_delay_seconds", 0), 0)
         if delay > 0 and ts.readd_attempts == 0 and ts.readd_next_retry_at is None:
+            # Timer-park, never sleep: the retry instant persists in the DB
+            # across restarts; a sleep would lose it (and stall the worker).
             log.info(
                 "parking %s for %ds fuse mount indexing before re-injection",
                 ts.source_name[:50], delay,
             )
-            if delay > 5:
-                ts.readd_next_retry_at = now + dt.timedelta(seconds=delay)
-                if store is not None:
-                    store.upsert(ts)
-                return
-            else:
-                await asyncio.sleep(delay)
+            ts.readd_next_retry_at = now + dt.timedelta(seconds=delay)
+            if store is not None:
+                store.upsert(ts)
+            return
 
-        max_age_val = getattr(self.cfg, "fuse_reinject_max_age_seconds", 86400)
-        max_age_sec = max_age_val if isinstance(max_age_val, (int, float)) else 86400
-        max_age = dt.timedelta(seconds=max_age_sec)
+        max_age = dt.timedelta(seconds=_readd_gap_seconds(
+            getattr(self.cfg, "fuse_reinject_max_age_seconds", 86400), 86400))
 
-        retry_gap_val = getattr(self.cfg, "fuse_reinject_retry_gap_seconds", 120)
-        retry_gap = retry_gap_val if isinstance(retry_gap_val, (int, float)) else 120
+        retry_gap = _readd_gap_seconds(
+            getattr(self.cfg, "fuse_reinject_retry_gap_seconds", 120), 120)
 
-        backoff_val = getattr(self.cfg, "fuse_reinject_backoff_seconds", 1800)
-        backoff_interval = backoff_val if isinstance(backoff_val, (int, float)) else 1800
+        backoff_interval = _readd_gap_seconds(
+            getattr(self.cfg, "fuse_reinject_backoff_seconds", 1800), 1800)
 
         elapsed = now - ts.readd_first_attempted_at
         if elapsed >= max_age:
@@ -668,7 +682,7 @@ class ReaddMixin:
                 # fresh absence — that is usually fuse/rclone index lag).
                 # Fail-closed: any healer trouble parks exactly as today.
                 try:
-                    await self._maybe_heal_readd_missing(
+                    _healed = await self._maybe_heal_readd_missing(
                         ts, gate_missing, gate_target, gate_blob)
                 except (AbandonedError, asyncio.CancelledError):
                     raise
@@ -677,7 +691,13 @@ class ReaddMixin:
                         "re-add heal failed for %s: %s",
                         ts.source_name[:50], e,
                     )
-                ts.readd_next_retry_at = now + dt.timedelta(seconds=retry_gap)
+                    _healed = False
+                if _healed:
+                    # Healed bytes just moved: re-check promptly on the next
+                    # tick instead of waiting out a retry gap.
+                    ts.readd_next_retry_at = None
+                else:
+                    ts.readd_next_retry_at = now + dt.timedelta(seconds=retry_gap)
                 if store is not None:
                     store.upsert(ts)
                 return
@@ -691,87 +711,83 @@ class ReaddMixin:
         except Exception:
             pass
 
-        max_cycle_attempts = 2
+        # One drive attempt per tick (no same-tick sleep-retry): a failure
+        # timer-parks and the next tick retries. Escalation rides
+        # readd_attempts (reset on DONE): first failing attempt parks with
+        # the short retry gap, consecutive failures back off 30m.
+        ts.readd_attempts += 1
+        try:
+            # 1) Re-inject the racing-client torrents (private or otherwise)
+            # pointing at the fuse mount with skip_check=True (req #3).
+            # Watch rows (any SSD flavour label) re-inject their
+            # persisted blobs instead.
+            if self.cfg.cross_seed.inject_racing_torrents_to_fuse:
+                if self._is_watch_row(ts):
+                    await self._re_inject_watch_dir_torrents(ts)
+                else:
+                    await self._re_inject_racing_torrents(ts)
 
-        for cycle_attempt in range(1, max_cycle_attempts + 1):
-            ts.readd_attempts += 1
-            try:
-                # 1) Re-inject the racing-client torrents (private or otherwise)
-                # pointing at the fuse mount with skip_check=True (req #3).
-                # Watch rows (any SSD flavour label) re-inject their
-                # persisted blobs instead.
-                if self.cfg.cross_seed.inject_racing_torrents_to_fuse:
-                    if self._is_watch_row(ts):
-                        await self._re_inject_watch_dir_torrents(ts)
-                    else:
-                        await self._re_inject_racing_torrents(ts)
+            # 2) Re-add the cross-seed torrent
+            await self._re_add_cross_seed_torrent(ts)
 
-                # 2) Re-add the cross-seed torrent
-                await self._re_add_cross_seed_torrent(ts)
+            if ts.state != State.FAILED:
+                ts.readd_next_retry_at = None
+                # The content now seeds from fuse: record the fuse mount
+                # as the save location. Late-seed/cleanup guards read a
+                # non-fuse save_path on DONE rows as "never moved" — a
+                # stale SSD path here would demote healthy rows forever.
+                # Use the blob-derived mount (fresh adoptions start as
+                # kind="unknown" and would otherwise record unsorted).
+                try:
+                    ts.save_path = str(self._target_mount_for_blob(gate_blob, self._target_mount_for(ts)))
+                except Exception:  # noqa: BLE001
+                    pass
+                self.transition(ts, State.DONE)
+            return
 
-                if ts.state != State.FAILED:
-                    ts.readd_next_retry_at = None
-                    # The content now seeds from fuse: record the fuse mount
-                    # as the save location. Late-seed/cleanup guards read a
-                    # non-fuse save_path on DONE rows as "never moved" — a
-                    # stale SSD path here would demote healthy rows forever.
-                    # Use the blob-derived mount (fresh adoptions start as
-                    # kind="unknown" and would otherwise record unsorted).
-                    try:
-                        ts.save_path = str(self._target_mount_for_blob(gate_blob, self._target_mount_for(ts)))
-                    except Exception:  # noqa: BLE001
-                        pass
-                    self.transition(ts, State.DONE)
+        except Exception as e:  # noqa: BLE001
+            if not is_retryable_client_error(e):
+                # Fatal disk/permission errors (and unexpected
+                # failures) fail loudly via the worker wrapper
+                # instead of riding the retry clock.
+                raise
+            now_curr = dt.datetime.now(dt.timezone.utc)
+            elapsed_curr = now_curr - ts.readd_first_attempted_at
+            if elapsed_curr >= max_age:
+                err = (
+                    f"re-injection timed out after {int(elapsed_curr.total_seconds())}s "
+                    f"(>24h limit): {e}"
+                )
+                log.error("giving up on %s: %s", ts.source_name, err)
+                ts.readd_next_retry_at = None
+                self.transition(ts, State.FAILED, error=err)
                 return
 
-            except Exception as e:  # noqa: BLE001
-                if not is_retryable_client_error(e):
-                    # Fatal disk/permission errors (and unexpected
-                    # failures) fail loudly via the worker wrapper
-                    # instead of riding the retry clock.
-                    raise
-                now_curr = dt.datetime.now(dt.timezone.utc)
-                elapsed_curr = now_curr - ts.readd_first_attempted_at
-                if elapsed_curr >= max_age:
-                    err = (
-                        f"re-injection timed out after {int(elapsed_curr.total_seconds())}s "
-                        f"(>24h limit): {e}"
-                    )
-                    log.error("giving up on %s: %s", ts.source_name, err)
-                    ts.readd_next_retry_at = None
-                    self.transition(ts, State.FAILED, error=err)
-                    return
-
-                if cycle_attempt < max_cycle_attempts:
-                    log.warning(
-                        "WebUI unresponsive during re-add for %s (%s); "
-                        "retrying in %ds (attempt %d/%d)",
-                        ts.source_name[:50], e, retry_gap, cycle_attempt, max_cycle_attempts,
-                    )
-                    if retry_gap > 5:
-                        ts.readd_next_retry_at = now_curr + dt.timedelta(seconds=retry_gap)
-                        if store is not None:
-                            store.upsert(ts)
-                        return
-                    else:
-                        if store is not None:
-                            store.upsert(ts)
-                        await asyncio.sleep(retry_gap)
-                        if self._stop:
-                            return
-                else:
-                    ts.readd_next_retry_at = now_curr + dt.timedelta(seconds=backoff_interval)
-                    log.warning(
-                        "WebUI still unresponsive for %s after %d attempts (%s); "
-                        "backing off for %ds (30m) until %s (elapsed=%ds, max=%ds)",
-                        ts.source_name[:50], max_cycle_attempts, e, backoff_interval,
-                        ts.readd_next_retry_at.isoformat(timespec="seconds"),
-                        int(elapsed_curr.total_seconds()), int(max_age.total_seconds()),
-                    )
-                    if store is not None:
-                        store.upsert(ts)
-                    self._schedule_telegram_update(ts)
-                    return
+            if ts.readd_attempts < 2:
+                # First failing attempt: short retry-gap park. The timer
+                # persists in the DB across restarts; a sleep would lose
+                # it (and stall the worker). Next tick retries.
+                log.warning(
+                    "WebUI unresponsive during re-add for %s (%s); "
+                    "retrying next tick in %ds (attempt %d)",
+                    ts.source_name[:50], e, retry_gap, ts.readd_attempts,
+                )
+                ts.readd_next_retry_at = now_curr + dt.timedelta(seconds=retry_gap)
+                if store is not None:
+                    store.upsert(ts)
+                return
+            ts.readd_next_retry_at = now_curr + dt.timedelta(seconds=backoff_interval)
+            log.warning(
+                "WebUI still unresponsive for %s after %d attempts (%s); "
+                "backing off for %ds (30m) until %s (elapsed=%ds, max=%ds)",
+                ts.source_name[:50], ts.readd_attempts, e, backoff_interval,
+                ts.readd_next_retry_at.isoformat(timespec="seconds"),
+                int(elapsed_curr.total_seconds()), int(max_age.total_seconds()),
+            )
+            if store is not None:
+                store.upsert(ts)
+            self._schedule_telegram_update(ts)
+            return
 
     async def _re_add_cross_seed_torrent(self, ts: TorrentState) -> None:
         h = (ts.dest_infohash or ts.source_infohash or "").lower()

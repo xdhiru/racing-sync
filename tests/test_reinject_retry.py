@@ -146,7 +146,12 @@ def test_state_store_readd_fields_round_trip(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_reinject_immediate_retry_succeeds():
+async def test_reinject_retry_parks_then_succeeds_next_tick():
+    """Transient WebUI failure parks with a timer; the next tick succeeds.
+
+    Same-tick sleep-retry is gone: the retry instant persists in the DB
+    across restarts instead of stalling the worker.
+    """
     coord = make_coordinator()
     coord.cfg.fuse_reinject_delay_seconds = 0
     coord.cfg.fuse_reinject_retry_gap_seconds = 0.001
@@ -176,10 +181,29 @@ async def test_reinject_immediate_retry_succeeds():
 
     await coord._do_re_add(ts)
 
+    assert coord.dest_client.add_torrent.call_count == 1
+    assert ts.state == State.RE_ADDING
+    assert ts.readd_attempts == 1
+    assert ts.readd_next_retry_at is not None
+
+    await coord._do_re_add(ts)
+
     assert coord.dest_client.add_torrent.call_count == 2
     assert ts.state == State.DONE
     assert ts.readd_attempts == 2
     assert ts.readd_next_retry_at is None
+
+
+def test_readd_gap_seconds_rejects_bool():
+    """Config True/False must not become a 1s/0s max-age or gap."""
+    from racing_sync.coordinator_readd import _readd_gap_seconds
+
+    assert _readd_gap_seconds(True, 120) == 120
+    assert _readd_gap_seconds(False, 120) == 120
+    assert _readd_gap_seconds("soon", 120) == 120
+    assert _readd_gap_seconds(None, 120) == 120
+    assert _readd_gap_seconds(5, 120) == 5.0
+    assert _readd_gap_seconds(0, 99) == 0
 
 
 @pytest.mark.anyio
@@ -213,6 +237,16 @@ async def test_reinject_cycle_fails_triggers_30m_backoff():
         transition_called = True
         setattr(t, "state", s)
     coord.transition = mock_transition
+
+    await coord._do_re_add(ts)
+
+    # Tick 1: first failure parks with the retry-gap timer (no same-tick
+    # sleep-retry anymore).
+    assert coord.dest_client.add_torrent.call_count == 1
+    assert not transition_called
+    assert ts.state == State.RE_ADDING
+    assert ts.readd_attempts == 1
+    assert ts.readd_next_retry_at is not None
 
     await coord._do_re_add(ts)
 

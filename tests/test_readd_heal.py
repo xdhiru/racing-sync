@@ -246,6 +246,8 @@ async def test_heal_happy_path_selective(tmp_path):
         # Attempts capped so the fresh move cannot trigger a re-download
         # while fuse indexes it.
         assert coord._readd_heal_track["c" * 40][2] >= 3
+        # Heal success re-checks promptly: no retry-gap timer lingers.
+        assert row.readd_next_retry_at is None
     finally:
         store.close()
 
