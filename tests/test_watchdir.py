@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -551,6 +553,88 @@ async def test_re_inject_watch_dir_torrents_skips_missing_fuse_content(tmp_path:
 
     coord.dest_client.add_torrent.assert_not_called()
     assert ts.injected_private_hashes == ""
+
+
+@pytest.mark.anyio
+async def test_re_inject_watch_dir_missing_blob_dir_warns(tmp_path: Path, caplog):
+    """A missing blob dir warns loudly instead of silently skipping."""
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    coord = make_coordinator()
+    coord.cfg.general.state_db = db_path
+    coord.store = store
+    coord.dest_client = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="3333444455556666777788889999000011112222",
+        source_name="Movie",
+        cross_seed_source="watch-dir",
+        state=State.RE_ADDING,
+    )
+
+    with caplog.at_level("WARNING", logger="racing_sync.coordinator"):
+        await coord._re_inject_watch_dir_torrents(ts)
+
+    coord.dest_client.add_torrent.assert_not_called()
+    assert "blob dir" in caplog.text
+    assert "missing" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_re_inject_watch_dir_members_inject_concurrently(tmp_path: Path):
+    """Watch-dir drops load, gate and inject in parallel, not in series."""
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    coord = make_coordinator()
+    coord.cfg.general.state_db = db_path
+    coord.store = store
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    (fuse_dir / "Movie.Part1").write_bytes(b"x" * 2000)
+    (fuse_dir / "Movie.Part2").write_bytes(b"x" * 2000)
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
+    coord.dest_client = AsyncMock()
+    coord.dest_client.add_torrent.return_value = AddResult(hash="h1", accepted=True)
+    coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path=str(fuse_dir)))
+
+    infohash = "4444555566667777888899990000111122223333"
+    watch_cross_dir = tmp_path / "watch_cross_seeds" / infohash
+    watch_cross_dir.mkdir(parents=True)
+    t1 = _create_sample_torrent_data("Movie.Part1", 2000, "http://tracker1/announce")
+    t2 = _create_sample_torrent_data("Movie.Part2", 2000, "http://tracker2/announce")
+    (watch_cross_dir / "t1.torrent").write_bytes(t1)
+    (watch_cross_dir / "t2.torrent").write_bytes(t2)
+
+    in_flight = 0
+    peak = 0
+    real_ensure = coord._ensure_fuse_entry
+
+    async def _counting(**kw):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await asyncio.sleep(0.05)
+            return await real_ensure(**kw)
+        finally:
+            in_flight -= 1
+
+    coord._ensure_fuse_entry = _counting
+
+    ts = TorrentState(
+        source_infohash=infohash,
+        source_name="Movie",
+        cross_seed_source="watch-dir",
+        state=State.RE_ADDING,
+    )
+
+    await coord._re_inject_watch_dir_torrents(ts)
+
+    assert coord.dest_client.add_torrent.await_count == 2
+    assert peak == 2
+    assert len(ts.injected_private_hashes.split(",")) == 2
 
 
 @pytest.mark.anyio

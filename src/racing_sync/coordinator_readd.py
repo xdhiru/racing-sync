@@ -26,6 +26,10 @@ from .coordinator_errors import (
     WebUIUnresponsiveError,
     is_retryable_client_error,
 )
+from .coordinator_fuse import (
+    _is_duplicate_add_detail,
+    _record_injected_hash,
+)
 from .coordinator_inject import _group_is_ignored
 from .coordinator_paths import (
     _safe_ssd_join,
@@ -842,69 +846,136 @@ class ReaddMixin:
         """Re-add every watch-dir dropped torrent and discovered cross-seeds onto FUSE."""
         watch_cross_dir = _watch_cross_seed_dir(
             self.cfg.general.state_db, ts.source_infohash)
-        if watch_cross_dir is None or not watch_cross_dir.exists():
+        if watch_cross_dir is None:
+            log.warning(
+                "re-inject watch-dir torrents for %s: no blob dir "
+                "(unsafe infohash or in-memory DB); skipping",
+                ts.source_name[:50],
+            )
+            return
+        if not watch_cross_dir.exists():
+            log.warning(
+                "re-inject watch-dir torrents for %s: blob dir %s missing; skipping",
+                ts.source_name[:50], watch_cross_dir,
+            )
             return
         ts_fallback_mount = self._target_mount_for(ts)
         injected = [h.lower() for h in ts.injected_private_hashes.split(",") if h]
         injected_set = set(injected)
 
         try:
-            for p in sorted(watch_cross_dir.glob("*.torrent")):
-                try:
-                    blob = await asyncio.to_thread(p.read_bytes)
-                    from .watchdir import _bencoded_info_hash
-                    h, _, _, _ = _bencoded_info_hash(blob)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("failed to read watch-dir torrent %s: %s", p.name, e)
-                    continue
+            paths = sorted(watch_cross_dir.glob("*.torrent"))
+        except Exception as e:  # noqa: BLE001
+            log.warning("re-inject watch-dir list failed for %s: %s",
+                        ts.source_name[:50], e)
+            return
 
-                h_low = h.lower()
-                if h_low in injected_set:
-                    continue
+        async def _load(p):
+            """Read + decode + fuse-gate one drop (no state change)."""
+            try:
+                blob = await asyncio.to_thread(p.read_bytes)
+            except Exception as e:  # noqa: BLE001
+                return (p, None, f"failed to read ({e})")
+            try:
+                from .watchdir import _bencoded_info_hash
+                h, _, _, _ = _bencoded_info_hash(blob)
+                h_low = (h or "").lower()
+            except Exception:
+                return (p, None, "undecodable .torrent")
+            if not h_low:
+                return (p, None, "undecodable .torrent")
+            # Fuse gate (fail-closed): never point a re-added torrent at
+            # missing/unverifiable data.
+            target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
+            watch_expected = self._expected_fuse_files(blob)
+            if not watch_expected:
+                return (p, (h_low, None, None),
+                        "cannot decode file list; skipping blind injection")
+            watch_missing = await self._missing_fuse_files(
+                target_mount, watch_expected)
+            if watch_missing:
+                return (p, (h_low, None, None),
+                        f"fuse content missing at {target_mount} "
+                        f"({len(watch_missing)} files); skipping blind injection")
+            return (p, (h_low, blob, target_mount), "")
 
-                # Fuse gate (fail-closed): never point a re-added torrent at
-                # missing/unverifiable data.
-                target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
-                watch_expected = self._expected_fuse_files(blob)
-                if not watch_expected:
-                    log.warning(
-                        "re-inject watch-dir torrent %s: cannot decode file list; skipping blind injection",
-                        h[:10],
-                    )
-                    continue
-                watch_missing = await self._missing_fuse_files(target_mount, watch_expected)
-                if watch_missing:
-                    log.warning(
-                        "re-inject watch-dir torrent %s: fuse content missing at %s (%d files); skipping blind injection",
-                        h[:10], target_mount, len(watch_missing),
-                    )
-                    continue
+        try:
+            _loaded = await asyncio.gather(*(_load(p) for p in paths))
+        except Exception as e:  # noqa: BLE001
+            log.warning("re-inject watch-dir load failed for %s: %s",
+                        ts.source_name[:50], e)
+            return
 
-                ok, detail = await self._ensure_fuse_entry(
-                    blob=blob, infohash=h_low, target_mount=target_mount,
-                    label="watch-dir torrent",
-                )
+        async def _inject(item) -> tuple[str, bool, str]:
+            """Ensure one gated member; (h_low, ok, detail).
 
+            Transport errors propagate (the row parks and retries) —
+            only client rejections return; a flap must never read as a
+            hard skip.
+            """
+            h_low, blob, target_mount = item
+            ok, detail = await self._ensure_fuse_entry(
+                blob=blob, infohash=h_low, target_mount=target_mount,
+                label="watch-dir torrent",
+            )
+            return (h_low, bool(ok), detail or "")
+
+        try:
+            _ready = [(p, pay, prob) for p, pay, prob in _loaded]
+            _sem = asyncio.Semaphore(4)
+
+            async def _one(_h_low, _blob, _target):
+                async with _sem:
+                    return await _inject((_h_low, _blob, _target))
+
+            _results: dict[str, tuple[bool, str]] = {}
+            _pending = [(pay[0], pay[1], pay[2])
+                        for _, pay, prob in _ready
+                        if pay is not None and pay[1] is not None
+                        and pay[0] not in injected_set and not prob]
+            if _pending:
+                _outs = await asyncio.gather(
+                    *(_one(h, b, t) for h, b, t in _pending))
+                for (h, _b, _t), (_h2, ok, detail) in zip(_pending, _outs):
+                    _results[h] = (ok, detail)
+                    injected_set.add(h)
+            for p, pay, prob in _ready:
+                if pay is None:
+                    log.warning("failed to read watch-dir torrent %s: %s",
+                                p.name, prob)
+                    continue
+                h_low = pay[0]
+                if prob:
+                    log.warning("re-inject watch-dir torrent %s: %s",
+                                h_low[:10], prob)
+                    continue
+                if h_low in injected:
+                    continue
+                if h_low not in _results:
+                    continue
+                ok, detail = _results[h_low]
                 if ok:
                     injected.append(h_low)
-                    injected_set.add(h_low)
-                else:
-                    # Split like _re_add_cross_seed_torrent: transient client
-                    # states park the row for retry; a hard rejection (e.g.
-                    # invalid blob) skips just this torrent so one bad .torrent
-                    # can't hold the whole row (and its moved bytes) hostage.
-                    if (not detail or detail == "Fails."
-                            or detail == _NOT_VISIBLE_DETAIL
-                            or "already" in detail.lower()):
-                        log.warning("re-inject watch-dir torrent %s rejected: %s", h[:10], detail)
-                        raise WebUIUnresponsiveError(f"re-inject watch-dir torrent {h[:10]} rejected: {detail}")
-                    log.warning(
-                        "re-inject watch-dir torrent %s hard-rejected (%s); skipping it",
-                        h[:10], detail,
-                    )
                     continue
+                # Split like _re_add_cross_seed_torrent: transient client
+                # states park the row for retry; a hard rejection (e.g.
+                # invalid blob) skips just this torrent so one bad .torrent
+                # can't hold the whole row (and its moved bytes) hostage.
+                if (not detail or detail == _NOT_VISIBLE_DETAIL
+                        or _is_duplicate_add_detail(detail)):
+                    log.warning("re-inject watch-dir torrent %s rejected: %s", h_low[:10], detail)
+                    raise WebUIUnresponsiveError(f"re-inject watch-dir torrent {h_low[:10]} rejected: {detail}")
+                log.warning(
+                    "re-inject watch-dir torrent %s hard-rejected (%s); skipping it",
+                    h_low[:10], detail,
+                )
+                continue
         finally:
-            ts.injected_private_hashes = ",".join(dict.fromkeys(injected))
+            try:
+                for _h in injected:
+                    _record_injected_hash(ts, _h)
+            except Exception:
+                pass
 
     async def _re_inject_racing_torrents(self, ts: TorrentState) -> None:
         """Re-add every racing-client torrent matching this content onto VPS2
