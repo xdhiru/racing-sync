@@ -326,13 +326,15 @@ class ReaddMixin:
                 return False
             if entry is None:
                 try:
-                    res = await self.dest_client.add_torrent(
-                        torrent_files=[bytes(gate_blob)],
-                        save_path=str(ssd_base),
-                        category="racing",
-                        paused=True,
-                        skip_check=False,
-                    )
+                    res = await rpc(
+                        self.dest_client.add_torrent(
+                            torrent_files=[bytes(gate_blob)],
+                            save_path=str(ssd_base),
+                            category="racing",
+                            paused=True,
+                            skip_check=False,
+                        ),
+                        getattr(self, "cfg", None), "dest heal add_torrent")
                 except Exception as e:  # noqa: BLE001
                     log.warning(
                         "re-add heal: re-add failed for %s: %s",
@@ -356,7 +358,9 @@ class ReaddMixin:
                 except Exception:
                     pass
             try:
-                files = await self.dest_client.get_torrent_files(helper_h)
+                files = await rpc(
+                    self.dest_client.get_torrent_files(helper_h),
+                    getattr(self, "cfg", None), "dest heal get_torrent_files")
             except Exception:
                 return False
             if not files:
@@ -369,10 +373,12 @@ class ReaddMixin:
                 )
                 return False
             try:
-                await self.dest_client.set_file_priorities(
-                    helper_h,
-                    {f.name: (1 if f.name in heal_set else 0) for f in files},
-                )
+                await rpc(
+                    self.dest_client.set_file_priorities(
+                        helper_h,
+                        {f.name: (1 if f.name in heal_set else 0) for f in files},
+                    ),
+                    getattr(self, "cfg", None), "dest heal set_file_priorities")
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "re-add heal: priority set failed for %s: %s",
@@ -380,7 +386,9 @@ class ReaddMixin:
                 )
                 return False
             try:
-                await self.dest_client.resume(helper_h)
+                await rpc(
+                    self.dest_client.resume(helper_h),
+                    getattr(self, "cfg", None), "dest heal resume")
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "re-add heal: resume failed for %s: %s",
@@ -389,8 +397,9 @@ class ReaddMixin:
                 return False
             # Point the row at the helper entry on SSD for the wait below
             # (_wait_for_completion derives its client hash + disk base
-            # from these fields). Restored implicitly: success deletes the
-            # helper and the DONE transition records the fuse mount.
+            # from these fields). The pointer is restored explicitly on
+            # success (helper deleted); the DONE transition records the
+            # fuse mount.
             try:
                 ts.dest_infohash = helper_h
                 if not ts.save_path or self._save_path_is_on_fuse(ts.save_path):
@@ -413,7 +422,9 @@ class ReaddMixin:
                     pass
                 return False
             try:
-                await self.dest_client.pause(helper_h)
+                await rpc(
+                    self.dest_client.pause(helper_h),
+                    getattr(self, "cfg", None), "dest heal pause")
             except Exception:
                 pass
             try:
@@ -453,7 +464,9 @@ class ReaddMixin:
                     pass
                 return False
             try:
-                await self.dest_client.delete(helper_h, delete_files=False)
+                await rpc(
+                    self.dest_client.delete(helper_h, delete_files=False),
+                    getattr(self, "cfg", None), "dest heal delete")
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "re-add heal: helper delete failed for %s: %s",
