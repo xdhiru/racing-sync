@@ -1656,3 +1656,74 @@ async def test_stale_cache_miss_reprobed_fresh_no_backoff(tmp_path: Path):
     coord._ensure_fuse_entry.assert_awaited_once()
     assert h not in getattr(coord, "_failed_late_cross_seeds", {})
 
+
+@pytest.mark.anyio
+async def test_re_inject_racing_skips_size_mismatch():
+    """Same name, different size (repack/mislabel) must not ride the row."""
+    coord = make_coordinator()
+    coord._target_mount_for = MagicMock(return_value=Path("/mnt/fuse"))
+    coord.dest_client = AsyncMock()
+    coord._fetch_racing_torrent_bytes = AsyncMock()
+    coord._list_source_torrents = AsyncMock(return_value=[
+        Torrent(hash="m" * 40, name="Movie", category="", save_path="",
+                size_bytes=2000, state="seeding", progress=1.0),
+    ])
+
+    ts = TorrentState(
+        source_infohash="s" * 40, source_name="Movie", total_bytes=1000,
+        injected_private_hashes="",
+    )
+
+    await coord._re_inject_racing_torrents(ts)
+
+    coord._fetch_racing_torrent_bytes.assert_not_called()
+    coord.dest_client.add_torrent.assert_not_called()
+    assert ts.injected_private_hashes == ""
+
+
+@pytest.mark.anyio
+async def test_re_inject_racing_matches_fetch_concurrently(tmp_path: Path):
+    """Racing matches fetch in parallel, not one SFTP/export at a time."""
+    from racing_sync.watchdir import _bencode
+
+    fuse_dir = tmp_path / "fuse"
+    fuse_dir.mkdir()
+    (fuse_dir / "Movie.File.mkv").write_bytes(b"x" * 50)
+    blob = _bencode({b"info": {b"name": b"Movie.File.mkv", b"length": 50}})
+
+    coord = make_coordinator()
+    coord._target_mount_for = MagicMock(return_value=fuse_dir)
+    coord.dest_client = AsyncMock()
+    coord._ensure_fuse_entry = AsyncMock(return_value=(True, "ok"))
+    in_flight = 0
+    peak = 0
+
+    async def _counting(h):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await asyncio.sleep(0.05)
+            return blob
+        finally:
+            in_flight -= 1
+
+    coord._fetch_racing_torrent_bytes = _counting
+    coord._list_source_torrents = AsyncMock(return_value=[
+        Torrent(hash="1" * 40, name="Movie", category="", save_path="",
+                size_bytes=50, state="seeding", progress=1.0),
+        Torrent(hash="2" * 40, name="Movie", category="", save_path="",
+                size_bytes=50, state="seeding", progress=1.0),
+    ])
+
+    ts = TorrentState(
+        source_infohash="s" * 40, source_name="Movie", total_bytes=50,
+        injected_private_hashes="",
+    )
+
+    await coord._re_inject_racing_torrents(ts)
+
+    assert peak == 2
+    assert coord._ensure_fuse_entry.await_count == 2
+    assert set(ts.injected_private_hashes.split(",")) == {"1" * 40, "2" * 40}
+
