@@ -42,6 +42,62 @@ async def test_fail_downloading_row_abandoned_first(tmp_path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_missing_files_needs_two_sightings(tmp_path):
+    """One missingFiles report parks quiet; two within the window condemn."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(
+            source_infohash="m" * 40, source_name="M",
+            state=State.DOWNLOADING))
+        coord = make_coordinator(store)
+        ts = store.get("m" * 40)
+        assert await coord._check_dest_tracker_health(ts, "m" * 40, "missingFiles") is None
+        with pytest.raises(RuntimeError):
+            await coord._check_dest_tracker_health(ts, "m" * 40, "missingFiles")
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_missing_files_sightings_expire(tmp_path):
+    """Far-apart sightings are independent incidents, not a confirm pair."""
+    import time
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(
+            source_infohash="m" * 40, source_name="M",
+            state=State.DOWNLOADING))
+        coord = make_coordinator(store)
+        coord._missing_files_sightings = {"m" * 40: time.monotonic() - 400.0}
+        ts = store.get("m" * 40)
+        assert await coord._check_dest_tracker_health(ts, "m" * 40, "missingFiles") is None
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_fail_downloading_row_refuses_illegal_edge(tmp_path):
+    """Force-assign fallback asserts legality: DONE must not become FAILED."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(
+            source_infohash="d" * 40, source_name="D",
+            state=State.DONE))
+        coord = make_coordinator(store)
+        coord.cfg = MagicMock()
+        coord.dest_client = AsyncMock()
+        coord._notify_telegram = AsyncMock()
+        with pytest.raises(ValueError):
+            await coord._fail_downloading_row(
+                store.get("d" * 40), "d" * 40, "stalled")
+        assert store.get("d" * 40).state == State.DONE
+        coord._notify_telegram.assert_not_called()
+    finally:
+        store.close()
+
+
 def test_batches_fit_under_cap():
     eps = [
         Episode(f"S01E{i:02d}.mkv", 1, i, 2_000_000_000)

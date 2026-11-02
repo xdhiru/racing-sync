@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import time
 
 from .coordinator_content import announce_domain, normalize_content_name
 from .coordinator_errors import (
@@ -20,10 +21,14 @@ from .coordinator_errors import (
     UnregisteredTorrentError,
     classify_tracker_message,
 )
-from .state import State, TorrentState
+from .state import State, TorrentState, check_transition
 
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
+
+# missingFiles sightings more than this far apart are independent incidents
+# (a single stale/racy report must not fail a row hours later).
+_MISSING_FILES_CONFIRM_S = 300.0
 
 
 class WatchdogMixin:
@@ -97,6 +102,11 @@ class WatchdogMixin:
         try:
             self.transition(ts, State.FAILED, error=error[:500])
         except (AbandonedError, ValueError):
+            # Force-assign fallback for rows the guarded write refuses
+            # (concurrent move / tombstone race): assert the edge is legal
+            # first, so a programming error (e.g. failing a DONE row) still
+            # raises loudly instead of writing an illegal state silently.
+            check_transition(ts.state, State.FAILED)
             try:
                 ts.state = State.FAILED
                 ts.last_error = error[:500]
@@ -112,7 +122,9 @@ class WatchdogMixin:
         """Raise on tracker-side or client-side download death.
 
         - qB `missingFiles`: our files vanished from SSD (operator wipe) —
-          waiting can never complete.
+          waiting can never complete. A single report may be a stale/racy
+          client state, so it takes two sightings within a short window to
+          condemn the row (far-apart sightings restart the clock).
         - Tracker msg "unregistered/deleted" (or revoked auth): the release
           is gone upstream — no seeds will ever come.
         Best-effort and quiet when the client exposes no messages (Deluge):
@@ -120,6 +132,26 @@ class WatchdogMixin:
         or RuntimeError (missing files, terminal via the generic wrapper).
         """
         if (t_state or "") == "missingFiles":
+            try:
+                _seen = getattr(self, "_missing_files_sightings", None)
+                if not isinstance(_seen, dict):
+                    _seen = {}
+                    self._missing_files_sightings = _seen  # type: ignore[attr-defined]
+                _key = (ts.source_infohash or "").lower()
+                _now_m = time.monotonic()
+                try:
+                    _first = float(_seen.get(_key, 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    _first = 0.0
+                if not _first or _now_m - _first > _MISSING_FILES_CONFIRM_S:
+                    _seen[_key] = _now_m
+                    if len(_seen) > 5000:
+                        for _k in list(_seen.keys())[: len(_seen) - 5000]:
+                            _seen.pop(_k, None)
+                    return
+                _seen.pop(_key, None)
+            except Exception:
+                pass
             raise RuntimeError(
                 f"torrent files missing on disk for {ts.source_name}: "
                 "client reports missingFiles")
