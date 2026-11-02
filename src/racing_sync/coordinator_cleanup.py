@@ -242,26 +242,40 @@ class CleanupMixin:
         dry_run = bool(getattr(cfg, "dry_run", True))
 
         candidates: list[tuple[float, float, TorrentState, list[Torrent]]] = []
-        for ts in rows:
-            try:
-                group = self._cleanup_group_for(ts, by_hash)
-            except Exception as e:  # noqa: BLE001
-                log.warning("cleanup: group resolve failed for %s: %s",
-                            ts.source_infohash[:10], e)
-                continue
-            if not group:
-                continue
-            if self._cleanup_protected(ts):
-                continue
-            try:
-                verdict = await self._cleanup_verdict(ts, group, grace_s, now_utc, dry_run, free_bytes)
-            except Exception as e:  # noqa: BLE001
-                log.warning("cleanup: verdict failed for %s: %s",
-                            ts.source_infohash[:10], e)
-                continue
-            if verdict is None:
-                continue
-            candidates.append(verdict)
+        _sem = asyncio.Semaphore(4)
+
+        async def _verdict_one(ts: TorrentState):
+            async with _sem:
+                try:
+                    group = self._cleanup_group_for(ts, by_hash)
+                    if not group:
+                        return None
+                    if self._cleanup_protected(ts):
+                        return None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    log.warning("cleanup: group resolve failed for %s: %s",
+                                ts.source_infohash[:10], e)
+                    return None
+                try:
+                    return await self._cleanup_verdict(
+                        ts, group, grace_s, now_utc, dry_run, free_bytes)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    log.warning("cleanup: verdict failed for %s: %s",
+                                ts.source_infohash[:10], e)
+                    return None
+
+        try:
+            _verdicts = await asyncio.gather(*(_verdict_one(ts) for ts in rows))
+        except Exception as e:  # noqa: BLE001
+            log.warning("cleanup: verdict phase failed: %s", e)
+            return
+        # Verdicts are per-row independent (narrow stamps on distinct rows;
+        # dry-run mutates nothing): gather preserves row order here.
+        candidates.extend(v for v in (_verdicts or []) if v is not None)
 
         if not candidates:
             return
