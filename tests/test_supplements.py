@@ -245,4 +245,79 @@ async def test_rides_re_inject_racing_torrents(tmp_path):
         coord.store.close()
 
 
+@pytest.mark.anyio
+async def test_search_failure_short_memos(tmp_path):
+    """A failed search re-runs soon (5m), never suppresses 6h."""
+    import time
+
+    coord, _, _, _ = _coord(tmp_path)
+    coord.prowlarr.search_indexers_parallel = AsyncMock(
+        side_effect=RuntimeError("indexer down"))
+    coord.prowlarr.download_torrent = AsyncMock()
+    try:
+        coord.store.upsert(_row())
+        await coord._re_inject_tracker_map_supplements(
+            coord.store.get("e" * 40))
+        remaining = coord._supplement_ok_at["e" * 40] - time.monotonic()
+        assert 60 < remaining < 3600
+        coord.prowlarr.download_torrent.assert_not_called()
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_empty_search_short_memos_not_six_hours(tmp_path):
+    """A search fetching nothing usable must not earn the 6h window."""
+    import time
+
+    coord, _, _, _ = _coord(tmp_path)
+    coord.prowlarr.search_indexers_parallel = AsyncMock(return_value={})
+    coord.prowlarr.download_torrent = AsyncMock(return_value=_blob())
+    try:
+        coord.store.upsert(_row())
+        await coord._re_inject_tracker_map_supplements(
+            coord.store.get("e" * 40))
+        remaining = coord._supplement_ok_at["e" * 40] - time.monotonic()
+        assert 60 < remaining < 3600
+        coord.prowlarr.download_torrent.assert_not_called()
+    finally:
+        coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_downloads_run_concurrently(tmp_path):
+    """Supplement .torrent downloads fly in parallel, not in series."""
+    import asyncio
+
+    coord, _, _, fuse_u = _coord(tmp_path)
+    blob = _blob()
+    (fuse_u / NAME).write_bytes(b"x" * SIZE)
+    coord.prowlarr.search_indexers_parallel = AsyncMock(
+        return_value={"PrivIdx": [_hit(), _hit()]})
+    in_flight = 0
+    peak = 0
+
+    async def _counting(hit):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await asyncio.sleep(0.05)
+            return blob
+        finally:
+            in_flight -= 1
+
+    coord.prowlarr.download_torrent = _counting
+    coord._ensure_fuse_entry = AsyncMock(return_value=(True, "ok"))
+    try:
+        coord.store.upsert(_row())
+        await coord._re_inject_tracker_map_supplements(
+            coord.store.get("e" * 40))
+        assert peak == 2
+        # Same bytes twice: first injects, second dedupes as known.
+        assert coord._ensure_fuse_entry.await_count == 1
+    finally:
+        coord.store.close()
+
+
 
