@@ -995,82 +995,168 @@ class ReaddMixin:
             log.warning("could not list racing torrents for re-injection: %s", e)
             racing = []
 
-        matches = [
-            t for t in racing
-            if t.name == ts.source_name or _same_release_name(t.name, ts.source_name)
-        ]
+        try:
+            want_size = int(ts.total_bytes or 0)
+        except (TypeError, ValueError):
+            want_size = 0
+
+        matches = []
+        for t in racing or []:
+            try:
+                if not (t.name == ts.source_name
+                        or _same_release_name(t.name, ts.source_name)):
+                    continue
+            except Exception:
+                continue
+            # Same name alone is not same content: a different-sized
+            # same-name torrent (repack, mislabel) must not ride this
+            # row's injection. Unknown sizes (0) still match.
+            try:
+                t_size = int(getattr(t, "size_bytes", 0) or 0)
+            except (TypeError, ValueError):
+                t_size = 0
+            if want_size and t_size and t_size != want_size:
+                log.info(
+                    "re-inject: size mismatch for %s (%s: VPS1 %d != row %d); skipping",
+                    (t.name or "")[:50], (t.infohash or "")[:10],
+                    t_size, want_size,
+                )
+                continue
+            matches.append(t)
+
+        async def _load(t):
+            """Fetch + gate one match (no state change)."""
+            try:
+                h_low = (t.infohash or "").lower()
+            except Exception:
+                return (t, None, "unreadable infohash; skipping")
+            if not h_low:
+                return (t, None, "unreadable infohash; skipping")
+            if _group_is_ignored([t], getattr(self, "store", None)):
+                return (t, None, "cancelled; skipping")
+            try:
+                blob = await self._fetch_racing_torrent_bytes(t.infohash)
+            except Exception as e:  # noqa: BLE001
+                return (t, None, f"fetch failed ({e})")
+            if not blob:
+                # SFTP clean-miss + no export endpoint (Deluge has no
+                # core.get_torrent_file) surface nowhere else — log
+                # loudly so a skipped racing seed is visible.
+                return (t, None,
+                        "no .torrent bytes available; "
+                        "skipping for now (late-seed job will retry)")
+            # Per-torrent mount: ts.kind may be stale "unknown" (fresh
+            # adoption); the blob's own layout is authoritative.
+            target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
+            # Per-match fuse gate (fail-closed): only inject torrents
+            # whose content is actually available at the target (same
+            # release name does not guarantee the bytes were moved).
+            match_expected = self._expected_fuse_files(blob)
+            if not match_expected:
+                return (t, None,
+                        "cannot decode file list; skipping blind injection")
+            match_missing = await self._missing_fuse_files(
+                target_mount, match_expected)
+            if match_missing:
+                return (t, None,
+                        f"fuse content missing at {target_mount} "
+                        f"({len(match_missing)} files); skipping blind injection")
+            return (t, (h_low, blob, target_mount), "")
+
+        # Already-recorded matches skip the fetch entirely (no SFTP/export
+        # round-trip for hashes known injected).
+        try:
+            fresh = [t for t in matches
+                     if (getattr(t, "infohash", "") or "").lower() not in injected_set]
+        except Exception:
+            fresh = list(matches)
+        try:
+            _loaded = await asyncio.gather(*(_load(t) for t in fresh))
+        except Exception as e:  # noqa: BLE001
+            log.warning("re-inject racing load failed for %s: %s",
+                        ts.source_name[:60], e)
+            return
+
+        async def _inject(item) -> tuple[str, bool, str]:
+            """Ensure one gated match; (h_low, ok, detail).
+
+            Transport errors propagate (the row parks and retries) —
+            only client rejections return.
+            """
+            h_low, blob, target_mount = item
+            ok, detail = await self._ensure_fuse_entry(
+                blob=blob, infohash=h_low, target_mount=target_mount,
+                label="racing torrent",
+            )
+            return (h_low, bool(ok), detail or "")
 
         try:
-            for t in matches:
-                h_low = t.infohash.lower()
-                if h_low in injected_set:
-                    continue
-                if _group_is_ignored([t], getattr(self, "store", None)):
-                    log.info("re-inject: skipping cancelled torrent %s (%s)",
-                             t.infohash[:10], (t.name or "")[:40])
-                    continue
+            _sem = asyncio.Semaphore(4)
+
+            async def _one(_h_low, _blob, _target):
+                async with _sem:
+                    return await _inject((_h_low, _blob, _target))
+
+            _results: dict[str, tuple[bool, str]] = {}
+            _pending = [(pay[0], pay[1], pay[2])
+                        for _, pay, prob in _loaded
+                        if pay is not None and pay[1] is not None
+                        and pay[0] not in injected_set and not prob]
+            if _pending:
+                _outs = await asyncio.gather(
+                    *(_one(h, b, t) for h, b, t in _pending))
+                for (h, _b, _t), (_h2, ok, detail) in zip(_pending, _outs):
+                    _results[h] = (ok, detail)
+                    injected_set.add(h)
+            for t, pay, prob in _loaded:
                 try:
-                    blob = await self._fetch_racing_torrent_bytes(t.infohash)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("re-inject: fetch %s failed: %s",
-                                t.infohash[:10], e)
+                    _t_hash = (t.infohash or "")[:10]
+                    _t_name = (t.name or "")[:50]
+                except Exception:
+                    _t_hash, _t_name = "?", "?"
+                if pay is None:
+                    if prob == "cancelled; skipping":
+                        log.info("re-inject: skipping cancelled torrent %s (%s)",
+                                 _t_hash, (_t_name or "")[:40])
+                    else:
+                        log.warning("re-inject: %s for %s (%s); skipping",
+                                    prob, _t_hash, _t_name)
                     continue
-                if not blob:
-                    # SFTP clean-miss + no export endpoint (Deluge has no
-                    # core.get_torrent_file) surface nowhere else — log
-                    # loudly so a skipped racing seed is visible.
+                h_low = pay[0]
+                if prob:
+                    log.warning("re-inject: %s for %s (%s); skipping",
+                                prob, _t_hash, _t_name)
+                    continue
+                if h_low in injected:
+                    continue
+                if h_low not in _results:
+                    continue
+                ok, detail = _results[h_low]
+                if ok:
+                    injected.append(h_low)
+                    added += 1
+                    continue
+                # Split like _re_add_cross_seed_torrent: transient client
+                # states park the row for retry; a hard rejection skips
+                # just this torrent so the cross-seed still lands.
+                if (not detail or detail == _NOT_VISIBLE_DETAIL
+                        or _is_duplicate_add_detail(detail)):
                     log.warning(
-                        "re-inject: no .torrent bytes available for %s (%s); "
-                        "skipping for now (late-seed job will retry)",
-                        t.infohash[:10], t.name[:50],
+                        "re-inject: add %s rejected: %s",
+                        _t_hash, detail,
                     )
-                    continue
-                # Per-torrent mount: ts.kind may be stale "unknown" (fresh
-                # adoption); the blob's own layout is authoritative.
-                target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
-                # Per-match fuse gate (fail-closed): only inject torrents
-                # whose content is actually available at the target (same
-                # release name does not guarantee the bytes were moved).
-                match_expected = self._expected_fuse_files(blob)
-                if not match_expected:
-                    log.warning(
-                        "re-inject: cannot decode file list for %s; skipping blind injection",
-                        t.infohash[:10],
-                    )
-                    continue
-                match_missing = await self._missing_fuse_files(target_mount, match_expected)
-                if match_missing:
-                    log.warning(
-                        "re-inject: fuse content missing for %s (%s) at %s (%d files); skipping blind injection",
-                        t.infohash[:10], t.name[:50], target_mount, len(match_missing),
-                    )
-                    continue
-                ok, detail = await self._ensure_fuse_entry(
-                    blob=blob, infohash=h_low, target_mount=target_mount,
-                    label="racing torrent",
+                    raise WebUIUnresponsiveError(f"re-inject add {_t_hash} rejected: {detail}")
+                log.warning(
+                    "re-inject: add %s hard-rejected (%s); skipping it",
+                    _t_hash, detail,
                 )
-                if not ok:
-                    # Split like _re_add_cross_seed_torrent: transient client
-                    # states park the row for retry; a hard rejection skips
-                    # just this torrent so the cross-seed still lands.
-                    if (not detail or detail == "Fails."
-                            or detail == _NOT_VISIBLE_DETAIL
-                            or "already" in detail.lower()):
-                        log.warning(
-                            "re-inject: add %s rejected: %s",
-                            t.infohash[:10], detail,
-                        )
-                        raise WebUIUnresponsiveError(f"re-inject add {t.infohash[:10]} rejected: {detail}")
-                    log.warning(
-                        "re-inject: add %s hard-rejected (%s); skipping it",
-                        t.infohash[:10], detail,
-                    )
-                    continue
-                injected.append(h_low)
-                injected_set.add(h_low)
-                added += 1
+                continue
         finally:
-            ts.injected_private_hashes = ",".join(dict.fromkeys(injected))
+            try:
+                for _h in injected:
+                    _record_injected_hash(ts, _h)
+            except Exception:
+                pass
 
         if added == 0:
             pending = [t for t in matches if t.infohash.lower() not in injected_set]
