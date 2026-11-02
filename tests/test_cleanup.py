@@ -504,3 +504,51 @@ async def test_ssd_bytes_outside_roots_fails_closed(tmp_path: Path):
             store.get(pub)) is False
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_verdicts_evaluate_concurrently(tmp_path: Path):
+    """Per-row verdicts fan out instead of serializing on client RPCs."""
+    import asyncio
+
+    store = StateStore(tmp_path / "s.db")
+    now = dt.datetime.now(dt.timezone.utc)
+    members = []
+    names = ("Show.A", "Show.B")
+    try:
+        for i, name in enumerate(names):
+            h = str(i + 1) * 40
+            store.upsert(TorrentState(
+                source_infohash=h, source_name=name, dest_infohash=h,
+                total_bytes=FSIZE, state=State.DONE,
+                completed_at=now - dt.timedelta(hours=100),
+                vps1_last_activity_at=now - dt.timedelta(hours=10)))
+            members.append(Torrent(
+                hash=h, name=name, category="", save_path="/vps1/data",
+                size_bytes=FSIZE, state="seeding", progress=1.0, ratio=2.0,
+                trackers=[], upspeed_bps=0, num_leechers=0, added_on=0))
+        cfg = _base_cfg(tmp_path)
+        cfg.cleanup = _cleanup_cfg(delete_stagger_seconds=0)
+        _healthy_fuse(tmp_path, store, ["1" * 40, "2" * 40], cfg)
+        coord = _make_coord(tmp_path, store, _FakeSource(list(members)),
+                            _FakeDest(["1" * 40, "2" * 40]), cfg)
+        in_flight = 0
+        peak = 0
+        real_verdict = coord._cleanup_verdict
+
+        async def _counting(*a, **k):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            try:
+                await asyncio.sleep(0.05)
+                return await real_verdict(*a, **k)
+            finally:
+                in_flight -= 1
+
+        coord._cleanup_verdict = _counting
+        await coord._maybe_cleanup_source()
+        assert peak == 2
+        assert len(coord.source_client.deleted) == 2
+    finally:
+        store.close()
