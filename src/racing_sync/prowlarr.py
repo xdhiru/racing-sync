@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote_plus, urlsplit, urlunsplit
@@ -559,25 +558,17 @@ class ProwlarrClient:
 def _norm_title_for_match(name: str) -> str:
     """Normalize a release title for exact-release comparison.
 
-    Mirrors `coordinator.normalize_content_name` (trailing `[...]` indexer
-    tags and `.torrent`/media extensions stripped, case-folded) and additionally
-    unifies `.`/`_`/`-`/space runs so punctuation variants of the same release
-    still match. Release-group suffixes (`-Raccoon` vs `-WebRip`) and other
-    tokens survive as-is and keep discriminating.
+    Delegates to `coordinator_content.normalize_content_name` with
+    separator unification (`.`/`_`/`-`/space runs collapse) so
+    punctuation variants of the same release still match. Release-group
+    suffixes (`-Raccoon` vs `-WebRip`) and other tokens survive as-is
+    and keep discriminating. (Previously a local single-pass copy with
+    fewer extensions and opposite strip order; the looped superset
+    subsumes it — multi-tag titles now collapse fully too.)
     """
-    s = (name or "").strip()
-    s = re.sub(r"\.torrent$", "", s, flags=re.IGNORECASE).strip()
-    for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v"):
-        if s.lower().endswith(ext):
-            s = s[: -len(ext)].strip()
-            break
-    # Strip AFTER extensions: indexer tags trail the filename
-    # ("... [A1B2C3D4].mkv"), so tag stripping must see the bare name.
-    # (Deliberately local: coordinator.normalize_content_name keeps the
-    # opposite order so differently-tagged releases stay separate rows.)
-    s = re.sub(r"\s*\[[^\]]+\]\s*$", "", s).strip()
-    s = re.sub(r"[._\- ]+", " ", s).strip()
-    return s.lower()
+    from .coordinator_content import normalize_content_name
+
+    return normalize_content_name(name, unify_separators=True)
 
 
 def _is_exact_release_match(hit_title: str, hit_size: int, target_name: str, target_size: int) -> bool:
@@ -585,18 +576,21 @@ def _is_exact_release_match(hit_title: str, hit_size: int, target_name: str, tar
     return release_title_matches(hit_title, hit_size, target_name, target_size)
 
 
-def release_title_matches(hit_title: str, hit_size: int, target_name: str, target_size: int) -> bool:
+def release_title_matches(hit_title: str, hit_size: int, target_name: str, target_size: int,
+                          *, kind: str | None = None) -> bool:
     """Public exact-release predicate shared with the coordinator.
 
     Same rules as the `best_match` selection gate (normalized title equality
-    with unified separators, plus min(50 MiB, 2%) size agreement), so a
+    with unified separators, plus per-kind size agreement), so a
     downloaded `.torrent` whose *internal* name/size drifted from its index
     listing is still rejected before its bytes reach any client.
     """
-    if _norm_title_for_match(hit_title) != _norm_title_for_match(target_name):
+    from .coordinator_content import normalize_content_name, size_within_tolerance
+
+    if (normalize_content_name(hit_title, unify_separators=True)
+            != normalize_content_name(target_name, unify_separators=True)):
         return False
-    from .coordinator_content import size_within_tolerance
-    return size_within_tolerance(hit_size, target_size)
+    return size_within_tolerance(hit_size, target_size, kind=kind)
 
 
 def _findtext_ns(item: Any, name: str) -> str:

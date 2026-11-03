@@ -20,12 +20,21 @@ from .state import State, TorrentState
 log = logging.getLogger(__name__)
 
 
-def normalize_content_name(name: str) -> str:
+def normalize_content_name(name: str, *, unify_separators: bool = False) -> str:
     """Normalize release/torrent names for deduplication and grouping.
 
     Strips trailing indexer tags (e.g. '[A1B2C3D4]', '[FL]'), trailing
     file extensions ('.torrent', '.mkv', etc.), and case-folds/strips.
     Loops until stable so 'Show [A] [B]' and 'Movie.mkv.torrent' fully collapse.
+
+    With `unify_separators`, `.`/`_`/`-`/space runs also collapse to one
+    space so punctuation variants of one release compare equal (search
+    recall: 'Show.S01' == 'Show S01'). Grouping/dedup callers keep the
+    default False — separators stay significant for row identity, and
+    only the search-side matchers opt into unification. This is the one
+    implementation backing both coordinator grouping and Prowlarr title
+    matching (which previously drifted: fewer extensions, single pass,
+    opposite strip order — all subsumed by the loop).
     """
     s = (name or "").strip()
     for _ in range(5):
@@ -39,37 +48,63 @@ def normalize_content_name(name: str) -> str:
                 break
         if s == prev:
             break
+    if unify_separators:
+        s = re.sub(r"[._\- ]+", " ", s).strip()
     return s.lower()
 
 
-def size_within_tolerance(hit_size: int, target_size: int) -> bool:
-    """True iff two byte sizes agree within min(50 MiB, 2%).
+#: Per-kind size agreement for release matching: (absolute cap, fraction).
+#: Series content repacks/propers routinely shift tens of MB on multi-GB
+#: packs (a 60 MiB repack diff must not park an episode forever), while
+#: movies keep the tighter historical rule. Unknown kinds keep legacy.
+_SIZE_TOLERANCE_BY_KIND: dict[str, tuple[int, float]] = {
+    "episode": (100 * 1024 * 1024, 0.05),
+    "season": (100 * 1024 * 1024, 0.05),
+    "mixed": (100 * 1024 * 1024, 0.05),
+    "movie": (50 * 1024 * 1024, 0.02),
+}
+_SIZE_TOLERANCE_DEFAULT = (50 * 1024 * 1024, 0.02)
+
+
+def size_within_tolerance(hit_size: int, target_size: int, *, kind: str | None = None) -> bool:
+    """True iff two byte sizes agree within the (per-kind) tolerance.
 
     A zero on either side means "unknown" and passes — callers only gate
     when both sides are known. Shared by the coordinator and Prowlarr
     matchers so the rule can't drift between selection and verification.
+    `kind` selects the series/movie window; None keeps the legacy
+    min(50 MiB, 2%) for every caller that doesn't pass one.
     """
     if hit_size > 0 and target_size > 0:
-        tolerance = min(1024 * 1024 * 50, int(target_size * 0.02))
+        try:
+            cap, frac = _SIZE_TOLERANCE_BY_KIND.get(
+                (kind or "").lower(), _SIZE_TOLERANCE_DEFAULT)
+            tolerance = min(int(cap), int(target_size * float(frac)))
+        except (TypeError, ValueError):
+            tolerance = min(1024 * 1024 * 50, int(target_size * 0.02))
         return abs(hit_size - target_size) <= tolerance
     return True
 
 
-def _matches_release(hit_title: str, hit_size: int, target_name: str, target_size: int) -> bool:
-    """Check if a Prowlarr hit matches the target release by title and size."""
-    ht_norm = normalize_content_name(hit_title)
-    tg_norm = normalize_content_name(target_name)
-    title_matches = (
-        ht_norm == tg_norm
-        or hit_title.strip().lower() == target_name.strip().lower()
-    )
-    if not title_matches:
+def _matches_release(hit_title: str, hit_size: int, target_name: str, target_size: int,
+                     *, kind: str | None = None, unify_separators: bool = False) -> bool:
+    """Check if a Prowlarr hit matches the target release by title and size.
+
+    Single predicate for index selection and supplement matching (the old
+    raw-lower fallback was subsumed: raw-equal strings always normalize
+    equal). Pass the row's classification kind for the per-kind size
+    window; search-recall callers opt into separator unification.
+    """
+    ht_norm = normalize_content_name(hit_title, unify_separators=unify_separators)
+    tg_norm = normalize_content_name(target_name, unify_separators=unify_separators)
+    if ht_norm != tg_norm:
         return False
-    return size_within_tolerance(hit_size, target_size)
+    return size_within_tolerance(hit_size, target_size, kind=kind)
 
 
 def _verified_cross_seed_blob(
-    blob: bytes | None, *, target_name: str, target_size: int, hit_title: str
+    blob: bytes | None, *, target_name: str, target_size: int, hit_title: str,
+    kind: str | None = None,
 ) -> tuple[bytes, str, str] | None:
     """Decode downloaded cross-seed bytes and prove they are the exact release.
 
@@ -77,6 +112,8 @@ def _verified_cross_seed_blob(
     matching is re-checked against the authoritative decoded name/size here.
     Returns (blob, real_infohash, announce_url) or None — callers treat None
     exactly like "no hit" (park/retry/fallback), never downloading onward.
+    `kind` selects the per-kind size window (must match the window the
+    selection gate used, or repacks accepted at selection die in verify).
     """
     if not blob:
         return None
@@ -97,7 +134,7 @@ def _verified_cross_seed_blob(
     try:
         from .prowlarr import release_title_matches
         ok = release_title_matches(blob_name, blob_size,
-                                   target_name, target_size)
+                                   target_name, target_size, kind=kind)
     except Exception:
         ok = False
     if not ok:

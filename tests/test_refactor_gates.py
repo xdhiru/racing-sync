@@ -177,3 +177,68 @@ async def test_fuse_gate_skipped_strict_equality(tmp_path):
     assert await skipped_present(mount, [("d/real.mkv", 11)]) == set()
     # Missing file does not skip.
     assert await skipped_present(mount, [("d/nope.mkv", 5)]) == set()
+
+
+def test_title_normalizer_is_single_implementation():
+    """Prowlarr matching delegates to the one coordinator normalizer."""
+    from racing_sync.coordinator_content import normalize_content_name
+    from racing_sync.prowlarr import _norm_title_for_match
+
+    titles = [
+        "Show.S01E01.1080p",
+        "Show.S01E01.1080p.mkv",
+        "Show.S01E01.1080p [A1B2C3D4]",
+        "Show.S01E01.1080p [A] [B].mkv.torrent",
+        "Movie.2024.mp4.torrent",
+        "Galaxy Rangers S04E08",
+        "Galaxy.Rangers.S04E08",
+    ]
+    for t in titles:
+        assert _norm_title_for_match(t) == normalize_content_name(
+            t, unify_separators=True)
+    # Unification only affects separators; grouping default stays strict.
+    assert normalize_content_name("Show.S01") != normalize_content_name("Show S01")
+    assert normalize_content_name(
+        "Show.S01", unify_separators=True) == normalize_content_name(
+            "Show S01", unify_separators=True)
+
+
+def test_size_tolerance_per_kind():
+    """Series packs tolerate repack-scale diffs; movies keep the tight rule."""
+    from racing_sync.coordinator_content import size_within_tolerance
+
+    target = 10_000_000_000
+    repack_diff = 60_000_000  # 60 MiB repack shift
+    # Legacy default unchanged.
+    assert size_within_tolerance(target, target + repack_diff) is False
+    assert size_within_tolerance(target, target + repack_diff, kind=None) is False
+    assert size_within_tolerance(target, target + repack_diff, kind="movie") is False
+    assert size_within_tolerance(target, target + repack_diff, kind="unknown") is False
+    # Series kinds admit it.
+    for kind in ("episode", "season", "mixed"):
+        assert size_within_tolerance(target, target + repack_diff, kind=kind) is True
+    # ...but not anything: 500 MiB still parks everywhere.
+    for kind in (None, "movie", "episode", "season", "mixed", "unknown"):
+        assert size_within_tolerance(target, target + 500_000_000, kind=kind) is False
+    # Unknown sizes still pass.
+    assert size_within_tolerance(0, target, kind="movie") is True
+    assert size_within_tolerance(target, 0, kind="episode") is True
+
+
+def test_matches_release_kind_and_separators():
+    """One predicate: kind window for supplements, unify opt-in for recall."""
+    from racing_sync.coordinator_content import _matches_release
+
+    # Punctuation variants need the opt-in.
+    assert not _matches_release("Show.S01", 1000, "Show S01", 1000)
+    assert _matches_release("Show.S01", 1000, "Show S01", 1000,
+                            unify_separators=True)
+    # Repack-scale episode diffs admit with kind, park without.
+    target = 10_000_000_000
+    assert not _matches_release("Show.S01", target, "Show.S01",
+                                target + 60_000_000)
+    assert _matches_release("Show.S01", target, "Show.S01",
+                            target + 60_000_000, kind="episode")
+    # Release groups still discriminate.
+    assert not _matches_release("Show.S01-GRP1", target, "Show.S01-GRP2",
+                                target, kind="episode", unify_separators=True)
