@@ -398,6 +398,25 @@ class CleanupMixin:
         except (TypeError, ValueError):
             return False
 
+    @staticmethod
+    def _cleanup_stats_unknown(t: Torrent) -> bool:
+        """True when the member's self stats are all zero (unreported, not quiet).
+
+        A daemon that reports nothing yields zeros — indistinguishable from
+        idle, so fail closed and keep. Only SELF stats count (upspeed,
+        uploaded, ratio, seed time): swarm counts (leechers/seeds) are
+        observed signals, and any lifetime seeding history (even a second)
+        proves the stats channel works. Never raises.
+        """
+        try:
+            up = int(getattr(t, "upspeed_bps", 0) or 0)
+            uploaded = int(getattr(t, "total_uploaded_bytes", 0) or 0)
+            ratio = float(getattr(t, "ratio", 0.0) or 0.0)
+            seed_s = float(getattr(t, "seeding_time_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            return True
+        return up <= 0 and uploaded <= 0 and ratio <= 0 and seed_s <= 0
+
     def _cleanup_minimums_met(self, group: list[Torrent], cfg: object) -> bool:
         """H&R minimums across every group member (0 = disabled).
 
@@ -457,6 +476,14 @@ class CleanupMixin:
                     pass
             log.debug("cleanup: %s still active on VPS1 (%d/%d racing); keeping",
                       ts.source_name[:60], len(lively), len(group))
+            return None
+        # 1b. Unknown self stats (stat-less client): never read as quiet.
+        # A stat-less Deluge looks exactly like an idle swarm — deleting on
+        # that evidence alone risks an H&R hit on a live race. Keep without
+        # bumping the activity stamp (unknown is not activity).
+        if any(self._cleanup_stats_unknown(m) for m in group):
+            log.debug("cleanup: %s has unknown swarm stats; keeping",
+                      ts.source_name[:60])
             return None
         # 2. Opt-in H&R minimums (default off — same-account fuse seeding
         #    keeps the account compliant; see [cleanup] docs).

@@ -581,3 +581,31 @@ def test_group_for_requires_known_equal_sizes():
         source_infohash="f" * 40, source_name=FNAME, total_bytes=0,
         state=State.DONE)
     assert coord._cleanup_group_for(fresh, by_hash) == []
+
+
+@pytest.mark.anyio
+async def test_unknown_stats_veto_delete(tmp_path: Path):
+    """All-zero self stats (stat-less client) never read as an idle swarm."""
+    import time
+
+    pub = "a" * 40
+    added = int(time.time()) - 5 * 24 * 3600
+    store = StateStore(tmp_path / "s.db")
+    _row(store, pub, State.DONE, completed_h_ago=None, activity_h_ago=None,
+         injected="")
+    member = _member(pub, upspeed=0, leechers=0, ratio=0.0, added_on=added)
+    member.total_uploaded_bytes = 0
+    member.seeding_time_seconds = 0
+    src = _FakeSource([member])
+    dest = _FakeDest([pub])
+    cfg = _base_cfg(tmp_path)
+    _healthy_fuse(tmp_path, store, [pub], cfg)
+    coord = _make_coord(tmp_path, store, src, dest, cfg)
+
+    await coord._maybe_cleanup_source()
+
+    # Old + quiet-looking, but stats unreported: keep (would delete on the
+    # added_on fallback alone — cf. test_done_old_quiet_no_stamp).
+    assert src.deleted == []
+    # Unknown is not activity: no stamp invented either.
+    assert store.get(pub).vps1_last_activity_at is None
