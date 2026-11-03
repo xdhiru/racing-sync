@@ -1320,9 +1320,14 @@ class ReaddMixin:
                 except (TypeError, ValueError):
                     return None
                 try:
+                    _kind = (ts.classification_kind or "").strip() or None
+                except Exception:
+                    _kind = None
+                try:
                     if not _matches_release(
                             ht, hs, ts.source_name or "",
-                            int(ts.total_bytes or 0)):
+                            int(ts.total_bytes or 0),
+                            kind=_kind, unify_separators=True):
                         return None
                 except Exception:
                     return None
@@ -1339,7 +1344,7 @@ class ReaddMixin:
                     verified = _verified_cross_seed_blob(
                         blob, target_name=ts.source_name or "",
                         target_size=int(ts.total_bytes or 0),
-                        hit_title=ht)
+                        hit_title=ht, kind=_kind)
                 except Exception:
                     return None
                 if verified is None:
