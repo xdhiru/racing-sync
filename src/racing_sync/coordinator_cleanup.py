@@ -329,18 +329,30 @@ class CleanupMixin:
     def _cleanup_group_for(self, ts: TorrentState, by_hash: dict[str, Torrent]) -> list[Torrent]:
         """Live VPS1 torrents holding this row's content.
 
-        Same normalized release name plus matching total size (0-size rows,
-        e.g. fresh adoptions, match on name alone). Only live client entries
-        are returned — already-vanished torrents need no work.
+        Same normalized release name plus KNOWN and EQUAL total size on
+        both sides. Unknown sizes never match: grouping a size-unknown
+        member (or row) by name alone could delete a different release's
+        only VPS1 copy. Only live client entries are returned —
+        already-vanished torrents need no work.
         """
         want_norm = normalize_content_name(ts.source_name or "")
         if not want_norm:
+            return []
+        try:
+            want_size = int(ts.total_bytes or 0)
+        except (TypeError, ValueError):
+            want_size = 0
+        if not want_size:
             return []
         out: list[Torrent] = []
         for t in by_hash.values():
             if normalize_content_name(t.name or "") != want_norm:
                 continue
-            if ts.total_bytes and t.size_bytes and t.size_bytes != ts.total_bytes:
+            try:
+                got_size = int(t.size_bytes or 0)
+            except (TypeError, ValueError):
+                got_size = 0
+            if not got_size or got_size != want_size:
                 continue
             out.append(t)
         return out
@@ -476,16 +488,9 @@ class CleanupMixin:
         else:
             return None
         sort_key = completed.timestamp() if completed else now_utc.timestamp()
-        if ts.total_bytes:
-            size = float(ts.total_bytes)
-        else:
-            # Fresh adoptions carry no total: dedupe by save_path so
-            # cross-seeds sharing the same on-disk files don't multiply.
-            by_path: dict[str, int] = {}
-            for m in group:
-                key = m.save_path or ""
-                by_path[key] = max(by_path.get(key, 0), int(m.size_bytes or 0))
-            size = float(sum(by_path.values()) or 0)
+        # Grouping guarantees a known row total (unknown sizes never
+        # group), so this is always the row's own byte count.
+        size = float(ts.total_bytes or 0)
         return (sort_key, size, ts, group)
 
     def _cleanup_idle_confirmed(
