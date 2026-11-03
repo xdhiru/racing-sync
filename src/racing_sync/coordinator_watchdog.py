@@ -13,7 +13,11 @@ import datetime as dt
 import logging
 import time
 
-from .coordinator_content import announce_domain, normalize_content_name
+from .coordinator_content import (
+    _created_ts,
+    announce_domain,
+    normalize_content_name,
+)
 from .coordinator_errors import (
     AbandonedError,
     TRACKER_AUTH_MARKER,
@@ -257,7 +261,7 @@ class WatchdogMixin:
         # retry budget is burned either way.
         try:
             _now_utc = dt.datetime.now(dt.timezone.utc)
-            _cands: list[tuple[tuple[int, str, str], object]] = []
+            _cands: list[tuple[tuple[int, float, str], object]] = []
             for r in rows or []:
                 try:
                     rh = (r.source_infohash or "").lower()
@@ -277,11 +281,7 @@ class WatchdogMixin:
                         _rank = int(self._watch_rank(r))
                     except Exception:
                         _rank = 2
-                    try:
-                        _created = str(getattr(r, "created_at", "") or "")
-                    except Exception:
-                        _created = ""
-                    _cands.append(((_rank, _created, rh), r))
+                    _cands.append(((_rank, _created_ts(r), rh), r))
                 except Exception:
                     continue
             _cands.sort(key=lambda item: item[0])

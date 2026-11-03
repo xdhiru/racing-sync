@@ -9,6 +9,7 @@ all names are re-exported from coordinator for backwards compat.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import re
 import time
@@ -371,6 +372,29 @@ def watch_rank(row: TorrentState, cfg) -> int:
     return 2
 
 
+def _created_ts(row: TorrentState) -> float:
+    """Sortable creation instant for election ordering.
+
+    String comparison of datetimes only orders when formats align
+    (mixed aware/naive or DB-vs-memory shapes mis-sort); a timestamp
+    never lies. Unparseable/missing sorts first (oldest). Never raises.
+    """
+    try:
+        v = getattr(row, "created_at", None)
+    except Exception:
+        return 0.0
+    try:
+        if v is None or v == "":
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, dt.datetime):
+            return v.timestamp()
+        return float(dt.datetime.fromisoformat(str(v)).timestamp())
+    except Exception:
+        return 0.0
+
+
 def watch_election_winner(rows, ts: TorrentState, cfg) -> TorrentState | None:
     """Winner blocking `ts`, or None when it may proceed. Pure.
 
@@ -420,17 +444,17 @@ def watch_election_winner(rows, ts: TorrentState, cfg) -> TorrentState | None:
             return None
         locked = sorted(
             (p for p in peers if p.state in WATCH_ELECTION_LOCKED_STATES),
-            key=lambda p: (p.source_infohash or "").lower(),
+            key=lambda p: (_created_ts(p), (p.source_infohash or "").lower()),
         )
         if locked:
             return locked[0]
 
-        def _wkey(p: TorrentState) -> tuple[int, str, str]:
+        def _wkey(p: TorrentState) -> tuple[int, float, str]:
             try:
                 rank = watch_rank(p, cfg)
             except Exception:
                 rank = 2
-            return (rank, str(getattr(p, "created_at", "") or ""),
+            return (rank, _created_ts(p),
                     (p.source_infohash or "").lower())
 
         ordered = sorted([ts, *[p for p in peers

@@ -2116,6 +2116,33 @@ def test_watch_election_skips_grace_held_peers(tmp_path: Path):
         store.close()
 
 
+def test_election_locked_earliest_created_wins():
+    """Locked peers elect by creation time, not infohash sort.
+
+    A later row with a lower hash must not steal ownership from the
+    earlier downloader (timestamps, never string-compared datetimes).
+    """
+    import datetime as dt
+
+    from racing_sync.coordinator_content import watch_election_winner
+
+    now = dt.datetime.now(dt.timezone.utc)
+
+    def _lock(h, age_s):
+        return TorrentState(
+            source_infohash=h, source_name="Show.S01", total_bytes=500,
+            cross_seed_source="watch-dir", state=State.QUEUED,
+            created_at=now - dt.timedelta(seconds=age_s))
+
+    early = _lock("z" * 40, 100)  # earlier, higher hash
+    late = _lock("a" * 40, 10)  # later, lower hash
+    waiter = TorrentState(
+        source_infohash="w" * 40, source_name="Show.S01", total_bytes=500,
+        cross_seed_source="watch-dir", state=State.NEW, created_at=now)
+    assert watch_election_winner([early, late], waiter, MagicMock()) is early
+    assert watch_election_winner([late, early], waiter, MagicMock()) is early
+
+
 @pytest.mark.anyio
 async def test_watch_sacrificial_hit_skips_hold(tmp_path: Path):
     """A download-indexer hit found by the search releases the hold at once."""
