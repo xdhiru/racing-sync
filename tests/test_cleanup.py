@@ -552,3 +552,32 @@ async def test_verdicts_evaluate_concurrently(tmp_path: Path):
         assert len(coord.source_client.deleted) == 2
     finally:
         store.close()
+
+
+def test_group_for_requires_known_equal_sizes():
+    """Unknown sizes never group: name-only matches could delete a stranger."""
+    from conftest import make_coordinator
+
+    coord = make_coordinator()
+    row = TorrentState(
+        source_infohash="r" * 40, source_name=FNAME, total_bytes=FSIZE,
+        state=State.DONE)
+    same = _member("m" * 40)
+    by_hash = {"m" * 40: same}
+    assert coord._cleanup_group_for(row, by_hash) == [same]
+
+    # Same name, different size: different release, never grouped.
+    other = _member("o" * 40)
+    other.size_bytes = FSIZE + 1
+    assert coord._cleanup_group_for(row, {"o" * 40: other}) == []
+
+    # Unknown member size: fail closed, no group.
+    nosize = _member("n" * 40)
+    nosize.size_bytes = 0
+    assert coord._cleanup_group_for(row, {"n" * 40: nosize}) == []
+
+    # Unknown row size (fresh adoption): fail closed, no group.
+    fresh = TorrentState(
+        source_infohash="f" * 40, source_name=FNAME, total_bytes=0,
+        state=State.DONE)
+    assert coord._cleanup_group_for(fresh, by_hash) == []
