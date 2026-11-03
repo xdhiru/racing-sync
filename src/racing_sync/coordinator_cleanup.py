@@ -493,7 +493,7 @@ class CleanupMixin:
         completed = ts.completed_at
         age_s = (now_utc - completed).total_seconds() if completed else 0.0
         if ts.state == State.DONE:
-            if not await self._cleanup_fuse_healthy(ts):
+            if not await self._cleanup_fuse_healthy(ts, dry_run):
                 return None
             if age_s < grace_s and not self._cleanup_idle_confirmed(ts, group, now_utc, cfg):
                 return None
@@ -565,7 +565,7 @@ class CleanupMixin:
         except Exception:
             return False
 
-    async def _cleanup_fuse_healthy(self, ts: TorrentState) -> bool:
+    async def _cleanup_fuse_healthy(self, ts: TorrentState, dry_run: bool) -> bool:
         """Re-verify the row really seeds from fuse (entries AND bytes).
 
         Single batched entry lookup by hashes, plus a file-presence check at
@@ -577,6 +577,10 @@ class CleanupMixin:
         update, no whole-row overwrite). Rows without bytes get one
         blob re-export attempt per janitor run — a healed blob verifies
         normally next time instead of pinning VPS1 forever.
+
+        Dry-run performs zero state mutations: the stamp and the healed
+        blob apply in memory only, so rehearsal output matches a live run
+        without persisting anything.
         """
         hashes = {
             h.lower() for h in (
@@ -617,12 +621,15 @@ class CleanupMixin:
             # No bytes to verify against: entries existing is NOT enough
             # (skip_check ghosts). Try healing the blob from the live
             # dest entry; until that succeeds the VPS1 copy stays.
-            if await self._cleanup_heal_blob(ts, hashes):
-                try:
-                    blob = await asyncio.to_thread(
-                        self.store.get_blob, ts.source_infohash)
-                except Exception:
-                    blob = None
+            if await self._cleanup_heal_blob(ts, hashes, dry_run):
+                if dry_run:
+                    blob = ts.cross_seed_blob or ts._blob
+                else:
+                    try:
+                        blob = await asyncio.to_thread(
+                            self.store.get_blob, ts.source_infohash)
+                    except Exception:
+                        blob = None
         expected = self._expected_fuse_files(blob)
         if not expected:
             log.warning("cleanup: no verifiable fuse bytes for %s; keeping VPS1",
@@ -642,19 +649,23 @@ class CleanupMixin:
             return False
         if not ts.fuse_verified and getattr(self, "store", None) is not None:
             try:
-                await asyncio.to_thread(
-                    self.store.set_fuse_verified, ts.source_infohash, True)
+                if not dry_run:
+                    await asyncio.to_thread(
+                        self.store.set_fuse_verified, ts.source_infohash, True)
                 ts.fuse_verified = 1
             except Exception:
                 pass
         return True
 
-    async def _cleanup_heal_blob(self, ts: TorrentState, hashes: set[str]) -> bool:
+    async def _cleanup_heal_blob(
+        self, ts: TorrentState, hashes: set[str], dry_run: bool,
+    ) -> bool:
         """Re-export .torrent bytes for a blobless row; True when healed.
 
         One best-effort export per janitor run from the live dest entry
-        (persisted via narrow update). Failures keep the old blobless
-        behavior — the VPS1 copy stays until bytes are verifiable.
+        (persisted via narrow update — in-memory only under dry-run).
+        Failures keep the old blobless behavior — the VPS1 copy stays
+        until bytes are verifiable.
         """
         try:
             export = getattr(self.dest_client, "export_torrent", None)
@@ -667,9 +678,10 @@ class CleanupMixin:
                     continue
                 if isinstance(blob, (bytes, bytearray)) and blob:
                     try:
-                        await asyncio.to_thread(
-                            self.store.set_blob, ts.source_infohash,
-                            bytes(blob))
+                        if not dry_run:
+                            await asyncio.to_thread(
+                                self.store.set_blob, ts.source_infohash,
+                                bytes(blob))
                     except Exception:
                         return False
                     ts.cross_seed_blob = bytes(blob)

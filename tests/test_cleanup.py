@@ -645,3 +645,36 @@ async def test_unknown_stats_veto_delete(tmp_path: Path):
     assert src.deleted == []
     # Unknown is not activity: no stamp invented either.
     assert store.get(pub).vps1_last_activity_at is None
+
+
+@pytest.mark.anyio
+async def test_dry_run_heals_in_memory_only(tmp_path: Path, caplog):
+    """Dry-run previews the heal path with zero persisted mutations."""
+    pub = "a" * 40
+    store = StateStore(tmp_path / "s.db")
+    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0,
+         injected="")
+    src = _FakeSource([_member(pub)])
+    dest = _FakeDest([pub])
+    cfg = _base_cfg(tmp_path)
+    fuse = tmp_path / "fuse"
+    fuse_u = tmp_path / "fuse_u"
+    fuse.mkdir(exist_ok=True)
+    fuse_u.mkdir(exist_ok=True)
+    cfg.rclone.fuse.mount = fuse
+    cfg.rclone.fuse.mount_unsorted = fuse_u
+    (fuse / FNAME).write_bytes(b"\x00" * FSIZE)
+    (fuse_u / FNAME).write_bytes(b"\x00" * FSIZE)
+    dest.export_torrent = AsyncMock(return_value=_single_file_blob())
+    cfg.cleanup = _cleanup_cfg(dry_run=True)
+    coord = _make_coord(tmp_path, store, src, dest, cfg)
+
+    with caplog.at_level("INFO", logger="racing_sync.coordinator"):
+        await coord._maybe_cleanup_source()
+
+    assert src.deleted == []
+    # Rehearsal still finds the candidate a live run would delete.
+    assert "would delete" in caplog.text
+    # ...but persists nothing: no blob, no stamp.
+    assert not store.get_blob(pub)
+    assert store.get(pub).fuse_verified == 0
