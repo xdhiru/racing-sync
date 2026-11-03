@@ -483,6 +483,42 @@ async def test_ssd_bytes_present_with_verified_bytes(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_ssd_bytes_check_runs_off_loop(tmp_path: Path):
+    """Resolves, joins, stats and sizes never run on the event loop."""
+    import threading
+    from unittest.mock import patch
+
+    import racing_sync.coordinator_cleanup as _cleanup_mod
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    (ssd / FNAME).write_bytes(b"\x00" * FSIZE)
+    files = [TorrentFile(name=FNAME, size_bytes=FSIZE, progress=1.0)]
+    pub = "b" * 40
+    store = StateStore(tmp_path / "s.db")
+    try:
+        _row(store, pub, State.MOVING, completed_h_ago=None,
+             activity_h_ago=10.0, injected="", save_path=str(ssd))
+        cfg = _base_cfg(ssd)
+        cfg.ssd.path = ssd
+        coord = _make_coord(ssd, store, _FakeSource([_member(pub)]),
+                            _FakeDest([pub], files=list(files)), cfg)
+        seen = {}
+        real_join = _cleanup_mod._safe_ssd_join
+
+        def _spy(base, name):
+            seen["thread"] = threading.current_thread()
+            return real_join(base, name)
+
+        with patch.object(_cleanup_mod, "_safe_ssd_join", side_effect=_spy):
+            assert await coord._cleanup_ssd_bytes_present(
+                store.get(pub)) is True
+        assert seen["thread"] is not threading.main_thread()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_ssd_bytes_outside_roots_fails_closed(tmp_path: Path):
     """A stale fuse-pointing save_path never proves SSD bytes."""
     ssd = tmp_path / "ssd"

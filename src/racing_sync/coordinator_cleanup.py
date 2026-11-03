@@ -707,52 +707,66 @@ class CleanupMixin:
         base = Path(ts.save_path) if ts.save_path else Path(self.cfg.dest.save_path)
         # SSD-root assert: a stale save_path pointing at the fuse mount
         # (or anywhere outside the SSD trees) must fail closed — proving
-        # bytes there is not proving them on SSD.
+        # bytes there is not proving them on SSD. Resolves, joins, stats
+        # and sizes all run in one worker thread: per-file exists/stat on
+        # the loop stalls the janitor on a slow disk.
         try:
-            _roots: list[Path] = []
+            _cfg = getattr(self, "cfg", None)
+            _raw_roots = [
+                getattr(getattr(_cfg, "ssd", None), "path", None),
+                getattr(getattr(_cfg, "dest", None), "save_path", None),
+            ]
+        except Exception:
+            _raw_roots = []
+
+        def _verify_ssd() -> bool:
             try:
-                _cfg = getattr(self, "cfg", None)
-                _raw_roots = [
-                    getattr(getattr(_cfg, "ssd", None), "path", None),
-                    getattr(getattr(_cfg, "dest", None), "save_path", None),
-                ]
-            except Exception:
-                _raw_roots = []
-            for _raw in _raw_roots:
-                if not isinstance(_raw, (str, Path)) or not str(_raw):
-                    continue
+                _roots: list[Path] = []
+                for _raw in _raw_roots:
+                    if not isinstance(_raw, (str, Path)) or not str(_raw):
+                        continue
+                    try:
+                        _roots.append(Path(_raw).resolve())
+                    except OSError:
+                        continue
                 try:
-                    _roots.append(Path(_raw).resolve())
+                    _base_real = base.resolve()
                 except OSError:
-                    continue
-            _base_real = base.resolve()
-            if not _roots or not any(
-                    _base_real == _r or _base_real.is_relative_to(_r)
-                    for _r in _roots):
-                log.warning("cleanup: SSD base %s outside SSD roots for %s; "
-                            "keeping VPS1", base, ts.source_infohash[:10])
-                return False
-        except OSError:
-            return False
-        for name, want, progress in expected:
-            try:
-                p = _safe_ssd_join(base, name)
-                if p is None:
                     return False
-                if not p.exists():
-                    return False
-                # Size alone is not proof: qB pre-allocates deselected files
-                # at full size. Require client-verified progress when known —
-                # and fail closed when unknown: a full-size preallocated
-                # partial must never pass as "complete".
-                if want and (not isinstance(progress, (int, float))
-                             or progress < 0.999):
-                    return False
-                if want and p.stat().st_size < want:
+                if not _roots or not any(
+                        _base_real == _r or _base_real.is_relative_to(_r)
+                        for _r in _roots):
                     return False
             except OSError:
                 return False
-        return True
+            for name, want, progress in expected:
+                try:
+                    p = _safe_ssd_join(base, name)
+                    if p is None:
+                        return False
+                    if not p.exists():
+                        return False
+                    # Size alone is not proof: qB pre-allocates deselected files
+                    # at full size. Require client-verified progress when known —
+                    # and fail closed when unknown: a full-size preallocated
+                    # partial must never pass as "complete".
+                    if want and (not isinstance(progress, (int, float))
+                                 or progress < 0.999):
+                        return False
+                    if want and p.stat().st_size < want:
+                        return False
+                except OSError:
+                    return False
+            return True
+
+        try:
+            ok = await asyncio.to_thread(_verify_ssd)
+        except Exception:
+            return False
+        if not ok:
+            log.warning("cleanup: SSD bytes unverifiable for %s at %s; keeping VPS1",
+                        ts.source_infohash[:10], base)
+        return ok
 
     async def _delete_source_group(
         self, ts: TorrentState, group: list[Torrent], cfg: object, dry_run: bool
