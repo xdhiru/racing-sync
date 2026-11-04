@@ -18,6 +18,25 @@ from .http_base import HTTPClientBase, AuthError
 log = logging.getLogger(__name__)
 
 
+def _scrub_add_url(u: object) -> str:
+    """Host-only rendering of an add URL for errors/logs.
+
+    URLs can carry passkeys (tracker `tr=` params) and magnet xt hashes;
+    error paths must never echo them.
+    """
+    try:
+        from urllib.parse import urlsplit as _us
+
+        _p = _us(str(u or ""))
+        if _p.scheme == "magnet":
+            return "magnet:?xt=..."
+        if _p.hostname:
+            return f"{_p.scheme}://{_p.hostname}/..."
+        return f"{(_p.scheme or 'url')}:..."
+    except Exception:
+        return "<unparsable>"
+
+
 class QBittorrentClient(TorrentClient, HTTPClientBase):
     """Speaks the qBittorrent WebUI v2 API."""
 
@@ -272,6 +291,11 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
     ) -> AddResult:
         if not urls and not torrent_files:
             raise ValueError("add_torrent requires urls or torrent_files")
+        if urls and torrent_files:
+            raise ValueError(
+                "add_torrent takes urls or torrent_files, not both "
+                "(mixed multipart keeps only the last urls part on some "
+                "qB versions — split into two calls)")
 
         if urls:
             # Never hand daemon-local paths or hostless URLs to the
@@ -282,7 +306,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 try:
                     _p = _us(u)
                 except Exception:
-                    raise ValueError(f"qbittorrent add_torrent refusing unparsable URL: {u!r}")
+                    raise ValueError(f"qbittorrent add_torrent refusing unparsable URL: {_scrub_add_url(u)}")
                 if _p.scheme not in ("http", "https", "magnet"):
                     raise ValueError(
                         f"qbittorrent add_torrent refusing scheme "
@@ -290,7 +314,8 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                         f"paths to the VPS2 daemon)")
                 if _p.scheme in ("http", "https") and not _p.hostname:
                     raise ValueError(
-                        f"qbittorrent add_torrent refusing URL without host: {u!r}")
+                        "qbittorrent add_torrent refusing URL without host: "
+                        f"{_scrub_add_url(u)}")
 
         fields: dict[str, str] = {
             "savepath": save_path,
@@ -313,14 +338,16 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             # Sending multiple `urls` parts keeps only the last on some versions.
             data.add_field("urls", "\n".join(urls))
         if torrent_files:
+            from ..watchdir import MAX_TORRENT_BYTES
+
             for idx, blob in enumerate(torrent_files):
-                try:
-                    _n = len(blob or b"")
-                except Exception:
-                    _n = 0
-                if _n > 20 * 1024 * 1024:
+                if not isinstance(blob, (bytes, bytearray)):
                     raise ValueError(
-                        "torrent payload exceeds 20 MiB; refusing")
+                        f"torrent payload #{idx} is not bytes "
+                        f"({type(blob).__name__}); refusing")
+                if len(blob) > MAX_TORRENT_BYTES:
+                    raise ValueError(
+                        f"torrent payload exceeds {MAX_TORRENT_BYTES} bytes; refusing")
                 fname = f"torrent_{idx}.torrent"
                 data.add_field(
                     "torrents",
@@ -559,7 +586,15 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                         f"{MAX_TORRENT_BYTES} bytes"
                     )
                 chunks.append(chunk)
-            return b"".join(chunks)
+            data = b"".join(chunks)
+            # A bencoded torrent is always a dict: refuse empty/error
+            # pages before they travel as "bytes" (callers treat b""
+            # as a clean miss, but HTML garbage must fail loudly).
+            if not data.startswith(b"d"):
+                raise ValueError(
+                    f"qB .torrent export for {torrent_hash} is not bencoded data"
+                )
+            return data
 
     async def get_properties(self, torrent_hash: str) -> dict[str, Any]:
         return await self._request_json(
