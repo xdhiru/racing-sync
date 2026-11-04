@@ -92,6 +92,75 @@ async def test_qbittorrent_export_torrent_rejects_oversize():
 
 
 @pytest.mark.anyio
+async def test_qbittorrent_export_rejects_non_bencoded():
+    """Empty/error pages fail loudly instead of travelling as b''."""
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+
+    async def _chunks(payload: bytes):
+        yield payload
+
+    def _ctx(payload: bytes):
+        class DummyResponseContext:
+            async def __aenter__(self):
+                resp = MagicMock()
+                resp.content.iter_chunked = MagicMock(
+                    side_effect=lambda size: _chunks(payload))
+                return resp
+
+            async def __aexit__(self, *args):
+                pass
+
+        return DummyResponseContext()
+
+    for bad in (b"", b"<html>login</html>", b"Fails."):
+        async def mock_request(method, endpoint, params=None, **kwargs):
+            return _ctx(bad)
+
+        client.request = mock_request
+        with pytest.raises(ValueError, match="not bencoded"):
+            await client.export_torrent("abc12345")
+
+
+@pytest.mark.anyio
+async def test_qbittorrent_add_rejects_mixed_and_non_bytes():
+    """urls+files together and non-bytes payloads refuse before any POST."""
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+    client.request = AsyncMock()
+
+    with pytest.raises(ValueError, match="not both"):
+        await client.add_torrent(urls=["http://example.com/x.torrent"],
+                                 torrent_files=[b"d8:announcee"],
+                                 save_path="/downloads")
+    with pytest.raises(ValueError, match="not bytes"):
+        await client.add_torrent(torrent_files=["not-bytes"],
+                                 save_path="/downloads")
+    client.request.assert_not_called()
+
+
+def test_qbittorrent_add_url_errors_scrub_secrets():
+    """Add-URL rejections name the scheme/host, never passkeys or hashes."""
+    from racing_sync.clients.qbittorrent import _scrub_add_url
+
+    assert _scrub_add_url(
+        "http://tracker.example/announce?passkey=SECRET") == "http://tracker.example/..."
+    assert _scrub_add_url(
+        "magnet:?xt=urn:btih:" + "a" * 40 + "&tr=http://t.example/a?pass=x") == "magnet:?xt=..."
+    assert "SECRET" not in _scrub_add_url("http://u/p?passkey=SECRET")
+
+
+@pytest.mark.anyio
+async def test_qbittorrent_add_file_url_refuses_without_path():
+    """file:// URLs refuse without echoing the local path."""
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+    with pytest.raises(ValueError) as exc:
+        await client.add_torrent(urls=["file:///etc/passwd"], save_path="/downloads")
+    assert "/etc/passwd" not in str(exc.value)
+
+
+@pytest.mark.anyio
 async def test_qbittorrent_set_save_path_uses_hashes_field():
     cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
     client = QBittorrentClient(cfg, label="dest-qb")
