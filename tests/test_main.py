@@ -344,7 +344,9 @@ def test_app_config_rejects_ssd_fuse_overlap(tmp_path: Path):
 
 
 def test_check_config_flags_same_remote_and_cap(tmp_path: Path):
-    """default==unsorted and cap>disk surface as check-config problems."""
+    """default==unsorted refuses at load; cap>disk surfaces as check-config problem."""
+    import pytest
+    from pydantic import ValidationError
     from racing_sync.__main__ import _check_config_env
     from racing_sync.config import AppConfig
 
@@ -352,9 +354,16 @@ def test_check_config_flags_same_remote_and_cap(tmp_path: Path):
                                          'unsorted = "remote:movies/"')
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(same_remote)
+    with pytest.raises(ValidationError, match="same tree"):
+        AppConfig.from_toml(cfg_file)
+    cfg_file.write_text(MINIMAL_CONFIG)
     cfg = AppConfig.from_toml(cfg_file)
-    problems = _check_config_env(cfg)
-    assert any("unsorted" in p for p in problems)
+    from types import SimpleNamespace
+
+    with patch("shutil.disk_usage",
+               return_value=SimpleNamespace(total=10**8, used=0, free=10**8)):
+        problems = _check_config_env(cfg)
+    assert any("max_inflight_bytes" in p for p in problems)
 
 
 def test_general_config_preferred_grace_default():

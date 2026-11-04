@@ -311,8 +311,16 @@ def test_reject_hijack_flags_normalizes_variants():
                 "-password-command=x", "--ask-password"):
         with pytest.raises(RcloneError):
             _reject_hijack_flags([bad], "test")
+    # Credential families and the remote-control surface are refused too.
+    for bad in ("--password", "--rc", "--rc-addr", "--rc-user",
+                "--drive-token", "--s3-session-token", "--b2-key=x",
+                "--dropbox-client-secret", "--gcs-client-id",
+                "--custom-token"):
+        with pytest.raises(RcloneError):
+            _reject_hijack_flags([bad], "test")
     # Legit tuning flags pass through untouched.
-    _reject_hijack_flags(["--transfers=4", "-v", "--bwlimit=0"], "test")
+    _reject_hijack_flags(["--transfers=4", "-v", "--bwlimit=0",
+                          "--s3-chunk-size=64M"], "test")
 
 
 def test_move_timeout_seconds_falls_back_for_test_doubles():
