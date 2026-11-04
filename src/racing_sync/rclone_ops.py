@@ -201,24 +201,30 @@ def _reject_hijack_flags(flags: list[str] | None, where: str) -> None:
     """Refuse rclone flags that swap config/credentials (defense in depth).
 
     The config validator is the primary gate; this covers programmatic
-    callers. Narrow on purpose: tuning flags (--transfers, --bwlimit,
+    callers. Shares the predicate with config so the two gates cannot
+    drift. Narrow on purpose: tuning flags (--transfers, --bwlimit,
     --s3-chunk-size, ...) pass through untouched.
     """
+    try:
+        from .config import _is_rclone_hijack_flag as _is_hijack
+    except Exception:
+        _is_hijack = None
     for item in flags or []:
         try:
-            flag = str(item).strip().lower().split("=", 1)[0]
-            # Normalize any dash count and underscores (-config,
-            # ---config, --password_command) to the bare canonical form,
-            # mirroring the config validator.
-            norm = flag.lstrip("-").replace("_", "-")
+            if _is_hijack is not None:
+                blocked = bool(_is_hijack(item))
+            else:
+                flag = str(item).strip().lower().split("=", 1)[0]
+                norm = flag.lstrip("-").replace("_", "-")
+                blocked = norm in ("config", "password-command", "ask-password",
+                                   "config-file", "c",
+                                   "log-file", "log-file-max-size", "syslog", "syslog-facility",
+                                   "s3-access-key-id", "s3-secret-access-key",
+                                   "files-from", "files-from-raw", "files-from-encoding",
+                                   "filter-from", "exclude-file", "include-file")
         except Exception:
             continue
-        if norm in ("config", "password-command", "ask-password",
-                      "config-file", "c",
-                      "log-file", "log-file-max-size", "syslog", "syslog-facility",
-                      "s3-access-key-id", "s3-secret-access-key",
-                      "files-from", "files-from-raw", "files-from-encoding",
-                      "filter-from", "exclude-file", "include-file"):
+        if blocked:
             raise RcloneError(
                 f"refusing rclone {where} flag that hijacks config/credentials/filters: {item!r}"
             )

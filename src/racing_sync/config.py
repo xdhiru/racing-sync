@@ -306,9 +306,145 @@ class RemoteConfig(BaseModel):
             raise ValueError(
                 f"rclone remote path must include a path after 'name:', got: {v!r}"
             )
+        # NOTE: a leading '/' after the colon (`remote:/media/`) is valid
+        # rclone addressing the remote root — only `..` escapes are refused.
+        if ".." in [seg for seg in path.replace("\\", "/").split("/")]:
+            raise ValueError(
+                f"rclone remote path must not contain '..' segments "
+                f"(escape from the remote root, got: {v!r})"
+            )
         if not v.endswith("/"):
             raise ValueError(f"rclone remote path must end with '/', got: {v!r}")
         return v
+
+    @model_validator(mode="after")
+    def _no_shared_tree(self) -> "RemoteConfig":
+        """default and unsorted must not be the same tree.
+
+        The identical tree for both makes moves land inside their own
+        source filter — silent data loops. Sibling subtrees under one
+        remote (`remote:qb/` + `remote:qb/unsorted/`) are the documented
+        layout and stay allowed.
+        """
+        def _parts(v: str) -> tuple[str, str]:
+            m = re.match(r"^([A-Za-z0-9_\-]+):(.*)$", (v or "").strip())
+            if not m:
+                return "", ""
+            return m.group(1), m.group(2).rstrip("/")
+        d_name, d_path = _parts(self.default)
+        u_name, u_path = _parts(self.unsorted)
+        if d_name and d_name == u_name and d_path == u_path:
+            raise ValueError(
+                f"rclone remotes default ({self.default!r}) and unsorted "
+                f"({self.unsorted!r}) share the same tree — moves would land "
+                "inside their own source; use disjoint paths"
+            )
+        return self
+
+
+#: episode_regex patterns already proven safe by the backtracking probe
+#: (per process — config loads repeat the default constantly).
+_REDOS_PROBED_SAFE: dict[str, None] = {}
+
+
+def _redos_probe(pattern: str) -> None:
+    """Reject catastrophic-backtracking regexes via a subprocess probe.
+
+    In-process timeouts cannot stop C-level `re` backtracking (no kill
+    switch; a wedged thread holds the GIL), so the adversarial inputs run
+    in a child interpreter with a hard timeout. Safe patterns finish in
+    milliseconds; evil ones are killed at the deadline. Results cache per
+    pattern — the default probes once per process. Raises ValueError on
+    evil; probe-infra failures pass open (length + compile guards remain).
+    """
+    if pattern in _REDOS_PROBED_SAFE:
+        return
+    # NOTE: runs must be lowercase-consumable: backtracking only explodes
+    # when the atoms actually match (uppercase runs fail instantly).
+    # Evils travel via argv and stay small (~4KB total): Windows caps
+    # command lines (~32K; long argv fails the spawn with WinError 206),
+    # and stdin piping deadlocks against an unresponsive child. A 200-run
+    # already means 2^200 paths for a nested quantifier — plenty.
+    _evil_inputs = (
+        "a" * 200 + "!",
+        "a." * 250,
+        " " * 1000 + "!",
+        "[FL] " * 250,
+        "S01E01" * 150 + "!",
+        "a" * 150 + "b" * 150 + "!",
+    )
+    _prog = (
+        "import re, sys;"
+        "rx = re.compile(sys.argv[1]);"
+        "[rx.search(x) for x in sys.argv[2:]]"
+    )
+    try:
+        import subprocess as _sp
+        import sys as _sys
+
+        _res = _sp.run([_sys.executable, "-c", _prog, pattern, *_evil_inputs],
+                       timeout=5.0, capture_output=True)
+        if _res.returncode != 0:
+            raise ValueError(
+                "episode_regex probe errored in the worker "
+                f"(rc={_res.returncode}): cannot prove it safe"
+            )
+    except _sp.TimeoutExpired:
+        raise ValueError(
+            "episode_regex did not finish the backtracking probe "
+            "within 5s — likely catastrophic backtracking (ReDoS); "
+            "simplify nested quantifiers"
+        )
+    except ValueError:
+        raise
+    except Exception:
+        pass
+    _REDOS_PROBED_SAFE[pattern] = None
+
+
+#: Exact-match rclone flags that hijack config/credentials/filters.
+#: Shared with rclone_ops._reject_hijack_flags (runtime defense in depth)
+#: so the two gates cannot drift.
+_RCLONE_HIJACK_EXACT = frozenset({
+    "config", "password-command", "ask-password",
+    "config-file", "c",
+    "log-file", "log-file-max-size", "syslog", "syslog-facility",
+    "password",
+    "s3-access-key-id", "s3-secret-access-key", "s3-session-token",
+    "drive-client-id", "drive-client-secret", "drive-token",
+    "gcs-client-id", "gcs-client-secret", "gcs-token",
+    "b2-account", "b2-key",
+    "dropbox-client-id", "dropbox-client-secret", "dropbox-token",
+    "onedrive-client-id", "onedrive-client-secret", "onedrive-token",
+    "box-client-id", "box-client-secret", "box-token",
+    "files-from", "files-from-raw", "files-from-encoding",
+    "filter-from", "exclude-file", "include-file",
+})
+
+
+def _is_rclone_hijack_flag(item: object) -> bool:
+    """True when an rclone flag smuggles config/credentials/remote-control.
+
+    Normalizes dash count and underscores like the runtime guard, then
+    matches exact credential/config/filter flags plus whole families:
+    every `--rc*` flag (remote-control surface) and every provider
+    `--*-token` / `--*-client-id` / `--*-client-secret` flag. Tuning
+    flags (--transfers, --bwlimit, --s3-chunk-size, ...) never match.
+    """
+    try:
+        norm = str(item).strip().lower().split("=", 1)[0].lstrip("-").replace("_", "-")
+    except Exception:
+        return False
+    if not norm:
+        return False
+    if norm in _RCLONE_HIJACK_EXACT:
+        return True
+    if norm == "rc" or norm.startswith("rc-"):
+        return True
+    if (norm.endswith("-token") or norm.endswith("-client-id")
+            or norm.endswith("-client-secret")):
+        return True
+    return False
 
 
 class FuseConfig(BaseModel):
@@ -366,32 +502,24 @@ class RcloneConfig(BaseModel):
 
         ``--config`` (any form) swaps the whole rclone config; anything
         matching ``--password-command`` / ``--ask-password`` executes or
-        prompts. Both are footguns in a tuning list — everything else
-        (transfers, bwlimit, s3-chunk-size, ...) passes through.
+        prompts; credential-bearing provider flags and the `--rc*`
+        remote-control surface are refused too. Everything else
+        (transfers, bwlimit, s3-chunk-size, ...) passes through. The
+        runtime guard (rclone_ops) shares the predicate.
         """
         bad: list[str] = []
         for item in v or []:
             try:
-                low = str(item).strip().lower()
+                if _is_rclone_hijack_flag(item):
+                    bad.append(str(item))
             except Exception:
                 continue
-            # Normalize like the runtime guard (rclone_ops): any dash
-            # count and underscores collapse, so `-config`,
-            # `---config` and `--password_command` cannot slip past an
-            # exact-match blocklist.
-            norm = low.split("=", 1)[0].lstrip("-").replace("_", "-")
-            if norm in ("config", "password-command", "ask-password",
-                        "config-file", "c",
-                        "log-file", "log-file-max-size", "syslog", "syslog-facility",
-                        "s3-access-key-id", "s3-secret-access-key",
-                        "files-from", "files-from-raw", "files-from-encoding",
-                        "filter-from", "exclude-file", "include-file"):
-                bad.append(str(item))
         if bad:
             raise ValueError(
                 "rclone move flags must not include config/credential/filter-hijack "
                 "flags (--config[-file], --password-command, --ask-password, "
-                "--log-file, --syslog, --s3-access-key-id, --files-from*, "
+                "--password, --rc*, --*-token/--*-client-id/--*-client-secret, "
+                "--s3-access-key-id, --files-from*, "
                 "--filter-from, --exclude/include-file), got: "
                 f"{bad!r}"
             )
@@ -413,6 +541,8 @@ class ClassifierConfig(BaseModel):
         if len(v) > 500:
             raise ValueError("episode_regex exceeds 500 chars (ReDoS guard)")
         re.compile(v)  # raises if invalid
+        # Backtracking probe: adversarial inputs must match fast.
+        _redos_probe(v)
         return v
 
     @property
@@ -1190,17 +1320,20 @@ class AppConfig(BaseModel):
             data = tomllib.load(f)
         _warn_unknown_keys(cls, data)
         # Secrets at rest: the file holds passwords/api keys/bot tokens —
-        # warn when group/other can read it (0600 recommended).
+        # warn when group/other can read it (0600 recommended). POSIX-only:
+        # Windows ACLs don't map to mode bits, so the check is meaningless
+        # (and noisy) there.
         try:
             import os as _os
-            _mode = _os.stat(path).st_mode & 0o077
-            if _mode:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "config file %s is readable by group/other (mode %o); "
-                    "consider chmod 600 — it holds secrets",
-                    path, _os.stat(path).st_mode & 0o777,
-                )
+            if _os.name == "posix":
+                _mode = _os.stat(path).st_mode & 0o077
+                if _mode:
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        "config file %s is readable by group/other (mode %o); "
+                        "consider chmod 600 — it holds secrets",
+                        path, _os.stat(path).st_mode & 0o777,
+                    )
         except Exception:
             pass
         return cls.model_validate(data)
@@ -1292,10 +1425,19 @@ class AppConfig(BaseModel):
 
         SSD dirs nested inside (or containing) a fuse mount misclassify
         every torrent (on_fuse detection, move sources and wipe guards all
-        assume disjoint trees) — advisory warnings were not enough. Path
-        comparison mirrors the startup overlap warning.
+        assume disjoint trees) — advisory warnings were not enough. Paths
+        resolve (symlinks, `..`, case) before comparison so an SSD
+        symlinked into a fuse mount cannot slip past string matching.
         """
         def _norm(p: object) -> str:
+            try:
+                import os as _os
+                resolved = str(Path(str(p or "")).resolve())
+                if _os.name == "nt":
+                    return resolved.lower()
+                return resolved
+            except Exception:
+                pass
             try:
                 return str(p or "").rstrip("/\\").replace("\\", "/")
             except Exception:

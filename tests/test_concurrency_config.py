@@ -570,6 +570,10 @@ def test_rclone_flag_validator_rejects_dash_variants():
                 "--password_command", "--ask-password=yes"):
         with pytest.raises(ValidationError):
             _cfg_with([bad])
+    for bad in ("--password", "--rc-addr", "--drive-token",
+                "--s3-session-token", "--b2-key", "--custom-token"):
+        with pytest.raises(ValidationError):
+            _cfg_with([bad])
 
 
 def test_warn_unknown_keys_descends_into_indexer_lists(caplog):
@@ -994,3 +998,48 @@ def test_config_strategy_rejects():
                      password="CHANGE_ME")
     assert SourceConfig(
         type="qbittorrent", host="http://seedbox.lan:8080").host.startswith("http")
+
+
+def test_remote_dotdot_rejected_and_overlap_resolves():
+    """`..` escapes refuse; resolved paths catch symlink-style overlap."""
+    import pytest
+    from pydantic import ValidationError
+    from racing_sync.config import RemoteConfig
+
+    with pytest.raises(ValidationError, match=r"\.\."):
+        RemoteConfig(default="remote:a/../b/", unsorted="remote:u/")
+    # Distinct trees stay fine (nested documented layout allowed).
+    assert RemoteConfig(
+        default="remote:qb/", unsorted="remote:qb/unsorted/").default == "remote:qb/"
+
+
+def test_storage_overlap_resolves_dotdot(tmp_path: Path):
+    """An SSD path resolving into a fuse mount refuses at load."""
+    import pytest
+    import tomllib
+    from pydantic import ValidationError
+    from racing_sync.config import AppConfig
+
+    fuse = tmp_path / "fuse"
+    tricky_ssd = tmp_path / "sub" / ".." / "fuse"
+    text = _minimal_app_toml().replace(
+        'mount = "/mnt/fuse"', f'mount = "{fuse}"').replace(
+        'mount_unsorted = "/mnt/fuse/unsorted"',
+        f'mount_unsorted = "{fuse}-u"').replace(
+        'path = "/downloads"', f'path = "{tricky_ssd}"').replace(
+        'save_path = "/downloads"', f'save_path = "{tricky_ssd}"')
+    with pytest.raises(ValidationError, match="overlap"):
+        AppConfig.model_validate(tomllib.loads(text))
+
+
+def test_episode_regex_redos_probe():
+    """Catastrophic-backtracking patterns refuse at load; defaults pass."""
+    import pytest
+    from pydantic import ValidationError
+    from racing_sync.config import ClassifierConfig
+
+    assert ClassifierConfig().episode_regex.startswith("(?i)")
+    with pytest.raises(ValidationError, match="backtracking"):
+        ClassifierConfig(episode_regex=r"(a+)+$")
+    with pytest.raises(ValidationError, match="backtracking"):
+        ClassifierConfig(episode_regex=r"^(a|aa)+$")
