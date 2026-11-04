@@ -110,8 +110,10 @@ def _do_reset(cfg: AppConfig) -> list[str]:
     except Exception:
         db = None
     if db is not None and db_refusal is not None:
-        removed.append(f"{db_refusal}; state.db kept")
-        db = None
+        # Abort the whole reset, not just the DB half: wiping logs while
+        # keeping state.db is a half-fresh state (old rows, no history).
+        # The daemon then starts normally against the kept DB.
+        return [f"{db_refusal}; state.db kept — reset aborted, nothing wiped"]
     if db is not None:
         for candidate in _db_sidecar_paths(db):
             try:
@@ -160,12 +162,14 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
     try:
         await dest.start()
     except Exception as e:
-        done.append(f"full reset: dest client unreachable ({e}); client entries kept")
+        # Abort the whole wipe, not just the dest half: clearing SSD/blobs
+        # while dest entries survive re-adopts rows whose bytes are gone.
         try:
             await dest.close()
         except Exception:
             pass
-        dest = None  # type: ignore[assignment]
+        return [f"full reset: dest client unreachable ({e}); "
+                "full reset aborted, nothing wiped"]
     if dest is not None:
         try:
             try:
@@ -173,6 +177,11 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
             except Exception as e:
                 racing = []
                 done.append(f"full reset: cannot list dest entries ({e})")
+                try:
+                    await dest.close()
+                except Exception:
+                    pass
+                return done + ["full reset aborted, nothing wiped"]
             for t in racing:
                 h = (getattr(t, "hash", "") or "").lower()
                 if not h:
@@ -282,26 +291,21 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        _backup = backup_db(cfg, tag="pre-forget")
+        _backup, _backup_reason = backup_db(cfg, tag="pre-forget")
         if _backup is not None:
             print(f"state.db backed up to: {_backup}")
+        elif _backup_reason == "no-db":
+            print("warning: no state.db yet; continuing without backup",
+                  file=sys.stderr)
         else:
             # Distinguish "no DB file yet" (nothing to lose) from a real
             # snapshot failure (destructive op without a safety net):
             # refuse the latter instead of warn-continuing.
-            try:
-                import os as _os
-                _db_exists = _os.path.exists(str(cfg.general.state_db))
-            except Exception:
-                _db_exists = True
-            if _db_exists:
-                print("refusing forget --apply: state.db backup failed "
-                      "(snapshot error, not a missing DB); fix the backup "
-                      "path before deleting anything.",
-                      file=sys.stderr)
-                return 2
-            print("warning: no state.db yet; continuing without backup",
+            print("refusing forget --apply: state.db backup failed "
+                  f"({_backup_reason}); fix the backup "
+                  "path before deleting anything.",
                   file=sys.stderr)
+            return 2
 
     async def _run() -> dict:
         store = StateStore(cfg.general.state_db)
@@ -381,15 +385,11 @@ def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
     from .safety import DaemonLock, daemon_lock_path
     from .state import StateStore
 
-    try:
-        store = StateStore(cfg.general.state_db)
-    except Exception as e:
-        print(f"forget failed: {e}", file=sys.stderr)
-        return 1
     _mutating = bool(getattr(args, "all", False) or getattr(args, "target", None))
     _lock = None
     if _mutating:
-        # Same race as forget --apply: refuse against a live daemon.
+        # Lock before touching the DB: refuse against a live daemon
+        # without creating anything (same race as forget --apply).
         _lp = daemon_lock_path(cfg)
         _lock = DaemonLock(_lp) if _lp is not None else None
         if _lock is not None and not _lock.acquire():
@@ -398,11 +398,22 @@ def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
                 "(stop it first).",
                 file=sys.stderr,
             )
-            try:
-                store.close()
-            except Exception:
-                pass
             return 2
+    else:
+        # Read-only --list must never mkdir/init the DB as a side effect:
+        # a missing DB simply means an empty ignore list.
+        try:
+            _db_missing = not Path(str(cfg.general.state_db)).is_file()
+        except Exception:
+            _db_missing = False
+        if _db_missing:
+            print("ignore list is empty (no state.db yet)")
+            return 0
+    try:
+        store = StateStore(cfg.general.state_db)
+    except Exception as e:
+        print(f"unignore failed: {e}", file=sys.stderr)
+        return 1
     try:
         if getattr(args, "list", False) or (not getattr(args, "target", None)
                                             and not getattr(args, "all", False)):
@@ -450,13 +461,17 @@ def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
             pass
 
 
-def _check_config_env(cfg: AppConfig) -> list[str]:
+def _check_config_env(cfg: AppConfig, *, probe_writes: bool = True) -> list[str]:
     """Best-effort environment checks beyond schema validation.
 
     Schema validation already ran (from_toml). Here: filesystem reachability
     (log dir writable, state/db parents, SSD/fuse paths exist) and the rclone
     binary being present + executable. Returns problem strings (empty = OK).
     Never raises — every probe is guarded.
+
+    `probe_writes=False` skips the log-dir write probe for the daemon-startup
+    subset: startup must be read-only (a probe file next to real logs is
+    harmless but the subset rule keeps startup side-effect free).
     """
     problems: list[str] = []
 
@@ -485,7 +500,9 @@ def _check_config_env(cfg: AppConfig) -> list[str]:
                 if not target.is_dir():
                     problems.append(f"{label} is not a directory: {target}")
                     return
-                probe = target / ".racing-sync-write-probe"
+                if not probe_writes:
+                    return
+                probe = target / f".racing-sync-write-probe-{os.getpid()}"
                 try:
                     with open(probe, "w") as _fh:
                         _fh.write("probe")
@@ -568,8 +585,8 @@ def _check_config_env(cfg: AppConfig) -> list[str]:
                 f"({_total}): grows can overcommit past ENOSPC — size the cap "
                 "below the disk"
             )
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        problems.append(f"ssd disk probe failed: {e}")
     return problems
 
 
@@ -725,6 +742,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     try:
+        # Read-only startup pre-flight (no write probes): surface broken
+        # environments loudly at startup instead of crashing mid-tick.
+        # Advisory only — the daemon still starts (a missing fuse mount is
+        # routine); check-config remains the refusing gate.
+        try:
+            for _env_problem in _check_config_env(cfg, probe_writes=False):
+                print(f"startup environment: {_env_problem}", file=sys.stderr)
+        except Exception:
+            pass
         if getattr(args, "reset", False) or getattr(args, "full", False):
             if getattr(args, "full", False) and not getattr(args, "yes", False):
                 print(
@@ -742,26 +768,20 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 2
-            _backup = backup_db(cfg, tag="pre-reset")
+            _backup, _backup_reason = backup_db(cfg, tag="pre-reset")
             if _backup is not None:
                 print(f"state.db backed up to: {_backup}")
-            else:
-                # Same guard as forget --apply: "no DB file yet" (nothing to
-                # lose) proceeds, but a real snapshot failure (e.g. full
-                # disk) refuses — deleting state.db without a backup when
-                # the backup itself just failed is how data is lost.
-                try:
-                    import os as _os
-                    _db_exists = _os.path.exists(str(cfg.general.state_db))
-                except Exception:
-                    _db_exists = True
-                if _db_exists:
-                    print("refusing --reset: state.db backup failed "
-                          "(snapshot error, not a missing DB); fix the backup "
-                          "path before deleting anything.",
-                          file=sys.stderr)
-                    return 2
+            elif _backup_reason == "no-db":
                 print("no state.db to back up (fresh start)")
+            else:
+                # A real snapshot failure (e.g. full disk) refuses — deleting
+                # state.db without a backup when the backup itself just
+                # failed is how data is lost.
+                print(f"refusing --reset: state.db backup failed "
+                      f"({_backup_reason}); fix the backup "
+                      "path before deleting anything.",
+                      file=sys.stderr)
+                return 2
             for line in _do_reset(cfg):
                 print(line)
             if getattr(args, "full", False):

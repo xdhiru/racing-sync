@@ -273,6 +273,12 @@ class DaemonLock:
     it on process death, so stale locks are impossible by construction.
     One holder at a time across daemon and mutating CLI commands.
 
+    Local filesystems only: the Windows branch (msvcrt.locking, 1 byte)
+    is ADVISORY — a process that never locks can still write — and
+    neither branch is reliable on NFS/SMB (lock daemons may be absent,
+    leases may silently lapse). Keep state.db on local disk; a second
+    daemon started over a network mount may fail to exclude.
+
     Usage: daemon holds for its lifetime (refuses to start a second
     instance); `forget --apply` / `unignore` take it non-blocking and
     refuse with "stop the daemon first" instead of racing the tick.
@@ -351,7 +357,11 @@ class DaemonLock:
 
 
 def _lock_file_nonblocking(fh) -> bool:
-    """OS file lock without waiting; False when held elsewhere."""
+    """OS file lock without waiting; False when held elsewhere.
+
+    Local disk only (see DaemonLock): advisory on Windows, unreliable
+    over NFS/SMB.
+    """
     try:
         import fcntl  # noqa: PLC0415 (posix only)
 
@@ -436,22 +446,22 @@ def _unlock_file(fh) -> None:
         pass
 
 
-def backup_db(cfg: object, *, tag: str = "manual") -> str | None:
+def backup_db(cfg: object, *, tag: str = "manual") -> tuple[str | None, str]:
     """Timestamped consistent snapshot of state.db (VACUUM INTO).
 
-    Returns the backup path, or None when there is nothing to back up
-    (missing DB) or the snapshot failed (logged by the caller via the
-    returned reason — callers treat None as "proceed without backup"
-    only for read-only paths; destructive paths must refuse instead).
-    Old backups for the same DB are pruned to the newest 7.
+    Returns (backup path or None, reason): "ok" on success, "no-db" when
+    there is nothing to back up (missing DB), or an error description when
+    the snapshot failed. Callers must not re-probe the filesystem to tell
+    "no-db" from failure apart (TOCTOU) — the reason says which. Old
+    backups for the same DB are pruned to the newest 7.
     """
     try:
         db = str(getattr(getattr(cfg, "general", cfg), "state_db", "") or "")
         if not db:
-            return None
+            return None, "no-db"
         src = Path(db)
         if not src.is_file():
-            return None
+            return None, "no-db"
         stamp = time.strftime("%Y%m%d-%H%M%S")
         safe_tag = "".join(c if (c.isalnum() or c in ("-", "_")) else "_"
                            for c in (tag or "manual"))[:24] or "manual"
@@ -466,10 +476,10 @@ def backup_db(cfg: object, *, tag: str = "manual") -> str | None:
                     conn.close()
                 except Exception:
                     pass
-        except Exception:
-            return None
+        except Exception as e:  # noqa: BLE001
+            return None, f"snapshot failed: {e}"
         if not dest.is_file():
-            return None
+            return None, "snapshot missing after VACUUM"
         # Prune: newest 7 backups for this DB survive.
         try:
             siblings = sorted(src.parent.glob(f"{src.name}.*.bak"),
@@ -481,9 +491,9 @@ def backup_db(cfg: object, *, tag: str = "manual") -> str | None:
                     pass
         except OSError:
             pass
-        return str(dest)
-    except Exception:
-        return None
+        return str(dest), "ok"
+    except Exception as e:  # noqa: BLE001
+        return None, f"backup failed: {e}"
 
 
 __all__ = [
