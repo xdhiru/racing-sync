@@ -876,3 +876,82 @@ async def test_do_queued_remote_first_skips_slot_park(tmp_path):
         assert getattr(coord, "_download_admissions", set()) == set()
     finally:
         store.close()
+
+
+def test_telegram_rate_product_warns(caplog):
+    """outbound_rate × interval > ~100 warns (Telegram 429 risk)."""
+    from racing_sync.config import TelegramConfig
+
+    with caplog.at_level("WARNING", logger="racing_sync.config"):
+        TelegramConfig(enabled=True, bot_token="1:abc", chat_id="9",
+                       outbound_rate=30, status_update_interval=5)
+    assert "outbound_rate" in caplog.text
+    assert "429" in caplog.text
+
+
+def test_telegram_repost_clamp_warns(caplog):
+    """1–4s repost intervals warn (clamped to 5 at runtime)."""
+    from racing_sync.config import TelegramConfig
+
+    with caplog.at_level("WARNING", logger="racing_sync.config"):
+        TelegramConfig(enabled=True, bot_token="1:abc", chat_id="9",
+                       active_repost_interval_seconds=3)
+    assert "clamped to 5" in caplog.text
+
+
+def _minimal_app_toml(**general_over):
+    lines = [
+        "[general]",
+        "source_poll_interval = 30",
+        "dest_poll_interval = 15",
+        "",
+        "[source]",
+        'type = "qbittorrent"',
+        'host = "http://127.0.0.1:8080"',
+        "",
+        "[dest]",
+        'host = "http://127.0.0.1:8081"',
+        'save_path = "/downloads"',
+        "",
+        "[ssd]",
+        'path = "/downloads"',
+        "max_inflight_bytes = 1000000000",
+        "skip_movie_larger_than_bytes = 1000000000",
+        "",
+        "[rclone.remote]",
+        'default = "remote:movies/"',
+        'unsorted = "remote:unsorted/"',
+        "",
+        "[rclone.fuse]",
+        'mount = "/mnt/fuse"',
+        'mount_unsorted = "/mnt/fuse/unsorted"',
+    ]
+    for key, value in general_over.items():
+        lines.insert(3, f"{key} = {value}")
+    return "\n".join(lines)
+
+
+def test_rpc_timeout_exceeding_poll_warns(caplog):
+    """An RPC budget outliving its tick warns at load."""
+    import tomllib
+
+    from racing_sync.config import AppConfig
+
+    with caplog.at_level("WARNING", logger="racing_sync.config"):
+        AppConfig.model_validate(tomllib.loads(
+            _minimal_app_toml(client_rpc_timeout_seconds=60)))
+    assert "client_rpc_timeout_seconds" in caplog.text
+
+
+def test_general_override_logs_winner(caplog):
+    """[general] overrides log which section wins."""
+    import tomllib
+
+    from racing_sync.config import AppConfig
+
+    with caplog.at_level("INFO", logger="racing_sync.config"):
+        cfg = AppConfig.model_validate(tomllib.loads(
+            _minimal_app_toml(max_active_downloads=7)))
+    assert cfg.max_active_downloads == 7
+    assert "wins over" in caplog.text
+    assert "[general].max_active_downloads=7" in caplog.text

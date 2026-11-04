@@ -444,6 +444,30 @@ class TelegramConfig(BaseModel):
             if uid not in seen:
                 seen.append(uid)
         self.admin_user_ids = seen
+        if self.enabled:
+            try:
+                _product = int(self.outbound_rate or 0) * int(self.status_update_interval or 0)
+            except (TypeError, ValueError):
+                _product = 0
+            if _product > 100:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "telegram: outbound_rate (%d) × status_update_interval (%ds) = %d "
+                    "edits per pinned-message cycle — expect Telegram 429 "
+                    "flood-control; lower the rate or lengthen the interval",
+                    self.outbound_rate, self.status_update_interval, _product,
+                )
+            try:
+                _repost = int(self.active_repost_interval_seconds or 0)
+            except (TypeError, ValueError):
+                _repost = 0
+            if 1 <= _repost <= 4:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "telegram: active_repost_interval_seconds=%d is clamped to 5 "
+                    "at runtime to respect rate limits; set 0 (off) or >= 5",
+                    _repost,
+                )
         return self
 
 
@@ -1148,6 +1172,50 @@ class AppConfig(BaseModel):
     @property
     def fuse_readd_heal_after_seconds(self) -> int:
         return self.rclone.fuse.readd_heal_missing_after_seconds
+
+    @model_validator(mode="after")
+    def _warn_suspicious_combos(self) -> "AppConfig":
+        """Log suspicious cross-section combos (warn, never refuse).
+
+        Refusing to start on a merely-slow combination would strand
+        upgrades; a loud warning at load names the trade-off instead.
+        """
+        try:
+            import logging as _logging
+            _log = _logging.getLogger(__name__)
+            try:
+                _rpc = int(self.general.client_rpc_timeout_seconds or 0)
+                _poll = min(int(self.general.source_poll_interval or 0),
+                            int(self.general.dest_poll_interval or 0))
+            except (TypeError, ValueError):
+                _rpc, _poll = 0, 0
+            if _rpc and _poll and _rpc > _poll:
+                _log.warning(
+                    "config: [general].client_rpc_timeout_seconds (%d) exceeds "
+                    "the poll interval (%ds) — a hung RPC outlives its tick; "
+                    "lower the timeout or raise the poll interval",
+                    _rpc, _poll,
+                )
+            try:
+                if self.general.max_active_downloads is not None:
+                    _log.info(
+                        "config: [general].max_active_downloads=%d wins over "
+                        "[dest].max_active_downloads=%d",
+                        self.general.max_active_downloads,
+                        self.dest.max_active_downloads,
+                    )
+                if self.general.max_concurrent_moves is not None:
+                    _log.info(
+                        "config: [general].max_concurrent_moves=%d wins over "
+                        "[rclone].max_concurrent_moves=%d",
+                        self.general.max_concurrent_moves,
+                        self.rclone.max_concurrent_moves,
+                    )
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return self
 
     def is_episode(self, name: str) -> bool:
         return bool(self.classifier._episode_re.search(name))
