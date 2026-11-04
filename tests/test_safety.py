@@ -146,7 +146,8 @@ def test_backup_db_snapshot_and_prune(tmp_path: Path):
         store.close()
     cfg = _cfg(state_db=str(db))
 
-    first = backup_db(cfg, tag="pre-reset")
+    first, reason = backup_db(cfg, tag="pre-reset")
+    assert reason == "ok"
     assert first is not None and Path(first).is_file()
     # A snapshot taken through WAL reads back the data.
     from racing_sync.state import StateStore as S2
@@ -155,11 +156,12 @@ def test_backup_db_snapshot_and_prune(tmp_path: Path):
         assert probe.get_meta("k") == "v"
     finally:
         probe.close()
-    # Missing DB → None (nothing to back up).
-    assert backup_db(_cfg(state_db=str(tmp_path / "nope.db"))) is None
+    # Missing DB reports no-db (distinct from snapshot failure — no
+    # filesystem re-probe needed to tell them apart).
+    assert backup_db(_cfg(state_db=str(tmp_path / "nope.db"))) == (None, "no-db")
     # Prune keeps the newest 7.
     for i in range(9):
-        p = backup_db(cfg, tag=f"t{i}")
+        p, _ = backup_db(cfg, tag=f"t{i}")
         assert p is not None
     survivors = sorted(db.parent.glob("state.db.*.bak"))
     assert len(survivors) == 7

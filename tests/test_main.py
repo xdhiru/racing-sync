@@ -187,7 +187,8 @@ def test_run_reset_refuses_when_backup_fails_and_db_exists(tmp_path: Path, capsy
     with patch("racing_sync.__main__.AppConfig") as mock_cfg_cls, \
          patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
          patch("racing_sync.__main__.setup_logging"), \
-         patch("racing_sync.safety.backup_db", return_value=None):
+         patch("racing_sync.safety.backup_db",
+               return_value=(None, "snapshot failed: disk full")):
         mock_cfg_cls.from_toml.return_value = cfg
         mock_coord_cls.return_value = MagicMock()
         rc = main(["run", "--config", str(cfg_file), "--reset", "--yes"])
@@ -213,7 +214,8 @@ def test_run_reset_proceeds_without_backup_when_no_db(tmp_path: Path):
     with patch("racing_sync.__main__.AppConfig") as mock_cfg_cls, \
          patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
          patch("racing_sync.__main__.setup_logging"), \
-         patch("racing_sync.safety.backup_db", return_value=None):
+         patch("racing_sync.safety.backup_db",
+               return_value=(None, "no-db")):
         mock_cfg_cls.from_toml.return_value = cfg
         mock_coord = MagicMock()
 
@@ -522,3 +524,128 @@ def test_run_async_does_not_mask_app_errors():
     with patch.dict("sys.modules", {"uvloop": fake}):
         with pytest.raises(ValueError, match="app blew up"):
             _run_async(_boom())
+
+
+def test_run_prints_startup_environment_warnings(tmp_path: Path, capsys):
+    """Daemon startup surfaces env problems loudly (read-only), then starts."""
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+
+    with patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
+         patch("racing_sync.__main__.setup_logging"):
+        mock_coord = MagicMock()
+
+        async def fake_run():
+            return 0
+
+        async def fake_shutdown():
+            pass
+
+        mock_coord.run.side_effect = fake_run
+        mock_coord.shutdown.side_effect = fake_shutdown
+        mock_coord_cls.return_value = mock_coord
+
+        rc = main(["run", "--config", str(cfg_file)])
+        assert rc == 0
+    # MINIMAL_CONFIG points at nonexistent /downloads + /mnt/fuse.
+    assert "startup environment:" in capsys.readouterr().err
+
+
+def test_unignore_list_missing_db_creates_nothing(tmp_path: Path, capsys):
+    """Read-only --list with no state.db reports empty without init."""
+    from racing_sync.__main__ import main
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+    assert main(["unignore", "--config", str(cfg_file), "--list"]) == 0
+    assert "no state.db" in capsys.readouterr().out
+
+
+def test_run_reset_aborts_on_db_refusal(tmp_path: Path, capsys):
+    """DB refusal aborts the whole reset: logs kept, daemon starts on old DB."""
+    from racing_sync.config import AppConfig
+    from racing_sync.state import StateStore
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "pyproject.toml").write_text("")
+    victim = proj / "state.db"
+    store = StateStore(victim)
+    store.close()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "keep.log").write_text("history")
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+    cfg = AppConfig.from_toml(cfg_file)
+    cfg.general.state_db = victim
+    cfg.general.log_dir = log_dir
+
+    with patch("racing_sync.__main__.AppConfig") as mock_cfg_cls, \
+         patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
+         patch("racing_sync.__main__.setup_logging"):
+        mock_cfg_cls.from_toml.return_value = cfg
+        mock_coord = MagicMock()
+
+        async def fake_run():
+            return 0
+
+        async def fake_shutdown():
+            pass
+
+        mock_coord.run.side_effect = fake_run
+        mock_coord.shutdown.side_effect = fake_shutdown
+        mock_coord_cls.return_value = mock_coord
+
+        rc = main(["run", "--config", str(cfg_file), "--reset", "--yes"])
+        assert rc == 0
+    out = capsys.readouterr().out
+    assert "aborted, nothing wiped" in out
+    assert victim.exists()
+    assert (log_dir / "keep.log").exists()
+
+
+def test_run_full_aborts_on_unreachable_dest(tmp_path: Path, capsys):
+    """Unreachable dest aborts --full: SSD data kept, nothing half-wiped."""
+    from unittest.mock import AsyncMock
+
+    from racing_sync.config import AppConfig
+
+    state_db = tmp_path / "state.db"
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    (ssd / "stranded.bin").write_bytes(b"data")
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+    cfg = AppConfig.from_toml(cfg_file)
+    cfg.general.state_db = state_db
+    cfg.general.log_dir = tmp_path / "logs"
+    cfg.ssd.path = ssd
+    cfg.dest.save_path = ssd
+
+    with patch("racing_sync.__main__.AppConfig") as mock_cfg_cls, \
+         patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
+         patch("racing_sync.__main__.setup_logging"), \
+         patch("racing_sync.clients.qbittorrent.QBittorrentClient") as mock_qb:
+        mock_cfg_cls.from_toml.return_value = cfg
+        mock_qb.return_value.start = AsyncMock(
+            side_effect=ConnectionError("refused"))
+        mock_coord = MagicMock()
+
+        async def fake_run():
+            return 0
+
+        async def fake_shutdown():
+            pass
+
+        mock_coord.run.side_effect = fake_run
+        mock_coord.shutdown.side_effect = fake_shutdown
+        mock_coord_cls.return_value = mock_coord
+
+        rc = main(["run", "--config", str(cfg_file), "--full", "--yes"])
+        assert rc == 0
+    out = capsys.readouterr().out
+    assert "aborted, nothing wiped" in out
+    assert (ssd / "stranded.bin").exists()
