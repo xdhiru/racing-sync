@@ -196,7 +196,7 @@ def test_secret_str_masking_in_repr_and_string_equality():
     assert f"user:{sec}" == "user:**********"
     assert sec.get_secret_value() == "mypassword"
 
-    cfg = SourceConfig(type="qbittorrent", host="localhost", password="mypassword")
+    cfg = SourceConfig(type="qbittorrent", host="http://localhost", password="mypassword")
     assert "mypassword" not in repr(cfg)
     assert "mypassword" not in str(cfg)
     assert "SecretStr('**********')" in repr(cfg)
@@ -955,3 +955,42 @@ def test_general_override_logs_winner(caplog):
     assert cfg.max_active_downloads == 7
     assert "wins over" in caplog.text
     assert "[general].max_active_downloads=7" in caplog.text
+
+
+def test_config_strategy_rejects():
+    """Cross-section strategy contradictions fail at load, not silently."""
+    import pytest
+    from pydantic import ValidationError
+    from racing_sync.config import (
+        CrossSeedConfig,
+        ProwlarrConfig,
+        SourceConfig,
+        SSDConfig,
+    )
+
+    # 1-char skip substrings match nearly every title.
+    with pytest.raises(ValidationError, match="too short"):
+        ProwlarrConfig(skip_query_substrings=["a"])
+    assert ProwlarrConfig(skip_query_substrings=["ab"]).skip_query_substrings == ["ab"]
+    # Retry must fit inside the max-age window.
+    with pytest.raises(ValidationError, match="must be less than"):
+        CrossSeedConfig(prowlarr_retry_interval_seconds=86400,
+                        prowlarr_max_age_seconds=3600)
+    # Refetch without Prowlarr queries is a silent no-op.
+    with pytest.raises(ValidationError, match="silent no-op"):
+        CrossSeedConfig(refetch_public_via_prowlarr=True,
+                        allow_prowlarr_cross_seed=False)
+    # Absurd inflight caps are typos, not plans.
+    with pytest.raises(ValidationError):
+        SSDConfig(path="/ssd", max_inflight_bytes=2**60,
+                  skip_movie_larger_than_bytes=1)
+    # Source origins need a scheme + host; placeholders rejected.
+    with pytest.raises(ValidationError, match="http"):
+        SourceConfig(type="qbittorrent", host="seedbox.lan:8080")
+    with pytest.raises(ValidationError, match="include a host"):
+        SourceConfig(type="qbittorrent", host="http://")
+    with pytest.raises(ValidationError, match="placeholder"):
+        SourceConfig(type="qbittorrent", host="http://seedbox.lan:8080",
+                     password="CHANGE_ME")
+    assert SourceConfig(
+        type="qbittorrent", host="http://seedbox.lan:8080").host.startswith("http")

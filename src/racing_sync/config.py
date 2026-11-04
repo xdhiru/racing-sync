@@ -209,6 +209,48 @@ class SourceConfig(BaseModel):
             raise ValueError("Deluge source requires [source.deluge_sftp] enabled")
         return self
 
+    @model_validator(mode="after")
+    def _check_host(self) -> "SourceConfig":
+        """Fail fast on unusable WebUI origins (not at first RPC)."""
+        host = (self.host or "").strip()
+        if not host.startswith(("http://", "https://")):
+            raise ValueError(
+                "source.host must start with http(s):// "
+                f"(got: {host!r})"
+            )
+        try:
+            from urllib.parse import urlsplit as _us
+            _p = _us(host)
+            if _p.username or _p.password:
+                raise ValueError(
+                    "source.host must not embed userinfo "
+                    "(creds would leak to logs — use username/password)")
+            if _p.query or _p.fragment:
+                raise ValueError(
+                    "source.host must be a bare origin (no query/fragment)")
+            if not _p.hostname:
+                raise ValueError("source.host must include a host")
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"source.host is not a valid URL: {e}")
+        for label, secret in (
+            ("username", self.username),
+            ("password", self.password.get_secret_value()
+             if isinstance(self.password, SecretStr) else str(self.password or "")),
+        ):
+            try:
+                text = str(secret or "").strip()
+            except Exception:
+                continue
+            if text and text.upper() in (
+                    "CHANGE_ME", "YOUR_USERNAME", "YOUR_PASSWORD"):
+                raise ValueError(
+                    f"source.{label} looks like an unedited placeholder "
+                    f"({text!r})"
+                )
+        return self
+
 
 class DestConfig(BaseModel):
     host: str
@@ -226,7 +268,10 @@ class DestConfig(BaseModel):
 
 class SSDConfig(BaseModel):
     path: Path
-    max_inflight_bytes: int = Field(ge=1)
+    # Upper bound (1 PiB): no SSD is that large — anything above is a
+    # typo'd zero away from silently admitting the whole disk. The live
+    # disk-total check in check-config still gates realistic values.
+    max_inflight_bytes: int = Field(ge=1, le=2**50)
     skip_movie_larger_than_bytes: int = Field(ge=1)
     safety_margin_bytes: int = Field(default=0, ge=0)
 
@@ -716,6 +761,13 @@ class ProwlarrConfig(BaseModel):
                         f"prowlarr download indexer {entry.name!r} has a blank "
                         "announce_substrings entry (blank matches every URL)"
                     )
+        for sub in self.skip_query_substrings or []:
+            if len(str(sub).strip()) < 2:
+                raise ValueError(
+                    f"prowlarr skip_query_substrings entry {sub!r} is too short "
+                    "(single characters match nearly every title — same rule "
+                    "as tracker_map substring keys)"
+                )
         self.download_indexers = entries
         if self.enabled:
             if not self.base_url.startswith(("http://", "https://")):
@@ -852,6 +904,20 @@ class CrossSeedConfig(BaseModel):
                 "cross_seed: fallback_to_racing_torrent_on_prowlarr_timeout=true "
                 "requires allow_ssh_export=true (the fallback fetches the "
                 "racing torrent's own bytes via SFTP / export endpoint)."
+            )
+        if int(self.prowlarr_retry_interval_seconds or 0) >= int(self.prowlarr_max_age_seconds or 0):
+            raise ValueError(
+                "cross_seed: prowlarr_retry_interval_seconds "
+                f"({self.prowlarr_retry_interval_seconds}) must be less than "
+                f"prowlarr_max_age_seconds ({self.prowlarr_max_age_seconds}) — "
+                "otherwise the retry clock never fires before the max-age FAIL"
+            )
+        if self.refetch_public_via_prowlarr and not self.allow_prowlarr_cross_seed:
+            raise ValueError(
+                "cross_seed: refetch_public_via_prowlarr=true with "
+                "allow_prowlarr_cross_seed=false is a silent no-op (no Prowlarr "
+                "query ever runs) — enable allow_prowlarr_cross_seed or drop "
+                "the refetch flag"
             )
         return self
 
