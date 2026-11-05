@@ -84,9 +84,14 @@ _ACTIVE_MOVES_CAP = 5000
 
 def _tree_key(tree: object) -> str | None:
     try:
-        return os.path.normcase(os.path.abspath(os.fspath(tree)))
+        # realpath, not abspath: two spellings of one tree (symlinks,
+        # `..`, case) must share one guard entry or duplicate moves race.
+        return os.path.normcase(os.path.realpath(os.fspath(tree)))
     except Exception:
-        return None
+        try:
+            return os.path.normcase(os.path.abspath(os.fspath(tree)))
+        except Exception:
+            return None
 
 
 def _proc_reaped(proc: object) -> bool:
@@ -129,8 +134,18 @@ def _active_check(tree: object) -> str | None:
                 f"retry later)")
     try:
         if len(_ACTIVE_MOVES) >= _ACTIVE_MOVES_CAP:
-            for _k in list(_ACTIVE_MOVES.keys())[: len(_ACTIVE_MOVES) - _ACTIVE_MOVES_CAP + 1]:
-                _ACTIVE_MOVES.pop(_k, None)
+            # Evict reaped entries only: a live entry guards a running
+            # move and must never be dropped for a newcomer. If every
+            # entry is live the map temporarily exceeds the cap (bounded
+            # in practice by concurrent moves, not by time).
+            for _k in list(_ACTIVE_MOVES.keys()):
+                if len(_ACTIVE_MOVES) < _ACTIVE_MOVES_CAP:
+                    break
+                try:
+                    if _proc_reaped(_ACTIVE_MOVES.get(_k)):
+                        _ACTIVE_MOVES.pop(_k, None)
+                except Exception:
+                    pass
     except Exception:
         pass
     return key
@@ -234,6 +249,8 @@ def build_move_cmd(cfg: AppConfig, source: Path, dest_remote: str,
                    *, include: list[str] | None = None,
                    files_from: str | None = None,
                    extra: list[str] | None = None) -> list[str]:
+    if not dest_remote or not dest_remote.strip():
+        raise RcloneError(f"refusing rclone move with empty dest_remote (source={source})")
     if dest_remote.startswith("-"):
         raise RcloneError(f"refusing rclone dest_remote starting with '-': {dest_remote!r}")
     if include and not all(i.startswith("--include=") for i in include):
@@ -470,13 +487,14 @@ async def run_rclone(
         _active_drop(_move_key, keep=not _proc_reaped(proc))
         raise
     dt = time.monotonic() - t0
+    # Bound memory BEFORE decoding: rclone -v can emit MBs, and decoding
+    # first would briefly hold the whole output twice as str.
+    if len(stdout_b) > 1_048_576:
+        stdout_b = stdout_b[-1_048_576:]
+    if len(stderr_b) > 1_048_576:
+        stderr_b = stderr_b[-1_048_576:]
     stdout = stdout_b.decode("utf-8", errors="replace")
     stderr = stderr_b.decode("utf-8", errors="replace")
-    # Bound memory: rclone -v can emit MBs; only the tail is ever logged.
-    if len(stdout) > 1_048_576:
-        stdout = stdout[-1_048_576:]
-    if len(stderr) > 1_048_576:
-        stderr = stderr[-1_048_576:]
     code = proc.returncode if proc.returncode is not None else -1
     res = RcloneResult(returncode=code,
                        stdout=stdout, stderr=stderr, duration=dt)
@@ -525,6 +543,18 @@ async def move_local_to_remote(
         raise ValueError("rclone files_from list must not be empty (refusing silent no-op move)")
     if files_from is not None:
         _validate_files_from_entries(files_from)
+    if not await _move_source_has_files(local, files_from):
+        # Nothing to transfer: either the bytes already moved (verify the
+        # remote holds them and report success without spawning a move) or
+        # data was lost (fail loudly — a silent "success" would mark DONE
+        # with bytes nowhere).
+        if await _remote_has_bytes(cfg, dest_remote, files_from):
+            log.info("rclone move %s -> %s: source already empty, remote holds "
+                     "the bytes; skipping move", local, dest_remote)
+            return RcloneResult(returncode=0, stdout="", stderr="", duration=0.0)
+        raise RcloneError(
+            f"rclone move {local} -> {dest_remote}: source empty and remote "
+            "holds no bytes — refusing silent no-op (data loss?)")
     list_path: str | None = None
     try:
         if files_from is not None:
@@ -539,8 +569,12 @@ async def move_local_to_remote(
             ) as fh:
                 fh.write("\n".join(files_from) + "\n")
                 list_path = fh.name
+        # Fail loudly when nothing moves: an rc=0 "success" that transferred
+        # zero files hides stalled/filtered moves (the source-empty case is
+        # handled above, so any no-transfer here is a real failure).
         cmd = build_move_cmd(cfg, local, dest_remote, include=include,
-                             files_from=list_path, extra=extra)
+                             files_from=list_path,
+                             extra=[*(extra or []), "--error-on-no-transfer"])
         return await run_rclone(cfg, cmd, timeout=timeout, tree=local)
     finally:
         if list_path:
@@ -548,6 +582,63 @@ async def move_local_to_remote(
                 os.unlink(list_path)
             except OSError as e:
                 log.warning("could not delete rclone file list %s: %s", list_path, e)
+
+
+async def _move_source_has_files(local: Path, files_from: list[str] | None) -> bool:
+    """True when the move has anything to transfer (off-loop for big trees)."""
+    def _check() -> bool:
+        try:
+            if files_from is not None:
+                for name in files_from:
+                    try:
+                        if (Path(local) / name).is_file():
+                            return True
+                    except OSError:
+                        continue
+                return False
+            try:
+                with os.scandir(local) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_file(follow_symlinks=False):
+                                return True
+                        except OSError:
+                            continue
+                return False
+            except OSError:
+                return False
+        except Exception:
+            return True  # fail open toward running the move (it errors loudly)
+
+    try:
+        return await asyncio.to_thread(_check)
+    except Exception:
+        return True
+
+
+async def _remote_has_bytes(
+    cfg: AppConfig, dest_remote: str, files_from: list[str] | None,
+) -> bool:
+    """True when the remote already holds the move's bytes (lsf verify)."""
+    try:
+        res = await run_rclone(
+            cfg, ["lsf", "--files-only", dest_remote],
+            timeout=120.0, tree=None)
+    except Exception as e:  # noqa: BLE001
+        log.warning("rclone lsf verify of %s failed: %s", dest_remote, e)
+        return False
+    if res.returncode != 0:
+        return False
+    try:
+        names = {ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()}
+    except Exception:
+        return False
+    if not names:
+        return False
+    if files_from is not None:
+        want = {n.replace("\\", "/").strip("/") for n in files_from if n}
+        return bool(want & names)
+    return True
 
 
 from .safety import validate_safe_delete_path  # noqa: F401 (re-exported)
@@ -575,16 +666,22 @@ async def wipe_local_tree(
 
 async def wipe_local_files(
     paths: list[Path], *, base_dir: Path | Iterable[Path] | None = None
-) -> None:
+) -> list[Path]:
+    """Remove files/dirs; returns the paths that failed (empty = all gone).
+
+    Failures log per path and collect here so callers can park/retry on
+    partial wipes instead of assuming a clean tree.
+    """
     if base_dir is None:
         raise ValueError("refusing to delete without base_dir guard")
     if not paths:
-        return
+        return []
+    failed: list[Path] = []
 
-    def _rm(p: Path) -> None:
+    def _rm(p: Path) -> bool:
         try:
             if not p.exists() and not p.is_symlink():
-                return
+                return True
             validate_safe_delete_path(p, base_dir=base_dir)
             if p.is_symlink():
                 p.unlink()
@@ -594,15 +691,19 @@ async def wipe_local_files(
                 p.unlink()
         except Exception as e:
             log.warning("rm %s: %s", p, e)
+            return False
+        return True
 
     # Bound concurrency: 1000-file seasons must not spawn 1000 threads.
     sem = asyncio.Semaphore(16)
 
     async def _rm_bounded(p: Path) -> None:
         async with sem:
-            await asyncio.to_thread(_rm, p)
+            if not await asyncio.to_thread(_rm, p):
+                failed.append(p)
 
     await asyncio.gather(*(_rm_bounded(p) for p in paths))
+    return failed
 
 
 
