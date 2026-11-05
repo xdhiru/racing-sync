@@ -1425,3 +1425,119 @@ def test_qb_parses_dlspeed_best_effort():
         {"hash": "b" * 40, "name": "S"}).dlspeed_bps == 0
 
 
+@pytest.mark.anyio
+async def test_qb_files_rejects_non_list_payload():
+    """Dict error envelopes yield [] loudly, not silent row misses."""
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+    client._request_json = AsyncMock(return_value={"error": "nope"})
+    assert await client.get_torrent_files("a" * 40) == []
+
+
+@pytest.mark.anyio
+async def test_qb_trackers_survive_bad_rows_and_auth_propagates():
+    """Non-dict rows skip; AuthError surfaces instead of reading quiet."""
+    from racing_sync.clients.http_base import AuthError
+
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+    client._request_json = AsyncMock(return_value=[
+        {"url": "http://t.example/a"},
+        "garbage",
+        {"url": "**DHT**"},
+        {"url": "http://t.example/a"},
+    ])
+    assert await client.get_trackers("a" * 40) == ["http://t.example/a"]
+    client._request_json = AsyncMock(side_effect=AuthError("expired"))
+    with pytest.raises(AuthError):
+        await client.get_tracker_messages("a" * 40)
+
+
+@pytest.mark.anyio
+async def test_qb_pause_probes_version_once():
+    """Legacy fallback remembers; modern servers skip probing entirely."""
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+    seen = []
+
+    class DummyCtx:
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.read = AsyncMock()
+            return resp
+
+        async def __aexit__(self, *args):
+            pass
+
+    async def mock_request(method, path, **kwargs):
+        seen.append(path)
+        if path == "/api/v2/torrents/stop":
+            raise aiohttp.ClientResponseError(
+                request_info=MagicMock(), history=(),
+                status=404, message="not found")
+        return DummyCtx()
+
+    import aiohttp
+
+    client.request = mock_request
+    await client.pause("a" * 40)
+    await client.pause("a" * 40)
+    assert seen == ["/api/v2/torrents/stop", "/api/v2/torrents/pause",
+                    "/api/v2/torrents/pause"]
+    assert client._legacy_pause_api is True
+
+
+@pytest.mark.anyio
+async def test_qb_prio_failure_logs_applied_and_raises():
+    """A mid-set 404 names what landed before failing."""
+    import aiohttp
+
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+    client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="a.mkv", size_bytes=100, progress=1.0),
+        TorrentFile(name="b.mkv", size_bytes=100, progress=1.0),
+    ])
+    calls = []
+
+    class DummyCtx:
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.read = AsyncMock()
+            return resp
+
+        async def __aexit__(self, *args):
+            pass
+
+    async def mock_request(method, path, **kwargs):
+        data = kwargs.get("data")
+        calls.append(path)
+        if len(calls) > 1:
+            raise aiohttp.ClientResponseError(
+                request_info=MagicMock(), history=(),
+                status=404, message="gone")
+        return DummyCtx()
+
+    client.request = mock_request
+    with pytest.raises(aiohttp.ClientResponseError):
+        await client.set_file_priorities("a" * 40, {"a.mkv": 0, "b.mkv": 1})
+
+
+def test_qb_mapping_size_fallback_and_magnet_hash():
+    """None size falls back to total_size; hashless rows try magnet_uri."""
+    import base64
+
+    from racing_sync.clients.qbittorrent import _torrent_from_qb
+
+    t = _torrent_from_qb({"hash": "a" * 40, "name": "S",
+                          "size": None, "total_size": 700})
+    assert t.size_bytes == 700
+    raw20 = bytes(range(20))
+    b32 = base64.b32encode(raw20).decode().rstrip("=")
+    t = _torrent_from_qb({"name": "S",
+                          "magnet_uri": f"magnet:?xt=urn:btih:{b32}"})
+    assert t.hash == raw20.hex()
+    with pytest.raises(ValueError, match="missing infohash"):
+        _torrent_from_qb({"name": "S"})
+
+

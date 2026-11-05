@@ -51,6 +51,11 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             http_cfg = cfg  # already an HTTPClientConfig
         HTTPClientBase.__init__(self, http_cfg, label=label)
         self._add_lock = asyncio.Lock()
+        # qBittorrent v5.0+ renamed pause/resume to stop/start. The 404
+        # fallback probes the version once per client instance (source and
+        # dest may run different versions): legacy servers must not pay a
+        # failed RPC plus retry on every call.
+        self._legacy_pause_api: bool | None = None
 
     async def _do_client_auth(self) -> None:
         async with self.session.post(
@@ -259,6 +264,11 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
     async def get_torrent_files(self, torrent_hash: str) -> list[TorrentFile]:
         data = await self._request_json(
             "GET", "/api/v2/torrents/files", params={"hash": torrent_hash})
+        if not isinstance(data, list):
+            # Dict error envelope (or garbage): no files to yield, and
+            # iterating a dict would silently produce [] via row.get misses.
+            log.warning("qB get_torrent_files unexpected non-list payload; returning empty")
+            return []
         out: list[TorrentFile] = []
         for row in data:
             try:
@@ -287,8 +297,13 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         data = await self._request_json(
             "GET", "/api/v2/torrents/trackers", params={"hash": torrent_hash})
         urls: list[str] = []
-        for row in data:
-            url = (row.get("url", "") or "").strip()
+        for row in data if isinstance(data, list) else []:
+            try:
+                if not isinstance(row, dict):
+                    continue
+                url = (row.get("url", "") or "").strip()
+            except Exception:
+                continue
             if url and not url.startswith("**") and url not in urls:
                 urls.append(url)
         return urls
@@ -298,6 +313,9 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         try:
             data = await self._request_json(
                 "GET", "/api/v2/torrents/trackers", params={"hash": torrent_hash})
+        except AuthError:
+            # Auth expiry must surface for re-login, never read as quiet.
+            raise
         except Exception:
             return []
         msgs: list[str] = []
@@ -529,49 +547,69 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 f"set_file_priorities: no valid files to update for {torrent_hash} "
                 "(caller would otherwise download unfiltered and blow the SSD budget)")
 
-        for prio, ids in prio_to_ids.items():
-            data = aiohttp.FormData()
-            data.add_field("hash", torrent_hash)
-            data.add_field("id", "|".join(ids))
-            data.add_field("priority", str(prio))
+        applied: list[tuple[int, list[str]]] = []
+        try:
+            for prio, ids in prio_to_ids.items():
+                data = aiohttp.FormData()
+                data.add_field("hash", torrent_hash)
+                data.add_field("id", "|".join(ids))
+                data.add_field("priority", str(prio))
+                async with await self.request(
+                    "POST", "/api/v2/torrents/filePrio", data=data
+                ) as r:
+                    await r.read()
+                applied.append((prio, ids))
+        except aiohttp.ClientResponseError as e:
+            # 404 = entry vanished mid-set (half-applied priorities stay);
+            # anything else aborts too. Either way the caller must know
+            # exactly what landed: log the rollback picture, then raise.
+            log.warning(
+                "qB set_file_priorities for %s failed after %d/%d batches "
+                "(HTTP %s; applied=%s): caller must re-verify",
+                torrent_hash, len(applied), len(prio_to_ids),
+                getattr(e, "status", "?"), applied)
+            raise
+
+    async def _pause_resume(self, torrent_hash: str, *, pause: bool) -> None:
+        data = aiohttp.FormData()
+        data.add_field("hashes", torrent_hash)
+        if self._legacy_pause_api is False:
             async with await self.request(
-                "POST", "/api/v2/torrents/filePrio", data=data
-            ) as r:
+                "POST", f"/api/v2/torrents/{'stop' if pause else 'start'}",
+                data=data) as r:
                 await r.read()
+            return
+        if self._legacy_pause_api is True:
+            async with await self.request(
+                "POST", f"/api/v2/torrents/{'pause' if pause else 'resume'}",
+                data=data) as r:
+                await r.read()
+            return
+        try:
+            # qBittorrent v5.0+ renamed pause/resume to stop/start
+            async with await self.request(
+                "POST", f"/api/v2/torrents/{'stop' if pause else 'start'}",
+                data=data) as r:
+                await r.read()
+            self._legacy_pause_api = False
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404:
+                # Legacy qBittorrent (< v5.0) fallback, remembered.
+                self._legacy_pause_api = True
+                data2 = aiohttp.FormData()
+                data2.add_field("hashes", torrent_hash)
+                async with await self.request(
+                    "POST", f"/api/v2/torrents/{'pause' if pause else 'resume'}",
+                    data=data2) as r:
+                    await r.read()
+            else:
+                raise
 
     async def pause(self, torrent_hash: str) -> None:
-        data = aiohttp.FormData()
-        data.add_field("hashes", torrent_hash)
-        try:
-            # qBittorrent v5.0+ renamed pause/resume to stop/start
-            async with await self.request("POST", "/api/v2/torrents/stop", data=data) as r:
-                await r.read()
-        except aiohttp.ClientResponseError as e:
-            if e.status == 404:
-                # Legacy qBittorrent (< v5.0) fallback
-                data2 = aiohttp.FormData()
-                data2.add_field("hashes", torrent_hash)
-                async with await self.request("POST", "/api/v2/torrents/pause", data=data2) as r:
-                    await r.read()
-            else:
-                raise
+        await self._pause_resume(torrent_hash, pause=True)
 
     async def resume(self, torrent_hash: str) -> None:
-        data = aiohttp.FormData()
-        data.add_field("hashes", torrent_hash)
-        try:
-            # qBittorrent v5.0+ renamed pause/resume to stop/start
-            async with await self.request("POST", "/api/v2/torrents/start", data=data) as r:
-                await r.read()
-        except aiohttp.ClientResponseError as e:
-            if e.status == 404:
-                # Legacy qBittorrent (< v5.0) fallback
-                data2 = aiohttp.FormData()
-                data2.add_field("hashes", torrent_hash)
-                async with await self.request("POST", "/api/v2/torrents/resume", data=data2) as r:
-                    await r.read()
-            else:
-                raise
+        await self._pause_resume(torrent_hash, pause=False)
 
     async def delete(self, torrent_hash: str, *, delete_files: bool = False) -> None:
         data = aiohttp.FormData()
@@ -688,6 +726,27 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
             sp = (leading + joined) if joined else sp
     infohash = str(d.get("hash") or "").strip().lower()
     if not infohash:
+        # Fall back to the magnet URI's xt hash when the row carries none
+        # (some proxies strip `hash` but keep `magnet_uri`).
+        try:
+            _mag = str(d.get("magnet_uri") or "")
+            _m = re.search(r"xt=urn:btih:([A-Za-z0-9]{32,64})", _mag)
+            if _m:
+                _raw = _m.group(1)
+                if len(_raw) == 40 and all(c in "0123456789abcdefABCDEF" for c in _raw):
+                    infohash = _raw.lower()
+                elif len(_raw) == 32 and all(c in "0123456789abcdefABCDEF" for c in _raw):
+                    pass  # ambiguous MD5-shaped ID: refuse, don't fabricate
+                else:
+                    try:
+                        import base64
+                        _padded = _raw.upper() + "=" * (-len(_raw) % 8)
+                        infohash = base64.b32decode(_padded).hex()
+                    except Exception:
+                        infohash = ""
+        except Exception:
+            infohash = ""
+    if not infohash:
         raise ValueError(f"qB torrent row missing infohash: {d!r}")
     def _num(value: object, default: int = 0) -> int:
         try:
@@ -725,7 +784,7 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
         name=torrent_name or infohash,
         category=d.get("category", "") or "",
         save_path=sp,
-        size_bytes=_num(d.get("size", d.get("total_size", 0))),
+        size_bytes=_num(d.get("size") or d.get("total_size") or 0),
         state=str(state),
         progress=_fprogress(d.get("progress", 0.0)),
         ratio=_fnum(d.get("ratio", 0.0)),
