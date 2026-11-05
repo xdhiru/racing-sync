@@ -166,6 +166,9 @@ async def test_move_local_to_remote_files_from_writes_and_cleans_list(tmp_path: 
     src = tmp_path / "src"
     src.mkdir()
     (src / "Top").mkdir()
+    (src / "Top" / "a.mkv").write_bytes(b"a")
+    (src / "Top" / "Sub").mkdir(parents=True)
+    (src / "Top" / "Sub" / "b.mkv").write_bytes(b"b")
 
     cfg = MagicMock(spec=AppConfig)
     cfg.rclone = MagicMock()
@@ -438,3 +441,143 @@ async def test_success_drops_tree_guard(monkeypatch, tmp_path):
         assert not rclone_ops._ACTIVE_MOVES
     finally:
         rclone_ops._ACTIVE_MOVES.clear()
+
+
+def test_tree_key_resolves_dotdot():
+    """Two spellings of one tree share one guard entry."""
+    from racing_sync.rclone_ops import _tree_key
+
+    assert _tree_key("a/b/../c") == _tree_key("a/c")
+    assert _tree_key("a/./c") == _tree_key("a/c")
+
+
+def test_cap_eviction_keeps_live_entries():
+    """Over-cap trim drops reaped guards, never running moves."""
+    from racing_sync import rclone_ops
+
+    live_holder = type("P", (), {"returncode": None})()
+    reaped_holder = type("P", (), {"returncode": 0})()
+    try:
+        for i in range(rclone_ops._ACTIVE_MOVES_CAP + 5):
+            key = f"/tree/{i}"
+            rclone_ops._ACTIVE_MOVES[key] = (
+                reaped_holder if i % 2 else live_holder)
+        kept_live = [k for k, v in rclone_ops._ACTIVE_MOVES.items()
+                     if v is live_holder]
+        assert kept_live, "live guards must survive cap pressure"
+    finally:
+        rclone_ops._ACTIVE_MOVES.clear()
+
+
+def test_build_move_cmd_rejects_empty_remote(tmp_path: Path):
+    import pytest as _pytest
+
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+    cfg.rclone.binary = Path("/usr/bin/rclone")
+    cfg.rclone.config_path = None
+    cfg.rclone.extra_move_flags = []
+
+    with _pytest.raises(Exception, match="empty dest_remote"):
+        build_move_cmd(cfg, tmp_path / "src", "   ")
+
+
+@pytest.mark.anyio
+async def test_empty_source_with_remote_bytes_skips_move(tmp_path: Path):
+    """Already-moved bytes: verified skip, no move spawned."""
+    from unittest.mock import AsyncMock, patch
+    from racing_sync import rclone_ops
+    from racing_sync.rclone_ops import move_local_to_remote
+
+    src = tmp_path / "src"
+    src.mkdir()
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+    cfg.rclone.binary = Path("/usr/bin/rclone")
+    cfg.rclone.config_path = None
+    cfg.rclone.extra_move_flags = []
+
+    async def _fake_run(cfg_, cmd, **kwargs):
+        assert cmd[0] == "lsf"
+        from racing_sync.rclone_ops import RcloneResult
+        return RcloneResult(returncode=0, stdout="Top/a.mkv\n", stderr="",
+                            duration=0.1)
+
+    with patch.object(rclone_ops, "run_rclone", AsyncMock(side_effect=_fake_run)) as _m:
+        res = await move_local_to_remote(
+            cfg, src, "remote:dest", files_from=["Top/a.mkv"])
+    assert res.ok
+    assert _m.await_count == 1  # lsf only; no move spawned
+
+
+@pytest.mark.anyio
+async def test_empty_source_without_remote_bytes_fails_loud(tmp_path: Path):
+    """Source gone + remote empty: RcloneError, never silent success."""
+    import pytest as _pytest
+    from unittest.mock import AsyncMock, patch
+    from racing_sync import rclone_ops
+    from racing_sync.rclone_ops import RcloneError, move_local_to_remote
+
+    src = tmp_path / "src"
+    src.mkdir()
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+    cfg.rclone.binary = Path("/usr/bin/rclone")
+    cfg.rclone.config_path = None
+    cfg.rclone.extra_move_flags = []
+
+    async def _fake_run(cfg_, cmd, **kwargs):
+        from racing_sync.rclone_ops import RcloneResult
+        return RcloneResult(returncode=0, stdout="", stderr="", duration=0.1)
+
+    with patch.object(rclone_ops, "run_rclone", AsyncMock(side_effect=_fake_run)):
+        with _pytest.raises(RcloneError, match="refusing silent no-op"):
+            await move_local_to_remote(
+                cfg, src, "remote:dest", files_from=["Top/a.mkv"])
+
+
+@pytest.mark.anyio
+async def test_move_cmd_carries_error_on_no_transfer(tmp_path: Path):
+    """Non-empty moves fail loudly when nothing transfers."""
+    from unittest.mock import AsyncMock, patch
+    from racing_sync import rclone_ops
+    from racing_sync.rclone_ops import move_local_to_remote
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.mkv").write_bytes(b"a")
+    cfg = MagicMock(spec=AppConfig)
+    cfg.rclone = MagicMock()
+    cfg.rclone.binary = Path("/usr/bin/rclone")
+    cfg.rclone.config_path = None
+    cfg.rclone.extra_move_flags = []
+
+    seen = {}
+
+    async def _fake_run(cfg_, cmd, **kwargs):
+        seen["cmd"] = list(cmd)
+        from racing_sync.rclone_ops import RcloneResult
+        return RcloneResult(returncode=0, stdout="", stderr="", duration=0.1)
+
+    with patch.object(rclone_ops, "run_rclone", AsyncMock(side_effect=_fake_run)):
+        res = await move_local_to_remote(cfg, src, "remote:dest")
+    assert res.ok
+    assert "--error-on-no-transfer" in seen["cmd"]
+
+
+@pytest.mark.anyio
+async def test_wipe_reports_partial_failures(tmp_path: Path):
+    """wipe_local_files returns what it could not remove."""
+    from racing_sync.rclone_ops import wipe_local_files
+
+    base = tmp_path / "base"
+    base.mkdir()
+    gone = base / "gone.bin"
+    gone.write_bytes(b"x")
+    missing = base / "missing.bin"
+    assert await wipe_local_files([gone, missing], base_dir=base) == []
+    assert not gone.exists()
+    outsider = tmp_path / "outside.bin"
+    outsider.write_bytes(b"x")
+    assert await wipe_local_files([outsider], base_dir=base) == [outsider]
+    assert outsider.exists()
