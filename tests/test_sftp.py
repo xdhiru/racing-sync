@@ -658,3 +658,102 @@ def test_connect_survives_channel_timeout_failure():
         exporter.connect()  # must not raise
         assert exporter._sftp is sftp
 
+
+def test_lease_revives_single_member_lazily():
+    """Leasing dials one closed member, not the whole pool per call."""
+    from racing_sync.sftp_source import SFTPExporter
+
+    exporter = SFTPExporter(_sftp_cfg(), pool_size=2)
+    exporter._members = [_live_member(exporter._cfg), _live_member(exporter._cfg)]
+    dials = []
+    for m in exporter._members:
+        m._closed = True
+
+        def _dial(m=m):
+            dials.append(m)
+            m._closed = False
+
+        m.connect = _dial
+    data = exporter.fetch_torrent("a" * 40)
+    assert data == b"d4:infod4:name4:teste"
+    assert len(dials) == 1
+
+
+def test_member_close_never_blocks_on_wedged_lock():
+    """close() tears down instantly even with a wedged holder."""
+    import time
+
+    exporter = object.__new__(_SFTPConnection)
+    exporter._lock = threading.RLock()
+    exporter._closed = False
+    mock_sftp = MagicMock()
+    mock_client = MagicMock()
+    exporter._sftp = mock_sftp
+    exporter._client = mock_client
+
+    _, release_holder, holder = _wedge_lock_in_thread(exporter._lock)
+    try:
+        start = time.monotonic()
+        exporter.close()
+        assert time.monotonic() - start < 5.0
+    finally:
+        release_holder.set()
+        holder.join(timeout=10)
+    mock_sftp.close.assert_called_once()
+    mock_client.close.assert_called_once()
+    assert exporter._sftp is None
+    assert exporter._client is None
+
+
+def test_pool_fetch_many_fans_out():
+    """fetch_many runs one member per hash concurrently, not in series."""
+    from racing_sync.sftp_source import SFTPExporter
+
+    exporter = SFTPExporter(_sftp_cfg(), pool_size=2)
+    exporter._members = [_live_member(exporter._cfg), _live_member(exporter._cfg)]
+    in_flight = 0
+    peak = 0
+    real_fetch = _SFTPConnection.fetch_torrent
+
+    def _counting(self, h):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            import time as _time
+            _time.sleep(0.05)
+            return real_fetch(self, h)
+        finally:
+            in_flight -= 1
+
+    _SFTPConnection.fetch_torrent = _counting
+    try:
+        out = exporter.fetch_many(["a" * 40, "b" * 40])
+    finally:
+        _SFTPConnection.fetch_torrent = real_fetch
+    assert set(out) == {"a" * 40, "b" * 40}
+    assert peak == 2
+
+
+def test_df_parses_wrapped_last_line():
+    """Long device names wrap: data comes from the last line, not [1]."""
+    import threading
+    from unittest.mock import MagicMock
+
+    exporter = object.__new__(_SFTPConnection)
+    exporter._lock = threading.RLock()
+    mock_client = MagicMock()
+    mock_client.get_transport().is_active.return_value = True
+    mock_stdout = MagicMock()
+    mock_stdout.read.return_value = (
+        b"Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+        b"/dev/mapper/vg0-extremely-long-volume-name-that-wraps\n"
+        b"                  80000000 76000000 4000000 95% /home\n"
+    )
+    mock_client.exec_command.return_value = (MagicMock(), mock_stdout, MagicMock())
+    mock_sftp = MagicMock(spec=[])
+    exporter._client = mock_client
+    exporter._sftp = mock_sftp
+
+    assert exporter.disk_free_bytes("/home") == 4000000 * 1024
+
