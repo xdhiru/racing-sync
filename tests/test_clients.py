@@ -620,17 +620,38 @@ async def test_deluge_add_torrent_rejects_none_result_and_uses_uuid_filename():
     async def mock_rpc(method, params=None):
         if method == "core.add_torrent_file":
             filenames_used.append(params[0])
-            return "hash_123"
+            return "d" * 40
         return None
 
     client._rpc = AsyncMock(side_effect=mock_rpc)
     res_success = await client.add_torrent(torrent_files=[blob1, blob2], save_path="/downloads")
     assert res_success.accepted is True
-    assert res_success.hash == "hash_123"
+    assert res_success.hash == "d" * 40
     assert len(filenames_used) == 2
     # Filenames must be unique and not match identical blob[:6].hex() prefix
     assert filenames_used[0] != filenames_used[1]
     assert not filenames_used[0].startswith("64383a616e6e")
+
+
+@pytest.mark.anyio
+async def test_deluge_add_torrent_rejects_garbage_hash():
+    """Daemon garbage never becomes a row hash (accepted, hash empty)."""
+    from unittest.mock import AsyncMock
+    from racing_sync.clients.deluge import DelugeClient
+    from racing_sync.config import SourceConfig
+
+    cfg = SourceConfig(
+        type="deluge",
+        host="http://localhost:8112",
+        password="secret",
+        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+    )
+    client = DelugeClient(cfg)
+    client._rpc = AsyncMock(return_value=True)
+    res = await client.add_torrent(
+        urls=["http://example.com/x.torrent"], save_path="/downloads")
+    assert res.accepted is True
+    assert res.hash is None
 
 
 @pytest.mark.anyio
@@ -1539,5 +1560,67 @@ def test_qb_mapping_size_fallback_and_magnet_hash():
     assert t.hash == raw20.hex()
     with pytest.raises(ValueError, match="missing infohash"):
         _torrent_from_qb({"name": "S"})
+
+
+def _deluge_test_client():
+    from racing_sync.clients.deluge import DelugeClient
+    from racing_sync.config import SourceConfig
+
+    cfg = SourceConfig(
+        type="deluge",
+        host="http://localhost:8112",
+        password="secret",
+        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+    )
+    return DelugeClient(cfg)
+
+
+@pytest.mark.anyio
+async def test_deluge_prio_warns_and_skips_unknown():
+    """Unknown names warn; garbage prios skip; all-garbage fails closed."""
+    from unittest.mock import AsyncMock
+
+    client = _deluge_test_client()
+    client._rpc = AsyncMock(return_value={
+        "files": [{"path": "a.mkv", "index": 0}],
+        "file_priorities": [1],
+    })
+    # Valid map applies (qB 6 down-mapped silently, unknown name warned).
+    await client.set_file_priorities("a" * 40, {"a.mkv": 6, "ghost.mkv": 1})
+    client._rpc.assert_awaited_with(
+        "core.set_torrent_file_priorities", ["a" * 40, [1]])
+    # Garbage-only map refuses instead of downloading unfiltered.
+    with pytest.raises(RuntimeError, match="no valid files"):
+        await client.set_file_priorities("a" * 40, {"ghost.mkv": 1})
+    with pytest.raises(RuntimeError, match="no valid files"):
+        await client.set_file_priorities("a" * 40, {"a.mkv": 99})
+
+
+@pytest.mark.anyio
+async def test_deluge_not_found_reraise_auth():
+    """Auth expiry surfaces from idempotent ops, never reads as gone."""
+    from unittest.mock import AsyncMock
+
+    from racing_sync.clients.http_base import AuthError
+
+    async def _failing(exc):
+        raise exc
+
+    client = _deluge_test_client()
+    with pytest.raises(AuthError):
+        await client._not_found_is_gone(
+            "delete", "a" * 40, _failing(AuthError("expired")))
+
+
+@pytest.mark.anyio
+async def test_deluge_export_rejects_non_bencoded():
+    """Base64-wrapped garbage fails loudly instead of travelling as bytes."""
+    import base64
+    from unittest.mock import AsyncMock
+
+    client = _deluge_test_client()
+    client._rpc = AsyncMock(return_value=base64.b64encode(b"<html>nope</html>").decode())
+    with pytest.raises(ValueError, match="not bencoded"):
+        await client.export_torrent("a" * 40)
 
 
