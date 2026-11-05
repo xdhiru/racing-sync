@@ -854,6 +854,14 @@ class ProwlarrConfig(BaseModel):
     # Network family for the Prowlarr session. False (default) forces IPv4:
     # intentional — see [source].use_ipv6.
     use_ipv6: bool = False
+    # HTTP pool shape + parallel-search bounds (previously hardcoded in
+    # the client): connection pool size, per-host connections, DNS cache
+    # TTL seconds, fan-out concurrency and overall gather timeout.
+    pool_limit: int = Field(default=100, ge=1, le=1000)
+    pool_per_host: int = Field(default=20, ge=1, le=200)
+    dns_cache_ttl_seconds: int = Field(default=300, ge=0, le=86400)
+    parallel_search_concurrency: int = Field(default=4, ge=1, le=16)
+    parallel_search_timeout_seconds: float = Field(default=90.0, ge=5.0, le=600.0)
 
     @property
     def download_indexer_names(self) -> list[str]:

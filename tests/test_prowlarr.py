@@ -1419,3 +1419,163 @@ async def test_picker_deadline_parks():
         assert dec is None
     finally:
         _picker._PICKER_DEADLINE_S = real
+
+
+def _search_cm(xml: bytes):
+    """Search-response double speaking the capped-read path."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.headers = {}
+
+    async def _read(n):
+        return xml
+
+    resp.content.read = _read
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=resp)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
+def _err_cm(status: int, retry_after: str | None = None):
+    """Failing-response double raising ClientResponseError on status."""
+    import aiohttp
+    from unittest.mock import AsyncMock, MagicMock
+
+    resp = MagicMock()
+    headers = {"Retry-After": retry_after} if retry_after else {}
+    resp.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(
+        request_info=MagicMock(), history=(), status=status, headers=headers))
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=resp)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
+_XML_ONE_HIT = (
+    b'<?xml version="1.0" encoding="UTF-8"?>'
+    b'<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">'
+    b'<channel><item>'
+    b'<title>Show.S01E01.1080p</title>'
+    b'<guid>abc</guid>'
+    b'<enclosure url="http://idx.example/dl/1.torrent" length="1000" type="application/x-bittorrent"/>'
+    b'</item></channel></rss>'
+)
+
+
+def _refresh_client():
+    from racing_sync.prowlarr import ProwlarrClient
+
+    cfg = ProwlarrConfig(
+        enabled=True,
+        base_url="http://prowlarr.local:9696",
+        api_key="prowlarr_key",
+        download_indexers=[DownloadIndexerConfig(name="indexer1")],
+    )
+    client = ProwlarrClient(cfg)
+    client._session = MagicMock()
+    return client
+
+
+@pytest.mark.anyio
+async def test_refresh_retries_transient_429():
+    """Flaky indexer refresh rides out 429/503 instead of failing at once."""
+    from unittest.mock import AsyncMock
+
+    client = _refresh_client()
+
+    ok = MagicMock()
+    ok.raise_for_status = MagicMock()
+    ok.json = AsyncMock(return_value=[
+        {"id": 1, "name": "indexer1", "protocol": "torrent", "enable": True}])
+    ok_cm = MagicMock()
+    ok_cm.__aenter__ = AsyncMock(return_value=ok)
+    ok_cm.__aexit__ = AsyncMock(return_value=False)
+    client._session.get.side_effect = [
+        _err_cm(429), _err_cm(503), ok_cm,
+    ]
+    await client._refresh_indexers()
+    assert client._session.get.call_count == 3
+    assert client.get_indexer_by_name("indexer1") is not None
+
+
+@pytest.mark.anyio
+async def test_search_retries_500_then_succeeds():
+    """Indexer 500s are transient for search (unlike qB application 500s)."""
+    client = _refresh_client()
+    idx = Indexer(1, "indexer1", "torrent", True, [])
+    client._session.get.side_effect = [
+        _err_cm(500), _search_cm(_XML_ONE_HIT),
+    ]
+    hits = await client.search_indexer(idx, "Show.S01E01.1080p")
+    assert len(hits) == 1
+    assert hits[0].title == "Show.S01E01.1080p"
+    assert client._session.get.call_count == 2
+
+
+@pytest.mark.anyio
+async def test_search_honors_retry_after_without_sleeping():
+    """Retry-After: 0 retries immediately instead of backing off blind."""
+    import time
+
+    client = _refresh_client()
+    idx = Indexer(1, "indexer1", "torrent", True, [])
+    client._session.get.side_effect = [
+        _err_cm(429, retry_after="0"), _search_cm(_XML_ONE_HIT),
+    ]
+    t0 = time.monotonic()
+    hits = await client.search_indexer(idx, "Show.S01E01.1080p")
+    assert len(hits) == 1
+    assert time.monotonic() - t0 < 5
+    assert client._session.get.call_count == 2
+
+
+@pytest.mark.anyio
+async def test_search_stream_cap_enforced_on_fallback():
+    """The uncapped-text fallback path is capped too."""
+    from racing_sync.prowlarr import _MAX_FEED_BYTES, ProwlarrError
+
+    client = _refresh_client()
+    idx = Indexer(1, "indexer1", "torrent", True, [])
+
+    async def _big_chunks(_n):
+        yield b"x" * (_MAX_FEED_BYTES + 1)
+
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.headers = {}
+
+    async def _read(_n):
+        raise RuntimeError("no read here")
+
+    resp.content.read = _read
+    resp.content.iter_chunked = MagicMock(return_value=_big_chunks(0))
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=resp)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    client._session.get.side_effect = [cm]
+    with pytest.raises(ProwlarrError, match="exceeds"):
+        await client.search_indexer(idx, "Show.S01E01.1080p")
+
+
+def test_parallel_bounds_explicit_config_wins():
+    """Explicit pool/search bounds apply; otherwise patchable defaults."""
+    from racing_sync.prowlarr import ProwlarrClient
+
+    cfg = ProwlarrConfig(
+        enabled=True,
+        base_url="http://prowlarr.local:9696",
+        api_key="prowlarr_key",
+        download_indexers=[DownloadIndexerConfig(name="indexer1")],
+        parallel_search_timeout_seconds=7.5,
+        parallel_search_concurrency=2,
+    )
+    assert ProwlarrClient(cfg)._parallel_bounds() == (2, 7.5)
+
+    plain = ProwlarrClient(ProwlarrConfig(
+        enabled=True, base_url="http://prowlarr.local:9696",
+        api_key="prowlarr_key",
+        download_indexers=[DownloadIndexerConfig(name="indexer1")]))
+    assert plain._parallel_bounds() == (4, 90.0)
