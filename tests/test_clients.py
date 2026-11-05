@@ -1624,3 +1624,48 @@ async def test_deluge_export_rejects_non_bencoded():
         await client.export_torrent("a" * 40)
 
 
+@pytest.mark.anyio
+async def test_deluge_daemon_busy_maps_to_timeout():
+    """Transient daemon errors park-and-retry instead of failing the row."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from racing_sync.coordinator_errors import is_retryable_client_error
+
+    client = _deluge_test_client()
+
+    async def _fake_request(method, path, **kwargs):
+        class _Ctx:
+            async def __aenter__(self):
+                resp = MagicMock()
+                resp.json = AsyncMock(return_value={
+                    "result": None, "error": "daemon busy, try again",
+                    "id": 1,
+                })
+                return resp
+
+            async def __aexit__(self, *args):
+                pass
+
+        return _Ctx()
+
+    client.request = _fake_request
+    with pytest.raises(TimeoutError, match="transient daemon error"):
+        await client._rpc("core.get_torrents_status", [{}, []])
+    try:
+        await client._rpc("core.get_torrents_status", [{}, []])
+    except TimeoutError as e:
+        assert is_retryable_client_error(e) is True
+
+
+@pytest.mark.anyio
+async def test_deluge_empty_scan_never_cached():
+    """Transient empty scans must not pin 'no torrents' for the TTL."""
+    from unittest.mock import AsyncMock
+
+    client = _deluge_test_client()
+    client._rpc = AsyncMock(return_value={})
+    assert await client.list_torrents() == []
+    assert await client.list_torrents() == []
+    assert client._rpc.await_count == 2
+
+

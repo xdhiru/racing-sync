@@ -16,6 +16,7 @@ from urllib.parse import quote_plus, urlsplit, urlunsplit
 
 import aiohttp
 
+from .clients.http_base import _backoff_delay, _retry_after_delay
 from .config import ProwlarrConfig
 
 
@@ -82,6 +83,21 @@ log = logging.getLogger(__name__)
 # malicious indexer must not OOM the daemon via an uncapped r.text().
 _MAX_FEED_BYTES = 10 * 1024 * 1024
 
+#: Indexer-side transient statuses worth retrying (search, download,
+#: refresh). 500 included UNLIKE the torrent-client set in http_base:
+#: flaky indexers use it transiently, and a missed search only parks —
+#: whereas qB 500s are application errors that must surface.
+_INDEXER_TRANSIENT_STATUSES = (408, 425, 429, 500, 502, 503, 504)
+
+
+def _retry_delay_from_exc(exc: BaseException | None, attempt: int) -> float:
+    """Backoff for an indexer retry, honoring Retry-After when present."""
+    try:
+        headers = getattr(exc, "headers", None) if exc is not None else None
+    except Exception:
+        headers = None
+    return _retry_after_delay(headers, _backoff_delay(attempt))
+
 
 @dataclass(slots=True)
 class Indexer:
@@ -140,14 +156,27 @@ class ProwlarrClient:
             use_v6 = False
         # IPv4-only by default (intentional — tracker/DNS on seedboxes is
         # overwhelmingly v4); bounded pool + cached DNS either way.
+        # Pool shape comes from config (getattr-guarded for test doubles).
+        try:
+            _pool = max(1, int(getattr(self._cfg, "pool_limit", 100) or 100))
+        except (TypeError, ValueError):
+            _pool = 100
+        try:
+            _per_host = max(1, int(getattr(self._cfg, "pool_per_host", 20) or 20))
+        except (TypeError, ValueError):
+            _per_host = 20
+        try:
+            _ttl = max(0, int(getattr(self._cfg, "dns_cache_ttl_seconds", 300) or 0))
+        except (TypeError, ValueError):
+            _ttl = 300
         self._session = aiohttp.ClientSession(
             base_url=self._cfg.base_url.rstrip("/") + "/",
             timeout=aiohttp.ClientTimeout(total=self._cfg.timeout_seconds),
             connector=aiohttp.TCPConnector(
                 family=socket.AF_UNSPEC if use_v6 else socket.AF_INET,
-                limit=100,
-                limit_per_host=20,
-                ttl_dns_cache=300,
+                limit=_pool,
+                limit_per_host=_per_host,
+                ttl_dns_cache=_ttl,
             ),
         )
         try:
@@ -183,12 +212,18 @@ class ProwlarrClient:
                         r.raise_for_status()
                         data = await r.json()
                     break
-                except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+                except (aiohttp.ClientConnectionError, asyncio.TimeoutError, OSError) as e:
                     last_exc = e
                     if attempt == 2:
                         raise ProwlarrError(f"prowlarr indexer refresh failed: {e}") from e
-                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    await asyncio.sleep(_backoff_delay(attempt))
                 except aiohttp.ClientResponseError as e:
+                    if e.status in _INDEXER_TRANSIENT_STATUSES:
+                        last_exc = e
+                        if attempt == 2:
+                            raise ProwlarrError(f"prowlarr indexer refresh failed: HTTP {e.status}") from e
+                        await asyncio.sleep(_retry_delay_from_exc(e, attempt))
+                        continue
                     raise ProwlarrError(f"prowlarr indexer refresh failed: HTTP {e.status}") from e
             if data is None:
                 if last_exc:
@@ -327,31 +362,39 @@ class ProwlarrClient:
                         # still cap — stream the body in chunks instead of
                         # one uncapped text() that OOMs on a bloated feed.
                         chunks: list[bytes] = []
+                        _streamed = 0
                         try:
                             async for chunk in r.content.iter_chunked(65536):
-                                chunks.append(bytes(chunk))
-                                if sum(map(len, chunks)) > _MAX_FEED_BYTES:
+                                _part = bytes(chunk)
+                                _streamed += len(_part)
+                                if _streamed > _MAX_FEED_BYTES:
                                     raise ProwlarrError(
                                         f"prowlarr feed from {indexer.name!r} exceeds "
                                         f"{_MAX_FEED_BYTES} bytes; refusing")
+                                chunks.append(_part)
                             text = b"".join(chunks).decode("utf-8", errors="replace")
                         except ProwlarrError:
                             raise
                         except Exception:
                             text = await r.text()
+                            if len(text) > _MAX_FEED_BYTES:
+                                raise ProwlarrError(
+                                    f"prowlarr feed from {indexer.name!r} exceeds "
+                                    f"{_MAX_FEED_BYTES} bytes; refusing")
                 break
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError, OSError) as e:
                 last_exc = e
             except aiohttp.ClientResponseError as e:
-                # Rate-limit / gateway hiccups are retryable; anything else
+                # Rate-limit / gateway hiccups are retryable (500 included:
+                # flaky indexers, and a miss only parks); anything else
                 # fails fast so bad queries don't burn 3 attempts.
-                if e.status not in (408, 425, 429, 502, 503, 504):
+                if e.status not in _INDEXER_TRANSIENT_STATUSES:
                     raise ProwlarrError(f"prowlarr search on {indexer.name!r} failed: HTTP {e.status}") from e
                 last_exc = e
             if attempt == 2:
                 raise ProwlarrError(f"prowlarr search on {indexer.name!r} failed: {last_exc}") from last_exc
-            await asyncio.sleep(0.5 * (2 ** attempt))
-        return _parse_newznab(text, indexer)
+            await asyncio.sleep(_retry_delay_from_exc(last_exc, attempt))
+        return await asyncio.to_thread(_parse_newznab, text, indexer)
 
     async def download_torrent(self, hit: TorrentHit) -> bytes:
         """Fetch the .torrent bytes for a hit (qBittorrent can accept this directly)."""
@@ -415,29 +458,20 @@ class ProwlarrClient:
                 # Size-cap violations are local verdicts, not retryable.
                 raise
             except aiohttp.ClientResponseError as e:
-                # Rate-limit / gateway hiccups mirror the search retry set;
-                # anything else fails fast.
-                if e.status not in (408, 425, 429, 502, 503, 504):
+                # Rate-limit / gateway hiccups mirror the search retry set
+                # (500 included for flaky indexers); anything else fails fast.
+                if e.status not in _INDEXER_TRANSIENT_STATUSES:
                     raise ProwlarrError(
                         f"torrent download from {safe_url} failed with HTTP status {e.status}"
                     ) from e
                 last_exc = e
-            except (TimeoutError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+            except (TimeoutError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
                 last_exc = e
             if attempt == 2:
                 raise ProwlarrError(
                     f"torrent download from {safe_url} failed: {last_exc}"
                 ) from last_exc
-            delay = 0.5 * (2 ** attempt)
-            try:
-                retry_after = None
-                if isinstance(last_exc, aiohttp.ClientResponseError):
-                    retry_after = last_exc.headers.get("Retry-After") if last_exc.headers else None
-                if retry_after:
-                    delay = min(5.0, float(retry_after))
-            except (TypeError, ValueError):
-                pass
-            await asyncio.sleep(delay)
+            await asyncio.sleep(_retry_delay_from_exc(last_exc, attempt))
 
         if not data.startswith(b"d"):
             raise ProwlarrError(
@@ -517,7 +551,33 @@ class ProwlarrClient:
     # session timeout, but the gather itself must not outlive the tick.
     # On timeout the in-flight searches are cancelled and an empty miss
     # is returned (callers park and retry on their own schedule).
+    # Bounds live in config when explicitly set, else the patchable class
+    # defaults below (tests/tools may override per class).
     _PARALLEL_SEARCH_TIMEOUT_S = 90.0
+    _PARALLEL_SEARCH_CONCURRENCY = 4
+
+    def _parallel_bounds(self) -> tuple[int, float]:
+        _fields_set = getattr(self._cfg, "model_fields_set", None) or set()
+        try:
+            if "parallel_search_concurrency" in _fields_set:
+                _conc = max(1, int(getattr(
+                    self._cfg, "parallel_search_concurrency", 4) or 4))
+            else:
+                _conc = max(1, int(self._PARALLEL_SEARCH_CONCURRENCY))
+        except (TypeError, ValueError):
+            _conc = 4
+        try:
+            if "parallel_search_timeout_seconds" in _fields_set:
+                _timeout = float(getattr(
+                    self._cfg, "parallel_search_timeout_seconds",
+                    self._PARALLEL_SEARCH_TIMEOUT_S))
+            else:
+                _timeout = float(self._PARALLEL_SEARCH_TIMEOUT_S)
+            if not (_timeout > 0):
+                _timeout = self._PARALLEL_SEARCH_TIMEOUT_S
+        except (TypeError, ValueError):
+            _timeout = self._PARALLEL_SEARCH_TIMEOUT_S
+        return _conc, _timeout
 
     async def search_indexers_parallel(
         self,
@@ -529,7 +589,8 @@ class ProwlarrClient:
             log.info("prowlarr: skipping parallel search for %r (matches skip_query_substrings)", query)
             return {}
 
-        sem = asyncio.Semaphore(4)
+        _conc, _timeout = self._parallel_bounds()
+        sem = asyncio.Semaphore(_conc)
 
         async def _search_one(idx: Indexer) -> tuple[str, list[TorrentHit]]:
             async with sem:
@@ -544,11 +605,11 @@ class ProwlarrClient:
         try:
             results = await asyncio.wait_for(
                 asyncio.gather(*tasks),
-                timeout=self._PARALLEL_SEARCH_TIMEOUT_S,
+                timeout=_timeout,
             )
         except asyncio.TimeoutError:
             log.warning("prowlarr parallel search timed out after %.0fs for %r; "
-                        "using partial hits", self._PARALLEL_SEARCH_TIMEOUT_S, query)
+                        "using partial hits", _timeout, query)
             return {}
         return dict(results)
 

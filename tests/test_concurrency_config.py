@@ -1023,11 +1023,11 @@ def test_storage_overlap_resolves_dotdot(tmp_path: Path):
     fuse = tmp_path / "fuse"
     tricky_ssd = tmp_path / "sub" / ".." / "fuse"
     text = _minimal_app_toml().replace(
-        'mount = "/mnt/fuse"', f'mount = "{fuse}"').replace(
+        'mount = "/mnt/fuse"', f'mount = "{fuse.as_posix()}"').replace(
         'mount_unsorted = "/mnt/fuse/unsorted"',
-        f'mount_unsorted = "{fuse}-u"').replace(
-        'path = "/downloads"', f'path = "{tricky_ssd}"').replace(
-        'save_path = "/downloads"', f'save_path = "{tricky_ssd}"')
+        f'mount_unsorted = "{fuse.as_posix()}-u"').replace(
+        'path = "/downloads"', f'path = "{tricky_ssd.as_posix()}"').replace(
+        'save_path = "/downloads"', f'save_path = "{tricky_ssd.as_posix()}"')
     with pytest.raises(ValidationError, match="overlap"):
         AppConfig.model_validate(tomllib.loads(text))
 

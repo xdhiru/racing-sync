@@ -27,6 +27,13 @@ from .http_base import HTTPClientBase
 log = logging.getLogger(__name__)
 
 
+# Raw-scan cache bounds (short TTL: mutations invalidate explicitly via
+# _invalidate_scan_cache, so this only smooths bursts of read-only
+# scans — the "5s" in older comments was stale; the code uses 15s).
+_SCAN_TTL_S = 15.0
+_SCAN_CACHE_CAP = 32
+
+
 def _extract_tracker_urls(raw: list) -> list[str]:
     """Deluge's daemon returns each torrent's trackers as a list of
     `[{url, tier}, ...]` dicts, NOT a list of URL strings. We only
@@ -239,6 +246,13 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     if attempt == 0 and await self._reauth_once():
                         continue
                     raise AuthError(f"deluge session expired: {err_text[:200]}")
+                # Daemon-side transient failures (load shedding, timeouts)
+                # must park-and-retry, not fail the row: surface them as
+                # TimeoutError, which the retryable contract honors.
+                if any(s in low for s in ("timeout", "timed out", "try again",
+                                          "busy", "overloaded", "unavailable")):
+                    raise TimeoutError(
+                        f"deluge rpc {method} transient daemon error: {err_text[:200]}")
                 raise RuntimeError(f"deluge rpc {method} error: {data['error']}")
             return data.get("result")
         raise RuntimeError("unreachable")  # pragma: no cover
@@ -280,7 +294,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             return []
         # NOTE: Deluge daemon does not support server-side hash filtering;
         # we fetch (possibly all) and filter client-side. Raw scans are
-        # cached 5s per label filter so single-hash get_torrent bursts
+        # cached 15s per label filter so single-hash get_torrent bursts
         # (late-seed, live status) don't each pay a full scan.
         status_keys = [
             "name",
@@ -388,7 +402,8 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             key = ("", ())
         try:
             cached = self._scan_cache.get(key)
-            if cached and _time.monotonic() - cached[0] < 15.0 and isinstance(cached[1], dict):
+            if (cached and _time.monotonic() - cached[0] < _SCAN_TTL_S
+                    and isinstance(cached[1], dict) and cached[1]):
                 return cached[1]
         except Exception:
             pass
@@ -404,7 +419,8 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         async with _lock:
             try:
                 cached = self._scan_cache.get(key)
-                if cached and _time.monotonic() - cached[0] < 15.0 and isinstance(cached[1], dict):
+                if (cached and _time.monotonic() - cached[0] < _SCAN_TTL_S
+                        and isinstance(cached[1], dict) and cached[1]):
                     return cached[1]
             except Exception:
                 pass
@@ -416,9 +432,11 @@ class DelugeClient(TorrentClient, HTTPClientBase):
 
         info = await self._rpc("core.get_torrents_status", [filt, status_keys])
         try:
-            if isinstance(info, dict):
+            # Empty dicts are not cached: a transient empty scan must not
+            # pin "no torrents" for the whole TTL.
+            if isinstance(info, dict) and info:
                 self._scan_cache[key] = (_time.monotonic(), info)
-                if len(self._scan_cache) > 32:
+                if len(self._scan_cache) > _SCAN_CACHE_CAP:
                     oldest = min(self._scan_cache, key=lambda k: self._scan_cache[k][0])
                     self._scan_cache.pop(oldest, None)
         except Exception:
@@ -685,7 +703,10 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     raise ValueError(
                         f"torrent payload exceeds {MAX_TORRENT_BYTES} bytes; refusing"
                     )
-                encoded = base64.b64encode(bytes(blob)).decode()
+                # Base64 of a 20 MiB blob is pure CPU: off the loop.
+                encoded = await asyncio.to_thread(
+                    base64.b64encode, bytes(blob))
+                encoded = encoded.decode()
                 res = await self._rpc(
                     "core.add_torrent_file", [f"{uuid.uuid4().hex}.torrent", encoded, opts]
                 )
@@ -850,7 +871,9 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         if len(encoded) > MAX_TORRENT_BYTES * 4 // 3 + 16:
             raise ValueError(f"deluge .torrent for {torrent_hash} exceeds size cap")
         try:
-            decoded = base64.b64decode(encoded, validate=True)
+            # Decode off the loop: base64 of a ~27MB string is pure CPU.
+            decoded = await asyncio.to_thread(
+                base64.b64decode, encoded, validate=True)
         except Exception as e:
             raise ValueError(f"deluge .torrent for {torrent_hash} is not valid base64: {e}") from e
         # A bencoded torrent is always a dict: refuse error pages and

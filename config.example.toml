@@ -66,7 +66,9 @@ type = "qbittorrent"
 # --- WebUI connection ---
 host = "http://127.0.0.1:8080"
 username = "admin"
-password = "change_me"
+# WebUI password. Empty = no auth. Never leave a placeholder here —
+# startup refuses passwords like "change_me"/"CHANGE_ME".
+password = ""
 # Network family for the WebUI session. false (default) forces IPv4 —
 # intentional: tracker allowlists, split-horizon DNS and jail/VPN egress on
 # seedboxes are overwhelmingly v4. Set true only for v6-capable setups.
@@ -155,7 +157,9 @@ pool_size = 3
 [dest]
 host = "http://127.0.0.1:8080"
 username = "admin"
-password = "change_me"
+# WebUI password. Empty = no auth. Never leave a placeholder here —
+# startup refuses passwords like "change_me"/"CHANGE_ME".
+password = ""
 
 # Default save_path used for movies / season-root folders.
 # This MUST be on the local SSD (not the fuse mount) so qBittorrent
