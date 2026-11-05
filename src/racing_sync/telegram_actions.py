@@ -164,10 +164,28 @@ class ActionsMixin:
         scratch. Workers are stopped first so no stale upsert resurrects.
         A duplicate tap while one execution is still running gets "working
         on it" instead of a second full forget (which would end in "gone").
+        Holds are per-hash (not one scope-string for the whole set), so an
+        overlapping tap on any shared copy conflicts instead of
+        double-forgetting it.
         """
-        _key = (f"keep:{','.join(sorted((h or '').lower() for h in hashes or []))}"
-                f":{'1' if remember else '0'}:{'del' if delete_files else 'keep'}")
-        if not self._claim_action(_key):
+        _flag = f"{'1' if remember else '0'}:{'del' if delete_files else 'keep'}"
+        _hashes = sorted({(h or "").lower()
+                          for h in hashes or [] if (h or "").strip()})
+        _claimed: list[str] = []
+        try:
+            for _h in _hashes:
+                _k = f"keep:{_h}:{_flag}"
+                if not self._claim_action(_k):
+                    for _c in _claimed:
+                        self._release_action(_c)
+                    return "Already working on it — one tap is enough."
+                _claimed.append(_k)
+        except Exception:
+            for _c in _claimed:
+                try:
+                    self._release_action(_c)
+                except Exception:
+                    pass
             return "Already working on it — one tap is enough."
         try:
             live = []
@@ -201,7 +219,11 @@ class ActionsMixin:
         except Exception as e:  # noqa: BLE001
             return f"Action failed: {e}"
         finally:
-            self._release_action(_key)
+            for _c in _claimed:
+                try:
+                    self._release_action(_c)
+                except Exception:
+                    pass
 
     def _live_notes_for(self, members: list) -> dict[str, str]:
         """Wait-note map for prefer eligibility (best-effort, str-only)."""

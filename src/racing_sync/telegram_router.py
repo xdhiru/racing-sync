@@ -292,12 +292,19 @@ class RouterMixin:
                     log.debug("telegram callback polling error: %s", e)
                     await asyncio.sleep(2)
 
+    #: Read-only chat commands: never debounced away (a /stats tap right
+    #: after any command still answers; only mutating verbs are gated).
+    _READ_ONLY_COMMANDS = frozenset({"stats", "find", "files"})
+
     def _debounced(self, key: str, *, window: float = 0.5) -> bool:
         """True when `key` fired within `window` seconds (caller skips).
 
         Shared by callback pagination and /cancel_/fetch_ chat commands: a
         double-tap (or flooding client) re-resolves and re-acts otherwise.
-        Fail-open on bookkeeping errors (never drop user input on doubt).
+        Fail-closed on bookkeeping errors (drop the tap on doubt — a
+        re-tap replays it, a double-act cannot be undone). Eviction
+        purges expired windows only and never records past the cap, so
+        no live window is ever flushed (no victim re-arms early).
         """
         now = time.monotonic()
         try:
@@ -307,14 +314,17 @@ class RouterMixin:
                 self._callback_times = times
             last = float(times.get(key, 0.0) or 0.0)
         except Exception:
-            return False
+            return True
         if now - last < window:
             return True
         try:
-            times[key] = now
-            if len(times) > 1000:
-                for k in list(times.keys())[:500]:
-                    times.pop(k, None)
+            for k in [k for k, t in times.items()
+                      if now - float(t or 0.0) >= window]:
+                times.pop(k, None)
+            if len(times) < 1000:
+                times[key] = now
+            # At cap the tap still runs once; its window just isn't
+            # recorded (memory stays bounded, no live window flushed).
         except Exception:
             pass
         return False
@@ -322,9 +332,11 @@ class RouterMixin:
     def _claim_action(self, key: str, *, ttl: float = 600.0) -> bool:
         """Hold a destructive scope while it executes (True when free).
 
-        Same fail-open shape as _debounced (tests build the bot without
-        __init__): bookkeeping trouble never blocks operator intent.
-        Stale holds (crashed mid-execution) expire via `ttl`.
+        Fail-closed like _debounced (tests build the bot without
+        __init__): bookkeeping trouble refuses the hold — the tap answers
+        "working on it" instead of risking a double forget. Stale holds
+        (crashed mid-execution) expire via `ttl`; past the cap new holds
+        are refused rather than evicting live ones.
         """
         now = time.monotonic()
         try:
@@ -337,10 +349,12 @@ class RouterMixin:
                 inflight.pop(k, None)
             if key in inflight:
                 return False
+            if len(inflight) >= 1000:
+                return False
             inflight[key] = now
             return True
         except Exception:
-            return True
+            return False
 
     def _release_action(self, key: str) -> None:
         """Drop a destructive-scope hold (best-effort)."""
@@ -384,7 +398,7 @@ class RouterMixin:
             _debounce_key = ""
         if self._debounced(_debounce_key):
             try:
-                await query.answer()
+                await query.answer("Slow down — one tap is enough")
             except Exception:
                 pass
             return
@@ -570,17 +584,6 @@ class RouterMixin:
             cfg_chat = str(self._cfg.chat_id)
             if str(chat_id) != cfg_chat and str(user_id) != cfg_chat:
                 return
-            # Same debounce as callbacks: a double-sent command must
-            # not resolve+act twice (double forget/double prefer).
-            # Namespaced apart from callback keys, keyed chat+user so one
-            # spammer cannot block other operators.
-            try:
-                _ckey = (f"cmd:{chat_id}:{user_id}"
-                         if chat_id is not None else f"cmd:{user_id}")
-            except Exception:
-                _ckey = ""
-            if _ckey and self._debounced(_ckey, window=2.0):
-                return
             text = (
                 getattr(message, "text", None)
                 or getattr(message, "caption", None)
@@ -594,6 +597,8 @@ class RouterMixin:
                 except Exception:
                     pass
                 return
+            _matched = None
+            _match = None
             for _cmd in _CHAT_COMMANDS:
                 try:
                     _m = _cmd.pattern.match(text)
@@ -601,8 +606,24 @@ class RouterMixin:
                     _m = None
                 if _m is None:
                     continue
-                await _cmd.handle(self, _m, message)
+                _matched, _match = _cmd, _m
+                break
+            if _matched is None:
                 return
+            # Debounce mutating verbs only (double-sent command must not
+            # resolve+act twice): read-only /stats|/find|/files always
+            # answer, even inside another command's window. Namespaced
+            # apart from callback keys, keyed chat+user so one spammer
+            # cannot block other operators.
+            if _matched.name not in self._READ_ONLY_COMMANDS:
+                try:
+                    _ckey = (f"cmd:{chat_id}:{user_id}"
+                             if chat_id is not None else f"cmd:{user_id}")
+                except Exception:
+                    _ckey = ""
+                if _ckey and self._debounced(_ckey, window=2.0):
+                    return
+            await _matched.handle(self, _match, message)
             return
         except Exception as e:  # noqa: BLE001
             log.debug("chat command handling failed: %s", e)
