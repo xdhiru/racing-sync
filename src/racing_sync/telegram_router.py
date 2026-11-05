@@ -24,6 +24,7 @@ from .telegram_protocol import (
     _slow_tap,
 )
 from .telegram_views import (
+    _group_active_items,
     _is_grace_note_for_prefer,
     _safe_display_name,
     _size_compact,
@@ -426,7 +427,19 @@ class RouterMixin:
             page_size = max(1, min(int(self._cfg.page_size), 50))
         except (TypeError, ValueError):
             page_size = 5
-        total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+        # Page over rendered GROUPS (election identity), not raw rows:
+        # the renderer groups same-file copies, so row-based wrapping
+        # desyncs prev/next (taps wrap early or look dead) whenever
+        # duplicates share a page.
+        try:
+            total_groups = len(_group_active_items(
+                [(r, None) for r in rows or []]))
+        except Exception:
+            try:
+                total_groups = len(rows or [])
+            except Exception:
+                total_groups = 0
+        total_pages = max(1, (total_groups + page_size - 1) // page_size)
 
         if action == "prev":
             self._current_page = (self._current_page - 1) % total_pages
@@ -435,7 +448,9 @@ class RouterMixin:
         elif action == "refresh":
             pass
 
-        self._last_active_cache = None
+        # No cache clear: a page change alters the dedup key (edit still
+        # fires); an unchanged render — the common refresh tap — hits the
+        # dedup cache and skips the pointless edit instead.
         await self._refresh_active_message()
 
     # ---- task cancellation via `/cancel_` chat commands ----
