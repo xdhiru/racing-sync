@@ -28,11 +28,23 @@ def _connector_for(cfg: HTTPClientConfig) -> aiohttp.TCPConnector:
         use_v6 = bool(getattr(cfg, "use_ipv6", False))
     except Exception:
         use_v6 = False
+    try:
+        limit = max(1, int(getattr(cfg, "pool_limit", 100) or 100))
+    except (TypeError, ValueError):
+        limit = 100
+    try:
+        per_host = max(1, int(getattr(cfg, "pool_per_host", 20) or 20))
+    except (TypeError, ValueError):
+        per_host = 20
+    try:
+        ttl = max(0, int(getattr(cfg, "dns_cache_ttl_seconds", 300) or 0))
+    except (TypeError, ValueError):
+        ttl = 300
     return aiohttp.TCPConnector(
         family=socket.AF_UNSPEC if use_v6 else _IPV4_ONLY,
-        limit=100,
-        limit_per_host=20,
-        ttl_dns_cache=300,
+        limit=limit,
+        limit_per_host=per_host,
+        ttl_dns_cache=ttl,
     )
 
 
@@ -191,7 +203,47 @@ def _clone_formdata(fd: aiohttp.FormData) -> aiohttp.FormData:
 # Transient gateway / rate-limit statuses worth retrying.
 # NOTE: deliberately excludes 500 — qB returns 500 for application errors
 # (e.g. missing torrent) that must surface immediately, not be retried.
+# Indexer clients (Prowlarr) opt into 500 separately: flaky indexers use
+# it transiently, and a missed search only parks.
 _TRANSIENT_STATUSES = (408, 425, 429, 502, 503, 504)
+
+# Retry-After values are honored up to this ceiling: an indexer asking
+# for an hour mostly means "go away", and no worker should sleep it off.
+_RETRY_AFTER_MAX_S = 5.0
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff for attempt N (0-based): 0.5s, 1s, 2s, ..."""
+    try:
+        return 0.5 * (2 ** max(0, int(attempt)))
+    except Exception:
+        return 0.5
+
+
+def _retry_after_delay(headers: Any, default: float) -> float:
+    """Honor Retry-After (seconds or HTTP-date, capped), else `default`."""
+    try:
+        retry_after = headers.get("Retry-After") if hasattr(headers, "get") else None
+    except Exception:
+        retry_after = None
+    if not retry_after:
+        return default
+    try:
+        return max(0.0, min(_RETRY_AFTER_MAX_S, float(retry_after)))
+    except (ValueError, TypeError, OverflowError):
+        pass
+    try:
+        from email.utils import parsedate_to_datetime as _p2d
+        import datetime as _dt
+        _dtv = _p2d(str(retry_after).strip())
+        if _dtv is not None:
+            if _dtv.tzinfo is None:
+                _dtv = _dtv.replace(tzinfo=_dt.timezone.utc)
+            _secs = (_dtv - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+            return max(0.0, min(_RETRY_AFTER_MAX_S, _secs))
+    except Exception:
+        pass
+    return default
 
 # Deluge/JSON-RPC method prefixes that only read server state. Everything
 # runs over POST, so the HTTP method alone cannot tell reads from writes:
@@ -242,6 +294,10 @@ class HTTPClientBase:
         self._session: aiohttp.ClientSession | None = None
         self._auth_lock = asyncio.Lock()
         self._authed = False
+        # Statuses worth a blind retry (reads only). qB keeps 500 out
+        # (application errors must surface); indexer clients may extend
+        # with 500 (flaky-indexer transient) on their instance.
+        self._transient_statuses = tuple(_TRANSIENT_STATUSES)
         # Single-flight re-auth: concurrent 401/403s share one login
         # instead of each worker logging in sequentially (N×3 logins).
         self._auth_future: asyncio.Future | None = None
@@ -517,6 +573,7 @@ class HTTPClientBase:
         json_body: Any | None = None,
         headers: dict[str, str] | None = None,
         retry_auth: bool = True,
+        timeout: float | None = None,
     ) -> aiohttp.ClientResponse:
         if not self._authed:
             # Initial login also goes through single-flight: workers
@@ -549,6 +606,17 @@ class HTTPClientBase:
         # the call was NOT processed, so the post-login re-issue below
         # still runs for every method.
         idempotent = _is_idempotent_request(method, path, json_body)
+        try:
+            _timeout = float(timeout) if timeout is not None else None
+            if _timeout is not None and not (_timeout > 0):
+                _timeout = None
+        except (TypeError, ValueError):
+            _timeout = None
+        # Only pass an explicit timeout when set: timeout=None would
+        # replace the session default instead of keeping it.
+        _timeout_kw: dict[str, Any] = (
+            {"timeout": aiohttp.ClientTimeout(total=_timeout)}
+            if _timeout is not None else {})
 
         async def _do() -> aiohttp.ClientResponse:
             for attempt in range(3 if idempotent else 1):
@@ -561,6 +629,7 @@ class HTTPClientBase:
                         data=req_data,
                         json=json_body,
                         headers=headers,
+                        **_timeout_kw,
                     )
                 except (
                     aiohttp.ClientConnectionError,
@@ -570,11 +639,12 @@ class HTTPClientBase:
                 ) as e:
                     if not idempotent or attempt == 2:
                         raise
+                    _wait = _backoff_delay(attempt)
                     log.warning(
                         "[%s] %s %s network error (%s); retrying in %.1fs",
-                        self._label, method, path, e, 0.5 * (attempt + 1),
+                        self._label, method, path, e, _wait,
                     )
-                    await asyncio.sleep(0.5 * (attempt + 1))
+                    await asyncio.sleep(_wait)
             raise RuntimeError("unreachable")
 
         r = await _do()
@@ -582,26 +652,10 @@ class HTTPClientBase:
         # Retry transient gateway / rate-limit errors — reads only, for the
         # same processed-but-lost reason as above.
         for attempt in range(3 if idempotent else 0):
-            if r.status not in _TRANSIENT_STATUSES:
+            if r.status not in self._transient_statuses:
                 break
-            delay = 0.5 * (2 ** attempt)
-            retry_after = r.headers.get("Retry-After")
-            if retry_after:
-                try:
-                    delay = min(5.0, float(retry_after))
-                except (ValueError, TypeError, OverflowError):
-                    # HTTP-date form: honor it (capped), else keep backoff.
-                    try:
-                        from email.utils import parsedate_to_datetime as _p2d
-                        import datetime as _dt
-                        _dtv = _p2d(str(retry_after).strip())
-                        if _dtv is not None:
-                            if _dtv.tzinfo is None:
-                                _dtv = _dtv.replace(tzinfo=_dt.timezone.utc)
-                            _secs = (_dtv - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
-                            delay = max(0.0, min(5.0, _secs))
-                    except Exception:
-                        pass
+            delay = _retry_after_delay(
+                r.headers, _backoff_delay(attempt))
             log.warning(
                 "[%s] %s %s -> HTTP %d; retrying in %.1fs (attempt %d/3)",
                 self._label, method, path, r.status, delay, attempt + 1,
@@ -671,25 +725,10 @@ class HTTPClientBase:
         # error — retry it instead of surfacing a hard failure (reads only;
         # a mutation that reached the server must not be re-issued).
         for attempt in range(3 if idempotent else 0):
-            if r.status not in _TRANSIENT_STATUSES:
+            if r.status not in self._transient_statuses:
                 break
-            delay = 0.5 * (2 ** attempt)
-            retry_after = r.headers.get("Retry-After")
-            if retry_after:
-                try:
-                    delay = min(5.0, float(retry_after))
-                except (ValueError, TypeError, OverflowError):
-                    try:
-                        from email.utils import parsedate_to_datetime as _p2d
-                        import datetime as _dt
-                        _dtv = _p2d(str(retry_after).strip())
-                        if _dtv is not None:
-                            if _dtv.tzinfo is None:
-                                _dtv = _dtv.replace(tzinfo=_dt.timezone.utc)
-                            _secs = (_dtv - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
-                            delay = max(0.0, min(5.0, _secs))
-                    except Exception:
-                        pass
+            delay = _retry_after_delay(
+                r.headers, _backoff_delay(attempt))
             log.warning(
                 "[%s] %s %s -> HTTP %d after re-auth; retrying in %.1fs (attempt %d/3)",
                 self._label, method, path, r.status, delay, attempt + 1,
@@ -743,5 +782,17 @@ async def get_json_async(client: HTTPClientBase, path: str, **params: Any) -> An
 
 
 async def get_bytes_async(client: HTTPClientBase, path: str, **params: Any) -> bytes:
+    """GET bytes with a stream cap (rogue endpoints cannot OOM the daemon)."""
+    from ..watchdir import MAX_TORRENT_BYTES
+
     async with await client.request("GET", path, params=params or None) as r:
-        return await r.read()
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in r.content.iter_chunked(64 * 1024):
+            total += len(chunk)
+            if total > MAX_TORRENT_BYTES:
+                raise ValueError(
+                    f"GET {path} exceeds {MAX_TORRENT_BYTES} bytes"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)

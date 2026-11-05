@@ -71,6 +71,11 @@ class HTTPClientConfig(BaseModel):
     # False (default) forces IPv4 for the WebUI session — intentional, see
     # [source].use_ipv6. Plumb-through only; set it on [source]/[dest].
     use_ipv6: bool = False
+    # HTTP pool shape (previously hardcoded in http_base): connection
+    # pool size, per-host connections, DNS cache TTL seconds.
+    pool_limit: int = Field(default=100, ge=1, le=1000)
+    pool_per_host: int = Field(default=20, ge=1, le=200)
+    dns_cache_ttl_seconds: int = Field(default=300, ge=0, le=86400)
 
     def has_nginx(self) -> bool:
         return self.nginx_mode in ("basic", "form_post")

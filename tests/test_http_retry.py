@@ -145,3 +145,90 @@ async def test_transient_status_not_retried_for_mutation():
     with pytest.raises(aiohttp.ClientResponseError):
         await client.request("POST", "/api/v2/torrents/delete")
     assert sess.calls == 1
+
+
+def test_backoff_delay_unified_exponential():
+    """One backoff shape everywhere: 0.5s, 1s, 2s, ..."""
+    from racing_sync.clients.http_base import _backoff_delay
+
+    assert _backoff_delay(0) == 0.5
+    assert _backoff_delay(1) == 1.0
+    assert _backoff_delay(2) == 2.0
+    assert _backoff_delay(-3) == 0.5
+
+
+def test_retry_after_honored_and_capped():
+    """Retry-After seconds/HTTP-date honored up to the ceiling."""
+    import datetime as dt
+
+    from racing_sync.clients.http_base import _retry_after_delay
+
+    assert _retry_after_delay({"Retry-After": "2"}, 0.5) == 2.0
+    assert _retry_after_delay({"Retry-After": "3600"}, 0.5) == 5.0
+    assert _retry_after_delay({}, 1.0) == 1.0
+    assert _retry_after_delay({"Retry-After": "garbage"}, 1.0) == 1.0
+    future = (dt.datetime.now(dt.timezone.utc)
+              + dt.timedelta(seconds=60)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    assert _retry_after_delay({"Retry-After": future}, 0.5) == 5.0
+    past = (dt.datetime.now(dt.timezone.utc)
+            - dt.timedelta(seconds=60)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    assert _retry_after_delay({"Retry-After": past}, 0.5) == 0.0
+
+
+@pytest.mark.anyio
+async def test_request_timeout_override_reaches_session():
+    """Per-request budgets override the session default (big listings)."""
+    seen = {}
+
+    class _TimeoutSession(_FakeSession):
+        async def request(self, *args, **kwargs):
+            seen.update(kwargs)
+            return await super().request(*args, **kwargs)
+
+    sess = _TimeoutSession([_FakeResponse(200)])
+    client = _client(sess)
+    await client.request("GET", "/api/v2/torrents/info", timeout=45)
+    assert isinstance(seen.get("timeout"), aiohttp.ClientTimeout)
+    assert seen["timeout"].total == 45
+    seen.clear()
+    await client.request("GET", "/api/v2/torrents/info")
+    assert "timeout" not in seen
+
+
+@pytest.mark.anyio
+async def test_get_bytes_async_caps_rogue_body():
+    """Uncapped reads cannot OOM the daemon on one response."""
+    from racing_sync.clients.http_base import get_bytes_async
+    from racing_sync.watchdir import MAX_TORRENT_BYTES
+
+    async def _big_chunks(_n):
+        yield b"x" * (MAX_TORRENT_BYTES + 1)
+
+    class _BigResponse(_FakeResponse):
+        @property
+        def content(self):
+            class _C:
+                async def iter_chunked(self, _n):
+                    async for c in _big_chunks(_n):
+                        yield c
+            return _C()
+
+    class _Ctx:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, *args):
+            pass
+
+    sess = _FakeSession([])
+    client = _client(sess)
+
+    async def _request(method, path, **kwargs):
+        return _Ctx(_BigResponse(200))
+
+    client.request = _request
+    with pytest.raises(ValueError, match="exceeds"):
+        await get_bytes_async(client, "/x")
