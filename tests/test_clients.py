@@ -1050,7 +1050,7 @@ async def test_qbittorrent_add_torrent_handles_duplicates_and_hex_validation():
     # 1. qB returns "Fails.", but torrent already exists on qB -> accepted=True, detail="already added"
     client.request = AsyncMock(return_value=DummyResponseContext("Fails."))
     existing_t = MagicMock()
-    client.get_torrent = AsyncMock(return_value=existing_t)
+    client.list_torrents = AsyncMock(return_value=[existing_t])
 
     res_dup = await client.add_torrent(torrent_files=[torrent_blob], save_path="/downloads")
     assert res_dup.accepted is True
@@ -1058,7 +1058,7 @@ async def test_qbittorrent_add_torrent_handles_duplicates_and_hex_validation():
     assert res_dup.detail == "already added"
 
     # 2. qB returns "Fails." and torrent does not exist -> accepted=False
-    client.get_torrent = AsyncMock(return_value=None)
+    client.list_torrents = AsyncMock(return_value=[])
     res_fail = await client.add_torrent(torrent_files=[torrent_blob], save_path="/downloads")
     assert res_fail.accepted is False
     assert res_fail.detail == "Fails."
@@ -1102,12 +1102,12 @@ async def test_qbittorrent_add_magnet_hash_resolution():
     client.request = AsyncMock(return_value=DummyResponseContext("Fails."))
     seen = []
 
-    async def fake_get(h):
-        seen.append(h)
+    async def fake_list(*, hashes=None, **kwargs):
+        seen.append(list(hashes or [])[0])
         t = MagicMock()
-        return t
+        return [t]
 
-    client.get_torrent = fake_get
+    client.list_torrents = fake_list
     hex32 = "ab12cd34ef56ab12cd34ef56ab12cd34ef56"[:32]
     res = await client.add_torrent(
         urls=[f"magnet:?xt=urn:btih:{hex32}"], save_path="/downloads")
@@ -1130,16 +1130,92 @@ async def test_qbittorrent_add_magnet_hash_resolution():
     v2 = "c" * 64
     calls = []
 
-    async def fake_get2(h):
+    async def fake_list2(*, hashes=None, **kwargs):
+        h = list(hashes or [])[0]
         calls.append(h)
-        return MagicMock() if h == v2[:40] else None
+        return [MagicMock()] if h == v2[:40] else []
 
-    client.get_torrent = fake_get2
+    client.list_torrents = fake_list2
     res = await client.add_torrent(
         urls=[f"magnet:?xt=urn:btih:{v2}"], save_path="/downloads")
     assert res.accepted is True
     assert res.hash == v2[:40]
     assert calls == [v2, v2[:40]]
+
+
+@pytest.mark.anyio
+async def test_qbittorrent_add_ok_reports_blob_hash():
+    """Accepted adds of known bytes report the hash (no lookup round-trip)."""
+    from racing_sync.watchdir import _bencode, _bencoded_info_hash
+
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+    blob = _bencode({
+        b"announce": b"http://tracker/announce",
+        b"info": {b"name": b"Known.Bytes", b"length": 100},
+    })
+    expected, _, _, _ = _bencoded_info_hash(blob)
+
+    class DummyResponseContext:
+        def __init__(self, text):
+            self.text = text
+
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.text = AsyncMock(return_value=self.text)
+            return resp
+
+        async def __aexit__(self, *args):
+            pass
+
+    client.request = AsyncMock(return_value=DummyResponseContext("Ok."))
+    client.list_torrents = AsyncMock(side_effect=AssertionError("no lookup needed"))
+    res = await client.add_torrent(torrent_files=[blob], save_path="/downloads")
+    assert res.accepted is True
+    assert res.hash == expected.lower()
+
+
+@pytest.mark.anyio
+async def test_qbittorrent_add_checks_every_blob_for_duplicates():
+    """A duplicate hiding behind the first blob is still recognized."""
+    from racing_sync.watchdir import _bencode, _bencoded_info_hash
+
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+
+    def _blob(name):
+        return _bencode({
+            b"announce": b"http://tracker/announce",
+            b"info": {b"name": name.encode(), b"length": 100},
+        })
+
+    fresh = _blob("Fresh.Release")
+    dup = _blob("Dup.Release")
+    dup_hash, _, _, _ = _bencoded_info_hash(dup)
+
+    class DummyResponseContext:
+        def __init__(self, text):
+            self.text = text
+
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.text = AsyncMock(return_value=self.text)
+            return resp
+
+        async def __aexit__(self, *args):
+            pass
+
+    client.request = AsyncMock(return_value=DummyResponseContext("Fails."))
+
+    async def fake_list(*, hashes=None, **kwargs):
+        h = list(hashes or [])[0]
+        return [MagicMock()] if h == dup_hash.lower() else []
+
+    client.list_torrents = fake_list
+    res = await client.add_torrent(torrent_files=[fresh, dup], save_path="/downloads")
+    assert res.accepted is True
+    assert res.hash == dup_hash.lower()
+    assert res.detail == "already added"
 
 
 def _deluge_client():
