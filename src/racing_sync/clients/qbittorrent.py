@@ -146,6 +146,40 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
 
     # ---- introspection ----
 
+    @staticmethod
+    def _hashes_from_blobs(torrent_files: list[bytes] | None) -> list[str]:
+        """Infohashes derivable from payload bytes (all decodable blobs).
+
+        Every blob is tried (not just the first): a multi-blob add whose
+        later blob is the duplicate must still resolve. Never raises.
+        """
+        out: list[str] = []
+        if not torrent_files:
+            return out
+        try:
+            from ..watchdir import _bencoded_info_hash
+        except Exception:
+            return out
+        for blob in torrent_files:
+            try:
+                if not isinstance(blob, (bytes, bytearray)) or not blob:
+                    continue
+                h, _, _, _ = _bencoded_info_hash(bytes(blob))
+                if h and h.lower() not in out:
+                    out.append(h.lower())
+            except Exception:
+                continue
+        return out
+
+    async def _exists_on_qb(self, infohash: str) -> bool:
+        """Single-RPC existence check (no files/trackers fan-out).
+
+        The duplicate-add path only needs to know the entry is there;
+        get_torrent() would pay info + files + trackers per candidate.
+        """
+        rows = await self.list_torrents(hashes=[infohash])
+        return bool(rows)
+
     async def list_torrents(
         self,
         *,
@@ -158,24 +192,35 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             params["filter"] = "all"
         hash_list = list(hashes) if hashes is not None else None
         if hash_list:
-            # Chunk large hash filters to avoid 414 URL-too-long on
-            # 10k-torrent instances (qB takes pipe-separated hashes).
+            # Chunk hash filters (qB takes pipe-separated hashes; URL
+            # limits bite past ~100) and fetch chunks concurrently
+            # (4-wide): 10k-hash verify sweeps no longer pay serial
+            # round-trips per chunk.
+            _sem = asyncio.Semaphore(4)
+
+            async def _one(chunk: list[str]) -> list[Torrent]:
+                async with _sem:
+                    chunk_params = dict(params)
+                    chunk_params["hashes"] = "|".join(chunk)
+                    data = await self._request_json(
+                        "GET", "/api/v2/torrents/info", params=chunk_params)
+                    if isinstance(data, dict):
+                        # Error envelope, not a list: no rows to yield.
+                        log.warning("qB list_torrents unexpected dict payload; skipping chunk")
+                        return []
+                    rows: list[Torrent] = []
+                    for row in data:
+                        try:
+                            rows.append(_torrent_from_qb(row))
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("qB list_torrents skipping bad row: %s", e)
+                    return rows
+
             out: list[Torrent] = []
-            for i in range(0, len(hash_list), 200):
-                chunk = hash_list[i : i + 200]
-                chunk_params = dict(params)
-                chunk_params["hashes"] = "|".join(chunk)
-                data = await self._request_json(
-                    "GET", "/api/v2/torrents/info", params=chunk_params)
-                if isinstance(data, dict):
-                    # Error envelope, not a list: no rows to yield.
-                    log.warning("qB list_torrents unexpected dict payload; skipping chunk")
-                    continue
-                for row in data:
-                    try:
-                        out.append(_torrent_from_qb(row))
-                    except Exception as e:  # noqa: BLE001
-                        log.warning("qB list_torrents skipping bad row: %s", e)
+            for part in await asyncio.gather(
+                    *(_one(hash_list[i:i + 100])
+                      for i in range(0, len(hash_list), 100))):
+                out.extend(part)
             return out
         elif hashes is not None:
             # Explicit empty filter: return nothing instead of everything.
@@ -368,76 +413,80 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         if is_hex40:
             return AddResult(hash=text.lower(), accepted=True, detail=text)
         if len(text) == 64 and all(c in "0123456789abcdefABCDEF" for c in text):
-            # v2 (sha256) hash echo: accept, but leave hash empty — callers
-            # resolve the v1 lookup hash from the .torrent blob instead.
-            return AddResult(hash=None, accepted=True, detail=text)
+            # v2 (sha256) hash echo: resolve the v1 lookup hash from the
+            # .torrent blob when callers supplied one (they usually did —
+            # the add carried the bytes), else leave empty as before.
+            _blob_hashes = self._hashes_from_blobs(torrent_files)
+            return AddResult(
+                hash=_blob_hashes[0] if _blob_hashes else None,
+                accepted=True, detail=text)
         if text == "Ok." or text == "":
-            return AddResult(hash=None, accepted=True, detail=text)
+            # Same blob-hash resolution: an accepted add of known bytes
+            # reports its hash so callers skip a lookup round-trip.
+            _blob_hashes = self._hashes_from_blobs(torrent_files)
+            return AddResult(
+                hash=_blob_hashes[0] if _blob_hashes else None,
+                accepted=True, detail=text)
         if text == "Fails.":
             # qBittorrent returns "Fails." for both invalid torrents and duplicate torrents.
             # Check if the torrent already exists in qBittorrent.
-            candidate_hash: str | None = None
-            if torrent_files:
-                for blob in torrent_files:
-                    try:
-                        from ..watchdir import _bencoded_info_hash
-                        candidate_hash, _, _, _ = _bencoded_info_hash(blob)
-                        break
-                    except Exception:
-                        candidate_hash = None
-                        continue
-            elif urls:
+            candidates: list[str] = self._hashes_from_blobs(torrent_files)
+            if urls and not candidates:
                 for u in urls:
                     m = re.search(
                         r"xt=urn:btih:([A-Za-z0-9]{32,64})", u
                     )
-                    if m:
-                        raw = m.group(1)
-                        if len(raw) == 32:
-                            # Ambiguous: 32-char all-hex could be either.
-                            # A genuine base32 v1 hash is ~never all-hex
-                            # ((16/32)^32), so try hex first — a base32
-                            # mis-decode yields a confidently-wrong hash.
-                            if all(c in "0123456789abcdefABCDEF" for c in raw):
-                                candidate_hash = raw.lower()
-                            else:
-                                try:
-                                    import base64
-                                    candidate_hash = base64.b32decode(raw.upper()).hex()
-                                except Exception:
-                                    continue
-                        elif len(raw) in (40, 64):
-                            # v1 hex (40) or v2 hex (64)
-                            if all(c in "0123456789abcdefABCDEF" for c in raw):
-                                candidate_hash = raw.lower()
-                            else:
-                                continue
+                    if not m:
+                        continue
+                    raw = m.group(1)
+                    if len(raw) == 32:
+                        # Ambiguous: 32-char all-hex could be either.
+                        # A genuine base32 v1 hash is ~never all-hex
+                        # ((16/32)^32), so try hex first — a base32
+                        # mis-decode yields a confidently-wrong hash.
+                        # (Deliberate, test-locked: never reject here.)
+                        if all(c in "0123456789abcdefABCDEF" for c in raw):
+                            parsed = raw.lower()
                         else:
-                            # 52-char base32 (v1+v2 hybrid) or other lengths
                             try:
                                 import base64
-                                padded = raw.upper() + "=" * (-len(raw) % 8)
-                                candidate_hash = base64.b32decode(padded).hex()
+                                parsed = base64.b32decode(raw.upper()).hex()
                             except Exception:
                                 continue
-                        break
+                    elif len(raw) in (40, 64):
+                        # v1 hex (40) or v2 hex (64)
+                        if all(c in "0123456789abcdefABCDEF" for c in raw):
+                            parsed = raw.lower()
+                        else:
+                            continue
+                    else:
+                        # 52-char base32 (v1+v2 hybrid) or other lengths
+                        try:
+                            import base64
+                            padded = raw.upper() + "=" * (-len(raw) % 8)
+                            parsed = base64.b32decode(padded).hex()
+                        except Exception:
+                            continue
+                    if parsed and parsed not in candidates:
+                        candidates.append(parsed)
 
-            if candidate_hash:
+            for candidate_hash in candidates:
                 try:
-                    existing = await self.get_torrent(candidate_hash.lower())
-                    if existing is None and len(candidate_hash) == 64:
-                        # v2/hybrid hash qB may index under the v1 prefix:
-                        # fall back to the first 40 hex chars (20 bytes).
-                        existing = await self.get_torrent(
-                            candidate_hash.lower()[:40])
-                        if existing is not None:
-                            candidate_hash = candidate_hash.lower()[:40]
-                    if existing is not None:
+                    if await self._exists_on_qb(candidate_hash.lower()):
                         log.info(
                             "qB add_torrent returned 'Fails.' but torrent %s already exists",
                             candidate_hash[:10],
                         )
                         return AddResult(hash=candidate_hash.lower(), accepted=True, detail="already added")
+                    if len(candidate_hash) == 64:
+                        # v2/hybrid hash qB may index under the v1 prefix:
+                        # fall back to the first 40 hex chars (20 bytes).
+                        if await self._exists_on_qb(candidate_hash.lower()[:40]):
+                            log.info(
+                                "qB add_torrent returned 'Fails.' but torrent %s already exists",
+                                candidate_hash[:10],
+                            )
+                            return AddResult(hash=candidate_hash.lower()[:40], accepted=True, detail="already added")
                 except Exception as e:
                     log.debug("could not check if torrent %s exists after Fails: %s", candidate_hash[:10], e)
 
