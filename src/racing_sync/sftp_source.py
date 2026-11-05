@@ -283,15 +283,16 @@ class _SFTPConnection:
         )
 
     def close(self) -> None:
-        # Best-effort: never block shutdown on a wedged holder, and never
-        # leak the transport. Mark dead first so new leases skip this member;
-        # then close even if the lock stays held — the in-flight holder will
-        # error out of its op (callers already retry on exactly that).
+        # Best-effort, never blocks: mark dead first so new leases skip
+        # this member, then close even if the lock stays held — the
+        # in-flight holder errors out of its op (callers already retry on
+        # exactly that). A 5s lock wait here used to stall shutdown behind
+        # one wedged holder; non-blocking acquire keeps it instant.
         # Re-entrant same-thread acquisition succeeds immediately, so nested
         # callers (connect() under fetch_torrent's guard) are unaffected.
         self._closed = True
         try:
-            acquired = self._lock.acquire(timeout=5)
+            acquired = self._lock.acquire(blocking=False)
         except Exception:
             acquired = False
         try:
@@ -529,12 +530,19 @@ class _SFTPConnection:
             _close_exec_streams(stdin, stdout, stderr)
         try:
             lines = [ln.split() for ln in out.splitlines() if ln.split()]
-            # Header + one data line; data line has >=6 fields with Available 4th.
-            data = lines[1] if len(lines) > 1 else []
-            if len(data) < 6:
+            # Data is the LAST non-empty line: long device names wrap onto
+            # extra lines under -P, so lines[1] can be a fragment.
+            # Unwrapped: 6 fields with Available 4th. Wrapped: the device
+            # spills above, leaving 5 numeric-led fields (Available 3rd).
+            data = lines[-1] if lines else []
+            if len(data) >= 6:
+                avail = data[3]
+            elif len(data) == 5 and data[0].isdigit():
+                avail = data[2]
+            else:
                 log.warning("ssh df %s returned unparsable output: %r", path, out[:200])
                 return None
-            return int(data[3]) * 1024
+            return int(avail) * 1024
         except (TypeError, ValueError, IndexError) as e:
             log.warning("ssh df %s returned unparsable output: %s", path, e)
             return None
@@ -642,6 +650,10 @@ class SFTPExporter:
         self._pool_lock = threading.Lock()
         self._shutdown = False
         self._rr = 0
+        # Dial epoch: bumped on close() so a dial that completes after
+        # shutdown tears its fresh transport down instead of leaking it
+        # on a member the pool will never lease again.
+        self._generation = 0
 
     def __enter__(self) -> SFTPExporter:
         self.connect()
@@ -688,27 +700,22 @@ class SFTPExporter:
         with self._pool_lock:
             start = self._rr % len(members)
             self._rr += 1
-        # Revive closed members before leasing: without this a burst of
-        # transient failures closes every member and the pool stays dead
-        # until restart (only connect() revived, called at startup).
         # Never revive after close(): shutdown must stay shut (no
         # use-after-close re-dial from a late worker).
         if getattr(self, "_shutdown", False):
             raise RuntimeError("sftp pool is closed")
-        for i in range(len(members)):
-            m = members[(start + i) % len(members)]
-            try:
-                if getattr(m, "_closed", False):
-                    self._try_revive(m)
-            except Exception:
-                continue
         deadline = time.monotonic() + _POOL_LEASE_TIMEOUT
         while True:
             for i in range(len(members)):
                 m = members[(start + i) % len(members)]
                 try:
                     if getattr(m, "_closed", False):
-                        continue
+                        # Lazy single revive: dial only the member we may
+                        # actually lease. Reviving the whole pool per call
+                        # pays a dial storm after every transient outage.
+                        self._try_revive(m)
+                        if getattr(m, "_closed", False):
+                            continue
                     if m._lock.acquire(blocking=False):
                         if getattr(m, "_closed", False):
                             try:
@@ -726,6 +733,8 @@ class SFTPExporter:
             for i in range(len(members)):
                 m = members[(start + i) % len(members)]
                 try:
+                    # No revive here: the first pass already tried. Dialing
+                    # per 50ms slice would storm a down host while waiting.
                     if getattr(m, "_closed", False):
                         continue
                     remaining = deadline - time.monotonic()
@@ -762,12 +771,26 @@ class SFTPExporter:
         import concurrent.futures as _fut
 
         members = self._members_snapshot()
+        gen = self._generation
+
+        def _dial_one(m: _SFTPConnection) -> None:
+            m.connect()
+            if gen != self._generation or getattr(self, "_shutdown", False):
+                # Late success past close()/shutdown: tear the fresh
+                # transport down at once instead of leaking it on a
+                # member the pool will never lease again.
+                try:
+                    m.close()
+                except Exception:
+                    pass
+                raise SFTPError("sftp pool closed during dial")
+
         pool = _fut.ThreadPoolExecutor(
             max_workers=max(1, len(members)), thread_name_prefix="sftp-dial",
         )
         futs: dict = {}
         try:
-            futs = {pool.submit(m.connect): m for m in members}
+            futs = {pool.submit(_dial_one, m): m for m in members}
             try:
                 for fut in _fut.as_completed(futs, timeout=self._DIAL_TIMEOUT_S):
                     exc = fut.exception()
@@ -805,6 +828,7 @@ class SFTPExporter:
         try:
             with self._pool_lock:
                 self._shutdown = True
+                self._generation += 1
                 members = list(self._members)
         except Exception:
             members = list(getattr(self, "_members", None) or [])
@@ -828,14 +852,35 @@ class SFTPExporter:
             self._release(m)
 
     def fetch_many(self, infohashes: Iterable[str]) -> dict[str, bytes]:
+        """Fetch many .torrents, one pool member per hash concurrently.
+
+        SYNC and blocking — run via asyncio.to_thread, never on the loop
+        (a wedged member stalls its worker thread until its own timeouts
+        fire; the pool lease still fails fast for the rest). Members are
+        independent transports, so hashes fan out across
+        min(len, pool_size) threads. Per-hash failures skip (a missing
+        torrent must not fail its siblings).
+        """
+        import concurrent.futures as _fut
+
+        hashes = [h for h in (infohashes or [])]
+        if not hashes:
+            return {}
         out: dict[str, bytes] = {}
-        for h in infohashes:
+
+        def _one(h: str) -> tuple[str, bytes | None]:
             try:
-                data = self.fetch_torrent(h)
+                return h, self.fetch_torrent(h)
             except Exception:
-                continue
-            if data:
-                out[h] = data
+                return h, None
+
+        _workers = max(1, min(len(hashes), self._pool_size))
+        with _fut.ThreadPoolExecutor(
+                max_workers=_workers,
+                thread_name_prefix="sftp-fetch") as _pool:
+            for h, data in _pool.map(_one, hashes):
+                if data:
+                    out[h] = data
         return out
 
     def disk_free_bytes(self, path: str) -> int | None:
