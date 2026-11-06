@@ -17,6 +17,7 @@ from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 
 from .state import State, TorrentState
 from .telegram_protocol import (
+    _SSD_FREE_TTL_S,
     _VPS1_FREE_TTL_S,
     _is_parse_error,
     _is_transient_tg_error,
@@ -79,12 +80,33 @@ class RefreshMixin:
         # Serialize periodic refresh vs callback-triggered refresh so
         # concurrent edits can't interleave or race the dedup cache.
         # (Lazy: unit tests build the bot via object.__new__.)
+        # Coalesce: a caller arriving while a refresh runs marks dirty
+        # and returns — the holder re-runs once — so a burst of taps
+        # (or tick+taps) pays one extra pass, not N queued full passes
+        # each re-stating the SSD and re-sending notes.
         lock = getattr(self, "_active_lock", None)
         if lock is None:
             lock = asyncio.Lock()
             self._active_lock = lock
+        if lock.locked():
+            try:
+                self._refresh_dirty = True
+            except Exception:
+                pass
+            return
         async with lock:
-            await self._refresh_active_message_inner()
+            while True:
+                try:
+                    self._refresh_dirty = False
+                except Exception:
+                    pass
+                await self._refresh_active_message_inner()
+                try:
+                    dirty = bool(getattr(self, "_refresh_dirty", False))
+                except Exception:
+                    dirty = False
+                if not dirty:
+                    break
 
     def _valid_byte_count(self, value: object) -> int | None:
         """int byte count, or None when missing/nonsense. Never raises."""
@@ -141,12 +163,21 @@ class RefreshMixin:
             cfg = getattr(coord, "cfg", None)
             if coord is None or cfg is None:
                 return ""
-            # VPS2 SSD free: cheap local syscall, probed every refresh.
+            # VPS2 SSD free: cheap local syscall, but cached — a burst of
+            # taps shares one stat instead of each paying it (display-only
+            # footer; the cleanup janitor owns real low-space reaction).
             ssd_free: int | None = None
             try:
-                from .rclone_ops import ssd_free_bytes as _ssd_free
-                ssd_free = self._valid_byte_count(
-                    await asyncio.to_thread(_ssd_free, cfg))
+                _now_s = time.monotonic()
+                _cached_s = getattr(self, "_ssd_free_cache", None)
+                if (_cached_s is not None and len(_cached_s) == 2
+                        and _now_s - float(_cached_s[0]) < _SSD_FREE_TTL_S):
+                    ssd_free = self._valid_byte_count(_cached_s[1])
+                else:
+                    from .rclone_ops import ssd_free_bytes as _ssd_free
+                    ssd_free = self._valid_byte_count(
+                        await asyncio.to_thread(_ssd_free, cfg))
+                    self._ssd_free_cache = (_now_s, ssd_free)
             except Exception:
                 ssd_free = None
             # SSD reservation ledger: in-memory, no I/O.
@@ -221,15 +252,48 @@ class RefreshMixin:
         # Stale-card net: re-queue detail updates whose card drifted from
         # the row (edits lost to flood bans, restarts mid-edit). Steady
         # state is silent — only drift enqueues, with live progress, and
-        # the worker batch coalesces duplicates.
+        # the worker batch coalesces duplicates. Hashes on a card-update
+        # fail streak sit out (their route already proved dead — every
+        # refresh re-driving them burns an API call each pass); every 8th
+        # skip re-drives once so a healed route still recovers, and any
+        # success clears the streak.
         try:
             _sent = self._sent_state_map()
+            try:
+                _fail_streak = getattr(self, "_detail_fail_streak", None)
+                if not isinstance(_fail_streak, dict):
+                    _fail_streak = {}
+            except Exception:
+                _fail_streak = {}
+            try:
+                _drift_skip = getattr(self, "_detail_drift_skip", None)
+                if not isinstance(_drift_skip, dict):
+                    _drift_skip = {}
+                    self._detail_drift_skip = _drift_skip
+            except Exception:
+                _drift_skip = {}
             for _ts, _prog in items:
                 try:
                     _h = _ts.source_infohash or ""
                     if not _h:
                         continue
                     if _sent.get(_h) != _ts.state.value:
+                        try:
+                            _n = int(_fail_streak.get(_h, 0) or 0)
+                        except Exception:
+                            _n = 0
+                        if _n >= 5:
+                            try:
+                                _c = int(_drift_skip.get(_h, 0) or 0) + 1
+                                _drift_skip[_h] = _c
+                            except Exception:
+                                _c = 1
+                            if _c < 8:
+                                continue
+                            try:
+                                _drift_skip.pop(_h, None)
+                            except Exception:
+                                pass
                         self._enqueue_detail(_h, _prog)
                 except Exception:
                     continue
@@ -382,6 +446,12 @@ class RefreshMixin:
                         "(transient %s); keeping it, will retry next "
                         "interval", _prev_id, _prev_e,
                     )
+                    # Feed the orphan sweep too: if the retry path ever
+                    # stops firing, the sweep still retires this id.
+                    try:
+                        self._remember_orphan(_prev_id)
+                    except Exception:
+                        pass
                     return
                 except TelegramError as _prev_e:
                     _prev_msg = str(_prev_e).lower()
@@ -398,6 +468,12 @@ class RefreshMixin:
                             _prev_id, _prev_e,
                         )
                         self._prev_active_msg_id = None
+                        # The sweep drops it as hopeless (or deletes it if
+                        # rights are restored later).
+                        try:
+                            self._remember_orphan(_prev_id)
+                        except Exception:
+                            pass
                     elif (_is_transient_tg_error(_prev_e)
                             or "flood control" in _prev_msg
                             or "too many requests" in _prev_msg
@@ -746,6 +822,10 @@ class RefreshMixin:
                 "(transient %s); keeping old message, will retry next "
                 "interval", e,
             )
+            try:
+                self._remember_orphan(old_int)
+            except Exception:
+                pass
             return
         except TelegramError as e:
             msg = str(e).lower()
@@ -774,6 +854,10 @@ class RefreshMixin:
                     "active-tasks repost delete rate-limited (%s); "
                     "keeping old message, will retry next interval", e,
                 )
+                try:
+                    self._remember_orphan(old_int)
+                except Exception:
+                    pass
                 return
             else:
                 log.warning(
@@ -847,6 +931,23 @@ class RefreshMixin:
             return
         if self._active_msg_id is None or self._active_msg_id == self._pinned_message_id:
             return
+        # A persisted disable survives restarts (an in-memory cfg flip
+        # re-spams pin attempts every boot).
+        try:
+            if getattr(self, "_pin_disabled", False):
+                return
+            if not getattr(self, "_pin_disabled_checked", False):
+                self._pin_disabled_checked = True
+                try:
+                    _dis = await asyncio.to_thread(
+                        self._store.get_meta, "telegram_pin_disabled")
+                except Exception:
+                    _dis = None
+                if str(_dis or "") == "1":
+                    self._pin_disabled = True
+                    return
+        except Exception:
+            pass
         try:
             await self._bot.pin_chat_message(
                 self._cfg.chat_id, self._active_msg_id,
@@ -854,16 +955,24 @@ class RefreshMixin:
             self._pinned_message_id = self._active_msg_id
         except TelegramError as e:
             # Permanent failures (no rights, bad request) disable further
-            # pin attempts; transient rate-limit/network errors keep the
-            # setting — the next refresh retries.
+            # pin attempts persistently; transient rate-limit/network
+            # errors keep the setting — the next refresh retries.
             msg = str(e).lower()
             transient = isinstance(e, (RetryAfter, TimedOut, NetworkError))
             transient = transient or "retry after" in msg or "flood" in msg or "timeout" in msg
             if transient:
                 log.warning("pin deferred (transient %s); will retry", e)
                 return
-            log.warning("pin failed (%s); disabling pin_status_message", e)
-            self._cfg.pin_status_message = False
+            log.warning("pin failed (%s); disabling persistently", e)
+            try:
+                self._pin_disabled = True
+            except Exception:
+                pass
+            try:
+                await asyncio.to_thread(
+                    self._store.set_meta, "telegram_pin_disabled", "1")
+            except Exception:
+                pass
 
     # ---- one-shot notification (errors that don't belong to a torrent) ----
 
