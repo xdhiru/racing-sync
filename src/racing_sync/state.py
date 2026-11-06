@@ -855,6 +855,29 @@ class StateStore:
             ).fetchall()
             return [_row_to_state(r) for r in rows]
 
+    def all_card_prefill(self) -> list[tuple[str, int, str]]:
+        """Narrow startup prefill for Telegram card caches.
+
+        `(source_infohash, telegram_message_id, state)` only — the bot
+        startup path must not hydrate full rows (blobs/notes/errors) for
+        thousands of torrents just to learn "already sent".
+        """
+        self._ensure_open()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT source_infohash, telegram_message_id, state "
+                "FROM torrent_state WHERE deleted_at = ''"
+            ).fetchall()
+        out: list[tuple[str, int, str]] = []
+        for r in rows:
+            try:
+                out.append((str(r["source_infohash"]),
+                            int(r["telegram_message_id"] or 0),
+                            str(r["state"] or "")))
+            except Exception:
+                continue
+        return out
+
     def find_by_name(self, source_name: str) -> list[TorrentState]:
         self._ensure_open()
         clean_name = (source_name or "").strip()

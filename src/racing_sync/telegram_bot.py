@@ -227,6 +227,44 @@ async def _publish_bot_commands(bot: object) -> None:
         log.debug("telegram command menu publish failed: %s", e)
 
 
+class _FloodBackoff(Exception):
+    """Raise out of a card send when Telegram rate-limits it.
+
+    Carries the server's wait so the WORKER LOOP sleeps once per batch
+    instead of each card stalling the cards behind it (head-of-line).
+    Never raised to callers outside the loop: they treat it like any
+    send error (log + retry next pass).
+    """
+
+    def __init__(self, seconds: float):
+        super().__init__(f"telegram flood backoff {seconds:.0f}s")
+        try:
+            self.seconds = max(1.0, min(float(seconds), 300.0))
+        except Exception:
+            self.seconds = 5.0
+
+
+def _is_auth_failure(e: BaseException) -> bool:
+    """True when Telegram rejected the token (401/Unauthorized).
+
+    A bad token fails every call forever — starting the loops anyway
+    just burns API calls and hides the config error behind retries.
+    """
+    try:
+        from telegram.error import InvalidToken, Unauthorized
+        if isinstance(e, (InvalidToken, Unauthorized)):
+            return True
+    except Exception:
+        pass
+    try:
+        msg = str(e).lower()
+        if "401" in msg or "unauthorized" in msg:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _make_bot(token: str) -> Bot:
     """Bot with generous HTTP timeouts for slow routes to api.telegram.org.
 
@@ -331,15 +369,30 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         self._detail_queue = asyncio.Queue(maxsize=256)
         # Pre-fill cache from the store so we don't re-send every
         # torrent on restart. Sent states pre-fill too, so the stale-card
-        # net stays quiet until a card actually drifts.
-        all_items = await asyncio.to_thread(self._store.all)
-        for ts in all_items:
-            if ts.telegram_message_id:
-                self._detail_cache[ts.source_infohash] = ts.telegram_message_id
+        # net stays quiet until a card actually drifts. Narrow query
+        # (ids + states only): startup must not hydrate full rows for
+        # thousands of torrents just to learn "already sent".
+        try:
+            _prefill_fn = getattr(self._store, "all_card_prefill", None)
+            if callable(_prefill_fn):
+                _prefill_rows = await asyncio.to_thread(_prefill_fn)
+            else:
+                _prefill_rows = await asyncio.to_thread(self._store.all)
+        except Exception:
+            _prefill_rows = []
+        for _row in _prefill_rows or []:
             try:
-                self._detail_sent_state[ts.source_infohash] = ts.state.value
+                if isinstance(_row, tuple) and len(_row) == 3:
+                    _h, _mid, _st = _row
+                else:
+                    _h = _row.source_infohash
+                    _mid = _row.telegram_message_id
+                    _st = _row.state.value
+                if _mid:
+                    self._detail_cache[_h] = _mid
+                self._detail_sent_state[_h] = _st
             except Exception:
-                pass
+                continue
         # Restore active message ID across restarts to prevent duplicate messages
         raw_active_id = await asyncio.to_thread(self._store.get_meta, "telegram_active_msg_id")
         if raw_active_id:
@@ -383,6 +436,14 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                 except Exception:
                     pass
         except TelegramError as e:
+            if _is_auth_failure(e):
+                # 401/Unauthorized: the token is dead — every later call
+                # fails the same way. Fail fast (no loops) so the config
+                # error surfaces instead of hiding behind retries.
+                log.error("telegram token rejected (%s); fix bot_token "
+                          "and restart — not starting telegram loops", e)
+                raise RuntimeError(
+                    f"telegram bot_token rejected: {e}") from e
             log.warning("telegram probe failed: %s", e)
         self._task = asyncio.create_task(self._loop(), name="rs-telegram")
         self._callback_task = asyncio.create_task(
@@ -539,7 +600,9 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         stay under Telegram's bot API rate limit. When the queue
         contains multiple updates for the same infohash, only the
         latest is sent (intermediate states are skipped — they would
-        arrive in the same chat scroll anyway).
+        arrive in the same chat scroll anyway). Flood backoff sleeps
+        HERE, once per batch: a banned card no longer stalls the cards
+        behind it, and the unprocessed remainder requeues.
         """
         assert self._detail_queue is not None
         interval = 1.0 / max(0.1, float(getattr(self._cfg, "outbound_rate", 1.0)))
@@ -562,8 +625,20 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                     batch[h] = p
                 if not batch:
                     continue
-                for infohash, progress in batch.items():
-                    await self._send_one_detail(infohash, progress)
+                pending = list(batch.items())
+                for _i, (infohash, progress) in enumerate(pending):
+                    try:
+                        await self._send_one_detail(infohash, progress)
+                    except _FloodBackoff as _fb:
+                        log.warning(
+                            "telegram detail batch flood; backing off "
+                            "for %ds (%d card(s) requeued)",
+                            int(_fb.seconds), len(pending) - _i,
+                        )
+                        await asyncio.sleep(_fb.seconds)
+                        for _rh, _rp in pending[_i:]:
+                            self._enqueue_detail(_rh, _rp)
+                        break
                     await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 return
@@ -689,18 +764,20 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         if msg_id is None:
             msg_id = await asyncio.to_thread(self._store.get_telegram_message_id, infohash)
 
-        async def _retry_rate_limited(err: BaseException) -> bool:
-            """Sleep out a rate limit and requeue; False when not one."""
+        def _rate_limit_wait(err: BaseException) -> float | None:
+            """Server's wait for a rate limit; None when not one.
+
+            Pure calculator — the caller raises _FloodBackoff so the
+            WORKER LOOP sleeps once per batch (never per card here).
+            """
             _wait = _flood_wait_seconds(err)
             if _wait is None:
-                return False
+                return None
             log.warning(
-                "telegram detail rate-limited for %s; retrying in %ds",
-                infohash[:10], _wait,
+                "telegram detail rate-limited for %s; backing off %ds",
+                infohash[:10], int(_wait),
             )
-            await asyncio.sleep(_wait)
-            self._enqueue_detail(infohash, progress)
-            return True
+            return _wait
 
         try:
             if msg_id is None:
@@ -765,8 +842,8 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                             message_id=msg_id,
                         )
                         self._mark_detail_sent(infohash, state_value)
-                    elif await _retry_rate_limited(e):
-                        return
+                    elif (_w := _rate_limit_wait(e)) is not None:
+                        raise _FloodBackoff(_w)
                     elif _is_transient_tg_error(e):
                         # Timeout on EDIT: the row may settle (DONE/FAILED)
                         # right after, leaving the active list where the
@@ -789,14 +866,17 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
             else:
                 wait_s = _with_flood_margin(e.retry_after)
             log.warning("telegram flood control hit; backing off for %ds", wait_s)
-            await asyncio.sleep(wait_s)
-            self._enqueue_detail(infohash, progress)
+            raise _FloodBackoff(wait_s) from e
         except (TimedOut, NetworkError) as e:
             log.warning("telegram detail send timed out (%s); will retry next interval", e)
             self._note_detail_transient_failure(infohash, progress, state_value)
         except TelegramError as e:
-            if await _retry_rate_limited(e):
-                return
+            if ((_w2 := _flood_wait_seconds(e)) is not None):
+                log.warning(
+                    "telegram detail rate-limited for %s; backing off %ds",
+                    infohash[:10], int(_w2),
+                )
+                raise _FloodBackoff(_w2) from e
             log.warning("telegram detail send failed for %s: %s",
                         infohash[:10], e)
 
