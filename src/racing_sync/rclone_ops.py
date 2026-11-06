@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import time
 from collections.abc import Iterable
@@ -101,6 +102,218 @@ def _note_rclone_move(ok: bool) -> None:
         _RCLONE_COUNTERS["move_ok" if ok else "move_fail"] += 1
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Live move progress (P1)
+# --------------------------------------------------------------------------- #
+# Long `rclone move` runs are opaque until exit: without progress a 6h move
+# parks every tick and the park counter screams "stalled" at a healthy
+# transfer. With `--stats=5s --stats-one-line` rclone prints
+# `Transferred: X / Y, Z%, S/s, ETA T` lines to stderr (text form, like
+# MLTB's transfer.py parses — NOT --use-json-log, which would also turn
+# every error line into JSON and mangle RcloneResult.stderr consumers).
+# The pump below ingests those lines into _RCLONE_PROGRESS[tree] while the
+# move runs; completion/timeout/cancel evicts the entry.
+
+@dataclass
+class RcloneProgress:
+    transferred_bytes: int = 0
+    total_bytes: int = 0
+    percent: float = 0.0
+    speed_bps: int = 0
+    eta_seconds: int = 0
+    updated_at: float = 0.0
+
+
+_RCLONE_PROGRESS: dict[str, RcloneProgress] = {}
+_MAX_PROGRESS_STDERR = 65536
+
+_TRANSFERRED_RE = re.compile(
+    r"Transferred:\s+([\d.]+\s*\w+)\s+/\s+([\d.]+\s*\w+),\s+"
+    r"([\d.]+%)\s*,\s+([\d.]+\s*\w+/s),\s+ETA\s+([\dwdhms-]+)"
+)
+_SIZE_RE = re.compile(r"^\s*([\d.]+)\s*([KMGTPE]?)(i?[Bb])?(ytes?)?\s*(/s)?\s*$",
+                      re.IGNORECASE)
+_ETA_RE = re.compile(
+    r"^\s*(?:(\d+)\s*h\s*)?(?:(\d+)\s*m\s*)?(?:(\d+)\s*s\s*)?\s*$",
+    re.IGNORECASE)
+_SIZE_FACTORS = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3,
+                 "T": 1024 ** 4, "P": 1024 ** 5, "E": 1024 ** 6}
+
+
+def _parse_rclone_size(text: object) -> int | None:
+    """`80.5M`/`12G`/`0 B` -> bytes (rclone stats are 1024-based)."""
+    try:
+        m = _SIZE_RE.match(str(text or ""))
+        if not m:
+            return None
+        return int(float(m.group(1)) * _SIZE_FACTORS.get(
+            (m.group(2) or "").upper(), 1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_rclone_eta(text: object) -> int | None:
+    """`3m12s`/`45s`/`2h` -> seconds; `-`/blank -> None."""
+    try:
+        s = str(text or "").strip()
+        if not s or s == "-":
+            return None
+        m = _ETA_RE.match(s)
+        if not m or not any(m.groups()):
+            return None
+        h, mi, se = m.groups()
+        return (int(h or 0) * 3600 + int(mi or 0) * 60 + int(se or 0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _ingest_progress_line(key: str, raw: bytes) -> None:
+    """Parse one stderr line into _RCLONE_PROGRESS[key]. Never raises."""
+    try:
+        try:
+            text = bytes(raw).decode("utf-8", errors="replace")
+        except Exception:
+            return
+        m = _TRANSFERRED_RE.search(text)
+        if not m:
+            return
+        _trans, _total, _pct, _spd, _eta = m.groups()
+        transferred = _parse_rclone_size(_trans)
+        total = _parse_rclone_size(_total)
+        try:
+            pct = max(0.0, min(100.0, float(_pct.rstrip("%"))))
+        except (TypeError, ValueError):
+            pct = 0.0
+        speed = _parse_rclone_speed(_spd)
+        eta = _parse_rclone_eta(_eta)
+        _RCLONE_PROGRESS[key] = RcloneProgress(
+            transferred_bytes=transferred or 0,
+            total_bytes=total or 0,
+            percent=pct,
+            speed_bps=speed or 0,
+            eta_seconds=eta or 0,
+            updated_at=time.monotonic(),
+        )
+    except Exception:
+        pass
+
+
+def _parse_rclone_speed(text: object) -> int | None:
+    try:
+        s = str(text or "").strip()
+        if s.endswith("/s"):
+            s = s[:-2]
+        return _parse_rclone_size(s)
+    except Exception:
+        return None
+
+
+def rclone_progress_map() -> dict[str, RcloneProgress]:
+    """Snapshot of live move progress by tree key. Never raises."""
+    try:
+        return dict(_RCLONE_PROGRESS)
+    except Exception:
+        return {}
+
+
+def _progress_drop(key: str | None) -> None:
+    try:
+        if key:
+            _RCLONE_PROGRESS.pop(key, None)
+    except Exception:
+        pass
+
+
+def _with_stats_flags(cmd: list[str]) -> list[str]:
+    """Insert periodic-stats flags BEFORE `--` (positionals stay last)."""
+    flags = ["--stats=5s", "--stats-one-line", "--stats-log-level", "NOTICE"]
+    try:
+        out = list(cmd)
+        if "--" in out:
+            idx = out.index("--")
+            return out[:idx] + flags + out[idx:]
+        return out + flags
+    except Exception:
+        return cmd
+
+
+async def _communicate_with_progress(
+    proc: object, key: str, timeout: float,
+) -> tuple[bytes, bytes]:
+    """Pump stderr stats lines while the move runs; then collect output.
+
+    Same timeout contract as communicate(): TimeoutError propagates to
+    the caller's kill path. stderr is accumulated (capped) so
+    RcloneResult.stderr stays meaningful on failure.
+    """
+    async def _pump() -> tuple[bytes, bytes]:
+        err_parts: list[bytes] = []
+        err_len = 0
+        try:
+            while True:
+                try:
+                    _rc = proc.returncode
+                except Exception:
+                    _rc = None
+                if _rc is not None:
+                    try:
+                        if proc.stderr.at_eof():
+                            break
+                    except Exception:
+                        break
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stderr.readline(), 60.0)
+                except asyncio.TimeoutError:
+                    if _rc is not None:
+                        break
+                    continue
+                if not line:
+                    if _rc is not None:
+                        break
+                    try:
+                        await asyncio.sleep(0.5)
+                    except asyncio.CancelledError:
+                        raise
+                    continue
+                try:
+                    if err_len < _MAX_PROGRESS_STDERR:
+                        err_parts.append(bytes(line))
+                        err_len += len(bytes(line))
+                except Exception:
+                    pass
+                _ingest_progress_line(key, line)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        try:
+            rest = await proc.stderr.read()
+        except Exception:
+            rest = b""
+        try:
+            if rest and err_len < _MAX_PROGRESS_STDERR:
+                err_parts.append(bytes(rest)[:_MAX_PROGRESS_STDERR - err_len])
+        except Exception:
+            pass
+        try:
+            out = await proc.stdout.read()
+        except Exception:
+            out = b""
+        try:
+            if proc.returncode is None:
+                await proc.wait()
+        except Exception:
+            pass
+        try:
+            return (bytes(out or b""),
+                    b"".join(err_parts)[:_MAX_PROGRESS_STDERR])
+        except Exception:
+            return b"", b""
+
+    return await asyncio.wait_for(_pump(), timeout=timeout)
 
 
 def _tree_key(tree: object) -> str | None:
@@ -364,6 +577,7 @@ async def run_rclone(
     *,
     timeout: float | None = None,
     tree: Path | None = None,
+    progress: bool = False,
 ) -> RcloneResult:
     """Run one rclone command with a wall-clock ceiling.
 
@@ -371,11 +585,18 @@ async def run_rclone(
     `local`). Refuses with RcloneBusyError while a previous move for
     the same tree is still alive instead of racing it; an unreaped
     orphan keeps its guard entry until it exits.
+
+    `progress`: pump `--stats` lines into the live progress map while a
+    move runs (long moves stay visible instead of parking "stalled").
+    Requires `tree`; ignored otherwise.
     """
     if timeout is None:
         timeout = _move_timeout_seconds(cfg)
     _validate_rclone_binary(cfg)
     _move_key = _active_check(tree)
+    _progress_key = _move_key if (progress and _move_key) else None
+    if _progress_key is not None:
+        cmd = _with_stats_flags(cmd)
     log.info("rclone: %s", redact_rclone_cmd(cmd))
     t0 = time.monotonic()
     try:
@@ -417,9 +638,16 @@ async def run_rclone(
             pass
 
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
-        )
+        if _progress_key is not None:
+            try:
+                stdout_b, stderr_b = await _communicate_with_progress(
+                    proc, _progress_key, timeout)
+            finally:
+                _progress_drop(_progress_key)
+        else:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
     except asyncio.CancelledError:
         # Shutdown while a move is in flight: terminate the child (bounded)
         # so it can't keep uploading/deleting source files after we exit,
@@ -557,6 +785,7 @@ async def move_local_to_remote(
     files_from: list[str] | None = None,
     extra: list[str] | None = None,
     timeout: float | None = None,
+    progress: bool = False,
 ) -> RcloneResult:
     if not local.exists():
         raise FileNotFoundError(f"rclone source missing: {local}")
@@ -597,7 +826,8 @@ async def move_local_to_remote(
                              files_from=list_path,
                              extra=[*(extra or []), "--error-on-no-transfer"])
         try:
-            res = await run_rclone(cfg, cmd, timeout=timeout, tree=local)
+            res = await run_rclone(cfg, cmd, timeout=timeout, tree=local,
+                                   progress=progress)
         except Exception:
             _note_rclone_move(False)
             raise

@@ -567,7 +567,7 @@ async def test_move_cmd_carries_error_on_no_transfer(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_wipe_reports_partial_failures(tmp_path: Path):
-    """wipe_local_files returns what it could not remove."""
+
     from racing_sync.rclone_ops import wipe_local_files
 
     base = tmp_path / "base"
@@ -581,3 +581,88 @@ async def test_wipe_reports_partial_failures(tmp_path: Path):
     outsider.write_bytes(b"x")
     assert await wipe_local_files([outsider], base_dir=base) == [outsider]
     assert outsider.exists()
+
+
+def test_parse_rclone_size_and_eta():
+    from racing_sync.rclone_ops import _parse_rclone_size, _parse_rclone_eta
+
+    assert _parse_rclone_size("80.5M") == int(80.5 * 1024 ** 2)
+    assert _parse_rclone_size("1.2G") == int(1.2 * 1024 ** 3)
+    assert _parse_rclone_size("0 B") == 0
+    assert _parse_rclone_size("nope") is None
+    assert _parse_rclone_eta("3m12s") == 192
+    assert _parse_rclone_eta("45s") == 45
+    assert _parse_rclone_eta("2h") == 7200
+    assert _parse_rclone_eta("-") is None
+    assert _parse_rclone_eta("") is None
+
+
+def test_ingest_progress_line_updates_map():
+    from racing_sync import rclone_ops
+    from racing_sync.rclone_ops import _ingest_progress_line
+
+    try:
+        _ingest_progress_line(
+            "k",
+            b"Transferred: 80.500M / 200.000M, 40%, 10.000M/s, ETA 12s\n")
+        prog = rclone_ops._RCLONE_PROGRESS["k"]
+        assert prog.percent == 40.0
+        assert prog.transferred_bytes == int(80.5 * 1024 ** 2)
+        assert prog.total_bytes == int(200.0 * 1024 ** 2)
+        assert prog.speed_bps == int(10.0 * 1024 ** 2)
+        assert prog.eta_seconds == 12
+        # Noise lines never create entries.
+        _ingest_progress_line("j", b"2026/01/01 NOTICE: Config file\n")
+        assert "j" not in rclone_ops._RCLONE_PROGRESS
+    finally:
+        rclone_ops._RCLONE_PROGRESS.clear()
+
+
+def test_stats_flags_inserted_before_positionals(tmp_path: Path):
+    from racing_sync.rclone_ops import _with_stats_flags
+
+    cmd = ["rclone", "move", "--stats=9s", "--", "src", "remote:dest"]
+    assert _with_stats_flags(cmd) == [
+        "rclone", "move", "--stats=9s",
+        "--stats=5s", "--stats-one-line", "--stats-log-level", "NOTICE",
+        "--", "src", "remote:dest",
+    ]
+
+
+@pytest.mark.anyio
+async def test_progress_run_pumps_stats_and_evicts(monkeypatch, tmp_path):
+    """A progress move ingests stats lines, keeps stderr, evicts after."""
+    import asyncio as _asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync import rclone_ops
+    from racing_sync.rclone_ops import (
+        _tree_key, rclone_counters, run_rclone,
+    )
+
+    tree = tmp_path / "Top"
+    tree.mkdir()
+    proc = MagicMock()
+    proc.returncode = 0
+    proc.stderr.at_eof.return_value = False
+    proc.stderr.readline = AsyncMock(side_effect=[
+        b"Transferred: 10.000M / 20.000M, 50%, 5.000M/s, ETA 10s\n",
+        b"",
+    ])
+    proc.stderr.read = AsyncMock(return_value=b"tail\n")
+    proc.stdout.read = AsyncMock(return_value=b"")
+    proc.wait = AsyncMock(return_value=0)
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec",
+                        AsyncMock(return_value=proc))
+    before = rclone_counters()["moves"]
+    try:
+        res = await run_rclone(
+            _rclone_cfg(), ["rclone", "move", "--", "x", "y"],
+            timeout=60, tree=tree, progress=True)
+    finally:
+        rclone_ops._ACTIVE_MOVES.clear()
+        rclone_ops._RCLONE_PROGRESS.clear()
+    assert res.ok
+    assert res.stderr.endswith("tail\n")
+    # Entry evicted on completion (no stale percentages linger).
+    assert _tree_key(tree) not in rclone_ops._RCLONE_PROGRESS
+    assert rclone_counters()["moves"] == before
