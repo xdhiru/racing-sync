@@ -964,6 +964,45 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     owned[task] = factory
                 except Exception:
                     pass
+            # Telegram loops under the same supervisor: adopt the tasks
+            # bot.start() already spawned (never spawn a second poll —
+            # double polling self-conflicts); a crashed detail worker /
+            # refresh loop / callback poll respawns loudly like any other
+            # lane. Conflict-fatal polls never respawn (another session
+            # holds the token — respawning would re-conflict).
+            try:
+                _tg = getattr(self, "_tg", None)
+                if _tg is not None and not bool(
+                        getattr(_tg, "_poll_conflict_fatal", False)):
+                    try:
+                        _tg_by_name = {
+                            "rs-telegram": _tg._loop,
+                            "rs-telegram-callbacks": _tg._callback_loop,
+                            "rs-telegram-detail": _tg._detail_worker_loop,
+                        }
+                    except Exception:
+                        _tg_by_name = {}
+                    for _attr in ("_task", "_callback_task",
+                                  "_detail_worker"):
+                        try:
+                            _t = getattr(_tg, _attr, None)
+                        except Exception:
+                            continue
+                        if not isinstance(_t, asyncio.Task) or _t.done():
+                            continue
+                        try:
+                            _fac = (_tg_by_name or {}).get(_t.get_name())
+                        except Exception:
+                            _fac = None
+                        if not callable(_fac):
+                            continue
+                        try:
+                            loop_tasks.add(_t)
+                            owned[_t] = _fac
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             while not self._stop:
                 try:
                     await asyncio.sleep(1.0)
@@ -996,6 +1035,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                                 log.error("loop task died; respawning: %s", e,
                                           exc_info=True)
                             if factory is not None and not self._stop:
+                                try:
+                                    _fself = getattr(factory, "__self__",
+                                                     None)
+                                    _fconflict = bool(getattr(
+                                        _fself, "_poll_conflict_fatal",
+                                        False)) if _fself is not None else False
+                                except Exception:
+                                    _fconflict = False
+                                if _fconflict:
+                                    log.error(
+                                        "telegram poll conflict-fatal; not "
+                                        "respawning (another session holds "
+                                        "the token)")
+                                    continue
                                 try:
                                     new_task = asyncio.create_task(factory())
                                     loop_tasks.add(new_task)

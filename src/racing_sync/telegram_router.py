@@ -271,6 +271,12 @@ class RouterMixin:
                     timeout=10,
                     allowed_updates=["callback_query", "message", "channel_post"],
                 )
+                # A clean poll clears the conflict streak (only
+                # consecutive conflicts fail fast).
+                try:
+                    self._poll_conflicts = 0
+                except Exception:
+                    pass
                 for u in updates:
                     offset = max(offset, u.update_id + 1)
                     if u.callback_query:
@@ -286,6 +292,33 @@ class RouterMixin:
             except Exception as e:
                 msg = str(e).lower()
                 if "conflict" in msg:
+                    # Another bot session holds this token: backing off
+                    # forever just burns API calls. Count consecutive
+                    # conflicts; at 3 fail fast (stop the loop loudly —
+                    # the coordinator will not respawn a conflicted poll
+                    # and the double-run surfaces instead of hiding).
+                    try:
+                        _n = int(getattr(self, "_poll_conflicts", 0) or 0) + 1
+                    except Exception:
+                        _n = 1
+                    try:
+                        self._poll_conflicts = _n
+                    except Exception:
+                        pass
+                    if _n >= 3:
+                        try:
+                            self._poll_conflict_fatal = True
+                        except Exception:
+                            pass
+                        log.error(
+                            "telegram polling conflict x%s (another bot "
+                            "session with this token?); stopping callback "
+                            "loop", _n)
+                        try:
+                            self._stopped = True
+                        except Exception:
+                            pass
+                        return
                     log.warning("telegram callback polling conflict (another bot session running?): %s", e)
                     await asyncio.sleep(15)
                 else:

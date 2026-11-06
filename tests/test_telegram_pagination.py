@@ -223,10 +223,14 @@ async def test_send_one_detail_handles_timedelta_retry_after():
     err = MockRetryAfter(dt.timedelta(seconds=5))
     bot._bot.send_message = AsyncMock(side_effect=err)
 
+    from racing_sync.telegram_bot import _FloodBackoff
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-        await bot._send_one_detail("abc123", 0.5)
-        mock_sleep.assert_awaited_once_with(7)
-    assert not bot._detail_queue.empty()
+        with pytest.raises(_FloodBackoff) as _exc:
+            await bot._send_one_detail("abc123", 0.5)
+        mock_sleep.assert_not_called()
+    assert _exc.value.seconds == 7
+    # No self-requeue: the worker loop sleeps once and requeues the batch.
+    assert bot._detail_queue.empty()
 
 
 def test_flood_wait_seconds_helper():
@@ -257,12 +261,14 @@ def test_flood_wait_seconds_helper():
 async def test_send_one_detail_recovers_plain_flood_edit():
     """The reported bug: a flood-shaped plain TelegramError dropped the edit.
 
-    First call hits flood on edit -> sleeps the requested window and
-    re-queues; second call succeeds and the card carries the DONE state.
+    The send now raises _FloodBackoff (loop sleeps + requeues); the
+    re-driven update sends the fresh DONE text.
     """
     import asyncio
     from unittest.mock import AsyncMock, MagicMock, patch
     from telegram.error import TelegramError
+
+    from racing_sync.telegram_bot import _FloodBackoff
 
     bot = object.__new__(TelegramBot)
     bot._bot = MagicMock()
@@ -281,27 +287,28 @@ async def test_send_one_detail_recovers_plain_flood_edit():
     bot._bot.edit_message_text = AsyncMock(side_effect=flood)
 
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-        await bot._send_one_detail(h, None)
-        mock_sleep.assert_awaited_once_with(47)
-    assert not bot._detail_queue.empty()
+        with pytest.raises(_FloodBackoff) as _exc:
+            await bot._send_one_detail(h, None)
+        mock_sleep.assert_not_called()
+    assert _exc.value.seconds == 47
     # Nothing recorded as sent yet — the card still shows the old state.
     assert bot._sent_state_map().get(h) != State.DONE.value
 
-    # Flood lifts: the re-queued update sends the fresh DONE text.
+    # Flood lifts: the re-driven update sends the fresh DONE text.
     bot._bot.edit_message_text = AsyncMock()
-    h2, _ = bot._detail_queue.get_nowait()
-    assert h2 == h
-    await bot._send_one_detail(h2, None)
+    await bot._send_one_detail(h, None)
     sent_text = bot._bot.edit_message_text.call_args[0][0]
     assert "DONE" in sent_text
     assert bot._sent_state_map().get(h) == State.DONE.value
 
 
 @pytest.mark.anyio
-async def test_send_one_detail_send_path_flood_requeues():
+async def test_send_one_detail_send_path_flood_raises_to_loop():
     import asyncio
     from unittest.mock import AsyncMock, MagicMock, patch
     from telegram.error import TelegramError
+
+    from racing_sync.telegram_bot import _FloodBackoff
 
     bot = object.__new__(TelegramBot)
     bot._bot = MagicMock()
@@ -318,9 +325,11 @@ async def test_send_one_detail_send_path_flood_requeues():
         side_effect=TelegramError("Too Many Requests: retry after 12"))
 
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-        await bot._send_one_detail(h, None)
-        mock_sleep.assert_awaited_once_with(15)
-    assert not bot._detail_queue.empty()
+        with pytest.raises(_FloodBackoff) as _exc:
+            await bot._send_one_detail(h, None)
+        mock_sleep.assert_not_called()
+    assert _exc.value.seconds == 15
+    assert bot._detail_queue.empty()
 
 
 @pytest.mark.anyio
