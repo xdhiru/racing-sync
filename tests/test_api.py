@@ -369,8 +369,18 @@ def test_healthz_needs_no_auth():
     assert resp.json() == {"status": "ok"}
 
 
-def test_readyz_reports_checks_when_authed():
-    coord, _cfg = _api_coord()
+def test_readyz_reports_checks_when_authed(tmp_path):
+    import time as _time
+    from types import SimpleNamespace
+
+    coord, _ = _api_coord()
+    cfg = MagicMock()
+    cfg.api = APIConfig(enabled=True, api_token="secret",
+                        trust_nginx_header=False)
+    cfg.rclone = SimpleNamespace(fuse=SimpleNamespace(mount=tmp_path))
+    cfg.ssd = SimpleNamespace(path=tmp_path)
+    coord.cfg = cfg
+    coord._last_tick_at = _time.monotonic()
     app = build_app(coord)
     client = TestClient(app)
     resp = client.get("/readyz", headers={"X-Api-Token": "secret"})
@@ -378,10 +388,15 @@ def test_readyz_reports_checks_when_authed():
     data = resp.json()
     assert data["ready"] is True
     assert data["checks"]["state_db"] is True
+    assert data["checks"]["fuse_mount"] is True
+    assert data["checks"]["ssd_writable"] is True
+    assert data["checks"]["tick_fresh"] is True
     assert client.get("/readyz").status_code == 401
 
 
 def test_metrics_exposes_state_counts():
+    import time as _time
+
     from racing_sync.state import State, TorrentState
 
     coord, _cfg = _api_coord()
@@ -390,8 +405,15 @@ def test_metrics_exposes_state_counts():
         TorrentState(source_infohash="b" * 40, state=State.MOVING),
         TorrentState(source_infohash="c" * 40, state=State.QUEUED),
     ]
+    # Authoritative counts (DONE/FAILED live outside all_active).
+    coord.store.count_by_state.return_value = {
+        "moving": 2, "queued": 1, "done": 5, "failed": 1,
+        "waiting_disk": 3,
+    }
     coord._tasks = set()
     coord._started_at = 0.0
+    coord._last_tick_at = _time.monotonic()
+    coord._last_tick_duration_s = 1.5
     app = build_app(coord)
     client = TestClient(app)
     resp = client.get("/metrics", headers={"X-Api-Token": "secret"})
@@ -400,6 +422,13 @@ def test_metrics_exposes_state_counts():
     assert "racing_sync_uptime_seconds" in body
     assert 'racing_sync_rows{state="moving"} 2' in body
     assert 'racing_sync_rows{state="queued"} 1' in body
+    assert 'racing_sync_rows{state="done"} 5' in body
+    assert 'racing_sync_rows{state="failed"} 1' in body
+    assert "racing_sync_waiting_disk_depth 3" in body
+    assert "racing_sync_tick_latency_seconds 1.500" in body
+    assert "racing_sync_tick_age_seconds" in body
+    assert "racing_sync_prowlarr_searches_total" in body
+    assert "racing_sync_rclone_moves_total" in body
     assert client.get("/metrics").status_code == 401
 
 

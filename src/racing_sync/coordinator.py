@@ -1291,8 +1291,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         if lock is None:
             lock = asyncio.Lock()
             self._ops_lock = lock
+        _t0 = time.monotonic()
         async with lock:
             await self._tick_inner()
+        # Tick health for /readyz + /metrics (strict numerics; a wedged
+        # loop shows as ever-growing age while the process stays up).
+        try:
+            _t1 = time.monotonic()
+            self._last_tick_at = _t1
+            self._last_tick_duration_s = _t1 - _t0
+        except Exception:
+            pass
 
     async def _poll_source_racing(self, src_torrents: list[Torrent]) -> list[TorrentState]:
         """Step 2: group source torrents by release and ingest/track each group.

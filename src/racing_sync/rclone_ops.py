@@ -81,6 +81,27 @@ class RcloneBusyError(RcloneTimeoutError):
 _ACTIVE_MOVES: dict[str, object] = {}
 _ACTIVE_MOVES_CAP = 5000
 
+#: Lifetime move counters for /metrics (module-level: same reasoning as
+#: the prowlarr counters — client churn must not reset them).
+_RCLONE_COUNTERS = {"moves": 0, "move_ok": 0, "move_fail": 0}
+
+
+def rclone_counters() -> dict[str, int]:
+    """Snapshot of lifetime move counters. Never raises."""
+    try:
+        return {k: int(_RCLONE_COUNTERS.get(k, 0))
+                for k in ("moves", "move_ok", "move_fail")}
+    except Exception:
+        return {"moves": 0, "move_ok": 0, "move_fail": 0}
+
+
+def _note_rclone_move(ok: bool) -> None:
+    try:
+        _RCLONE_COUNTERS["moves"] += 1
+        _RCLONE_COUNTERS["move_ok" if ok else "move_fail"] += 1
+    except Exception:
+        pass
+
 
 def _tree_key(tree: object) -> str | None:
     try:
@@ -575,7 +596,13 @@ async def move_local_to_remote(
         cmd = build_move_cmd(cfg, local, dest_remote, include=include,
                              files_from=list_path,
                              extra=[*(extra or []), "--error-on-no-transfer"])
-        return await run_rclone(cfg, cmd, timeout=timeout, tree=local)
+        try:
+            res = await run_rclone(cfg, cmd, timeout=timeout, tree=local)
+        except Exception:
+            _note_rclone_move(False)
+            raise
+        _note_rclone_move(bool(getattr(res, "ok", False)))
+        return res
     finally:
         if list_path:
             try:

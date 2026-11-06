@@ -878,6 +878,26 @@ class StateStore:
                 continue
         return out
 
+    def count_by_state(self) -> dict[str, int]:
+        """Live-table row counts per state (narrow GROUP BY, no row scan).
+
+        Feeds `/metrics` without the 5000-row truncation of sampled
+        scans — DONE/FAILED totals live outside `all_active`.
+        """
+        self._ensure_open()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT state, COUNT(*) AS n FROM torrent_state "
+                "WHERE deleted_at = '' GROUP BY state"
+            ).fetchall()
+        out: dict[str, int] = {}
+        for r in rows:
+            try:
+                out[str(r["state"])] = int(r["n"])
+            except Exception:
+                continue
+        return out
+
     def find_by_name(self, source_name: str) -> list[TorrentState]:
         self._ensure_open()
         clean_name = (source_name or "").strip()

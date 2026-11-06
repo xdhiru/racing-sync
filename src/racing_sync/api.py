@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import secrets
 import time
@@ -44,10 +45,40 @@ log = logging.getLogger(__name__)
 
 _INFOHASH_RE = re.compile(r"[0-9a-f]{40}")
 
-# Brute-force throttle: per-IP auth-failure timestamps (monotonic).
+# Brute-force throttle: per-IP auth-failure timestamps (monotonic),
+# last-seen map for LRU eviction, and per-/24 buckets so a many-IP
+# spray from one subnet trips the same limit (IPv4 only; IPv6 and
+# hostnames stay per-key).
 _AUTH_FAILURES: dict[str, list[float]] = {}
+_AUTH_LAST_SEEN: dict[str, float] = {}
+_AUTH_SUBNET_FAILURES: dict[str, list[float]] = {}
 _AUTH_WINDOW_S = 60.0
 _AUTH_MAX_FAILURES = 10
+_AUTH_CAP = 1000
+
+
+def _subnet_key(ip: str) -> str | None:
+    """`/24` bucket for an IPv4 literal; None otherwise. Never raises."""
+    try:
+        import ipaddress as _ip
+        try:
+            addr = _ip.ip_address((ip or "").strip())
+        except ValueError:
+            return None
+        if isinstance(addr, _ip.IPv4Address):
+            return str(_ip.ip_network(f"{addr}/24", strict=False))
+    except Exception:
+        pass
+    return None
+
+
+def _prune_bucket(bucket: list[float], cutoff: float) -> list[float]:
+    try:
+        while bucket and bucket[0] < cutoff:
+            bucket.pop(0)
+    except Exception:
+        pass
+    return bucket
 
 
 def _note_auth_failure(ip: str) -> bool:
@@ -59,25 +90,74 @@ def _note_auth_failure(ip: str) -> bool:
             fails = []
             _AUTH_FAILURES[ip] = fails
         cutoff = now - _AUTH_WINDOW_S
-        while fails and fails[0] < cutoff:
-            fails.pop(0)
+        _prune_bucket(fails, cutoff)
         fails.append(now)
-        if len(_AUTH_FAILURES) > 1000:
-            # Evict expired/idle entries first (a many-IP spray must not
-            # flush real throttles); fall back to oldest-half on flood.
+        try:
+            _AUTH_LAST_SEEN[ip] = now
+        except Exception:
+            pass
+        throttled = len(fails) > _AUTH_MAX_FAILURES
+        # Same window against the whole /24: a spray of distinct source
+        # IPs from one subnet trips the limit together.
+        try:
+            _sub = _subnet_key(ip)
+        except Exception:
+            _sub = None
+        if _sub is not None:
+            try:
+                _sfails = _AUTH_SUBNET_FAILURES.get(_sub)
+                if not isinstance(_sfails, list):
+                    _sfails = []
+                    _AUTH_SUBNET_FAILURES[_sub] = _sfails
+                _prune_bucket(_sfails, cutoff)
+                _sfails.append(now)
+                try:
+                    _AUTH_LAST_SEEN[f"subnet:{_sub}"] = now
+                except Exception:
+                    pass
+                if len(_sfails) > _AUTH_MAX_FAILURES:
+                    throttled = True
+            except Exception:
+                pass
+        if len(_AUTH_FAILURES) + len(_AUTH_SUBNET_FAILURES) > _AUTH_CAP:
+            # Evict idle/expired entries first (a many-IP spray must not
+            # flush real throttles); then least-recently-seen (LRU) down
+            # to the cap — never a blind oldest-half flush of live bans.
             try:
                 for k, v in list(_AUTH_FAILURES.items()):
                     try:
                         if not v or all(t < cutoff for t in v):
                             _AUTH_FAILURES.pop(k, None)
+                            _AUTH_LAST_SEEN.pop(k, None)
                     except Exception:
                         _AUTH_FAILURES.pop(k, None)
             except Exception:
                 pass
-            if len(_AUTH_FAILURES) > 1000:
-                for k in list(_AUTH_FAILURES.keys())[:500]:
-                    _AUTH_FAILURES.pop(k, None)
-        return len(fails) > _AUTH_MAX_FAILURES
+            try:
+                for k, v in list(_AUTH_SUBNET_FAILURES.items()):
+                    try:
+                        if not v or all(t < cutoff for t in v):
+                            _AUTH_SUBNET_FAILURES.pop(k, None)
+                            _AUTH_LAST_SEEN.pop(f"subnet:{k}", None)
+                    except Exception:
+                        _AUTH_SUBNET_FAILURES.pop(k, None)
+            except Exception:
+                pass
+            try:
+                _over = (len(_AUTH_FAILURES) + len(_AUTH_SUBNET_FAILURES)
+                         - _AUTH_CAP)
+                if _over > 0:
+                    _ranked = sorted(
+                        ((k, float(_AUTH_LAST_SEEN.get(k, 0.0)))
+                         for k in list(_AUTH_FAILURES)),
+                        key=lambda kv: kv[1],
+                    )
+                    for k, _ in _ranked[:_over]:
+                        _AUTH_FAILURES.pop(k, None)
+                        _AUTH_LAST_SEEN.pop(k, None)
+            except Exception:
+                pass
+        return throttled
     except Exception:
         return False
 
@@ -199,14 +279,30 @@ def build_app(coord: Coordinator) -> FastAPI:
             want = (token_str or "").strip().encode("utf-8")
             got = (x_api_token or "").strip().encode("utf-8")
             if want and got and secrets.compare_digest(got, want):
+                # A correct token returns BEFORE _note_auth_failure: the
+                # throttle counts failures only, so valid operators can
+                # never trip it (and a spray with the right token is
+                # already authenticated — nothing to throttle).
                 return "token"
         except Exception:
             pass
         _fail_ip = (client_host or "unknown").strip() or "unknown"
+        try:
+            _ep = request.url.path
+            _method = request.method
+        except Exception:
+            _ep, _method = "?", "?"
+        try:
+            _ident = ((x_authenticated_user or "").strip()
+                      or ("token" if (x_api_token or "").strip() else "-"))
+        except Exception:
+            _ident = "-"
         if _note_auth_failure(_fail_ip):
-            log.warning("api auth throttled for %s (too many failures)", _fail_ip)
+            log.warning("api auth throttled for %s (%s %s user=%s; too many "
+                        "failures)", _fail_ip, _method, _ep, _ident)
             raise HTTPException(429, "too many auth failures; backing off")
-        log.warning("api auth failure from %s", _fail_ip)
+        log.warning("api auth failure from %s (%s %s user=%s)",
+                    _fail_ip, _method, _ep, _ident)
         raise HTTPException(401, "auth required")
 
     @app.get("/healthz")
@@ -216,7 +312,11 @@ def build_app(coord: Coordinator) -> FastAPI:
 
     @app.get("/readyz", dependencies=[Depends(auth)])
     async def readyz() -> dict[str, Any]:
-        """Readiness probe (authed): DB readable + clients present."""
+        """Readiness probe (authed): DB + clients + fuse + SSD + tick.
+
+        Every check is strict-typed (test doubles answer truthy to
+        everything — a MagicMock must read as NOT ready, never ready).
+        """
         checks: dict[str, bool] = {}
         try:
             await asyncio.to_thread(coord.store.all_active, False, 1)
@@ -228,6 +328,34 @@ def build_app(coord: Coordinator) -> FastAPI:
                 checks[name] = getattr(coord, name, None) is not None
             except Exception:
                 checks[name] = False
+        # Fuse mount present (the seeding lane depends on it).
+        try:
+            _mount = getattr(getattr(getattr(cfg, "rclone", None),
+                                     "fuse", None), "mount", None)
+            _mpath = os.fspath(_mount) if _mount is not None else ""
+            checks["fuse_mount"] = bool(_mpath) and os.path.isdir(_mpath)
+        except Exception:
+            checks["fuse_mount"] = False
+        # SSD path writable with readable free space.
+        try:
+            _spath = getattr(getattr(cfg, "ssd", None), "path", None)
+            _spath_s = os.fspath(_spath) if _spath is not None else ""
+            _writable = bool(_spath_s) and os.access(_spath_s, os.W_OK)
+            _free = await asyncio.to_thread(ssd_free_bytes, cfg)
+            checks["ssd_writable"] = bool(_writable and int(_free) >= 0)
+        except Exception:
+            checks["ssd_writable"] = False
+        # Coordinator tick loop alive (stale tick = wedged daemon).
+        try:
+            _last = getattr(coord, "_last_tick_at", None)
+            if isinstance(_last, bool) or not isinstance(
+                    _last, (int, float)):
+                checks["tick_fresh"] = False
+            else:
+                _age = time.monotonic() - float(_last)
+                checks["tick_fresh"] = 0.0 <= _age < 300.0
+        except Exception:
+            checks["tick_fresh"] = False
         ready = all(checks.values())
         return {"ready": ready, "checks": checks}
 
@@ -252,19 +380,41 @@ def build_app(coord: Coordinator) -> FastAPI:
             started = 0.0
         uptime = max(0.0, time.monotonic() - started) if started else 0.0
         lines.append(f"racing_sync_uptime_seconds {uptime:.0f}")
-        try:
-            rows = await asyncio.to_thread(coord.store.all_active, False, 5000)
-        except Exception:
-            rows = []
+        # Authoritative per-state counts (no 5000-row truncation: DONE and
+        # FAILED live outside all_active, so a sample scan undercounts
+        # exactly the states operators watch). Legacy doubles without
+        # count_by_state fall back to the bounded active sample.
         counts: dict[str, int] = {}
-        for t in rows or []:
+        try:
+            _counter = getattr(coord.store, "count_by_state", None)
+            if callable(_counter):
+                _raw = await asyncio.to_thread(_counter)
+                for _k, _v in dict(_raw or {}).items():
+                    try:
+                        counts[str(_k)] = int(_v)
+                    except (TypeError, ValueError):
+                        continue
+        except Exception:
+            counts = {}
+        if not counts:
             try:
-                st = t.state.value
+                rows = await asyncio.to_thread(
+                    coord.store.all_active, False, 5000)
             except Exception:
-                st = "unknown"
-            counts[st] = counts.get(st, 0) + 1
+                rows = []
+            for t in rows or []:
+                try:
+                    st = t.state.value
+                except Exception:
+                    st = "unknown"
+                counts[st] = counts.get(st, 0) + 1
         for st in sorted(counts):
             lines.append(f'racing_sync_rows{{state="{st}"}} {counts[st]}')
+        try:
+            lines.append(f"racing_sync_waiting_disk_depth "
+                         f"{int(counts.get('waiting_disk', 0))}")
+        except Exception:
+            pass
         try:
             free_bytes = await asyncio.to_thread(ssd_free_bytes, cfg)
             lines.append(f"racing_sync_ssd_free_bytes {int(free_bytes)}")
@@ -273,6 +423,47 @@ def build_app(coord: Coordinator) -> FastAPI:
         try:
             tasks = getattr(coord, "_tasks", set())
             lines.append(f"racing_sync_worker_tasks {len(tasks or [])}")
+        except Exception:
+            pass
+        # Tick health: last-pass latency + age (a wedged loop shows as
+        # ever-growing age while the process stays up).
+        try:
+            _dur = getattr(coord, "_last_tick_duration_s", None)
+            if (not isinstance(_dur, bool)
+                    and isinstance(_dur, (int, float))):
+                lines.append(f"racing_sync_tick_latency_seconds "
+                             f"{float(_dur):.3f}")
+        except Exception:
+            pass
+        try:
+            _lt = getattr(coord, "_last_tick_at", None)
+            if not isinstance(_lt, bool) and isinstance(
+                    _lt, (int, float)):
+                lines.append(f"racing_sync_tick_age_seconds "
+                             f"{max(0.0, time.monotonic() - float(_lt)):.0f}")
+        except Exception:
+            pass
+        # Indexer + move counters (best-effort; absent when never used).
+        try:
+            from .prowlarr import prowlarr_counters as _pc
+            _p = _pc()
+            lines.append(f"racing_sync_prowlarr_searches_total "
+                         f"{int(_p.get('searches', 0))}")
+            lines.append(f"racing_sync_prowlarr_hits_total "
+                         f"{int(_p.get('hits', 0))}")
+            lines.append(f"racing_sync_prowlarr_errors_total "
+                         f"{int(_p.get('errors', 0))}")
+        except Exception:
+            pass
+        try:
+            from .rclone_ops import rclone_counters as _rc
+            _r = _rc()
+            lines.append(f"racing_sync_rclone_moves_total "
+                         f"{int(_r.get('moves', 0))}")
+            lines.append(f"racing_sync_rclone_move_ok_total "
+                         f"{int(_r.get('move_ok', 0))}")
+            lines.append(f"racing_sync_rclone_move_fail_total "
+                         f"{int(_r.get('move_fail', 0))}")
         except Exception:
             pass
         body = "\n".join(lines) + "\n"
