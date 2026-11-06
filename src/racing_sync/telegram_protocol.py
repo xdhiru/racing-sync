@@ -739,6 +739,9 @@ def _is_parse_error(e: BaseException) -> bool:
 #: footer. Refresh ticks every status_update_interval (45s default); a
 #: probe per tick would chatter the SFTP channel for a footer line.
 _VPS1_FREE_TTL_S = 300.0
+#: Local SSD free-stat TTL for the active-list footer: display-only, so a
+#: burst of taps shares one stat instead of each paying a syscall.
+_SSD_FREE_TTL_S = 120.0
 
 
 def _is_transient_tg_error(e: BaseException) -> bool:
