@@ -77,11 +77,12 @@ async def _runner(coord: Coordinator) -> int:
                 pass
         # Bounded shutdown: a wedged close (dead mount, hung socket) must
         # delay SIGTERM, never block it forever. SQLite WAL recovers
-        # natively, so abandoning a stuck shutdown is safe.
+        # natively, so abandoning a stuck shutdown is safe. 60s matches
+        # the coordinator stage budget table (see shutdown()).
         try:
-            await asyncio.wait_for(coord.shutdown(), timeout=30.0)
+            await asyncio.wait_for(coord.shutdown(), timeout=60.0)
         except asyncio.TimeoutError:
-            log.warning("shutdown timed out after 30s; exiting anyway")
+            log.warning("shutdown timed out after 60s; exiting anyway")
 
 
 from .safety import (
