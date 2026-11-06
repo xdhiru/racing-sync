@@ -95,9 +95,9 @@ async def test_channel_post_command_warns_and_runs(caplog):
     assert calls == ["handled"]
     assert any("without sender" in r.message for r in caplog.records)
 
-
 @pytest.mark.anyio
 async def test_channel_post_refused_when_allowlist_configured():
+
     import racing_sync.telegram_router as _router
 
     calls: list[str] = []
@@ -127,3 +127,89 @@ async def test_channel_post_refused_when_allowlist_configured():
         _router._CHAT_COMMANDS = orig
     assert calls == []
     bot._reply.assert_awaited_once()
+
+
+def test_action_error_text_scrubs_secrets():
+    from racing_sync.telegram_protocol import _action_error_text, _scrubbed
+
+    evil = ValueError(
+        "fetch blew up: passkey=SECRET123 "
+        "https://tracker.example/announce?passkey=XYZ "
+        "token abcdefghij1234567890")
+    text = _action_error_text(evil)
+    assert text.startswith("Action failed:")
+    assert "SECRET123" not in text
+    assert "XYZ" not in text
+    assert "abcdefghij1234567890" not in text
+    assert _scrubbed(evil) and "Action failed" not in _scrubbed(evil)
+
+
+def _act_bot(rows, **kw):
+    from unittest.mock import AsyncMock, MagicMock
+    bot = object.__new__(TelegramBot)
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
+    bot._store = MagicMock()
+    bot._store.list_active_inflight.return_value = list(rows)
+    bot._bot = MagicMock()
+    bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+    for k, v in kw.items():
+        setattr(bot, k, v)
+    return bot
+
+
+def _act_rows():
+    from racing_sync.state import State, TorrentState
+    mk = lambda h, name, size: TorrentState(  # noqa: E731
+        source_infohash=h, source_name=name, state=State.QUEUED,
+        total_bytes=size,
+        source_announce_url="https://alpha.cc/announce/xyz")
+    return [mk("a" * 40, "Show.One.S01E01", 1000),
+            mk("b" * 40, "Show.Two.S01E01", 2000)]
+
+
+@pytest.mark.anyio
+async def test_act_number_warns_on_generation_change():
+    """Typed /act_2 against a stale render warns (positions rot)."""
+    from unittest.mock import MagicMock
+    bot = _act_bot(_act_rows(), _last_rendered_groups=5)
+    await bot._act_command_entry("2", MagicMock())
+    text = bot._bot.send_message.call_args[0][1]
+    assert text.startswith("⚠️ List changed since render (5→2 titles)")
+
+
+@pytest.mark.anyio
+async def test_act_number_quiet_when_generation_matches():
+    from unittest.mock import MagicMock
+    bot = _act_bot(_act_rows(), _last_rendered_groups=2)
+    await bot._act_command_entry("2", MagicMock())
+    text = bot._bot.send_message.call_args[0][1]
+    assert "⚠️" not in text
+    assert "Show.Two" in text
+
+
+@pytest.mark.anyio
+async def test_refresh_stamps_rendered_generation():
+    """The active refresh records the group count taps resolve against."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.state import State, TorrentState
+
+    bot = object.__new__(TelegramBot)
+    bot._bot = MagicMock()
+    bot._bot.edit_message_text = AsyncMock()
+    bot._bot.send_message = AsyncMock(
+        return_value=MagicMock(message_id=99))
+    bot._store = MagicMock()
+    bot._coord = MagicMock()
+    bot._coord.live_progress_map.return_value = {}
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
+    bot._current_page = 0
+    bot._active_msg_id = None
+    bot._prev_active_msg_id = None
+    bot._last_active_cache = None
+    bot._detail_cache = {}
+    bot._detail_queue = asyncio.Queue()
+    bot._detail_sent_state = {}
+    bot._store.list_active_inflight.return_value = _act_rows()
+    await bot._refresh_active_message_inner()
+    assert bot._last_rendered_groups == 2

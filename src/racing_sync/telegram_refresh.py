@@ -24,6 +24,7 @@ from .telegram_protocol import (
 )
 from .telegram_views import (
     _esc,
+    _group_active_items,
     _inflight_note_for,
     _safe_truncate_markdown,
     _size_compact,
@@ -365,6 +366,15 @@ class RefreshMixin:
             items, page=self._current_page, page_size=self._cfg.page_size,
             notes=notes, footer=footer, speeds=speed_map,
         )
+        # Stamp the rendered generation: typed /act_N positions resolve
+        # against the live list, so a count change between render and tap
+        # (a group finished, a dupe arrived) warns instead of misacting.
+        try:
+            self._last_rendered_groups = len(
+                _group_active_items(list(items or [])))
+            self._last_rendered_page = cur_page
+        except Exception:
+            pass
         if len(text) > 4096:
             text = _safe_truncate_markdown(text)
         self._current_page = cur_page

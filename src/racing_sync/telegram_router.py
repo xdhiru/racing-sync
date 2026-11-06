@@ -17,6 +17,8 @@ from telegram.error import NetworkError, TimedOut
 from .state import State, TorrentState
 from .telegram_protocol import (
     _CHAT_COMMANDS,
+    _action_error_text,
+    _scrubbed,
     CancelScope,
     ScopeGone,
     _now_command,
@@ -106,7 +108,7 @@ class RouterMixin:
                 try:
                     result = await self._fetch_torrent(_h)
                 except Exception as e:  # noqa: BLE001
-                    result = f"Action failed: {e}"
+                    result = _action_error_text(e)
                 await _say(result)
                 await _refresh()
                 return
@@ -123,7 +125,7 @@ class RouterMixin:
                     await _refresh()
                     return
                 except Exception as e:  # noqa: BLE001
-                    await _say(f"Action failed: {e}")
+                    await _say(_action_error_text(e))
                     return
                 if _scope.kind == "group":
                     _subject = (
@@ -155,7 +157,7 @@ class RouterMixin:
                     await _refresh()
                     return
                 except Exception as e:  # noqa: BLE001
-                    await _say(f"Action failed: {e}")
+                    await _say(_action_error_text(e))
                     return
                 _text, _rows = self._keepq_text_and_rows(
                     _r.title_raw, _r.qlabel,
@@ -177,7 +179,7 @@ class RouterMixin:
                     await _refresh()
                     return
                 except Exception as e:  # noqa: BLE001
-                    await _say(f"Action failed: {e}")
+                    await _say(_action_error_text(e))
                     return
                 result = await self._execute_snapshot_cancel(
                     _r.hashes, _r.etitle_raw,
@@ -193,10 +195,10 @@ class RouterMixin:
                 try:
                     resolved = await coord.injectfuse_resolve(_h)
                 except (LookupError, ValueError) as e:
-                    await _say(str(e)[:300])
+                    await _say(_scrubbed(e)[:300])
                     return
                 except Exception as e:  # noqa: BLE001
-                    await _say(f"Action failed: {e}")
+                    await _say(_action_error_text(e))
                     return
                 try:
                     _ask = dict(resolved)
@@ -225,7 +227,7 @@ class RouterMixin:
                     else:
                         result = await coord.injectfuse_confirmed([_h])
                 except Exception as e:  # noqa: BLE001
-                    result = f"Action failed: {e}"
+                    result = _action_error_text(e)
                 await _say(result[:300])
                 await _refresh()
                 return
@@ -237,7 +239,7 @@ class RouterMixin:
                 try:
                     result = await self._skip_torrents(_hashes, hold=True)
                 except Exception as e:  # noqa: BLE001
-                    result = f"Action failed: {e}"
+                    result = _action_error_text(e)
                 await _say(result)
                 await _refresh()
                 return
@@ -252,7 +254,7 @@ class RouterMixin:
                 try:
                     result = await self._resume_hashes_reply(_hashes)
                 except Exception as e:  # noqa: BLE001
-                    result = f"Resume failed: {e}"
+                    result = f"Resume failed: {_scrubbed(e)}"
                 await _say(result)
                 await _refresh()
                 return
@@ -779,7 +781,7 @@ class RouterMixin:
         try:
             infohash, name, size, announce = _bencoded_info_hash(data)
         except Exception as e:  # noqa: BLE001
-            await self._reply(f"Not a valid .torrent file ({e}).",
+            await self._reply(f"Not a valid .torrent file ({_scrubbed(e)}).",
                               reply_to=message)
             return
         store = getattr(self, "_store", None)
@@ -824,11 +826,11 @@ class RouterMixin:
                             announce=announce or "", blob=bytes(data),
                             source_label="telegram")
                     except LookupError as e:
-                        await self._reply(str(e)[:300], reply_to=message)
+                        await self._reply(_scrubbed(e)[:300], reply_to=message)
                         await self._delete_chat_file(message, doc_msg)
                         return
                     except Exception as e:  # noqa: BLE001
-                        await self._reply(f"Action failed: {e}",
+                        await self._reply(_action_error_text(e),
                                           reply_to=message)
                         return
                     await self._reply(
@@ -898,7 +900,8 @@ class RouterMixin:
                 state=State.NEW,
             )
         except Exception as e:  # noqa: BLE001
-            await self._reply(f"Action failed: could not track {name} ({e}).",
+            await self._reply(f"Action failed: could not track {name} "
+                              f"({_scrubbed(e)}).",
                               reply_to=message)
             return
         try:
@@ -908,7 +911,8 @@ class RouterMixin:
         try:
             store.upsert(ts)
         except Exception as e:  # noqa: BLE001
-            await self._reply(f"Action failed: could not track {name} ({e}).",
+            await self._reply(f"Action failed: could not track {name} "
+                              f"({_scrubbed(e)}).",
                               reply_to=message)
             return
         try:

@@ -17,6 +17,8 @@ from .telegram_buttons import ButtonMaker
 from .telegram_protocol import (
     _MATCH_MAX_BYTES,
     _MATCH_MIN_CHARS,
+    _action_error_text,
+    _scrubbed,
     CancelScope,
     _match_token,
     _resume_command,
@@ -57,7 +59,7 @@ class ActionsMixin:
         try:
             from .forget import forget_torrent
         except Exception as e:  # noqa: BLE001
-            return f"Action failed: {e}"
+            return _action_error_text(e)
         coord = getattr(self, "_coord", None)
         store = getattr(self, "_store", None)
         if coord is None or store is None:
@@ -114,7 +116,7 @@ class ActionsMixin:
         except LookupError:
             return "Already gone from tracking"
         except Exception as e:  # noqa: BLE001
-            return f"Action failed: {e}"
+            return _action_error_text(e)
         name = str(result.get("source_name") or infohash[:10])[:50]
         # The row (and its telegram_message_id) is gone: mark its detail
         # card cancelled (best-effort) and drop the cached id so a future
@@ -197,7 +199,7 @@ class ActionsMixin:
                     # here strands a live torrent with no way forward.
                     log.warning("cancel liveness read failed for %s: %s",
                                 (h or "")[:10], e)
-                    return f"Action failed: {e}"
+                    return _action_error_text(e)
                 if row is not None:
                     live.append(h)
             if not live:
@@ -208,7 +210,7 @@ class ActionsMixin:
                     outs.append(await self._execute_cancel_one(
                         h, delete_files=delete_files, remember=remember))
                 except Exception as e:  # noqa: BLE001
-                    outs.append(f"Action failed: {e}")
+                    outs.append(_action_error_text(e))
             if len(outs) == 1:
                 return outs[0]
             ok = sum(1 for o in outs
@@ -217,7 +219,7 @@ class ActionsMixin:
             suffix = "" if delete_files else " (data left in place)"
             return f"{verb} {title} ({ok}/{len(outs)} copies){suffix}"
         except Exception as e:  # noqa: BLE001
-            return f"Action failed: {e}"
+            return _action_error_text(e)
         finally:
             for _c in _claimed:
                 try:
@@ -277,7 +279,7 @@ class ActionsMixin:
             files = await dest.get_torrent_files(h)
         except Exception as e:  # noqa: BLE001
             try:
-                await self._reply(f"Action failed: {e}", reply_to=message)
+                await self._reply(_action_error_text(e), reply_to=message)
             except Exception:
                 pass
             return
@@ -344,7 +346,7 @@ class ActionsMixin:
             # Same rule as the snapshot cancel: a failed read is not a
             # gone row — say so instead of stranding a live torrent.
             try:
-                await self._reply(f"Action failed: {e}"[:300],
+                await self._reply(_action_error_text(e)[:300],
                                   reply_to=message)
             except Exception:
                 pass
@@ -373,7 +375,7 @@ class ActionsMixin:
                 result = await self._skip_torrents(
                     _gh or [full_hash], hold=(kind == "skip"))
             except Exception as e:  # noqa: BLE001
-                result = f"Action failed: {e}"
+                result = _action_error_text(e)
             try:
                 await self._reply(result[:300], reply_to=message)
             except Exception:
@@ -398,7 +400,7 @@ class ActionsMixin:
             else:
                 result = await self._prefer_torrent(full_hash)
         except Exception as e:  # noqa: BLE001
-            result = f"Action failed: {e}"
+            result = _action_error_text(e)
         try:
             await self._reply(result[:300], reply_to=message)
         except Exception:
@@ -519,13 +521,13 @@ class ActionsMixin:
             resolved = await coord.injectfuse_resolve(full_hash)
         except (LookupError, ValueError) as e:
             try:
-                await self._reply(str(e)[:300], reply_to=message)
+                await self._reply(_scrubbed(e)[:300], reply_to=message)
             except Exception:
                 pass
             return
         except Exception as e:  # noqa: BLE001
             try:
-                await self._reply(f"Action failed: {e}", reply_to=message)
+                await self._reply(_action_error_text(e), reply_to=message)
             except Exception:
                 pass
             return
@@ -633,7 +635,7 @@ class ActionsMixin:
                 rows = await asyncio.to_thread(store.list_active_inflight)
             except Exception as e:  # noqa: BLE001
                 try:
-                    await self._reply(f"Action failed: {e}", reply_to=message)
+                    await self._reply(_action_error_text(e), reply_to=message)
                 except Exception:
                     pass
                 return
@@ -642,6 +644,7 @@ class ActionsMixin:
             except Exception:
                 groups = []
             members: list = []
+            _positional = False
             if norm.isdigit():
                 try:
                     _n = int(norm)
@@ -650,6 +653,28 @@ class ActionsMixin:
                 if 1 <= _n <= len(groups):
                     _gk, _mem = groups[_n - 1]
                     members = [t for (t, _) in _mem]
+                    _positional = True
+            # Positional numbers rot when the list changes between render
+            # and tap: warn when the live group count differs from the
+            # last rendered generation (gid/hash/prefix paths are stable
+            # and skip this). The sheet still names the resolved title so
+            # the operator confirms the file, not the number.
+            _gen_warn = ""
+            if _positional:
+                try:
+                    _rendered = int(
+                        getattr(self, "_last_rendered_groups", 0) or 0)
+                except Exception:
+                    _rendered = 0
+                try:
+                    _live_n = len(groups)
+                except Exception:
+                    _live_n = 0
+                if _rendered and _live_n and _rendered != _live_n:
+                    _gen_warn = (
+                        f"⚠️ List changed since render "
+                        f"({_rendered}→{_live_n} titles) — confirm this "
+                        f"is the file you meant.\n")
             if not members and norm:
                 try:
                     _by_gid = _live_group_by_gid(list(rows or []), norm)
@@ -672,13 +697,13 @@ class ActionsMixin:
                         members = [target]
                 except LookupError as e:
                     try:
-                        await self._reply(str(e)[:300], reply_to=message)
+                        await self._reply(_scrubbed(e)[:300], reply_to=message)
                     except Exception:
                         pass
                     return
                 except Exception as e:  # noqa: BLE001
                     try:
-                        await self._reply(f"Action failed: {e}", reply_to=message)
+                        await self._reply(_action_error_text(e), reply_to=message)
                     except Exception:
                         pass
                     return
@@ -698,9 +723,11 @@ class ActionsMixin:
                 _text, _rows = self._sheet_text_and_rows(
                     members, title, getattr(members[0], "total_bytes", 0)
                     if members else 0, notes)
+                if _gen_warn:
+                    _text = _gen_warn + _text
             except Exception as e:  # noqa: BLE001
                 try:
-                    await self._reply(f"Action failed: {e}", reply_to=message)
+                    await self._reply(_action_error_text(e), reply_to=message)
                 except Exception:
                     pass
                 return
@@ -860,7 +887,7 @@ class ActionsMixin:
             matches = await asyncio.to_thread(self._live_match, q)
         except Exception as e:  # noqa: BLE001
             try:
-                await self._reply(f"Action failed: {e}", reply_to=message)
+                await self._reply(_action_error_text(e), reply_to=message)
             except Exception:
                 pass
             return
@@ -907,7 +934,7 @@ class ActionsMixin:
             groups = await self._live_stalled()
         except Exception as e:  # noqa: BLE001
             try:
-                await self._reply(f"Action failed: {e}", reply_to=message)
+                await self._reply(_action_error_text(e), reply_to=message)
             except Exception:
                 pass
             return
@@ -961,7 +988,7 @@ class ActionsMixin:
             rows = await asyncio.to_thread(self._store.list_active_inflight)
         except Exception as e:  # noqa: BLE001
             try:
-                await self._reply(f"Action failed: {e}", reply_to=message)
+                await self._reply(_action_error_text(e), reply_to=message)
             except Exception:
                 pass
             return
@@ -991,13 +1018,13 @@ class ActionsMixin:
                 full_hash = target.source_infohash
             except LookupError as e:
                 try:
-                    await self._reply(str(e)[:300], reply_to=message)
+                    await self._reply(_scrubbed(e)[:300], reply_to=message)
                 except Exception:
                     pass
                 return
             except Exception as e:  # noqa: BLE001
                 try:
-                    await self._reply(f"Action failed: {e}", reply_to=message)
+                    await self._reply(_action_error_text(e), reply_to=message)
                 except Exception:
                     pass
                 return
@@ -1099,13 +1126,13 @@ class ActionsMixin:
                                 "size": _tsz}
                 except Exception:
                     try:
-                        await self._reply(str(e)[:300], reply_to=message)
+                        await self._reply(_scrubbed(e)[:300], reply_to=message)
                     except Exception:
                         pass
                     return
             except Exception as e:  # noqa: BLE001
                 try:
-                    await self._reply(f"Action failed: {e}", reply_to=message)
+                    await self._reply(_action_error_text(e), reply_to=message)
                 except Exception:
                     pass
                 return
@@ -1138,7 +1165,7 @@ class ActionsMixin:
                 result = await self._skip_torrents(
                     _hashes, hold=(kind == "skip"))
             except Exception as e:  # noqa: BLE001
-                result = f"Action failed: {e}"
+                result = _action_error_text(e)
             try:
                 await self._reply(result[:300], reply_to=message)
             except Exception:
@@ -1168,7 +1195,7 @@ class ActionsMixin:
             try:
                 result = await self._fetch_torrent(_labels[0][0])
             except Exception as e:  # noqa: BLE001
-                result = f"Action failed: {e}"
+                result = _action_error_text(e)
             try:
                 await self._reply(result[:300], reply_to=message)
             except Exception:
@@ -1236,7 +1263,7 @@ class ActionsMixin:
                 try:
                     store.upsert(row)
                 except Exception as e:  # noqa: BLE001
-                    return f"Fetch failed: {e}"
+                    return f"Fetch failed: {_scrubbed(e)}"
                 return (
                     f"Fetching original for {(row.source_name or infohash[:10])[:50]} "
                     f"(bypassing Prowlarr; VPS1 copy, else supplied .torrent)"
@@ -1258,7 +1285,7 @@ class ActionsMixin:
                         store.upsert(row)
                         _applied = True
                 except Exception as e:  # noqa: BLE001
-                    return f"Fetch failed: {e}"
+                    return f"Fetch failed: {_scrubbed(e)}"
                 if not _applied:
                     return (
                         f"{(row.source_name or infohash[:10])[:50]} moved "
@@ -1297,12 +1324,12 @@ class ActionsMixin:
             else:
                 outcome = await asyncio.to_thread(_flag)
         except LookupError as e:
-            return f"Fetch failed: {e}"
+            return f"Fetch failed: {_scrubbed(e)}"
         except ValueError as e:
             # Illegal transition (row left WAITING_INDEXER concurrently).
-            return f"Fetch failed: {e}"
+            return f"Fetch failed: {_scrubbed(e)}"
         except Exception as e:  # noqa: BLE001
-            return f"Fetch failed: {e}"
+            return f"Fetch failed: {_scrubbed(e)}"
         # NEW watch rows stay NEW: wake one worker now so the flag takes
         # effect this tick (the scheduler is the backstop).
         try:
@@ -1341,9 +1368,9 @@ class ActionsMixin:
             else:
                 row, outcome = await asyncio.to_thread(prefer, short)
         except LookupError as e:
-            return f"Prefer failed: {e}"
+            return f"Prefer failed: {_scrubbed(e)}"
         except Exception as e:  # noqa: BLE001
-            return f"Prefer failed: {e}"
+            return f"Prefer failed: {_scrubbed(e)}"
         if row is not None:
             try:
                 spawn = getattr(coord, "_spawn_worker", None)
@@ -1419,7 +1446,7 @@ class ActionsMixin:
             else:
                 await asyncio.to_thread(_flag)
         except Exception as e:  # noqa: BLE001
-            return f"{verb.capitalize()} failed: {e}"
+            return f"{verb.capitalize()} failed: {_scrubbed(e)}"
         if not acted:
             return (f"Already gone from tracking"
                     if gone else f"Nothing to {verb} (states changed)")
@@ -1474,7 +1501,7 @@ class ActionsMixin:
         except LookupError as e:
             return None, str(e)[:300]
         except Exception as e:  # noqa: BLE001
-            return None, f"Action failed: {e}"
+            return None, _action_error_text(e)
         try:
             h = (entry.get("source_infohash") or "").lower()
             name = str(entry.get("source_name") or h[:10])[:60]
@@ -1484,7 +1511,7 @@ class ActionsMixin:
             store.unignore_torrent(h)
             store.clear_tombstone(h)
         except Exception as e:  # noqa: BLE001
-            return None, f"Action failed: {e}"
+            return None, _action_error_text(e)
         return name, None
 
     async def _unignore_torrent(self, target: str, message: Any) -> None:
@@ -1501,7 +1528,7 @@ class ActionsMixin:
         try:
             name, err = await asyncio.to_thread(self._unignore_core, target)
         except Exception as e:  # noqa: BLE001
-            name, err = None, f"Action failed: {e}"
+            name, err = None, _action_error_text(e)
         if err is not None and name is None:
             try:
                 await self._reply(err[:300], reply_to=message)
@@ -1541,7 +1568,7 @@ class ActionsMixin:
                     rows = await asyncio.to_thread(store.list_active_inflight)
                 except Exception as e:  # noqa: BLE001
                     try:
-                        await self._reply(f"Action failed: {e}", reply_to=message)
+                        await self._reply(_action_error_text(e), reply_to=message)
                     except Exception:
                         pass
                     return
@@ -1616,7 +1643,7 @@ class ActionsMixin:
                         return
                     except Exception as e:  # noqa: BLE001
                         try:
-                            await self._reply(f"Action failed: {e}", reply_to=message)
+                            await self._reply(_action_error_text(e), reply_to=message)
                         except Exception:
                             pass
                         return
