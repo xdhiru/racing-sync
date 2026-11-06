@@ -89,6 +89,40 @@ _MAX_FEED_BYTES = 10 * 1024 * 1024
 #: whereas qB 500s are application errors that must surface.
 _INDEXER_TRANSIENT_STATUSES = (408, 425, 429, 500, 502, 503, 504)
 
+#: Lifetime search counters for /metrics (module-level: the client is
+#: rebuilt across coordinator restarts, the counters must not reset).
+_PROWLARR_COUNTERS = {"searches": 0, "hits": 0, "errors": 0}
+
+
+def prowlarr_counters() -> dict[str, int]:
+    """Snapshot of lifetime search counters. Never raises."""
+    try:
+        return {k: int(_PROWLARR_COUNTERS.get(k, 0))
+                for k in ("searches", "hits", "errors")}
+    except Exception:
+        return {"searches": 0, "hits": 0, "errors": 0}
+
+
+def _note_prowlarr_search() -> None:
+    try:
+        _PROWLARR_COUNTERS["searches"] += 1
+    except Exception:
+        pass
+
+
+def _note_prowlarr_hits(n: int) -> None:
+    try:
+        _PROWLARR_COUNTERS["hits"] += max(0, int(n))
+    except Exception:
+        pass
+
+
+def _note_prowlarr_error() -> None:
+    try:
+        _PROWLARR_COUNTERS["errors"] += 1
+    except Exception:
+        pass
+
 
 def _retry_delay_from_exc(exc: BaseException | None, attempt: int) -> float:
     """Backoff for an indexer retry, honoring Retry-After when present."""
@@ -323,6 +357,26 @@ class ProwlarrClient:
         if self._cfg.should_skip_title(query):
             log.info("prowlarr: skipping search on %s for %r (matches skip_query_substrings)", indexer.name, query)
             return []
+        if not self._session:
+            raise ProwlarrError("not started")
+        _note_prowlarr_search()
+        try:
+            hits = await self._search_indexer_inner(
+                indexer, query, limit=limit)
+        except Exception:
+            _note_prowlarr_error()
+            raise
+        _note_prowlarr_hits(len(hits or []))
+        return hits
+
+    async def _search_indexer_inner(
+        self,
+        indexer: Indexer,
+        query: str,
+        *,
+        limit: int | None = None,
+    ) -> list[TorrentHit]:
+        """Single-indexer search body (counter wrapper above)."""
         if not self._session:
             raise ProwlarrError("not started")
         limit = limit or self._cfg.max_results
