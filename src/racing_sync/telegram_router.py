@@ -73,9 +73,10 @@ class RouterMixin:
         answered questions never linger behind their follow-up.
         """
         async def _say(text: str) -> None:
+            # Standalone (no reply_to): the tapped sheet is deleted by the
+            # caller once this returns, so threading to it would dangle.
             try:
-                await self._reply(text[:300],
-                                  reply_to=getattr(query, "message", None))
+                await self._reply(text[:300])
             except Exception:
                 pass
 
@@ -133,9 +134,10 @@ class RouterMixin:
                         f"Forget {_safe_display_name((_r.title_raw or '')[:60])}?")
                 _text, _rows = _scope.remember_sheet(_subject)
                 try:
-                    await self._send_sheet(
-                        _text, _rows,
-                        reply_to=getattr(query, "message", None))
+                    # Standalone sheet: query.message (the tapped sheet)
+                    # is deleted by the caller below — a reply_to would
+                    # dangle off a deleted message.
+                    await self._send_sheet(_text, _rows)
                 except Exception:
                     pass
                 return
@@ -159,9 +161,8 @@ class RouterMixin:
                     _r.title_raw, _r.qlabel,
                     _r.scope, None, remember=_ig)
                 try:
-                    await self._send_sheet(
-                        _text, _rows,
-                        reply_to=getattr(query, "message", None))
+                    # Standalone (see remember-sheet above).
+                    await self._send_sheet(_text, _rows)
                 except Exception:
                     pass
                 return
@@ -201,8 +202,7 @@ class RouterMixin:
                     _ask = dict(resolved)
                 except Exception:
                     _ask = resolved
-                await self._inject_ask_send(
-                    _ask, getattr(query, "message", None))
+                await self._inject_ask_send(_ask, None)
                 return
             if cmd == "inject" and _choice in ("yes", "no"):
                 if _choice != "yes":
@@ -584,6 +584,11 @@ class RouterMixin:
             cfg_chat = str(self._cfg.chat_id)
             if str(chat_id) != cfg_chat and str(user_id) != cfg_chat:
                 return
+            # Channel posts carry no sender: note the origin (anonymous
+            # destructive commands from the right chat still execute when
+            # no admin allowlist is configured, but they must leave an
+            # audit trail; a configured allowlist refuses them below).
+            _via_channel = user_id is None
             text = (
                 getattr(message, "text", None)
                 or getattr(message, "caption", None)
@@ -610,6 +615,13 @@ class RouterMixin:
                 break
             if _matched is None:
                 return
+            if _via_channel:
+                try:
+                    log.warning("channel-post command /%s without sender "
+                                "(chat=%s): %r", _matched.name, chat_id,
+                                text[:80])
+                except Exception:
+                    pass
             # Debounce mutating verbs only (double-sent command must not
             # resolve+act twice): read-only /stats|/find|/files always
             # answer, even inside another command's window. Namespaced
