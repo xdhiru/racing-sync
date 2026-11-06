@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime as dt
+import logging
 import re
 from typing import Any, NamedTuple
 
@@ -349,6 +350,23 @@ async def _cmd_stats(bot, match, message):
         _footer = ""
     if _footer:
         _lines.append(_footer)
+    # Live diagnostics tail: the last warnings/errors from the in-memory
+    # ring buffer, so /stats shows what the logs say without ssh. Best
+    # effort — an unwired buffer simply yields no tail.
+    try:
+        from .logging_setup import get_ring_buffer
+        _events = get_ring_buffer().snapshot(last=3,
+                                             min_level=logging.WARNING)
+    except Exception:
+        _events = []
+    for _ev in _events or []:
+        try:
+            _emsg = str(getattr(_ev, "message", "") or "")[:140]
+            _elog = str(getattr(_ev, "logger", "") or "").split(".")[-1]
+            if _emsg:
+                _lines.append(f"⚠️ {_elog}: {_emsg}")
+        except Exception:
+            continue
     try:
         await bot._reply("\n".join(_lines)[:1000], reply_to=message)
     except Exception:

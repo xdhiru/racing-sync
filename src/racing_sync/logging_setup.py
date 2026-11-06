@@ -66,12 +66,15 @@ _SENSITIVE_HEADER_KEYS = frozenset(
 
 
 class ENOSPCSafeTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
-    """Timed file handler that disables itself on ENOSPC instead of traceback-storming.
+    """Timed file handler that disables itself on persistent OSError.
 
     Once the log disk is full, every emit() would raise OSError(28) and the
     logging module prints a full traceback to stderr per message — which
-    fills the disk faster and buries the real error. Fail silent after the
-    first ENOSPC: drop file output, keep console/ring, and print one line.
+    fills the disk faster and buries the real error. ENOSPC disables
+    immediately; any other OSError disables after 3 consecutive failures
+    (a wedged mount/NFS stall must not traceback-storm either, but one
+    transient blip keeps file output). Drop file output, keep
+    console/ring, and print one line.
     """
 
     _disabled_due_to_enospc: bool = False
@@ -84,12 +87,22 @@ class ENOSPCSafeTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandl
         except OSError as e:
             import errno as _errno
 
-            if e.errno == _errno.ENOSPC:
+            try:
+                _streak = int(getattr(self, "_os_error_streak", 0) or 0) + 1
+            except Exception:
+                _streak = 1
+            try:
+                self._os_error_streak = _streak
+            except Exception:
+                pass
+            if e.errno == _errno.ENOSPC or _streak >= 3:
                 self._disabled_due_to_enospc = True
                 try:
+                    _why = ("no space left on device" if e.errno == _errno.ENOSPC
+                            else f"persistent write error {e!r}")
                     sys.stderr.write(
                         f"[log] disabling file handler {self.baseFilename}: "
-                        "no space left on device (logging to console/ring only)\n"
+                        f"{_why} (logging to console/ring only)\n"
                     )
                     sys.stderr.flush()
                 except Exception:
@@ -102,6 +115,11 @@ class ENOSPCSafeTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandl
             self.handleError(record)
         except Exception:
             self.handleError(record)
+        else:
+            try:
+                self._os_error_streak = 0
+            except Exception:
+                pass
 
 
 def sanitize_log_text(text: str) -> str:
@@ -405,6 +423,45 @@ def setup_logging(cfg: AppConfig) -> None:
         level_name = str(cfg.logging_sink.forward_min_level or "INFO").upper()
         if level_name not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             level_name = "INFO"
+        # Loud startup line for the plaintext opt-in: log bodies (and, with
+        # allow_plaintext, the bearer token) ship unencrypted — this must
+        # be a deliberate, visible choice, not a quiet config default.
+        try:
+            _sink_url = str(cfg.logging_sink.url or "")
+            _parsed = urlsplit(_sink_url)
+            _plain = (_parsed.scheme == "http" and _parsed.hostname
+                      not in ("localhost", "127.0.0.1", "::1"))
+        except Exception:
+            _plain = False
+        try:
+            _has_token = bool(
+                (cfg.logging_sink.auth_token.get_secret_value()
+                 if hasattr(cfg.logging_sink.auth_token, "get_secret_value")
+                 else str(cfg.logging_sink.auth_token or "")).strip())
+        except Exception:
+            _has_token = False
+        if _plain:
+            try:
+                _opt_in = bool(cfg.logging_sink.allow_plaintext)
+            except Exception:
+                _opt_in = False
+            if _opt_in and _has_token:
+                logging.getLogger("racing_sync").error(
+                    "logging sink bearer token will be sent over PLAINTEXT "
+                    "http:// to %s (allow_plaintext opt-in) — log bodies "
+                    "and credentials travel unencrypted",
+                    _parsed.hostname)
+            elif _has_token:
+                logging.getLogger("racing_sync").warning(
+                    "logging sink is plaintext http:// to %s: bearer token "
+                    "withheld per request (no allow_plaintext opt-in), but "
+                    "log bodies still ship unencrypted — prefer https://",
+                    _parsed.hostname)
+            else:
+                logging.getLogger("racing_sync").warning(
+                    "logging sink is plaintext http:// to %s: log bodies "
+                    "ship unencrypted — prefer https://",
+                    _parsed.hostname)
         sink = HTTPSinkHandler(cfg.logging_sink)
         sink.setLevel(getattr(logging, level_name))
         root.addHandler(sink)
@@ -452,9 +509,30 @@ def setup_logging(cfg: AppConfig) -> None:
 
 async def post_log_event_async(
     session: aiohttp.ClientSession, url: str, payload: dict[str, Any]
-) -> None:
+) -> bool:
+    """POST one log event; True on 2xx, False otherwise. Never raises."""
     try:
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as r:
-            await r.read()
-    except Exception:
-        pass
+            try:
+                await r.read()
+            except Exception:
+                pass
+            try:
+                _ok = 200 <= int(getattr(r, "status", 0) or 0) < 300
+            except Exception:
+                _ok = False
+            if not _ok:
+                try:
+                    logging.getLogger(__name__).warning(
+                        "log sink POST %s -> HTTP %s",
+                        sanitize_log_text(str(url)),
+                        getattr(r, "status", "?"))
+                except Exception:
+                    pass
+            return _ok
+    except Exception as e:  # noqa: BLE001
+        try:
+            logging.getLogger(__name__).debug("log sink POST failed: %s", e)
+        except Exception:
+            pass
+        return False

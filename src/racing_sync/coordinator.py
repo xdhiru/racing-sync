@@ -788,7 +788,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         return list(filtered)
 
     def request_stop(self) -> None:
-        log.warning("stop requested")
+        log.info("stop requested")
         self._stop = True
 
     def set_intake_paused(self, paused: bool) -> bool:
@@ -806,6 +806,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
     async def shutdown(self) -> None:
         # Idempotent: __main__ and run() both call us, so guard against
         # the second invocation producing duplicate log lines.
+        # Budget table (worst case, sequential): workers 15 + tg tasks 10
+        # + tg.stop 10 + api drain 10 + prowlarr 5 + source 5 + dest 5 =
+        # 60s, matching the __main__ runner budget — no stage may grow
+        # without raising that budget, or the tail (client/store close)
+        # gets abandoned on timeout.
         if self._shutdown_done:
             return
         self._shutdown_done = True
