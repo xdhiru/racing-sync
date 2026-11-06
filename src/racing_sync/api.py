@@ -56,6 +56,11 @@ _AUTH_WINDOW_S = 60.0
 _AUTH_MAX_FAILURES = 10
 _AUTH_CAP = 1000
 
+#: Authed-endpoint rate-limit buckets: per-IP request timestamps
+#: (monotonic). 300/min is far above any legitimate poller (15s
+#: metrics + operator use) and far below abuse.
+_AUTHD_HITS: dict[str, list[float]] = {}
+
 
 def _subnet_key(ip: str) -> str | None:
     """`/24` bucket for an IPv4 literal; None otherwise. Never raises."""
@@ -234,7 +239,7 @@ class ForgetResult(BaseModel):
     skipped_paths: list[str]
     errors: list[str]
     ignored: bool = False
-    paired_cancelled: list[str] = []
+    paired_cancelled: list[dict[str, Any]] = []
 
 
 def build_app(coord: Coordinator) -> FastAPI:
@@ -248,6 +253,57 @@ def build_app(coord: Coordinator) -> FastAPI:
     # behind token/nginx auth, its schema surface should too.
     app = FastAPI(title="racing-sync", version="0.1.0",
                   docs_url=None, openapi_url=None, redoc_url=None)
+
+    # Request guards: 1 MiB body cap (no endpoint takes a body — query
+    # params only) + a generous authed rate limit. /healthz stays
+    # unguarded (load-balancer liveness must never 429).
+    try:
+        from fastapi.responses import JSONResponse as _JSONResponse
+
+        @app.middleware("http")
+        async def _request_guards(request, call_next):
+            try:
+                _path = request.url.path or ""
+            except Exception:
+                _path = ""
+            if _path != "/healthz":
+                try:
+                    _cl = request.headers.get("content-length")
+                    if _cl is not None and int(str(_cl).strip()) > 1048576:
+                        return _JSONResponse(
+                            {"detail": "body too large"}, status_code=413)
+                except Exception:
+                    pass
+                try:
+                    _rip = (request.client.host
+                            if request.client else "unknown")
+                except Exception:
+                    _rip = "unknown"
+                try:
+                    _bucket = _AUTHD_HITS.get(_rip)
+                    if not isinstance(_bucket, list):
+                        _bucket = []
+                        _AUTHD_HITS[_rip] = _bucket
+                    _now = time.monotonic()
+                    _cut = _now - 60.0
+                    while _bucket and _bucket[0] < _cut:
+                        _bucket.pop(0)
+                    _bucket.append(_now)
+                    if len(_bucket) > 300:
+                        return _JSONResponse(
+                            {"detail": "rate limited; backing off"},
+                            status_code=429)
+                    if len(_AUTHD_HITS) > 1000:
+                        for k in list(_AUTHD_HITS)[:len(_AUTHD_HITS) - 1000]:
+                            _AUTHD_HITS.pop(k, None)
+                except Exception:
+                    pass
+            try:
+                return await call_next(request)
+            except Exception:
+                raise
+    except Exception:
+        pass
 
     def auth(
         request: Request,
@@ -556,13 +612,14 @@ def build_app(coord: Coordinator) -> FastAPI:
             new_state = await asyncio.to_thread(_do_retry)
         return RetryResult(source_infohash=normalized, new_state=new_state)
 
-    @app.post("/api/forget/{source_infohash}", dependencies=[Depends(auth)])
+    @app.post("/api/forget/{source_infohash}")
     async def forget(
         source_infohash: str,
         delete_files: bool = Query(default=True),
         ignore: bool = Query(default=False),
         confirm: bool = Query(default=False,
                               description="must be true: forget is destructive"),
+        requester: str = Depends(auth),
     ) -> ForgetResult:
         normalized = (source_infohash or "").strip().lower()
         if not _INFOHASH_RE.fullmatch(normalized):
@@ -572,7 +629,7 @@ def build_app(coord: Coordinator) -> FastAPI:
                 400, "forget is destructive; re-issue with ?confirm=true")
         try:
             log.warning("api forget %s by %s (delete_files=%s, ignore=%s)",
-                        normalized[:10], "token", delete_files, ignore)
+                        normalized[:10], requester, delete_files, ignore)
         except Exception:
             pass
         async with _hold_ops_lock(coord):
@@ -604,19 +661,42 @@ def build_app(coord: Coordinator) -> FastAPI:
                     _mp.pop(_gone, None)
             except Exception:
                 pass
-        paired_hashes: list[str] = []
-        try:
-            for pair in result.get("paired_cancelled") or []:
-                _ph = (pair.get("source_infohash") or "").strip().lower()
-                if _ph:
-                    paired_hashes.append(_ph)
-        except Exception:
-            paired_hashes = []
-        try:
-            for _ph in paired_hashes:
-                await coord._ssd_release(_ph)
-        except Exception:
-            pass
+            # Paired releases stay inside the same ops lock: the lock is
+            # what serializes budget maps against the tick, and a paired
+            # release outside it races a concurrent admission.
+            paired: list[dict[str, Any]] = []
+            try:
+                for pair in result.get("paired_cancelled") or []:
+                    try:
+                        _ph = ((pair.get("source_infohash") or "")
+                               .strip().lower()) if isinstance(
+                                   pair, dict) else str(pair or "").strip().lower()
+                    except Exception:
+                        continue
+                    if not _ph:
+                        continue
+                    try:
+                        await coord._ssd_release(_ph)
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(pair, dict):
+                            paired.append({
+                                "source_infohash": _ph,
+                                "source_name": str(pair.get(
+                                    "source_name") or "")[:200],
+                                "errors": [str(e)[:300] for e in
+                                           (pair.get("errors") or [])],
+                            })
+                        else:
+                            paired.append({"source_infohash": _ph,
+                                           "source_name": "",
+                                           "errors": []})
+                    except Exception:
+                        paired.append({"source_infohash": _ph,
+                                       "source_name": "", "errors": []})
+            except Exception:
+                pass
         return ForgetResult(
             source_infohash=result["source_infohash"],
             source_name=result["source_name"],
@@ -626,7 +706,7 @@ def build_app(coord: Coordinator) -> FastAPI:
             skipped_paths=result["skipped_paths"],
             errors=result["errors"],
             ignored=bool(result.get("ignored", False)),
-            paired_cancelled=paired_hashes,
+            paired_cancelled=paired,
         )
 
     return app
@@ -654,6 +734,17 @@ def _ts_to_dict(t) -> dict[str, Any]:
         name_val = str(t.source_name or "")[:200]
     except Exception:
         name_val = ""
+    # Admission/transport flags operators filter on (strict numerics —
+    # test doubles answer truthy to everything and must read 0).
+    def _flag(name: str) -> int:
+        try:
+            v = getattr(t, name, 0)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return 0
+            return int(v)
+        except Exception:
+            return 0
+
     return {
         "source_infohash": t.source_infohash,
         "dest_infohash": t.dest_infohash,
@@ -666,6 +757,10 @@ def _ts_to_dict(t) -> dict[str, Any]:
         "last_error": safe_error,
         "created_at": created,
         "updated_at": updated,
+        "skipped": _flag("skipped"),
+        "force_direct": _flag("force_direct"),
+        "fuse_verified": _flag("fuse_verified"),
+        "version": _flag("version"),
     }
 
 

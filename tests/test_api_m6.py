@@ -153,3 +153,89 @@ def test_prowlarr_and_rclone_counters_roundtrip():
 
     assert prowlarr_counters() == {"searches": 0, "hits": 0, "errors": 0}
     assert rclone_counters() == {"moves": 0, "move_ok": 0, "move_fail": 0}
+
+
+def test_forget_keeps_per_pair_attribution_and_identity(caplog):
+    import logging
+    from unittest.mock import AsyncMock, patch
+
+    cfg = MagicMock(spec=AppConfig)
+    cfg.api = APIConfig(enabled=True, api_token="secret",
+                        trust_nginx_header=False)
+    coord = MagicMock()
+    coord.cfg = cfg
+    coord._ssd_release = AsyncMock()
+    app = build_app(coord)
+    client = TestClient(app, raise_server_exceptions=False)
+    headers = {"X-Api-Token": "secret"}
+
+    planned = {
+        "applied": True,
+        "source_infohash": "b" * 40,
+        "source_name": "Pack",
+        "dest_entries": [],
+        "local_paths": [],
+        "skipped_paths": [],
+        "errors": [],
+        "paired_cancelled": [
+            {"source_infohash": "c" * 40, "source_name": "Pair",
+             "errors": ["boom"]},
+        ],
+    }
+    with patch("racing_sync.api.forget_torrent",
+               new_callable=AsyncMock) as mock_forget:
+        mock_forget.return_value = planned
+        with caplog.at_level(logging.WARNING, logger="racing_sync.api"):
+            resp = client.post("/api/forget/" + "b" * 40 + "?confirm=true",
+                               headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["paired_cancelled"] == [
+        {"source_infohash": "c" * 40, "source_name": "Pair",
+         "errors": ["boom"]}]
+    # Paired SSD release ran (inside the ops lock, not after it).
+    coord._ssd_release.assert_any_await("c" * 40)
+    assert any("by token" in r.message for r in caplog.records)
+
+
+def test_ts_to_dict_carries_admission_flags():
+    from racing_sync.api import _ts_to_dict
+    from racing_sync.state import State, TorrentState
+    from unittest.mock import MagicMock
+
+    ts = TorrentState(source_infohash="a" * 40, source_name="Show",
+                      state=State.QUEUED, skipped=2, force_direct=1,
+                      fuse_verified=1, version=3)
+    d = _ts_to_dict(ts)
+    assert (d["skipped"], d["force_direct"], d["fuse_verified"],
+            d["version"]) == (2, 1, 1, 3)
+    # Test doubles answer truthy to everything: strict zeros, not 1s.
+    assert _ts_to_dict(MagicMock())["version"] == 0
+
+
+def test_oversize_body_rejected_before_handlers():
+    coord, _cfg = _api_coord()
+    app = build_app(coord)
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.post("/api/recover", content=b"x" * (2 * 1024 * 1024),
+                       headers={"X-Api-Token": "secret"})
+    assert resp.status_code == 413
+
+
+def test_authed_endpoints_rate_limited_healthz_spared():
+    import racing_sync.api as api_mod
+
+    coord, _cfg = _api_coord()
+    app = build_app(coord)
+    client = TestClient(app, raise_server_exceptions=False)
+    headers = {"X-Api-Token": "secret"}
+    api_mod._AUTHD_HITS.clear()
+    try:
+        codes = [client.get("/api/state", headers=headers).status_code
+                 for _ in range(305)]
+        assert 429 in codes
+        assert codes.count(429) == 5
+        # Liveness never throttles.
+        assert client.get("/healthz").status_code == 200
+    finally:
+        api_mod._AUTHD_HITS.clear()
