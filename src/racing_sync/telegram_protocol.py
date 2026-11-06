@@ -124,6 +124,31 @@ FIND_RE = re.compile(r"^/find(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
 FILES_RE = re.compile(r"^/files_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 
+def _scrubbed(e: object) -> str:
+    """Sanitized exception text (no `Action failed:` prefix)."""
+    try:
+        from .logging_setup import sanitize_log_text
+        return sanitize_log_text(str(e))
+    except Exception:
+        try:
+            return type(e).__name__
+        except Exception:
+            return "error"
+
+
+def _action_error_text(e: object) -> str:
+    """User-facing failure line with secrets scrubbed.
+
+    Exception text can carry tracker passkeys, tokens, passwords, and
+    full announce URLs — none of which may reach the chat. Falls back
+    to a bare line when the sanitizer itself is unavailable.
+    """
+    try:
+        return f"Action failed: {_scrubbed(e)}"
+    except Exception:
+        return "Action failed."
+
+
 class _ChatCommand(NamedTuple):
     """One typed chat command: name, matcher, and dispatch handler.
 
@@ -186,7 +211,7 @@ async def _cmd_pause_intake(bot, match, message):
         setter(True)
     except Exception as e:  # noqa: BLE001
         try:
-            await bot._reply(f"Action failed: {e}", reply_to=message)
+            await bot._reply(_action_error_text(e), reply_to=message)
         except Exception:
             pass
         return
@@ -215,7 +240,7 @@ async def _cmd_resume_intake(bot, match, message):
         setter(False)
     except Exception as e:  # noqa: BLE001
         try:
-            await bot._reply(f"Action failed: {e}", reply_to=message)
+            await bot._reply(_action_error_text(e), reply_to=message)
         except Exception:
             pass
         return
@@ -241,7 +266,7 @@ async def _cmd_tick(bot, match, message):
         await step()
     except Exception as e:  # noqa: BLE001
         try:
-            await bot._reply(f"Action failed: {e}", reply_to=message)
+            await bot._reply(_action_error_text(e), reply_to=message)
         except Exception:
             pass
         return
@@ -361,13 +386,13 @@ async def _cmd_find(bot, match, message):
         res = await finder(q)
     except LookupError as e:
         try:
-            await bot._reply(str(e)[:300], reply_to=message)
+            await bot._reply(_scrubbed(e)[:300], reply_to=message)
         except Exception:
             pass
         return
     except Exception as e:  # noqa: BLE001
         try:
-            await bot._reply(f"Action failed: {e}", reply_to=message)
+            await bot._reply(_action_error_text(e), reply_to=message)
         except Exception:
             pass
         return
@@ -400,7 +425,7 @@ async def _cmd_find(bot, match, message):
         await bot._reply("\n".join(_lines)[:1500], reply_to=message)
     except Exception as e:  # noqa: BLE001
         try:
-            await bot._reply(f"Action failed: {e}", reply_to=message)
+            await bot._reply(_action_error_text(e), reply_to=message)
         except Exception:
             pass
 
