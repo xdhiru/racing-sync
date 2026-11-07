@@ -226,6 +226,74 @@ def _progress_drop(key: str | None) -> None:
         pass
 
 
+def abort_move_tree(tree_key: str | None) -> bool:
+    """Terminate a live move proc for a tree (bounded terminate+reap).
+
+    True when a running child was found (whether or not it died —
+    callers treat the move as cancelled either way and the row parks
+    for retry). An unreaped orphan keeps its guard entry per the
+    existing rule, so the next tick parks instead of racing it.
+    Never raises.
+    """
+    try:
+        if not tree_key:
+            return False
+        try:
+            proc = _ACTIVE_MOVES.get(tree_key)
+        except Exception:
+            return False
+        try:
+            _rc = getattr(proc, "returncode", None)
+        except Exception:
+            return False
+        if proc is None or _rc is not None:
+            return False
+        try:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                import asyncio as _asyncio
+
+                async def _reap() -> None:
+                    try:
+                        await _asyncio.wait_for(proc.wait(), timeout=10.0)
+                    except _asyncio.TimeoutError:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        try:
+                            await _asyncio.wait_for(proc.wait(),
+                                                    timeout=10.0)
+                        except _asyncio.TimeoutError:
+                            pass
+
+                try:
+                    _loop = _asyncio.get_running_loop()
+                except RuntimeError:
+                    _loop = None
+                if _loop is not None:
+                    # Fire-and-forget: the guard entry below already
+                    # reflects "reap pending", and callers must not block.
+                    try:
+                        _loop.create_task(_reap())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            _active_drop(tree_key, keep=not _proc_reaped(proc))
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 def _with_stats_flags(cmd: list[str]) -> list[str]:
     """Insert periodic-stats flags BEFORE `--` (positionals stay last)."""
     flags = ["--stats=5s", "--stats-one-line", "--stats-log-level", "NOTICE"]
