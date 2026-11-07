@@ -1464,6 +1464,12 @@ class AdmitMixin:
         """
         key = (ts.source_infohash or "").lower()
         try:
+            # Force-start bypass (operator override): skip both the cap
+            # and the admission record (forced rows are invisible to the
+            # gate — over-admission is the intent, and it disarms on
+            # leaving the lane).
+            if key and self._is_forced(key):
+                return True
             raw = getattr(self.cfg, "max_active_downloads", 0)
             if isinstance(raw, bool) or not isinstance(raw, (int, float)):
                 return True
@@ -1499,12 +1505,333 @@ class AdmitMixin:
         except Exception:
             return True
 
-    async def _park_queued_for_download_slot(self, ts: TorrentState) -> bool:
-        """Stay QUEUED when the download cap is full; True when parked."""
+    # Lane queues (P4): lane -> {infohash.lower(): enqueue_monotonic}.
+    # Workers that lose the lane race event-park here (sem released, no
+    # DB churn) instead of exiting + respawning + re-running intake every
+    # tick; start_from_queued() wakes them by priority when slots free.
+    _LANE_KINDS = {"dl": ("queued", "downloading"), "move": ("moving",)}
+
+    def _lane_cap(self, lane: str) -> int | None:
+        """Lane slot cap, or None when unconfigured (fail-open admit)."""
         try:
-            return not await self._try_admit_download(ts)
+            raw = getattr(self.cfg,
+                          "max_active_downloads" if lane == "dl"
+                          else "max_concurrent_moves", 0)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                return None
+            val = int(raw or 0)
+            return val if val > 0 else None
+        except Exception:
+            return None
+
+    def _lane_live_count(self, lane: str) -> int:
+        """Running, non-parked lane usage (handles; no handles = 0)."""
+        try:
+            from .task import handles_for  # noqa: F401 (re-export guard)
+        except Exception:
+            return 0
+        try:
+            from .task import handles_for as _hf
+            _reg = getattr(self, "_task_handles", None)
+            if not isinstance(_reg, dict):
+                return 0
+            _kinds = self._LANE_KINDS.get(lane, ())
+            n = 0
+            for _h, _set in list(_reg.items()):
+                if not isinstance(_set, set):
+                    continue
+                for _x in list(_set):
+                    try:
+                        if (getattr(_x, "kind", "") in _kinds
+                                and not getattr(_x, "queued", False)
+                                and not getattr(_x, "cancelled", False)):
+                            n += 1
+                            break
+                    except Exception:
+                        continue
+            return n
+        except Exception:
+            return 0
+
+    def _is_forced(self, key: str) -> bool:
+        """True when /forcestart armed this hash (in-memory bypass)."""
+        try:
+            _f = getattr(self, "_forced", None)
+            return (isinstance(_f, set)
+                    and (key or "").lower() in _f)
         except Exception:
             return False
+
+    def _queue_lane_event(self, lane: str, key: str):
+        """Register (or fetch) the lane-wait event for a hash."""
+        try:
+            _lanes = getattr(self, "_queued_lane", None)
+            if not isinstance(_lanes, dict):
+                _lanes = {}
+                self._queued_lane = _lanes  # type: ignore[attr-defined]
+            _q = _lanes.get(lane)
+            if not isinstance(_q, dict):
+                _q = {}
+                _lanes[lane] = _q
+            if key not in _q:
+                try:
+                    import time as _time
+                    _q[key] = _time.monotonic()
+                except Exception:
+                    _q[key] = 0.0
+                if len(_q) > 500:
+                    try:
+                        _oldest = sorted(_q.items(),
+                                         key=lambda kv: kv[1])[: len(_q) - 500]
+                        for _k, _ in _oldest:
+                            _q.pop(_k, None)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            from .task import handles_for
+            for _hd in handles_for(self, key):
+                try:
+                    return _hd.event
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    def check_running_tasks(self, ts, lane: str = "dl"):
+        """(queued, event): can this row start `lane` now?
+
+        Force-armed rows never queue. Otherwise compares live lane usage
+        (running, non-parked handles) against the cap; when full the row
+        registers in the lane queue and gets its handle event (or None
+        when handle-less — caller treats that as admittable, today's
+        edge behavior). Never raises.
+        """
+        try:
+            key = ((getattr(ts, "source_infohash", "") or "")
+                   .strip().lower())
+        except Exception:
+            return False, None
+        if not key:
+            return False, None
+        try:
+            if self._is_forced(key):
+                return False, None
+            cap = self._lane_cap(lane)
+            if cap is None:
+                return False, None
+            if self._lane_live_count(lane) < cap:
+                try:
+                    _lanes = getattr(self, "_queued_lane", None)
+                    if isinstance(_lanes, dict):
+                        _q = _lanes.get(lane)
+                        if isinstance(_q, dict):
+                            _q.pop(key, None)
+                except Exception:
+                    pass
+                return False, None
+            # Full lane: only worker-backed rows park (their handle event
+            # is the wake primitive). Handle-less callers stay admittable
+            # — today's edge behavior, no phantom queue entries.
+            try:
+                from .task import handles_for
+                _hs = handles_for(self, key)
+            except Exception:
+                _hs = []
+            if not _hs:
+                return False, None
+            self._queue_lane_event(lane, key)
+            try:
+                return True, _hs[0].event
+            except Exception:
+                return True, None
+        except Exception:
+            return False, None
+
+    async def start_from_queued(self) -> int:
+        """Wake queued lane-waiters that now fit, by priority.
+
+        Runs each scheduler tick while the queue is non-empty: fetches
+        queued rows (bounded), drops gone/unforceable ones, and sets the
+        events of the highest-priority rows up to the free slots. Woken
+        workers re-check admission authoritatively (an event is a hint,
+        not a grant). Returns woken count. Never raises.
+        """
+        total = 0
+        try:
+            try:
+                from .coordinator import _sched_priority
+            except Exception:
+                _sched_priority = None  # type: ignore[assignment]
+            _lanes = getattr(self, "_queued_lane", None)
+            if not isinstance(_lanes, dict) or not _lanes:
+                return 0
+            for lane in ("dl", "move"):
+                try:
+                    _q = _lanes.get(lane)
+                    if not isinstance(_q, dict) or not _q:
+                        continue
+                    cap = self._lane_cap(lane)
+                    if cap is None:
+                        # Unconfigured lane: wake everyone (admit is open).
+                        _free = len(_q)
+                    else:
+                        _free = cap - self._lane_live_count(lane)
+                    if _free <= 0:
+                        continue
+                    _hashes = list(_q.keys())[:50]
+                    _rows: list = []
+                    for _h in _hashes:
+                        try:
+                            _r = self.store.get(_h, include_blob=False)
+                        except Exception:
+                            _r = None
+                        if _r is None:
+                            try:
+                                _q.pop(_h, None)
+                            except Exception:
+                                pass
+                            continue
+                        _rows.append(_r)
+                    if _sched_priority is not None:
+                        try:
+                            _rows.sort(key=_sched_priority)
+                        except Exception:
+                            pass
+                    for _r in _rows:
+                        if total >= _free and cap is not None:
+                            break
+                        try:
+                            _rk = (getattr(_r, "source_infohash", "") or "") \
+                                .lower()
+                        except Exception:
+                            continue
+                        if not _rk or _rk not in _q:
+                            continue
+                        try:
+                            _st = getattr(getattr(_r, "state", None),
+                                          "value", "")
+                        except Exception:
+                            _st = ""
+                        _want = (("queued", "downloading") if lane == "dl"
+                                 else ("moving",))
+                        if _st not in _want and not self._is_forced(_rk):
+                            try:
+                                _q.pop(_rk, None)
+                            except Exception:
+                                pass
+                            continue
+                        if getattr(_r, "skipped", 0):
+                            continue
+                        try:
+                            from .task import handles_for
+                            _hs = handles_for(self, _rk)
+                        except Exception:
+                            _hs = []
+                        if not _hs:
+                            try:
+                                _q.pop(_rk, None)
+                            except Exception:
+                                pass
+                            continue
+                        try:
+                            _hs[0].event.set()
+                            _q.pop(_rk, None)
+                            total += 1
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return total
+
+    async def _park_queued_for_download_slot(
+        self, ts, *, holds_slot: bool = False,
+    ) -> bool:
+        """Event-park when the download lane is full; True = exit worker.
+
+        Replaces the old park-to-QUEUED upsert: the worker idles on its
+        handle event (download_sem released while waiting, re-acquired
+        after) instead of exiting + respawning + re-running intake and
+        upserting QUEUED every tick. Each wake re-checks admission
+        authoritatively; row-gone/shutdown exits True (caller returns).
+        """
+        try:
+            key = ((getattr(ts, "source_infohash", "") or "")
+                   .strip().lower())
+        except Exception:
+            return False
+        while not getattr(self, "_stop", False):
+            try:
+                if self._abandoned(ts):
+                    return True
+            except Exception:
+                pass
+            if key and self._is_forced(key):
+                try:
+                    from .task import handles_for
+                    for _hd in handles_for(self, key):
+                        try:
+                            _hd.queued = False
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                return False
+            queued, ev = self.check_running_tasks(ts, "dl")
+            if not queued:
+                try:
+                    from .task import handles_for
+                    for _hd in handles_for(self, key):
+                        try:
+                            _hd.queued = False
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # Second gate (DB-truth edge): the handle count won the
+                # race but the live count says full — back to the queue
+                # instead of over-admitting (the M2 burst incident).
+                try:
+                    if await self._try_admit_download(ts):
+                        return False
+                except Exception:
+                    return False
+                continue
+            try:
+                from .task import handles_for
+                for _hd in handles_for(self, key):
+                    try:
+                        _hd.queued = True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if ev is None:
+                return True
+            log.info("downloads full; %s waits for a slot (no churn)",
+                     (getattr(ts, "source_name", "") or key)[:60])
+            try:
+                async def _wait_ev() -> None:
+                    try:
+                        await asyncio.wait_for(ev.wait(), 60.0)
+                    except (TimeoutError, asyncio.TimeoutError):
+                        pass
+                    try:
+                        ev.clear()
+                    except Exception:
+                        pass
+
+                await self._run_outside_download_slot(
+                    _wait_ev(), holds_slot)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        return True
 
     async def _run_outside_download_slot(self, coro, holds: bool):
         """Run `coro` with the caller's download_sem slot released.
@@ -1672,7 +1999,8 @@ class AdmitMixin:
                         )
                         ts.dest_infohash = ext.hash.lower()
                         ts.save_path = str(ssd_root)
-                        if await self._park_queued_for_download_slot(ts):
+                        if await self._park_queued_for_download_slot(
+                                ts, holds_slot=_holds_download_slot):
                             return
                         self.transition(ts, State.DOWNLOADING)
                         return
@@ -1750,7 +2078,8 @@ class AdmitMixin:
             )
             ts.dest_infohash = ext.hash.lower()
             ts.save_path = ext.save_path
-            if await self._park_queued_for_download_slot(ts):
+            if await self._park_queued_for_download_slot(
+                    ts, holds_slot=_holds_download_slot):
                 return
             # Batch-priority re-verify before resume: this entry may predate
             # its priorities (setup-transient park, restart between add and
@@ -1806,7 +2135,8 @@ class AdmitMixin:
         # Brand-new entry: gate before adding so a fresh-start burst of NEW
         # workers can't sail past the tick's snapshot-QUEUED-only cap into
         # concurrent DOWNLOADING (live incident: 5 at once against max 3).
-        if await self._park_queued_for_download_slot(ts):
+        if await self._park_queued_for_download_slot(
+                ts, holds_slot=_holds_download_slot):
             return
         result = await self.dest_client.add_torrent(
             torrent_files=[blob],
@@ -1845,7 +2175,8 @@ class AdmitMixin:
         # Deliberate terminal transitions (WAITING_DISK park, oversize-movie
         # FAILED) return normally inside the block and are unaffected.
         try:
-            await self._setup_queued_download(ts, blob)
+            await self._setup_queued_download(
+                ts, blob, _holds_download_slot=_holds_download_slot)
         except ValueError as e:
             # Deterministic poison (bad batching/classify, no valid files
             # for priorities): retrying the same bytes parks QUEUED forever.
@@ -2815,7 +3146,8 @@ class AdmitMixin:
             log.warning("fuse skip check failed, downloading everything: %s", e)
             return set()
 
-    async def _setup_queued_download(self, ts: TorrentState, blob: bytes) -> None:
+    async def _setup_queued_download(self, ts: TorrentState, blob: bytes, *,
+                                     _holds_download_slot: bool = True) -> None:
         """Classify, prioritize, and resume a just-added SSD torrent."""
         # Classify (with a short retry: the files endpoint can 404 for a few
         # seconds right after add while qB registers the torrent).
@@ -3077,7 +3409,8 @@ class AdmitMixin:
         # resumes on reaching the first batch with work). Gate first: setup
         # (add + prioritize) already ran, so park with the paused entry
         # intact — the next tick resumes through the existing-entry path.
-        if await self._park_queued_for_download_slot(ts):
+        if await self._park_queued_for_download_slot(
+                ts, holds_slot=_holds_download_slot):
             return
         if first_need is None or first_need:
             await self.dest_client.resume(ts.dest_infohash or ts.source_infohash)

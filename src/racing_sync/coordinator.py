@@ -1739,15 +1739,35 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         except (TypeError, ValueError, AttributeError):
             max_concurrent_workers = 12
 
+        # Event-parked lane waiters (P4): they hold a worker claim (no
+        # dupe spawns) but must not count as live lane usage — freed
+        # slots wake them via start_from_queued().
+        try:
+            _reg = getattr(self, "_task_handles", None)
+            _parked: set[str] = set()
+            if isinstance(_reg, dict):
+                for _hk, _hs in list(_reg.items()):
+                    try:
+                        if isinstance(_hs, set) and any(
+                                getattr(_x, "queued", False)
+                                for _x in list(_hs)):
+                            _parked.add(_hk)
+                    except Exception:
+                        continue
+        except Exception:
+            _parked = set()
+
         active_downloads = sum(
             1 for t in active
             if (t.source_infohash or "").lower() in self._running_infohashes
             and t.state in (State.QUEUED, State.DOWNLOADING)
+            and (t.source_infohash or "").lower() not in _parked
         )
         active_moves = sum(
             1 for t in active
             if (t.source_infohash or "").lower() in self._running_infohashes
             and t.state == State.MOVING
+            and (t.source_infohash or "").lower() not in _parked
         )
         # Per-phase worker budgets: a handful of multi-hour DOWNLOADING /
         # MOVING workers must not starve every other state via the global
@@ -1758,6 +1778,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             1 for t in active
             if (t.source_infohash or "").lower() in self._running_infohashes
             and t.state not in (State.QUEUED, State.DOWNLOADING, State.MOVING)
+            and (t.source_infohash or "").lower() not in _parked
         )
 
         for ts in active:
@@ -1804,12 +1825,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             # Limit concurrent active qBittorrent additions / downloads on SSD.
             # Both QUEUED and workerless DOWNLOADING rows consume a slot:
             # spawning over cap just parks inside _try_admit after burning
-            # a worker plus a dest list_torrents storm.
-            if ts.state in (State.QUEUED, State.DOWNLOADING) and active_downloads >= self.cfg.max_active_downloads:
+            # a worker plus a dest list_torrents storm. Force-start bypasses
+            # (operator override; the worker still honors admission).
+            if (ts.state in (State.QUEUED, State.DOWNLOADING)
+                    and active_downloads >= self.cfg.max_active_downloads
+                    and not self._is_forced(_tkey)):
                 continue
 
             # Limit concurrent active rclone move commands
-            if ts.state == State.MOVING and active_moves >= self.cfg.max_concurrent_moves:
+            if (ts.state == State.MOVING
+                    and active_moves >= self.cfg.max_concurrent_moves
+                    and not self._is_forced(_tkey)):
                 continue
 
             # All other states (NEW intake, WAITING_DISK checks, RE_ADDING,
@@ -1838,6 +1864,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             scheduled += 1
             if ts.state == State.WAITING_DISK:
                 scheduled_waiting_disk += 1
+        # Wake queued lane-waiters that now fit (priority-ordered):
+        # freed slots go to parked workers before new spawns churn.
+        try:
+            await self.start_from_queued()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.debug("start_from_queued failed; continuing: %s", e)
         if scheduled:
             # Quiet-wait: a tick that only re-checked parked WAITING_DISK
             # rows is routine while batches drain — debug, not info, so a
@@ -2342,6 +2376,33 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                         _m.pop((ts.source_infohash or "").lower(), None)
                 except Exception:
                     pass
+        # TaskHandle kind follows the row (lane accounting reads kinds):
+        # a worker spawned for NEW that reaches QUEUED counts as queued.
+        try:
+            from .task import handles_for
+            try:
+                _dk = str(getattr(dst, "value", "") or "").lower()
+            except Exception:
+                _dk = ""
+            if _dk:
+                for _hd in handles_for(
+                        self, ts.source_infohash or ""):
+                    try:
+                        _hd.kind = _dk
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Force-start is lane-scoped: leaving the forceable states
+        # (QUEUED/DOWNLOADING/MOVING) disarms it (in-memory only, so a
+        # restart can never wedge a bypass).
+        if dst not in (State.QUEUED, State.DOWNLOADING, State.MOVING):
+            try:
+                _f = getattr(self, "_forced", None)
+                if isinstance(_f, set):
+                    _f.discard((ts.source_infohash or "").lower())
+            except Exception:
+                pass
         log.info(
             "%s %s -> %s (batch %s/%s)",
             ts.source_name[:60],
