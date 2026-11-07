@@ -36,6 +36,7 @@ from .coordinator_errors import (
 from .coordinator_paths import _safe_ssd_join, left_on_disk_many
 from .io_bounds import rpc
 from .rclone_ops import (
+    RcloneBusyError,
     _tree_key,
     move_local_to_remote,
     rclone_progress_map,
@@ -1773,6 +1774,72 @@ class MoveMixin:
         # queue behind bulk multi-hour moves); everything else shares
         # move_sem.
         _sem = self.heal_move_sem if heal else self.move_sem
+        try:
+            _mkey = (ts.source_infohash or "").lower()
+        except Exception:
+            _mkey = ""
+        # Move-lane queue: wait for a lane slot BEFORE taking the
+        # semaphore (parking under it would serialize the lane behind
+        # waiters). Forced rows skip the queue (still serialized by the
+        # semaphore below — force bypasses caps, never mutual exclusion).
+        while not getattr(self, "_stop", False):
+            try:
+                _gone = self._abandoned(ts)
+            except Exception:
+                _gone = False
+            if _gone:
+                raise AbandonedError(
+                    f"row gone for {_mkey[:10]}; not moving")
+            try:
+                _forced = self._is_forced(_mkey) if _mkey else False
+            except Exception:
+                _forced = False
+            if _forced:
+                break
+            try:
+                _mqueued, _mev = self.check_running_tasks(ts, "move")
+            except Exception:
+                break
+            if not _mqueued:
+                break
+            try:
+                from .task import handles_for
+                for _hd in handles_for(self, _mkey):
+                    try:
+                        _hd.queued = True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            log.info("moves full; %s waits for a slot (no churn)",
+                     (getattr(ts, "source_name", "") or _mkey)[:60])
+            if _mev is None:
+                break
+            try:
+                async def _wait_mev() -> None:
+                    try:
+                        await asyncio.wait_for(_mev.wait(), 60.0)
+                    except (TimeoutError, asyncio.TimeoutError):
+                        pass
+                    try:
+                        _mev.clear()
+                    except Exception:
+                        pass
+
+                await _wait_mev()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        try:
+            from .task import handles_for as _hf2
+            for _hd in _hf2(self, _mkey):
+                try:
+                    _hd.queued = False
+                except Exception:
+                    pass
+        except Exception:
+            pass
         async with _sem:
             if files_from is not None:
                 preview = ", ".join(files_from[:3]) + ("…" if len(files_from) > 3 else "")

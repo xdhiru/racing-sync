@@ -38,6 +38,10 @@ class TaskHandle:
     event: asyncio.Event = field(default_factory=asyncio.Event)
     force: bool = False
     cancelled: bool = False
+    # Lane-queue park flag (P4): an event-parked waiter keeps its worker
+    # claim (no dupe spawns) but must NOT count as live lane usage —
+    # live counters skip queued handles so freed slots wake waiters.
+    queued: bool = False
     task: asyncio.Task | None = None
     tree_key: str | None = None
     progress: float | None = None
