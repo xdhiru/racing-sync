@@ -362,9 +362,19 @@ class RefreshMixin:
         except Exception:
             notes = {}
         footer = await self._active_footer()
+        # Live rclone lines for MOVING rows (strict dict: test doubles
+        # answer truthy to everything and must degrade to no lines).
+        try:
+            _mp_fn = getattr(self._coord, "rclone_move_progress_map", None)
+            move_progress = _mp_fn() if callable(_mp_fn) else {}
+            if not isinstance(move_progress, dict):
+                move_progress = {}
+        except Exception:
+            move_progress = {}
         text, cur_page, total_pages = render_active(
             items, page=self._current_page, page_size=self._cfg.page_size,
             notes=notes, footer=footer, speeds=speed_map,
+            move_progress=move_progress,
         )
         # Stamp the rendered generation: typed /act_N positions resolve
         # against the live list, so a count change between render and tap

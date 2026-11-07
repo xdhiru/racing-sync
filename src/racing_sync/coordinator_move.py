@@ -35,7 +35,11 @@ from .coordinator_errors import (
 )
 from .coordinator_paths import _safe_ssd_join, left_on_disk_many
 from .io_bounds import rpc
-from .rclone_ops import move_local_to_remote
+from .rclone_ops import (
+    _tree_key,
+    move_local_to_remote,
+    rclone_progress_map,
+)
 from .state import State, TorrentState
 
 # Keep the historic logger name so log output is unchanged by the split.
@@ -79,6 +83,28 @@ class MoveMixin:
             if not isinstance(parks, dict):
                 parks = {}
                 self._moving_parks = parks
+            # Live-transfer reset: a move pumping bytes is not stalled —
+            # transferred growth restarts the park count instead of
+            # escalating a healthy multi-hour move to ERROR.
+            try:
+                _prog_now = self._moving_transferred(key)
+            except Exception:
+                _prog_now = None
+            if _prog_now is not None:
+                try:
+                    _marks = getattr(self, "_moving_progress_bytes", None)
+                    if not isinstance(_marks, dict):
+                        _marks = {}
+                        self._moving_progress_bytes = _marks
+                    _prev = _marks.get(key)
+                    if isinstance(_prev, (int, float)) and _prog_now > _prev:
+                        parks[key] = 0
+                    _marks[key] = _prog_now
+                    if len(_marks) > 5000:
+                        for _k in list(_marks.keys())[: len(_marks) - 5000]:
+                            _marks.pop(_k, None)
+                except Exception:
+                    pass
             n = int(parks.get(key, 0) or 0) + 1
             parks[key] = n
             if len(parks) > 5000:
@@ -211,6 +237,53 @@ class MoveMixin:
                 self._recheck_in_flight = [_key, time.monotonic()]
         except Exception:
             pass
+
+    def _moving_transferred(self, row_key: str) -> int | None:
+        """Live transferred bytes for a MOVING row, or None when unknown.
+
+        Joins the row to its move tree (`_moving_tree`, recorded when the
+        move spawned) and reads the rclone progress map. Pure lookup —
+        never raises, never touches the loop.
+        """
+        try:
+            _trees = getattr(self, "_moving_tree", None)
+            if not isinstance(_trees, dict):
+                return None
+            _tkey = _trees.get((row_key or "").lower())
+            if not _tkey:
+                return None
+            _prog = rclone_progress_map().get(_tkey)
+            if _prog is None:
+                return None
+            try:
+                return int(getattr(_prog, "transferred_bytes", 0) or 0)
+            except (TypeError, ValueError):
+                return None
+        except Exception:
+            return None
+
+    def rclone_move_progress_map(self) -> dict[str, object]:
+        """RcloneProgress by lowercase row infohash (for active-list cards).
+
+        Only rows with a live move tree appear; entries vanish when the
+        move completes. Never raises.
+        """
+        out: dict[str, object] = {}
+        try:
+            _trees = getattr(self, "_moving_tree", None)
+            if not isinstance(_trees, dict):
+                return out
+            _live = rclone_progress_map()
+            for _rowkey, _tkey in list(_trees.items()):
+                try:
+                    _prog = _live.get(_tkey)
+                    if _prog is not None:
+                        out[_rowkey] = _prog
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
 
     def _register_checking_park(self, ts: TorrentState,
                                   progress: float = 0.0) -> str | None:
@@ -1710,8 +1783,26 @@ class MoveMixin:
             # RcloneTimeoutError propagates: the child is terminated and the
             # source tree intact, so callers park the row for retry (never
             # fail — failing would loop: re-download, stall again, fail…).
+            # progress=True publishes live stats (long moves stay visible;
+            # transferred growth resets the park-stall clock).
+            try:
+                _trees = getattr(self, "_moving_tree", None)
+                if not isinstance(_trees, dict):
+                    _trees = {}
+                    self._moving_tree = _trees
+                try:
+                    _trees[(ts.source_infohash or "").lower()] = _tree_key(
+                        local)
+                except Exception:
+                    pass
+                if len(_trees) > 5000:
+                    for _k in list(_trees.keys())[: len(_trees) - 5000]:
+                        _trees.pop(_k, None)
+            except Exception:
+                pass
             res = await move_local_to_remote(self.cfg, local, remote, include=include,
-                                             files_from=files_from, extra=extra)
+                                             files_from=files_from, extra=extra,
+                                             progress=True)
             if not res.ok:
                 err = res.stderr.strip()
                 # Headline first: rclone puts the summary up top and the

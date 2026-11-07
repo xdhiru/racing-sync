@@ -2275,6 +2275,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     _mp.pop((ts.source_infohash or "").lower(), None)
             except Exception:
                 pass
+            # Same lifecycle for the move-progress join maps (row tree +
+            # transferred watermark): a later re-entry starts fresh.
+            for _attr in ("_moving_tree", "_moving_progress_bytes"):
+                try:
+                    _m = getattr(self, _attr, None)
+                    if isinstance(_m, dict):
+                        _m.pop((ts.source_infohash or "").lower(), None)
+                except Exception:
+                    pass
         log.info(
             "%s %s -> %s (batch %s/%s)",
             ts.source_name[:60],
