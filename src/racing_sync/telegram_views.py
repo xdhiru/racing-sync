@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import re
+import time
 from urllib.parse import urlsplit
 
 from .state import State, TorrentState
@@ -446,12 +447,15 @@ def _active_note(ts: TorrentState, notes: dict[str, str] | None) -> str:
 
 
 def _active_state_text(ts: TorrentState, progress: float | None, note: str,
-                       speed_bps: object = 0) -> str:
+                       speed_bps: object = 0,
+                       move_progress: object = None) -> str:
     """One-line stage text for an active-tasks tracker row.
 
     DOWNLOADING rows additionally show bar + percent + rate + ETA when
     known (``⬇️ Downloading · 45.0% · ████░░░░ · 1.2M/s · ETA 4m``);
-    anything unknown is omitted rather than guessed.
+    MOVING rows show the rclone live line (``📦 Moving · 42% · ▓▓▓░░░ ·
+    80M/s · ETA 12m``) when `move_progress` carries a fresh
+    RcloneProgress; anything unknown is omitted rather than guessed.
     """
     _bd = _batch_display(ts)
     try:
@@ -494,6 +498,27 @@ def _active_state_text(ts: TorrentState, progress: float | None, note: str,
             state_text = f"📦 Moving leftovers · {_bd}"
         else:
             state_text = "📦 Moving"
+        # Live rclone line when a move is actually pumping stats for
+        # this row (stale/absent entries render the plain badge).
+        try:
+            _mp_pct = float(getattr(move_progress, "percent", 0.0) or 0.0)
+            _mp_spd = int(getattr(move_progress, "speed_bps", 0) or 0)
+            _mp_eta = int(getattr(move_progress, "eta_seconds", 0) or 0)
+            _mp_age = time.monotonic() - float(
+                getattr(move_progress, "updated_at", 0.0) or 0.0)
+            _mp_fresh = 0.0 <= _mp_age < 120.0
+        except Exception:
+            _mp_pct, _mp_spd, _mp_eta, _mp_fresh = 0.0, 0, 0, False
+        if _mp_fresh and (_mp_pct > 0 or _mp_spd > 0):
+            _mp_parts = [f"{_mp_pct:.0f}%", _list_bar(_mp_pct / 100.0)]
+            _mp_rate = _speed_human(_mp_spd)
+            if _mp_rate:
+                _mp_parts.append(_mp_rate)
+            _mp_eta_h = _eta_human(_mp_eta)
+            if _mp_eta_h:
+                _mp_parts.append(f"ETA {_mp_eta_h}")
+            state_text += " · " + " · ".join(
+                [p for p in _mp_parts if p])
         if (ts.last_error or "").strip():
             state_text += " · retrying"
     elif ts.state == State.RE_ADDING:
@@ -726,6 +751,7 @@ def render_active(
     notes: dict[str, str] | None = None,
     footer: str = "",
     speeds: dict[str, int] | None = None,
+    move_progress: dict[str, object] | None = None,
 ) -> tuple[str, int, int]:
     """Render paginated active tasks, grouped by file for mobile width.
 
@@ -743,6 +769,8 @@ def render_active(
 
     Compact mobile layout (detail cards stay fully detailed). `notes`
     maps source_infohash -> one-line extra shown on that tracker's line.
+    `move_progress` maps lowercase infohash -> RcloneProgress for MOVING
+    rows (live rclone line); absent/stale entries render plainly.
 
     `footer` is an optional trailing line (e.g. storage stats) appended
     directly after (single newline, no blank gap); "" disables it.
@@ -808,7 +836,13 @@ def render_active(
                     (ts.source_infohash or "").lower(), 0)
             except Exception:
                 _spd = 0
-            state_text = _active_state_text(ts, progress, _note, _spd)
+            try:
+                _mp = (move_progress or {}).get(
+                    (ts.source_infohash or "").lower())
+            except Exception:
+                _mp = None
+            state_text = _active_state_text(ts, progress, _note, _spd,
+                                            move_progress=_mp)
             if domain_full:
                 lines.append(f"▸ {_esc(domain_full)} {state_text}")
             else:
