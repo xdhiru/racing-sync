@@ -939,13 +939,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             return False
 
     async def run(self) -> int:
-        """Supervise the poller, scheduler and janitor loops.
+        """Supervise the poller, scheduler, janitor and qb-listener loops.
 
-        Three independent loops with separate locks and clocks (a wedged
-        source poll, wedged scheduler, or slow janitor degrades only its
-        own lane). Each loop guards its own iterations and never raises;
-        the supervisor just waits for stop and cancels them on shutdown.
-        `_tick()` remains the single-pass equivalent for tests.
+        Four independent loops with separate locks and clocks (a wedged
+        source poll, wedged scheduler, slow janitor, or dead dest poll
+        degrades only its own lane). Each loop guards its own iterations
+        and never raises; the supervisor just waits for stop and cancels
+        them on shutdown. `_tick()` remains the single-pass equivalent
+        for tests.
         """
         await self.start()
         try:
@@ -957,7 +958,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 except Exception:
                     pass
             factories = (self._poller_loop, self._scheduler_loop,
-                         self._janitor_loop)
+                         self._janitor_loop, self._qb_listener_loop)
             owned: dict[asyncio.Task, object] = {}
             for factory in factories:
                 try:
