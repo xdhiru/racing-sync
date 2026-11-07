@@ -533,8 +533,18 @@ class DownloadMixin:
             return
 
         while not self._stop:
-            t = await rpc(self.dest_client.get_torrent(h),
-                          getattr(self, "cfg", None), "dest poll get_torrent")
+            # Central snapshot first: the listener poll already fetched
+            # this row seconds ago — a per-row get_torrent every 1-2s per
+            # worker is O(workers x polls). A stale/missing snapshot means
+            # the listener is down: one direct fetch (never blind). A
+            # consumed `complete` verdict still goes through every gate
+            # below (vanish handling, file list, byte-on-disk) — the fast
+            # path only skips the redundant RPC, never a check.
+            self._consume_live_verdict(h)
+            t = self._live_snapshot_for(h)
+            if t is None:
+                t = await rpc(self.dest_client.get_torrent(h),
+                              getattr(self, "cfg", None), "dest poll get_torrent")
             if t is None:
                 # Vanished entry + vanished row = the operator abandoned
                 # this torrent mid-download (forget/cancel): unwind quietly
@@ -663,7 +673,63 @@ class DownloadMixin:
 
             if all_done:
                 return
-            await asyncio.sleep(poll_interval)
+            await self._wait_worker_pause(ts, poll_interval)
+
+    async def _wait_worker_pause(self, ts, timeout_s: float) -> None:
+        """Park between download polls on the task event, not sleep().
+
+        The listener sets the handle event on every central verdict, so
+        a completion wakes the worker immediately instead of sleeping
+        out the full poll interval; the timeout keeps every existing
+        per-row gate (stall watchdog, tracker health, byte-on-disk)
+        running when nothing happens. No handles (bare doubles) sleep
+        exactly like before. Never raises except CancelledError.
+        """
+        try:
+            _to = max(0.1, float(timeout_s or 0.0))
+        except (TypeError, ValueError):
+            _to = 2.0
+        _ev = None
+        try:
+            from .task import handles_for
+            for _x in handles_for(
+                    self, getattr(ts, "source_infohash", "") or ""):
+                try:
+                    _e = getattr(_x, "event", None)
+                    if _e is not None:
+                        _ev = _e
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            _ev = None
+        if _ev is None:
+            try:
+                await asyncio.sleep(_to)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            return
+        # Edge-triggered: clear any stale set (a verdict already
+        # consumed at loop top) so this wait only fires on NEW listener
+        # activity or the timeout.
+        try:
+            _ev.clear()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(_ev.wait(), _to)
+        except (TimeoutError, asyncio.TimeoutError):
+            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        try:
+            _ev.clear()
+        except Exception:
+            pass
 
     async def _prepare_next_batch(
         self, ts: TorrentState, *, strict: bool = False
