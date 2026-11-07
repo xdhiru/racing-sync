@@ -1209,6 +1209,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
 
         No-op if the row already has a live worker (both call sites
         pre-check too; the re-check here closes the gap after awaits).
+        A TaskHandle rides alongside the raw task: uniform cancel(),
+        plus the event/force slots P3/P4 park on. The raw `_worker_tasks`
+        registry stays (callers poke it); handles only add behavior.
         """
         h = (ts.source_infohash or "").lower()
         if h in self._running_infohashes:
@@ -1230,6 +1233,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             _wt.setdefault(h, set()).add(task)
         except Exception:
             pass
+        try:
+            from .task import TaskHandle, register_handle, short_gid
+            try:
+                _kind = str(getattr(getattr(ts, "state", None),
+                                    "value", "") or "").lower() or "worker"
+            except Exception:
+                _kind = "worker"
+            _handle = TaskHandle(infohash=h, gid=short_gid(h),
+                                 kind=_kind, task=task)
+            try:
+                _trees = getattr(self, "_moving_tree", None)
+                if isinstance(_trees, dict) and h in _trees:
+                    _handle.tree_key = _trees[h]
+            except Exception:
+                pass
+            register_handle(self, _handle)
+        except Exception:
+            _handle = None  # type: ignore[assignment]
         def _done_cb(t: asyncio.Task, infohash: str = h) -> None:
             self._tasks.discard(t)
             self._running_infohashes.discard(infohash)
@@ -1241,6 +1262,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                         _s.discard(t)
                         if not _s:
                             _wt2.pop(infohash, None)
+            except Exception:
+                pass
+            try:
+                if _handle is not None:
+                    from .task import unregister_handle
+                    unregister_handle(self, _handle)
             except Exception:
                 pass
         task.add_done_callback(_done_cb)
@@ -1255,38 +1282,68 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         finally drops the live map. Best-effort and idempotent; unknown
         hashes (and bare test doubles) report False.
 
-        Bounded by _STOP_WORKERS_TIMEOUT_S: cancel() cannot interrupt a
-        worker wedged in a to_thread body (fuse/SFTP syscalls), so the
-        join must not hang the forget/API call behind a leaked thread.
+        Cancels via TaskHandle (flag + wake + task-cancel + owned rclone
+        abort), falling back to raw task cancels for handles-less
+        entries. Bounded by _STOP_WORKERS_TIMEOUT_S: cancel() cannot
+        interrupt a worker wedged in a to_thread body (fuse/SFTP
+        syscalls), so the join must not hang the forget/API call behind
+        a leaked thread.
         """
         try:
             h = (infohash or "").strip().lower()
             if not h:
                 return False
             try:
-                _wt = getattr(self, "_worker_tasks", None)
-                _tasks = list(_wt.get(h, ())) if isinstance(_wt, dict) else []
+                from .task import handles_for
+                _handles = handles_for(self, h)
             except Exception:
-                return False
-            _live = [t for t in _tasks if not t.done()]
-            if not _live:
-                return False
-            for t in _live:
+                _handles = []
+            _live_tasks: list = []
+            _stopped = False
+            for _hd in _handles:
                 try:
-                    t.cancel()
+                    if _hd.cancel():
+                        _stopped = True
+                except Exception:
+                    pass
+                try:
+                    _t = getattr(_hd, "task", None)
+                    if _t is not None and not _t.done():
+                        _live_tasks.append(_t)
                 except Exception:
                     pass
             try:
+                _wt = getattr(self, "_worker_tasks", None)
+                _tasks = list(_wt.get(h, ())) if isinstance(_wt, dict) else []
+            except Exception:
+                return _stopped
+            for t in _tasks:
+                try:
+                    if t.done():
+                        continue
+                except Exception:
+                    continue
+                if t not in _live_tasks:
+                    _live_tasks.append(t)
+                if t not in [getattr(_x, "task", None) for _x in _handles]:
+                    try:
+                        t.cancel()
+                    except Exception:
+                        pass
+                    _stopped = True
+            if not _live_tasks and not _stopped:
+                return False
+            try:
                 await asyncio.wait_for(
-                    asyncio.gather(*_live, return_exceptions=True),
+                    asyncio.gather(*_live_tasks, return_exceptions=True),
                     timeout=_STOP_WORKERS_TIMEOUT_S)
             except (TimeoutError, asyncio.TimeoutError):
                 log.warning(
                     "stop_workers_for %s timed out; %d worker(s) linger",
-                    h[:10], len(_live))
+                    h[:10], len(_live_tasks))
             except Exception:
                 pass
-            return True
+            return True if (_stopped or _live_tasks) else False
         except Exception:
             return False
 

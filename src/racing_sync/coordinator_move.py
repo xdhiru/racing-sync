@@ -1791,10 +1791,23 @@ class MoveMixin:
                     _trees = {}
                     self._moving_tree = _trees
                 try:
-                    _trees[(ts.source_infohash or "").lower()] = _tree_key(
-                        local)
+                    _tkey = _tree_key(local)
+                    _trees[(ts.source_infohash or "").lower()] = _tkey
                 except Exception:
-                    pass
+                    _tkey = None
+                # The worker's handle owns this tree for cancel(): a
+                # later TaskHandle.cancel() aborts exactly this proc.
+                if _tkey:
+                    try:
+                        from .task import handles_for
+                        for _hd in handles_for(
+                                self, (ts.source_infohash or "")):
+                            try:
+                                _hd.tree_key = _tkey
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 if len(_trees) > 5000:
                     for _k in list(_trees.keys())[: len(_trees) - 5000]:
                         _trees.pop(_k, None)
