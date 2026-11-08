@@ -45,6 +45,11 @@ PREFER_CMD_RE = re.compile(r"^/prefer_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 #: rows (watch or racing) start their SSD download at once.
 NOW_CMD_RE = re.compile(r"^/now_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
+#: `/forcestart_<n|hex>` — operator override: arm the lane-cap bypass
+#: for a queued/moving row or group (in-memory force + wake). Extends
+#: `/now_` (same token shapes); force disarms on lane exit / restart.
+FORCESTART_CMD_RE = re.compile(r"^/forcestart_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
 #: `/skip_<hex>` — same shape: hold a tracked release (whole group):
 #: no workers, no Prowlarr queries, no downloads, no moves until
 #: `/unskip_`. State is kept; `/add` / watch-dir re-drop resumes it.
@@ -455,6 +460,8 @@ _CHAT_COMMANDS: tuple = (
     _ChatCommand("fetch", FETCH_CMD_RE, _cmd_group("fetch")),
     _ChatCommand("prefer", PREFER_CMD_RE, _cmd_group("prefer")),
     _ChatCommand("now", NOW_CMD_RE, _cmd_group("now")),
+    _ChatCommand("forcestart", FORCESTART_CMD_RE,
+                 _cmd_group("forcestart")),
     _ChatCommand("skip", SKIP_CMD_RE, _cmd_group("skip")),
     _ChatCommand("unskip", UNSKIP_CMD_RE, _cmd_resume),
     _ChatCommand("resume", RESUME_CMD_RE, _cmd_resume),
