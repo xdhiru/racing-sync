@@ -492,6 +492,36 @@ _MATCH_MAX_BYTES = 35
 _MATCH_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,47}$")
 
 
+#: Active-list status filters: key -> row states shown (`None` = all).
+#: QD covers the queued/waiting lanes (QUEUED + NEW + WAITING_*).
+_STATUS_FILTERS: dict[str, frozenset | None] = {
+    "all": None,
+    "dl": frozenset({"downloading"}),
+    "mv": frozenset({"moving"}),
+    "rd": frozenset({"re_adding"}),
+    "qd": frozenset({"queued", "new", "waiting_disk", "waiting_indexer"}),
+}
+#: Filter keyboard buttons in order: (key, label). `ov` is the aggregate
+#: overview (not a filter) and shares the `status:` callback namespace.
+_STATUS_FILTER_BUTTONS: tuple = (
+    ("all", "All"), ("dl", "DL"), ("mv", "MV"), ("rd", "RD"),
+    ("qd", "QD"), ("ov", "📊"),
+)
+
+
+def match_status_filter(state_value: object, key: str) -> bool:
+    """True when a row state passes the active-list filter. Never raises."""
+    try:
+        if (key or "all") == "all":
+            return True
+        _want = _STATUS_FILTERS.get(key or "all")
+        if _want is None:
+            return True
+        return str(state_value or "").lower() in _want
+    except Exception:
+        return True
+
+
 def _is_bulk_scope(h: str) -> bool:
     """True for re-resolved bulk scopes (`match:<tok>`, `stalled`).
 
