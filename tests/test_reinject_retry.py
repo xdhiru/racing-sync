@@ -763,7 +763,7 @@ async def test_do_queued_fuse_fast_track_persists_classification(tmp_path: Path)
 @pytest.mark.anyio
 async def test_do_queued_retries_files_listing_after_add(tmp_path: Path):
     """A 404 right after add (loaded client registration lag) must not FAILED."""
-    from unittest.mock import patch
+    from unittest.mock import MagicMock, patch
     from racing_sync.clients.abstract import AddResult, TorrentFile
 
     coord = make_coordinator()
@@ -778,8 +778,14 @@ async def test_do_queued_retries_files_listing_after_add(tmp_path: Path):
         return_value=AddResult(hash="ab" * 20, accepted=True, detail="Ok.")
     )
     movie = [TorrentFile(name="Queued.Movie.2026.mkv", size_bytes=100, progress=0.0)]
+
+    def _lag_404():
+        import aiohttp
+        return aiohttp.ClientResponseError(
+            request_info=MagicMock(), history=(), status=404)
+
     coord.dest_client.get_torrent_files = AsyncMock(
-        side_effect=[RuntimeError("404 Not Found"), RuntimeError("404 Not Found"), movie]
+        side_effect=[_lag_404(), _lag_404(), movie]
     )
     coord.dest_client.resume = AsyncMock()
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))

@@ -1764,12 +1764,14 @@ class AdmitMixin:
                    .strip().lower())
         except Exception:
             return False
+        # Waiter identity: only worker-backed rows (spawned → handle with
+        # an event) can event-park. Handle-less callers (tests, exotic
+        # paths) keep the classic park-exit below instead of spinning.
+        # No row-existence check here: _try_admit_download already stays
+        # silent for forgotten rows, and forget/API paths cancel the
+        # worker task itself (cancellation unwinds the wait).
+        _ever_queued = False
         while not getattr(self, "_stop", False):
-            try:
-                if self._abandoned(ts):
-                    return True
-            except Exception:
-                pass
             if key and self._is_forced(key):
                 try:
                     from .task import handles_for
@@ -1800,7 +1802,20 @@ class AdmitMixin:
                         return False
                 except Exception:
                     return False
+                if not _ever_queued:
+                    # No waiter identity: classic park-exit (row stays
+                    # QUEUED; the next tick respawns) — never spin.
+                    return True
+                # Briefly breather before re-queueing (disagreement
+                # between handle/live counts must not tight-loop).
+                try:
+                    await asyncio.sleep(1.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
                 continue
+            _ever_queued = True
             try:
                 from .task import handles_for
                 for _hd in handles_for(self, key):
@@ -3150,22 +3165,19 @@ class AdmitMixin:
                                      _holds_download_slot: bool = True) -> None:
         """Classify, prioritize, and resume a just-added SSD torrent."""
         # Classify (with a short retry: the files endpoint can 404 for a few
-        # seconds right after add while qB registers the torrent).
-        files: list[TorrentFile] = []
-        last_err: Exception | None = None
-        for _ in range(4):
-            try:
-                files = await rpc(
-                    self.dest_client.get_torrent_files(ts.dest_infohash or ts.source_infohash),
-                    getattr(self, "cfg", None), "dest setup files",
-                )
-                last_err = None
-                break
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                await asyncio.sleep(2)
-        if last_err is not None:
-            raise last_err
+        # seconds right after add while qB registers the torrent). Central
+        # read-retry policy (1/2/5s, 404-tolerant) replaces the hand-rolled
+        # 4x loop: same tolerance, one policy, deterministic errors fast.
+        from .retry import retryable
+
+        async def _fetch_setup_files() -> list[TorrentFile]:
+            return await rpc(
+                self.dest_client.get_torrent_files(ts.dest_infohash or ts.source_infohash),
+                getattr(self, "cfg", None), "dest setup files",
+            )
+
+        files: list[TorrentFile] = await retryable(
+            label="dest setup files")(_fetch_setup_files)()
         from . import coordinator as _coordinator
 
         cls = _coordinator.classify(files, self.cfg)
