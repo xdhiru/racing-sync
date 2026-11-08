@@ -205,7 +205,16 @@ class ActionsMixin:
             if not live:
                 return "Already gone from tracking"
             outs = []
-            for h in live:
+            for _i, h in enumerate(live):
+                # Stagger bulk cancels (2s between executions): a lane
+                # wipe otherwise stampedes the clients + DB at once.
+                if _i > 0:
+                    try:
+                        await asyncio.sleep(2.0)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
                 try:
                     outs.append(await self._execute_cancel_one(
                         h, delete_files=delete_files, remember=remember))
@@ -1006,6 +1015,105 @@ class ActionsMixin:
             "\nForget them all?")
         try:
             await self._send_sheet(_text, _rows, reply_to=message)
+        except Exception:
+            pass
+
+    async def _cancel_status_command_entry(self, message: Any) -> None:
+        """`/cancel_status`: pick a lane, then the usual remember sheet.
+
+        One button per non-empty lane (DL/MV/RD/QD + live counts);
+        tapping one opens the same remember -> keep/delete sheets as
+        every other scope (`cancel:status:<key>`, re-resolved live at
+        each tap). Empty lanes are omitted; an empty list replies so.
+        """
+        try:
+            from .telegram_protocol import (
+                _STATUS_FILTER_BUTTONS, match_status_filter)
+            _get_all = getattr(self._store, "list_active_inflight", None)
+            rows = await asyncio.to_thread(_get_all) \
+                if callable(_get_all) else []
+        except Exception as e:  # noqa: BLE001
+            try:
+                await self._reply(_action_error_text(e), reply_to=message)
+            except Exception:
+                pass
+            return
+        _counts: dict[str, int] = {}
+        try:
+            for _r in rows or []:
+                try:
+                    _sv = getattr(getattr(_r, "state", None), "value", "")
+                except Exception:
+                    continue
+                for _key, _ in _STATUS_FILTER_BUTTONS:
+                    if _key in ("all", "ov"):
+                        continue
+                    try:
+                        if match_status_filter(_sv, _key):
+                            _counts[_key] = _counts.get(_key, 0) + 1
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        if not _counts:
+            try:
+                await self._reply("Nothing live to cancel.",
+                                  reply_to=message)
+            except Exception:
+                pass
+            return
+        if len(_counts) == 1 and list(_counts.values())[0] == 1:
+            _only = next(iter(_counts))
+            try:
+                _solo = await asyncio.to_thread(
+                    self._store.list_active_inflight)
+            except Exception:
+                _solo = []
+            _hsolo = []
+            try:
+                for _r in _solo or []:
+                    try:
+                        if match_status_filter(
+                                getattr(getattr(_r, "state", None),
+                                        "value", ""), _only):
+                            _rh = (getattr(_r, "source_infohash", "")
+                                   or "").lower()
+                            if _rh:
+                                _hsolo.append(_rh)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            if len(_hsolo) == 1:
+                await self._start_single_command(
+                    "cancel", _hsolo[0], message)
+                return
+        _maker = ButtonMaker()
+        for (_key, _label) in _STATUS_FILTER_BUTTONS:
+            if _key in ("all", "ov"):
+                continue
+            try:
+                _n = int(_counts.get(_key, 0) or 0)
+            except (TypeError, ValueError):
+                _n = 0
+            if _n <= 0:
+                continue
+            try:
+                _maker.add(f"X {_label} ({_n})", f"cancel:status:{_key}")
+            except Exception:
+                continue
+        try:
+            _maker.add("Close", "abort")
+        except Exception:
+            pass
+        try:
+            _rows = _maker.newline().rows()
+        except Exception:
+            return
+        try:
+            await self._send_sheet("Cancel by status - pick a lane:",
+                                   _rows, reply_to=message)
         except Exception:
             pass
 
