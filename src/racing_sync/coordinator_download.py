@@ -532,6 +532,25 @@ class DownloadMixin:
             # Whole batch already on the remote: nothing to wait for.
             return
 
+        # Central read-retry for the direct-fallback fetches below (the
+        # snapshot path needs none): a transient blip retries in 1/2/5s
+        # instead of failing or burning a stall window. Defined once —
+        # the loop below must not rebuild decorators per poll.
+        from .retry import retryable
+
+        async def _fetch_poll():
+            return await rpc(self.dest_client.get_torrent(h),
+                             getattr(self, "cfg", None),
+                             "dest poll get_torrent")
+
+        async def _fetch_wait_files():
+            return await rpc(self.dest_client.get_torrent_files(h),
+                             getattr(self, "cfg", None), "dest wait files")
+
+        _poll_read = retryable(label="dest poll get_torrent")(_fetch_poll)
+        _wait_files_read = retryable(
+            label="dest wait files")(_fetch_wait_files)
+
         while not self._stop:
             # Central snapshot first: the listener poll already fetched
             # this row seconds ago — a per-row get_torrent every 1-2s per
@@ -543,8 +562,7 @@ class DownloadMixin:
             self._consume_live_verdict(h)
             t = self._live_snapshot_for(h)
             if t is None:
-                t = await rpc(self.dest_client.get_torrent(h),
-                              getattr(self, "cfg", None), "dest poll get_torrent")
+                t = await _poll_read()
             if t is None:
                 # Vanished entry + vanished row = the operator abandoned
                 # this torrent mid-download (forget/cancel): unwind quietly
@@ -590,8 +608,7 @@ class DownloadMixin:
                               (ts.source_infohash or "")[:10], e)
 
             if expected_files is not None:
-                files = await rpc(self.dest_client.get_torrent_files(h),
-                                  getattr(self, "cfg", None), "dest wait files")
+                files = await _wait_files_read()
                 f_map = {f.name: f for f in files}
                 missing_files = [fn for fn in expected_files if fn not in f_map]
                 if missing_files:
