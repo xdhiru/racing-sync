@@ -675,6 +675,30 @@ class AdmitMixin:
         except Exception:
             pass
 
+        # Admit-time stop-duplicate (P8): a same-content sibling already
+        # past admission owns the SSD bytes — defer to it (recorded, so
+        # later windows skip the scan while it is live) instead of a
+        # second Prowlarr search + duplicate download. The WAITING_INDEXER
+        # retry clock still bounds the wait: owner death hands back
+        # control, max-age fails eventually. Fail-open: any doubt picks.
+        try:
+            _new_leader = self._inflight_same_content(ts)
+        except Exception:
+            _new_leader = None
+        if _new_leader is not None:
+            try:
+                self._record_deferred_on(
+                    (ts.source_infohash or "").lower(),
+                    _new_leader.source_infohash or "")
+            except Exception:
+                pass
+            log.info("deferring %s to in-flight same-content %s (%s)",
+                     (ts.source_name or "")[:60],
+                     (_new_leader.source_infohash or "")[:10],
+                     _new_leader.state.value)
+            self._park_for_indexer_retry(ts, reason="same-content deferred")
+            return
+
         all_source = await self._list_source_torrents()
         await self._pick_and_admit(ts, st, self._same_content_torrents(all_source, st))
 
@@ -900,6 +924,107 @@ class AdmitMixin:
             pass
         return rows
 
+    def _record_deferred_on(self, waiter_key: str, owner_hash: str) -> None:
+        """Record a same-content deferral (waiter -> live owner).
+
+        In-memory (`_supplement_ok_at`-style map, capped): ticks skip
+        Prowlarr for the waiter till the owner leaves. Entries clear on
+        use (owner gone) — no transition hook needed.
+        """
+        try:
+            _m = getattr(self, "_deferred_on", None)
+            if not isinstance(_m, dict):
+                _m = {}
+                self._deferred_on = _m  # type: ignore[attr-defined]
+            _o = (owner_hash or "").strip().lower()
+            if not _o:
+                return
+            _m[(waiter_key or "").strip().lower()] = _o
+            if len(_m) > 5000:
+                for _k in list(_m.keys())[: len(_m) - 5000]:
+                    if _k != (waiter_key or "").strip().lower():
+                        _m.pop(_k, None)
+        except Exception:
+            pass
+
+    def _deferred_owner_of(self, waiter_key: str) -> str | None:
+        """Recorded deferral owner for a waiter, if any. Never raises."""
+        try:
+            _m = getattr(self, "_deferred_on", None)
+            if not isinstance(_m, dict):
+                return None
+            _o = _m.get((waiter_key or "").strip().lower())
+            return _o or None
+        except Exception:
+            return None
+
+    def _clear_deferred_on(self, waiter_key: str) -> None:
+        """Drop a deferral record. Never raises."""
+        try:
+            _m = getattr(self, "_deferred_on", None)
+            if isinstance(_m, dict):
+                _m.pop((waiter_key or "").strip().lower(), None)
+        except Exception:
+            pass
+
+    def _deferred_owner_live(self, owner_hash: str) -> bool:
+        """True when the recorded owner is still in-flight (shared scan).
+
+        DONE/FAILED/forgotten owners read gone — the waiter then falls
+        through to its own scan + pick. Never raises (doubt = not live
+        would strand; doubt here returns False only on real absence —
+        errors return False and the waiter re-scans, today's behavior).
+        """
+        try:
+            _o = (owner_hash or "").strip().lower()
+            if not _o:
+                return False
+            for r in self._inflight_snapshot_rows() or []:
+                try:
+                    if ((r.source_infohash or "").lower() == _o
+                            and r.state in (State.QUEUED, State.DOWNLOADING,
+                                            State.MOVING, State.RE_ADDING)):
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def _repark_deferred(self, ts: TorrentState) -> None:
+        """Push the deferral retry timer quietly (no Prowlarr this window).
+
+        Same schedule the row is parked on (public-export rows keep the
+        public timer, everything else the indexer timer), attempts and
+        max-age untouched so a dead owner hands back control. Silent
+        when the row is gone (no upsert-resurrect).
+        """
+        try:
+            _interval = max(60.0, float(
+                self.cfg.cross_seed.prowlarr_retry_interval_seconds))
+        except (TypeError, ValueError):
+            _interval = 1800.0
+        try:
+            _public_interval = max(60.0, float(
+                self.cfg.cross_seed.public_export_retry_interval_seconds))
+        except (TypeError, ValueError, AttributeError):
+            _public_interval = 1800.0
+        try:
+            if self._abandoned(ts):
+                return
+            if (ts.public_export_next_retry_at
+                    and not ts.indexer_next_retry_at):
+                ts.public_export_next_retry_at = (
+                    dt.datetime.now(dt.timezone.utc)
+                    + dt.timedelta(seconds=_public_interval))
+            else:
+                ts.indexer_next_retry_at = (
+                    dt.datetime.now(dt.timezone.utc)
+                    + dt.timedelta(seconds=_interval))
+            self.store.upsert(ts)
+        except Exception:
+            pass
+
     async def _adopt_ssd_entry(self, ts: TorrentState, entry) -> bool:
         """Adopt a complete SSD-resident dest entry; True when queued.
 
@@ -1058,6 +1183,29 @@ class AdmitMixin:
             await self._do_new_watch_dir(ts)
             return
 
+        # Admit-time record fast path (P8): a recorded owner still live
+        # skips the VPS1 fetch + scan below — no Prowlarr till it leaves.
+        # Owner gone: clear the record and fall through to the scan.
+        try:
+            _wkey = (ts.source_infohash or "").lower()
+            _rec = self._deferred_owner_of(_wkey)
+        except Exception:
+            _wkey, _rec = "", None
+        if _rec:
+            try:
+                _alive = self._deferred_owner_live(_rec)
+            except Exception:
+                _alive = False
+            if _alive:
+                log.info("still deferring %s to live same-content %s",
+                         (ts.source_name or "")[:60], _rec[:10])
+                self._repark_deferred(ts)
+                return
+            try:
+                self._clear_deferred_on(_wkey)
+            except Exception:
+                pass
+
         # Pull fresh data from VPS1 in case the torrent name changed.
         # A vanished VPS1 copy (space-cleared, pruned) proceeds from the
         # persisted metadata instead of failing: Prowlarr or a surviving
@@ -1087,40 +1235,18 @@ class AdmitMixin:
         except Exception:
             _leader = None
         if _leader is not None:
-            try:
-                _interval = max(60.0, float(self.cfg.cross_seed.prowlarr_retry_interval_seconds))
-            except (TypeError, ValueError):
-                _interval = 1800.0
-            try:
-                _public_interval = max(60.0, float(
-                    self.cfg.cross_seed.public_export_retry_interval_seconds))
-            except (TypeError, ValueError, AttributeError):
-                _public_interval = 1800.0
             log.info(
                 "deferring Prowlarr retry for %s — same content %s already %s",
                 ts.source_name[:60], (_leader.source_infohash or "")[:10],
                 _leader.state.value,
             )
             try:
-                if self._abandoned(ts):
-                    raise AbandonedError(
-                        f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}")
-                # Push the schedule this row is actually parked on: a
-                # public-export row must not gain an indexer timer (it
-                # would wake on the wrong schedule and confuse the
-                # max-age accounting).
-                if (ts.public_export_next_retry_at
-                        and not ts.indexer_next_retry_at):
-                    ts.public_export_next_retry_at = (
-                        dt.datetime.now(dt.timezone.utc)
-                        + dt.timedelta(seconds=_public_interval))
-                else:
-                    ts.indexer_next_retry_at = (
-                        dt.datetime.now(dt.timezone.utc)
-                        + dt.timedelta(seconds=_interval))
-                self.store.upsert(ts)
+                self._record_deferred_on(
+                    (ts.source_infohash or "").lower(),
+                    _leader.source_infohash or "")
             except Exception:
                 pass
+            self._repark_deferred(ts)
             return
 
         all_source = await self._list_source_torrents()
