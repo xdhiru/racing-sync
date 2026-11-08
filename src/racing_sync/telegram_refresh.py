@@ -10,6 +10,7 @@ the `telegram_protocol` / `telegram_views` helpers.
 import asyncio
 import logging
 import time
+from typing import Any
 
 from telegram import InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -371,8 +372,31 @@ class RefreshMixin:
                 move_progress = {}
         except Exception:
             move_progress = {}
+        # Status filter (All/DL/MV/RD/QD buttons): the detail nets above
+        # run on the FULL list (filtered-out cards still heal); only the
+        # render + numbering narrow. Unknown keys show everything.
+        try:
+            _flt = getattr(self, "_status_filter", None) or "all"
+        except Exception:
+            _flt = "all"
+        try:
+            from .telegram_protocol import match_status_filter as _matchflt
+            if _flt == "all":
+                shown = items
+            else:
+                shown = [
+                    (_ts, _pg) for (_ts, _pg) in items
+                    if _matchflt(
+                        getattr(getattr(_ts, "state", None), "value", ""),
+                        _flt)]
+        except Exception:
+            shown = items
+            try:
+                _flt = "all"
+            except Exception:
+                pass
         text, cur_page, total_pages = render_active(
-            items, page=self._current_page, page_size=self._cfg.page_size,
+            shown, page=self._current_page, page_size=self._cfg.page_size,
             notes=notes, footer=footer, speeds=speed_map,
             move_progress=move_progress,
         )
@@ -381,14 +405,19 @@ class RefreshMixin:
         # (a group finished, a dupe arrived) warns instead of misacting.
         try:
             self._last_rendered_groups = len(
-                _group_active_items(list(items or [])))
+                _group_active_items(list(shown or [])))
             self._last_rendered_page = cur_page
         except Exception:
             pass
         if len(text) > 4096:
             text = _safe_truncate_markdown(text)
         self._current_page = cur_page
-        keyboard = self._build_keyboard(cur_page, total_pages)
+        try:
+            _kb_filter = getattr(self, "_status_filter", None) or "all"
+        except Exception:
+            _kb_filter = "all"
+        keyboard = self._build_keyboard(cur_page, total_pages,
+                                        status_filter=_kb_filter)
 
         # Skip the API call if page, total_pages and text are identical
         # — unless a keep-at-bottom repost is due (position refreshes
@@ -944,6 +973,88 @@ class RefreshMixin:
         await asyncio.to_thread(
             self._store.set_meta, "telegram_active_msg_id", str(sent.message_id)
         )
+
+    async def _send_overview_message(self, query: Any = None) -> None:
+        """Answer the 📊 button: one-line fleet aggregate + state chips.
+
+        `(bps, n)` downloads from live_totals(), rclone move count/rate
+        from the progress map, per-state counts from the active list.
+        Operator-requested, so a standalone reply (threaded to the tapped
+        list message when available). Never raises.
+        """
+        try:
+            _bps, _n = 0, 0
+            try:
+                _fn = getattr(getattr(self, "_coord", None),
+                              "live_totals", None)
+                _tot = _fn() if callable(_fn) else (0, 0)
+                _bps = int(_tot[0]) if not isinstance(
+                    _tot[0], bool) else 0
+                _n = int(_tot[1]) if not isinstance(
+                    _tot[1], bool) else 0
+            except Exception:
+                pass
+            _rn, _rs = 0, 0
+            try:
+                from .rclone_ops import rclone_progress_map
+                _rm = rclone_progress_map()
+                _rn = len(_rm)
+                for _rp in list(_rm.values()):
+                    try:
+                        _rs += max(0, int(
+                            getattr(_rp, "speed_bps", 0) or 0))
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            _counts: dict[str, int] = {}
+            try:
+                _rows = await asyncio.to_thread(
+                    self._store.list_active_inflight)
+                for _r in _rows or []:
+                    try:
+                        _sv = getattr(getattr(_r, "state", None),
+                                      "value", "")
+                        _counts[_sv] = _counts.get(_sv, 0) + 1
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            try:
+                _dl = _speed_human(_bps) or "0 B/s"
+            except Exception:
+                _dl = "0 B/s"
+            _parts = [f"▼ {_dl} · {_n} downloading"]
+            if _rn:
+                try:
+                    _rl = _speed_human(_rs) or "0 B/s"
+                except Exception:
+                    _rl = "0 B/s"
+                _parts.append(f"rclone {_rn} moving · {_rl}")
+            _chips = []
+            for _sv, _tag in (("downloading", "DL"), ("moving", "MV"),
+                              ("re_adding", "RD"), ("queued", "Q"),
+                              ("waiting_disk", "WD"),
+                              ("waiting_indexer", "WI"),
+                              ("new", "NEW")):
+                try:
+                    if _counts.get(_sv):
+                        _chips.append(f"{_tag}{_counts[_sv]}")
+                except Exception:
+                    continue
+            if _chips:
+                _parts.append(" · ".join(_chips))
+            _text = "📊 " + " · ".join(_parts)
+            try:
+                _reply_to = getattr(query, "message", None)
+            except Exception:
+                _reply_to = None
+            try:
+                await self._reply(_text[:500], reply_to=_reply_to)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     async def _reconcile_pinned(self) -> None:
         """Telegram allows at most one pinned message per chat; pin ours."""

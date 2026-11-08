@@ -82,21 +82,33 @@ def test_render_active_pagination_and_numbering():
 def test_keyboard_builder():
     bot = TelegramBot(TelegramConfig(bot_token="fake:token", chat_id="12345"), None, None)
     
-    # 1 page -> refresh only
+    # 1 page -> refresh + filter rows
     kb1 = bot._build_keyboard(current_page=0, total_pages=1)
     assert kb1 is not None
-    assert len(kb1.inline_keyboard) == 1
+    assert len(kb1.inline_keyboard) == 2
     assert kb1.inline_keyboard[0][0].text == "🔄 Refresh"
+    # Filter row: All bracketed when active, ov button present.
+    _frow = kb1.inline_keyboard[1]
+    assert [b.text for b in _frow] == (
+        ["·All·", "DL", "MV", "RD", "QD", "📊"])
+    assert all((b.callback_data or "").startswith("status:")
+               for b in _frow)
 
-    # 3 pages -> Prev, Page, Next, Refresh
+    # 3 pages -> Prev, Page, Next, Refresh, filters
     kb3 = bot._build_keyboard(current_page=1, total_pages=3)
     assert kb3 is not None
-    assert len(kb3.inline_keyboard) == 2
+    assert len(kb3.inline_keyboard) == 3
     row0 = kb3.inline_keyboard[0]
     assert row0[0].text == "◀️ Prev"
     assert row0[1].text == "2 / 3"
     assert row0[2].text == "Next ▶️"
     assert kb3.inline_keyboard[1][0].text == "🔄 Refresh"
+
+    # Active filter marking follows the argument.
+    kb_dl = bot._build_keyboard(current_page=0, total_pages=1,
+                                status_filter="dl")
+    assert [b.text for b in kb_dl.inline_keyboard[1]] == (
+        ["All", "·DL·", "MV", "RD", "QD", "📊"])
 
 
 def test_render_detail_formatting():

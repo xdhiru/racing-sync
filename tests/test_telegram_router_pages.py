@@ -82,3 +82,114 @@ async def test_page_refresh_keeps_dedup_cache():
     await bot._handle_callback(_query("page:refresh"))
     assert bot._last_active_cache is sentinel
     bot._refresh_active_message.assert_awaited_once()
+
+
+def test_match_status_filter_shapes():
+    from racing_sync.telegram_protocol import match_status_filter
+
+    assert match_status_filter("downloading", "all") is True
+    assert match_status_filter("downloading", "dl") is True
+    assert match_status_filter("moving", "dl") is False
+    assert match_status_filter("moving", "mv") is True
+    assert match_status_filter("queued", "qd") is True
+    assert match_status_filter("waiting_disk", "qd") is True
+    assert match_status_filter("new", "qd") is True
+    assert match_status_filter("re_adding", "rd") is True
+    assert match_status_filter("downloading", "bogus") is True
+
+
+@pytest.mark.anyio
+async def test_status_tap_sets_filter_resets_page_clears_cache():
+    bot = _page_bot([_row("a" * 40, "Twin.Show.S01E01")])
+    bot._current_page = 2
+    bot._status_filter = "all"
+    bot._last_active_cache = (0, 1, "old")
+    await bot._handle_callback(_query("status:dl"))
+    assert bot._status_filter == "dl"
+    assert bot._current_page == 0
+    assert bot._last_active_cache is None
+    bot._refresh_active_message.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_same_filter_tap_keeps_cache():
+    bot = _page_bot([_row("a" * 40, "Twin.Show.S01E01")])
+    bot._status_filter = "dl"
+    sentinel = (0, 1, "cached")
+    bot._last_active_cache = sentinel
+    await bot._handle_callback(_query("status:dl"))
+    assert bot._last_active_cache is sentinel
+    bot._refresh_active_message.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_unknown_status_key_ignored():
+    bot = _page_bot([_row("a" * 40, "Twin.Show.S01E01")])
+    await bot._handle_callback(_query("status:bogus"))
+    bot._refresh_active_message.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_filtered_refresh_narrows_render():
+    """Inner honors _status_filter; detail nets still see everything."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.config import TelegramConfig
+    from racing_sync.state import State, TorrentState
+    from racing_sync.telegram_bot import TelegramBot
+
+    bot = object.__new__(TelegramBot)
+    bot._bot = MagicMock()
+    bot._bot.edit_message_text = AsyncMock()
+    bot._bot.send_message = AsyncMock(
+        return_value=MagicMock(message_id=99))
+    bot._store = MagicMock()
+    bot._coord = MagicMock()
+    bot._coord.live_progress_map.return_value = {}
+    bot._coord.live_speed_map.return_value = {}
+    bot._coord.rclone_move_progress_map.return_value = {}
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
+    bot._current_page = 0
+    bot._active_msg_id = None
+    bot._prev_active_msg_id = None
+    bot._last_active_cache = None
+    bot._detail_cache = {}
+    bot._detail_queue = asyncio.Queue()
+    bot._detail_sent_state = {}
+    bot._status_filter = "dl"
+    mk = lambda h, st, name: TorrentState(  # noqa: E731
+        source_infohash=h, source_name=name, state=st, total_bytes=1000,
+        source_announce_url="https://alpha.cc/announce/xyz")
+    bot._store.list_active_inflight.return_value = [
+        mk("a" * 40, State.DOWNLOADING, "Dl.Show.S01E01"),
+        mk("b" * 40, State.QUEUED, "Q.Show.S01E01"),
+    ]
+    await bot._refresh_active_message_inner()
+    sent_text = bot._bot.send_message.call_args[0][1]
+    assert "Dl.Show" in sent_text
+    assert "Q.Show" not in sent_text
+    assert bot._last_rendered_groups == 1
+
+
+@pytest.mark.anyio
+async def test_overview_button_sends_aggregate():
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.state import State, TorrentState
+
+    bot = _page_bot([])
+    bot._coord = MagicMock()
+    bot._coord.live_totals.return_value = (10_000_000, 2)
+    bot._store = MagicMock()
+    bot._store.list_active_inflight.return_value = [
+        TorrentState(source_infohash="a" * 40, source_name="D",
+                     state=State.DOWNLOADING),
+        TorrentState(source_infohash="b" * 40, source_name="M",
+                     state=State.MOVING),
+    ]
+    bot._reply = AsyncMock()
+    q = _query("status:ov")
+    await bot._handle_callback(q)
+    text = bot._reply.call_args[0][0]
+    assert text.startswith("📊")
+    assert "2 downloading" in text
+    assert "DL1" in text and "MV1" in text

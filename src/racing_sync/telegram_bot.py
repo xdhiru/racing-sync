@@ -887,13 +887,16 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         current_page: int,
         total_pages: int,
         extra_rows: list[list[tuple[str, str]]] | tuple = (),
+        status_filter: str = "all",
     ) -> InlineKeyboardMarkup | None:
         """Pagination nav buttons plus extra action rows.
 
         Extra rows are ``(label, callback_data)`` pairs (hash-direct
         action buttons) or a ButtonMaker, already chunked by the caller —
         invalid entries are logged and skipped so one bad button can
-        never break the periodic list render.
+        never break the periodic list render. The trailing filter row
+        (All/DL/MV/RD/QD + overview) carries `status:` callbacks; the
+        active filter renders bracketed.
         """
         if total_pages <= 1:
             buttons = [
@@ -918,6 +921,21 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                         _label, callback_data=_data))
                 if _btns:
                     buttons.append(_btns)
+        except Exception:
+            pass
+        try:
+            from .telegram_protocol import _STATUS_FILTER_BUTTONS
+            _cur = (status_filter or "all")
+            _frow = []
+            for (_key, _label) in _STATUS_FILTER_BUTTONS:
+                try:
+                    _txt = f"·{_label}·" if _key == _cur else _label
+                    _frow.append(InlineKeyboardButton(
+                        _txt, callback_data=f"status:{_key}"))
+                except Exception:
+                    continue
+            if _frow:
+                buttons.append(_frow)
         except Exception:
             pass
         return InlineKeyboardMarkup(buttons)

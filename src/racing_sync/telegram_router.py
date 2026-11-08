@@ -468,6 +468,39 @@ class RouterMixin:
                     pass
             return
         if not data.startswith("page:"):
+            if data.startswith("status:"):
+                _skey = data.split(":", 1)[1].strip().lower()
+                if _skey == "ov":
+                    try:
+                        await self._send_overview_message(query)
+                    except Exception:
+                        pass
+                    return
+                try:
+                    from .telegram_protocol import _STATUS_FILTERS
+                    _valid = _skey in _STATUS_FILTERS
+                except Exception:
+                    _valid = _skey in ("all", "dl", "mv", "rd", "qd")
+                if _valid:
+                    try:
+                        _cur = getattr(self, "_status_filter", "all") or "all"
+                    except Exception:
+                        _cur = "all"
+                    # Filter flips re-render (buttons + list change): drop
+                    # the dedup cache so the identical-text gate can't
+                    # skip the button update. Same-filter taps keep it.
+                    if _skey != _cur:
+                        try:
+                            self._status_filter = _skey
+                        except Exception:
+                            pass
+                        self._current_page = 0
+                        try:
+                            self._last_active_cache = None
+                        except Exception:
+                            pass
+                    await self._refresh_active_message()
+                return
             return
 
         action = data.split(":", 1)[1]
