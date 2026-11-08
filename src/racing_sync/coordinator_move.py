@@ -1784,13 +1784,6 @@ class MoveMixin:
         # semaphore below — force bypasses caps, never mutual exclusion).
         while not getattr(self, "_stop", False):
             try:
-                _gone = self._abandoned(ts)
-            except Exception:
-                _gone = False
-            if _gone:
-                raise AbandonedError(
-                    f"row gone for {_mkey[:10]}; not moving")
-            try:
                 _forced = self._is_forced(_mkey) if _mkey else False
             except Exception:
                 _forced = False
