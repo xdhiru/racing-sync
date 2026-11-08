@@ -361,6 +361,49 @@ class ActionsMixin:
         if kind == "files":
             await self._files_for_row(row, message)
             return
+        if kind == "forcestart":
+            # Full-hash fast path (group numbers go through
+            # _start_group_command): same arming, one row.
+            _hh = (full_hash or "").strip().lower()
+            try:
+                _coord = getattr(self, "_coord", None)
+                if _coord is None:
+                    raise LookupError("bot not attached")
+                _forced = getattr(_coord, "_forced", None)
+                if not isinstance(_forced, set):
+                    _forced = set()
+                    try:
+                        _coord._forced = _forced
+                    except Exception:
+                        pass
+                _forced.add(_hh)
+                from .task import handles_for
+                _woke = 0
+                for _hd in handles_for(self, _hh):
+                    try:
+                        _hd.force = True
+                        _hd.queued = False
+                        _hd.event.set()
+                        _woke += 1
+                    except Exception:
+                        continue
+                result = (f"Force-start armed for {title}"
+                          f"{f' ({_woke} waiter(s) woken)' if _woke else ''} "
+                          f"— bypasses slot caps until it leaves the lane.")
+            except (LookupError, ValueError) as e:
+                result = _scrubbed(e)[:300]
+            except Exception as e:  # noqa: BLE001
+                result = _action_error_text(e)
+            try:
+                await self._reply(result[:300], reply_to=message)
+            except Exception:
+                pass
+            try:
+                self._last_active_cache = None
+                await self._refresh_active_message()
+            except Exception:
+                pass
+            return
         if kind in ("skip", "unskip"):
             # Group-scoped even from one hash: expand to the live group
             # first (single hash as the fallback when it is not grouped
@@ -1171,6 +1214,85 @@ class ActionsMixin:
             except Exception:
                 pass
             try:
+                await self._refresh_active_message()
+            except Exception:
+                pass
+            return
+        # forcestart: operator override — arm the lane-cap bypass for the
+        # whole group (in-memory force + wake parked waiters). Queued and
+        # moving rows start past full lanes; force disarms on leaving the
+        # lane and clears on restart (never wedged). No state change here:
+        # the woken/spawned worker still honors every other gate.
+        if kind == "forcestart":
+            _hashes = []
+            for _m in members or []:
+                try:
+                    _mh = _member_hash(_m)
+                except Exception:
+                    _mh = ""
+                if _mh:
+                    _hashes.append(_mh)
+            if not _hashes:
+                try:
+                    await self._reply("Already gone from tracking",
+                                      reply_to=message)
+                except Exception:
+                    pass
+                return
+            _armed = 0
+            try:
+                _coord = getattr(self, "_coord", None)
+                if _coord is None:
+                    raise LookupError("bot not attached")
+                _forced = getattr(_coord, "_forced", None)
+                if not isinstance(_forced, set):
+                    _forced = set()
+                    try:
+                        _coord._forced = _forced
+                    except Exception:
+                        pass
+                from .task import handles_for
+                for _hh in _hashes:
+                    try:
+                        _forced.add(_hh)
+                        if len(_forced) > 5000:
+                            break
+                    except Exception:
+                        pass
+                    try:
+                        for _hd in handles_for(self, _hh):
+                            try:
+                                _hd.force = True
+                                _hd.queued = False
+                                _hd.event.set()
+                                _armed += 1
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+            except (LookupError, ValueError) as e:
+                try:
+                    await self._reply(_scrubbed(e)[:300], reply_to=message)
+                except Exception:
+                    pass
+                return
+            except Exception as e:  # noqa: BLE001
+                try:
+                    await self._reply(_action_error_text(e), reply_to=message)
+                except Exception:
+                    pass
+                return
+            try:
+                await self._reply(
+                    f"Force-start armed for {title} ({len(_hashes)} "
+                    f"cop{'y' if len(_hashes) == 1 else 'ies'}"
+                    f"{f', {_armed} waiter(s) woken' if _armed else ''}) — "
+                    f"bypasses slot caps until it leaves the lane.",
+                    reply_to=message)
+            except Exception:
+                pass
+            try:
+                self._last_active_cache = None
                 await self._refresh_active_message()
             except Exception:
                 pass

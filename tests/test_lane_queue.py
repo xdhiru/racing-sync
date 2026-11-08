@@ -124,3 +124,64 @@ async def test_try_admit_honors_force():
     coord._forced = {"b" * 40}
     assert await coord._try_admit_download(
         _row("b" * 40, State.QUEUED)) is True
+
+
+@pytest.mark.anyio
+async def test_forcestart_single_arms_and_wakes():
+    """Full-hash /forcestart sets in-memory force + wakes the waiter."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.config import TelegramConfig
+    from racing_sync.state import State
+    from racing_sync.task import TaskHandle, register_handle
+    from racing_sync.telegram_bot import TelegramBot
+
+    bot = object.__new__(TelegramBot)
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
+    bot._store = MagicMock()
+    bot._store.get.return_value = _row("b" * 40, State.QUEUED)
+    bot._coord = SimpleNamespace()
+    bot._reply = AsyncMock()
+    bot._refresh_active_message = AsyncMock()
+    bot._last_active_cache = None
+    hd = TaskHandle(infohash="b" * 40, gid="b" * 12, kind="queued")
+    register_handle(bot, hd)
+    await bot._start_single_command("forcestart", "b" * 40, MagicMock())
+    assert bot._coord._forced == {"b" * 40}
+    assert hd.force is True and hd.event.is_set()
+    assert "Force-start armed" in bot._reply.call_args[0][0]
+
+
+@pytest.mark.anyio
+async def test_forcestart_group_number_arms_group():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+    from racing_sync.config import TelegramConfig
+    from racing_sync.state import State
+    from racing_sync.telegram_bot import TelegramBot
+
+    bot = object.__new__(TelegramBot)
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
+    bot._store = MagicMock()
+    bot._store.list_active_inflight.return_value = [
+        _row("a" * 40, State.QUEUED, total_bytes=1000),
+        _row("b" * 40, State.QUEUED, total_bytes=2000),
+    ]
+    bot._coord = SimpleNamespace()
+    bot._reply = AsyncMock()
+    bot._refresh_active_message = AsyncMock()
+    bot._last_active_cache = None
+    await bot._start_group_command("forcestart", "2", MagicMock())
+    assert bot._coord._forced == {"b" * 40}
+    assert "Force-start armed" in bot._reply.call_args[0][0]
+
+
+def test_forcestart_command_registered():
+    import re
+    from racing_sync.telegram_protocol import _CHAT_COMMANDS
+
+    names = [c.name for c in _CHAT_COMMANDS]
+    assert "forcestart" in names
+    row = next(c for c in _CHAT_COMMANDS if c.name == "forcestart")
+    assert row.pattern.match("/forcestart_" + "a" * 40)
+    assert not row.pattern.match("/now_" + "a" * 40)
