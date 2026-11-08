@@ -107,6 +107,11 @@ CANCEL_MATCH_RE = re.compile(r"^/cancel_match(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
 #: dest client at tap time). Optional `@bot` suffix; no argument.
 CANCEL_STALLED_RE = re.compile(r"^/cancel_stalled(?:@[\w_]+)?\s*$")
 
+#: `/cancel_status` — lane menu (DL/MV/RD/QD + live counts), then the
+#: usual remember + keep/delete sheets over the picked lane.
+#: Optional `@bot` suffix; no argument.
+CANCEL_STATUS_RE = re.compile(r"^/cancel_status(?:@[\w_]+)?\s*$")
+
 #: Operator pause/resume for intake of NEW work (in-flight rows drain
 #: normally; the flag resets on restart). Optional `@bot` suffix.
 PAUSE_INTAKE_RE = re.compile(r"^/pause_intake(?:@[\w_]+)?\s*$")
@@ -200,6 +205,11 @@ async def _cmd_cancel_match(bot, match, message):
 async def _cmd_cancel_stalled(bot, match, message):
     """`/cancel_stalled` bulk cancel of seederless downloads."""
     await bot._cancel_stalled_command_entry(message)
+
+
+async def _cmd_cancel_status(bot, match, message):
+    """`/cancel_status` lane menu."""
+    await bot._cancel_status_command_entry(message)
 
 
 async def _cmd_pause_intake(bot, match, message):
@@ -473,6 +483,7 @@ _CHAT_COMMANDS: tuple = (
     _ChatCommand("act", ACT_CMD_RE, _cmd_act),
     _ChatCommand("cancel_match", CANCEL_MATCH_RE, _cmd_cancel_match),
     _ChatCommand("cancel_stalled", CANCEL_STALLED_RE, _cmd_cancel_stalled),
+    _ChatCommand("cancel_status", CANCEL_STATUS_RE, _cmd_cancel_status),
     _ChatCommand("pause_intake", PAUSE_INTAKE_RE, _cmd_pause_intake),
     _ChatCommand("resume_intake", RESUME_INTAKE_RE, _cmd_resume_intake),
     _ChatCommand("tick", TICK_RE, _cmd_tick),
@@ -523,13 +534,15 @@ def match_status_filter(state_value: object, key: str) -> bool:
 
 
 def _is_bulk_scope(h: str) -> bool:
-    """True for re-resolved bulk scopes (`match:<tok>`, `stalled`).
+    """True for re-resolved bulk scopes (`match:<tok>`, `stalled`,
+    `status:<filter>`).
 
     Bulk scopes carry no frozen hash list: every tap re-resolves the
     live set, so no stored pending state exists to expire.
     """
     try:
-        return h == "stalled" or h.startswith("match:")
+        return (h == "stalled" or h.startswith("match:")
+                or h.startswith("status:"))
     except Exception:
         return False
 
@@ -556,7 +569,8 @@ class CancelScope(NamedTuple):
     """Declarative cancel scope: one model for all four Q1/Q2/execute paths.
 
     Kinds: `single` (one hash), `group` (leader hash, all live copies),
-    `match` (base64url title substring), `stalled` (0-seeder predicate).
+    `match` (base64url title substring), `stalled` (0-seeder predicate),
+    `status` (active-list filter key: `dl`/`mv`/`rd`/`qd`).
     `resolve` re-derives the live set on every call (raising
     :class:`ScopeGone` with the kind's reply when empty, ``RuntimeError``
     on infrastructure failure); `remember_sheet` builds the identical
@@ -573,6 +587,8 @@ class CancelScope(NamedTuple):
         if _is_bulk_scope(h):
             if h == "stalled":
                 return cls("stalled", "")
+            if h.startswith("status:"):
+                return cls("status", h[len("status:"):])
             return cls("match", h[len("match:"):])
         if all:
             return cls("group", h)
@@ -586,6 +602,8 @@ class CancelScope(NamedTuple):
             return f"match:{self.key}"
         if self.kind == "stalled":
             return "stalled"
+        if self.kind == "status":
+            return f"status:{self.key}"
         return self.key
 
     async def resolve(self, bot: Any) -> ResolvedScope:
@@ -639,6 +657,38 @@ class CancelScope(NamedTuple):
                 f" · {total} copies", "stalled",
                 f"{len(groups)} stalled groups",
                 [h for (_, hs) in groups for h in hs or []])
+        if self.kind == "status":
+            # Fail closed: only the lane keys cancel. An unknown key
+            # (all/ov/garbage) must never resolve to the whole list —
+            # match_status_filter fail-opens to True for display.
+            if self.key not in ("dl", "mv", "rd", "qd"):
+                raise ScopeGone()
+            _label = dict(_STATUS_FILTER_BUTTONS).get(self.key, self.key)
+            _get_all = getattr(store, "list_active_inflight", None) \
+                if store else None
+            try:
+                rows = await asyncio.to_thread(_get_all) \
+                    if callable(_get_all) else []
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"resolve failed: {e}") from e
+            hashes = []
+            for _r in rows or []:
+                try:
+                    _sv = getattr(getattr(_r, "state", None), "value", "")
+                    if not match_status_filter(_sv, self.key):
+                        continue
+                    _rh = (getattr(_r, "source_infohash", "") or "").lower()
+                    if _rh:
+                        hashes.append(_rh)
+                except Exception:
+                    continue
+            if not hashes:
+                raise ScopeGone()
+            _n = len(hashes)
+            _title = (f"{_n} {_label} "
+                      f"{'copy' if _n == 1 else 'copies'}")
+            return ResolvedScope(
+                _title, "", f"status:{self.key}", _title, hashes)
         raise ScopeGone()
 
     async def _resolve_match(self, bot: Any) -> ResolvedScope:
@@ -926,6 +976,24 @@ def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
                     and parts[3] in ("yes", "no"):
                 return (parts[0], False, "stalled", parts[3],
                         parts[2] == "1")
+        # Status scope: lane filter key, re-resolved live like stalled.
+        # Only the cancellable lane keys (never all/ov/unknown — those
+        # must not resolve to the whole list).
+        if len(parts) == 3 and parts[0] == "cancel":
+            if parts[1] == "status" and parts[2] in (
+                    "dl", "mv", "rd", "qd"):
+                return (parts[0], False, f"status:{parts[2]}", "", None)
+        if len(parts) == 4 and parts[0] == "forget":
+            if parts[1] == "status" and parts[3] in ("0", "1") \
+                    and parts[2] in ("dl", "mv", "rd", "qd"):
+                return (parts[0], False, f"status:{parts[2]}", "",
+                        parts[3] == "1")
+        if len(parts) == 5 and parts[0] == "keep":
+            if parts[1] == "status" and parts[3] in ("0", "1") \
+                    and parts[4] in ("yes", "no") \
+                    and parts[2] in ("dl", "mv", "rd", "qd"):
+                return (parts[0], False, f"status:{parts[2]}", parts[4],
+                        parts[3] == "1")
     except Exception:
         pass
     return ("", False, "", "", None)
@@ -952,6 +1020,9 @@ def _bot_command_menu() -> list:
             "cancel_stalled",
             "Cancel every downloading group with no seeders — "
             "/cancel_stalled",
+        ), BotCommand(
+            "cancel_status",
+            "Cancel a whole lane (DL/MV/RD/QD) — /cancel_status",
         ), BotCommand(
             "pause_intake",
             "Pause intake — no new downloads start until /resume_intake",

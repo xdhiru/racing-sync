@@ -1014,7 +1014,7 @@ def test_chat_command_registry_covers_all_verbs():
     from racing_sync.telegram_bot import _CHAT_COMMANDS
 
     names = [c.name for c in _CHAT_COMMANDS]
-    assert len(names) == len(set(names)) == 22
+    assert len(names) == len(set(names)) == 23
     for c in _CHAT_COMMANDS:
         assert callable(c.pattern.match)
         assert callable(c.handle)
@@ -1034,6 +1034,7 @@ def test_chat_command_registry_covers_all_verbs():
         "/cancel_match evil show": ["cancel_match"],
         "/cancel_match": ["cancel_match"],
         "/cancel_stalled": ["cancel_stalled"],
+        "/cancel_status": ["cancel_status"],
         "/injectfuse_2": ["injectfuse"],
         "/injectfuse abc123": ["injectfuse_hash"],
         "/act_1": ["act"],
@@ -1050,11 +1051,124 @@ def test_chat_command_registry_covers_all_verbs():
         hits = [c.name for c in _CHAT_COMMANDS if c.pattern.match(text)]
         assert hits == want, (text, hits)
     for text in ("/hello", "/cancel_xyz", "/cancel_", "/act_", "/now_",
-                 "/forcestart_", "/forcestartx",
+                 "/forcestart_", "/forcestartx", "/cancel_statusx",
                  "/cancel_match_foo", "/cancel_stalledx", "/pause_intakex",
                  "/statsx", "/findx", "/files_", ""):
         assert [c.name for c in _CHAT_COMMANDS
                 if c.pattern.match(text)] == [], text
+
+
+def test_status_scope_parses_and_resolves():
+    """cancel/forget/keep status shapes round-trip; unknown keys are stale."""
+    from racing_sync.telegram_protocol import (
+        CancelScope, ScopeGone, _parse_action_data,
+    )
+
+    assert _parse_action_data("cancel:status:dl") == (
+        "cancel", False, "status:dl", "", None)
+    assert _parse_action_data("forget:status:mv:1") == (
+        "forget", False, "status:mv", "", True)
+    assert _parse_action_data("keep:status:qd:0:yes") == (
+        "keep", False, "status:qd", "yes", False)
+    for bad in ("cancel:status:all", "cancel:status:ov",
+                "cancel:status:bogus", "forget:status:dl:2",
+                "keep:status:dl:1:maybe"):
+        assert _parse_action_data(bad) == ("", False, "", "", None), bad
+    assert CancelScope.from_parsed(False, "status:dl") == ("status", "dl")
+    assert CancelScope("status", "dl").to_data() == "status:dl"
+
+
+@pytest.mark.anyio
+async def test_status_scope_resolve_filters_lane():
+    from unittest.mock import MagicMock
+    from racing_sync.state import State, TorrentState
+    from racing_sync.telegram_protocol import CancelScope, ScopeGone
+
+    bot = MagicMock()
+    bot._store = MagicMock()
+    bot._store.list_active_inflight.return_value = [
+        TorrentState(source_infohash="a" * 40, source_name="Dl",
+                     state=State.DOWNLOADING),
+        TorrentState(source_infohash="b" * 40, source_name="Mv",
+                     state=State.MOVING),
+    ]
+    r = await CancelScope("status", "dl").resolve(bot)
+    assert r.hashes == ["a" * 40]
+    with pytest.raises(ScopeGone):
+        await CancelScope("status", "rd").resolve(bot)
+    with pytest.raises(ScopeGone):
+        await CancelScope("status", "all").resolve(bot)
+
+
+@pytest.mark.anyio
+async def test_cancel_status_menu_lists_lanes():
+    bot = _bot()
+    bot._store.list_active_inflight.return_value = [
+        TorrentState(source_infohash="a" * 40, source_name="Dl",
+                     state=State.DOWNLOADING),
+        TorrentState(source_infohash="b" * 40, source_name="Dl2",
+                     state=State.DOWNLOADING),
+        TorrentState(source_infohash="c" * 40, source_name="Mv",
+                     state=State.MOVING),
+    ]
+    bot._reply = AsyncMock()
+    await bot._handle_chat_message(_message(text="/cancel_status"))
+    assert bot._bot.send_message.await_count == 1
+    _kwargs = bot._bot.send_message.call_args[1]
+    _data = [b.callback_data for r in
+             _kwargs["reply_markup"].inline_keyboard for b in r]
+    assert "cancel:status:dl" in _data
+    assert "cancel:status:mv" in _data
+    assert "cancel:status:rd" not in _data
+
+
+@pytest.mark.anyio
+async def test_cancel_status_menu_empty_replies():
+    bot = _bot()
+    bot._store.list_active_inflight.return_value = []
+    bot._reply = AsyncMock()
+    await bot._cancel_status_command_entry(_message(text="/cancel_status"))
+    bot._reply.assert_awaited_once()
+    assert "Nothing live" in bot._reply.call_args[0][0]
+
+
+@pytest.mark.anyio
+async def test_status_keep_flow_executes_with_stagger():
+    """keep:status:dl:1:yes forgets the lane with 2s between rows."""
+    import asyncio
+    from unittest.mock import patch
+
+    bot = _bot()
+    bot._store.get.side_effect = lambda h, **k: {
+        "a" * 40: TorrentState(
+            source_infohash="a" * 40, source_name="Dl",
+            state=State.DOWNLOADING),
+        "b" * 40: TorrentState(
+            source_infohash="b" * 40, source_name="Dl2",
+            state=State.DOWNLOADING),
+    }.get(h)
+    bot._store.list_active_inflight.return_value = [
+        TorrentState(source_infohash="a" * 40, source_name="Dl",
+                     state=State.DOWNLOADING),
+        TorrentState(source_infohash="b" * 40, source_name="Dl2",
+                     state=State.DOWNLOADING),
+    ]
+    executed = []
+    bot._bot.delete_message = AsyncMock()
+
+    async def _fake_one(h, **kw):
+        executed.append(h)
+        return f"Cancelled {h[:6]}"
+
+    bot._execute_cancel_one = _fake_one
+    bot._reply = AsyncMock()
+    q = _query("keep:status:dl:1:yes")
+    with patch("asyncio.sleep", new_callable=AsyncMock) as _sleep:
+        await bot._handle_callback(q)
+    assert sorted(executed) == ["a" * 40, "b" * 40]
+    _sleep.assert_awaited_once_with(2.0)
+    assert "Kept files for" in bot._reply.call_args[0][0]
+    assert "(2/2 copies)" in bot._reply.call_args[0][0]
 
 
 @pytest.mark.anyio
