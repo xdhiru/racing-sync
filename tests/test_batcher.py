@@ -457,6 +457,98 @@ async def test_wait_for_completion_waits_when_bytes_missing_on_disk(tmp_path):
     assert calls["n"] == 2
 
 
+@pytest.mark.anyio
+async def test_wait_for_completion_waits_for_flush_at_100_downloading(tmp_path):
+    """100% while still downloading is a pending flush, not completion.
+
+    Regression: progress-only logic advanced to MOVING and force-rechecked
+    mid-flush, wedging the global check slot behind every later row
+    ("checking resume data"). The wait must keep polling until the client
+    flips to a seeding state.
+    """
+    from racing_sync.clients.abstract import Torrent
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.cfg = MagicMock()
+    coord.cfg.general.dest_poll_interval = 0.01
+    coord.cfg.general.download_stall_timeout_seconds = 0
+    coord.cfg.dest.save_path = tmp_path
+
+    calls = {"n": 0}
+
+    async def _downloading_at_100(_h):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            coord._stop = True
+        return Torrent(hash="hash1", name="Solo", size_bytes=2000,
+                       progress=1.0, state="downloading", category="racing",
+                       save_path="/tmp")
+
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(side_effect=_downloading_at_100)
+
+    ts = TorrentState(source_infohash="hash1", source_name="Solo",
+                      save_path=str(tmp_path))
+    await coord._wait_for_completion(ts)
+    assert calls["n"] == 2
+
+
+@pytest.mark.anyio
+async def test_wait_for_completion_returns_once_seeding_at_100(tmp_path):
+    """Flush landed (downloading -> seeding): the wait returns."""
+    from racing_sync.clients.abstract import Torrent
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.cfg = MagicMock()
+    coord.cfg.general.dest_poll_interval = 0.01
+    coord.cfg.general.download_stall_timeout_seconds = 0
+    coord.cfg.dest.save_path = tmp_path
+
+    states = ["downloading", "uploading"]
+
+    async def _flip(_h):
+        return Torrent(hash="hash1", name="Solo", size_bytes=2000,
+                       progress=1.0, state=states.pop(0), category="racing",
+                       save_path="/tmp")
+
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(side_effect=_flip)
+
+    ts = TorrentState(source_infohash="hash1", source_name="Solo",
+                      save_path=str(tmp_path))
+    await coord._wait_for_completion(ts)
+    assert states == []
+
+
+@pytest.mark.anyio
+async def test_wait_for_completion_returns_when_paused_at_100(tmp_path):
+    """Paused-at-100% keeps the historic behavior (settle path decides).
+
+    Only actively-downloading states wait; paused/checking/unknown fail
+    open toward MOVING where the existing guards handle them.
+    """
+    from racing_sync.clients.abstract import Torrent
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.cfg = MagicMock()
+    coord.cfg.general.dest_poll_interval = 0.01
+    coord.cfg.general.download_stall_timeout_seconds = 0
+    coord.cfg.dest.save_path = tmp_path
+
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
+        hash="hash1", name="Solo", size_bytes=2000, progress=1.0,
+        state="pausedDL", category="racing", save_path="/tmp"))
+
+    ts = TorrentState(source_infohash="hash1", source_name="Solo",
+                      save_path=str(tmp_path))
+    await coord._wait_for_completion(ts)
+    assert coord.dest_client.get_torrent.await_count == 1
+
+
 def test_classify_tracker_message():
     """Tracker verdicts: deleted vs auth vs healthy."""
     from racing_sync.coordinator_errors import classify_tracker_message
