@@ -498,6 +498,9 @@ async def test_bot_command_menu_lists_add(tmp_path):
         "Cancel every downloading group with no seeders — "
         "/cancel_stalled",
     ), (
+        "cancel_status",
+        "Cancel a whole lane (DL/MV/RD/QD) — /cancel_status",
+    ), (
         "pause_intake",
         "Pause intake — no new downloads start until /resume_intake",
     ), (
@@ -554,7 +557,8 @@ async def test_start_publishes_command_menu(tmp_path):
         try:
             cmds = fake.set_my_commands.await_args.args[0]
             assert [c.command for c in cmds] == [
-                "add", "cancel_match", "cancel_stalled", "pause_intake",
+                "add", "cancel_match", "cancel_stalled", "cancel_status",
+                "pause_intake",
                 "resume_intake", "tick", "stats", "find", "files"]
         finally:
             try:
