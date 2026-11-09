@@ -666,3 +666,44 @@ async def test_progress_run_pumps_stats_and_evicts(monkeypatch, tmp_path):
     # Entry evicted on completion (no stale percentages linger).
     assert _tree_key(tree) not in rclone_ops._RCLONE_PROGRESS
     assert rclone_counters()["moves"] == before
+
+
+@pytest.mark.anyio
+async def test_single_file_source_counts_as_having_files(tmp_path: Path):
+    """A single-file move source is never 'empty' (regression: scandir
+    on a file raised NotADirectoryError, misdiagnosing present files
+    as empty and failing healthy single-file moves as silent no-ops)."""
+    from racing_sync.rclone_ops import _move_source_has_files
+
+    single = tmp_path / "Show.S01E01.mkv"
+    single.write_bytes(b"x" * 16)
+    assert await _move_source_has_files(single, None) is True
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    assert await _move_source_has_files(empty_dir, None) is False
+    full_dir = tmp_path / "full"
+    full_dir.mkdir()
+    (full_dir / "a.mkv").write_bytes(b"x")
+    assert await _move_source_has_files(full_dir, None) is True
+    assert await _move_source_has_files(tmp_path / "missing", None) is False
+
+
+@pytest.mark.anyio
+async def test_single_file_move_reaches_spawn(tmp_path: Path):
+    """End to end: an existing single file proceeds to the move call."""
+    from unittest.mock import AsyncMock, patch
+    from racing_sync import rclone_ops
+    from racing_sync.rclone_ops import RcloneResult, move_local_to_remote
+
+    single = tmp_path / "Show.S01E01.mkv"
+    single.write_bytes(b"x" * 16)
+
+    async def _fake_run(cfg_, cmd, **kwargs):
+        return RcloneResult(returncode=0, stdout="", stderr="", duration=0.1)
+
+    with patch.object(rclone_ops, "run_rclone",
+                      AsyncMock(side_effect=_fake_run)) as _m:
+        res = await move_local_to_remote(_rclone_cfg(), single,
+                                         "remote:dest")
+    assert res.ok
+    assert _m.await_count == 1  # the move spawned; no refusal, no lsf
