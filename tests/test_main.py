@@ -504,6 +504,35 @@ def test_run_async_falls_back_without_uvloop():
         assert _run_async(_value()) == 42
 
 
+def test_run_async_pre_312_installs_policy_without_loop_factory(monkeypatch):
+    """Python <3.12 asyncio.run() has no loop_factory knob (3.12+): passing
+    it dies as 'unexpected keyword argument'. There _run_async installs
+    the uvloop policy in-process instead (same loop, no new dependency)."""
+    import asyncio
+    import sys
+
+    from racing_sync.__main__ import _run_async
+
+    async def _value():
+        await asyncio.sleep(0)
+        return 42
+
+    fake = MagicMock()
+    monkeypatch.setitem(sys.modules, "uvloop", fake)
+    monkeypatch.setattr(sys, "version_info", (3, 11, 9, "final", 0))
+    calls = {}
+    real_run = asyncio.run
+
+    def _spy(coro, **kwargs):
+        calls.update(kwargs)
+        return real_run(coro)
+
+    monkeypatch.setattr(asyncio, "run", _spy)
+    assert _run_async(_value()) == 42
+    assert "loop_factory" not in calls
+    fake.install.assert_called_once_with()
+
+
 def test_run_async_does_not_mask_app_errors():
     """An app exception must propagate as-is, never as 'cannot reuse
     already awaited coroutine' from running the same coroutine twice."""
