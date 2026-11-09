@@ -33,7 +33,14 @@ def _run_async(coro):
         import uvloop
     except ImportError:
         return asyncio.run(coro)
-    return asyncio.run(coro, loop_factory=uvloop.new_event_loop)
+    if sys.version_info >= (3, 12):
+        return asyncio.run(coro, loop_factory=uvloop.new_event_loop)
+    # 3.11 and older: asyncio.run() has no loop_factory knob (added in
+    # 3.12), so passing it dies as "unexpected keyword argument". Install
+    # the policy in-process instead — this helper owns the process loop
+    # policy at every call site, same resulting loop, no new dependency.
+    uvloop.install()
+    return asyncio.run(coro)
 
 
 async def _runner(coord: Coordinator) -> int:
