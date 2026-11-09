@@ -1096,6 +1096,35 @@ class MoveMixin:
                             quiet=True,
                         )
                         return
+                    # Completion-flush guard (single-file settle only): full
+                    # bytes on disk while the client still reports an
+                    # actively-downloading state is libtorrent's 100% flush
+                    # pending, stretched to minutes on starved disks — not
+                    # per-file reporting lag. Forcing a recheck here aborts
+                    # the flush and wedges the single global hash-check
+                    # slot, queueing every later row as "checking resume
+                    # data". Park quietly (no recheck, no resume) and let
+                    # the flush land; the next tick verifies normally. Only
+                    # full-byte rows take this lane — short files still
+                    # fall through to the resume path below. Unknowable
+                    # states fail open toward the historic recheck.
+                    if _full_on_disk:
+                        try:
+                            _flush_state = str(
+                                _check_state_now or "").lower().replace(
+                                    " ", "").replace("_", "")
+                        except Exception:
+                            _flush_state = ""
+                        if _flush_state in ("downloading", "stalleddl",
+                                            "forceddl"):
+                            self._park_moving(
+                                ts,
+                                f"client still finalizing download "
+                                f"({_check_state_now}); waiting for the "
+                                f"completion flush before verifying",
+                                quiet=True,
+                            )
+                            return
                     try:
                         _rh = (ts.source_infohash or "").lower()
                     except Exception:

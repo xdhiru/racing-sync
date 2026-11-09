@@ -45,6 +45,31 @@ _TESTING = False
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
 
+# Client states with an actively-downloading libtorrent (flush still in
+# flight): progress can already read 100% while the last pieces are not
+# yet flushed/verified, so the entry has not flipped to seeding. Returning
+# on progress alone then pauses + force-rechecks a torrent mid-flush,
+# which aborts the flush and wedges the single global hash-check slot
+# (every later row queues as "checking resume data"). Single-flow
+# completion therefore waits these states out; anything else (seeding
+# family, paused, checking, unknown/exotic) keeps the old behavior.
+_DOWNLOADING_ACTIVE_STATES = frozenset(
+    {"downloading", "stalleddl", "forceddl"})
+
+
+def _is_actively_downloading(state: object) -> bool:
+    """True iff the client state is still downloading (flush may pend).
+
+    Never raises; unknowable states answer False (fail open toward the
+    historic progress-only behavior, never strand a row on an exotic
+    client spelling).
+    """
+    try:
+        s = str(state or "").lower().replace(" ", "").replace("_", "")
+    except Exception:
+        return False
+    return s in _DOWNLOADING_ACTIVE_STATES
+
 
 @dataclass
 class LiveItem:
@@ -689,6 +714,27 @@ class DownloadMixin:
                     last_stall_warn = now
 
             if all_done:
+                # Single-flow only (expected_files is None reaches this
+                # branch with torrent-level progress): 100% while still
+                # downloading is libtorrent's completion flush pending,
+                # stretched to minutes on starved disks — not a done
+                # download. Returning now would pause + recheck mid-flush
+                # (see _do_moving's settle guard). Keep polling; the
+                # >=0.999 progress skips the stall trip above, so this
+                # wait is bounded only by the flush landing.
+                if expected_files is None:
+                    try:
+                        _done_state = str(getattr(t, "state", "") or "")
+                    except Exception:
+                        _done_state = ""
+                    if _is_actively_downloading(_done_state):
+                        log.info(
+                            "download %s at 100%% but client still %s; "
+                            "waiting for the completion flush before moving",
+                            ts.source_name, _done_state or "downloading",
+                        )
+                        await self._wait_worker_pause(ts, poll_interval)
+                        continue
                 return
             await self._wait_worker_pause(ts, poll_interval)
 

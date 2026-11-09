@@ -68,6 +68,33 @@ async def test_settle_recheck_fires_once_then_hands_to_downloading(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_settle_recheck_skipped_while_flush_pending(tmp_path):
+    """Full bytes + 100% + still downloading: flush pending, not lag.
+
+    Regression: force-rechecking here aborts libtorrent's completion
+    flush and wedges the single global check slot, queueing every later
+    row as "checking resume data". Must park quietly (no recheck, no
+    resume) and let the flush land.
+    """
+    from types import SimpleNamespace
+
+    coord, store = _moving_single(tmp_path, progress=0.0)
+    row = store.get("s" * 40)
+    coord.dest_client.list_torrents = AsyncMock(return_value=[
+        SimpleNamespace(state="downloading", progress=1.0)])
+    with patch("racing_sync.coordinator.wipe_local_tree",
+               new_callable=AsyncMock) as mock_wipe:
+        await coord._do_moving(row)
+        assert store.get("s" * 40).state == State.MOVING
+        coord.dest_client.recheck.assert_not_called()
+        coord.dest_client.resume.assert_not_called()
+        coord._rclone_move.assert_not_called()
+        mock_wipe.assert_not_awaited()
+        assert (tmp_path / "ssd" / "Solo.mkv").exists()
+    store.close()
+
+
+@pytest.mark.anyio
 async def test_no_recheck_when_file_short(tmp_path):
     """Genuinely short file: pre-existing missing-file path, no recheck.
 
