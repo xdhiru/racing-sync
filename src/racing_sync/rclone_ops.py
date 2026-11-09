@@ -922,6 +922,13 @@ async def _move_source_has_files(local: Path, files_from: list[str] | None) -> b
                         continue
                 return False
             try:
+                # Single-file move: the file itself is the payload
+                # (scandir below only works on directories).
+                if Path(local).is_file():
+                    return True
+            except OSError:
+                pass
+            try:
                 with os.scandir(local) as it:
                     for entry in it:
                         try:
