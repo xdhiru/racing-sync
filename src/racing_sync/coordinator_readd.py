@@ -37,6 +37,7 @@ from .coordinator_paths import (
     left_on_disk_many,
 )
 from .io_bounds import rpc
+from .recovery import _save_path_on_ssd, _ssd_roots_known
 from .state import _MAX_READD_CYCLES, State, TorrentState
 
 # Keep the historic logger name so log output is unchanged by the split.
@@ -343,6 +344,27 @@ class ReaddMixin:
                 entry = cur[0] if cur else None
             except Exception:
                 return False
+            if entry is not None:
+                # Placement gate: never resume a helper entry whose bytes
+                # are not under an SSD/dest root (foreign/stale mount, or a
+                # fuse path). Unknown roots (test doubles) stay fail-open.
+                try:
+                    _entry_sp = str(getattr(entry, "save_path", "") or "")
+                    _entry_foreign = bool(
+                        _entry_sp
+                        and _ssd_roots_known(self.cfg)
+                        and not _save_path_on_ssd(self.cfg, _entry_sp)
+                    )
+                except Exception:
+                    _entry_foreign = False
+                if _entry_foreign:
+                    log.warning(
+                        "re-add heal: existing entry %s for %s sits at "
+                        "foreign path %s (not under an SSD/dest root); "
+                        "not resuming it as the heal helper",
+                        helper_h[:10], ts.source_name[:50], _entry_sp,
+                    )
+                    return False
             if entry is None:
                 try:
                     res = await rpc(

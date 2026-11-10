@@ -156,6 +156,23 @@ async def _fill_entries_by_hash(
                 actual_by_hash[h] = t
 
 
+def _ssd_roots_known(cfg: AppConfig) -> bool:
+    """True iff at least one configured SSD/dest root is a real path.
+
+    Test doubles (MagicMock cfg) expose attribute values that are not
+    str/Path: placement membership is then unknowable, so callers must
+    preserve their legacy fail-open behavior.
+    """
+    try:
+        return any(
+            isinstance(raw, (str, Path)) and str(raw).strip()
+            for raw in (getattr(cfg.dest, "save_path", None),
+                        getattr(cfg.ssd, "path", None))
+        )
+    except Exception:
+        return False
+
+
 def _save_path_on_ssd(cfg: AppConfig, save_path: str) -> bool:
     """True iff a client entry's save_path lives under a configured SSD root.
 
@@ -790,11 +807,7 @@ async def _reconcile_snapshot(
             # Placement gate: only adopt entries under known SSD/fuse roots.
             # With unresolvable roots (e.g. MagicMock cfg in unit tests)
             # membership is unknowable — preserve legacy adopt behavior.
-            _roots_known = any(
-                isinstance(raw, (str, Path)) and str(raw).strip()
-                for raw in (getattr(cfg.dest, "save_path", None),
-                            getattr(cfg.ssd, "path", None))
-            )
+            _roots_known = _ssd_roots_known(cfg)
             on_ssd = _save_path_on_ssd(cfg, save_path)
             if save_path and not on_fuse and not on_ssd and _roots_known:
                 # Foreign placement (stale path, other mount): adopting it

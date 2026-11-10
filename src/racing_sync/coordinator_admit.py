@@ -39,7 +39,7 @@ from .coordinator_paths import _left_on_disk, _safe_ssd_join, _watch_cross_seed_
 from .coordinator_paths import _watch_cross_seed_dir
 from .io_bounds import chunked, offload, rpc
 from .prowlarr import TorrentHit
-from .recovery import find_content_on_ssd
+from .recovery import _save_path_on_ssd, _ssd_roots_known, find_content_on_ssd
 from .state import State, TorrentState
 
 # Keep the historic logger name so log output is unchanged by the split.
@@ -2095,7 +2095,28 @@ class AdmitMixin:
                     getattr(ext, "save_path", "")))
             except Exception:
                 on_fuse = False
-            if on_fuse and ext.is_complete():
+            try:
+                complete = bool(ext.is_complete())
+            except Exception:
+                complete = False
+            if on_fuse and not complete:
+                # An incomplete entry on the fuse mount must never be
+                # adopted as a local SSD download: resuming it would write
+                # bytes through the fuse mount, and the later move stage
+                # would treat that path as its SSD source. Route the row to
+                # the normal fuse-gated re-add flow instead and leave
+                # ts.save_path untouched (it must stay an SSD path).
+                _ext_hash = getattr(ext, "hash", "")
+                if isinstance(_ext_hash, str) and _ext_hash.strip():
+                    ts.dest_infohash = _ext_hash.lower()
+                log.warning(
+                    "torrent %s already exists incomplete on fuse at %s; "
+                    "not adopting as an SSD download — routing to RE_ADDING",
+                    (ts.source_infohash or "")[:10], save_path,
+                )
+                self.transition(ts, State.RE_ADDING)
+                return
+            if on_fuse and complete:
                 # Verify the bytes are really behind the fuse path: a torrent
                 # added with skip_check=True reports complete even when its
                 # files were never moved. Missing bytes must never mark DONE —
@@ -2222,9 +2243,38 @@ class AdmitMixin:
                 self.transition(ts, State.DONE)
                 return
 
+            # Placement gate: only adopt entries under a known SSD/dest
+            # root. A foreign save_path (stale path, other mount) would
+            # later be moved as if it were our SSD source; fail closed
+            # instead of adopting arbitrary directories. Unresolvable roots
+            # (MagicMock cfg in unit tests) keep legacy adopt behavior.
+            _foreign_known = False
+            if save_path:
+                try:
+                    _roots_known = _ssd_roots_known(self.cfg)
+                    _on_ssd = _save_path_on_ssd(self.cfg, save_path)
+                except Exception:
+                    _roots_known = False
+                    _on_ssd = False
+                _foreign_known = bool(_roots_known and not _on_ssd)
+            if _foreign_known:
+                log.error(
+                    "torrent %s already on VPS2 but at foreign path %s "
+                    "(not under an SSD/dest root); refusing to adopt/resume it",
+                    (ts.source_infohash or "")[:10], save_path,
+                )
+                self.transition(
+                    ts, State.FAILED,
+                    error=(
+                        f"existing dest entry at foreign path {save_path!r} "
+                        "(not SSD/dest or fuse); refusing to adopt it as a "
+                        "download source"
+                    ),
+                )
+                return
             log.info(
-                "torrent already on VPS2: %s (complete=%s, on_fuse=False)",
-                ts.source_infohash[:10], ext.is_complete(),
+                "torrent already on VPS2: %s (complete=%s, on_fuse=%s)",
+                ts.source_infohash[:10], complete, on_fuse,
             )
             ts.dest_infohash = ext.hash.lower()
             ts.save_path = ext.save_path

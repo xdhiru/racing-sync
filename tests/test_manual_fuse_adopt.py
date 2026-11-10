@@ -11,6 +11,8 @@ hit that would never come, because:
 
 from __future__ import annotations
 
+import logging
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -509,5 +511,172 @@ async def test_reconcile_keeps_done_seed_under_other_category(tmp_path: Path):
         assert row.state == State.DONE
         assert h not in report.re_added
         assert h in report.kept
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_queued_incomplete_fuse_entry_routes_to_readd(
+        tmp_path: Path, caplog):
+    """An incomplete fuse entry is never adopted as an SSD download."""
+    store = StateStore(tmp_path / "state.db")
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    h = "i" * 40
+    keep_path = str(ssd / "Pack.2026")
+    store.upsert(TorrentState(
+        source_infohash=h, source_name="Pack.2026", state=State.QUEUED,
+        save_path=keep_path, cross_seed_blob=b"blob"))
+
+    coord = make_coordinator()
+    coord.store = store
+    fuse = _fuse_cfg(tmp_path, coord)
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[Torrent(
+        hash=h, name="Pack.2026", category="racing", save_path=str(fuse),
+        size_bytes=100, state="downloading", progress=0.5)])
+    coord._prepare_next_batch = AsyncMock()
+    coord._park_queued_for_download_slot = AsyncMock(return_value=False)
+    try:
+        with caplog.at_level(logging.WARNING,
+                             logger="racing_sync.coordinator"):
+            await coord._do_queued(store.get(h))
+        row = store.get(h)
+        assert row.state == State.RE_ADDING
+        assert row.dest_infohash == h
+        assert row.save_path == keep_path
+        coord.dest_client.resume.assert_not_awaited()
+        coord._prepare_next_batch.assert_not_awaited()
+        coord._park_queued_for_download_slot.assert_not_awaited()
+        assert str(fuse).replace("\\", "/") in caplog.text
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_queued_foreign_existing_entry_fails_closed(tmp_path: Path):
+    """A non-fuse entry outside every known root is not adopted/resumed."""
+    store = StateStore(tmp_path / "state.db")
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    h = "j" * 40
+    foreign = "/etc/foreign"
+    store.upsert(TorrentState(
+        source_infohash=h, source_name="Pack.2026", state=State.QUEUED,
+        cross_seed_blob=b"blob"))
+
+    coord = make_coordinator()
+    coord.store = store
+    _fuse_cfg(tmp_path, coord)
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[Torrent(
+        hash=h, name="Pack.2026", category="racing", save_path=foreign,
+        size_bytes=100, state="downloading", progress=0.5)])
+    coord._prepare_next_batch = AsyncMock()
+    coord._park_queued_for_download_slot = AsyncMock(return_value=False)
+    try:
+        await coord._do_queued(store.get(h))
+        row = store.get(h)
+        assert row.state == State.FAILED
+        assert row.save_path == ""
+        assert foreign in (row.last_error or "")
+        coord.dest_client.resume.assert_not_awaited()
+        coord._prepare_next_batch.assert_not_awaited()
+        coord._park_queued_for_download_slot.assert_not_awaited()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_queued_unknown_roots_keep_legacy_adoption(tmp_path: Path):
+    """MagicMock roots are unknowable: preserve legacy adopt/resume."""
+    store = StateStore(tmp_path / "state.db")
+    h = "l" * 40
+    adopted_path = str(tmp_path / "ssd" / "Pack.2026")
+    store.upsert(TorrentState(
+        source_infohash=h, source_name="Pack.2026", state=State.QUEUED,
+        cross_seed_blob=b"blob"))
+
+    coord = make_coordinator()
+    coord.store = store
+    _fuse_cfg(tmp_path, coord)
+    # cfg.dest / cfg.ssd remain MagicMock: roots unknown -> fail-open.
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[Torrent(
+        hash=h, name="Pack.2026", category="racing", save_path=adopted_path,
+        size_bytes=100, state="downloading", progress=0.5)])
+    coord._prepare_next_batch = AsyncMock()
+    coord._park_queued_for_download_slot = AsyncMock(return_value=False)
+    coord.dest_client.resume = AsyncMock()
+    try:
+        await coord._do_queued(store.get(h))
+        row = store.get(h)
+        assert row.state == State.DOWNLOADING
+        assert row.save_path == adopted_path
+        coord.dest_client.resume.assert_awaited_once_with(h)
+        coord._prepare_next_batch.assert_awaited_once()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_readd_heal_foreign_helper_not_resumed(tmp_path: Path):
+    """The healer never resumes a helper entry outside the SSD roots."""
+    from racing_sync.watchdir import _bencode, _bencoded_info_hash
+
+    top = "Batch"
+    missing = f"{top}/ep04v2.mkv"
+    blob = bytes(_bencode({
+        b"info": {
+            b"name": top.encode(),
+            b"files": [
+                {b"length": 100, b"path": [b"ep01.mkv"]},
+                {b"length": 200, b"path": [b"ep04v2.mkv"]},
+            ],
+        },
+    }))
+    blob_hash, _, _, _ = _bencoded_info_hash(blob)
+
+    ssd = tmp_path / "ssd"
+    fuse = tmp_path / "fuse"
+    ssd.mkdir()
+    (fuse / top).mkdir(parents=True)
+    (fuse / top / "ep01.mkv").write_bytes(b"x" * 100)
+    h = "k" * 40
+
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(
+        source_infohash=h, source_name="Show.Batch",
+        dest_infohash=blob_hash, save_path=str(ssd),
+        cross_seed_blob=blob, state=State.RE_ADDING))
+    coord = make_coordinator()
+    coord.store = store
+    coord._stop = False
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.rclone.fuse.mount = fuse
+    coord.cfg.rclone.fuse.mount_unsorted = fuse
+    coord.cfg.fuse_readd_heal_after_seconds = 7200
+    coord._readd_heal_track = {
+        h: [time.monotonic() - 10800, (missing,), 0],
+    }
+    coord._ssd_try_reserve = AsyncMock(return_value=True)
+    coord._ssd_release = AsyncMock()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[Torrent(
+        hash=blob_hash, name="Show.Batch", category="racing",
+        save_path=str(fuse), size_bytes=300, state="downloading",
+        progress=0.5)])
+    try:
+        healed = await coord._maybe_heal_readd_missing(
+            store.get(h), [missing], fuse, blob)
+        assert healed is False
+        coord.dest_client.set_file_priorities.assert_not_awaited()
+        coord.dest_client.resume.assert_not_awaited()
+        coord._ssd_release.assert_awaited_once()
     finally:
         store.close()
