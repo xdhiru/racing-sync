@@ -367,6 +367,13 @@ _TOMBSTONE_TTL_SECONDS = 24 * 3600
 _DISPLAY_CACHE_S = 10.0
 
 
+class UpsertResult(enum.Enum):
+    """Outcome of StateStore.upsert()."""
+
+    WRITTEN = "written"
+    TOMBSTONED = "tombstoned"
+
+
 class StateStore:
     """SQLite-backed persistent store for TorrentState records.
 
@@ -646,7 +653,13 @@ class StateStore:
             ).fetchone()
         return bool(row and row["deleted_at"])
 
-    def upsert(self, ts: TorrentState) -> None:
+    def upsert(self, ts: TorrentState) -> UpsertResult:
+        """Write the full row, or refuse when the hash is tombstoned.
+
+        Returns WRITTEN after the row is persisted (and the in-memory
+        revision synced), or TOMBSTONED when a forget tombstone suppressed
+        the write. Callers must treat only WRITTEN as proof of ingestion.
+        """
         self._ensure_open()
         norm = (ts.source_infohash or "").strip().lower()
         if norm:
@@ -658,7 +671,7 @@ class StateStore:
                 # Forget tombstone: the operator abandoned this torrent — drop
                 # the write instead of resurrecting it. Applies to creates too
                 # (re-discovery while tombstoned stays away until GC expiry).
-                return
+                return UpsertResult.TOMBSTONED
             ts.updated_at = dt.datetime.now(dt.timezone.utc)
             row = ts.to_row()
             cols = ", ".join(row.keys())
@@ -699,6 +712,7 @@ class StateStore:
                     ts.version = int(_vrow["version"] or 0)
             except Exception:
                 pass
+        return UpsertResult.WRITTEN
 
     def list_by_state(self, *states: State) -> list[TorrentState]:
         self._ensure_open()
@@ -1262,7 +1276,14 @@ class StateStore:
                     ts.batch_index = batch_index
                 if _cur is None:
                     # Brand-new row: nothing to clobber, plain insert path.
-                    self.upsert(ts)
+                    # A tombstone that landed since the pre-check makes
+                    # upsert refuse; never report success without a row.
+                    if self.upsert(ts) is not UpsertResult.WRITTEN:
+                        raise AbandonedError(
+                            f"row insert refused (tombstoned) for "
+                            f"{ts.source_infohash or ''}; "
+                            f"refusing {src.value} -> {dst.value}"
+                        )
                 else:
                     self._transition_write(ts, src, expected_version)
                     ts.version = expected_version + 1

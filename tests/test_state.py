@@ -4,7 +4,13 @@ from pathlib import Path
 import pytest
 from conftest import make_coordinator
 
-from racing_sync.state import State, StateStore, TorrentState, check_transition
+from racing_sync.state import (
+    State,
+    StateStore,
+    TorrentState,
+    UpsertResult,
+    check_transition,
+)
 
 
 def test_done_can_only_transition_to_re_adding():
@@ -525,6 +531,56 @@ def test_tombstone_hides_and_refuses_writes(tmp_path: Path):
             "UPDATE torrent_state SET deleted_at = '2000-01-01T00:00:00+00:00' "
             "WHERE source_infohash = ?", ("t" * 40,))
         assert store.gc_tombstones() == 1
+    finally:
+        store.close()
+
+
+def test_upsert_reports_written_and_tombstoned(tmp_path: Path):
+    """upsert tells callers whether the row actually landed (H2)."""
+    store = StateStore(tmp_path / "s.db")
+    try:
+        ts = TorrentState(source_infohash="r" * 40, source_name="R",
+                          state=State.NEW)
+        assert store.upsert(ts) is UpsertResult.WRITTEN
+        assert store.tombstone("r" * 40) is True
+        before = store._conn.execute(
+            "SELECT updated_at, version FROM torrent_state "
+            "WHERE source_infohash = ?", ("r" * 40,)).fetchone()
+        stamp = ts.updated_at
+        ts.source_name = "R2"
+        assert store.upsert(ts) is UpsertResult.TOMBSTONED
+        after = store._conn.execute(
+            "SELECT updated_at, version FROM torrent_state "
+            "WHERE source_infohash = ?", ("r" * 40,)).fetchone()
+        # A refused write must not touch the row or the in-memory snapshot.
+        assert after["updated_at"] == before["updated_at"]
+        assert after["version"] == before["version"]
+        assert ts.updated_at == stamp
+    finally:
+        store.close()
+
+
+def test_transition_new_row_refused_by_tombstone_raises(tmp_path: Path):
+    """A tombstone landing between the pre-check and the insert is not a
+    successful transition (new-row upsert path)."""
+    from unittest.mock import MagicMock
+
+    from racing_sync.coordinator_errors import AbandonedError
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        ts = TorrentState(source_infohash="z" * 40, source_name="Z",
+                          state=State.NEW)
+        # First probe: transition's pre-check (no tombstone). Second probe:
+        # upsert inside the transaction (tombstone landed concurrently).
+        store._is_tombstoned = MagicMock(side_effect=[False, True])
+        with pytest.raises(AbandonedError, match="tombstoned"):
+            store.transition(ts, State.QUEUED)
+        del store._is_tombstoned  # restore the bound method
+        assert store.all() == []
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM torrent_state").fetchone()[0] == 0
+        assert ts.state == State.NEW
     finally:
         store.close()
 

@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from racing_sync.api import build_app
 from racing_sync.config import APIConfig, AppConfig
 from racing_sync.recovery import RecoveryReport
+from racing_sync.state import UpsertResult
 
 
 def test_api_recover_returns_dictionary():
@@ -166,6 +167,7 @@ async def test_coordinator_scan_watch_ingests_and_returns_items(anyio_backend):
     coord.cfg = MagicMock(spec=AppConfig)
     coord.cfg.watch_dir = MagicMock(delete_after_pickup=True)
     coord.store.get.return_value = None
+    coord.store.upsert.return_value = UpsertResult.WRITTEN
 
     mock_watch = MagicMock()
     item = WatchItem(

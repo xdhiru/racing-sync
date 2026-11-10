@@ -83,7 +83,7 @@ from .rclone_ops import (
     wipe_local_tree,  # noqa: F401  (runtime use via coordinator_move lazy lookup + compat)
 )
 from .sftp_source import SFTPExporter
-from .state import State, StateStore, TorrentState
+from .state import State, StateStore, TorrentState, UpsertResult
 from .watchdir import WatchDirScanner, WatchItem
 
 log = logging.getLogger(__name__)
@@ -1128,16 +1128,26 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     state=State.NEW,
                 )
                 ts._blob = item.torrent_bytes
-                await asyncio.to_thread(self.store.upsert, ts)
-                ingested = True
-                log.info(
-                    "discovered watch-dir release: %s (%s, %d bytes) announce=%s",
-                    item.name,
-                    item.infohash[:10],
-                    item.size_bytes,
-                    # Domain only: announce URLs embed per-user passkeys.
-                    announce_domain(item.announce_url),
-                )
+                _res = await asyncio.to_thread(self.store.upsert, ts)
+                if _res is not UpsertResult.WRITTEN:
+                    # Forget tombstone refused the write: never mark the
+                    # drop consumed or delete it. The file stays for the
+                    # operator to unignore and re-drop.
+                    log.warning(
+                        "watch-dir: release is tombstoned, leaving drop in "
+                        "place: %s (%s); run unignore first",
+                        item.name[:60], item.infohash,
+                    )
+                else:
+                    ingested = True
+                    log.info(
+                        "discovered watch-dir release: %s (%s, %d bytes) announce=%s",
+                        item.name,
+                        item.infohash[:10],
+                        item.size_bytes,
+                        # Domain only: announce URLs embed per-user passkeys.
+                        announce_domain(item.announce_url),
+                    )
             elif _existing.state == State.FAILED:
                 # A re-dropped file for a failed release is the operator
                 # retrying it by hand: revive into a fresh pipeline run

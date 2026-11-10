@@ -1679,6 +1679,80 @@ async def test_scan_watch_skips_ignored_drop_and_keeps_file(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.anyio
+async def test_scan_watch_tombstoned_drop_kept_and_not_ingested(
+        tmp_path: Path, caplog):
+    """A forgotten (tombstoned) release re-dropped is left in place.
+
+    Regression for H2: upsert used to silently skip the write while
+    scan_watch still marked the drop ingested and deleted it.
+    """
+    import logging
+
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    raw = _create_sample_torrent_data(
+        "Forgotten.Show.S01E01", 5000, "https://alpha.cc/announce/xyz")
+    tfile = watch_dir / "forgotten.torrent"
+    tfile.write_bytes(raw)
+    infohash, _, _, _ = _bencoded_info_hash(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(TorrentState(source_infohash=infohash,
+                              source_name="Forgotten.Show.S01E01",
+                              state=State.DONE))
+    store.tombstone(infohash)
+
+    coord = make_coordinator()
+    coord.store = store
+    wcfg = WatchDirConfig(path=watch_dir, glob="*.torrent",
+                          delete_after_pickup=True)
+    coord.watch = WatchDirScanner(wcfg, prowlarr=None)
+    coord.cfg.watch_dir = wcfg
+    try:
+        with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
+            items = await coord.scan_watch()
+        assert len(items) == 1
+        assert tfile.exists()
+        assert store.get(infohash) is None
+        assert any(
+            "tombstoned" in r.message
+            and "Forgotten.Show.S01E01" in r.message
+            and infohash in r.message
+            for r in caplog.records
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_scan_watch_new_drop_ingested_and_deleted(tmp_path: Path):
+    """Normal ingestion still marks the drop consumed and deletes it."""
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    raw = _create_sample_torrent_data(
+        "Fresh.Show.S01E01", 5000, "https://alpha.cc/announce/xyz")
+    tfile = watch_dir / "fresh.torrent"
+    tfile.write_bytes(raw)
+    infohash, _, _, _ = _bencoded_info_hash(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = make_coordinator()
+    coord.store = store
+    wcfg = WatchDirConfig(path=watch_dir, glob="*.torrent",
+                          delete_after_pickup=True)
+    coord.watch = WatchDirScanner(wcfg, prowlarr=None)
+    coord.cfg.watch_dir = wcfg
+    try:
+        items = await coord.scan_watch()
+        assert len(items) == 1
+        assert not tfile.exists()
+        row = store.get(infohash)
+        assert row is not None and row.state == State.NEW
+    finally:
+        store.close()
+
+
 def test_watch_election_prefers_public(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     coord = _election_coord(tmp_path, store)
