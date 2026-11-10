@@ -12,12 +12,13 @@ hit that would never come, because:
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from conftest import make_coordinator
 
 from racing_sync.clients.abstract import Torrent, TorrentFile
+from racing_sync.recovery import reconcile
 from racing_sync.state import State, StateStore, TorrentState
 
 
@@ -402,4 +403,111 @@ async def test_queued_reinject_releases_download_slot(tmp_path: Path):
         assert store.get(h).state == State.DONE
     finally:
         sem.release()
+        store.close()
+
+
+def _category_seed(fuse: Path, h: str, name: str, files: list[tuple[str, int]]):
+    """A complete, byte-verified seed living under a non-racing category."""
+    cat = fuse / "SUB"
+    cat.mkdir(exist_ok=True)
+    for rel, size in files:
+        target = cat / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x" * size)
+    entry = Torrent(
+        hash=h, name=name, category="SUB", save_path=str(cat),
+        size_bytes=sum(size for _, size in files), state="seeding", progress=1.0,
+    )
+    return cat, entry
+
+
+@pytest.mark.anyio
+async def test_re_add_adopts_seed_under_category_subfolder(tmp_path: Path):
+    """RE_ADDING row already seeding from /fuse/SUB must not re-inject.
+
+    The gate derives the mount root from the blob and reports the
+    subfolder bytes missing; the entry's own save_path is authoritative.
+    """
+    store = StateStore(tmp_path / "state.db")
+    h = "9" * 40
+    store.upsert(TorrentState(
+        source_infohash=h, source_name="voices38-demon.slayer",
+        dest_infohash=h, state=State.RE_ADDING))
+
+    coord = make_coordinator()
+    coord.store = store
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+    (fuse / "unsorted").mkdir()
+    cat, entry = _category_seed(
+        fuse, h, "voices38-demon.slayer",
+        [("voices38.nfo", 10), ("game.iso", 90)],
+    )
+    coord.cfg.rclone.fuse.mount = fuse
+    coord.cfg.rclone.fuse.mount_unsorted = fuse / "unsorted"
+    coord.cfg.fuse_reinject_delay_seconds = 0
+    coord.cfg.fuse_reinject_retry_gap_seconds = 120
+    coord.cfg.fuse_reinject_backoff_seconds = 1800
+    coord.cfg.fuse_reinject_max_age_seconds = 86400
+    coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[entry])
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="voices38.nfo", size_bytes=10, progress=1.0),
+        TorrentFile(name="game.iso", size_bytes=90, progress=1.0),
+    ])
+    coord.dest_client.add_torrent = AsyncMock(
+        side_effect=AssertionError("already seeding; must not re-add"))
+
+    try:
+        await coord._do_re_add(store.get(h))
+        row = store.get(h)
+        assert row.state == State.DONE
+        assert row.save_path == str(cat)
+        coord.dest_client.add_torrent.assert_not_called()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_reconcile_keeps_done_seed_under_other_category(tmp_path: Path):
+    """DONE row hidden from the racing snapshot keeps DONE via hash lookup."""
+    store = StateStore(tmp_path / "state.db")
+    h = "8" * 40
+    store.upsert(TorrentState(
+        source_infohash=h, source_name="voices38-demon.slayer",
+        dest_infohash=h, state=State.DONE))
+
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+    (fuse / "unsorted").mkdir()
+    cat, entry = _category_seed(
+        fuse, h, "voices38-demon.slayer", [("game.iso", 100)])
+
+    cfg = MagicMock()
+    cfg.rclone.fuse.mount = fuse
+    cfg.rclone.fuse.mount_unsorted = fuse / "unsorted"
+    cfg.dest.save_path = tmp_path / "ssd"
+    cfg.ssd.path = tmp_path / "ssd"
+
+    dest = AsyncMock()
+
+    async def _list(*, category=None, hashes=None):
+        if category == "racing":
+            return []
+        assert hashes and h in hashes
+        return [entry]
+
+    dest.list_torrents = AsyncMock(side_effect=_list)
+    dest.get_torrent_files = AsyncMock(return_value=[
+        TorrentFile(name="game.iso", size_bytes=100, progress=1.0),
+    ])
+
+    try:
+        report = await reconcile(cfg, dest=dest, store=store)
+        row = store.get(h)
+        assert row.state == State.DONE
+        assert h not in report.re_added
+        assert h in report.kept
+    finally:
         store.close()

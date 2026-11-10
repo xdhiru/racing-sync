@@ -18,11 +18,10 @@ import logging
 from collections.abc import Iterable
 from pathlib import Path
 
-from .clients.abstract import TorrentClient, TorrentFile
+from .clients.abstract import TorrentClient
 from .config import AppConfig
 from .coordinator_errors import AbandonedError
-from .io_bounds import bounded, offload, rpc
-from .rclone_ops import ssd_free_bytes
+from .io_bounds import bounded, chunked, offload, rpc
 from .state import State, StateStore, TorrentState
 
 log = logging.getLogger(__name__)
@@ -89,6 +88,72 @@ def _hash_is_ignored(store, infohash: str) -> bool:
         return fn(infohash) is True
     except Exception:
         return False
+
+
+def _known_row_hashes(ts: TorrentState) -> set[str]:
+    """Every hash that can identify this row's dest entry (lowercased)."""
+    known = {
+        k.lower()
+        for k in (ts.source_infohash, ts.dest_infohash, ts.cross_seed_infohash)
+        if k
+    }
+    if ts.injected_private_hashes:
+        for iph in ts.injected_private_hashes.split(","):
+            if iph.strip():
+                known.add(iph.strip().lower())
+    return known
+
+
+async def _fill_entries_by_hash(
+    dest: TorrentClient,
+    rows: Iterable[TorrentState],
+    actual_by_hash: dict[str, object],
+) -> None:
+    """Resolve DONE rows hidden behind a non-racing category by hash.
+
+    The category snapshot is a load shortcut, not a truth source: an
+    entry can seed from a fuse subfolder under another category (e.g. a
+    per-tracker folder like ``SUB``). Without this fallback such a row
+    reads as lost and is demoted to RE_ADDING, where the fuse gate only
+    checks the kind-derived mount root and parks forever on bytes that
+    actually live in the subfolder.
+
+    Only DONE rows are looked up (the destructive false-demotion case),
+    and only hashes absent from the snapshot, in bounded chunks. A
+    failed lookup keeps the snapshot view: an unseen row then follows
+    the normal lost path rather than being trusted blind.
+    """
+    want: set[str] = set()
+    try:
+        for ts in rows or []:
+            if ts.state != State.DONE:
+                continue
+            for h in _known_row_hashes(ts):
+                if h not in actual_by_hash:
+                    want.add(h)
+    except Exception:
+        return
+    if not want:
+        return
+    for chunk in chunked(sorted(want), 100):
+        try:
+            found = await bounded(
+                dest.list_torrents(hashes=chunk),
+                timeout=30.0, label="reconcile hash lookup",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "reconcile: category-agnostic hash lookup failed "
+                "(%d hashes): %s", len(chunk), e,
+            )
+            continue
+        allowed = set(chunk)
+        for t in found or []:
+            h = (getattr(t, "hash", "") or "").strip().lower()
+            if h and h in allowed:
+                actual_by_hash[h] = t
 
 
 def _save_path_on_ssd(cfg: AppConfig, save_path: str) -> bool:
@@ -376,6 +441,9 @@ async def reconcile_verify(
     except Exception as e:  # noqa: BLE001
         log.warning("reconcile_verify: cannot read state DB: %s", e)
         return counts
+    # DONE rows whose entry lives under another category are invisible to
+    # the racing snapshot; resolve them by hash so they are verified too.
+    await _fill_entries_by_hash(dest, all_rows, actual_by_hash)
     try:
         sem = asyncio.Semaphore(max(1, int(concurrency or 4)))
     except (TypeError, ValueError):
@@ -576,19 +644,14 @@ async def _reconcile_snapshot(
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"reconcile: cannot read state DB: {e}") from e
 
+    # Entries can seed from a fuse subfolder under another category (e.g.
+    # a tracker folder like SUB) and are missing from the racing snapshot.
+    # Resolve DONE rows by hash before any is declared lost and demoted.
+    await _fill_entries_by_hash(dest, all_rows, actual_by_hash)
+
     for ts in all_rows:
         h = ts.source_infohash.lower()
-        known_hashes = {
-            k.lower()
-            for k in (ts.source_infohash, ts.dest_infohash, ts.cross_seed_infohash)
-            if k
-        }
-        # An injected private hash still seeding covers presence too —
-        # otherwise DONE rows with vanished source/dest falsely re-add.
-        if ts.injected_private_hashes:
-            for iph in ts.injected_private_hashes.split(","):
-                if iph.strip():
-                    known_hashes.add(iph.strip().lower())
+        known_hashes = _known_row_hashes(ts)
         present = any(k in actual_by_hash for k in known_hashes)
         if ts.state == State.DONE:
             if present:

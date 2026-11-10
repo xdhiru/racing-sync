@@ -766,6 +766,78 @@ async def test_public_export_failure_parks_as_source_export_miss(caplog):
 
 
 @pytest.mark.anyio
+async def test_waiting_indexer_retry_republishes_public_schedule(tmp_path: Path, caplog):
+    """A public row re-parked from WAITING_INDEXER must not be counted as
+    an 'indexer miss': the reason is re-derived, the public timer is pushed
+    and a stale indexer timer is cleared. Otherwise list_waiting_ready
+    wakes it every tick, inflating attempts until the 24h FAILED a row
+    that has no max-age clock by design."""
+    import datetime as dt
+    import logging
+    from unittest.mock import AsyncMock, MagicMock
+
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import StateStore
+
+    cfg = MagicMock()
+    cfg.cross_seed.allow_ssh_export = True
+    cfg.cross_seed.refetch_public_via_prowlarr = False
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+    cfg.cross_seed.prowlarr_retry_interval_seconds = 1800
+    cfg.cross_seed.prowlarr_max_age_seconds = 86400
+    cfg.cross_seed.public_export_retry_interval_seconds = 1800
+    cfg.cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout = False
+    cfg.dest.save_path = "/ssd"
+
+    torrent = Torrent(
+        hash="p" * 40, name="Public.Show.S01E01.mkv", category="",
+        save_path="", size_bytes=500, state="seeding", progress=1.0,
+        trackers=["http://tracker.opentrackr.org/announce"],
+    )
+    sftp = MagicMock()
+    sftp.fetch_torrent = MagicMock(return_value=None)
+    source_client = AsyncMock()
+    source_client.get_torrent = AsyncMock(return_value=torrent)
+    source_client.export_torrent = AsyncMock(side_effect=RuntimeError("nope"))
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator()
+        coord.cfg = cfg
+        coord.store = store
+        coord.source_client = source_client
+        coord.sftp = sftp
+        coord.prowlarr = None
+        coord._list_source_torrents = AsyncMock(return_value=[torrent])
+        coord.dest_client = AsyncMock()
+        coord.dest_client.list_torrents = AsyncMock(return_value=[])
+        coord.transition = MagicMock(
+            side_effect=lambda t, s, **k: setattr(t, "state", s))
+
+        now = dt.datetime.now(dt.timezone.utc)
+        ts = TorrentState(
+            source_infohash="p" * 40, source_name="Public.Show.S01E01.mkv",
+            total_bytes=500, state=State.WAITING_INDEXER,
+            indexer_first_queried_at=now - dt.timedelta(seconds=60),
+            indexer_attempts=5,
+            indexer_next_retry_at=now - dt.timedelta(seconds=1))
+        store.upsert(ts)
+
+        with caplog.at_level(logging.INFO, logger="racing_sync.coordinator"):
+            await coord._do_waiting_indexer(store.get("p" * 40))
+
+        row = store.get("p" * 40)
+        assert row.state == State.WAITING_INDEXER
+        assert row.public_export_next_retry_at is not None
+        assert row.indexer_next_retry_at is None
+        assert row.indexer_attempts == 5
+        assert any("source export miss #1" in r.message for r in caplog.records)
+        assert not any("indexer miss" in r.message for r in caplog.records)
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_public_export_miss_never_hits_max_age_failed(tmp_path: Path):
     """Public-export misses retry indefinitely: an ancient first attempt
     must re-park (not FAILED), on the public schedule only."""

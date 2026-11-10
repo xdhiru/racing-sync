@@ -531,6 +531,93 @@ class ReaddMixin:
                 except Exception:
                     pass
 
+    async def _adopt_existing_fuse_seed(self, ts: TorrentState) -> bool:
+        """Finish RE_ADDING when the content already seeds from fuse.
+
+        Reconcile snapshots ``category="racing"``, so an entry placed in
+        another category folder (e.g. ``/mnt/teldrive/qbittorrent/SUB``)
+        reads as lost on boot. The availability gate derives the mount
+        root from the blob and then reports the subfolder bytes missing
+        forever. Verify at the entry's own fuse save_path (the only
+        authoritative location) and adopt instead of re-injecting.
+        """
+        try:
+            hashes = {
+                h.lower() for h in (
+                    ts.dest_infohash,
+                    ts.source_infohash,
+                    ts.cross_seed_infohash,
+                    *ts.injected_private_hashes.split(","),
+                ) if h
+            }
+            if not hashes:
+                return False
+            entries = await self._dest_entries_for_hashes(hashes)
+        except (AbandonedError, asyncio.CancelledError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.debug("re-add: existing fuse lookup failed for %s: %s",
+                      (ts.source_infohash or "")[:10], e)
+            return False
+        for ext in entries or []:
+            h_low = (getattr(ext, "hash", "") or "").lower()
+            save_path = str(getattr(ext, "save_path", "") or "")
+            if not h_low or not self._save_path_is_on_fuse(save_path):
+                continue
+            try:
+                if not bool(ext.is_complete()):
+                    continue
+                files = await rpc(
+                    self.dest_client.get_torrent_files(h_low),
+                    getattr(self, "cfg", None),
+                    "readd existing fuse get_torrent_files",
+                )
+                expected = [
+                    (str(f.name), int(f.size_bytes or 0))
+                    for f in (files or []) if getattr(f, "name", "")
+                ]
+                if not expected:
+                    continue
+                missing = await self._confirmed_fuse_missing(
+                    Path(save_path), expected)
+                if missing:
+                    continue
+                if not await self._select_all_fuse_files(
+                        h_low, label="existing fuse seed"):
+                    return False
+            except (AbandonedError, asyncio.CancelledError):
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.debug("re-add: fuse-entry check failed for %s: %s",
+                          h_low[:10], e)
+                continue
+            ts.dest_infohash = h_low
+            ts.save_path = save_path
+            log.info(
+                "re-add: %s already seeds from fuse at %s (%s); adopting as DONE",
+                ts.source_name[:50], save_path, h_low[:10],
+            )
+            try:
+                self.transition(ts, State.DONE)
+            except ValueError as e:
+                try:
+                    fresh = self.store.get(
+                        ts.source_infohash, include_blob=False)
+                except Exception:
+                    fresh = None
+                if fresh is None or fresh.state != State.DONE:
+                    log.warning(
+                        "re-add: could not adopt %s from %s: %s",
+                        (ts.source_infohash or "")[:10], ts.state.value, e,
+                    )
+                    return False
+                ts.state = fresh.state
+                ts.dest_infohash = fresh.dest_infohash or ts.dest_infohash
+                ts.save_path = fresh.save_path or ts.save_path
+                return True
+            return True
+        return False
+
     async def _do_re_add(self, ts: TorrentState) -> None:
         store = getattr(self, "store", None)
         now = dt.datetime.now(dt.timezone.utc)
@@ -550,6 +637,26 @@ class ReaddMixin:
             ts.readd_next_retry_at = None
             self.transition(ts, State.FAILED, error=err)
             return
+        # Manual fuse adoption: if the same infohash already seeds from a fuse
+        # mount on VPS2 (any category / subfolder, e.g. an operator-placed
+        # entry under SUB/), adopt to DONE instead of re-checking/injecting.
+        try:
+            if await self._adopt_manual_fuse_if_present(ts):
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        # Existing fuse seed under a non-derived path (category subfolder):
+        # adopt before the delay/gate, which would otherwise park forever.
+        try:
+            if await self._adopt_existing_fuse_seed(ts):
+                return
+        except (AbandonedError, asyncio.CancelledError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "re-add: existing fuse adoption check failed for %s: %s",
+                ts.source_name[:50], e,
+            )
         if ts.readd_first_attempted_at is None:
             ts.readd_first_attempted_at = now
             if store is not None:

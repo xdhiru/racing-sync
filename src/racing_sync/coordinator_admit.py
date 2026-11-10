@@ -327,7 +327,7 @@ class AdmitMixin:
         try:
             if ts.state == State.DONE:
                 return True
-            if ts.state not in (State.NEW, State.WAITING_INDEXER, State.WAITING_DISK):
+            if ts.state not in (State.NEW, State.WAITING_INDEXER, State.WAITING_DISK, State.RE_ADDING):
                 return False
             try:
                 if getattr(self, "store", None) is not None and hasattr(self.store, "is_ignored"):
@@ -452,7 +452,7 @@ class AdmitMixin:
             dest_client = getattr(self, "dest_client", None)
             if dest_client is None:
                 return False
-            if ts.state not in (State.NEW, State.WAITING_INDEXER, State.WAITING_DISK):
+            if ts.state not in (State.NEW, State.WAITING_INDEXER, State.WAITING_DISK, State.RE_ADDING):
                 return False
             h = (ts.source_infohash or "").lower()
             if not h:
@@ -759,6 +759,10 @@ class AdmitMixin:
             _max_age_s = 86400.0
         next_retry = now + dt.timedelta(seconds=max(60.0, _retry_gap))
         ts.indexer_next_retry_at = next_retry
+        # The row runs the indexer schedule now: a leftover public-export
+        # timer (e.g. from an earlier public park) stays in the past and
+        # would make list_waiting_ready wake this row every tick.
+        ts.public_export_next_retry_at = None
         max_age = dt.timedelta(seconds=max(60.0, _max_age_s))
         elapsed = now - ts.indexer_first_queried_at
 
@@ -834,6 +838,11 @@ class AdmitMixin:
             ts.public_export_first_attempted_at = now
         ts.public_export_attempts += 1
         ts.public_export_next_retry_at = now + dt.timedelta(seconds=interval)
+        # The row runs the public schedule now: a leftover indexer timer
+        # (e.g. from a misclassified retry of a public row) stays in the
+        # past and would make list_waiting_ready wake this row every tick,
+        # inflating attempts until the 24h max-age FAILED a public row.
+        ts.indexer_next_retry_at = None
         # Unbounded schedule by design (no max-age FAILED), so rotate
         # verbosity: first misses log loudly, the long tail at debug —
         # a wedged export must not fill the log disk with its own lines.
@@ -1252,7 +1261,7 @@ class AdmitMixin:
         all_source = await self._list_source_torrents()
         await self._pick_and_admit(
             ts, st, self._same_content_torrents(all_source, st),
-            park_reason="indexer miss",
+            park_reason=None,
         )
 
     # How long a still-full WAITING_DISK row stays quiet before its next
