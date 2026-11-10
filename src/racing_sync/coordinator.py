@@ -185,6 +185,19 @@ def _sched_priority(ts) -> tuple[int, dt.datetime]:
     return (prio, _FAR)
 
 
+def _strict_lane_number(value: object) -> float | None:
+    """Strict timestamp/duration coercion: bools, NaN, inf, doubles -> None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if out != out or out in (float("inf"), float("-inf")):
+        return None
+    return out
+
+
 def _elect_primary_torrent(group: list) -> object:
     """Elect ONE primary torrent for SSD download, deterministically.
 
@@ -1957,6 +1970,109 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 log.warning("tick step %s failed; continuing: %s",
                             getattr(_step, "__name__", "?"), e)
 
+    # ---- per-lane health (production loop heartbeats) ----
+
+    def _lane_health_map(self) -> dict:
+        """Lane-health map, lazily created.
+
+        Bare test doubles are constructed with ``object.__new__`` (no
+        dataclass field defaults), so this attribute cannot be a field.
+        """
+        try:
+            lanes = getattr(self, "_lane_health", None)
+        except Exception:
+            lanes = None
+        if not isinstance(lanes, dict):
+            lanes = {}
+            try:
+                self._lane_health = lanes
+            except Exception:
+                pass
+        return lanes
+
+    def _lane_entry(self, name: str) -> dict:
+        lanes = self._lane_health_map()
+        entry = lanes.get(name)
+        if not isinstance(entry, dict):
+            entry = {}
+            lanes[name] = entry
+        return entry
+
+    def _lane_note_attempt(self, name: str) -> float:
+        """Stamp a lane attempt (before the lock/step); returns start time."""
+        now = time.monotonic()
+        try:
+            self._lane_entry(name)["last_attempt_at"] = now
+        except Exception:
+            pass
+        return now
+
+    def _lane_note_success(self, name: str, started_at) -> None:
+        """Stamp a lane success + duration; a pass clears failure state."""
+        try:
+            now = time.monotonic()
+            entry = self._lane_entry(name)
+            entry["last_success_at"] = now
+            _start = _strict_lane_number(started_at)
+            entry["last_duration_s"] = (
+                max(0.0, now - _start) if _start is not None else 0.0)
+            entry["consecutive_failures"] = 0
+            entry["last_error"] = ""
+        except Exception:
+            pass
+
+    def _lane_note_failure(self, name: str, error) -> None:
+        """Stamp a lane failure; CancelledError must never reach here."""
+        try:
+            entry = self._lane_entry(name)
+            try:
+                failures = int(entry.get("consecutive_failures", 0) or 0)
+            except (TypeError, ValueError):
+                failures = 0
+            entry["consecutive_failures"] = max(0, failures) + 1
+            entry["last_failure_at"] = time.monotonic()
+            try:
+                text = str(error) or error.__class__.__name__
+            except Exception:
+                text = error.__class__.__name__
+            entry["last_error"] = text[:300]
+        except Exception:
+            pass
+
+    def lane_health_snapshot(self) -> dict:
+        """Defensive, strict-typed copy of per-lane health (never raises)."""
+        out: dict[str, dict] = {}
+        try:
+            items = list(self._lane_health_map().items())
+        except Exception:
+            items = []
+        for name, raw in items:
+            try:
+                if not isinstance(name, str) or not isinstance(raw, dict):
+                    continue
+                duration = _strict_lane_number(raw.get("last_duration_s"))
+                failures = raw.get("consecutive_failures", 0)
+                if isinstance(failures, bool) or not isinstance(failures, int):
+                    failures = 0
+                error = raw.get("last_error", "")
+                if not isinstance(error, str):
+                    error = ""
+                out[name] = {
+                    "last_attempt_at": _strict_lane_number(
+                        raw.get("last_attempt_at")),
+                    "last_success_at": _strict_lane_number(
+                        raw.get("last_success_at")),
+                    "last_failure_at": _strict_lane_number(
+                        raw.get("last_failure_at")),
+                    "last_duration_s": (
+                        max(0.0, duration) if duration is not None else None),
+                    "consecutive_failures": max(0, failures),
+                    "last_error": error[:300],
+                }
+            except Exception:
+                continue
+        return out
+
     def _loop_lock(self, name: str) -> asyncio.Lock:
         """Per-loop lock, lazily created (tolerates bare test doubles)."""
         try:
@@ -1978,6 +2094,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
     async def _poller_loop(self) -> None:
         """Source-poller loop: watch + source ingest + fuse sweep."""
         while not self._stop:
+            _lane_started = self._lane_note_attempt("poller")
             try:
                 lock = self._loop_lock("_ops_lock")
                 if lock is not None:
@@ -1988,12 +2105,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             except asyncio.CancelledError:
                 break
             except AuthError as e:
+                self._lane_note_failure("poller", e)
                 log.error("poller: auth still failing; backing off: %s", e)
             except TimeoutError as e:
+                self._lane_note_failure("poller", e)
                 log.warning("poller: timed out; backing off: %s", e)
             except Exception as e:  # noqa: BLE001
+                self._lane_note_failure("poller", e)
                 log.error("poller: unexpected error; backing off: %s",
                           e, exc_info=True)
+            else:
+                self._lane_note_success("poller", _lane_started)
             if self._stop:
                 break
             try:
@@ -2007,6 +2129,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
     async def _scheduler_loop(self) -> None:
         """Worker-scheduler loop: wakeups, admissions, live refresh."""
         while not self._stop:
+            _lane_started = self._lane_note_attempt("scheduler")
             try:
                 lock = self._loop_lock("_schedule_lock")
                 if lock is not None:
@@ -2017,12 +2140,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             except asyncio.CancelledError:
                 break
             except AuthError as e:
+                self._lane_note_failure("scheduler", e)
                 log.error("scheduler: auth still failing; backing off: %s", e)
             except TimeoutError as e:
+                self._lane_note_failure("scheduler", e)
                 log.warning("scheduler: timed out; backing off: %s", e)
             except Exception as e:  # noqa: BLE001
+                self._lane_note_failure("scheduler", e)
                 log.error("scheduler: unexpected error; backing off: %s",
                           e, exc_info=True)
+            else:
+                self._lane_note_success("scheduler", _lane_started)
             if self._stop:
                 break
             try:
@@ -2038,6 +2166,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         # The step self-gates on janitor_interval_seconds, so the loop
         # wakes often enough to stay responsive without busy work.
         while not self._stop:
+            _lane_started = self._lane_note_attempt("janitor")
             try:
                 lock = self._loop_lock("_janitor_lock")
                 if lock is not None:
@@ -2048,8 +2177,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             except asyncio.CancelledError:
                 break
             except Exception as e:  # noqa: BLE001
+                self._lane_note_failure("janitor", e)
                 log.error("janitor: unexpected error; backing off: %s",
                           e, exc_info=True)
+            else:
+                self._lane_note_success("janitor", _lane_started)
             if self._stop:
                 break
             try:

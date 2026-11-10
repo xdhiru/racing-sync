@@ -85,7 +85,7 @@ def test_readyz_not_ready_without_tick_or_paths():
     app = build_app(coord)
     client = TestClient(app)
     resp = client.get("/readyz", headers={"X-Api-Token": "secret"})
-    assert resp.status_code == 200
+    assert resp.status_code == 503
     data = resp.json()
     assert data["ready"] is False
     assert data["checks"]["tick_fresh"] is False

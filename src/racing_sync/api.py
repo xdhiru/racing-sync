@@ -33,6 +33,7 @@ except ImportError:
     Depends = Header = HTTPException = Query = Request = object  # type: ignore[assignment,misc]
     FastAPI = Any  # type: ignore[assignment,misc]
 
+from .config import AppConfig
 from .coordinator import Coordinator
 from .coordinator_errors import AbandonedError
 from .forget import forget_torrent
@@ -225,6 +226,161 @@ async def _hold_ops_lock(coord: Coordinator) -> AsyncIterator[None]:
             yield
 
 
+#: Readiness gates on the two intake/scheduling lanes; janitor and
+#: qb_listener are reported for observability but never gate readiness.
+_REQUIRED_LANES = ("poller", "scheduler")
+_ALL_LANES = ("poller", "scheduler", "janitor", "qb_listener")
+#: Default loop interval when config is absent/broken (MagicMock doubles).
+_LANE_DEFAULT_INTERVAL_S = 30.0
+#: qb_listener loop cadence (coordinator_live._QB_LISTENER_INTERVAL_S).
+_QB_LISTENER_INTERVAL_S = 4.0
+#: Janitor default when [cleanup] is absent; its loop floors at 300s.
+_JANITOR_DEFAULT_INTERVAL_S = 3600.0
+_JANITOR_MIN_INTERVAL_S = 300.0
+#: Freshness floor: a slow configured interval still gets a wide window.
+_LANE_MIN_FRESH_S = 300.0
+#: Legacy `_last_tick_at` window for test doubles / single-pass callers.
+_LEGACY_TICK_FRESH_S = 300.0
+
+
+def _strict_float(value: object) -> float | None:
+    """Strict numeric coercion: bools, doubles, NaN/inf read as None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if out != out or out in (float("inf"), float("-inf")):
+        return None
+    return out
+
+
+def _strict_count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, int(value))
+
+
+def _strict_text(value: object, limit: int = 300) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value[:limit]
+
+
+def _lane_entry(raw: object) -> dict[str, Any]:
+    """Defensive, strict-typed lane entry (never raises)."""
+    src = raw if isinstance(raw, dict) else {}
+    duration = _strict_float(src.get("last_duration_s"))
+    return {
+        "last_attempt_at": _strict_float(src.get("last_attempt_at")),
+        "last_success_at": _strict_float(src.get("last_success_at")),
+        "last_failure_at": _strict_float(src.get("last_failure_at")),
+        "last_duration_s": (
+            max(0.0, duration) if duration is not None else None),
+        "consecutive_failures": _strict_count(
+            src.get("consecutive_failures")),
+        "last_error": _strict_text(src.get("last_error")),
+    }
+
+
+def _lane_health(coord: Coordinator) -> dict[str, dict[str, Any]]:
+    """Strict snapshot of every lane; absent lanes read as empty entries."""
+    snap = None
+    try:
+        fn = getattr(coord, "lane_health_snapshot", None)
+        if callable(fn):
+            snap = fn()
+    except Exception:
+        snap = None
+    out: dict[str, dict[str, Any]] = {}
+    for name in _ALL_LANES:
+        raw = snap.get(name) if isinstance(snap, dict) else None
+        out[name] = _lane_entry(raw)
+    return out
+
+
+def _lane_interval(cfg: AppConfig, name: str) -> float:
+    try:
+        value = getattr(getattr(cfg, "general", None), name, None)
+    except Exception:
+        return _LANE_DEFAULT_INTERVAL_S
+    interval = _strict_float(value)
+    if interval is None or interval <= 0:
+        return _LANE_DEFAULT_INTERVAL_S
+    return interval
+
+
+def _janitor_interval(cfg: AppConfig) -> float:
+    """Janitor cadence: configured interval floored like the loop itself."""
+    try:
+        value = getattr(getattr(cfg, "cleanup", None),
+                        "janitor_interval_seconds", None)
+    except Exception:
+        return _JANITOR_DEFAULT_INTERVAL_S
+    interval = _strict_float(value)
+    if interval is None or interval <= 0:
+        interval = _JANITOR_DEFAULT_INTERVAL_S
+    return max(_JANITOR_MIN_INTERVAL_S, interval)
+
+
+def _lane_threshold(interval: float) -> float:
+    return max(_LANE_MIN_FRESH_S, 3.0 * interval)
+
+
+def _lane_fresh(
+    entry: dict[str, Any],
+    *,
+    now: float,
+    threshold: float,
+    started_at: float | None,
+    legacy_tick: float | None,
+) -> bool:
+    """Lane freshness (H1).
+
+    A success is the anchor; a newer in-flight attempt replaces it so a
+    legitimately long pass is not declared stale mid-run (a hung one
+    still trips after the threshold). No success yet falls back to the
+    attempt, then to startup grace, then to the legacy tick field used
+    by test doubles / single-pass callers.
+    """
+    success = entry.get("last_success_at")
+    attempt = entry.get("last_attempt_at")
+    if success is not None:
+        if attempt is not None and attempt > success:
+            ref = attempt
+        else:
+            ref = success
+    elif attempt is not None:
+        ref = attempt
+    elif started_at is not None:
+        ref = started_at
+    elif legacy_tick is not None:
+        ref = legacy_tick
+        threshold = _LEGACY_TICK_FRESH_S
+    else:
+        return False
+    age = now - ref
+    return 0.0 <= age <= threshold
+
+
+def _lane_body(
+    entry: dict[str, Any], *, required: bool, ok: bool, now: float,
+) -> dict[str, Any]:
+    def _age(value: float | None) -> float | None:
+        return round(max(0.0, now - value), 3) if value is not None else None
+
+    return {
+        "required": bool(required),
+        "ok": bool(ok),
+        "last_success_age_s": _age(entry.get("last_success_at")),
+        "last_attempt_age_s": _age(entry.get("last_attempt_at")),
+        "last_duration_s": entry.get("last_duration_s"),
+        "consecutive_failures": entry.get("consecutive_failures", 0),
+        "last_error": entry.get("last_error") or "",
+    }
+
+
 class RetryResult(BaseModel):
     source_infohash: str
     new_state: str
@@ -367,11 +523,14 @@ def build_app(coord: Coordinator) -> FastAPI:
         return {"status": "ok"}
 
     @app.get("/readyz", dependencies=[Depends(auth)])
-    async def readyz() -> dict[str, Any]:
-        """Readiness probe (authed): DB + clients + fuse + SSD + tick.
+    async def readyz() -> Any:
+        """Readiness probe (authed): DB + clients + fuse + SSD + lanes.
 
         Every check is strict-typed (test doubles answer truthy to
         everything — a MagicMock must read as NOT ready, never ready).
+        Only the poller and scheduler lanes gate readiness; janitor and
+        qb_listener are reported but never turn a healthy daemon 503.
+        Returns 200 when ready, 503 with the same JSON body otherwise.
         """
         checks: dict[str, bool] = {}
         try:
@@ -401,19 +560,47 @@ def build_app(coord: Coordinator) -> FastAPI:
             checks["ssd_writable"] = bool(_writable and int(_free) >= 0)
         except Exception:
             checks["ssd_writable"] = False
-        # Coordinator tick loop alive (stale tick = wedged daemon).
+        # Per-lane freshness: production loops heartbeat independently;
+        # `_last_tick_at` is only written by the test/manual single-pass
+        # path, so it is a back-compat fallback, never the primary signal.
+        now = time.monotonic()
+        lanes = _lane_health(coord)
         try:
-            _last = getattr(coord, "_last_tick_at", None)
-            if isinstance(_last, bool) or not isinstance(
-                    _last, (int, float)):
-                checks["tick_fresh"] = False
-            else:
-                _age = time.monotonic() - float(_last)
-                checks["tick_fresh"] = 0.0 <= _age < 300.0
+            started_at = _strict_float(getattr(coord, "_started_at", None))
         except Exception:
-            checks["tick_fresh"] = False
+            started_at = None
+        try:
+            legacy_tick = _strict_float(getattr(coord, "_last_tick_at", None))
+        except Exception:
+            legacy_tick = None
+        thresholds = {
+            "poller": _lane_threshold(
+                _lane_interval(cfg, "source_poll_interval")),
+            "scheduler": _lane_threshold(
+                _lane_interval(cfg, "dest_poll_interval")),
+            "janitor": _lane_threshold(_janitor_interval(cfg)),
+            "qb_listener": _lane_threshold(_QB_LISTENER_INTERVAL_S),
+        }
+        lane_body: dict[str, dict[str, Any]] = {}
+        for name in _ALL_LANES:
+            required = name in _REQUIRED_LANES
+            ok = _lane_fresh(
+                lanes[name], now=now, threshold=thresholds[name],
+                started_at=started_at, legacy_tick=legacy_tick,
+            )
+            lane_body[name] = _lane_body(
+                lanes[name], required=required, ok=ok, now=now)
+        checks["poller_fresh"] = bool(lane_body["poller"]["ok"])
+        checks["scheduler_fresh"] = bool(lane_body["scheduler"]["ok"])
+        checks["tick_fresh"] = bool(
+            checks["poller_fresh"] and checks["scheduler_fresh"])
         ready = all(checks.values())
-        return {"ready": ready, "checks": checks}
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            {"ready": ready, "checks": checks, "lanes": lane_body},
+            status_code=200 if ready else 503,
+        )
 
     @app.get("/metrics", dependencies=[Depends(auth)])
     async def metrics() -> Any:
@@ -481,24 +668,82 @@ def build_app(coord: Coordinator) -> FastAPI:
             lines.append(f"racing_sync_worker_tasks {len(tasks or [])}")
         except Exception:
             pass
-        # Tick health: last-pass latency + age (a wedged loop shows as
-        # ever-growing age while the process stays up).
+        # Per-lane health: every production loop heartbeats on its own
+        # clock, so a wedged lane shows an ever-growing age even though
+        # `_last_tick_at` (test/manual path) is never written in run().
+        _lanes = _lane_health(coord)
+        _now = time.monotonic()
+        for _name in _ALL_LANES:
+            _ent = _lanes.get(_name) or {}
+            _has_data = (
+                _ent.get("consecutive_failures", 0) > 0
+                or any(_ent.get(key) is not None for key in (
+                    "last_attempt_at", "last_success_at",
+                    "last_failure_at", "last_duration_s"))
+            )
+            if not _has_data:
+                continue
+            _succ = _ent.get("last_success_at")
+            _att = _ent.get("last_attempt_at")
+            _ldur = _ent.get("last_duration_s")
+            if _succ is not None:
+                lines.append(
+                    f'racing_sync_lane_success_age_seconds{{lane="{_name}"}} '
+                    f"{max(0.0, _now - _succ):.0f}")
+            if _att is not None:
+                lines.append(
+                    f'racing_sync_lane_attempt_age_seconds{{lane="{_name}"}} '
+                    f"{max(0.0, _now - _att):.0f}")
+            if _ldur is not None:
+                lines.append(
+                    f'racing_sync_lane_latency_seconds{{lane="{_name}"}} '
+                    f"{float(_ldur):.3f}")
+            lines.append(
+                f'racing_sync_lane_consecutive_failures{{lane="{_name}"}} '
+                f"{int(_ent.get('consecutive_failures', 0) or 0)}")
+        # Legacy tick aliases: prefer the single-pass fields when present;
+        # otherwise derive from the required lanes so production exports
+        # them too (age = oldest required-lane reference = worst staleness;
+        # latency = slowest required-lane pass).
         try:
-            _dur = getattr(coord, "_last_tick_duration_s", None)
-            if (not isinstance(_dur, bool)
-                    and isinstance(_dur, (int, float))):
-                lines.append(f"racing_sync_tick_latency_seconds "
-                             f"{float(_dur):.3f}")
+            _tick_dur = _strict_float(
+                getattr(coord, "_last_tick_duration_s", None))
         except Exception:
-            pass
+            _tick_dur = None
+        if _tick_dur is None:
+            _durs = [
+                _lanes[_n]["last_duration_s"] for _n in _REQUIRED_LANES
+                if _lanes[_n].get("last_duration_s") is not None
+            ]
+            if _durs:
+                _tick_dur = max(_durs)
+        if _tick_dur is not None:
+            lines.append(f"racing_sync_tick_latency_seconds "
+                         f"{float(_tick_dur):.3f}")
         try:
-            _lt = getattr(coord, "_last_tick_at", None)
-            if not isinstance(_lt, bool) and isinstance(
-                    _lt, (int, float)):
-                lines.append(f"racing_sync_tick_age_seconds "
-                             f"{max(0.0, time.monotonic() - float(_lt)):.0f}")
+            _tick_at = _strict_float(getattr(coord, "_last_tick_at", None))
         except Exception:
-            pass
+            _tick_at = None
+        if _tick_at is None:
+            _refs = []
+            for _name in _REQUIRED_LANES:
+                _ent = _lanes[_name]
+                _succ = _ent.get("last_success_at")
+                _att = _ent.get("last_attempt_at")
+                if _succ is not None:
+                    _ref = (_att if (_att is not None and _att > _succ)
+                            else _succ)
+                elif _att is not None:
+                    _ref = _att
+                else:
+                    _ref = None
+                if _ref is not None:
+                    _refs.append(_ref)
+            if _refs:
+                _tick_at = min(_refs)
+        if _tick_at is not None:
+            lines.append(f"racing_sync_tick_age_seconds "
+                         f"{max(0.0, time.monotonic() - _tick_at):.0f}")
         # Indexer + move counters (best-effort; absent when never used).
         try:
             from .prowlarr import prowlarr_counters as _pc

@@ -115,6 +115,59 @@ async def test_worker_falls_back_to_direct_fetch_when_stale():
 
 
 @pytest.mark.anyio
+async def test_listener_loop_records_lane_health(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from conftest import make_coordinator
+
+    import racing_sync.coordinator_live as live_mod
+
+    monkeypatch.setattr(live_mod, "_QB_LISTENER_INTERVAL_S", 0.01)
+    coord = make_coordinator(MagicMock())
+    coord._stop = False
+    coord.dest_client = None
+    coord._live = {}
+
+    async def fake_pass():
+        coord.request_stop()
+
+    coord._qb_listener_pass = fake_pass
+    await coord._qb_listener_loop()
+
+    entry = coord.lane_health_snapshot()["qb_listener"]
+    assert entry["last_attempt_at"] is not None
+    assert entry["last_success_at"] is not None
+    assert entry["consecutive_failures"] == 0
+
+
+@pytest.mark.anyio
+async def test_listener_loop_records_failure(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from conftest import make_coordinator
+
+    import racing_sync.coordinator_live as live_mod
+
+    monkeypatch.setattr(live_mod, "_QB_LISTENER_INTERVAL_S", 0.01)
+    coord = make_coordinator(MagicMock())
+    coord._stop = False
+    coord.dest_client = None
+    coord._live = {}
+
+    async def failing_pass():
+        coord._stop = True
+        raise RuntimeError("listener boom")
+
+    coord._qb_listener_pass = failing_pass
+    await coord._qb_listener_loop()
+
+    entry = coord.lane_health_snapshot()["qb_listener"]
+    assert entry["last_success_at"] is None
+    assert entry["consecutive_failures"] == 1
+    assert "listener boom" in entry["last_error"]
+
+
+@pytest.mark.anyio
 async def test_listener_loop_idle_without_client():
     from unittest.mock import MagicMock
     from conftest import make_coordinator

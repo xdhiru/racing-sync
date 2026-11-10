@@ -233,15 +233,19 @@ class LiveStatusMixin:
         """Supervised central dest-poll loop (every ~4s). Never raises."""
         try:
             while not getattr(self, "_stop", False):
+                _lane_started = self._lane_note_attempt("qb_listener")
                 try:
                     await self._qb_listener_pass()
                 except asyncio.CancelledError:
                     return
                 except Exception as e:  # noqa: BLE001
+                    self._lane_note_failure("qb_listener", e)
                     try:
                         log.debug("qb listener pass failed: %s", e)
                     except Exception:
                         pass
+                else:
+                    self._lane_note_success("qb_listener", _lane_started)
                 try:
                     await asyncio.sleep(_QB_LISTENER_INTERVAL_S)
                 except asyncio.CancelledError:
