@@ -3505,10 +3505,14 @@ class AdmitMixin:
 
                 if not _coordinator.ssd_has_room(self.cfg, min(total_files, ts.total_bytes or total_files)):
                     log.info("ssd cap in use; parking %s", ts.source_name)
+                    # Keep the paused entry for the retry (existing-entry
+                    # adopt path) — see the grow-fail park below. A
+                    # metadata-driven wipe could take shared-save_path
+                    # sibling data.
                     try:
                         _h = ts.dest_infohash or ts.source_infohash
                         if _h:
-                            await self.dest_client.delete(_h, delete_files=True)
+                            await self.dest_client.delete(_h, delete_files=False)
                     except Exception:
                         pass
                     self.transition(ts, State.WAITING_DISK)
