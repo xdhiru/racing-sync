@@ -20,6 +20,7 @@ from .clients.abstract import Torrent
 from .content_keys import same_content as _same_content_key
 from .coordinator_content import _looks_public
 from .io_bounds import chunked, offload, rpc
+from .recovery import _save_path_on_ssd
 from .state import State, TorrentState
 
 # Keep the historic logger name so log output is unchanged by the split.
@@ -341,11 +342,13 @@ class InjectMixin:
         """Abandon an SSD-active download so the row can go RE_ADDING.
 
         Releases the SSD reservation, drops the frozen batch cap, and
-        best-effort deletes the SSD-side dest entries (with files — the
-        bytes already live on the remote by operator claim and fuse verify
-        passed). Fuse-side entries are never deleted with files. Never
-        raises: a leftover partial only wastes SSD until the next janitor
-        pass; the state drive matters.
+        best-effort deletes the SSD-side dest entries. Files are only
+        deleted for entries whose save_path is under a configured SSD
+        root (`_save_path_on_ssd`); fuse entries and foreign/unknown
+        paths (other mounts, network shares, empty save_path) are removed
+        file-less so the preempt never deletes data we do not own.
+        Never raises: a leftover partial only wastes SSD until the next
+        janitor pass; the state drive matters.
         """
         try:
             await self._ssd_release(row.source_infohash or "")
@@ -401,17 +404,23 @@ class InjectMixin:
                     h = (getattr(entry, "hash", "") or "").lower()
                     if not h:
                         return
-                    on_fuse = False
+                    # Only a save_path proven to sit under a configured
+                    # SSD root owns local bytes. Fuse entries and any
+                    # foreign/unknown path (other disk, network share,
+                    # empty save_path) are removed file-less: `on_fuse`
+                    # alone is not ownership (audit A3).
+                    cfg = getattr(self, "cfg", None)
+                    save_path = getattr(entry, "save_path", "") or ""
+                    on_ssd = False
                     try:
-                        on_fuse = bool(self._save_path_is_on_fuse(
-                            getattr(entry, "save_path", "") or ""))
+                        on_ssd = bool(cfg is not None
+                                      and _save_path_on_ssd(cfg, save_path))
                     except Exception:
-                        on_fuse = False
-                    await rpc(dest.delete(h, delete_files=not on_fuse),
-                              getattr(self, "cfg", None),
-                              "injectfuse preempt delete")
-                    log.info("injectfuse: preempt removed SSD entry %s (delete_files=%s)",
-                             h[:10], not on_fuse)
+                        on_ssd = False
+                    await rpc(dest.delete(h, delete_files=on_ssd),
+                              cfg, "injectfuse preempt delete")
+                    log.info("injectfuse: preempt removed entry %s (delete_files=%s)",
+                             h[:10], on_ssd)
                 except Exception as e:  # noqa: BLE001
                     log.debug("injectfuse: preempt delete failed: %s", e)
 

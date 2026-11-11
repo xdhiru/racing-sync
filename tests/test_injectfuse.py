@@ -655,13 +655,13 @@ async def test_verify_members_run_concurrently(tmp_path):
 async def test_preempt_deletes_ssd_entry_under_rpc_budget(tmp_path):
     """Preempt lists + deletes under the RPC budget; SSD entry is dropped."""
     dest_h = "d" * 40
-    coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
+    coord, ssd, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     blob = _blob()
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
-    coord.dest_client.list_torrents = AsyncMock(return_value=[
-        _torrent(dest_h, TRACKER1),
-    ])
+    _ssd_entry = _torrent(dest_h, TRACKER1)
+    _ssd_entry.save_path = str(ssd)
+    coord.dest_client.list_torrents = AsyncMock(return_value=[_ssd_entry])
     coord.dest_client.delete = AsyncMock()
     try:
         coord.store.upsert(TorrentState(
@@ -673,7 +673,8 @@ async def test_preempt_deletes_ssd_entry_under_rpc_budget(tmp_path):
         coord.dest_client.delete.assert_awaited_once()
         _args, _kw = coord.dest_client.delete.call_args
         assert _args[0] == dest_h
-        # /vps1 is not a fuse mount: the SSD partial goes with files.
+        # A save_path under the configured SSD root is the one place a
+        # preempt may take partial bytes with it.
         assert _kw.get("delete_files") is True
     finally:
         coord.store.close()
