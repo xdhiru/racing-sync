@@ -18,6 +18,7 @@ directly; nothing here is itself a patch target.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import stat
@@ -49,6 +50,17 @@ log = logging.getLogger("racing_sync.coordinator")
 # Unreadable-mount parks before a MOVING row fails for operator
 # attention (errno-None OSErrors never heal by retrying).
 _MOVE_ERRNO_FAIL_PARKS = 10
+
+# Durable MOVING checkpoints. The order is delete -> cleanup -> transition
+# (kept from the historic ordering), so a crash at any point can be replayed
+# idempotently without re-listing/re-pausing a client entry that may be gone.
+_MOVE_STAGE_MOVED = "moved"
+_MOVE_STAGE_ENTRY_DELETED = "entry_deleted"
+_MOVE_STAGE_WIPED = "wiped"
+_MOVE_STAGES = frozenset({
+    _MOVE_STAGE_MOVED, _MOVE_STAGE_ENTRY_DELETED, _MOVE_STAGE_WIPED,
+})
+_MOVE_PLAN_VERSION = 1
 
 
 class MoveMixin:
@@ -373,8 +385,394 @@ class MoveMixin:
             pass
         return None
 
+    # ---- durable MOVING checkpoint ----
+
+    def _persist_move_stage(self, ts: TorrentState, stage: str,
+                            plan: str | None = None) -> bool:
+        """Checkpoint a move stage under a narrow MOVING-guarded write.
+
+        Returns False (and leaves the in-memory row at its previous stage)
+        when the row moved underneath us, is tombstoned, or the write fails.
+        Callers must then park without any further destructive action.
+        """
+        stage = (stage or "").strip().lower()
+        prev_stage = str(getattr(ts, "move_stage", "") or "")
+        prev_plan = str(getattr(ts, "move_plan", "") or "")
+        new_plan = prev_plan if plan is None else str(plan)
+        ts.move_stage = stage
+        ts.move_plan = new_plan
+        _up = getattr(self.store, "update_columns", None)
+        if not callable(_up):
+            ts.move_stage, ts.move_plan = prev_stage, prev_plan
+            return False
+        try:
+            _nv = _up(
+                (ts.source_infohash or ""),
+                {"move_stage": stage, "move_plan": new_plan},
+                expected_state=State.MOVING,
+            )
+        except Exception:  # noqa: BLE001
+            ts.move_stage, ts.move_plan = prev_stage, prev_plan
+            return False
+        if isinstance(_nv, int):
+            if _nv > 0:
+                try:
+                    ts.version = _nv
+                except Exception:
+                    pass
+                return True
+            # Row vanished / state changed / tombstoned: never overwrite a
+            # concurrent state. Keep memory at the last durable value.
+            ts.move_stage, ts.move_plan = prev_stage, prev_plan
+            return False
+        # Non-int return from a test double: best-effort success.
+        return True
+
+    def _configured_ssd_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        for raw in (
+            getattr(getattr(self, "cfg", None), "ssd", None) is not None
+            and getattr(self.cfg.ssd, "path", None),
+            getattr(getattr(self, "cfg", None), "dest", None) is not None
+            and getattr(self.cfg.dest, "save_path", None),
+        ):
+            try:
+                if not raw:
+                    continue
+                p = Path(raw).resolve()
+            except (TypeError, ValueError, OSError):
+                continue
+            if p not in roots:
+                roots.append(p)
+        return roots
+
+    def _move_checkpoint_root(self, ts: TorrentState) -> Path:
+        """Resolve+validate the SSD root a persisted move plan refers to."""
+        _raw = getattr(ts, "save_path", "") or ""
+        if not _raw:
+            _raw = getattr(getattr(self.cfg, "dest", None), "save_path", "")
+        try:
+            root = Path(_raw).resolve()
+        except (TypeError, ValueError, OSError) as e:
+            raise ValueError(f"invalid SSD root {_raw!r}: {e}") from e
+        roots = self._configured_ssd_roots()
+        if not roots:
+            raise ValueError("no configured SSD root is available")
+        if not any(root == r or root.is_relative_to(r) for r in roots):
+            raise ValueError(f"SSD root {root} is outside the configured roots")
+        try:
+            if not root.exists():
+                raise ValueError(f"SSD root {root} is missing/unavailable")
+        except OSError as e:
+            raise ValueError(f"SSD root {root} is unreadable: {e}") from e
+        return root
+
+    @staticmethod
+    def _plan_rel_path(root: Path, rel: object, label: str) -> Path:
+        """Join+validate one relative plan path under `root` (no symlinks)."""
+        if not isinstance(rel, str) or not rel:
+            raise ValueError(f"{label} path is not a non-empty string")
+        joined = _safe_ssd_join(root, rel)
+        if joined is None:
+            raise ValueError(
+                f"{label} path {rel!r} is absolute or traverses outside the SSD root")
+        norm = rel.replace("\\", "/").strip("/")
+        cur = root
+        try:
+            for part in norm.split("/"):
+                if not part:
+                    continue
+                cur = cur / part
+                if cur.is_symlink():
+                    raise ValueError(f"{label} path {rel!r} contains a symlink")
+            resolved = joined.resolve()
+        except OSError as e:
+            raise ValueError(f"{label} path {rel!r} is unreadable: {e}") from e
+        if resolved != root and not resolved.is_relative_to(root):
+            raise ValueError(f"{label} path {rel!r} escapes the SSD root")
+        return joined
+
+    def _load_move_plan(
+        self, ts: TorrentState, stage: str,
+    ) -> tuple[Path, dict] | None:
+        """Parse, schema-check and path-validate the persisted move plan.
+
+        Any failure parks the row with an operator-visible reason and
+        returns None: there is no safe cleanup without a trustworthy plan.
+        """
+        raw = str(getattr(ts, "move_plan", "") or "").strip()
+        if not raw:
+            self._park_moving(
+                ts,
+                f"move checkpoint {stage!r} has no plan; refusing unsafe wipe",
+            )
+            return None
+        try:
+            plan = json.loads(raw)
+        except Exception as e:  # noqa: BLE001
+            self._park_moving(
+                ts,
+                f"move checkpoint {stage!r} plan is corrupt (invalid JSON: {e}); "
+                f"refusing unsafe wipe",
+            )
+            return None
+        if not isinstance(plan, dict):
+            self._park_moving(
+                ts,
+                f"move checkpoint {stage!r} plan is corrupt (not an object); "
+                f"refusing unsafe wipe",
+            )
+            return None
+        try:
+            version = plan.get("version")
+            if version != _MOVE_PLAN_VERSION:
+                raise ValueError(f"unsupported plan version {version!r}")
+            layout = plan.get("layout")
+            if layout not in ("folder", "flat"):
+                raise ValueError(f"unknown layout {layout!r}")
+            keep = plan.get("keep", [])
+            flat = plan.get("flat", [])
+            folder = plan.get("folder", "")
+            if not isinstance(keep, list) or not all(
+                    isinstance(v, str) for v in keep):
+                raise ValueError("keep is not a list of strings")
+            if not isinstance(flat, list) or not all(
+                    isinstance(v, str) for v in flat):
+                raise ValueError("flat is not a list of strings")
+            if not isinstance(folder, str):
+                raise ValueError("folder is not a string")
+            if layout == "folder" and not folder.strip("/").strip():
+                raise ValueError("folder layout has no folder")
+        except ValueError as e:
+            self._park_moving(
+                ts,
+                f"move checkpoint {stage!r} plan is corrupt ({e}); "
+                f"refusing unsafe wipe",
+            )
+            return None
+        try:
+            root = self._move_checkpoint_root(ts)
+        except ValueError as e:
+            self._park_moving(
+                ts,
+                f"move checkpoint {stage!r} cannot be replayed: {e}; "
+                f"refusing cleanup without the SSD root",
+            )
+            return None
+        try:
+            if layout == "folder":
+                self._plan_rel_path(root, folder, "folder")
+            for rel in keep:
+                self._plan_rel_path(root, rel, "keep")
+            for rel in flat:
+                self._plan_rel_path(root, rel, "flat")
+        except ValueError as e:
+            self._park_moving(
+                ts,
+                f"move checkpoint {stage!r} plan is unsafe ({e}); "
+                f"refusing unsafe wipe",
+            )
+            return None
+        return root, {
+            "layout": layout,
+            "folder": folder,
+            "keep": list(keep),
+            "flat": list(flat),
+        }
+
+    def _build_move_plan(
+        self, src_dir: Path, folder: Path | None, keep: set[str],
+        flat: list[str],
+    ) -> str:
+        """Build+validate the compact relative-path cleanup plan."""
+        src_real = src_dir.resolve()
+
+        def _rel(p: Path) -> str | None:
+            try:
+                r = p.resolve().relative_to(src_real)
+            except (ValueError, OSError):
+                return None
+            return str(r).replace("\\", "/")
+
+        folder_rel = ""
+        if folder is not None:
+            try:
+                if folder.exists() and folder.resolve() != src_real:
+                    folder_rel = _rel(folder) or ""
+            except OSError:
+                folder_rel = ""
+        layout = "folder" if folder_rel else "flat"
+        keep_rel = sorted({
+            k for k in (keep or set())
+            if isinstance(k, str) and k
+        })
+        flat_rel: list[str] = []
+        seen: set[str] = set()
+        for rel in flat or []:
+            if not isinstance(rel, str) or not rel or rel in seen:
+                continue
+            if _safe_ssd_join(src_dir, rel) is None:
+                continue
+            seen.add(rel)
+            flat_rel.append(rel)
+        plan = {
+            "version": _MOVE_PLAN_VERSION,
+            "layout": layout,
+            "folder": folder_rel if layout == "folder" else "",
+            "keep": keep_rel,
+            "flat": flat_rel if layout == "flat" else [],
+        }
+        for rel in [*plan["keep"], *plan["flat"]]:
+            if _safe_ssd_join(src_dir, rel) is None:
+                raise ValueError(f"unsafe move plan path {rel!r}")
+        if plan["folder"] and _safe_ssd_join(src_dir, plan["folder"]) is None:
+            raise ValueError(f"unsafe move plan folder {plan['folder']!r}")
+        return json.dumps(plan, separators=(",", ":"), sort_keys=True)
+
+    def _finish_moving_tracking(self, ts: TorrentState) -> None:
+        """Drop the check-watch and settle-recheck hold before RE_ADDING."""
+        try:
+            _csd = getattr(self, "_checking_track", None)
+            if isinstance(_csd, dict):
+                _csd.pop((ts.source_infohash or "").lower(), None)
+        except Exception:
+            pass
+        self._release_recheck_holder(ts)
+
+    async def _cleanup_move_checkpoint(
+        self, ts: TorrentState,
+        loaded: tuple[Path, dict] | None = None,
+    ) -> bool:
+        """Run (or retry) the persisted cleanup. True only when fully done."""
+        if loaded is None:
+            stage = (ts.move_stage or "").strip().lower() or _MOVE_STAGE_MOVED
+            loaded = self._load_move_plan(ts, stage)
+            if loaded is None:
+                return False
+        root, plan = loaded
+        stage = (ts.move_stage or "").strip().lower() or _MOVE_STAGE_ENTRY_DELETED
+        if plan["layout"] == "folder":
+            folder = _safe_ssd_join(root, plan["folder"])
+            if folder is None:
+                self._park_moving(
+                    ts,
+                    f"move checkpoint {stage!r} folder is unsafe; "
+                    f"refusing unsafe wipe",
+                )
+                return False
+            try:
+                if not folder.exists():
+                    return True
+                if plan["keep"]:
+                    if not await self._wipe_folder_except(
+                            folder, set(plan["keep"]), root):
+                        self._park_moving(
+                            ts,
+                            f"folder wipe left file(s) it owns under "
+                            f"{plan['folder']}; staying at entry_deleted "
+                            f"without advancing",
+                        )
+                        return False
+                else:
+                    log.info("deleting content folder after move: %s", folder)
+                    from . import coordinator as _coordinator
+
+                    await _coordinator.wipe_local_tree(
+                        folder,
+                        base_dir=[self.cfg.ssd.path, Path(self.cfg.dest.save_path)],
+                    )
+            except OSError as e:
+                self._park_moving(
+                    ts,
+                    f"folder wipe failed after move ({e}); staying at "
+                    f"entry_deleted without advancing",
+                )
+                return False
+            return True
+        failed: list[str] = []
+        for rel in plan["flat"]:
+            p = _safe_ssd_join(root, rel)
+            if p is None:
+                failed.append(rel)
+                continue
+            try:
+                if p.is_symlink():
+                    failed.append(rel)
+                    continue
+                if not p.exists():
+                    continue
+                if not p.is_file():
+                    failed.append(rel)
+                    continue
+                p.unlink()
+                log.info("removed leftover shell %s after single move", rel)
+            except OSError:
+                failed.append(rel)
+        if failed:
+            self._park_moving(
+                ts,
+                f"flat cleanup left {len(failed)} file(s) it owns "
+                f"(e.g. {failed[0]}); staying at entry_deleted without advancing",
+            )
+            return False
+        return True
+
+    async def _replay_move_checkpoint(self, ts: TorrentState, stage: str) -> None:
+        """Replay a durable move stage without re-listing/pausing the client."""
+        h = ts.dest_infohash or ts.source_infohash
+        stage = (stage or "").strip().lower()
+        if stage not in _MOVE_STAGES:
+            self._park_moving(
+                ts,
+                f"unknown move checkpoint {stage!r}; refusing unsafe cleanup",
+            )
+            return
+        loaded = None
+        if stage in (_MOVE_STAGE_MOVED, _MOVE_STAGE_ENTRY_DELETED):
+            loaded = self._load_move_plan(ts, stage)
+            if loaded is None:
+                return
+        if stage == _MOVE_STAGE_MOVED:
+            try:
+                await self.dest_client.delete(h, delete_files=False)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "could not delete old torrent from client after move: %s", e)
+                self._park_moving(
+                    ts,
+                    f"client entry delete failed after move ({e}); staying in "
+                    f"MOVING with checkpoint 'moved'",
+                )
+                return
+            if not self._persist_move_stage(ts, _MOVE_STAGE_ENTRY_DELETED):
+                self._park_moving(
+                    ts,
+                    "could not persist move checkpoint 'entry_deleted'; "
+                    "staying in MOVING without cleaning up",
+                )
+                return
+            stage = _MOVE_STAGE_ENTRY_DELETED
+        if stage == _MOVE_STAGE_ENTRY_DELETED:
+            if not await self._cleanup_move_checkpoint(ts, loaded):
+                return
+            if not self._persist_move_stage(ts, _MOVE_STAGE_WIPED):
+                self._park_moving(
+                    ts,
+                    "could not persist move checkpoint 'wiped'; "
+                    "staying at entry_deleted without advancing",
+                )
+                return
+            stage = _MOVE_STAGE_WIPED
+        if stage == _MOVE_STAGE_WIPED:
+            self._finish_moving_tracking(ts)
+            self.transition(ts, State.RE_ADDING)
+
     async def _do_moving(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
+        _stage = str(getattr(ts, "move_stage", "") or "").strip().lower()
+        if _stage:
+            await self._replay_move_checkpoint(ts, _stage)
+            return
         try:
             cls_files = await self.dest_client.get_torrent_files(h)
         except Exception as e:  # noqa: BLE001
@@ -472,12 +870,15 @@ class MoveMixin:
             _pre = None
             _pre_state = ""
         if _pre is not None and not _pre:
-            # Empty list (not an error): the entry may be registering —
-            # but proceeding to pause a ghost entry is wrong. Park for
-            # the next tick instead of pausing nothing.
+            # Empty list (not an error). A stage-less row may be a legacy
+            # row whose entry was already deleted before the checkpoint
+            # existed: re-listing forever (or wiping blind) is unsafe, so
+            # fail closed with an explicit operator message. Checkpointed
+            # rows never reach this branch (replay runs at the top).
             self._park_moving(
                 ts,
-                "dest entry not listed before move; will retry on next tick",
+                "legacy MOVING row has no checkpoint; refusing unsafe wipe "
+                "(dest entry not listed before move)",
             )
             return
         try:
@@ -1589,24 +1990,7 @@ class MoveMixin:
             except Exception as e:  # noqa: BLE001
                 log.warning("could not persist cross-seed blob for %s: %s", h[:10], e)
 
-        # 7. Delete old torrent from VPS2 client (delete_files=False) before re-adding to FUSE.
-        # A failed delete parks (no wipe): the entry still exists, so the
-        # next tick retries instead of wiping toward a row whose client
-        # state no longer matches. Same for a failing folder wipe below —
-        # a fully-moved row must not FAILED over a releasable handle
-        # (Windows open-handle): park and retry.
-        try:
-            await self.dest_client.delete(h, delete_files=False)
-        except Exception as e:  # noqa: BLE001
-            log.warning("could not delete old torrent from client after move: %s", e)
-            self._park_moving(
-                ts,
-                f"client entry delete failed after move ({e}); staying in "
-                f"MOVING without wiping",
-            )
-            return
-
-        # 7b. Missing-but-client-complete gate: files the client calls
+        # 7. Missing-but-client-complete gate: files the client calls
         # complete yet absent from SSD must not be wiped past silently —
         # the fuse gate would park forever on unseedable bytes. Expected
         # absences are excluded first: files in already-moved batches
@@ -1679,86 +2063,105 @@ class MoveMixin:
                 ts, h,
                 f"{len(_desync)} client-complete file(s) missing on SSD "
                 f"(e.g. {_desync[0][0]}); data lost, not wiping",
-                delete_files=False)
+                delete_files=False, entry_hash=h)
             return
 
-        # 8. Delete local content folder on SSD after move
-        # (wipe resolves through the coordinator namespace: patched in
-        # tests as racing_sync.coordinator.wipe_local_tree.)
-        if folder and folder.resolve() != src_dir.resolve() and folder.exists():
-            if oversized_names:
-                # Foreign bytes share this folder: wipe per-file, sparing
-                # them (and their parent dirs), so sibling data survives.
-                await self._wipe_folder_except(folder, oversized_names, src_dir)
-            else:
-                log.info("deleting content folder after move: %s", folder)
-                from . import coordinator as _coordinator
-
-                try:
-                    await _coordinator.wipe_local_tree(
-                        folder,
-                        base_dir=[self.cfg.ssd.path, Path(self.cfg.dest.save_path)],
-                    )
-                except OSError as e:
-                    # Cleanup failure after a verified move: park, don't fail
-                    # the fully-moved row (retry converges when the handle
-                    # releases; the ERROR escalation pages if it never does).
-                    self._park_moving(
-                        ts,
-                        f"folder wipe failed after move ({e}); staying in "
-                        f"MOVING without advancing",
-                    )
-                    return
-        elif uncertain_files:
-            # Flat/single layouts have no folder to wipe: leftover shells
-            # (deselected preallocated data, never moved) would leak on SSD
-            # forever. Unlink this torrent's own uncertain files (files
-            # only, save-path-contained, never oversized-foreign).
-            for _uf in uncertain_files:
-                try:
-                    _unm = getattr(_uf, "name", "") or ""
-                    _up = _safe_ssd_join(src_dir, _unm)
-                    if _up is None:
-                        continue
-                    try:
-                        _urel = str(_up.relative_to(src_dir)).replace("\\", "/")
-                    except ValueError:
-                        continue
-                    if _urel in oversized_names:
-                        continue
-                    if _up.is_symlink() or not _up.is_file():
-                        continue
-                    _up.unlink()
-                    log.info("removed leftover shell %s after single move", _unm)
-                except OSError:
+        # 8. Build and persist the cleanup plan BEFORE deleting the client
+        # entry. A failed checkpoint write parks with nothing destroyed.
+        _flat_names: list[str] = []
+        for _uf in uncertain_files:
+            try:
+                _unm = getattr(_uf, "name", "") or ""
+                _up = _safe_ssd_join(src_dir, _unm)
+                if _up is None:
                     continue
-
+                _urel = str(_up.relative_to(src_dir)).replace("\\", "/")
+                if _urel in oversized_names:
+                    continue
+                if _up.is_symlink() or not _up.is_file():
+                    continue
+                _flat_names.append(_urel)
+            except (OSError, ValueError, AttributeError):
+                continue
         try:
-            _csd = getattr(self, "_checking_track", None)
-            if isinstance(_csd, dict):
-                _csd.pop((ts.source_infohash or "").lower(), None)
-        except Exception:
-            pass
-        self._release_recheck_holder(ts)
+            _plan_json = self._build_move_plan(
+                src_dir, folder, oversized_names, _flat_names)
+        except Exception as e:  # noqa: BLE001
+            self._park_moving(
+                ts,
+                f"could not build a safe move plan ({e}); staying in "
+                f"MOVING without deleting or wiping",
+            )
+            return
+        if not self._persist_move_stage(ts, _MOVE_STAGE_MOVED, _plan_json):
+            self._park_moving(
+                ts,
+                "could not persist the move checkpoint ('moved'); staying in "
+                "MOVING without deleting or wiping",
+            )
+            return
+
+        # 9. Delete old torrent from VPS2 client (delete_files=False) before
+        # re-adding to FUSE. A failed delete parks at 'moved' (no wipe): the
+        # next tick replays the delete only. Same for the cleanup below �?"
+        # a fully-moved row must not FAILED over a releasable handle
+        # (Windows open-handle): park and retry from the checkpoint.
+        try:
+            await self.dest_client.delete(h, delete_files=False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not delete old torrent from client after move: %s", e)
+            self._park_moving(
+                ts,
+                f"client entry delete failed after move ({e}); staying in "
+                f"MOVING with checkpoint 'moved'",
+            )
+            return
+        if not self._persist_move_stage(ts, _MOVE_STAGE_ENTRY_DELETED):
+            self._park_moving(
+                ts,
+                "could not persist move checkpoint 'entry_deleted'; staying "
+                "in MOVING without cleaning up",
+            )
+            return
+
+        # 10. Delete local content on SSD; checkpoint 'wiped' only when the
+        # cleanup is fully done (partial wipes stay at 'entry_deleted').
+        if not await self._cleanup_move_checkpoint(ts):
+            return
+        if not self._persist_move_stage(ts, _MOVE_STAGE_WIPED):
+            self._park_moving(
+                ts,
+                "could not persist move checkpoint 'wiped'; staying at "
+                "entry_deleted without advancing",
+            )
+            return
+
+        self._finish_moving_tracking(ts)
         self.transition(ts, State.RE_ADDING)
 
     async def _wipe_folder_except(self, folder: Path, keep: set[str],
-                                    src_dir: Path) -> None:
+                                    src_dir: Path) -> bool:
         """Wipe a moved folder but spare foreign (oversized) files.
 
         Deletes every file under `folder` except the keep set (SSD-relative
         posix names, matched exactly or as a parent dir), then removes dirs
-        left empty. Best-effort and off-loop; failures only warn — the row
-        already completed its move.
+        left empty. Returns False when an owned file could not be removed —
+        callers must park at `entry_deleted` rather than claim a clean wipe.
         """
         log.info("wiping moved folder except %d foreign file(s): %s",
                  len(keep), folder)
 
-        def _sweep() -> None:
+        def _kept(rel: str) -> bool:
+            return any(rel == _k or _k.startswith(rel + "/")
+                       for _k in keep)
+
+        def _sweep() -> bool:
             try:
                 _paths = sorted(folder.rglob("*"), reverse=True)
-            except OSError:
-                return
+            except OSError as e:
+                log.warning("cannot list %s for per-file wipe: %s", folder, e)
+                return False
+            clean = True
             for _p in _paths:
                 try:
                     if _p.is_symlink():
@@ -1769,24 +2172,44 @@ class MoveMixin:
                         continue
                     if not _rel or _rel == ".":
                         continue
-                    _kept = any(_rel == _k or _k.startswith(_rel + "/")
-                                for _k in keep)
-                    if _kept:
+                    if _kept(_rel):
                         continue
                     if _p.is_file():
-                        _p.unlink()
+                        try:
+                            _p.unlink()
+                        except OSError as e:
+                            log.warning("could not remove %s: %s", _p, e)
+                            clean = False
                     elif _p.is_dir():
                         try:
                             _p.rmdir()
                         except OSError:
                             pass
                 except OSError:
+                    clean = False
                     continue
+            # Post-check: any file we own that survived (e.g. a failed
+            # unlink that returned quietly) means the wipe is not done.
+            try:
+                for _p in folder.rglob("*"):
+                    try:
+                        if _p.is_symlink() or not _p.is_file():
+                            continue
+                        _rel = str(_p.relative_to(src_dir)).replace("\\", "/")
+                    except (OSError, ValueError):
+                        continue
+                    if _rel and _rel != "." and not _kept(_rel):
+                        clean = False
+                        break
+            except OSError:
+                return False
+            return clean
 
         try:
-            await asyncio.to_thread(_sweep)
+            return bool(await asyncio.to_thread(_sweep))
         except Exception as e:  # noqa: BLE001
             log.warning("per-file wipe of %s failed: %s", folder, e)
+            return False
 
     async def _rclone_move(
         self,

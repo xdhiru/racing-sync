@@ -695,6 +695,65 @@ async def test_fix_orphan_glob_escape_matches_special_characters(tmp_path: Path)
 
 
 @pytest.mark.anyio
+async def test_fix_orphan_respects_moving_checkpoint(tmp_path: Path):
+    """A checkpointed MOVING row must not be inferred as RE_ADDING/FAILED."""
+    from racing_sync.recovery import fix_orphan
+
+    store = StateStore(tmp_path / "state.db")
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    cfg = MagicMock()
+    cfg.dest.save_path = ssd
+    cfg.ssd.path = ssd
+    cfg.rclone.fuse.mount = ssd / "fuse"
+    cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+
+    # No SSD content: content inference would otherwise say FAILED.
+    ts = TorrentState(
+        source_infohash="h4checkpoint" + "0" * 28, source_name="H4.Show",
+        state=State.MOVING, save_path=str(ssd),
+        move_stage="entry_deleted",
+        move_plan='{"version":1,"layout":"folder","folder":"H4.Show","keep":[],"flat":[]}',
+    )
+    store.upsert(ts)
+    dest = AsyncMock()
+    try:
+        res = await fix_orphan(ts, cfg, dest=dest, store=store)
+        assert res == State.MOVING.value
+        row = store.get(ts.source_infohash)
+        assert row.state == State.MOVING
+        assert row.move_stage == "entry_deleted"
+        assert row.move_plan == ts.move_plan
+        dest.list_torrents.assert_not_awaited()
+        dest.add_torrent.assert_not_awaited()
+        dest.delete.assert_not_awaited()
+    finally:
+        store.close()
+
+
+def test_force_state_clears_move_checkpoint(tmp_path: Path):
+    from racing_sync.recovery import _force_state
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        ts = TorrentState(
+            source_infohash="h4force" + "0" * 33, source_name="H4.Force",
+            state=State.MOVING, move_stage="wiped",
+            move_plan='{"version":1,"layout":"flat","folder":"","keep":[],"flat":[]}',
+        )
+        store.upsert(ts)
+        row = store.get(ts.source_infohash)
+        _force_state(store, row, State.FAILED, error="forced by recovery")
+        assert row.move_stage == "" and row.move_plan == ""
+        reloaded = store.get(ts.source_infohash)
+        assert reloaded.state == State.FAILED
+        assert reloaded.last_error == "forced by recovery"
+        assert reloaded.move_stage == "" and reloaded.move_plan == ""
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_reconcile_preserves_parked_waiting_indexer(tmp_path: Path):
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)

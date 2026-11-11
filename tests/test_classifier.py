@@ -132,6 +132,10 @@ async def test_do_moving_missing_content_goes_readding(tmp_path: Path):
     from racing_sync.state import TorrentState, State
 
     cfg = _cfg()
+    # The row's save_path is a configured SSD root (as in production), so the
+    # persisted move plan/cleanup can be validated and replayed.
+    cfg.dest.save_path = tmp_path
+    cfg.ssd.path = tmp_path
     coord = make_coordinator()
     coord.cfg = cfg
     coord.dest_client = AsyncMock()

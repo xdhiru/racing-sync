@@ -195,6 +195,147 @@ def test_skipped_migrates_old_database(tmp_path: Path):
         store.close()
 
 
+def test_move_checkpoint_defaults_and_roundtrips(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    try:
+        assert TorrentState(source_infohash="a" * 40).move_stage == ""
+        assert TorrentState(source_infohash="a" * 40).move_plan == ""
+        ts = TorrentState(
+            source_infohash="b" * 40, state=State.MOVING,
+            move_stage="entry_deleted",
+            move_plan='{"version":1,"layout":"flat","folder":"","keep":[],"flat":[]}',
+        )
+        store.upsert(ts)
+        row = store.get("b" * 40)
+        assert row.move_stage == "entry_deleted"
+        assert row.move_plan == ts.move_plan
+        # Blob-less list paths carry the checkpoint too (replay source).
+        listed = store.list_by_state(State.MOVING)[0]
+        assert listed.move_stage == "entry_deleted"
+        assert listed.move_plan == ts.move_plan
+    finally:
+        store.close()
+
+
+def test_move_checkpoint_columns_migrate_old_database(tmp_path: Path):
+    """A DB predating the move checkpoint gains both columns on open."""
+    import sqlite3
+
+    from racing_sync.state import SCHEMA_TABLES
+
+    old_schema = "\n".join(
+        ln for ln in SCHEMA_TABLES.splitlines()
+        if "move_stage" not in ln and "move_plan" not in ln
+    )
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO torrent_state (source_infohash, state, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?)",
+        ("c" * 40, "moving", "2026-01-01T00:00:00+00:00",
+         "2026-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = StateStore(db)
+    try:
+        cols = [r[1] for r in store._conn.execute(
+            "PRAGMA table_info(torrent_state)").fetchall()]
+        assert "move_stage" in cols and "move_plan" in cols
+        row = store.get("c" * 40)
+        assert row.move_stage == "" and row.move_plan == ""
+        row.move_stage = "moved"
+        row.move_plan = "{}"
+        store.upsert(row)
+        reloaded = store.get("c" * 40)
+        assert (reloaded.move_stage, reloaded.move_plan) == ("moved", "{}")
+    finally:
+        store.close()
+
+
+def test_transition_clears_move_checkpoint_when_crossing_moving(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    try:
+        ts = TorrentState(
+            source_infohash="m" * 40, source_name="M", state=State.MOVING,
+            move_stage="wiped", move_plan='{"version":1}',
+        )
+        store.upsert(ts)
+        row = store.get("m" * 40)
+        store.transition(row, State.RE_ADDING)
+        assert row.move_stage == "" and row.move_plan == ""
+        reloaded = store.get("m" * 40)
+        assert reloaded.state == State.RE_ADDING
+        assert reloaded.move_stage == "" and reloaded.move_plan == ""
+
+        # A stale checkpoint on a pre-MOVING row is cleared on entry too.
+        stale = TorrentState(
+            source_infohash="n" * 40, source_name="N",
+            state=State.DOWNLOADING, move_stage="moved",
+            move_plan='{"version":1}',
+        )
+        store.upsert(stale)
+        row2 = store.get("n" * 40)
+        store.transition(row2, State.MOVING)
+        assert row2.move_stage == "" and row2.move_plan == ""
+        reloaded2 = store.get("n" * 40)
+        assert reloaded2.state == State.MOVING
+        assert reloaded2.move_stage == "" and reloaded2.move_plan == ""
+    finally:
+        store.close()
+
+
+def test_transition_restores_move_checkpoint_on_failed_write(
+        tmp_path: Path, monkeypatch):
+    store = StateStore(tmp_path / "state.db")
+    try:
+        ts = TorrentState(
+            source_infohash="f" * 40, source_name="F", state=State.MOVING,
+            move_stage="entry_deleted", move_plan='{"version":1}',
+        )
+        store.upsert(ts)
+        row = store.get("f" * 40)
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        monkeypatch.setattr(store, "_transition_write", _boom)
+        with pytest.raises(RuntimeError):
+            store.transition(row, State.RE_ADDING)
+        # Snapshot restored: memory matches the still-MOVING DB row.
+        assert row.state == State.MOVING
+        assert row.move_stage == "entry_deleted"
+        assert row.move_plan == '{"version":1}'
+        reloaded = store.get("f" * 40)
+        assert reloaded.state == State.MOVING
+        assert reloaded.move_stage == "entry_deleted"
+    finally:
+        store.close()
+
+
+def test_update_columns_move_checkpoint_guarded_by_moving(tmp_path: Path):
+    store = StateStore(tmp_path / "state.db")
+    try:
+        ts = TorrentState(source_infohash="g" * 40, state=State.MOVING)
+        store.upsert(ts)
+        assert store.update_columns(
+            "g" * 40, {"move_stage": "moved", "move_plan": "{}"},
+            expected_state=State.MOVING) > 0
+        assert store.get("g" * 40).move_stage == "moved"
+        # Concurrent state move: the checkpoint write must not clobber it.
+        row = store.get("g" * 40)
+        store.transition(row, State.RE_ADDING)
+        assert store.update_columns(
+            "g" * 40, {"move_stage": "wiped"}, expected_state=State.MOVING) == 0
+        reloaded = store.get("g" * 40)
+        assert reloaded.state == State.RE_ADDING
+        assert reloaded.move_stage == ""
+    finally:
+        store.close()
+
+
 def test_indexer_no_self_transition():
     # Re-parking bumps fields but should not go through transition().
     # The state machine still treats WAITING_INDEXER -> WAITING_INDEXER

@@ -177,6 +177,11 @@ class TorrentState:
     vps1_last_activity_at: dt.datetime | None = None
     # Lifecycle
     state: State = State.NEW
+    # Durable MOVING checkpoint: "", "moved", "entry_deleted", "wiped".
+    # move_plan is compact JSON (relative paths only) describing the local
+    # cleanup that must still run after the dest entry is deleted.
+    move_stage: str = ""
+    move_plan: str = ""
     batch_index: int = 0
     batches_total: int = 0
     # Frozen per-torrent SSD batch cap (persisted so restarts keep the same
@@ -254,6 +259,8 @@ class TorrentState:
                 self.vps1_last_activity_at.isoformat()
                 if self.vps1_last_activity_at else "",
             "state": self.state.value,
+            "move_stage": self.move_stage,
+            "move_plan": self.move_plan,
             "batch_index": self.batch_index,
             "batches_total": self.batches_total,
             "batch_cap_bytes": self.batch_cap_bytes,
@@ -299,6 +306,8 @@ CREATE TABLE IF NOT EXISTS torrent_state (
     completed_at             TEXT NOT NULL DEFAULT '',
     vps1_last_activity_at    TEXT NOT NULL DEFAULT '',
     state                    TEXT NOT NULL,
+    move_stage               TEXT NOT NULL DEFAULT '',
+    move_plan                TEXT NOT NULL DEFAULT '',
     batch_index              INTEGER NOT NULL DEFAULT 0,
     batches_total            INTEGER NOT NULL DEFAULT 0,
     batch_cap_bytes          INTEGER NOT NULL DEFAULT 0,
@@ -353,7 +362,7 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = (
     "indexer_next_retry_at, indexer_attempts, force_direct, skipped, readd_first_attempted_at, "
     "readd_next_retry_at, readd_attempts, failed_retries, completed_at, "
     "vps1_last_activity_at, fuse_verified, public_export_first_attempted_at, "
-    "public_export_next_retry_at, public_export_attempts, state, batch_index, batches_total, batch_cap_bytes, readd_cycles, version, "
+    "public_export_next_retry_at, public_export_attempts, state, move_stage, move_plan, batch_index, batches_total, batch_cap_bytes, readd_cycles, version, "
     "last_error, created_at, updated_at, telegram_message_id, deleted_at"
 )
 
@@ -440,6 +449,8 @@ class StateStore:
             "ADD COLUMN public_export_first_attempted_at TEXT NOT NULL DEFAULT ''",
             "ADD COLUMN public_export_next_retry_at TEXT NOT NULL DEFAULT ''",
             "ADD COLUMN public_export_attempts INTEGER NOT NULL DEFAULT 0",
+            "ADD COLUMN move_stage TEXT NOT NULL DEFAULT ''",
+            "ADD COLUMN move_plan TEXT NOT NULL DEFAULT ''",
         ):
             try:
                 self._conn.execute(f"ALTER TABLE torrent_state {_ddl}")
@@ -1188,7 +1199,7 @@ class StateStore:
         # (SQLITE_FULL, locked, lost race) must leave the in-memory
         # object identical to the DB row.
         _snapshot = (
-            ts.state, ts.last_error,
+            ts.state, ts.last_error, ts.move_stage, ts.move_plan,
             ts.indexer_first_queried_at, ts.indexer_next_retry_at,
             ts.indexer_attempts, ts.readd_first_attempted_at,
             ts.readd_next_retry_at, ts.readd_attempts, ts.failed_retries,
@@ -1232,6 +1243,12 @@ class StateStore:
                 ts.state = dst
                 ts.last_error = error
                 ts.updated_at = now
+                if src == State.MOVING or dst == State.MOVING:
+                    # The move checkpoint is scoped to a single MOVING
+                    # episode: leaving it (or starting a fresh one) must
+                    # never replay a stale destructive plan.
+                    ts.move_stage = ""
+                    ts.move_plan = ""
                 if dst in (State.NEW, State.QUEUED):
                     ts.indexer_first_queried_at = None
                     ts.indexer_next_retry_at = None
@@ -1288,7 +1305,7 @@ class StateStore:
                     self._transition_write(ts, src, expected_version)
                     ts.version = expected_version + 1
         except Exception:
-            (ts.state, ts.last_error,
+            (ts.state, ts.last_error, ts.move_stage, ts.move_plan,
              ts.indexer_first_queried_at, ts.indexer_next_retry_at,
              ts.indexer_attempts, ts.readd_first_attempted_at,
              ts.readd_next_retry_at, ts.readd_attempts, ts.failed_retries,
@@ -1473,8 +1490,9 @@ class StateStore:
         "public_export_next_retry_at", "public_export_attempts",
         "fuse_verified", "force_direct", "skipped", "readd_first_attempted_at",
         "readd_next_retry_at", "readd_attempts", "failed_retries",
-        "completed_at", "vps1_last_activity_at", "state", "batch_index",
-        "batches_total", "batch_cap_bytes", "readd_cycles", "last_error",
+        "completed_at", "vps1_last_activity_at", "state", "move_stage",
+        "move_plan", "batch_index", "batches_total", "batch_cap_bytes",
+        "readd_cycles", "last_error",
         "telegram_message_id", "updated_at",
     })
 
@@ -1737,6 +1755,14 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
             else None
         ),
         state=_safe_state(row["state"]) if "state" in keys else State.NEW,
+        move_stage=(
+            str(row["move_stage"] or "")
+            if "move_stage" in keys else ""
+        ),
+        move_plan=(
+            str(row["move_plan"] or "")
+            if "move_plan" in keys else ""
+        ),
         batch_index=_safe_int(row["batch_index"]) if "batch_index" in keys else 0,
         batches_total=_safe_int(row["batches_total"]) if "batches_total" in keys else 0,
         batch_cap_bytes=_safe_int(row["batch_cap_bytes"]) if "batch_cap_bytes" in keys else 0,

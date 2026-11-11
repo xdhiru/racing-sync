@@ -39,7 +39,8 @@ class WatchdogMixin:
     """Tracker-death watchdog + sibling cascade (duck-typed ``self``)."""
 
     async def _fail_downloading_row(self, ts: TorrentState, h: str, error: str,
-                                    *, delete_files: bool = True) -> None:
+                                    *, delete_files: bool = True,
+                                    entry_hash: str | None = None) -> None:
         """Fail a DOWNLOADING row terminally and free its slot.
 
         Releases the SSD reservation (a FAILED row holds no budget),
@@ -85,7 +86,10 @@ class WatchdogMixin:
         except Exception:
             pass
         try:
-            _dh = (ts.dest_infohash or "").lower()
+            # `entry_hash` lets pre-delete callers (the MOVING preflight)
+            # identify the client entry even when dest_infohash was never
+            # persisted (legacy/public rows where source == dest).
+            _dh = (ts.dest_infohash or entry_hash or "").lower()
         except Exception:
             _dh = ""
         if _dh:

@@ -973,6 +973,11 @@ def _force_state(store: StateStore, ts: TorrentState, dst: State, *, error: str 
     longer allows from here); a non-empty error is preserved verbatim
     for operators, an empty one leaves last_error untouched.
     """
+    # Recovery decisions supersede any in-flight move checkpoint: a forced
+    # state must not leave a stale destructive plan behind for the next
+    # MOVING tick to replay.
+    ts.move_stage = ""
+    ts.move_plan = ""
     try:
         store.transition(ts, dst, error=error)
     except AbandonedError:
@@ -1049,6 +1054,15 @@ async def fix_orphan(
         return State.RE_ADDING.value
 
     if ts.state == State.MOVING:
+        if (ts.move_stage or "").strip():
+            # A durable checkpoint means the move already crossed the
+            # destructive boundary (entry deleted / SSD wiped). Only the
+            # coordinator can replay it safely; do not infer a new state
+            # from the SSD listing (which is expected to be empty).
+            log.info(
+                "orphan %s: move checkpoint %r present; leaving MOVING for replay",
+                h, ts.move_stage)
+            return State.MOVING.value
         src_path = Path(ts.save_path) if ts.save_path else Path(cfg.dest.save_path)
         # Torrent display name often differs from the on-disk top folder, so
         # prefer the exact file list decoded from the stored .torrent bytes.

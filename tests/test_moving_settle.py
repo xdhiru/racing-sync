@@ -804,6 +804,355 @@ def _moved_season_row(tmp_path):
     return coord, store, ssd
 
 
+def _checkpoint_fixture(tmp_path, stage, plan, *, files=None, ssd_exists=True):
+    """MOVING row with a persisted checkpoint; replay must not re-list it."""
+    import json
+
+    ssd = tmp_path / "ssd"
+    if ssd_exists:
+        ssd.mkdir(exist_ok=True)
+    for rel, data in (files or {}).items():
+        p = ssd / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = make_coordinator(store)
+    coord._stop = False
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    coord.cfg.rclone.remote.default = "remote:media"
+    coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+    coord.cfg.rclone.fuse.mount = ssd / "fuse"
+    coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+    coord.cfg.rclone.batch_move_extra_flags = []
+    coord.dest_client = AsyncMock()
+    coord.dest_client.delete = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(
+        side_effect=AssertionError("replay must not re-list files"))
+    coord.dest_client.list_torrents = AsyncMock(
+        side_effect=AssertionError("replay must not re-read client state"))
+    coord.dest_client.pause = AsyncMock(
+        side_effect=AssertionError("replay must not pause"))
+    coord.dest_client.resume = AsyncMock(
+        side_effect=AssertionError("replay must not resume"))
+    coord._rclone_move = AsyncMock()
+    ts = TorrentState(
+        source_infohash="c" * 40, source_name="Show.S01",
+        dest_infohash="c" * 40, save_path=str(ssd),
+        classification_kind="season", batches_total=1, batch_index=0,
+        state=State.MOVING, move_stage=stage,
+        move_plan=plan if isinstance(plan, str) else json.dumps(plan),
+    )
+    ts._blob = b"blob"
+    store.upsert(ts)
+    return coord, store, ssd
+
+
+@pytest.mark.anyio
+async def test_moving_wipe_failure_replays_from_checkpoint(tmp_path):
+    """Wipe failure parks at entry_deleted; retry cleans without re-listing."""
+    import shutil
+
+    coord, store, _ssd = _moved_season_row(tmp_path)
+    try:
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe:
+            mock_wipe.side_effect = PermissionError("open handle")
+            await coord._do_moving(store.get("w" * 40))
+        row = store.get("w" * 40)
+        assert row.state == State.MOVING
+        assert row.move_stage == "entry_deleted"
+        assert "open handle" in (row.last_error or "")
+        files_calls = coord.dest_client.get_torrent_files.await_count
+        list_calls = coord.dest_client.list_torrents.await_count
+        pause_calls = coord.dest_client.pause.await_count
+
+        async def _wipe_ok(path, *, base_dir=None):
+            shutil.rmtree(path)
+
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe2:
+            mock_wipe2.side_effect = _wipe_ok
+            await coord._do_moving(store.get("w" * 40))
+        row = store.get("w" * 40)
+        assert row.state == State.RE_ADDING
+        assert row.move_stage == "" and row.move_plan == ""
+        assert not (tmp_path / "ssd" / "Show.S01").exists()
+        # Replay never re-listed/re-paused the (already deleted) entry.
+        assert coord.dest_client.get_torrent_files.await_count == files_calls
+        assert coord.dest_client.list_torrents.await_count == list_calls
+        assert coord.dest_client.pause.await_count == pause_calls
+        assert coord.dest_client.delete.await_count == 1
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_delete_failure_retries_delete_only(tmp_path):
+    """Delete failure parks at 'moved'; retry deletes then cleans up."""
+    import shutil
+
+    coord, store, _ssd = _moved_season_row(tmp_path)
+    try:
+        coord.dest_client.delete = AsyncMock(side_effect=OSError("gone"))
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock):
+            await coord._do_moving(store.get("w" * 40))
+        row = store.get("w" * 40)
+        assert row.state == State.MOVING
+        assert row.move_stage == "moved"
+        files_calls = coord.dest_client.get_torrent_files.await_count
+        list_calls = coord.dest_client.list_torrents.await_count
+        pause_calls = coord.dest_client.pause.await_count
+
+        coord.dest_client.delete = AsyncMock()
+
+        async def _wipe_ok(path, *, base_dir=None):
+            shutil.rmtree(path)
+
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe:
+            mock_wipe.side_effect = _wipe_ok
+            await coord._do_moving(store.get("w" * 40))
+        row = store.get("w" * 40)
+        assert row.state == State.RE_ADDING
+        assert coord.dest_client.delete.await_count == 1
+        assert coord.dest_client.get_torrent_files.await_count == files_calls
+        assert coord.dest_client.list_torrents.await_count == list_calls
+        assert coord.dest_client.pause.await_count == pause_calls
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_replay_moved_retries_ambiguous_delete(tmp_path):
+    """Ambiguous delete: stay at 'moved' (no cleanup) and retry delete."""
+    plan = {"version": 1, "layout": "folder", "folder": "Show.S01",
+            "keep": [], "flat": []}
+    coord, store, ssd = _checkpoint_fixture(
+        tmp_path, "moved", plan,
+        files={"Show.S01/Show.S01E01.mkv": b"x" * 100})
+    try:
+        coord.dest_client.delete = AsyncMock(side_effect=OSError("timeout"))
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe:
+            await coord._do_moving(store.get("c" * 40))
+        row = store.get("c" * 40)
+        assert row.state == State.MOVING and row.move_stage == "moved"
+        assert (ssd / "Show.S01" / "Show.S01E01.mkv").exists()
+        mock_wipe.assert_not_awaited()
+
+        coord.dest_client.delete = AsyncMock()
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe2:
+            mock_wipe2.side_effect = lambda path, *, base_dir=None: (
+                __import__("shutil").rmtree(path))
+            await coord._do_moving(store.get("c" * 40))
+        row = store.get("c" * 40)
+        assert row.state == State.RE_ADDING
+        assert coord.dest_client.delete.await_count == 1
+        assert not (ssd / "Show.S01").exists()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_crash_after_delete_before_checkpoint(tmp_path):
+    """Stage 'moved' with the entry already gone: delete is idempotent."""
+    import shutil
+
+    plan = {"version": 1, "layout": "folder", "folder": "Show.S01",
+            "keep": [], "flat": []}
+    coord, store, ssd = _checkpoint_fixture(
+        tmp_path, "moved", plan,
+        files={"Show.S01/Show.S01E01.mkv": b"x" * 100})
+    try:
+        async def _wipe_ok(path, *, base_dir=None):
+            shutil.rmtree(path)
+
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe:
+            mock_wipe.side_effect = _wipe_ok
+            await coord._do_moving(store.get("c" * 40))
+        row = store.get("c" * 40)
+        assert row.state == State.RE_ADDING
+        assert row.move_stage == "" and row.move_plan == ""
+        coord.dest_client.delete.assert_awaited_once_with(
+            "c" * 40, delete_files=False)
+        assert not (ssd / "Show.S01").exists()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_crash_after_wipe_before_checkpoint(tmp_path):
+    """Stage 'entry_deleted' with the tree already gone: just checkpoint+advance."""
+    plan = {"version": 1, "layout": "folder", "folder": "Show.S01",
+            "keep": [], "flat": []}
+    coord, store, _ssd = _checkpoint_fixture(tmp_path, "entry_deleted", plan)
+    try:
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe:
+            await coord._do_moving(store.get("c" * 40))
+        row = store.get("c" * 40)
+        assert row.state == State.RE_ADDING
+        assert row.move_stage == ""
+        mock_wipe.assert_not_awaited()
+        coord.dest_client.delete.assert_not_awaited()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_partial_flat_wipe_stays_entry_deleted(tmp_path):
+    """One flat unlink failure keeps the checkpoint at entry_deleted."""
+    from pathlib import Path
+
+    plan = {"version": 1, "layout": "flat", "folder": "",
+            "keep": [], "flat": ["a.bin", "b.bin"]}
+    coord, store, ssd = _checkpoint_fixture(
+        tmp_path, "entry_deleted", plan,
+        files={"a.bin": b"a" * 10, "b.bin": b"b" * 10})
+    real_unlink = Path.unlink
+
+    def _flaky_unlink(self, *a, **k):
+        if self.name == "b.bin":
+            raise OSError("busy")
+        return real_unlink(self, *a, **k)
+
+    try:
+        with patch.object(Path, "unlink", _flaky_unlink):
+            await coord._do_moving(store.get("c" * 40))
+        row = store.get("c" * 40)
+        assert row.state == State.MOVING
+        assert row.move_stage == "entry_deleted"
+        assert not (ssd / "a.bin").exists()
+        assert (ssd / "b.bin").exists()
+        assert "flat cleanup left" in (row.last_error or "")
+
+        await coord._do_moving(store.get("c" * 40))
+        row = store.get("c" * 40)
+        assert row.state == State.RE_ADDING
+        assert not (ssd / "b.bin").exists()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_corrupt_plan_parks_without_wiping(tmp_path):
+    """Corrupt checkpoint JSON: operator-visible park, never a blind wipe."""
+    coord, store, ssd = _checkpoint_fixture(
+        tmp_path, "entry_deleted", "{not-json",
+        files={"Show.S01/Show.S01E01.mkv": b"x" * 100})
+    try:
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe:
+            await coord._do_moving(store.get("c" * 40))
+        row = store.get("c" * 40)
+        assert row.state == State.MOVING
+        assert row.move_stage == "entry_deleted"
+        assert "corrupt" in (row.last_error or "")
+        assert (ssd / "Show.S01" / "Show.S01E01.mkv").exists()
+        mock_wipe.assert_not_awaited()
+        coord.dest_client.delete.assert_not_awaited()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_plan_traversal_parks_without_wiping(tmp_path):
+    """Plan paths escaping the SSD root are rejected before any cleanup."""
+    outside = tmp_path / "escape.bin"
+    outside.write_bytes(b"keep me")
+    plan = {"version": 1, "layout": "flat", "folder": "",
+            "keep": [], "flat": ["../escape.bin"]}
+    coord, store, _ssd = _checkpoint_fixture(tmp_path, "entry_deleted", plan)
+    try:
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe:
+            await coord._do_moving(store.get("c" * 40))
+        row = store.get("c" * 40)
+        assert row.state == State.MOVING
+        assert row.move_stage == "entry_deleted"
+        assert "unsafe" in (row.last_error or "")
+        assert outside.exists()
+        mock_wipe.assert_not_awaited()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_missing_ssd_root_parks_without_wiping(tmp_path):
+    """A vanished SSD root parks instead of joining paths against nothing."""
+    plan = {"version": 1, "layout": "folder", "folder": "Show.S01",
+            "keep": [], "flat": []}
+    coord, store, _ssd = _checkpoint_fixture(
+        tmp_path, "entry_deleted", plan, ssd_exists=False)
+    try:
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe:
+            await coord._do_moving(store.get("c" * 40))
+        row = store.get("c" * 40)
+        assert row.state == State.MOVING
+        assert row.move_stage == "entry_deleted"
+        assert "SSD root" in (row.last_error or "")
+        mock_wipe.assert_not_awaited()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_legacy_empty_prelist_fails_closed(tmp_path):
+    """Stage-less row with an unlisted entry: explicit unsafe-wipe refusal."""
+    coord, store = _moving_single(tmp_path, progress=1.0)
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    try:
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe:
+            await coord._do_moving(store.get("s" * 40))
+        row = store.get("s" * 40)
+        assert row.state == State.MOVING
+        assert "legacy MOVING row has no checkpoint" in (row.last_error or "")
+        coord.dest_client.pause.assert_not_called()
+        coord.dest_client.delete.assert_not_called()
+        mock_wipe.assert_not_awaited()
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_moving_checkpoint_write_failure_parks_before_delete(tmp_path):
+    """A lost checkpoint write parks with no destructive action."""
+    coord, store, ssd = _moved_season_row(tmp_path)
+    original = store.update_columns
+
+    def _lose_move_write(h, mapping, *, expected_state=None,
+                         expected_version=None):
+        if isinstance(mapping, dict) and "move_stage" in mapping:
+            return 0
+        return original(h, mapping, expected_state=expected_state,
+                        expected_version=expected_version)
+
+    store.update_columns = _lose_move_write
+    try:
+        with patch("racing_sync.coordinator.wipe_local_tree",
+                   new_callable=AsyncMock) as mock_wipe:
+            await coord._do_moving(store.get("w" * 40))
+        row = store.get("w" * 40)
+        assert row.state == State.MOVING
+        assert row.move_stage == ""
+        assert "could not persist the move checkpoint" in (row.last_error or "")
+        coord.dest_client.delete.assert_not_called()
+        mock_wipe.assert_not_awaited()
+        assert (ssd / "Show.S01").exists()
+    finally:
+        store.update_columns = original
+        store.close()
+
+
 @pytest.mark.anyio
 async def test_moving_delete_fail_parks_without_wipe(tmp_path):
     """Post-move entry-delete failure parks (no wipe): the next tick
