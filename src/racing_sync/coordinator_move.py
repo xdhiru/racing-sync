@@ -1007,8 +1007,20 @@ class MoveMixin:
                     # file on the hot move path.
                     _st = file_path.stat()
                     _on_disk = _st.st_size if stat.S_ISREG(_st.st_mode) else -1
-                except OSError:
-                    _on_disk = -1
+                except OSError as e:
+                    # Transient stat failure (EACCES, ESTALE, fuse blip, AV
+                    # lock) says nothing about the bytes: classifying the
+                    # file as "short" would put it in incomplete_files and
+                    # step 3 would unlink a fully downloaded file. Treat it
+                    # as unverifiable instead — never moved, never deleted
+                    # (selected files also block the wipe in 5b).
+                    log.warning(
+                        "could not stat file %s on SSD (%s); leaving it "
+                        "unverified (never moved, never deleted)",
+                        f.name, e,
+                    )
+                    uncertain_files.append(f)
+                    continue
                 if _on_disk == (f.size_bytes or 0):
                     completed_files.append(f)
                     continue
@@ -1038,7 +1050,15 @@ class MoveMixin:
                 continue
             try:
                 on_disk = file_path.stat().st_size
-            except OSError:
+            except OSError as e:
+                # Same rule for the incomplete branch: a stat failure must
+                # not silently drop the file to the folder wipe unverified.
+                log.warning(
+                    "could not stat file %s on SSD (%s); leaving it "
+                    "unverified (never moved, never deleted)",
+                    f.name, e,
+                )
+                uncertain_files.append(f)
                 continue
             if on_disk < (f.size_bytes or 0):
                 incomplete_files.append(f)
