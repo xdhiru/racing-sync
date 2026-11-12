@@ -12,7 +12,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote_plus, urlsplit, urlunsplit
+from urllib.parse import quote_plus, urljoin, urlsplit, urlunsplit
 
 import aiohttp
 
@@ -82,6 +82,10 @@ log = logging.getLogger(__name__)
 # Upper bound for one Newznab feed payload (10 MiB): a bloated or
 # malicious indexer must not OOM the daemon via an uncapped r.text().
 _MAX_FEED_BYTES = 10 * 1024 * 1024
+
+# Upper bound for redirect hops followed by download_torrent. Redirects
+# are followed manually (see below) so every hop can be re-validated.
+_MAX_DOWNLOAD_REDIRECTS = 5
 
 #: Indexer-side transient statuses worth retrying (search, download,
 #: refresh). 500 included UNLIKE the torrent-client set in http_base:
@@ -464,52 +468,96 @@ class ProwlarrClient:
         # base_url) requires the key — without it same-host downloads 401.
         if not _is_fetchable_http_url(hit.download_url):
             raise ProwlarrError(f"refusing non-routable download_url: {safe_url!r}")
-        headers = None
+        # Compare origin as (scheme, host, effective port): a bare
+        # "host" vs "host:8080" (or userinfo/query/fragment smuggled
+        # into base_url) must not confuse the same-host key decision.
+        def _origin(p):
+            try:
+                port = p.port
+            except Exception:
+                port = None
+            if port is None:
+                port = 443 if p.scheme == "https" else 80
+            return (p.scheme.lower(), (p.hostname or "").lower(), port)
+
         try:
-            # Compare origin as (scheme, host, effective port): a bare
-            # "host" vs "host:8080" (or userinfo/query/fragment smuggled
-            # into base_url) must not confuse the same-host key decision.
-            _base = urlsplit(self._cfg.base_url)
-            def _origin(p):
-                try:
-                    port = p.port
-                except Exception:
-                    port = None
-                if port is None:
-                    port = 443 if p.scheme == "https" else 80
-                return (p.scheme.lower(), (p.hostname or "").lower(), port)
-            if _origin(parsed) == _origin(_base):
-                headers = self._auth_headers
+            _base_origin = _origin(urlsplit(self._cfg.base_url))
         except Exception:
-            headers = None
+            _base_origin = None
+
+        def _headers_for(url: str) -> dict[str, str] | None:
+            """Auth headers for one hop: the key only ever goes to Prowlarr."""
+            try:
+                if _base_origin is not None and _origin(urlsplit(url)) == _base_origin:
+                    return self._auth_headers
+            except Exception:
+                pass
+            return None
 
         last_exc: Exception | None = None
         data = b""
+        max_bytes = 20 * 1024 * 1024
         for attempt in range(3):
             try:
-                async with self._session.get(hit.download_url, headers=headers) as r:
-                    r.raise_for_status()
-                    content_length = r.headers.get("Content-Length")
-                    max_bytes = 20 * 1024 * 1024
-                    if content_length:
-                        cl = content_length.replace(",", "").strip()
-                        if cl.isdigit() and int(cl) > max_bytes:
-                            raise ProwlarrError(
-                                f"torrent download from {safe_url} exceeds max size: {content_length} bytes"
-                            )
-                    chunks: list[bytes] = []
-                    total = 0
-                    async for chunk in r.content.iter_chunked(64 * 1024):
-                        total += len(chunk)
-                        if total > max_bytes:
-                            raise ProwlarrError(
-                                f"torrent download from {safe_url} exceeded max size of {max_bytes} bytes"
-                            )
-                        chunks.append(chunk)
-                    data = b"".join(chunks)
+                # Follow redirects manually: aiohttp strips its own auth
+                # headers on a host change but NOT a custom X-Api-Key, and
+                # an automatic hop would bypass the URL gate above (SSRF to
+                # metadata/link-local hosts). Each hop is re-validated and
+                # its auth decision recomputed from scratch.
+                url = hit.download_url
+                headers = _headers_for(url)
+                redirects = 0
+                while True:
+                    async with self._session.get(
+                        url, headers=headers, allow_redirects=False
+                    ) as r:
+                        status = getattr(r, "status", None)
+                        if status in (301, 302, 303, 307, 308):
+                            redirects += 1
+                            if redirects > _MAX_DOWNLOAD_REDIRECTS:
+                                raise ProwlarrError(
+                                    f"torrent download from {safe_url} exceeded "
+                                    f"{_MAX_DOWNLOAD_REDIRECTS} redirects; refusing"
+                                )
+                            location = r.headers.get("Location")
+                            if not isinstance(location, str) or not location.strip():
+                                raise ProwlarrError(
+                                    f"torrent download from {safe_url} got a "
+                                    f"redirect without Location: {_scrub_url(url)!r}"
+                                )
+                            next_url = urljoin(url, location.strip())
+                            if not _is_fetchable_http_url(next_url):
+                                raise ProwlarrError(
+                                    f"torrent download from {safe_url} redirects to "
+                                    f"unsafe target: {_scrub_url(next_url)!r}"
+                                )
+                            url = next_url
+                            # Never carry headers across an origin change.
+                            headers = _headers_for(url)
+                            continue
+                        r.raise_for_status()
+                        content_length = r.headers.get("Content-Length")
+                        if content_length:
+                            cl = content_length.replace(",", "").strip()
+                            if cl.isdigit() and int(cl) > max_bytes:
+                                raise ProwlarrError(
+                                    f"torrent download from {safe_url} exceeds max size: {content_length} bytes"
+                                )
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in r.content.iter_chunked(64 * 1024):
+                            total += len(chunk)
+                            if total > max_bytes:
+                                raise ProwlarrError(
+                                    f"torrent download from {safe_url} exceeded max size of {max_bytes} bytes"
+                                )
+                            chunks.append(chunk)
+                        data = b"".join(chunks)
+                    break
                 break
             except ProwlarrError:
-                # Size-cap violations are local verdicts, not retryable.
+                # Size-cap violations and bad redirects are local verdicts,
+                # not retryable.
                 raise
             except aiohttp.ClientResponseError as e:
                 # Rate-limit / gateway hiccups mirror the search retry set
