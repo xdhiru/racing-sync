@@ -1294,6 +1294,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     unregister_handle(self, _handle)
             except Exception:
                 pass
+            # Retrieve the result: an unretrieved exception (AbandonedError,
+            # a real crash) would otherwise surface only as "Task exception
+            # was never retrieved" at GC. Never re-raise here.
+            if not t.cancelled():
+                try:
+                    exc = t.exception()
+                except BaseException:
+                    exc = None
+                if exc is not None:
+                    log.debug("worker for %s ended with %r",
+                              (infohash or "")[:10], exc)
         task.add_done_callback(_done_cb)
 
     async def stop_workers_for(self, infohash: str) -> bool:
