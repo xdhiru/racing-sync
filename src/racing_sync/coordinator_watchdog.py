@@ -109,11 +109,31 @@ class WatchdogMixin:
             pass
         try:
             self.transition(ts, State.FAILED, error=error[:500])
-        except (AbandonedError, ValueError):
+        except AbandonedError:
+            # Row forgotten (hard-deleted/tombstoned) or moved concurrently
+            # while we were failing it: force-writing would upsert-resurrect
+            # a hard-deleted row as a zombie FAILED row (tombstoned rows are
+            # refused by upsert, hard-deleted ones are not). Never do it.
+            log.debug("row abandoned while failing %s; not resurrecting",
+                      (h or ts.source_infohash or "")[:10])
+            return
+        except ValueError:
             # Force-assign fallback for rows the guarded write refuses
-            # (concurrent move / tombstone race): assert the edge is legal
-            # first, so a programming error (e.g. failing a DONE row) still
-            # raises loudly instead of writing an illegal state silently.
+            # (concurrent move): re-read first so a row deleted since the
+            # abandon pre-check is not resurrected by the upsert.
+            try:
+                still_there = self.store.get(ts.source_infohash) is not None
+            except Exception:
+                # Fail open on a read blip: the guarded write just failed for
+                # a non-abandon reason, so keep the historic force-write path.
+                still_there = True
+            if not still_there:
+                log.debug("row vanished while failing %s; not resurrecting",
+                          (h or ts.source_infohash or "")[:10])
+                return
+            # Assert the edge is legal first, so a programming error (e.g.
+            # failing a DONE row) still raises loudly instead of writing an
+            # illegal state silently.
             check_transition(ts.state, State.FAILED)
             try:
                 ts.state = State.FAILED
