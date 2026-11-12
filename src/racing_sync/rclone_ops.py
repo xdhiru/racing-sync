@@ -948,13 +948,28 @@ async def _move_source_has_files(local: Path, files_from: list[str] | None) -> b
         return True
 
 
+def _norm_listed_path(name: str) -> str:
+    """Normalize a remote listing path / files_from entry for comparison."""
+    norm = name.replace("\\", "/").strip()
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm.strip("/")
+
+
 async def _remote_has_bytes(
     cfg: AppConfig, dest_remote: str, files_from: list[str] | None,
 ) -> bool:
-    """True when the remote already holds the move's bytes (lsf verify)."""
+    """True when the remote already holds the move's bytes (recursive lsf verify).
+
+    Lists the remote recursively (``lsf -R --files-only``) so nested torrent
+    paths (``Show/Season/ep.mkv``) are visible, and compares normalized
+    relative paths. With ``files_from`` the verify only succeeds when EVERY
+    wanted file is present in the listing; a non-empty recursive listing means
+    bytes exist when no explicit file list is given.
+    """
     try:
         res = await run_rclone(
-            cfg, ["lsf", "--files-only", dest_remote],
+            cfg, ["lsf", "-R", "--files-only", dest_remote],
             timeout=120.0, tree=None)
     except Exception as e:  # noqa: BLE001
         log.warning("rclone lsf verify of %s failed: %s", dest_remote, e)
@@ -962,14 +977,16 @@ async def _remote_has_bytes(
     if res.returncode != 0:
         return False
     try:
-        names = {ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()}
+        names = {_norm_listed_path(ln) for ln in (res.stdout or "").splitlines()}
     except Exception:
         return False
+    names.discard("")
     if not names:
         return False
     if files_from is not None:
-        want = {n.replace("\\", "/").strip("/") for n in files_from if n}
-        return bool(want & names)
+        want = {_norm_listed_path(n) for n in files_from}
+        want.discard("")
+        return bool(want) and want <= names
     return True
 
 
