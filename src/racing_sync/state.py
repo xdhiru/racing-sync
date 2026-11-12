@@ -352,6 +352,10 @@ CREATE INDEX IF NOT EXISTS ix_active_updated ON torrent_state(updated_at)
     WHERE deleted_at = '';
 """
 
+# Convenience concatenation for fresh databases only. Upgrade paths must
+# NOT use this order: StateStore.__init__ runs SCHEMA_TABLES, then the ALTER
+# migrations, then SCHEMA_INDEXES, because some indexes reference columns
+# that only the migrations add to pre-1.0.0 tables.
 SCHEMA = SCHEMA_TABLES + SCHEMA_INDEXES
 
 
@@ -426,11 +430,14 @@ class StateStore:
         except Exception:
             pass
         self._conn.executescript(SCHEMA_TABLES)
-        self._conn.executescript(SCHEMA_INDEXES)
         # Columns added after 1.0.0: existing DBs predate them. CREATE TABLE
         # IF NOT EXISTS never backfills, so migrate idempotently here.
         # _row_to_state tolerates missing columns on read, but upsert INSERTs
         # every column and would OperationalError on an old DB.
+        # This MUST run before SCHEMA_INDEXES: ix_public_export_retry and
+        # ix_active_updated reference columns that only the ALTERs add, so
+        # indexing a pre-1.0.0 DB first raises "no such column" and the
+        # daemon cannot start.
         for _ddl in (
             "ADD COLUMN force_direct INTEGER NOT NULL DEFAULT 0",
             "ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0",
@@ -459,6 +466,9 @@ class StateStore:
                 # else (readonly, full-disk, corrupt) must be loud.
                 if "duplicate column" not in str(e).lower():
                     log.warning("state DB migration %r failed: %s", _ddl, e)
+        # Indexes last: they need every migrated column above. Existing DBs
+        # may also be missing an index whose columns only just appeared.
+        self._conn.executescript(SCHEMA_INDEXES)
         # Retired states: QUERYING was folded into WAITING_INDEXER (the
         # wakeup hop that created it is gone; workers handle timer-elapsed
         # WAITING_INDEXER rows directly). A pre-upgrade row parked there
