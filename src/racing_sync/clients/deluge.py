@@ -156,36 +156,56 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     if not check_data.get("result"):
                         hosts_payload = {"method": "web.get_hosts", "params": [], "id": 3}
                         async with self.session.post("json", json=hosts_payload) as hr:
-                            if hr.status == 200:
-                                hdata = await hr.json()
-                                hosts = hdata.get("result") or []
-                                if hosts:
-                                    host_id = hosts[0][0]
-                                    connect_payload = {
-                                        "method": "web.connect",
-                                        "params": [host_id],
-                                        "id": 4,
-                                    }
-                                    async with self.session.post("json", json=connect_payload) as cr:
-                                        try:
-                                            cdata = await cr.json()
-                                        except Exception:
-                                            cdata = {}
-                                        if isinstance(cdata, dict) and cdata.get("error"):
-                                            raise AuthError(
-                                                f"deluge web.connect to {host_id} failed: "
-                                                f"{cdata['error']}"
-                                            )
-                                        if (isinstance(cdata, dict)
-                                                and "result" in cdata
-                                                and cdata.get("result") is False):
-                                            raise AuthError(
-                                                f"deluge web.connect to {host_id} refused "
-                                                f"(returned False). If the daemon needs a "
-                                                f"password, store it in the WebUI host entry "
-                                                f"(WebUI Preferences → Daemon)."
-                                            )
-                                        log.info("deluge auto-connected to daemon %s", host_id)
+                            if hr.status != 200:
+                                # Fail closed: without the host list we cannot
+                                # tell whether auto-connect is possible, and
+                                # a silent pass leaves every later RPC failing
+                                # with "not connected" (a per-row error).
+                                raise AuthError(
+                                    f"deluge web.get_hosts at {self._cfg.host} "
+                                    f"returned HTTP {hr.status}; cannot verify "
+                                    f"the daemon link."
+                                )
+                            hdata = await hr.json()
+                            hosts = hdata.get("result") or []
+                            if not hosts:
+                                # Disconnected WebUI with nothing to connect
+                                # to: every later RPC would fail with "not
+                                # connected" and be misread as a per-row
+                                # error. Fail auth/startup instead.
+                                raise AuthError(
+                                    f"deluge WebUI at {self._cfg.host} is not "
+                                    f"connected to a daemon and no daemon hosts "
+                                    f"are configured (web.get_hosts returned no "
+                                    f"hosts). Add a host under WebUI Preferences "
+                                    f"→ Daemon, or start deluged."
+                                )
+                            host_id = hosts[0][0]
+                            connect_payload = {
+                                "method": "web.connect",
+                                "params": [host_id],
+                                "id": 4,
+                            }
+                            async with self.session.post("json", json=connect_payload) as cr:
+                                try:
+                                    cdata = await cr.json()
+                                except Exception:
+                                    cdata = {}
+                                if isinstance(cdata, dict) and cdata.get("error"):
+                                    raise AuthError(
+                                        f"deluge web.connect to {host_id} failed: "
+                                        f"{cdata['error']}"
+                                    )
+                                if (isinstance(cdata, dict)
+                                        and "result" in cdata
+                                        and cdata.get("result") is False):
+                                    raise AuthError(
+                                        f"deluge web.connect to {host_id} refused "
+                                        f"(returned False). If the daemon needs a "
+                                        f"password, store it in the WebUI host entry "
+                                        f"(WebUI Preferences → Daemon)."
+                                    )
+                                log.info("deluge auto-connected to daemon %s", host_id)
         except AuthError:
             raise
         except Exception as e:

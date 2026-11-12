@@ -1669,3 +1669,61 @@ async def test_deluge_empty_scan_never_cached():
     assert client._rpc.await_count == 2
 
 
+@pytest.mark.anyio
+async def test_deluge_web_connected_false_without_hosts_fails_auth():
+    """Disconnected WebUI with no configured hosts is an auth failure.
+
+    Returning success here makes every later RPC fail with "not connected",
+    which the coordinator classifies as a per-row error instead of a
+    startup/auth failure.
+    """
+    from racing_sync.clients.http_base import AuthError
+
+    def make_client(responses):
+        """One mocked POST per (payload, status) entry, in order."""
+        client = _deluge_test_client()
+        seq = list(responses)
+
+        class Ctx:
+            def __init__(self, spec):
+                self._payload, self._status = spec
+
+            async def __aenter__(self):
+                r = MagicMock()
+                r.status = self._status
+                r.json = AsyncMock(return_value=self._payload)
+                r.text = AsyncMock(return_value="{}")
+                r.read = AsyncMock(return_value=b"{}")
+                return r
+
+            async def __aexit__(self, *a):
+                return False
+
+        session = MagicMock()
+        session.post = MagicMock(side_effect=lambda *a, **k: Ctx(seq.pop(0)))
+        client._session = session
+        return client
+
+    # auth.login ok, web.connected false, web.get_hosts empty -> AuthError.
+    empty = make_client([
+        ({"result": True}, 200),    # auth.login
+        ({"result": False}, 200),   # web.connected: no daemon
+        ({"result": []}, 200),      # web.get_hosts: nothing configured
+    ])
+    with pytest.raises(AuthError, match="no daemon") as exc:
+        await empty._do_client_auth()
+    assert "localhost:8112" in str(exc.value)
+    # No web.connect attempt: only the three probes above ran.
+    assert empty._session.post.call_count == 3
+
+    # A non-200 web.get_hosts also fails auth instead of passing silently.
+    broken = make_client([
+        ({"result": True}, 200),
+        ({"result": False}, 200),
+        ({"result": []}, 503),      # web.get_hosts broke
+    ])
+    with pytest.raises(AuthError, match="503"):
+        await broken._do_client_auth()
+    assert broken._session.post.call_count == 3
+
+
