@@ -39,6 +39,36 @@ log = logging.getLogger("racing_sync.telegram_bot")
 
 
 class ActionsMixin:
+    def _positional_active_rows(self, rows: list) -> list:
+        """Rows the active list is currently numbering (status filter applied).
+
+        Positional commands (`/act_N`, `/now_N`, `/cancel_N`, `/resume_N`)
+        quote what the operator sees; the renderer numbers only the rows
+        passing `_status_filter` (`telegram_refresh.py`), so resolving a
+        number against the raw store list would misroute #1 to a
+        filtered-out row. Identity tokens (group id, full hash, legacy
+        prefix) are stable across filters and must keep the full list.
+        Fails open to the unfiltered rows — never raises.
+        """
+        try:
+            full = list(rows or [])
+        except Exception:
+            return []
+        try:
+            flt = getattr(self, "_status_filter", None) or "all"
+        except Exception:
+            flt = "all"
+        if not flt or str(flt).lower() == "all":
+            return full
+        try:
+            from .telegram_protocol import match_status_filter
+            return [
+                _r for _r in full
+                if match_status_filter(
+                    getattr(getattr(_r, "state", None), "value", ""), flt)]
+        except Exception:
+            return full
+
     async def _execute_cancel_one(self, infohash: str, *, delete_files: bool,
                                     remember: bool = True) -> str:
         """Forget one release; files kept iff not `delete_files`.
@@ -692,7 +722,9 @@ class ActionsMixin:
                     pass
                 return
             try:
-                groups = _group_active_items([(_r, None) for _r in rows or []])
+                groups = _group_active_items(
+                    [(_r, None)
+                     for _r in self._positional_active_rows(rows)])
             except Exception:
                 groups = []
             members: list = []
@@ -1143,10 +1175,16 @@ class ActionsMixin:
             except Exception:
                 pass
             return
-        try:
-            groups = _group_active_items([(_r, None) for _r in rows or []])
-        except Exception:
-            groups = []
+        groups: list = []
+        if token.isdigit():
+            # Numbers address the displayed (status-filtered) list; the
+            # gid/hash/prefix fallbacks below stay on the full rows.
+            try:
+                groups = _group_active_items(
+                    [(_r, None)
+                     for _r in self._positional_active_rows(rows)])
+            except Exception:
+                groups = []
         found: tuple | None = None
         if token.isdigit():
             try:
@@ -1803,7 +1841,9 @@ class ActionsMixin:
                         pass
                     return
                 try:
-                    groups = _group_active_items([(_r, None) for _r in rows or []])
+                    groups = _group_active_items(
+                        [(_r, None)
+                         for _r in self._positional_active_rows(rows)])
                 except Exception:
                     groups = []
                 try:
