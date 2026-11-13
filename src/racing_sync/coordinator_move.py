@@ -2305,6 +2305,15 @@ class MoveMixin:
                     pass
         except Exception:
             pass
+        if getattr(self, "_stop", False):
+            # Shutdown requested while queued (or just before the
+            # semaphore): never start a fresh transfer. Raise instead of
+            # returning — callers treat a normal return as a completed
+            # move and would commit checkpoints. The MOVING checkpoint
+            # already persisted makes a restart safe.
+            log.info("move of %s aborted: shutting down",
+                     (getattr(ts, "source_name", "") or _mkey)[:60])
+            raise asyncio.CancelledError
         async with _sem:
             if files_from is not None:
                 preview = ", ".join(files_from[:3]) + ("…" if len(files_from) > 3 else "")
