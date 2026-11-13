@@ -550,16 +550,38 @@ class StateStore:
                 _local.depth = 0
                 raise
             try:
-                yield
-            except Exception:
                 try:
-                    self._conn.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-            else:
-                self._conn.execute("COMMIT")
+                    yield
+                except BaseException:
+                    # BaseException (KeyboardInterrupt, CancelledError) must
+                    # unwind the transaction too, or the connection stays
+                    # open and every later BEGIN IMMEDIATE fails.
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except BaseException:
+                        pass
+                    raise
+                # COMMIT lives inside the rollback guard: a failed COMMIT
+                # (ENOSPC, SQLITE_BUSY after busy_timeout, disk I/O error)
+                # leaves the connection inside a transaction, wedging every
+                # write until restart. Roll back, then surface the error.
+                try:
+                    self._conn.execute("COMMIT")
+                except BaseException:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except BaseException:
+                        pass
+                    raise
             finally:
+                # Last-resort guard for a failed ROLLBACK above: never leave
+                # the connection mid-transaction. No-op after a successful
+                # COMMIT (in_transaction is False).
+                try:
+                    if self._conn.in_transaction:
+                        self._conn.execute("ROLLBACK")
+                except BaseException:
+                    pass
                 _local.depth = 0
 
     def close(self) -> None:
