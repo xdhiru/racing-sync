@@ -535,7 +535,6 @@ class DownloadMixin:
         last_progress_time = time.monotonic()
         last_stall_warn = 0.0
         poll_n = 0
-        empty_streak = 0
         stall_timeout = (
             getattr(self.cfg.general, "download_stall_timeout_seconds", 0)
             if hasattr(self, "cfg") and hasattr(self.cfg, "general")
@@ -636,21 +635,48 @@ class DownloadMixin:
                 files = await _wait_files_read()
                 f_map = {f.name: f for f in files}
                 missing_files = [fn for fn in expected_files if fn not in f_map]
+                # File-list drift (metadata re-resolve, deselect, rename)
+                # and registration-lag empties are usually transient: the
+                # outer worker re-resolves batches next tick. Count
+                # consecutive drifting ticks per row (persisted across
+                # parks, like _dl_stall_parks) so only a persistent
+                # mismatch fails the row.
+                _drift_key = (ts.source_infohash or "").lower()
+                try:
+                    _drift = getattr(self, "_dl_file_drift", None)
+                    if not isinstance(_drift, dict):
+                        _drift = {}
+                        self._dl_file_drift = _drift  # type: ignore[attr-defined]
+                except Exception:
+                    _drift = {}
+                try:
+                    _drift_n = int(_drift.get(_drift_key, 0) or 0)
+                except (TypeError, ValueError):
+                    _drift_n = 0
                 if missing_files:
-                    # No `and files` guard, but registration lag and client
-                    # restarts serve transient empties: park (TimeoutError,
-                    # no escalation) until the list stays empty — only a
-                    # persistent empty fails the row.
-                    empty_streak = empty_streak + 1 if not files else 0
-                    if not files and empty_streak < 3:
+                    _drift_n += 1
+                    try:
+                        _drift[_drift_key] = _drift_n
+                        if len(_drift) > 5000:
+                            for _k in list(_drift.keys())[: len(_drift) - 5000]:
+                                _drift.pop(_k, None)
+                    except Exception:
+                        pass
+                    if _drift_n < 3:
+                        _what = (
+                            "file list empty" if not files
+                            else "expected batch files missing")
                         raise TimeoutError(
-                            f"file list empty for {ts.source_name} "
-                            f"({empty_streak}/3); retrying"
+                            f"{_what} for {ts.source_name} "
+                            f"({_drift_n}/3); re-planning next tick"
                         )
                     raise RuntimeError(
                         f"expected batch files missing from torrent {ts.source_name}: {missing_files}"
                     )
-                empty_streak = 0
+                try:
+                    _drift.pop(_drift_key, None)
+                except Exception:
+                    pass
                 batch_files = [f_map[fn] for fn in expected_files if fn in f_map]
                 total_sz = sum(f.size_bytes for f in batch_files)
                 done_sz = sum(f.size_bytes * f.progress for f in batch_files)

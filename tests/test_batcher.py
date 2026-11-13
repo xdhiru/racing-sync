@@ -1463,6 +1463,12 @@ async def test_wait_for_completion_fails_fast_on_missing_expected_files():
         state=State.DOWNLOADING,
     )
 
+    # A batch mismatch parks for a re-plan (the worker re-resolves batches
+    # next tick); only a persistent mismatch fails the row.
+    with pytest.raises(TimeoutError, match="re-planning next tick"):
+        await coord._wait_for_completion(ts, expected_files=["Show.S01E01.mkv", "Show.S01E02.mkv"])
+    with pytest.raises(TimeoutError, match="re-planning next tick"):
+        await coord._wait_for_completion(ts, expected_files=["Show.S01E01.mkv", "Show.S01E02.mkv"])
     with pytest.raises(RuntimeError, match="expected batch files missing from torrent"):
         await coord._wait_for_completion(ts, expected_files=["Show.S01E01.mkv", "Show.S01E02.mkv"])
 
