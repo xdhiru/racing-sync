@@ -275,7 +275,15 @@ class ReaddMixin:
             return False
 
         def _ssd_has_any() -> str | None:
-            """First heal name still on SSD; "" when unverifiable; None when clear."""
+            """First heal name still on SSD; "" when unverifiable; None when clear.
+
+            Size-aware on purpose: a truncated/zero-byte same-name leftover
+            (interrupted earlier move) would otherwise suppress healing
+            forever while the full file exists remotely. Only an exact-size
+            match counts as "still local"; a size mismatch falls through to
+            the next name. Unknown expected size (0) keeps the plain
+            presence rule.
+            """
             for name in heal_names:
                 try:
                     p = _safe_ssd_join(ssd_base, name)
@@ -284,10 +292,17 @@ class ReaddMixin:
                 if p is None:
                     return ""
                 try:
-                    if p.exists():
-                        return name
+                    st = p.stat()
+                except (FileNotFoundError, NotADirectoryError):
+                    continue  # absent (as Path.exists() read it): keep looking
                 except OSError:
                     return ""
+                try:
+                    want = int(want_map.get(name, 0) or 0)
+                except (TypeError, ValueError):
+                    want = 0
+                if want <= 0 or int(st.st_size) == want:
+                    return name
             return None
 
         try:
