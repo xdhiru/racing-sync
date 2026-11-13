@@ -574,7 +574,7 @@ async def _verify_row(cfg, dest, store, ts, actual_by_hash, counts) -> None:
                 if kind and kind != "unknown":
                     ts.classification_kind = kind
                     try:
-                        store.upsert(ts)
+                        store.upsert(ts, expected_version=ts.version)
                     except Exception:
                         pass
                     counts["classified"] += 1
@@ -691,7 +691,7 @@ async def _reconcile_snapshot(
                         if _kind and _kind != "unknown":
                             ts.classification_kind = _kind
                             try:
-                                store.upsert(ts)
+                                store.upsert(ts, expected_version=ts.version)
                             except Exception:
                                 pass
                             log.info(
@@ -853,7 +853,7 @@ async def _reconcile_snapshot(
                         if h.lower() not in curr_lower and h.lower() != existing.source_infohash.lower():
                             curr.append(h)
                             existing.injected_private_hashes = ",".join(curr)
-                            store.upsert(existing)
+                            store.upsert(existing, expected_version=existing.version)
                             rpt.kept.append(h)
                             log.info(
                                 "reconcile: linked existing cross-seed %s to adopted release %s",

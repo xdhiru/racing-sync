@@ -837,7 +837,7 @@ class MoveMixin:
             ts.classification_kind = cls.kind
             pinned_kind = cls.kind
             try:
-                self.store.upsert(ts)
+                self.store.upsert(ts, expected_version=ts.version)
             except Exception:  # noqa: BLE001
                 pass
         elif cls.kind and cls.kind != pinned_kind:
@@ -2006,7 +2006,7 @@ class MoveMixin:
                     )
         if ts._blob or ts.cross_seed_blob:
             try:
-                self.store.upsert(ts)
+                self.store.set_blob(ts.source_infohash, bytes(ts._blob or ts.cross_seed_blob))
             except Exception as e:  # noqa: BLE001
                 log.warning("could not persist cross-seed blob for %s: %s", h[:10], e)
 

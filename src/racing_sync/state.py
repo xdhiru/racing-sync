@@ -385,6 +385,9 @@ class UpsertResult(enum.Enum):
 
     WRITTEN = "written"
     TOMBSTONED = "tombstoned"
+    # Guarded upsert lost a race: the row is gone or its state/version moved
+    # on since this snapshot was read. Nothing was written.
+    CONFLICT = "conflict"
 
 
 class StateStore:
@@ -696,12 +699,21 @@ class StateStore:
             ).fetchone()
         return bool(row and row["deleted_at"])
 
-    def upsert(self, ts: TorrentState) -> UpsertResult:
+    def upsert(
+        self, ts: TorrentState, *,
+        expected_version: int | None = None,
+        expected_state: State | None = None,
+    ) -> UpsertResult:
         """Write the full row, or refuse when the hash is tombstoned.
 
         Returns WRITTEN after the row is persisted (and the in-memory
         revision synced), or TOMBSTONED when a forget tombstone suppressed
         the write. Callers must treat only WRITTEN as proof of ingestion.
+
+        Pass expected_version/expected_state when writing a row that was
+        read earlier: a whole-row write then loses its race loudly
+        (CONFLICT, nothing written) instead of clobbering a concurrent
+        transition. A guarded write never inserts.
         """
         self._ensure_open()
         norm = (ts.source_infohash or "").strip().lower()
@@ -709,12 +721,29 @@ class StateStore:
             # Canonical key: hashes are hex, case-insensitive. Normalizing
             # on write keeps get/tombstone/clear lookups consistent.
             ts.source_infohash = norm
+        guarded = expected_version is not None or expected_state is not None
         with self._write_tx():
             if self._is_tombstoned(ts.source_infohash):
                 # Forget tombstone: the operator abandoned this torrent — drop
                 # the write instead of resurrecting it. Applies to creates too
                 # (re-discovery while tombstoned stays away until GC expiry).
                 return UpsertResult.TOMBSTONED
+            if guarded:
+                cur = self._conn.execute(
+                    "SELECT state, version FROM torrent_state "
+                    "WHERE source_infohash = ?",
+                    (ts.source_infohash,),
+                ).fetchone()
+                if cur is None:
+                    return UpsertResult.CONFLICT
+                if expected_version is not None:
+                    try:
+                        if int(cur["version"] or 0) != int(expected_version):
+                            return UpsertResult.CONFLICT
+                    except (TypeError, ValueError):
+                        return UpsertResult.CONFLICT
+                if expected_state is not None and cur["state"] != expected_state.value:
+                    return UpsertResult.CONFLICT
             ts.updated_at = dt.datetime.now(dt.timezone.utc)
             row = ts.to_row()
             cols = ", ".join(row.keys())
