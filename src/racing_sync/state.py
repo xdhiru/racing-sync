@@ -1004,7 +1004,12 @@ class StateStore:
         # re-raises instead of falling through to a live-row DELETE.
         if self.tombstone(norm):
             return
-        with self._lock:
+        with self._write_tx():
+            # tombstone() also returns False for an already-stamped row; a
+            # bare DELETE here would erase that tombstone and reopen the
+            # resurrection window. Only an absent row may fall through.
+            if self._is_tombstoned(norm):
+                return
             self._conn.execute(
                 "DELETE FROM torrent_state WHERE source_infohash = ?", (norm,)
             )
