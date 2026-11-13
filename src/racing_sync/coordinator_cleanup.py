@@ -491,12 +491,21 @@ class CleanupMixin:
             return None
         # 3. State-specific safety + timing.
         completed = ts.completed_at
-        age_s = (now_utc - completed).total_seconds() if completed else 0.0
+        # Rows adopted without completed_at must still serve the grace period;
+        # age them from created_at (the adoption instant).
+        age_s = (now_utc - (completed or ts.created_at)).total_seconds() if (
+            completed or ts.created_at) else 0.0
         if ts.state == State.DONE:
             if not await self._cleanup_fuse_healthy(ts, dry_run):
                 return None
-            if age_s < grace_s and not self._cleanup_idle_confirmed(ts, group, now_utc, cfg):
-                return None
+            if age_s < grace_s:
+                # Without a completion stamp the idle fast lane proves only
+                # that VPS1 has been quiet, not that the seed has served the
+                # grace period on VPS2 (recovery adopts DONE rows this way).
+                if completed is None:
+                    return None
+                if not self._cleanup_idle_confirmed(ts, group, now_utc, cfg):
+                    return None
         elif ts.state == State.MOVING:
             # Early pressure path: bytes are 100% on the VPS2 SSD (MOVING is
             # only entered after full completion) but not yet moved. Allowed
@@ -514,7 +523,8 @@ class CleanupMixin:
                 return None
         else:
             return None
-        sort_key = completed.timestamp() if completed else now_utc.timestamp()
+        _anchor = completed or ts.created_at
+        sort_key = _anchor.timestamp() if _anchor else now_utc.timestamp()
         # Grouping guarantees a known row total (unknown sizes never
         # group), so this is always the row's own byte count.
         size = float(ts.total_bytes or 0)

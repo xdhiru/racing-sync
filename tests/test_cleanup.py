@@ -91,7 +91,8 @@ def _member(h: str, upspeed: int = 0, leechers: int = 0, ratio: float = 2.0,
 
 
 def _row(store: StateStore, h: str, state: State, completed_h_ago: float | None,
-         activity_h_ago: float | None, injected: str, save_path: str = "") -> TorrentState:
+         activity_h_ago: float | None, injected: str, save_path: str = "",
+         created_h_ago: float | None = None) -> TorrentState:
     now = dt.datetime.now(dt.timezone.utc)
     ts = TorrentState(
         source_infohash=h, source_name=FNAME, dest_infohash=h,
@@ -102,6 +103,8 @@ def _row(store: StateStore, h: str, state: State, completed_h_ago: float | None,
             (now - dt.timedelta(hours=activity_h_ago)) if activity_h_ago is not None else None
         ),
     )
+    if created_h_ago is not None:
+        ts.created_at = now - dt.timedelta(hours=created_h_ago)
     store.upsert(ts)
     return ts
 
@@ -350,14 +353,16 @@ async def test_done_old_quiet_no_stamp_uses_added_on_fallback(tmp_path: Path):
     """Pre-existing idle backlog clears on the first run, no grace wait.
 
     No activity stamp was ever recorded, but every member was added days
-    ago and the swarm is quiet now: the race is verifiably over.
+    ago and the swarm is quiet now: the race is verifiably over. The row
+    is a legacy one (old created_at), so it has already served the grace
+    period even without a completed_at stamp.
     """
     import time
     pub = "a" * 40
     added = int(time.time()) - 5 * 24 * 3600
     store = StateStore(tmp_path / "s.db")
     _row(store, pub, State.DONE, completed_h_ago=None, activity_h_ago=None,
-         injected="")
+         injected="", created_h_ago=5 * 24)
     src = _FakeSource([_member(pub, added_on=added)])
     dest = _FakeDest([pub])
     cfg = _base_cfg(tmp_path)
