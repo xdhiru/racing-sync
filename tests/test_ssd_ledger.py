@@ -466,6 +466,38 @@ async def test_wait_disk_skips_reserve_when_downloads_full(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_prune_skips_fresh_reservation(tmp_path):
+    """A just-made WAITING_DISK reservation survives one prune.
+
+    The promotion reserves, then awaits the live-download count before
+    transitioning to QUEUED; a concurrent prune must not reap the fresh
+    reservation while the row still reads WAITING_DISK.
+    """
+    import time
+
+    store = StateStore(tmp_path / "s.db")
+    try:
+        store.upsert(TorrentState(source_infohash="w" * 40, source_name="W",
+                                  state=State.WAITING_DISK))
+        coord = make_coordinator(store)
+        coord.cfg = MagicMock()
+        coord._ssd_reserved = {"w" * 40: 5_000}
+        coord._ssd_reserved_at = {"w" * 40: time.monotonic()}
+        coord._ssd_prune_at = 0.0
+        await coord._ssd_prune_stale()
+        # Fresh: still WAITING_DISK but younger than the grace window.
+        assert coord._ssd_reserved == {"w" * 40: 5_000}
+        # Age past the grace: the stale non-active reservation is reaped.
+        coord._ssd_reserved_at["w" * 40] -= 61.0
+        coord._ssd_prune_at = 0.0
+        await coord._ssd_prune_stale()
+        assert coord._ssd_reserved == {}
+        assert coord._ssd_reserved_at == {}
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_prune_throttles_db_round_trips(tmp_path):
     """Repeat admissions within the window share one prune scan."""
     store = StateStore(tmp_path / "state.db")

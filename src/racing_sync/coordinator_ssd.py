@@ -20,6 +20,7 @@ import logging
 # Guards lazy SSD-lock creation so two coroutines cannot install two
 # different asyncio.Lock objects (split-brain over-admission).
 import threading as _threading
+import time
 from pathlib import Path
 
 from .state import State, TorrentState
@@ -29,6 +30,12 @@ _SSD_LOCK_GUARD = _threading.Lock()
 # Prune throttle: one batched DB round-trip per window across all
 # admission attempts (50 admits/tick must not mean 50 scans).
 _PRUNE_THROTTLE_S = 10.0
+
+# A WAITING_DISK promotion reserves, then awaits the live-download count
+# before transitioning to QUEUED; during that window the row still reads
+# WAITING_DISK and a concurrent prune would reap the fresh reservation.
+# Entries younger than this window are left alone.
+_RESERVATION_GRACE_S = 60.0
 
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
@@ -339,6 +346,7 @@ class SSDLedgerMixin:
                 return
             if not isinstance(rows, dict):
                 return
+            _at = getattr(self, "_ssd_reserved_at", None)
             if isinstance(d, dict) and d:
                 for h in list(d.keys()):
                     if h not in rows:
@@ -348,7 +356,17 @@ class SSDLedgerMixin:
                     # doubles (MagicMock state) → keep (can't prove stale).
                     if row is None:
                         d.pop(h, None)
+                        if isinstance(_at, dict):
+                            _at.pop(h, None)
                         continue
+                    if isinstance(_at, dict):
+                        _stamp = _at.get(h)
+                        if (isinstance(_stamp, (int, float))
+                                and _time.monotonic() - _stamp < _RESERVATION_GRACE_S):
+                            # Fresh reservation: the promotion that made it may
+                            # still be awaiting the live-download count before
+                            # the WAITING_DISK -> QUEUED transition. Leave it.
+                            continue
                     try:
                         st = getattr(row, "state", None)
                     except Exception:
@@ -357,6 +375,8 @@ class SSDLedgerMixin:
                         State.QUEUED, State.DOWNLOADING, State.MOVING,
                     ):
                         d.pop(h, None)
+                        if isinstance(_at, dict):
+                            _at.pop(h, None)
             # Quiet-wait hints / MOVING-park counters / prefer exemptions /
             # grace-search timestamps for rows that left (or lost) those
             # states without a transition pop.
@@ -452,6 +472,11 @@ class SSDLedgerMixin:
                     d = {}
                     self._ssd_reserved = d  # type: ignore[attr-defined]
                 d[key] = amount
+                _at = getattr(self, "_ssd_reserved_at", None)
+                if not isinstance(_at, dict):
+                    _at = {}
+                    self._ssd_reserved_at = _at  # type: ignore[attr-defined]
+                _at[key] = time.monotonic()
             except Exception:
                 pass
             return True
@@ -474,6 +499,9 @@ class SSDLedgerMixin:
                 d = getattr(self, "_ssd_reserved", None)
                 if isinstance(d, dict):
                     d.pop(key, None)
+                _at = getattr(self, "_ssd_reserved_at", None)
+                if isinstance(_at, dict):
+                    _at.pop(key, None)
             finally:
                 try:
                     if lk is not None:
@@ -589,6 +617,9 @@ class SSDLedgerMixin:
                 d = self._ssd_reserved
             else:
                 d.clear()
+            _at = getattr(self, "_ssd_reserved_at", None)
+            if isinstance(_at, dict):
+                _at.clear()
             store = getattr(self, "store", None)
             if store is None or not hasattr(store, "all"):
                 return
