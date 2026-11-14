@@ -16,13 +16,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
-
-from .state import State, TorrentState
 
 # Guards lazy SSD-lock creation so two coroutines cannot install two
 # different asyncio.Lock objects (split-brain over-admission).
 import threading as _threading
+from pathlib import Path
+
+from .state import State, TorrentState
 
 _SSD_LOCK_GUARD = _threading.Lock()
 
@@ -576,6 +576,12 @@ class SSDLedgerMixin:
             except Exception:
                 return
             cap = self._ssd_global_cap()
+            # Collect candidates first so the aggregate can be clamped
+            # oldest-first: after a crash with many in-flight rows each
+            # row reserves min(total, cap) and the sum can reach N×cap,
+            # which would block every admission until each row refines.
+            # The earliest-admitted work wins the budget.
+            candidates: list[tuple[object, str, int]] = []
             for ts in rows or []:
                 try:
                     if getattr(ts, "state", None) not in (
@@ -603,9 +609,31 @@ class SSDLedgerMixin:
                     else:
                         amt = total
                     if amt > 0:
-                        d[h] = int(amt)
+                        candidates.append(
+                            (getattr(ts, "created_at", None), h, int(amt)))
                 except Exception:
                     continue
+            # Oldest created_at first; corrupt/legacy rows without one sort
+            # last. The None flag is compared before the datetime, so mixed
+            # None/datetime keys never compare cross-type.
+            try:
+                candidates.sort(key=lambda c: (c[0] is None, c[0]))
+            except Exception:
+                candidates.sort(key=lambda c: c[0] is None)
+            clamped = 0
+            running = 0
+            for _created, h, amt in candidates:
+                if cap is not None and running + amt > cap:
+                    clamped += 1
+                    continue
+                running += amt
+                d[h] = amt
+            if clamped:
+                log.warning(
+                    "ssd ledger rebuild clamped %d of %d in-flight rows: "
+                    "their reservations would exceed the %d MB global cap; "
+                    "the youngest rows wait for the budget to free",
+                    clamped, len(candidates), cap // (1024 * 1024))
             # Clamp dict size for safety.
             if len(d) > 5000:
                 for k in list(d.keys())[: len(d) - 5000]:
