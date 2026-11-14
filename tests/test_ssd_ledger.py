@@ -9,8 +9,8 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from conftest import make_coordinator
+
 from racing_sync.state import State, StateStore, TorrentState
 
 
@@ -195,6 +195,7 @@ async def test_waiting_retry_uses_remaining_batches_not_total(tmp_path):
     reserve the remainder, not the total.
     """
     from unittest.mock import AsyncMock
+
     from racing_sync.clients.abstract import TorrentFile
 
     cap = 40_000
@@ -237,6 +238,40 @@ async def test_grow_beyond_physical_disk_fails(tmp_path):
     # A grow that fits the live disk still succeeds.
     assert await coord._ssd_adjust("p" * 40, 12_000) is True
     assert coord._ssd_reserved["p" * 40] == 12_000
+
+
+@pytest.mark.anyio
+async def test_admission_accounts_for_reserved_total_in_free_space(tmp_path):
+    """Admission checks free space against reserved total + this amount.
+
+    Two concurrent admissions must not each see enough free disk (their
+    reservations don't yet consume physical bytes) and both reserve.
+    """
+    cap = 1_000_000
+    coord = _coord_with_cap(tmp_path, cap)
+    cramped = MagicMock(total=1_000_000, used=960_000, free=40_000)
+    with patch("shutil.disk_usage", return_value=cramped):
+        assert await coord._ssd_try_reserve("a" * 40, 25_000) is True
+        # 25k reserved + 25k new = 50k > 40k free → refuse, even though
+        # 25k alone fits (the old check only compared 25k vs 40k free).
+        assert await coord._ssd_try_reserve("b" * 40, 25_000) is False
+    assert coord._ssd_reserved_total() == 25_000
+    assert list(coord._ssd_reserved) == ["a" * 40]
+
+
+@pytest.mark.anyio
+async def test_grow_accounts_for_reserved_total_in_free_space(tmp_path):
+    """A grow re-checks the new total reserved, not just the delta."""
+    cap = 1_000_000
+    coord = _coord_with_cap(tmp_path, cap)
+    assert await coord._ssd_try_reserve("a" * 40, 30_000) is True
+    assert await coord._ssd_try_reserve("b" * 40, 5_000) is True
+    cramped = MagicMock(total=1_000_000, used=950_000, free=50_000)
+    with patch("shutil.disk_usage", return_value=cramped):
+        # New total would be 30k+25k=55k > 50k free → refuse; the old
+        # delta-only check (20k vs 50k) would have wrongly passed.
+        assert await coord._ssd_adjust("b" * 40, 25_000) is False
+    assert coord._ssd_reserved["b" * 40] == 5_000
 
 
 @pytest.mark.anyio

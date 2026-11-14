@@ -406,15 +406,23 @@ class SSDLedgerMixin:
         # a stat on a slow/dead mount must never stall all admissions
         # behind the ledger lock.
         try:
+            res_total_pre = self._ssd_reserved_total()
+        except Exception:
+            res_total_pre = 0
+        try:
             cap = self._ssd_global_cap()
-            if cap is not None and self._ssd_reserved_total() + amount > cap:
+            if cap is not None and res_total_pre + amount > cap:
                 return False
         except Exception:
             pass
         try:
             from . import coordinator as _c
 
-            if not _c.ssd_has_room(self.cfg, amount):
+            # Existing reservations + this amount must fit live free
+            # space: reservations hold budget but not yet physical bytes,
+            # so two concurrent admissions would otherwise each pass the
+            # stat and overcommit past ENOSPC.
+            if not _c.ssd_has_room(self.cfg, res_total_pre + amount):
                 return False
         except Exception:
             return False
@@ -424,6 +432,13 @@ class SSDLedgerMixin:
         try:
             cap = self._ssd_global_cap()
             if cap is not None and self._ssd_reserved_total() + amount > cap:
+                return False
+            if self._ssd_reserved_total() != res_total_pre:
+                # A concurrent admission landed since the physical pre-check
+                # (reservations don't consume bytes yet, so the stat could
+                # pass for both): defer to the next tick. The ledger cannot
+                # change between this check and the reserve write because we
+                # hold the lock.
                 return False
             if len(getattr(self, "_ssd_reserved", {})) > 5000:
                 log.error(
@@ -491,11 +506,14 @@ class SSDLedgerMixin:
         try:
             _d0 = getattr(self, "_ssd_reserved", None)
             _old_pre = int((_d0.get(key, 0) if isinstance(_d0, dict) else 0) or 0)
+            res_total_pre = self._ssd_reserved_total()
         except Exception:
             _old_pre = 0
+            res_total_pre = 0
         if new_amount > _old_pre:
             # Grow: admission's physical check covered only the old
-            # (smaller) estimate — the delta must fit the live disk now.
+            # (smaller) estimate — the new total reserved (all rows, minus
+            # this key's old amount, plus new) must fit the live disk now.
             # Fail-closed like rclone_ops.disk_free_bytes_at: when free
             # space is unmeasurable (unstatable path) refuse the grow —
             # an SSD row that can't prove room must wait, not overcommit
@@ -516,7 +534,8 @@ class SSDLedgerMixin:
                     from .io_bounds import offload as _offload
 
                     await _offload(_shutil.disk_usage, str(_sp))
-                    _room_ok = _c.ssd_has_room(self.cfg, new_amount - _old_pre)
+                    _room_ok = _c.ssd_has_room(
+                        self.cfg, res_total_pre - _old_pre + new_amount)
             except Exception as e:
                 log.warning("ssd grow physical check unavailable (%s); refusing grow", e)
                 _room_ok = False
@@ -534,9 +553,11 @@ class SSDLedgerMixin:
                 except Exception:
                     return True
             old = int(d.get(key, 0) or 0)
-            if old < _old_pre:
-                # The ledger moved under our lock-free check (concurrent
-                # shrink/release): the validated delta understates.
+            if old != _old_pre or self._ssd_reserved_total() != res_total_pre:
+                # The ledger moved under our lock-free check: either this
+                # key shrank/was released (the validated delta understates)
+                # or another row's reservation landed, which invalidates the
+                # physical pre-check (reservations don't consume bytes yet).
                 # Refuse; the caller rolls back and retries next tick.
                 return False
             if new_amount <= old:
