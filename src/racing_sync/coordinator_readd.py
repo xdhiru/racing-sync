@@ -986,6 +986,16 @@ class ReaddMixin:
             self.transition(ts, State.FAILED, error=err_msg)
             return
 
+        # Success: remember the injected hash so the next cycle's early
+        # return guards skip the duplicate add/verify, and persist the row.
+        if _record_injected_hash(ts, target_hash):
+            log.info("cross-seed re-add recorded injected hash %s for %s",
+                     target_hash[:10], ts.source_name[:60])
+            try:
+                self.store.upsert(ts, expected_version=ts.version)
+            except Exception:
+                pass
+
     async def _re_inject_watch_dir_torrents(self, ts: TorrentState) -> None:
         """Re-add every watch-dir dropped torrent and discovered cross-seeds onto FUSE."""
         watch_cross_dir = _watch_cross_seed_dir(
