@@ -535,6 +535,7 @@ class DownloadMixin:
         last_progress_time = time.monotonic()
         last_stall_warn = 0.0
         poll_n = 0
+        flush_since: float | None = None
         stall_timeout = (
             getattr(self.cfg.general, "download_stall_timeout_seconds", 0)
             if hasattr(self, "cfg") and hasattr(self.cfg, "general")
@@ -722,6 +723,9 @@ class DownloadMixin:
             if prog > last_progress + 1e-9:
                 last_progress = prog
                 last_progress_time = now
+                # Genuine movement clears any pending completion-flush
+                # deadline so only a truly frozen 100% accumulates time.
+                flush_since = None
             elif prog < 0.999:
                 stalled_for = now - last_progress_time
                 if stall_timeout > 0 and stalled_for > stall_timeout:
@@ -747,7 +751,8 @@ class DownloadMixin:
                 # download. Returning now would pause + recheck mid-flush
                 # (see _do_moving's settle guard). Keep polling; the
                 # >=0.999 progress skips the stall trip above, so this
-                # wait is bounded only by the flush landing.
+                # wait is bounded by the flush deadline below, never by
+                # the 24h janitor.
                 if expected_files is None:
                     try:
                         _done_state = str(getattr(t, "state", "") or "")
@@ -759,9 +764,30 @@ class DownloadMixin:
                             "waiting for the completion flush before moving",
                             ts.source_name, _done_state or "downloading",
                         )
+                        # Hard deadline on the flush itself: a 100% entry
+                        # whose final flush never lands would otherwise pin
+                        # a worker + slot indefinitely. Reuse stall_timeout
+                        # as the flush window; the caller's stall handler
+                        # parks and eventually fails the row via the normal
+                        # consecutive-no-progress escalation.
+                        if flush_since is None:
+                            flush_since = now
+                        elif stall_timeout > 0 and now - flush_since > stall_timeout:
+                            raise DownloadStalledError(
+                                f"download {ts.source_name} stuck at 100% "
+                                f"(client still {_done_state or 'downloading'}) "
+                                f"waiting {int(now - flush_since)}s for the "
+                                f"completion flush",
+                                progress=prog,
+                            )
                         await self._wait_worker_pause(ts, poll_interval)
                         continue
+                # Flush landed (state flipped out of the downloading
+                # family) or the batched branch finished: clear the
+                # deadline tracker before the normal return.
+                flush_since = None
                 return
+            flush_since = None
             await self._wait_worker_pause(ts, poll_interval)
 
     async def _wait_worker_pause(self, ts, timeout_s: float) -> None:
