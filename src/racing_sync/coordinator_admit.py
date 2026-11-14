@@ -3541,6 +3541,38 @@ class AdmitMixin:
                     ts.dest_infohash or ts.source_infohash, prio_map,
                 )
                 await self._warn_if_preallocated(ts, files, first_need)
+        elif cls.kind == "episode" and len(files) > 1:
+            cap = self._frozen_batch_cap(ts)
+            if cap > 0 and sum(f.size_bytes for f in files) > cap:
+                # A single episode whose extras (sample/subs/nfo) push the total
+                # past the batch cap can never fit the full-torrent footprint:
+                # admission reserves at most the cap, and the refine-to-real grow
+                # would fail every cycle (WAITING_DISK loop). Batch the file
+                # groups instead; the episode lands in its own group and the
+                # extras stream through after it.
+                batches = make_file_batches(files, cap_bytes=cap)
+                ts.batches_total = len(batches)
+                ts.batch_index = 0
+                _rem = await self._remaining_batch_footprint(batches, cls.kind)
+                if _rem is None:
+                    try:
+                        _real_footprint = max((b.size_bytes for b in batches), default=0) or cap
+                    except Exception:
+                        _real_footprint = cap
+                else:
+                    _real_footprint = _rem
+                if batches:
+                    first = batches[0]
+                    wanted = {ep.file_name for ep in first.episodes}
+                    skip0 = await self._fuse_skipped(
+                        [(e.file_name, e.size_bytes) for e in first.episodes], cls.kind,
+                    )
+                    first_need = wanted - skip0
+                    prio_map = {f.name: (1 if f.name in first_need else 0) for f in files}
+                    await self.dest_client.set_file_priorities(
+                        ts.dest_infohash or ts.source_infohash, prio_map,
+                    )
+                    await self._warn_if_preallocated(ts, files, first_need)
 
         # All-remote fast path: every batch already sits verified on the
         # remote (remaining footprint zero) — nothing will ever hit SSD, so
