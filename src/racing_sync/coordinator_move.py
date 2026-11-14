@@ -51,6 +51,11 @@ log = logging.getLogger("racing_sync.coordinator")
 # attention (errno-None OSErrors never heal by retrying).
 _MOVE_ERRNO_FAIL_PARKS = 10
 
+# Legacy stage-less MOVING rows whose dest entry is gone: bounded parks
+# before failing for operator attention (re-listing can never bring a
+# deleted entry back, so parking forever strands the row in MOVING).
+_LEGACY_MOVE_FAIL_PARKS = 5
+
 # Durable MOVING checkpoints. The order is delete -> cleanup -> transition
 # (kept from the historic ordering), so a crash at any point can be replayed
 # idempotently without re-listing/re-pausing a client entry that may be gone.
@@ -873,14 +878,50 @@ class MoveMixin:
             # Empty list (not an error). A stage-less row may be a legacy
             # row whose entry was already deleted before the checkpoint
             # existed: re-listing forever (or wiping blind) is unsafe, so
-            # fail closed with an explicit operator message. Checkpointed
-            # rows never reach this branch (replay runs at the top).
+            # fail closed with an explicit operator message after a bounded
+            # run of parks (a briefly lagging list gets a few ticks to heal
+            # first). Checkpointed rows never reach this branch (replay runs
+            # at the top).
+            try:
+                _lmp = getattr(self, "_legacy_move_parks", None)
+                if not isinstance(_lmp, dict):
+                    _lmp = {}
+                    self._legacy_move_parks = _lmp  # type: ignore[attr-defined]
+                _n = int(_lmp.get(h.lower(), 0) or 0) + 1
+                _lmp[h.lower()] = _n
+                if len(_lmp) > 5000:
+                    for _k in list(_lmp.keys())[: len(_lmp) - 5000]:
+                        _lmp.pop(_k, None)
+            except Exception:
+                _n = 0
+            if _n >= _LEGACY_MOVE_FAIL_PARKS:
+                try:
+                    _lmp.pop(h.lower(), None)
+                except Exception:
+                    pass
+                await self._fail_downloading_row(
+                    ts, h,
+                    "legacy MOVING row has no checkpoint and no dest "
+                    "entry; failing for operator attention",
+                    delete_files=False)
+                return
             self._park_moving(
                 ts,
-                "legacy MOVING row has no checkpoint; refusing unsafe wipe "
-                "(dest entry not listed before move)",
+                f"legacy MOVING row has no checkpoint; refusing unsafe "
+                f"wipe (dest entry not listed before move) "
+                f"({_n}/{_LEGACY_MOVE_FAIL_PARKS})",
             )
             return
+        if _pre:
+            # A successful listing (entry present) heals the legacy counter:
+            # past missing-ticks no longer count toward a fail (mirrors the
+            # _move_errno_parks reset after a clean file list).
+            try:
+                _lmp_ok = getattr(self, "_legacy_move_parks", None)
+                if isinstance(_lmp_ok, dict):
+                    _lmp_ok.pop(h.lower(), None)
+            except Exception:
+                pass
         try:
             _pre_checking = str(_pre_state or "").lower().startswith("check")
         except Exception:
