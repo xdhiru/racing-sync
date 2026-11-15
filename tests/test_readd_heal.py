@@ -6,6 +6,7 @@ is observed continuously for fuse_readd_heal_after_seconds (2h default),
 with a fresh uncached re-stat, a healthy mount, SSD bytes also absent,
 and capped attempts — otherwise it parks exactly as before.
 """
+
 from __future__ import annotations
 
 import time
@@ -27,15 +28,17 @@ MISSING_SIZE = 200
 
 
 def _blob() -> bytes:
-    return _bencode({
-        b"info": {
-            b"name": TOP.encode(),
-            b"files": [
-                {b"length": PRESENT_SIZE, b"path": [b"ep01.mkv"]},
-                {b"length": MISSING_SIZE, b"path": [b"ep04v2.mkv"]},
-            ],
-        },
-    })
+    return _bencode(
+        {
+            b"info": {
+                b"name": TOP.encode(),
+                b"files": [
+                    {b"length": PRESENT_SIZE, b"path": [b"ep01.mkv"]},
+                    {b"length": MISSING_SIZE, b"path": [b"ep04v2.mkv"]},
+                ],
+            },
+        }
+    )
 
 
 def _scaffold(tmp_path, *, heal_after=7200):
@@ -76,8 +79,10 @@ def _scaffold(tmp_path, *, heal_after=7200):
     coord._schedule_telegram_update = MagicMock()
 
     ts = TorrentState(
-        source_infohash="c" * 40, source_name="Show.Batch",
-        dest_infohash=blob_hash, save_path=str(ssd),
+        source_infohash="c" * 40,
+        source_name="Show.Batch",
+        dest_infohash=blob_hash,
+        save_path=str(ssd),
         classification_kind="movie",
         cross_seed_blob=blob,
         state=State.RE_ADDING,
@@ -88,9 +93,7 @@ def _scaffold(tmp_path, *, heal_after=7200):
 
 
 def _track(coord, key, age_s, missing, attempts=0):
-    coord._readd_heal_track = {
-        key: [time.monotonic() - age_s, tuple(sorted(missing)), attempts]
-    }
+    coord._readd_heal_track = {key: [time.monotonic() - age_s, tuple(sorted(missing)), attempts]}
 
 
 @pytest.mark.anyio
@@ -119,8 +122,10 @@ async def test_heal_disabled_zero(tmp_path):
         await coord._do_re_add(store.get("c" * 40))
         assert store.get("c" * 40).state == State.RE_ADDING
         coord.dest_client.add_torrent.assert_not_called()
-        assert getattr(coord, "_readd_heal_track", {}) in ({}, None) or \
-            "c" * 40 not in coord._readd_heal_track
+        assert (
+            getattr(coord, "_readd_heal_track", {}) in ({}, None)
+            or "c" * 40 not in coord._readd_heal_track
+        )
     finally:
         store.close()
 
@@ -132,6 +137,7 @@ async def test_heal_mount_outage_never_heals(tmp_path):
     try:
         # Kill the mount: every fuse stat reads absent-with-marker.
         import shutil
+
         shutil.rmtree(tmp_path / "fuse-unsorted")
         _track(coord, "c" * 40, 10800, (MISSING,))
         await coord._do_re_add(store.get("c" * 40))
@@ -218,11 +224,20 @@ async def test_heal_happy_path_selective(tmp_path):
             ]
 
         coord.dest_client.get_torrent_files = AsyncMock(side_effect=_files)
-        coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
-            hash=blob_hash, name="Show.Batch", size_bytes=300, progress=1.0,
-            state="downloading", category="racing", save_path=str(ssd)))
+        coord.dest_client.get_torrent = AsyncMock(
+            return_value=Torrent(
+                hash=blob_hash,
+                name="Show.Batch",
+                size_bytes=300,
+                progress=1.0,
+                state="downloading",
+                category="racing",
+                save_path=str(ssd),
+            )
+        )
         coord.dest_client.add_torrent = AsyncMock(
-            return_value=AddResult(hash=blob_hash, accepted=True, detail="Ok."))
+            return_value=AddResult(hash=blob_hash, accepted=True, detail="Ok.")
+        )
 
         async def _move(local, remote, ts, files_from=None, **kw):
             assert files_from == [MISSING]
@@ -241,8 +256,7 @@ async def test_heal_happy_path_selective(tmp_path):
         prio_map = coord.dest_client.set_file_priorities.call_args[0][1]
         assert prio_map == {PRESENT: 0, MISSING: 1}
         coord.dest_client.resume.assert_awaited()
-        coord.dest_client.delete.assert_awaited_once_with(
-            blob_hash, delete_files=False)
+        coord.dest_client.delete.assert_awaited_once_with(blob_hash, delete_files=False)
         # Attempts capped so the fresh move cannot trigger a re-download
         # while fuse indexes it.
         assert coord._readd_heal_track["c" * 40][2] >= 3
@@ -260,7 +274,8 @@ async def test_heal_truncated_file_still_heals(tmp_path):
         _track(coord, "c" * 40, 10800, (MISSING,))
         # Truncated copy: regular file, wrong size — must not pass as present.
         (Path(coord.cfg.rclone.fuse.mount_unsorted) / TOP / "ep04v2.mkv").write_bytes(
-            b"t" * (MISSING_SIZE - 50))
+            b"t" * (MISSING_SIZE - 50)
+        )
 
         async def _files(h):
             if not hasattr(_files, "n"):
@@ -282,7 +297,8 @@ async def test_heal_truncated_file_still_heals(tmp_path):
 
         coord.dest_client.get_torrent_files = AsyncMock(side_effect=_files)
         coord.dest_client.add_torrent = AsyncMock(
-            return_value=AddResult(hash=blob_hash, accepted=True, detail="Ok."))
+            return_value=AddResult(hash=blob_hash, accepted=True, detail="Ok.")
+        )
 
         async def _move(local, remote, ts, files_from=None, **kw):
             for n in files_from or []:
@@ -310,14 +326,18 @@ async def test_heal_restores_preheal_dest_pointer(tmp_path):
     """
     coord, store, blob, blob_hash, ssd, fuse = _scaffold(tmp_path)
     try:
-        store.upsert(TorrentState(
-            source_infohash="e" * 40, source_name="Show.Batch",
-            dest_infohash="d" * 40, save_path=str(ssd),
-            classification_kind="movie",
-            cross_seed_blob=blob,
-            state=State.RE_ADDING,
-            readd_attempts=1,
-        ))
+        store.upsert(
+            TorrentState(
+                source_infohash="e" * 40,
+                source_name="Show.Batch",
+                dest_infohash="d" * 40,
+                save_path=str(ssd),
+                classification_kind="movie",
+                cross_seed_blob=blob,
+                state=State.RE_ADDING,
+                readd_attempts=1,
+            )
+        )
         _track(coord, "e" * 40, 10800, (MISSING,))
 
         async def _files(h):
@@ -338,7 +358,8 @@ async def test_heal_restores_preheal_dest_pointer(tmp_path):
 
         coord.dest_client.get_torrent_files = AsyncMock(side_effect=_files)
         coord.dest_client.add_torrent = AsyncMock(
-            return_value=AddResult(hash=blob_hash, accepted=True, detail="Ok."))
+            return_value=AddResult(hash=blob_hash, accepted=True, detail="Ok.")
+        )
 
         async def _move(local, remote, ts, files_from=None, **kw):
             for n in files_from or []:
@@ -353,7 +374,6 @@ async def test_heal_restores_preheal_dest_pointer(tmp_path):
         row = store.get("e" * 40)
         assert row.state == State.RE_ADDING
         assert row.dest_infohash == "d" * 40
-        coord.dest_client.delete.assert_awaited_once_with(
-            blob_hash, delete_files=False)
+        coord.dest_client.delete.assert_awaited_once_with(blob_hash, delete_files=False)
     finally:
         store.close()

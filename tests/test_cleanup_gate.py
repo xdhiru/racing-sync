@@ -1,4 +1,5 @@
 """Janitor gate: persisted cadence, startup delay, calm-and-roomy skip."""
+
 from __future__ import annotations
 
 import time
@@ -11,15 +12,14 @@ from conftest import make_coordinator
 from racing_sync.config import CleanupConfig
 from racing_sync.state import State, StateStore, TorrentState
 
-GiB = 1024 ** 3
+GiB = 1024**3
 
 
 def _gate_coord(tmp_path: Path, db_name: str = "s.db", **cleanup_over):
     store = StateStore(tmp_path / db_name)
     cfg = MagicMock()
     cfg.source.category = ""
-    base = dict(enabled=True, dry_run=True,
-                janitor_startup_delay_seconds=0.0)
+    base = dict(enabled=True, dry_run=True, janitor_startup_delay_seconds=0.0)
     base.update(cleanup_over)
     cfg.cleanup = CleanupConfig(**base)
     coord = make_coordinator()
@@ -60,8 +60,7 @@ async def test_persisted_clock_survives_restart(tmp_path: Path):
 @pytest.mark.anyio
 async def test_startup_delay_holds_first_run(tmp_path: Path):
     """No deletes in the settle window after boot; 0 disables."""
-    coord, store = _gate_coord(
-        tmp_path, janitor_startup_delay_seconds=3600.0)
+    coord, store = _gate_coord(tmp_path, janitor_startup_delay_seconds=3600.0)
     try:
         coord._run_source_cleanup = AsyncMock()
         await coord._maybe_cleanup_source()
@@ -82,10 +81,16 @@ async def test_calm_and_roomy_skips_scan(tmp_path: Path):
     coord, store = _gate_coord(tmp_path)
     try:
         now = dt.datetime.now(dt.timezone.utc)
-        store.upsert(TorrentState(
-            source_infohash="a" * 40, source_name="Old Show",
-            dest_infohash="a" * 40, total_bytes=700, state=State.DONE,
-            completed_at=now - dt.timedelta(hours=200)))
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Old Show",
+                dest_infohash="a" * 40,
+                total_bytes=700,
+                state=State.DONE,
+                completed_at=now - dt.timedelta(hours=200),
+            )
+        )
         # Roomy (above the 40 GiB high watermark) + calm.
         coord._source_free_bytes = AsyncMock(return_value=90 * GiB)
         coord._cleanup_arrivals_per_hour = MagicMock(return_value=0.0)
@@ -105,10 +110,16 @@ async def test_pressure_still_runs(tmp_path: Path):
     coord, store = _gate_coord(tmp_path)
     try:
         now = dt.datetime.now(dt.timezone.utc)
-        store.upsert(TorrentState(
-            source_infohash="a" * 40, source_name="Old Show",
-            dest_infohash="a" * 40, total_bytes=700, state=State.DONE,
-            completed_at=now - dt.timedelta(hours=200)))
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Old Show",
+                dest_infohash="a" * 40,
+                total_bytes=700,
+                state=State.DONE,
+                completed_at=now - dt.timedelta(hours=200),
+            )
+        )
         coord._source_free_bytes = AsyncMock(return_value=1 * GiB)
         coord._cleanup_arrivals_per_hour = MagicMock(return_value=0.0)
 
@@ -127,10 +138,16 @@ async def test_unknown_free_space_runs_fail_closed(tmp_path: Path):
     coord, store = _gate_coord(tmp_path)
     try:
         now = dt.datetime.now(dt.timezone.utc)
-        store.upsert(TorrentState(
-            source_infohash="a" * 40, source_name="Old Show",
-            dest_infohash="a" * 40, total_bytes=700, state=State.DONE,
-            completed_at=now - dt.timedelta(hours=200)))
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Old Show",
+                dest_infohash="a" * 40,
+                total_bytes=700,
+                state=State.DONE,
+                completed_at=now - dt.timedelta(hours=200),
+            )
+        )
         coord._source_free_bytes = AsyncMock(return_value=None)
         coord._cleanup_arrivals_per_hour = MagicMock(return_value=0.0)
 

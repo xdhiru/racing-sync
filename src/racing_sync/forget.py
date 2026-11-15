@@ -69,7 +69,8 @@ def resolve_row(store, target: str):
             hash_hits.append(ts)
     if len(hash_hits) > 1:
         preview = ", ".join(
-            f"{t.source_name} ({(t.source_infohash or '')[:10]})" for t in hash_hits[:5])
+            f"{t.source_name} ({(t.source_infohash or '')[:10]})" for t in hash_hits[:5]
+        )
         raise LookupError(
             f"forget target {target!r} matches {len(hash_hits)} torrents by hash: "
             f"{preview}; use a 40-char infohash to pick one"
@@ -80,7 +81,9 @@ def resolve_row(store, target: str):
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
-        preview = ", ".join(f"{t.source_name} ({(t.source_infohash or '')[:10]})" for t in matches[:5])
+        preview = ", ".join(
+            f"{t.source_name} ({(t.source_infohash or '')[:10]})" for t in matches[:5]
+        )
         raise LookupError(
             f"forget target {target!r} matches {len(matches)} torrents: {preview}; "
             "use a 40-char infohash to pick one"
@@ -139,7 +142,9 @@ def _tops_from_files(files: list) -> list[str]:
     return tops
 
 
-async def _candidate_local_paths(cfg, dest, row, entry_hashes: list[str]) -> tuple[list[Path], list[str]]:
+async def _candidate_local_paths(
+    cfg, dest, row, entry_hashes: list[str]
+) -> tuple[list[Path], list[str]]:
     """Local SSD paths owned by this torrent (validated) + skipped reasons.
 
     Unions tops across ALL dest entries with their own save_path base:
@@ -230,8 +235,9 @@ def _paired_waiter_identities(store, cfg, target) -> list[dict]:
                 continue
             winner = watch_election_winner(rows, cand, cfg)
             if winner is not None and (winner.source_infohash or "").lower() == target_hash:
-                out.append({"source_infohash": cand.source_infohash,
-                            "source_name": cand.source_name})
+                out.append(
+                    {"source_infohash": cand.source_infohash, "source_name": cand.source_name}
+                )
         except Exception:
             continue
     return sorted(out, key=lambda d: d["source_infohash"])
@@ -311,10 +317,12 @@ async def _forget_one(
                 _sh = (row.source_infohash or "")[:10]
             except Exception:
                 _sh = "?"
-            log.warning("forget: cannot list dest entries for %s: %s",
-                        _sh, e)
+            log.warning("forget: cannot list dest entries for %s: %s", _sh, e)
     local_paths, skipped = await _candidate_local_paths(
-        cfg, dest, row, [h for h in known if h in entries] or known[:1],
+        cfg,
+        dest,
+        row,
+        [h for h in known if h in entries] or known[:1],
     )
     # Cached .torrent blobs for this row (sibling of state.db): planned in
     # dry-run like any other local path, removed on apply.
@@ -344,15 +352,15 @@ async def _forget_one(
     for h in sorted(entries):
         try:
             entry = entries[h]
-            entry_save = (getattr(entry, "save_path", "") or "")
+            entry_save = getattr(entry, "save_path", "") or ""
             # Fuse/remote copies are never touched: entries seeding from the
             # fuse mount are removed without files even when the caller asked
             # for delete_files=True (SSD entries still use the caller flag).
-            effective_delete_files = (
-                False if _is_fuse_save_path(cfg, entry_save) else delete_files
-            )
+            effective_delete_files = False if _is_fuse_save_path(cfg, entry_save) else delete_files
             await dest.delete(h, delete_files=effective_delete_files)
-            log.info("forget: deleted dest entry %s (delete_files=%s)", h[:10], effective_delete_files)
+            log.info(
+                "forget: deleted dest entry %s (delete_files=%s)", h[:10], effective_delete_files
+            )
         except Exception as e:  # noqa: BLE001
             result["errors"].append(f"dest entry {h[:10]}: {e}")
     if sorted(entries):
@@ -374,13 +382,12 @@ async def _forget_one(
                 _sh2 = (row.source_infohash or "")[:10]
             except Exception:
                 _sh2 = "?"
-            log.warning("forget: cannot verify dest deletes for %s: %s",
-                        _sh2, e)
+            log.warning("forget: cannot verify dest deletes for %s: %s", _sh2, e)
         for h in sorted(remaining_entries):
             try:
-                entry_save = (getattr(remaining_entries[h], "save_path", "") or "")
+                entry_save = getattr(remaining_entries[h], "save_path", "") or ""
                 if not entry_save and h in entries:
-                    entry_save = (getattr(entries[h], "save_path", "") or "")
+                    entry_save = getattr(entries[h], "save_path", "") or ""
                 effective_delete_files = (
                     False if _is_fuse_save_path(cfg, entry_save) else delete_files
                 )
@@ -397,12 +404,14 @@ async def _forget_one(
         except Exception:
             still = set()
         for h in sorted(still):
-            result["errors"].append(
-                f"dest entry {h[:10]} still present after delete")
+            result["errors"].append(f"dest entry {h[:10]} still present after delete")
         if still:
-            log.warning("forget: %d dest entr%s still present for %s after delete",
-                        len(still), "y" if len(still) == 1 else "ies",
-                        row.source_infohash[:10])
+            log.warning(
+                "forget: %d dest entr%s still present for %s after delete",
+                len(still),
+                "y" if len(still) == 1 else "ies",
+                row.source_infohash[:10],
+            )
     if not verify_ok or still or not discover_ok:
         # Dest entries survived deletion (or the deletes are unverifiable):
         # wiping SSD data now would orphan bytes a surviving entry still
@@ -410,15 +419,14 @@ async def _forget_one(
         # survivor as a fresh row (resurrecting the cancel). Keep the row
         # so the operator can retry the forget.
         if not discover_ok:
-            result["errors"].append(
-                "could not list dest entries; keeping db row")
+            result["errors"].append("could not list dest entries; keeping db row")
         elif not verify_ok and not still:
-            result["errors"].append(
-                "could not verify dest deletes; keeping db row")
+            result["errors"].append("could not verify dest deletes; keeping db row")
         else:
             result["errors"].append(
                 f"kept db row: {len(still)} dest entr"
-                f"{'y' if len(still) == 1 else 'ies'} still present")
+                f"{'y' if len(still) == 1 else 'ies'} still present"
+            )
         result["ignored"] = False
         return result
     if delete_files:
@@ -527,22 +535,25 @@ async def forget_torrent(
     # Only a real async hook stops workers: bare MagicMock doubles (and
     # sync callables) are not awaitable, and awaiting them would record a
     # bogus "stop workers" error on every forget.
-    _stop_hook = (stop_workers
-                  if asyncio.iscoroutinefunction(stop_workers) else None)
+    _stop_hook = stop_workers if asyncio.iscoroutinefunction(stop_workers) else None
     if apply and _stop_hook is not None:
-        await _stop_workers_best_effort(
-            _stop_hook, row.source_infohash, _stop_errors)
+        await _stop_workers_best_effort(_stop_hook, row.source_infohash, _stop_errors)
     result = await _forget_one(
-        cfg, dest=dest, store=store, row=row,
-        apply=apply, delete_files=delete_files, ignore=ignore, hard=hard,
+        cfg,
+        dest=dest,
+        store=store,
+        row=row,
+        apply=apply,
+        delete_files=delete_files,
+        ignore=ignore,
+        hard=hard,
     )
     if _stop_errors:
         result["errors"] = _stop_errors + list(result.get("errors") or [])
     result["paired_cancelled"] = []
     if not apply:
         result["paired_cancelled"] = [
-            {"source_infohash": p["source_infohash"],
-             "source_name": p["source_name"], "errors": []}
+            {"source_infohash": p["source_infohash"], "source_name": p["source_name"], "errors": []}
             for p in paired
         ]
         return result
@@ -555,12 +566,16 @@ async def forget_torrent(
         if prow is None:
             continue
         if _stop_hook is not None:
-            await _stop_workers_best_effort(
-                _stop_hook, h, result["errors"])
+            await _stop_workers_best_effort(_stop_hook, h, result["errors"])
         try:
             pres = await _forget_one(
-                cfg, dest=dest, store=store, row=prow,
-                apply=True, delete_files=delete_files, ignore=ignore,
+                cfg,
+                dest=dest,
+                store=store,
+                row=prow,
+                apply=True,
+                delete_files=delete_files,
+                ignore=ignore,
                 hard=hard,
             )
         except LookupError:
@@ -568,14 +583,19 @@ async def forget_torrent(
         except Exception as e:  # noqa: BLE001
             result["errors"].append(f"paired {(h or '')[:10]}: {e}")
             continue
-        log.info("forget: auto-cancelled waiting pair %s (%s) with %s",
-                 (p["source_name"] or "?")[:60], (h or "")[:10],
-                 (row.source_name or "?")[:60])
-        result["paired_cancelled"].append({
-            "source_infohash": h,
-            "source_name": p["source_name"],
-            "errors": list(pres.get("errors") or []),
-        })
+        log.info(
+            "forget: auto-cancelled waiting pair %s (%s) with %s",
+            (p["source_name"] or "?")[:60],
+            (h or "")[:10],
+            (row.source_name or "?")[:60],
+        )
+        result["paired_cancelled"].append(
+            {
+                "source_infohash": h,
+                "source_name": p["source_name"],
+                "errors": list(pres.get("errors") or []),
+            }
+        )
         for e in pres.get("errors") or []:
             result["errors"].append(f"paired {(h or '')[:10]}: {e}")
     return result

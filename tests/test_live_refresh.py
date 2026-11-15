@@ -1,4 +1,5 @@
 """Live-status refresh: parallel chunk fetch."""
+
 from __future__ import annotations
 
 import asyncio
@@ -15,9 +16,9 @@ async def test_refresh_live_status_fetches_chunks_in_parallel():
     updates from its chunk's rows."""
     coord = make_coordinator()
     coord._live = {
-        f"{i:040d}": SimpleNamespace(progress=0.0, size_mb=0,
-                                      dlspeed_bps=0,
-                                      source_infohash=f"{i:040d}")
+        f"{i:040d}": SimpleNamespace(
+            progress=0.0, size_mb=0, dlspeed_bps=0, source_infohash=f"{i:040d}"
+        )
         for i in range(4)
     }
     in_flight = 0
@@ -31,12 +32,15 @@ async def test_refresh_live_status_fetches_chunks_in_parallel():
             await asyncio.sleep(0.05)
         finally:
             in_flight -= 1
-        return [SimpleNamespace(hash=h, progress=0.5, size_bytes=100,
-                                dlspeed_bps=10) for h in (hashes or [])]
+        return [
+            SimpleNamespace(hash=h, progress=0.5, size_bytes=100, dlspeed_bps=10)
+            for h in (hashes or [])
+        ]
 
     coord.dest_client = SimpleNamespace(list_torrents=_list)
-    with patch("racing_sync.coordinator_live.chunked",
-               side_effect=lambda keys: [[k] for k in keys]):
+    with patch(
+        "racing_sync.coordinator_live.chunked", side_effect=lambda keys: [[k] for k in keys]
+    ):
         await coord._refresh_live_status()
     assert peak >= 2
     assert all(v.progress == 0.5 for v in coord._live.values())

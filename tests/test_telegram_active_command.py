@@ -5,6 +5,7 @@ deleted from the chat — or a bot that latched the "chat not found" kill
 switch — leaves the operator with no card and no way back. `/active`
 sends a brand new one.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -35,10 +36,10 @@ async def test_render_active_now_sends_new_card_when_text_unchanged(tmp_path):
 
         # The stale card is retired by the orphan sweep (bounded, best
         # effort) — a flooded delete must not block the send.
-        bot._bot.delete_message = AsyncMock(side_effect=TelegramError(
-            "Flood control exceeded. Retry in 12 seconds"))
-        bot._bot.send_message = AsyncMock(
-            return_value=SimpleNamespace(message_id=9))
+        bot._bot.delete_message = AsyncMock(
+            side_effect=TelegramError("Flood control exceeded. Retry in 12 seconds")
+        )
+        bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=9))
 
         ok = await bot.render_active_now()
 
@@ -59,8 +60,7 @@ async def test_render_active_now_rearms_kill_switch(tmp_path):
         bot = _bot(_active_msg_id=-1)
         bot._store = store
         bot._active_footer = AsyncMock(return_value="")
-        bot._bot.send_message = AsyncMock(
-            return_value=SimpleNamespace(message_id=21))
+        bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=21))
 
         ok = await bot.render_active_now()
 
@@ -79,8 +79,7 @@ async def test_render_active_now_reports_failed_send(tmp_path):
         bot = _bot()
         bot._store = store
         bot._active_footer = AsyncMock(return_value="")
-        bot._bot.send_message = AsyncMock(
-            side_effect=TelegramError("Bad Request: chat not found"))
+        bot._bot.send_message = AsyncMock(side_effect=TelegramError("Bad Request: chat not found"))
 
         ok = await bot.render_active_now()
 
@@ -105,8 +104,7 @@ async def test_cmd_active_reports_success_and_failure():
     failing.render_active_now = AsyncMock(return_value=False)
     failing._reply = AsyncMock()
     await _cmd_active(failing, MagicMock(), msg)
-    assert failing._reply.call_args[0][0] == (
-        "Active tasks could not be sent — see the log.")
+    assert failing._reply.call_args[0][0] == ("Active tasks could not be sent — see the log.")
 
 
 @pytest.mark.anyio

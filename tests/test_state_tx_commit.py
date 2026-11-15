@@ -41,8 +41,7 @@ def test_commit_failure_rolls_back_and_next_write_succeeds(tmp_path: Path):
     real = store._conn
     try:
         ts = TorrentState(source_infohash="a" * 40, source_name="A")
-        store._conn = _CommitFailingConn(
-            real, sqlite3.OperationalError("disk I/O error"))
+        store._conn = _CommitFailingConn(real, sqlite3.OperationalError("disk I/O error"))
         with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
             store.upsert(ts)
         # The failed COMMIT must not strand an open transaction.
@@ -63,13 +62,13 @@ def test_base_exception_from_body_rolls_back(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     real = store._conn
     try:
+
         def _boom():
             raise KeyboardInterrupt
 
         with pytest.raises(KeyboardInterrupt):
             with store._write_tx():
-                store._conn.execute(
-                    "INSERT INTO meta (key, value) VALUES ('k', 'v')")
+                store._conn.execute("INSERT INTO meta (key, value) VALUES ('k', 'v')")
                 _boom()
 
         assert real.in_transaction is False

@@ -62,13 +62,21 @@ class InjectMixin:
     # abandon their partial download first (dest entry removed, reservation
     # released), cancelled/untracked groups are adopted; DONE/RE_ADDING are
     # no-ops.
-    _INJECTFUSE_DRIVABLE = frozenset({
-        State.NEW, State.WAITING_INDEXER,
-        State.WAITING_DISK, State.FAILED,
-    })
-    _INJECTFUSE_ACTIVE = frozenset({
-        State.QUEUED, State.DOWNLOADING, State.MOVING,
-    })
+    _INJECTFUSE_DRIVABLE = frozenset(
+        {
+            State.NEW,
+            State.WAITING_INDEXER,
+            State.WAITING_DISK,
+            State.FAILED,
+        }
+    )
+    _INJECTFUSE_ACTIVE = frozenset(
+        {
+            State.QUEUED,
+            State.DOWNLOADING,
+            State.MOVING,
+        }
+    )
 
     def _injectfuse_group_for(self, anchor, live: list) -> list:
         """Live VPS1 torrents holding the anchor's content.
@@ -95,8 +103,10 @@ class InjectMixin:
                 except (TypeError, ValueError):
                     t_size = 0
                 if not _same_content_key(
-                    getattr(t, "name", "") or "", t_size,
-                    getattr(anchor, "name", "") or "", want_size,
+                    getattr(t, "name", "") or "",
+                    t_size,
+                    getattr(anchor, "name", "") or "",
+                    want_size,
                 ):
                     continue
                 out.append(t)
@@ -131,15 +141,17 @@ class InjectMixin:
             anchor = members[0]
             name = getattr(anchor, "name", "") or ""
             size = int(getattr(anchor, "size_bytes", 0) or 0)
-            for m in (getattr(store, "find_by_name", lambda _n: [])(name) or []):
+            for m in getattr(store, "find_by_name", lambda _n: [])(name) or []:
                 try:
                     try:
                         m_size = int(getattr(m, "total_bytes", 0) or 0)
                     except (TypeError, ValueError):
                         m_size = 0
                     if not _same_content_key(
-                        getattr(m, "source_name", "") or "", m_size,
-                        name, size,
+                        getattr(m, "source_name", "") or "",
+                        m_size,
+                        name,
+                        size,
                     ):
                         continue
                     return m
@@ -164,7 +176,9 @@ class InjectMixin:
         try:
             live = await rpc(
                 self.source_client.list_torrents(),
-                getattr(self, "cfg", None), "source injectfuse list")
+                getattr(self, "cfg", None),
+                "source injectfuse list",
+            )
         except Exception as e:  # noqa: BLE001
             raise LookupError(f"cannot list VPS1 torrents: {e}") from e
         anchor = None
@@ -176,8 +190,7 @@ class InjectMixin:
             except Exception:
                 continue
         if anchor is None:
-            raise LookupError(
-                f"hash {norm[:10]} not on VPS1 (typo, or already removed)")
+            raise LookupError(f"hash {norm[:10]} not on VPS1 (typo, or already removed)")
         group = self._injectfuse_group_for(anchor, live)
         if not group:
             raise LookupError(f"hash {norm[:10]} not on VPS1")
@@ -199,7 +212,8 @@ class InjectMixin:
         }
 
     async def _injectfuse_verify_one(
-        self, t,
+        self,
+        t,
     ) -> tuple[str, bytes | None, list[str]]:
         """Verify one group member: fetchable bytes + fuse presence.
 
@@ -239,8 +253,7 @@ class InjectMixin:
                 # Never stat the SSD dir as fuse: bytes present on SSD
                 # are not on fuse, and a false "present" would pass
                 # verification for data never seeded. Fail closed.
-                raise ValueError(
-                    f"fuse target {target} not on a fuse mount")
+                raise ValueError(f"fuse target {target} not on a fuse mount")
         except Exception:
             return h, None, [f"{name}: no fuse target"]
         try:
@@ -253,8 +266,7 @@ class InjectMixin:
             shown = ", ".join(str(m)[:60] for m in missing[:3])
             if len(missing) > 3:
                 shown += f" (+{len(missing) - 3} more)"
-            return h, None, [
-                f"{name}: {len(missing)} missing at {target} (e.g. {shown})"]
+            return h, None, [f"{name}: {len(missing)} missing at {target} (e.g. {shown})"]
         return h, blobs[h], []
 
     async def injectfuse_verify(self, members: list) -> dict:
@@ -284,8 +296,7 @@ class InjectMixin:
                 continue
             if h and blob:
                 blobs[h] = blob
-        return {"ready": ready and bool(members), "blobs": blobs,
-                "problems": problems}
+        return {"ready": ready and bool(members), "blobs": blobs, "problems": problems}
 
     def _injectfuse_lift_cancel(self, members: list) -> bool:
         """Clear ignore entries + forget tombstones for a group (best-effort).
@@ -380,15 +391,20 @@ class InjectMixin:
         if not hashes:
             return
         try:
-            _parts = await asyncio.gather(*(
-                rpc(dest.list_torrents(hashes=_chunk),
-                    getattr(self, "cfg", None),
-                    "injectfuse preempt list")
-                for _chunk in chunked(hashes)
-            ))
+            _parts = await asyncio.gather(
+                *(
+                    rpc(
+                        dest.list_torrents(hashes=_chunk),
+                        getattr(self, "cfg", None),
+                        "injectfuse preempt list",
+                    )
+                    for _chunk in chunked(hashes)
+                )
+            )
         except Exception as e:  # noqa: BLE001
-            log.debug("injectfuse: preempt list failed for %s: %s",
-                      (row.source_infohash or "")[:10], e)
+            log.debug(
+                "injectfuse: preempt list failed for %s: %s", (row.source_infohash or "")[:10], e
+            )
             return
         entries: list = []
         for _part in _parts or []:
@@ -413,14 +429,13 @@ class InjectMixin:
                     save_path = getattr(entry, "save_path", "") or ""
                     on_ssd = False
                     try:
-                        on_ssd = bool(cfg is not None
-                                      and _save_path_on_ssd(cfg, save_path))
+                        on_ssd = bool(cfg is not None and _save_path_on_ssd(cfg, save_path))
                     except Exception:
                         on_ssd = False
-                    await rpc(dest.delete(h, delete_files=on_ssd),
-                              cfg, "injectfuse preempt delete")
-                    log.info("injectfuse: preempt removed entry %s (delete_files=%s)",
-                             h[:10], on_ssd)
+                    await rpc(dest.delete(h, delete_files=on_ssd), cfg, "injectfuse preempt delete")
+                    log.info(
+                        "injectfuse: preempt removed entry %s (delete_files=%s)", h[:10], on_ssd
+                    )
                 except Exception as e:  # noqa: BLE001
                     log.debug("injectfuse: preempt delete failed: %s", e)
 
@@ -535,8 +550,7 @@ class InjectMixin:
                 raise LookupError("already gone from tracking")
             row = fresh
             if row.state in (State.DONE, State.RE_ADDING):
-                return (f"already {row.state.value}: {title} "
-                        "(fuse gate runs next tick)")
+                return f"already {row.state.value}: {title} (fuse gate runs next tick)"
             if row.state in self._INJECTFUSE_ACTIVE:
                 prev = row.state.value
                 if not await self._injectfuse_blob_available(row, resolved, blobs):
@@ -552,22 +566,26 @@ class InjectMixin:
                 if not await self._injectfuse_ensure_blob(row, resolved, blobs):
                     raise LookupError("primary .torrent bytes missing; run again")
                 self.transition(row, State.RE_ADDING)
-                return (f"injecting {len(members)} torrent(s) for {title} "
-                        f"(SSD {prev} stopped{lift_note}; "
-                        "fuse gate runs next tick)")
+                return (
+                    f"injecting {len(members)} torrent(s) for {title} "
+                    f"(SSD {prev} stopped{lift_note}; "
+                    "fuse gate runs next tick)"
+                )
             if row.state not in self._INJECTFUSE_DRIVABLE:
                 raise LookupError(
-                    f"{title} is {row.state.value}; manual inject needs "
-                    "a waiting/failed row")
+                    f"{title} is {row.state.value}; manual inject needs a waiting/failed row"
+                )
             self._injectfuse_unhold(row)
             if not await self._injectfuse_ensure_blob(row, resolved, blobs):
                 raise LookupError("primary .torrent bytes missing; run again")
             self.transition(row, State.RE_ADDING)
-            return (f"injecting {len(members)} torrent(s) for {title} "
-                    f"(fuse gate runs next tick{lift_note})")
+            return (
+                f"injecting {len(members)} torrent(s) for {title} "
+                f"(fuse gate runs next tick{lift_note})"
+            )
         try:
             p_hash = (getattr(primary, "infohash", "") or "").lower()
-            p_name = (getattr(primary, "name", "") or p_hash[:10])
+            p_name = getattr(primary, "name", "") or p_hash[:10]
             try:
                 p_size = int(getattr(primary, "size_bytes", 0) or 0)
             except (TypeError, ValueError):
@@ -631,10 +649,15 @@ class InjectMixin:
             self._drop_frozen_batch_cap(ts)
         except Exception:
             pass
-        log.info("injectfuse: adopted %s (%d torrent(s)) straight to re_adding",
-                 p_name[:60], len(members))
-        return (f"injecting {len(members)} torrent(s) for {p_name[:60]} "
-                "(adopted; fuse gate runs next tick)")
+        log.info(
+            "injectfuse: adopted %s (%d torrent(s)) straight to re_adding",
+            p_name[:60],
+            len(members),
+        )
+        return (
+            f"injecting {len(members)} torrent(s) for {p_name[:60]} "
+            "(adopted; fuse gate runs next tick)"
+        )
 
     async def injectfuse_confirmed(self, hashes: list[str]) -> str:
         """Execute a confirmed /injectfuse: resolve live, verify, drive.
@@ -652,9 +675,7 @@ class InjectMixin:
                 n = (h or "").strip().lower()
             except Exception:
                 continue
-            if (len(n) == 40
-                    and all(c in "0123456789abcdef" for c in n)
-                    and n not in clean):
+            if len(n) == 40 and all(c in "0123456789abcdef" for c in n) and n not in clean:
                 clean.append(n)
         if not clean:
             return "Not injected — nothing to verify (expired?)."
@@ -679,8 +700,7 @@ class InjectMixin:
             if _p_hash:
                 driven.add(_p_hash)
             try:
-                verified = await self.injectfuse_verify(
-                    resolved.get("members") or [])
+                verified = await self.injectfuse_verify(resolved.get("members") or [])
             except Exception as e:  # noqa: BLE001
                 outs.append(f"Not injected — verify failed ({e})")
                 continue
@@ -697,8 +717,7 @@ class InjectMixin:
                 outs.append(f"Not injected{suffix}: " + "; ".join(probs[:3]) + extra)
                 continue
             try:
-                outs.append(await self.injectfuse_apply(
-                    resolved, verified.get("blobs") or {}))
+                outs.append(await self.injectfuse_apply(resolved, verified.get("blobs") or {}))
             except (LookupError, ValueError) as e:
                 outs.append(f"Not injected — {e}")
             except Exception as e:  # noqa: BLE001

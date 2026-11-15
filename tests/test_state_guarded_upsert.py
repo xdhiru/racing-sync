@@ -22,9 +22,14 @@ def test_guarded_upsert_writes_when_snapshot_matches(tmp_path):
         assert store.upsert(ts) is UpsertResult.WRITTEN
 
         ts.classification_kind = "movie"
-        assert store.upsert(
-            ts, expected_version=ts.version, expected_state=State.DOWNLOADING,
-        ) is UpsertResult.WRITTEN
+        assert (
+            store.upsert(
+                ts,
+                expected_version=ts.version,
+                expected_state=State.DOWNLOADING,
+            )
+            is UpsertResult.WRITTEN
+        )
         assert store.get(H).classification_kind == "movie"
     finally:
         store.close()
@@ -59,9 +64,13 @@ def test_expected_state_mismatch_conflicts(tmp_path):
         assert store.upsert(ts) is UpsertResult.WRITTEN
 
         ts.source_name = "Renamed"
-        assert store.upsert(
-            ts, expected_state=State.MOVING,
-        ) is UpsertResult.CONFLICT
+        assert (
+            store.upsert(
+                ts,
+                expected_state=State.MOVING,
+            )
+            is UpsertResult.CONFLICT
+        )
         assert store.get(H).source_name == "Guarded Row"
     finally:
         store.close()
@@ -85,8 +94,12 @@ def test_guarded_upsert_still_respects_tombstones(tmp_path):
         store.tombstone(H)
 
         ts.source_name = "Resurrected"
-        assert store.upsert(
-            ts, expected_version=ts.version,
-        ) is UpsertResult.TOMBSTONED
+        assert (
+            store.upsert(
+                ts,
+                expected_version=ts.version,
+            )
+            is UpsertResult.TOMBSTONED
+        )
     finally:
         store.close()

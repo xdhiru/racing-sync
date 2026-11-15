@@ -1,4 +1,5 @@
 """M6 logging/shutdown: handler disable policy, sink opt-in log, ring tail."""
+
 from __future__ import annotations
 
 import errno
@@ -8,13 +9,12 @@ import pytest
 
 
 def _record(msg="x"):
-    return logging.LogRecord("t", logging.WARNING, __file__, 1, msg, None,
-                             None)
+    return logging.LogRecord("t", logging.WARNING, __file__, 1, msg, None, None)
 
 
 def _handler(tmp_path, monkeypatch):
-    from racing_sync.logging_setup import (
-        ENOSPCSafeTimedRotatingFileHandler as H)
+    from racing_sync.logging_setup import ENOSPCSafeTimedRotatingFileHandler as H
+
     h = H(str(tmp_path / "t.log"), when="midnight", backupCount=1)
     h.handleError = lambda *a: None  # type: ignore[method-assign]
     return h
@@ -74,13 +74,19 @@ def test_handler_streak_resets_on_success(tmp_path, monkeypatch):
 
 def _sink_cfg(tmp_path, **kw):
     from types import SimpleNamespace
-    base = dict(enabled=True, url="http://logs.example/ingest",
-                auth_token="s3cret", forward_min_level="INFO",
-                allow_plaintext=True)
+
+    base = dict(
+        enabled=True,
+        url="http://logs.example/ingest",
+        auth_token="s3cret",
+        forward_min_level="INFO",
+        allow_plaintext=True,
+    )
     base.update(kw)
     return SimpleNamespace(
-        general=SimpleNamespace(log_dir=tmp_path, log_retention_days=1,
-                                state_db=str(tmp_path / "s.db")),
+        general=SimpleNamespace(
+            log_dir=tmp_path, log_retention_days=1, state_db=str(tmp_path / "s.db")
+        ),
         ssd=SimpleNamespace(path=tmp_path),
         dest=SimpleNamespace(save_path=tmp_path),
         logging_sink=SimpleNamespace(**base),
@@ -162,15 +168,11 @@ async def test_post_log_event_returns_bool_and_logs_non_2xx(caplog):
         def post(self, *a, **k):
             return _Post(self._status, self._boom)
 
-    assert await post_log_event_async(
-        _Session(200), "http://x/ingest", {}) is True
-    with caplog.at_level(logging.WARNING,
-                         logger="racing_sync.logging_setup"):
-        assert await post_log_event_async(
-            _Session(500), "http://x/ingest", {}) is False
+    assert await post_log_event_async(_Session(200), "http://x/ingest", {}) is True
+    with caplog.at_level(logging.WARNING, logger="racing_sync.logging_setup"):
+        assert await post_log_event_async(_Session(500), "http://x/ingest", {}) is False
     assert any("500" in r.message for r in caplog.records)
-    assert await post_log_event_async(
-        _Session(boom=True), "http://x/ingest", {}) is False
+    assert await post_log_event_async(_Session(boom=True), "http://x/ingest", {}) is False
 
 
 @pytest.mark.anyio
@@ -181,9 +183,17 @@ async def test_stats_carries_ring_tail():
     from racing_sync.telegram_protocol import _cmd_stats
 
     rb = _ls.RingBufferHandler(capacity=10)
-    rb.emit(logging.LogRecord("racing_sync.fuse", logging.WARNING,
-                              __file__, 1, "fuse wobbling passkey=SECRET",
-                              None, None))
+    rb.emit(
+        logging.LogRecord(
+            "racing_sync.fuse",
+            logging.WARNING,
+            __file__,
+            1,
+            "fuse wobbling passkey=SECRET",
+            None,
+            None,
+        )
+    )
     old, _ls._ring = _ls._ring, rb
     try:
         bot = MagicMock()
@@ -210,7 +220,7 @@ def test_request_stop_is_info_not_warning(caplog):
     with caplog.at_level(logging.INFO, logger="racing_sync.coordinator"):
         coord.request_stop()
     assert coord._stop is True
-    assert not [r for r in caplog.records
-                if r.levelno >= logging.WARNING
-                and "stop requested" in r.message]
+    assert not [
+        r for r in caplog.records if r.levelno >= logging.WARNING and "stop requested" in r.message
+    ]
     assert any("stop requested" in r.message for r in caplog.records)

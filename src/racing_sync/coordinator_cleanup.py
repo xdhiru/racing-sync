@@ -144,8 +144,7 @@ class CleanupMixin:
         if interval < 60:
             interval = 60
         try:
-            startup_delay = float(
-                getattr(cfg, "janitor_startup_delay_seconds", 300) or 0)
+            startup_delay = float(getattr(cfg, "janitor_startup_delay_seconds", 300) or 0)
         except (TypeError, ValueError):
             startup_delay = 300.0
         if startup_delay < 0:
@@ -189,12 +188,19 @@ class CleanupMixin:
             _min_hours = float(getattr(cfg, "min_seed_hours", 0.0) or 0.0)
         except (TypeError, ValueError):
             _high, _calm, _min_ratio, _min_hours = 0.0, 2.0, 0.0, 0.0
-        if (free_bytes is not None and _high > 0 and free_bytes >= _high
-                and arrivals <= _calm and _min_ratio <= 0 and _min_hours <= 0):
+        if (
+            free_bytes is not None
+            and _high > 0
+            and free_bytes >= _high
+            and arrivals <= _calm
+            and _min_ratio <= 0
+            and _min_hours <= 0
+        ):
             log.info(
                 "cleanup janitor: skipping run (VPS1 free=%d B >= high "
                 "watermark, arrivals=%.1f/h calm)",
-                free_bytes, arrivals,
+                free_bytes,
+                arrivals,
             )
             return
         grace_s = cleanup_grace_seconds(cfg, free_bytes, arrivals)
@@ -212,12 +218,14 @@ class CleanupMixin:
         log.info(
             "cleanup janitor: VPS1 free=%s arrivals=%.1f/h grace=%ds",
             f"{free_bytes} B" if free_bytes is not None else "unknown",
-            arrivals, int(grace_s),
+            arrivals,
+            int(grace_s),
         )
 
         try:
-            rows = [ts for ts in await offload(self.store.all)
-                    if ts.state in (State.DONE, State.MOVING)]
+            rows = [
+                ts for ts in await offload(self.store.all) if ts.state in (State.DONE, State.MOVING)
+            ]
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup: cannot list state rows: %s", e)
             return
@@ -225,10 +233,9 @@ class CleanupMixin:
             return
         try:
             src_torrents = await rpc(
-                self.source_client.list_torrents(
-                    category=self.cfg.source.category
-                ),
-                getattr(self, "cfg", None), "source cleanup list_torrents",
+                self.source_client.list_torrents(category=self.cfg.source.category),
+                getattr(self, "cfg", None),
+                "source cleanup list_torrents",
             )
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup: cannot list VPS1 torrents: %s", e)
@@ -255,17 +262,18 @@ class CleanupMixin:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001
-                    log.warning("cleanup: group resolve failed for %s: %s",
-                                ts.source_infohash[:10], e)
+                    log.warning(
+                        "cleanup: group resolve failed for %s: %s", ts.source_infohash[:10], e
+                    )
                     return None
                 try:
                     return await self._cleanup_verdict(
-                        ts, group, grace_s, now_utc, dry_run, free_bytes)
+                        ts, group, grace_s, now_utc, dry_run, free_bytes
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001
-                    log.warning("cleanup: verdict failed for %s: %s",
-                                ts.source_infohash[:10], e)
+                    log.warning("cleanup: verdict failed for %s: %s", ts.source_infohash[:10], e)
                     return None
 
         try:
@@ -304,13 +312,11 @@ class CleanupMixin:
             try:
                 ok = await self._delete_source_group(ts, group, cfg, dry_run)
             except Exception as e:  # noqa: BLE001
-                log.warning("cleanup: delete failed for %s: %s",
-                            ts.source_infohash[:10], e)
+                log.warning("cleanup: delete failed for %s: %s", ts.source_infohash[:10], e)
                 continue
             if ok:
                 deleted += 1
-                _more = (not dry_run and _i + 1 < len(_cands)
-                         and deleted < cap)
+                _more = not dry_run and _i + 1 < len(_cands) and deleted < cap
                 if _more and _stagger > 0:
                     # Spread load: back-to-back remove_torrent(+data) calls
                     # spike deluged teardown + disk unlinking, which has
@@ -322,9 +328,12 @@ class CleanupMixin:
                         await asyncio.sleep(_stagger)
                     except asyncio.CancelledError:
                         raise
-        log.info("cleanup janitor: %s %d content group(s)%s",
-                 "would delete" if dry_run else "deleted",
-                 deleted, f" (cap {cap})" if deleted >= cap else "")
+        log.info(
+            "cleanup janitor: %s %d content group(s)%s",
+            "would delete" if dry_run else "deleted",
+            deleted,
+            f" (cap {cap})" if deleted >= cap else "",
+        )
 
     def _cleanup_group_for(self, ts: TorrentState, by_hash: dict[str, Torrent]) -> list[Torrent]:
         """Live VPS1 torrents holding this row's content.
@@ -368,8 +377,11 @@ class CleanupMixin:
             try:
                 text = str(pat).strip().lower()
                 if text and text in name:
-                    log.info("cleanup: %s matches protected pattern %r; keeping",
-                             ts.source_name[:60], pat)
+                    log.info(
+                        "cleanup: %s matches protected pattern %r; keeping",
+                        ts.source_name[:60],
+                        pat,
+                    )
                     return True
             except Exception:
                 continue
@@ -450,8 +462,12 @@ class CleanupMixin:
         return True
 
     async def _cleanup_verdict(
-        self, ts: TorrentState, group: list[Torrent],
-        grace_s: float, now_utc: dt.datetime, dry_run: bool,
+        self,
+        ts: TorrentState,
+        group: list[Torrent],
+        grace_s: float,
+        now_utc: dt.datetime,
+        dry_run: bool,
         free_bytes: int | None,
     ) -> tuple[float, float, TorrentState, list[Torrent]] | None:
         """Decide deletion for one row; None = keep this run.
@@ -470,20 +486,23 @@ class CleanupMixin:
                 # must survive the janitor's observation.
                 try:
                     await asyncio.to_thread(
-                        self.store.set_vps1_activity,
-                        ts.source_infohash, now_utc)
+                        self.store.set_vps1_activity, ts.source_infohash, now_utc
+                    )
                 except Exception:
                     pass
-            log.debug("cleanup: %s still active on VPS1 (%d/%d racing); keeping",
-                      ts.source_name[:60], len(lively), len(group))
+            log.debug(
+                "cleanup: %s still active on VPS1 (%d/%d racing); keeping",
+                ts.source_name[:60],
+                len(lively),
+                len(group),
+            )
             return None
         # 1b. Unknown self stats (stat-less client): never read as quiet.
         # A stat-less Deluge looks exactly like an idle swarm — deleting on
         # that evidence alone risks an H&R hit on a live race. Keep without
         # bumping the activity stamp (unknown is not activity).
         if any(self._cleanup_stats_unknown(m) for m in group):
-            log.debug("cleanup: %s has unknown swarm stats; keeping",
-                      ts.source_name[:60])
+            log.debug("cleanup: %s has unknown swarm stats; keeping", ts.source_name[:60])
             return None
         # 2. Opt-in H&R minimums (default off — same-account fuse seeding
         #    keeps the account compliant; see [cleanup] docs).
@@ -493,8 +512,11 @@ class CleanupMixin:
         completed = ts.completed_at
         # Rows adopted without completed_at must still serve the grace period;
         # age them from created_at (the adoption instant).
-        age_s = (now_utc - (completed or ts.created_at)).total_seconds() if (
-            completed or ts.created_at) else 0.0
+        age_s = (
+            (now_utc - (completed or ts.created_at)).total_seconds()
+            if (completed or ts.created_at)
+            else 0.0
+        )
         if ts.state == State.DONE:
             if not await self._cleanup_fuse_healthy(ts, dry_run):
                 return None
@@ -531,8 +553,11 @@ class CleanupMixin:
         return (sort_key, size, ts, group)
 
     def _cleanup_idle_confirmed(
-        self, ts: TorrentState, group: list[Torrent],
-        now_utc: dt.datetime, cfg: object,
+        self,
+        ts: TorrentState,
+        group: list[Torrent],
+        now_utc: dt.datetime,
+        cfg: object,
     ) -> bool:
         """Fast lane: swarm quiet now (checked by caller) AND quiet long enough.
 
@@ -593,33 +618,43 @@ class CleanupMixin:
         without persisting anything.
         """
         hashes = {
-            h.lower() for h in (
+            h.lower()
+            for h in (
                 ts.dest_infohash,
                 ts.cross_seed_infohash,
                 *ts.injected_private_hashes.split(","),
-            ) if h
+            )
+            if h
         }
         if not hashes:
-            log.warning("cleanup: %s has no recorded fuse hashes; keeping VPS1",
-                        ts.source_name[:60])
+            log.warning(
+                "cleanup: %s has no recorded fuse hashes; keeping VPS1", ts.source_name[:60]
+            )
             return False
         try:
             present: list = []
             for _chunk in chunked(sorted(hashes)):
-                present.extend(await rpc(
-                    self.dest_client.list_torrents(hashes=_chunk),
-                    getattr(self, "cfg", None), "dest cleanup list_torrents",
-                ) or [])
+                present.extend(
+                    await rpc(
+                        self.dest_client.list_torrents(hashes=_chunk),
+                        getattr(self, "cfg", None),
+                        "dest cleanup list_torrents",
+                    )
+                    or []
+                )
         except Exception as e:  # noqa: BLE001
-            log.warning("cleanup: dest lookup failed for %s: %s",
-                        ts.source_infohash[:10], e)
+            log.warning("cleanup: dest lookup failed for %s: %s", ts.source_infohash[:10], e)
             return False
         have = {t.hash.lower() for t in (present or [])}
         missing = sorted(hashes - have)
         if missing:
-            log.warning("cleanup: %d fuse entr%s missing for %s (%s…); keeping VPS1",
-                        len(missing), "y" if len(missing) == 1 else "ies",
-                        ts.source_name[:60], missing[0][:10])
+            log.warning(
+                "cleanup: %d fuse entr%s missing for %s (%s…); keeping VPS1",
+                len(missing),
+                "y" if len(missing) == 1 else "ies",
+                ts.source_name[:60],
+                missing[0][:10],
+            )
             return False
         blob = ts._blob or ts.cross_seed_blob
         if not blob and getattr(self, "store", None) is not None:
@@ -636,14 +671,14 @@ class CleanupMixin:
                     blob = ts.cross_seed_blob or ts._blob
                 else:
                     try:
-                        blob = await asyncio.to_thread(
-                            self.store.get_blob, ts.source_infohash)
+                        blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
                     except Exception:
                         blob = None
         expected = self._expected_fuse_files(blob)
         if not expected:
-            log.warning("cleanup: no verifiable fuse bytes for %s; keeping VPS1",
-                        ts.source_name[:60])
+            log.warning(
+                "cleanup: no verifiable fuse bytes for %s; keeping VPS1", ts.source_name[:60]
+            )
             return False
         try:
             target = self._target_mount_for_blob(blob, self._target_mount_for(ts))
@@ -654,21 +689,27 @@ class CleanupMixin:
         except Exception:  # noqa: BLE001
             return False
         if file_missing:
-            log.warning("cleanup: %d fuse file(s) missing for %s at %s; keeping VPS1",
-                        len(file_missing), ts.source_name[:60], target)
+            log.warning(
+                "cleanup: %d fuse file(s) missing for %s at %s; keeping VPS1",
+                len(file_missing),
+                ts.source_name[:60],
+                target,
+            )
             return False
         if not ts.fuse_verified and getattr(self, "store", None) is not None:
             try:
                 if not dry_run:
-                    await asyncio.to_thread(
-                        self.store.set_fuse_verified, ts.source_infohash, True)
+                    await asyncio.to_thread(self.store.set_fuse_verified, ts.source_infohash, True)
                 ts.fuse_verified = 1
             except Exception:
                 pass
         return True
 
     async def _cleanup_heal_blob(
-        self, ts: TorrentState, hashes: set[str], dry_run: bool,
+        self,
+        ts: TorrentState,
+        hashes: set[str],
+        dry_run: bool,
     ) -> bool:
         """Re-export .torrent bytes for a blobless row; True when healed.
 
@@ -690,13 +731,14 @@ class CleanupMixin:
                     try:
                         if not dry_run:
                             await asyncio.to_thread(
-                                self.store.set_blob, ts.source_infohash,
-                                bytes(blob))
+                                self.store.set_blob, ts.source_infohash, bytes(blob)
+                            )
                     except Exception:
                         return False
                     ts.cross_seed_blob = bytes(blob)
-                    log.info("cleanup: healed missing blob for %s from %s",
-                             ts.source_name[:60], h[:10])
+                    log.info(
+                        "cleanup: healed missing blob for %s from %s", ts.source_name[:60], h[:10]
+                    )
                     return True
             return False
         except Exception:
@@ -715,14 +757,16 @@ class CleanupMixin:
         try:
             files = await rpc(
                 self.dest_client.get_torrent_files(h),
-                getattr(self, "cfg", None), "source cleanup list files")
+                getattr(self, "cfg", None),
+                "source cleanup list files",
+            )
         except Exception as e:  # noqa: BLE001
-            log.warning("cleanup: cannot list SSD files for %s: %s",
-                        ts.source_infohash[:10], e)
+            log.warning("cleanup: cannot list SSD files for %s: %s", ts.source_infohash[:10], e)
             return False
         expected = [
             (f.name, f.size_bytes, getattr(f, "progress", None))
-            for f in (files or []) if getattr(f, "name", "")
+            for f in (files or [])
+            if getattr(f, "name", "")
         ]
         if not expected:
             return False
@@ -756,8 +800,8 @@ class CleanupMixin:
                 except OSError:
                     return False
                 if not _roots or not any(
-                        _base_real == _r or _base_real.is_relative_to(_r)
-                        for _r in _roots):
+                    _base_real == _r or _base_real.is_relative_to(_r) for _r in _roots
+                ):
                     return False
             except OSError:
                 return False
@@ -772,8 +816,7 @@ class CleanupMixin:
                     # at full size. Require client-verified progress when known —
                     # and fail closed when unknown: a full-size preallocated
                     # partial must never pass as "complete".
-                    if want and (not isinstance(progress, (int, float))
-                                 or progress < 0.999):
+                    if want and (not isinstance(progress, (int, float)) or progress < 0.999):
                         return False
                     if want and p.stat().st_size < want:
                         return False
@@ -786,8 +829,11 @@ class CleanupMixin:
         except Exception:
             return False
         if not ok:
-            log.warning("cleanup: SSD bytes unverifiable for %s at %s; keeping VPS1",
-                        ts.source_infohash[:10], base)
+            log.warning(
+                "cleanup: SSD bytes unverifiable for %s at %s; keeping VPS1",
+                ts.source_infohash[:10],
+                base,
+            )
         return ok
 
     async def _delete_source_group(
@@ -822,26 +868,33 @@ class CleanupMixin:
             if size_key > 0:
                 parts.setdefault((m.save_path or "", size_key, ""), []).append(m)
             else:
-                parts.setdefault((m.save_path or "", 0,
-                                  (m.infohash or "").lower()), []).append(m)
+                parts.setdefault((m.save_path or "", 0, (m.infohash or "").lower()), []).append(m)
         ok = True
         for (save_path, _size_key, _name_key), members in parts.items():
             hashes = [m.infohash for m in members]
             # Members sharing a save_path hold the same on-disk files
             # (deleted exactly once via the first member), so the freed
             # size is one copy, not the sum over cross-seeds.
-            total_mb = (max((m.size_bytes or 0) for m in members) if members else 0) // (1024 * 1024)
+            total_mb = (max((m.size_bytes or 0) for m in members) if members else 0) // (
+                1024 * 1024
+            )
             if dry_run:
                 log.info(
                     "cleanup dry-run: would delete %d VPS1 torrent(s) for %s "
                     "(~%d MB, save_path=%s, delete_files=%s)",
-                    len(hashes), ts.source_name[:60], total_mb,
-                    save_path or "?", delete_files,
+                    len(hashes),
+                    ts.source_name[:60],
+                    total_mb,
+                    save_path or "?",
+                    delete_files,
                 )
                 continue
             log.warning(
                 "cleanup: deleting %d VPS1 torrent(s) for %s (~%d MB, save_path=%s)",
-                len(hashes), ts.source_name[:60], total_mb, save_path or "?",
+                len(hashes),
+                ts.source_name[:60],
+                total_mb,
+                save_path or "?",
             )
             first, rest = hashes[0], hashes[1:]
             try:

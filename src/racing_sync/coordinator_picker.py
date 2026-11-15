@@ -69,13 +69,20 @@ async def _pick_ssd_source_inner(
     # be redundant. The only exception is the rare case where the racing
     # client's .torrent is unreachable on VPS1 (then refetch_public_via_prowlarr
     # can fall back to Prowlarr as a last resort).
-    publics = [t for t in [source_torrent] + other_source_torrents
-               if _looks_public(getattr(t, "trackers", None) or [])]
+    publics = [
+        t
+        for t in [source_torrent] + other_source_torrents
+        if _looks_public(getattr(t, "trackers", None) or [])
+    ]
     # Deterministic election: client list order is arbitrary, so sort by
     # (size, name, hash) — same content elects the same copy every tick.
-    publics.sort(key=lambda t: ((getattr(t, "size_bytes", 0) or 0),
-                                (getattr(t, "name", "") or ""),
-                                (getattr(t, "infohash", "") or "").lower()))
+    publics.sort(
+        key=lambda t: (
+            (getattr(t, "size_bytes", 0) or 0),
+            (getattr(t, "name", "") or ""),
+            (getattr(t, "infohash", "") or "").lower(),
+        )
+    )
 
     if publics:
         chosen = publics[0]
@@ -90,8 +97,7 @@ async def _pick_ssd_source_inner(
         # the Deluge state directory.
         if cfg.cross_seed.allow_ssh_export and sftp is not None:
             log.info(
-                "public racing torrent present; "
-                "SFTP-exporting %s from VPS1 for SSD download",
+                "public racing torrent present; SFTP-exporting %s from VPS1 for SSD download",
                 chosen.infohash[:10],
             )
             blob = None
@@ -106,8 +112,11 @@ async def _pick_ssd_source_inner(
                     )
                     break
                 except TimeoutError:
-                    log.warning("sftp fetch %s timed out after 15s (attempt %d/2)",
-                                chosen.infohash[:10], attempt)
+                    log.warning(
+                        "sftp fetch %s timed out after 15s (attempt %d/2)",
+                        chosen.infohash[:10],
+                        attempt,
+                    )
                 except Exception as e:  # noqa: BLE001
                     log.warning("sftp fetch %s failed: %s", chosen.infohash[:10], e)
                     break
@@ -118,10 +127,7 @@ async def _pick_ssd_source_inner(
                     name=chosen.name,
                     size_bytes=chosen.size_bytes,
                     infohash=chosen.infohash,
-                    announce_url=(
-                        chosen.trackers[0]
-                        if chosen.trackers else ""
-                    ),
+                    announce_url=(chosen.trackers[0] if chosen.trackers else ""),
                 )
         # If allow_ssh_export=false (or SFTP returned nothing for the
         # source_infohash), try the source client's own export endpoint
@@ -137,13 +143,11 @@ async def _pick_ssd_source_inner(
                     timeout=15.0,
                 )
             except Exception as e:  # noqa: BLE001
-                log.warning("source export_torrent failed for %s: %s",
-                            chosen.infohash[:10], e)
+                log.warning("source export_torrent failed for %s: %s", chosen.infohash[:10], e)
                 blob = None
         if blob:
             log.info(
-                "public racing torrent present; "
-                "fetched %s via qB export endpoint for SSD download",
+                "public racing torrent present; fetched %s via qB export endpoint for SSD download",
                 chosen.infohash[:10],
             )
             return SourceDecision(
@@ -152,20 +156,19 @@ async def _pick_ssd_source_inner(
                 name=chosen.name,
                 size_bytes=chosen.size_bytes,
                 infohash=chosen.infohash,
-                announce_url=(
-                    chosen.trackers[0]
-                    if chosen.trackers else ""
-                ),
+                announce_url=(chosen.trackers[0] if chosen.trackers else ""),
             )
 
         # Last resort in the public branch: only if the user explicitly
         # asked for it, fetch a Prowlarr cross-seed copy. This is rare
         # and intended for cases where the racing client's torrent file
         # is unreachable (e.g. VPS1 crash mid-cycle).
-        if (cfg.cross_seed.refetch_public_via_prowlarr
-                and cfg.cross_seed.allow_prowlarr_cross_seed
-                and prowlarr is not None
-                and not cfg.prowlarr.should_skip_title(chosen.name)):
+        if (
+            cfg.cross_seed.refetch_public_via_prowlarr
+            and cfg.cross_seed.allow_prowlarr_cross_seed
+            and prowlarr is not None
+            and not cfg.prowlarr.should_skip_title(chosen.name)
+        ):
             log.warning(
                 "racing client's public .torrent unavailable; "
                 "falling back to Prowlarr cross-seed for %s",
@@ -173,23 +176,25 @@ async def _pick_ssd_source_inner(
             )
             try:
                 from .io_bounds import bounded as _bounded
+
                 _pq_timeout = 30.0
                 try:
-                    _pq_timeout = float(getattr(
-                        getattr(cfg, "prowlarr", None), "timeout_seconds", 30.0) or 30.0)
+                    _pq_timeout = float(
+                        getattr(getattr(cfg, "prowlarr", None), "timeout_seconds", 30.0) or 30.0
+                    )
                 except (TypeError, ValueError):
                     _pq_timeout = 30.0
                 hit = await _bounded(
                     prowlarr.best_match(
-                        chosen.name, target_size=chosen.size_bytes,
+                        chosen.name,
+                        target_size=chosen.size_bytes,
                         indexers=prowlarr.get_download_indexers(),
                     ),
                     timeout=max(5.0, min(300.0, _pq_timeout)),
                     label="prowlarr public-fallback search",
                 )
             except Exception as e:  # noqa: BLE001
-                log.warning("download-indexer search failed for %s: %s",
-                            chosen.name, e)
+                log.warning("download-indexer search failed for %s: %s", chosen.name, e)
                 hit = None
             verified = None
             hit_size = 0
@@ -197,6 +202,7 @@ async def _pick_ssd_source_inner(
                 hit_size = hit.size_bytes
                 try:
                     from .io_bounds import bounded as _bounded2
+
                     blob = await _bounded2(
                         prowlarr.download_torrent(hit),
                         timeout=max(5.0, min(300.0, _pq_timeout)),
@@ -205,13 +211,14 @@ async def _pick_ssd_source_inner(
                 except Exception as e:  # noqa: BLE001
                     # A 500/timeout fetching the payload is transient: fall
                     # through to the export fallback below, never FAILED.
-                    log.warning("download-indexer fetch failed for %s: %s",
-                                chosen.name, e)
+                    log.warning("download-indexer fetch failed for %s: %s", chosen.name, e)
                     blob = None
                 if blob is not None:
                     verified = _verified_cross_seed_blob(
-                        blob, target_name=chosen.name,
-                        target_size=chosen.size_bytes, hit_title=hit.title,
+                        blob,
+                        target_name=chosen.name,
+                        target_size=chosen.size_bytes,
+                        hit_title=hit.title,
                     )
             if verified is not None:
                 blob, real_hash, announce = verified
@@ -267,20 +274,21 @@ async def _pick_ssd_source_inner(
         try:
             try:
                 _pq_timeout = float(
-                    getattr(getattr(cfg, "prowlarr", None),
-                            "timeout_seconds", 30.0) or 30.0)
+                    getattr(getattr(cfg, "prowlarr", None), "timeout_seconds", 30.0) or 30.0
+                )
             except (TypeError, ValueError):
                 _pq_timeout = 30.0
             hit = await bounded(
                 prowlarr.best_match(
-                    source_torrent.name, target_size=source_torrent.size_bytes,
+                    source_torrent.name,
+                    target_size=source_torrent.size_bytes,
                     indexers=prowlarr.get_download_indexers(),
                 ),
-                timeout=_pq_timeout, label="prowlarr best_match",
+                timeout=_pq_timeout,
+                label="prowlarr best_match",
             )
         except Exception as e:  # noqa: BLE001
-            log.warning("download-indexer search failed for %s: %s",
-                        source_torrent.name, e)
+            log.warning("download-indexer search failed for %s: %s", source_torrent.name, e)
             hit = None
         verified = None
         hit_size = 0
@@ -288,23 +296,27 @@ async def _pick_ssd_source_inner(
             hit_size = hit.size_bytes
             log.info(
                 "prowlarr hit: %s (size=%d B, indexer=%s)",
-                hit.title, hit.size_bytes, hit.indexer,
+                hit.title,
+                hit.size_bytes,
+                hit.indexer,
             )
             try:
                 blob = await bounded(
                     prowlarr.download_torrent(hit),
-                    timeout=_pq_timeout, label="prowlarr download_torrent",
+                    timeout=_pq_timeout,
+                    label="prowlarr download_torrent",
                 )
             except Exception as e:  # noqa: BLE001
                 # Same transient class as a search failure: park and retry
                 # instead of failing a row over one bad fetch.
-                log.warning("download-indexer fetch failed for %s: %s",
-                            source_torrent.name, e)
+                log.warning("download-indexer fetch failed for %s: %s", source_torrent.name, e)
                 blob = None
             if blob is not None:
                 verified = _verified_cross_seed_blob(
-                    blob, target_name=source_torrent.name,
-                    target_size=source_torrent.size_bytes, hit_title=hit.title,
+                    blob,
+                    target_name=source_torrent.name,
+                    target_size=source_torrent.size_bytes,
+                    hit_title=hit.title,
                 )
         if verified is not None:
             blob, real_hash, announce = verified
@@ -314,7 +326,8 @@ async def _pick_ssd_source_inner(
                 name=source_torrent.name,
                 size_bytes=hit_size,
                 infohash=real_hash,
-                announce_url=announce or (source_torrent.trackers[0] if source_torrent.trackers else ""),
+                announce_url=announce
+                or (source_torrent.trackers[0] if source_torrent.trackers else ""),
             )
         if attempt_prowlarr:
             log.info(
@@ -368,7 +381,8 @@ async def _pick_ssd_source_inner(
     try:
         _st_urls = getattr(source_torrent, "trackers", None) or []
         _st_preferred = _looks_public(_st_urls) or any(
-            cfg.prowlarr.is_download_indexer(u or "") for u in _st_urls)
+            cfg.prowlarr.is_download_indexer(u or "") for u in _st_urls
+        )
     except Exception:
         _st_preferred = False
     direct_preferred = (direct_t is not source_torrent) or bool(_st_preferred)
@@ -400,8 +414,11 @@ async def _pick_ssd_source_inner(
                     )
                     break
                 except TimeoutError:
-                    log.warning("sftp fallback fetch %s timed out after 15s (attempt %d/2)",
-                                direct_t.infohash[:10], attempt)
+                    log.warning(
+                        "sftp fallback fetch %s timed out after 15s (attempt %d/2)",
+                        direct_t.infohash[:10],
+                        attempt,
+                    )
                 except Exception as e:  # noqa: BLE001
                     log.warning("sftp fallback fetch %s failed: %s", direct_t.infohash[:10], e)
                     break
@@ -422,11 +439,15 @@ async def _pick_ssd_source_inner(
                     )
                 except Exception as e:  # noqa: BLE001
                     if sftp is not None and isinstance(source_client, DelugeClient):
-                        log.debug("private export fallback unavailable for %s: %s",
-                                  direct_t.infohash[:10], e)
+                        log.debug(
+                            "private export fallback unavailable for %s: %s",
+                            direct_t.infohash[:10],
+                            e,
+                        )
                     else:
-                        log.warning("private export fallback fetch %s failed: %s",
-                                    direct_t.infohash[:10], e)
+                        log.warning(
+                            "private export fallback fetch %s failed: %s", direct_t.infohash[:10], e
+                        )
                     blob = None
             if blob:
                 label = "private-export-fallback"
@@ -437,10 +458,7 @@ async def _pick_ssd_source_inner(
                 name=source_torrent.name,
                 size_bytes=source_torrent.size_bytes,
                 infohash=direct_t.infohash,
-                announce_url=(
-                    direct_t.trackers[0]
-                    if direct_t.trackers else ""
-                ),
+                announce_url=(direct_t.trackers[0] if direct_t.trackers else ""),
                 preferred=direct_preferred,
             )
 
@@ -488,8 +506,11 @@ async def pick_ssd_source_for_racing(
             timeout=_PICKER_DEADLINE_S,
         )
     except (TimeoutError, asyncio.TimeoutError):
-        log.warning("picker exceeded %ds overall deadline for %s; parking",
-                    _PICKER_DEADLINE_S, (source_torrent.name or "")[:60])
+        log.warning(
+            "picker exceeded %ds overall deadline for %s; parking",
+            _PICKER_DEADLINE_S,
+            (source_torrent.name or "")[:60],
+        )
         return None
 
 

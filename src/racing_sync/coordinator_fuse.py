@@ -156,8 +156,9 @@ class FuseMixin:
             if 0 <= _age < _LATE_SEED_BOOT_GRACE_S:
                 try:
                     _failed = getattr(self, "_failed_late_cross_seeds", None)
-                    _seen = (self._fuse_healthy_fresh(_late_key)
-                             or (isinstance(_failed, dict) and _row_key in _failed))
+                    _seen = self._fuse_healthy_fresh(_late_key) or (
+                        isinstance(_failed, dict) and _row_key in _failed
+                    )
                 except Exception:
                     _seen = True
                 if not _seen:
@@ -167,9 +168,8 @@ class FuseMixin:
                         _jitter = 0.0
                     try:
                         self._fuse_healthy_store()[_late_key] = (
-                            time.monotonic()
-                            + (_LATE_SEED_BOOT_GRACE_S - _age)
-                            + _jitter)
+                            time.monotonic() + (_LATE_SEED_BOOT_GRACE_S - _age) + _jitter
+                        )
                     except Exception:
                         pass
                     return
@@ -186,7 +186,9 @@ class FuseMixin:
                 log.info(
                     "late cross-seed: %s seeds from fuse but save_path %s is stale; "
                     "repairing to %s instead of demoting",
-                    ts.source_name[:50], ts.save_path, verified_mount,
+                    ts.source_name[:50],
+                    ts.save_path,
+                    verified_mount,
                 )
                 ts.save_path = str(verified_mount)
                 try:
@@ -197,18 +199,21 @@ class FuseMixin:
                 log.warning(
                     "late cross-seed: %s is DONE but save_path %s is not on fuse; "
                     "demoting to MOVING so the SSD move runs before any injection",
-                    ts.source_name[:50], ts.save_path,
+                    ts.source_name[:50],
+                    ts.save_path,
                 )
                 await self._demote_false_done_to_moving(ts)
                 return
 
         known_hashes = {
-            h.lower() for h in (
+            h.lower()
+            for h in (
                 ts.source_infohash,
                 ts.dest_infohash,
                 ts.cross_seed_infohash,
                 *ts.injected_private_hashes.split(","),
-            ) if h
+            )
+            if h
         }
 
         def _late_pending() -> bool:
@@ -262,7 +267,8 @@ class FuseMixin:
         await self._ensure_source_fuse_entry(ts, group, now_utc)
 
         new_torrents = [
-            t for t in group
+            t
+            for t in group
             if t.infohash.lower() not in known_hashes
             and not _group_is_ignored([t], getattr(self, "store", None))
         ]
@@ -271,7 +277,8 @@ class FuseMixin:
         # otherwise an original SSD leftover only heals when something else
         # arrives. Failed-map gating inside keeps the steady state cheap.
         await self._ensure_original_fuse_entry(
-            ts, self._target_mount_for(ts),
+            ts,
+            self._target_mount_for(ts),
         )
 
         if not new_torrents:
@@ -297,7 +304,9 @@ class FuseMixin:
 
             log.info(
                 "detected late cross-seed for completed content '%s': %s (%s)",
-                ts.source_name[:40], t.infohash[:10], t.name[:40],
+                ts.source_name[:40],
+                t.infohash[:10],
+                t.name[:40],
             )
             try:
                 blob = await self._fetch_racing_torrent_bytes(t.infohash)
@@ -337,13 +346,18 @@ class FuseMixin:
                     # backoff (and no SSD-probe demote off an unproven miss).
                     log.warning(
                         "late cross-seed: fuse unavailable for %s at %s (%s); short defer",
-                        t.infohash[:10], target_mount, _outage[0] if _outage else "unknown",
+                        t.infohash[:10],
+                        target_mount,
+                        _outage[0] if _outage else "unknown",
                     )
                     self._note_fuse_outage(h_low)
                     continue
                 log.warning(
                     "late cross-seed: fuse content missing for %s (%s) at %s (%d files); deferring injection",
-                    t.infohash[:10], t.name[:40], target_mount, len(_real),
+                    t.infohash[:10],
+                    t.name[:40],
+                    target_mount,
+                    len(_real),
                 )
                 self._failed_late_cross_seeds[h_low] = now_utc
                 # Self-heal: content missing on fuse but still sitting on SSD
@@ -355,13 +369,13 @@ class FuseMixin:
                 try:
                     from .recovery import find_content_on_ssd
 
-                    _ssd_hit = await asyncio.to_thread(
-                        find_content_on_ssd, self.cfg, late_expected)
+                    _ssd_hit = await asyncio.to_thread(find_content_on_ssd, self.cfg, late_expected)
                     if _ssd_hit is not None:
                         log.warning(
                             "late cross-seed: %s missing on fuse but present on SSD; "
                             "demoting %s to MOVING",
-                            t.infohash[:10], ts.source_name[:50],
+                            t.infohash[:10],
+                            ts.source_name[:50],
                         )
                         await self._demote_false_done_to_moving(ts)
                         return
@@ -371,13 +385,17 @@ class FuseMixin:
 
             try:
                 ok, detail = await self._ensure_fuse_entry(
-                    blob=blob, infohash=h_low, target_mount=target_mount,
+                    blob=blob,
+                    infohash=h_low,
+                    target_mount=target_mount,
                     label="late cross-seed",
                 )
                 if ok:
                     log.info(
                         "auto-injected late cross-seed %s (%s) onto fuse (%s)",
-                        t.infohash[:10], t.name[:40], target_mount,
+                        t.infohash[:10],
+                        t.name[:40],
+                        target_mount,
                     )
                     if _record_injected_hash(ts, h_low):
                         changed = True
@@ -385,7 +403,8 @@ class FuseMixin:
                 else:
                     log.warning(
                         "late cross-seed: add %s rejected by dest client: %s",
-                        t.infohash[:10], detail,
+                        t.infohash[:10],
+                        detail,
                     )
                     self._failed_late_cross_seeds[h_low] = now_utc
                     if len(self._failed_late_cross_seeds) > 5000:
@@ -528,8 +547,13 @@ class FuseMixin:
             pass
 
     def _late_seed_memoize(
-        self, row_key: str, injected_before: str, save_before: str,
-        ts: TorrentState, *, changed: bool,
+        self,
+        row_key: str,
+        injected_before: str,
+        save_before: str,
+        ts: TorrentState,
+        *,
+        changed: bool,
     ) -> None:
         """Record a quiet healthy check so the next tick skips this DONE row."""
         try:
@@ -572,10 +596,14 @@ class FuseMixin:
         injected_set = {h.lower() for h in ts.injected_private_hashes.split(",") if h}
         if source_low in injected_set:
             return
-        if source_low in {(ts.dest_infohash or "").lower(), (ts.cross_seed_infohash or "").lower()} - {""}:
+        if source_low in {
+            (ts.dest_infohash or "").lower(),
+            (ts.cross_seed_infohash or "").lower(),
+        } - {""}:
             return
         src_entry = next(
-            (t for t in (group or []) if t.infohash.lower() == source_low), None,
+            (t for t in (group or []) if t.infohash.lower() == source_low),
+            None,
         )
         if src_entry is None:
             return  # VPS1 cleaned already; nothing to repair.
@@ -586,7 +614,9 @@ class FuseMixin:
             return
         log.info(
             "late cross-seed: racing torrent %s (%s) never injected for %s; repairing",
-            source_low[:10], (src_entry.name or "")[:40], ts.source_name[:40],
+            source_low[:10],
+            (src_entry.name or "")[:40],
+            ts.source_name[:40],
         )
         try:
             blob = await self._fetch_racing_torrent_bytes(ts.source_infohash)
@@ -625,20 +655,25 @@ class FuseMixin:
                 log.warning(
                     "late cross-seed: repair of racing torrent %s deferred "
                     "(fuse unavailable at %s; short defer)",
-                    source_low[:10], target_mount,
+                    source_low[:10],
+                    target_mount,
                 )
                 self._note_fuse_outage(source_low)
                 return
             log.warning(
                 "late cross-seed: repair of racing torrent %s deferred "
                 "(fuse content missing at %s, %d files)",
-                source_low[:10], target_mount, len(_real),
+                source_low[:10],
+                target_mount,
+                len(_real),
             )
             self._failed_late_cross_seeds[source_low] = now_utc
             return
         try:
             ok, detail = await self._ensure_fuse_entry(
-                blob=blob, infohash=source_low, target_mount=target_mount,
+                blob=blob,
+                infohash=source_low,
+                target_mount=target_mount,
                 label="racing torrent (repair)",
             )
         except Exception as e:  # noqa: BLE001
@@ -648,13 +683,16 @@ class FuseMixin:
         if not ok:
             log.warning(
                 "late cross-seed: repair add %s rejected by dest client: %s",
-                source_low[:10], detail,
+                source_low[:10],
+                detail,
             )
             self._failed_late_cross_seeds[source_low] = now_utc
             return
         log.info(
             "auto-injected missing racing torrent %s (%s) onto fuse (%s) (repair)",
-            source_low[:10], (src_entry.name or "")[:40], target_mount,
+            source_low[:10],
+            (src_entry.name or "")[:40],
+            target_mount,
         )
         _record_injected_hash(ts, source_low)
         self.store.upsert(ts)
@@ -669,17 +707,24 @@ class FuseMixin:
         try:
             present: list = []
             for _chunk in chunked(sorted(hashes)):
-                present.extend(await rpc(
-                    self.dest_client.list_torrents(hashes=_chunk),
-                    getattr(self, "cfg", None), "dest verify list_torrents",
-                ) or [])
+                present.extend(
+                    await rpc(
+                        self.dest_client.list_torrents(hashes=_chunk),
+                        getattr(self, "cfg", None),
+                        "dest verify list_torrents",
+                    )
+                    or []
+                )
             return present
         except Exception:  # noqa: BLE001
             return None
 
     async def _reinject_missing_done_entries(
-        self, ts: TorrentState, missing: set[str],
-        blob: bytes | None, target: Path,
+        self,
+        ts: TorrentState,
+        missing: set[str],
+        blob: bytes | None,
+        target: Path,
     ) -> bool:
         """Re-inject lost dest entries whose bytes verify at the target.
 
@@ -707,7 +752,9 @@ class FuseMixin:
                 return False
             try:
                 ok, _ = await self._ensure_fuse_entry(
-                    blob=bytes(blob), infohash=mh, target_mount=target,
+                    blob=bytes(blob),
+                    infohash=mh,
+                    target_mount=target,
                     label="missing entry (repair)",
                 )
             except Exception:  # noqa: BLE001
@@ -728,11 +775,13 @@ class FuseMixin:
         path (demote/defer), never assume health.
         """
         hashes = {
-            h.lower() for h in (
+            h.lower()
+            for h in (
                 ts.dest_infohash,
                 ts.cross_seed_infohash,
                 *ts.injected_private_hashes.split(","),
-            ) if h
+            )
+            if h
         }
         if not hashes:
             return None
@@ -755,8 +804,7 @@ class FuseMixin:
             return None
         missing_entries = hashes - have
         if missing_entries:
-            if not await self._reinject_missing_done_entries(
-                    ts, missing_entries, blob, target):
+            if not await self._reinject_missing_done_entries(ts, missing_entries, blob, target):
                 return None
             present = await self._dest_entries_for_hashes(hashes)
             if present is None:
@@ -790,7 +838,8 @@ class FuseMixin:
             files = await self.dest_client.get_torrent_files(h)
             expected = [
                 (str(f.name), int(f.size_bytes or 0))
-                for f in (files or []) if getattr(f, "name", "")
+                for f in (files or [])
+                if getattr(f, "name", "")
             ] or None
         except Exception:  # noqa: BLE001
             expected = None
@@ -799,16 +848,13 @@ class FuseMixin:
         try:
             from .recovery import find_content_on_ssd
 
-            ssd_root = await asyncio.to_thread(
-                find_content_on_ssd, self.cfg, expected)
+            ssd_root = await asyncio.to_thread(find_content_on_ssd, self.cfg, expected)
         except Exception:  # noqa: BLE001
             return
         if ssd_root is None:
             return
         try:
-            fresh = await asyncio.to_thread(
-                self.store.get,
-                (ts.source_infohash or "").lower())
+            fresh = await asyncio.to_thread(self.store.get, (ts.source_infohash or "").lower())
         except Exception:  # noqa: BLE001
             return
         if fresh is None:
@@ -819,22 +865,23 @@ class FuseMixin:
             log.warning(
                 "late cross-seed: demoted %s from DONE to MOVING; "
                 "SSD content at %s will move before fuse injection",
-                ts.source_name[:50], ssd_root,
+                ts.source_name[:50],
+                ssd_root,
             )
         except ValueError as e:
             log.warning(
                 "late cross-seed: could not demote %s to MOVING: %s",
-                ts.source_infohash[:10], e,
+                ts.source_infohash[:10],
+                e,
             )
         except Exception as e:  # noqa: BLE001
             log.warning(
                 "late cross-seed: demote failed for %s: %s",
-                ts.source_infohash[:10], e,
+                ts.source_infohash[:10],
+                e,
             )
 
-    async def _ensure_original_fuse_entry(
-        self, ts: TorrentState, fallback_mount: Path
-    ) -> None:
+    async def _ensure_original_fuse_entry(self, ts: TorrentState, fallback_mount: Path) -> None:
         """Ensure the original (adopted) hash also seeds from fuse.
 
         The reported incident left the public SSD entry behind while only
@@ -878,8 +925,8 @@ class FuseMixin:
             export_fn = getattr(self.dest_client, "export_torrent", None)
             if callable(export_fn):
                 candidate = await rpc(
-                    export_fn(h),
-                    getattr(self, "cfg", None), "dest original export")
+                    export_fn(h), getattr(self, "cfg", None), "dest original export"
+                )
                 if isinstance(candidate, (bytes, bytearray)) and candidate:
                     blob = bytes(candidate)
         except Exception:  # noqa: BLE001
@@ -912,13 +959,16 @@ class FuseMixin:
             return
         try:
             ok, detail = await self._ensure_fuse_entry(
-                blob=blob, infohash=h, target_mount=target,
+                blob=blob,
+                infohash=h,
+                target_mount=target,
                 label="original content",
             )
             if not ok:
                 log.warning(
                     "late cross-seed: original %s fuse repair rejected: %s",
-                    h[:10], detail,
+                    h[:10],
+                    detail,
                 )
                 self._late_seed_defer(h)
             else:
@@ -952,8 +1002,7 @@ class FuseMixin:
         try:
             from .fuse_gate import missing_under as _missing_under
 
-            fresh_missing = await _missing_under(
-                target_mount, files, fresh=True)
+            fresh_missing = await _missing_under(target_mount, files, fresh=True)
         except Exception:  # noqa: BLE001
             return missing
         if fresh_missing is None:
@@ -969,7 +1018,11 @@ class FuseMixin:
              Deluge core.get_torrent_file).
         """
         # Validate that infohash is a valid hex infohash
-        if not infohash or len(infohash) != 40 or not all(c in "0123456789abcdefABCDEF" for c in infohash):
+        if (
+            not infohash
+            or len(infohash) != 40
+            or not all(c in "0123456789abcdefABCDEF" for c in infohash)
+        ):
             log.warning("_fetch_racing_torrent_bytes: skipping invalid infohash %r", infohash)
             return None
 
@@ -988,8 +1041,9 @@ class FuseMixin:
                         return blob
                     break
                 except TimeoutError:
-                    log.warning("sftp fetch %s timed out after 15s (attempt %d/2)",
-                                infohash[:10], attempt)
+                    log.warning(
+                        "sftp fetch %s timed out after 15s (attempt %d/2)", infohash[:10], attempt
+                    )
                 except Exception as e:  # noqa: BLE001
                     log.warning("sftp fetch %s failed: %s", infohash[:10], e)
                     break
@@ -1006,10 +1060,15 @@ class FuseMixin:
             # mandatory path there, enforced by config validation), so a
             # failed fallback is routine — keep it out of the warning log.
             if self.sftp is not None and isinstance(self.source_client, DelugeClient):
-                log.debug("_fetch_racing_torrent_bytes deluge export unavailable for %s: %s",
-                          infohash[:10], e)
+                log.debug(
+                    "_fetch_racing_torrent_bytes deluge export unavailable for %s: %s",
+                    infohash[:10],
+                    e,
+                )
             else:
-                log.warning("_fetch_racing_torrent_bytes export failed for %s: %s", infohash[:10], e)
+                log.warning(
+                    "_fetch_racing_torrent_bytes export failed for %s: %s", infohash[:10], e
+                )
             return None
 
     @staticmethod
@@ -1028,9 +1087,7 @@ class FuseMixin:
         except Exception:
             return None
 
-    async def _fuse_entry_bytes_ok(
-        self, blob: bytes | None, target_mount: Path
-    ) -> bool:
+    async def _fuse_entry_bytes_ok(self, blob: bytes | None, target_mount: Path) -> bool:
         """Post-add byte re-verify: entry placed AND bytes still at target.
 
         Guards the gate→add TOCTOU (bytes moved between verification and
@@ -1214,11 +1271,15 @@ class FuseMixin:
             if not callable(pause_fn):
                 return
             await pause_fn(h_low)
-            log.info("pausing public %s %s on fuse (pause_public_torrents_on_fuse=true)",
-                     label, h_low[:10])
+            log.info(
+                "pausing public %s %s on fuse (pause_public_torrents_on_fuse=true)",
+                label,
+                h_low[:10],
+            )
         except Exception as e:  # noqa: BLE001
-            log.warning("could not pause public %s %s on fuse (keeps seeding): %s",
-                        label, h_low[:10], e)
+            log.warning(
+                "could not pause public %s %s on fuse (keeps seeding): %s", label, h_low[:10], e
+            )
 
     async def _select_all_fuse_files(self, h_low: str, *, label: str) -> bool:
         """Ensure every file in a fuse entry is wanted (priority != 0).
@@ -1233,15 +1294,18 @@ class FuseMixin:
         try:
             files = await rpc(
                 self.dest_client.get_torrent_files(h_low),
-                getattr(self, "cfg", None), "dest fuse get_torrent_files")
+                getattr(self, "cfg", None),
+                "dest fuse get_torrent_files",
+            )
         except Exception as e:  # noqa: BLE001
             # Test doubles often leave get_torrent_files as a plain
             # MagicMock (not awaitable): fail open, the entry itself was
             # already verified at the fuse target.
             if "can't be used in 'await'" in str(e) or "MagicMock" in str(e):
                 return True
-            log.warning("fuse priority check failed for %s %s: %s; parking re-add",
-                        label, h_low[:10], e)
+            log.warning(
+                "fuse priority check failed for %s %s: %s; parking re-add", label, h_low[:10], e
+            )
             return False
         if not isinstance(files, list) or not files:
             return True
@@ -1257,18 +1321,19 @@ class FuseMixin:
             needs_reset = False
         if not needs_reset:
             return True
-        log.warning("fuse entry %s %s has deselected files; selecting all",
-                    label, h_low[:10])
+        log.warning("fuse entry %s %s has deselected files; selecting all", label, h_low[:10])
         try:
             await rpc(
-                self.dest_client.set_file_priorities(
-                    h_low, {n: 1 for n in names}),
-                getattr(self, "cfg", None), "dest fuse set_file_priorities")
+                self.dest_client.set_file_priorities(h_low, {n: 1 for n in names}),
+                getattr(self, "cfg", None),
+                "dest fuse set_file_priorities",
+            )
         except Exception as e:  # noqa: BLE001
             if "can't be used in 'await'" in str(e) or "MagicMock" in str(e):
                 return True
-            log.warning("fuse priority reset failed for %s %s: %s; parking re-add",
-                        label, h_low[:10], e)
+            log.warning(
+                "fuse priority reset failed for %s %s: %s; parking re-add", label, h_low[:10], e
+            )
             return False
         return True
 
@@ -1308,8 +1373,11 @@ class FuseMixin:
             "skip_check": True,
             "tags": ["racing", "fuse"],
         }
-        res = await rpc(self.dest_client.add_torrent(**add_kwargs),  # type: ignore[arg-type]
-                        getattr(self, "cfg", None), "dest fuse add_torrent")
+        res = await rpc(
+            self.dest_client.add_torrent(**add_kwargs),  # type: ignore[arg-type]
+            getattr(self, "cfg", None),
+            "dest fuse add_torrent",
+        )
         detail = res.detail if isinstance(res.detail, str) else ""
         if res.accepted and not _is_duplicate_add_detail(detail):
             # Verify the entry actually landed where asked: the fuse index
@@ -1320,7 +1388,9 @@ class FuseMixin:
                 try:
                     _st = await rpc(
                         self.dest_client.get_torrent(h_low),
-                        getattr(self, "cfg", None), "dest fuse get_torrent")
+                        getattr(self, "cfg", None),
+                        "dest fuse get_torrent",
+                    )
                 except Exception:
                     _st = None
                 if _st is not None and self._save_path_points_at_target(
@@ -1330,7 +1400,9 @@ class FuseMixin:
                     if not await self._fuse_entry_bytes_ok(blob, target_mount):
                         log.warning(
                             "%s %s entry visible but bytes unverifiable at %s; parking re-add",
-                            label, h_low[:10], target_mount,
+                            label,
+                            h_low[:10],
+                            target_mount,
                         )
                         return False, _NOT_VISIBLE_DETAIL
                     if not await self._select_all_fuse_files(h_low, label=label):
@@ -1341,7 +1413,9 @@ class FuseMixin:
                 await asyncio.sleep(2)
             log.warning(
                 "%s %s accepted but not yet visible on fuse (%s); parking re-add",
-                label, h_low[:10], target_mount,
+                label,
+                h_low[:10],
+                target_mount,
             )
             return False, _NOT_VISIBLE_DETAIL
         if not _is_duplicate_add_detail(detail):
@@ -1350,7 +1424,9 @@ class FuseMixin:
         try:
             dest_st = await rpc(
                 self.dest_client.get_torrent(h_low),
-                getattr(self, "cfg", None), "dest fuse get_torrent")
+                getattr(self, "cfg", None),
+                "dest fuse get_torrent",
+            )
         except Exception as e:  # noqa: BLE001
             log.debug("could not check dest client for %s: %s", h_low[:10], e)
             dest_st = None
@@ -1361,7 +1437,9 @@ class FuseMixin:
             if not await self._fuse_entry_bytes_ok(blob, target_mount):
                 log.warning(
                     "%s %s entry on fuse but bytes unverifiable at %s; parking re-add",
-                    label, h_low[:10], target_mount,
+                    label,
+                    h_low[:10],
+                    target_mount,
                 )
                 return False, _NOT_VISIBLE_DETAIL
             if not await self._select_all_fuse_files(h_low, label=label):
@@ -1372,7 +1450,10 @@ class FuseMixin:
         if dest_st is not None:
             log.warning(
                 "%s %s exists at %s (not the fuse target %s); replacing with fuse entry",
-                label, h_low[:10], getattr(dest_st, "save_path", "?"), target_mount,
+                label,
+                h_low[:10],
+                getattr(dest_st, "save_path", "?"),
+                target_mount,
             )
             # Files kept deliberately: deleting with files here would destroy
             # bytes the fuse gate verified. The leftover SSD bytes are not
@@ -1383,12 +1464,18 @@ class FuseMixin:
             # treats the space as free; a truly full disk still parks via
             # the ssd_has_room stat gate.
             try:
-                await rpc(self.dest_client.delete(h_low, delete_files=False),
-                          getattr(self, "cfg", None), "dest fuse delete")
+                await rpc(
+                    self.dest_client.delete(h_low, delete_files=False),
+                    getattr(self, "cfg", None),
+                    "dest fuse delete",
+                )
             except Exception as e:  # noqa: BLE001
                 return False, f"cannot remove non-fuse entry: {e}"
-            res2 = await rpc(self.dest_client.add_torrent(**add_kwargs),  # type: ignore[arg-type]
-                             getattr(self, "cfg", None), "dest fuse add_torrent")
+            res2 = await rpc(
+                self.dest_client.add_torrent(**add_kwargs),  # type: ignore[arg-type]
+                getattr(self, "cfg", None),
+                "dest fuse add_torrent",
+            )
             detail2 = res2.detail if isinstance(res2.detail, str) else ""
             if res2.accepted or _is_duplicate_add_detail(detail2):
                 dest_st2 = None
@@ -1396,7 +1483,9 @@ class FuseMixin:
                     try:
                         dest_st2 = await rpc(
                             self.dest_client.get_torrent(h_low),
-                            getattr(self, "cfg", None), "dest fuse get_torrent")
+                            getattr(self, "cfg", None),
+                            "dest fuse get_torrent",
+                        )
                     except Exception:
                         dest_st2 = None
                     if dest_st2 is not None:

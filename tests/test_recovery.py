@@ -130,9 +130,13 @@ async def test_reconcile_heals_unknown_done_classification(tmp_path: Path):
     dest = AsyncMock()
     dest.list_torrents.return_value = [
         Torrent(
-            hash=h, name="Heal.Pack.S01", size_bytes=200,
-            save_path="/mnt/fuse/torrents", category="racing",
-            progress=1.0, state="seeding",
+            hash=h,
+            name="Heal.Pack.S01",
+            size_bytes=200,
+            save_path="/mnt/fuse/torrents",
+            category="racing",
+            progress=1.0,
+            state="seeding",
         ),
     ]
     dest.get_torrent_files.return_value = [
@@ -192,7 +196,8 @@ async def test_fix_orphan_readd_stays_paused_for_priority_setup(tmp_path: Path):
 
     dest = AsyncMock()
     dest.add_torrent = AsyncMock(
-        return_value=AddResult(hash="ab" * 20, accepted=True, detail="Ok."))
+        return_value=AddResult(hash="ab" * 20, accepted=True, detail="Ok.")
+    )
     cfg = MagicMock()
     cfg.dest.save_path = tmp_path / "downloads"
 
@@ -247,15 +252,17 @@ async def test_check_and_inject_late_cross_seeds(tmp_path: Path):
     fname = "Late.New.Release.mkv"
     fsize = 100
     (fuse_dir / fname).write_bytes(b"x" * fsize)
-    blob = _bencode({
-        b"announce": b"http://tracker.example/announce",
-        b"info": {
-            b"name": fname.encode(),
-            b"length": fsize,
-            b"piece length": 16384,
-            b"pieces": b"12345678901234567890",
-        },
-    })
+    blob = _bencode(
+        {
+            b"announce": b"http://tracker.example/announce",
+            b"info": {
+                b"name": fname.encode(),
+                b"length": fsize,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
 
     coord = make_coordinator()
     coord.dest_client = AsyncMock()
@@ -274,9 +281,33 @@ async def test_check_and_inject_late_cross_seeds(tmp_path: Path):
     )
 
     group = [
-        Torrent(hash="sourcehash", name="Show.Release", category="racing", save_path="", size_bytes=100, state="", progress=1.0),
-        Torrent(hash="already1", name="Show.Release", category="racing", save_path="", size_bytes=100, state="", progress=1.0),
-        Torrent(hash="newhash", name="Show.Release", category="racing", save_path="", size_bytes=100, state="", progress=1.0),
+        Torrent(
+            hash="sourcehash",
+            name="Show.Release",
+            category="racing",
+            save_path="",
+            size_bytes=100,
+            state="",
+            progress=1.0,
+        ),
+        Torrent(
+            hash="already1",
+            name="Show.Release",
+            category="racing",
+            save_path="",
+            size_bytes=100,
+            state="",
+            progress=1.0,
+        ),
+        Torrent(
+            hash="newhash",
+            name="Show.Release",
+            category="racing",
+            save_path="",
+            size_bytes=100,
+            state="",
+            progress=1.0,
+        ),
     ]
 
     await coord._check_and_inject_late_cross_seeds(ts, group)
@@ -301,25 +332,35 @@ async def test_check_and_inject_late_cross_seeds_recognizes_existing_torrent(tmp
     fname = "Existing.Show.Release.mkv"
     fsize = 100
     (fuse_dir / fname).write_bytes(b"y" * fsize)
-    blob = _bencode({
-        b"announce": b"http://tracker.example/announce",
-        b"info": {
-            b"name": fname.encode(),
-            b"length": fsize,
-            b"piece length": 16384,
-            b"pieces": b"12345678901234567890",
-        },
-    })
+    blob = _bencode(
+        {
+            b"announce": b"http://tracker.example/announce",
+            b"info": {
+                b"name": fname.encode(),
+                b"length": fsize,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
 
     coord = make_coordinator()
     coord.dest_client = AsyncMock()
     coord._target_mount_for = MagicMock(return_value=fuse_dir)
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
     # qBittorrent returns "Fails." because torrent is already in qBittorrent
-    coord.dest_client.add_torrent.return_value = AddResult(hash=None, accepted=False, detail="Fails.")
+    coord.dest_client.add_torrent.return_value = AddResult(
+        hash=None, accepted=False, detail="Fails."
+    )
     # get_torrent confirms it exists on dest_client
     coord.dest_client.get_torrent.return_value = Torrent(
-        hash="existinghash", name="Show.Release", category="racing", save_path=str(fuse_dir), size_bytes=100, state="uploading", progress=1.0
+        hash="existinghash",
+        name="Show.Release",
+        category="racing",
+        save_path=str(fuse_dir),
+        size_bytes=100,
+        state="uploading",
+        progress=1.0,
     )
 
     ts = TorrentState(
@@ -331,8 +372,24 @@ async def test_check_and_inject_late_cross_seeds_recognizes_existing_torrent(tmp
     )
 
     group = [
-        Torrent(hash="sourcehash", name="Show.Release", category="racing", save_path="", size_bytes=100, state="", progress=1.0),
-        Torrent(hash="existinghash", name="Show.Release", category="racing", save_path="", size_bytes=100, state="", progress=1.0),
+        Torrent(
+            hash="sourcehash",
+            name="Show.Release",
+            category="racing",
+            save_path="",
+            size_bytes=100,
+            state="",
+            progress=1.0,
+        ),
+        Torrent(
+            hash="existinghash",
+            name="Show.Release",
+            category="racing",
+            save_path="",
+            size_bytes=100,
+            state="",
+            progress=1.0,
+        ),
     ]
 
     await coord._check_and_inject_late_cross_seeds(ts, group)
@@ -358,8 +415,24 @@ async def test_reconcile_links_same_name_torrents_to_single_state(tmp_path: Path
     store = StateStore(db_path)
 
     # Destination client has 2 torrents on VPS2 with identical names (e.g. public + private)
-    t1 = Torrent(hash="hash1", name="Anime.Ep1", category="racing", save_path=str(cfg.rclone.fuse.mount), size_bytes=1000, state="seeding", progress=1.0)
-    t2 = Torrent(hash="hash2", name="Anime.Ep1", category="racing", save_path=str(cfg.rclone.fuse.mount), size_bytes=1000, state="seeding", progress=1.0)
+    t1 = Torrent(
+        hash="hash1",
+        name="Anime.Ep1",
+        category="racing",
+        save_path=str(cfg.rclone.fuse.mount),
+        size_bytes=1000,
+        state="seeding",
+        progress=1.0,
+    )
+    t2 = Torrent(
+        hash="hash2",
+        name="Anime.Ep1",
+        category="racing",
+        save_path=str(cfg.rclone.fuse.mount),
+        size_bytes=1000,
+        state="seeding",
+        progress=1.0,
+    )
 
     dest = AsyncMock()
     dest.list_torrents.return_value = [t1, t2]
@@ -710,8 +783,10 @@ async def test_fix_orphan_respects_moving_checkpoint(tmp_path: Path):
 
     # No SSD content: content inference would otherwise say FAILED.
     ts = TorrentState(
-        source_infohash="h4checkpoint" + "0" * 28, source_name="H4.Show",
-        state=State.MOVING, save_path=str(ssd),
+        source_infohash="h4checkpoint" + "0" * 28,
+        source_name="H4.Show",
+        state=State.MOVING,
+        save_path=str(ssd),
         move_stage="entry_deleted",
         move_plan='{"version":1,"layout":"folder","folder":"H4.Show","keep":[],"flat":[]}',
     )
@@ -737,8 +812,10 @@ def test_force_state_clears_move_checkpoint(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     try:
         ts = TorrentState(
-            source_infohash="h4force" + "0" * 33, source_name="H4.Force",
-            state=State.MOVING, move_stage="wiped",
+            source_infohash="h4force" + "0" * 33,
+            source_name="H4.Force",
+            state=State.MOVING,
+            move_stage="wiped",
             move_plan='{"version":1,"layout":"flat","folder":"","keep":[],"flat":[]}',
         )
         store.upsert(ts)
@@ -877,16 +954,24 @@ async def test_auto_retry_skips_tracker_deleted_rows(tmp_path: Path):
 
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
-    store.upsert(TorrentState(
-        source_infohash="dead1", source_name="Dead Release",
-        state=State.FAILED, failed_retries=0,
-        last_error=f"{TRACKER_UNREGISTERED_MARKER} gone upstream",
-    ))
-    store.upsert(TorrentState(
-        source_infohash="plain1", source_name="Plain Failure",
-        state=State.FAILED, failed_retries=0,
-        last_error="boom",
-    ))
+    store.upsert(
+        TorrentState(
+            source_infohash="dead1",
+            source_name="Dead Release",
+            state=State.FAILED,
+            failed_retries=0,
+            last_error=f"{TRACKER_UNREGISTERED_MARKER} gone upstream",
+        )
+    )
+    store.upsert(
+        TorrentState(
+            source_infohash="plain1",
+            source_name="Plain Failure",
+            state=State.FAILED,
+            failed_retries=0,
+            last_error="boom",
+        )
+    )
 
     coord = make_coordinator()
     coord.store = store
@@ -904,8 +989,7 @@ async def test_auto_retry_skips_tracker_deleted_rows(tmp_path: Path):
 
     _client = AsyncMock()
     _client.start = AsyncMock()
-    with patch("racing_sync.coordinator.QBittorrentClient",
-               return_value=_client):
+    with patch("racing_sync.coordinator.QBittorrentClient", return_value=_client):
         await coord.start()
 
     dead = store.get("dead1")
@@ -1133,8 +1217,7 @@ async def test_snapshot_adopts_without_per_row_rpcs(tmp_path: Path):
     ]
 
     try:
-        rpt = await _reconcile_snapshot(cfg, dest=dest, store=store,
-                                        verify=False)
+        rpt = await _reconcile_snapshot(cfg, dest=dest, store=store, verify=False)
         assert "snap_hash" in rpt.adopted
         t = store.get("snap_hash")
         assert t is not None
@@ -1256,9 +1339,14 @@ def test_revive_clears_stale_dest_pointer(tmp_path):
     store = StateStore(tmp_path / "state.db")
     try:
         coord = make_coordinator(store)
-        store.upsert(TorrentState(
-            source_infohash="a" * 40, source_name="X",
-            dest_infohash="d" * 40, state=State.FAILED))
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="X",
+                dest_infohash="d" * 40,
+                state=State.FAILED,
+            )
+        )
         ts = coord.revive_failed_row(infohash="a" * 40)
         assert ts.state == State.NEW
         assert ts.dest_infohash == ""
@@ -1307,28 +1395,40 @@ async def test_stale_done_rebuilds_lost_entry_instead_of_demoting(tmp_path: Path
     from racing_sync.watchdir import _bencode, _bencoded_info_hash
 
     coord, store, ssd, fuse, _fuse_u = _fuse_coord(tmp_path)
-    blob = _bencode({
-        b"info": {b"name": b"Repair.Movie.2026.mkv", b"length": 100},
-    })
+    blob = _bencode(
+        {
+            b"info": {b"name": b"Repair.Movie.2026.mkv", b"length": 100},
+        }
+    )
     blob_hash, _, _, _ = _bencoded_info_hash(blob)
-    target = coord._target_mount_for_blob(
-        blob, fuse)
+    target = coord._target_mount_for_blob(blob, fuse)
     (Path(target) / "Repair.Movie.2026.mkv").write_bytes(b"r" * 100)
     entry = Torrent(
-        hash=blob_hash, name="Repair.Movie.2026", category="racing",
-        save_path=str(target), size_bytes=100, state="seeding", progress=1.0,
+        hash=blob_hash,
+        name="Repair.Movie.2026",
+        category="racing",
+        save_path=str(target),
+        size_bytes=100,
+        state="seeding",
+        progress=1.0,
     )
     coord.dest_client.list_torrents = AsyncMock(side_effect=[[], [entry]])
     coord.dest_client.get_torrent = AsyncMock(return_value=entry)
     coord.dest_client.add_torrent = AsyncMock(
-        return_value=AddResult(hash=blob_hash, accepted=True, detail="Ok."))
+        return_value=AddResult(hash=blob_hash, accepted=True, detail="Ok.")
+    )
     try:
-        store.upsert(TorrentState(
-            source_infohash="s" * 40, source_name="Repair.Movie.2026",
-            cross_seed_infohash=blob_hash, cross_seed_blob=blob,
-            save_path=str(ssd), state=State.DONE))
-        await coord._check_and_inject_late_cross_seeds(
-            store.get("s" * 40), [])
+        store.upsert(
+            TorrentState(
+                source_infohash="s" * 40,
+                source_name="Repair.Movie.2026",
+                cross_seed_infohash=blob_hash,
+                cross_seed_blob=blob,
+                save_path=str(ssd),
+                state=State.DONE,
+            )
+        )
+        await coord._check_and_inject_late_cross_seeds(store.get("s" * 40), [])
         row = store.get("s" * 40)
         assert row.state == State.DONE
         assert row.save_path == str(target)
@@ -1345,9 +1445,11 @@ async def test_demote_false_done_single_guarded_write(tmp_path: Path):
     coord, store, ssd, _fuse, _fuse_u = _fuse_coord(tmp_path)
     (ssd / "Stranded.Movie.2026.mkv").write_bytes(b"s" * 100)
     coord.dest_client.list_torrents = AsyncMock(return_value=[])
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="Stranded.Movie.2026.mkv", size_bytes=100, progress=1.0),
-    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Stranded.Movie.2026.mkv", size_bytes=100, progress=1.0),
+        ]
+    )
     narrow_writes = []
     real_update = store.update_columns
 
@@ -1357,12 +1459,16 @@ async def test_demote_false_done_single_guarded_write(tmp_path: Path):
 
     store.update_columns = _spy
     try:
-        store.upsert(TorrentState(
-            source_infohash="s" * 40, source_name="Stranded.Movie.2026",
-            dest_infohash="d" * 40, save_path="/elsewhere",
-            state=State.DONE))
-        await coord._check_and_inject_late_cross_seeds(
-            store.get("s" * 40), [])
+        store.upsert(
+            TorrentState(
+                source_infohash="s" * 40,
+                source_name="Stranded.Movie.2026",
+                dest_infohash="d" * 40,
+                save_path="/elsewhere",
+                state=State.DONE,
+            )
+        )
+        await coord._check_and_inject_late_cross_seeds(store.get("s" * 40), [])
         row = store.get("s" * 40)
         assert row.state == State.MOVING
         assert row.save_path == str(ssd)
@@ -1381,9 +1487,11 @@ async def test_demote_ssd_probe_runs_off_loop(tmp_path: Path):
     coord, store, ssd, _fuse, _fuse_u = _fuse_coord(tmp_path)
     (ssd / "Stranded.Movie.2026.mkv").write_bytes(b"s" * 100)
     coord.dest_client.list_torrents = AsyncMock(return_value=[])
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="Stranded.Movie.2026.mkv", size_bytes=100, progress=1.0),
-    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Stranded.Movie.2026.mkv", size_bytes=100, progress=1.0),
+        ]
+    )
     import racing_sync.recovery as _rec
 
     real = _rec.find_content_on_ssd
@@ -1394,13 +1502,17 @@ async def test_demote_ssd_probe_runs_off_loop(tmp_path: Path):
         return real(cfg, expected)
 
     try:
-        store.upsert(TorrentState(
-            source_infohash="s" * 40, source_name="Stranded.Movie.2026",
-            dest_infohash="d" * 40, save_path="/elsewhere",
-            state=State.DONE))
+        store.upsert(
+            TorrentState(
+                source_infohash="s" * 40,
+                source_name="Stranded.Movie.2026",
+                dest_infohash="d" * 40,
+                save_path="/elsewhere",
+                state=State.DONE,
+            )
+        )
         with patch.object(_rec, "find_content_on_ssd", side_effect=_spy):
-            await coord._check_and_inject_late_cross_seeds(
-                store.get("s" * 40), [])
+            await coord._check_and_inject_late_cross_seeds(store.get("s" * 40), [])
         assert seen["thread"] is not threading.main_thread()
         assert store.get("s" * 40).state == State.MOVING
     finally:
@@ -1420,22 +1532,43 @@ async def test_injected_hashes_capped_at_fifty(tmp_path: Path):
     new_h = "n" * 40
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord.dest_client.add_torrent = AsyncMock(
-        return_value=AddResult(hash=new_h, accepted=True, detail="Ok."))
-    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
-        hash=new_h, name="Late.Arrival", category="racing",
-        save_path=str(target), size_bytes=100, state="seeding", progress=1.0))
+        return_value=AddResult(hash=new_h, accepted=True, detail="Ok.")
+    )
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=Torrent(
+            hash=new_h,
+            name="Late.Arrival",
+            category="racing",
+            save_path=str(target),
+            size_bytes=100,
+            state="seeding",
+            progress=1.0,
+        )
+    )
     old = [f"{i:040x}" for i in range(60)]
     try:
-        store.upsert(TorrentState(
-            source_infohash="s" * 40, source_name="Late.Arrival",
-            cross_seed_infohash="c" * 40,
-            injected_private_hashes=",".join(old),
-            save_path=str(target), state=State.DONE))
-        group = [Torrent(
-            hash=new_h, name="Late.Arrival", category="racing", save_path="",
-            size_bytes=100, state="", progress=1.0)]
-        await coord._check_and_inject_late_cross_seeds(
-            store.get("s" * 40), group)
+        store.upsert(
+            TorrentState(
+                source_infohash="s" * 40,
+                source_name="Late.Arrival",
+                cross_seed_infohash="c" * 40,
+                injected_private_hashes=",".join(old),
+                save_path=str(target),
+                state=State.DONE,
+            )
+        )
+        group = [
+            Torrent(
+                hash=new_h,
+                name="Late.Arrival",
+                category="racing",
+                save_path="",
+                size_bytes=100,
+                state="",
+                progress=1.0,
+            )
+        ]
+        await coord._check_and_inject_late_cross_seeds(store.get("s" * 40), group)
         kept = store.get("s" * 40).injected_private_hashes.split(",")
         assert len(kept) == 50
         assert kept[-1] == new_h
@@ -1465,21 +1598,42 @@ async def test_fuse_outage_short_defers_never_30m_backoff(tmp_path: Path):
     new_h = "e" * 40
     coord._fetch_racing_torrent_bytes = AsyncMock(return_value=blob)
     coord.dest_client.add_torrent = AsyncMock(
-        return_value=AddResult(hash=new_h, accepted=True, detail="Ok."))
-    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
-        hash=new_h, name="Outage.Arrival", category="racing",
-        save_path=str(target), size_bytes=100, state="seeding", progress=1.0))
-    group = [Torrent(
-        hash=new_h, name="Outage.Arrival", category="racing", save_path="",
-        size_bytes=100, state="", progress=1.0)]
+        return_value=AddResult(hash=new_h, accepted=True, detail="Ok.")
+    )
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=Torrent(
+            hash=new_h,
+            name="Outage.Arrival",
+            category="racing",
+            save_path=str(target),
+            size_bytes=100,
+            state="seeding",
+            progress=1.0,
+        )
+    )
+    group = [
+        Torrent(
+            hash=new_h,
+            name="Outage.Arrival",
+            category="racing",
+            save_path="",
+            size_bytes=100,
+            state="",
+            progress=1.0,
+        )
+    ]
     try:
-        store.upsert(TorrentState(
-            source_infohash="s" * 40, source_name="Outage.Arrival",
-            cross_seed_infohash="c" * 40,
-            save_path=str(target), state=State.DONE))
+        store.upsert(
+            TorrentState(
+                source_infohash="s" * 40,
+                source_name="Outage.Arrival",
+                cross_seed_infohash="c" * 40,
+                save_path=str(target),
+                state=State.DONE,
+            )
+        )
         shutil.rmtree(target)
-        await coord._check_and_inject_late_cross_seeds(
-            store.get("s" * 40), group)
+        await coord._check_and_inject_late_cross_seeds(store.get("s" * 40), group)
         # No inject, no 30m poison — only the short outage note.
         coord.dest_client.add_torrent.assert_not_called()
         assert new_h not in getattr(coord, "_failed_late_cross_seeds", {})
@@ -1489,16 +1643,12 @@ async def test_fuse_outage_short_defers_never_30m_backoff(tmp_path: Path):
         (Path(target) / "Outage.Arrival.mkv").write_bytes(b"o" * 100)
         _cp.fuse_stat_invalidate(target)
         _cp.fuse_stat_invalidate(Path(target) / "Outage.Arrival.mkv")
-        await coord._check_and_inject_late_cross_seeds(
-            store.get("s" * 40), group)
+        await coord._check_and_inject_late_cross_seeds(store.get("s" * 40), group)
         coord.dest_client.add_torrent.assert_not_called()
         # Past the short window with no 30m entry: injects immediately.
         coord._fuse_outage_until[new_h] = time.monotonic() - 1.0
-        await coord._check_and_inject_late_cross_seeds(
-            store.get("s" * 40), group)
+        await coord._check_and_inject_late_cross_seeds(store.get("s" * 40), group)
         coord.dest_client.add_torrent.assert_awaited_once()
         assert new_h in store.get("s" * 40).injected_private_hashes
     finally:
         store.close()
-
-

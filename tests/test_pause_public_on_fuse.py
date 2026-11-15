@@ -51,8 +51,13 @@ def _coord(pause_flag: bool, fuse: Path):
 
 def _fuse_entry(h: str, fuse: Path) -> Torrent:
     return Torrent(
-        hash=h, name="Show", category="racing", save_path=str(fuse),
-        size_bytes=100, state="uploading", progress=1.0,
+        hash=h,
+        name="Show",
+        category="racing",
+        save_path=str(fuse),
+        size_bytes=100,
+        state="uploading",
+        progress=1.0,
     )
 
 
@@ -72,7 +77,10 @@ async def test_public_fresh_add_lands_paused(tmp_path: Path):
     coord.dest_client.get_torrent = AsyncMock(return_value=_fuse_entry(h, fuse))
 
     ok, _ = await coord._ensure_fuse_entry(
-        blob=_blob(PUBLIC_ANNOUNCE), infohash=h, target_mount=fuse, label="test",
+        blob=_blob(PUBLIC_ANNOUNCE),
+        infohash=h,
+        target_mount=fuse,
+        label="test",
     )
 
     assert ok is True
@@ -94,7 +102,10 @@ async def test_public_add_disabled_seeds(tmp_path: Path):
     coord.dest_client.get_torrent = AsyncMock(return_value=_fuse_entry(h, fuse))
 
     ok, _ = await coord._ensure_fuse_entry(
-        blob=_blob(PUBLIC_ANNOUNCE), infohash=h, target_mount=fuse, label="test",
+        blob=_blob(PUBLIC_ANNOUNCE),
+        infohash=h,
+        target_mount=fuse,
+        label="test",
     )
 
     assert ok is True
@@ -115,7 +126,10 @@ async def test_private_never_pauses_even_when_enabled(tmp_path: Path):
     coord.dest_client.get_torrent = AsyncMock(return_value=_fuse_entry(h, fuse))
 
     ok, _ = await coord._ensure_fuse_entry(
-        blob=_blob(PRIVATE_ANNOUNCE), infohash=h, target_mount=fuse, label="test",
+        blob=_blob(PRIVATE_ANNOUNCE),
+        infohash=h,
+        target_mount=fuse,
+        label="test",
     )
 
     assert ok is True
@@ -136,7 +150,10 @@ async def test_public_already_seeding_gets_paused_in_place(tmp_path: Path):
     coord.dest_client.get_torrent = AsyncMock(return_value=_fuse_entry(h, fuse))
 
     ok, detail = await coord._ensure_fuse_entry(
-        blob=_blob(PUBLIC_ANNOUNCE), infohash=h, target_mount=fuse, label="test",
+        blob=_blob(PUBLIC_ANNOUNCE),
+        infohash=h,
+        target_mount=fuse,
+        label="test",
     )
 
     assert ok is True
@@ -156,7 +173,10 @@ async def test_undecodable_blob_fails_open_to_seeding(tmp_path: Path):
     coord.dest_client.get_torrent = AsyncMock(return_value=_fuse_entry(h, fuse))
 
     ok, _ = await coord._ensure_fuse_entry(
-        blob=b"not-a-torrent", infohash=h, target_mount=fuse, label="test",
+        blob=b"not-a-torrent",
+        infohash=h,
+        target_mount=fuse,
+        label="test",
     )
 
     assert ok is True
@@ -179,7 +199,10 @@ async def test_pause_failure_keeps_success(tmp_path: Path):
     coord.dest_client.pause = AsyncMock(side_effect=RuntimeError("webui down"))
 
     ok, _ = await coord._ensure_fuse_entry(
-        blob=_blob(PUBLIC_ANNOUNCE), infohash=h, target_mount=fuse, label="test",
+        blob=_blob(PUBLIC_ANNOUNCE),
+        infohash=h,
+        target_mount=fuse,
+        label="test",
     )
 
     assert ok is True

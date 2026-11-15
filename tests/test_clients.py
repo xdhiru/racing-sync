@@ -45,7 +45,8 @@ async def test_qbittorrent_export_torrent():
             resp = MagicMock()
             resp.read = AsyncMock(return_value=b"d8:announce...")
             resp.content.iter_chunked = MagicMock(
-                side_effect=lambda size: _chunks(b"d8:announce..."))
+                side_effect=lambda size: _chunks(b"d8:announce...")
+            )
             return resp
 
         async def __aexit__(self, *args):
@@ -76,8 +77,7 @@ async def test_qbittorrent_export_torrent_rejects_oversize():
     class DummyResponseContext:
         async def __aenter__(self):
             resp = MagicMock()
-            resp.content.iter_chunked = MagicMock(
-                side_effect=lambda size: _big_chunks())
+            resp.content.iter_chunked = MagicMock(side_effect=lambda size: _big_chunks())
             return resp
 
         async def __aexit__(self, *args):
@@ -104,8 +104,7 @@ async def test_qbittorrent_export_rejects_non_bencoded():
         class DummyResponseContext:
             async def __aenter__(self):
                 resp = MagicMock()
-                resp.content.iter_chunked = MagicMock(
-                    side_effect=lambda size: _chunks(payload))
+                resp.content.iter_chunked = MagicMock(side_effect=lambda size: _chunks(payload))
                 return resp
 
             async def __aexit__(self, *args):
@@ -114,6 +113,7 @@ async def test_qbittorrent_export_rejects_non_bencoded():
         return DummyResponseContext()
 
     for bad in (b"", b"<html>login</html>", b"Fails."):
+
         async def mock_request(method, endpoint, params=None, **kwargs):
             return _ctx(bad)
 
@@ -130,12 +130,13 @@ async def test_qbittorrent_add_rejects_mixed_and_non_bytes():
     client.request = AsyncMock()
 
     with pytest.raises(ValueError, match="not both"):
-        await client.add_torrent(urls=["http://example.com/x.torrent"],
-                                 torrent_files=[b"d8:announcee"],
-                                 save_path="/downloads")
+        await client.add_torrent(
+            urls=["http://example.com/x.torrent"],
+            torrent_files=[b"d8:announcee"],
+            save_path="/downloads",
+        )
     with pytest.raises(ValueError, match="not bytes"):
-        await client.add_torrent(torrent_files=["not-bytes"],
-                                 save_path="/downloads")
+        await client.add_torrent(torrent_files=["not-bytes"], save_path="/downloads")
     client.request.assert_not_called()
 
 
@@ -143,10 +144,14 @@ def test_qbittorrent_add_url_errors_scrub_secrets():
     """Add-URL rejections name the scheme/host, never passkeys or hashes."""
     from racing_sync.clients.qbittorrent import _scrub_add_url
 
-    assert _scrub_add_url(
-        "http://tracker.example/announce?passkey=SECRET") == "http://tracker.example/..."
-    assert _scrub_add_url(
-        "magnet:?xt=urn:btih:" + "a" * 40 + "&tr=http://t.example/a?pass=x") == "magnet:?xt=..."
+    assert (
+        _scrub_add_url("http://tracker.example/announce?passkey=SECRET")
+        == "http://tracker.example/..."
+    )
+    assert (
+        _scrub_add_url("magnet:?xt=urn:btih:" + "a" * 40 + "&tr=http://t.example/a?pass=x")
+        == "magnet:?xt=..."
+    )
     assert "SECRET" not in _scrub_add_url("http://u/p?passkey=SECRET")
 
 
@@ -278,8 +283,14 @@ async def test_qbittorrent_set_file_priorities_batched():
     await client.set_file_priorities("hash1", {"f0.mkv": 0, "f1.mkv": 0, "f2.mkv": 1, "f3.mkv": 1})
 
     assert len(posted_requests) == 2
-    assert posted_requests[0] == ("/api/v2/torrents/filePrio", {"hash": "hash1", "id": "0|1", "priority": "0"})
-    assert posted_requests[1] == ("/api/v2/torrents/filePrio", {"hash": "hash1", "id": "2|3", "priority": "1"})
+    assert posted_requests[0] == (
+        "/api/v2/torrents/filePrio",
+        {"hash": "hash1", "id": "0|1", "priority": "0"},
+    )
+    assert posted_requests[1] == (
+        "/api/v2/torrents/filePrio",
+        {"hash": "hash1", "id": "2|3", "priority": "1"},
+    )
 
 
 @pytest.mark.anyio
@@ -352,14 +363,19 @@ async def test_http_client_form_post_verifies_login_body():
         def __init__(self, text):
             self.status = 200
             self._text = text
+
         async def __aenter__(self):
             return self
+
         async def __aexit__(self, *args):
             pass
+
         async def text(self):
             return self._text
 
-    client._session.post = MagicMock(return_value=MockResp('<html><input type="password"/>Invalid password</html>'))
+    client._session.post = MagicMock(
+        return_value=MockResp('<html><input type="password"/>Invalid password</html>')
+    )
     with pytest.raises(AuthError, match="rejected credentials"):
         await client._auth(force=True)
 
@@ -426,10 +442,15 @@ async def test_deluge_web_connect_refusal_fails_fast():
 
     def client_with_posts(posts):
         cfg = SourceConfig(
-            type="deluge", host="http://localhost:8112", password="secret",
-            deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1",
-                         "ssh_password": "pwd",
-                         "state_dir": "/var/lib/deluged/state"},
+            type="deluge",
+            host="http://localhost:8112",
+            password="secret",
+            deluge_sftp={
+                "enabled": True,
+                "ssh_host": "127.0.0.1",
+                "ssh_password": "pwd",
+                "state_dir": "/var/lib/deluged/state",
+            },
         )
         client = DelugeClient(cfg)
 
@@ -455,29 +476,35 @@ async def test_deluge_web_connect_refusal_fails_fast():
         return client
 
     # Refused connect -> AuthError with actionable hint.
-    bad = client_with_posts([
-        {"result": True},                       # auth.login ok
-        {"result": False},                      # web.connected: no
-        {"result": [["host1", "h", 1, "on", ""]]},  # web.get_hosts
-        {"result": False},                      # web.connect refused
-    ])
+    bad = client_with_posts(
+        [
+            {"result": True},  # auth.login ok
+            {"result": False},  # web.connected: no
+            {"result": [["host1", "h", 1, "on", ""]]},  # web.get_hosts
+            {"result": False},  # web.connect refused
+        ]
+    )
     with pytest.raises(AuthError, match="web.connect"):
         await bad._do_client_auth()
 
     # Accepted connect -> silent success.
-    good = client_with_posts([
-        {"result": True},
-        {"result": False},
-        {"result": [["host1", "h", 1, "on", ""]]},
-        {"result": True},
-    ])
+    good = client_with_posts(
+        [
+            {"result": True},
+            {"result": False},
+            {"result": [["host1", "h", 1, "on", ""]]},
+            {"result": True},
+        ]
+    )
     await good._do_client_auth()
 
     # Already connected -> no connect call at all.
-    idle = client_with_posts([
-        {"result": True},
-        {"result": True},
-    ])
+    idle = client_with_posts(
+        [
+            {"result": True},
+            {"result": True},
+        ]
+    )
     await idle._do_client_auth()
     assert idle._session.post.call_count == 2
 
@@ -602,13 +629,20 @@ async def test_deluge_add_torrent_rejects_none_result_and_uses_uuid_filename():
         type="deluge",
         host="http://localhost:8112",
         password="secret",
-        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+        deluge_sftp={
+            "enabled": True,
+            "ssh_host": "127.0.0.1",
+            "ssh_password": "pwd",
+            "state_dir": "/var/lib/deluged/state",
+        },
     )
     client = DelugeClient(cfg)
 
     # 1. Deluge returns [None] on rejection -> accepted should be False
     client._rpc = AsyncMock(return_value=None)
-    res_rejected = await client.add_torrent(urls=["http://example.com/rejected.torrent"], save_path="/downloads")
+    res_rejected = await client.add_torrent(
+        urls=["http://example.com/rejected.torrent"], save_path="/downloads"
+    )
     assert res_rejected.accepted is False
     assert res_rejected.hash is None
 
@@ -644,12 +678,16 @@ async def test_deluge_add_torrent_rejects_garbage_hash():
         type="deluge",
         host="http://localhost:8112",
         password="secret",
-        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+        deluge_sftp={
+            "enabled": True,
+            "ssh_host": "127.0.0.1",
+            "ssh_password": "pwd",
+            "state_dir": "/var/lib/deluged/state",
+        },
     )
     client = DelugeClient(cfg)
     client._rpc = AsyncMock(return_value=True)
-    res = await client.add_torrent(
-        urls=["http://example.com/x.torrent"], save_path="/downloads")
+    res = await client.add_torrent(urls=["http://example.com/x.torrent"], save_path="/downloads")
     assert res.accepted is True
     assert res.hash is None
 
@@ -665,7 +703,12 @@ async def test_deluge_set_file_priorities_propagates_auth_error():
         type="deluge",
         host="http://localhost:8112",
         password="secret",
-        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+        deluge_sftp={
+            "enabled": True,
+            "ssh_host": "127.0.0.1",
+            "ssh_password": "pwd",
+            "state_dir": "/var/lib/deluged/state",
+        },
     )
     client = DelugeClient(cfg)
     client._rpc = AsyncMock(side_effect=AuthError("session expired"))
@@ -685,19 +728,26 @@ async def test_deluge_get_torrent_files_scales_progress_and_propagates_auth():
         type="deluge",
         host="http://localhost:8112",
         password="secret",
-        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+        deluge_sftp={
+            "enabled": True,
+            "ssh_host": "127.0.0.1",
+            "ssh_password": "pwd",
+            "state_dir": "/var/lib/deluged/state",
+        },
     )
     client = DelugeClient(cfg)
 
     # 1. Progress scaled from 0-100 down to 0-1.0
-    client._rpc = AsyncMock(return_value={
-        "files": [
-            {"path": "ep1.mkv", "size": 1000, "index": 0},
-            {"path": "ep2.mkv", "size": 2000, "index": 1},
-        ],
-        "file_priorities": [1, 1],
-        "file_progress": [50.0, 100.0],  # 50% and 100% in Deluge
-    })
+    client._rpc = AsyncMock(
+        return_value={
+            "files": [
+                {"path": "ep1.mkv", "size": 1000, "index": 0},
+                {"path": "ep2.mkv", "size": 2000, "index": 1},
+            ],
+            "file_priorities": [1, 1],
+            "file_progress": [50.0, 100.0],  # 50% and 100% in Deluge
+        }
+    )
     files = await client.get_torrent_files("hash_123")
     assert len(files) == 2
     assert pytest.approx(files[0].progress, 0.001) == 0.5
@@ -719,11 +769,19 @@ async def test_deluge_files_from_torrent_file_catches_sftp_error():
         type="deluge",
         host="http://localhost:8112",
         password="secret",
-        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+        deluge_sftp={
+            "enabled": True,
+            "ssh_host": "127.0.0.1",
+            "ssh_password": "pwd",
+            "state_dir": "/var/lib/deluged/state",
+        },
     )
     client = DelugeClient(cfg)
 
-    with patch("racing_sync.sftp_source.SFTPExporter.fetch_torrent", side_effect=ConnectionRefusedError("SSH server down")):
+    with patch(
+        "racing_sync.sftp_source.SFTPExporter.fetch_torrent",
+        side_effect=ConnectionRefusedError("SSH server down"),
+    ):
         files = await client._files_from_torrent_file("hash_123")
         assert files == []
 
@@ -739,7 +797,12 @@ async def test_deluge_files_prefers_shared_sftp_exporter():
         type="deluge",
         host="http://localhost:8112",
         password="secret",
-        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+        deluge_sftp={
+            "enabled": True,
+            "ssh_host": "127.0.0.1",
+            "ssh_password": "pwd",
+            "state_dir": "/var/lib/deluged/state",
+        },
     )
     client = DelugeClient(cfg)
     shared = MagicMock()
@@ -940,9 +1003,9 @@ async def test_http_client_concurrent_401s_share_one_login():
 
     client._session.request = AsyncMock(side_effect=request_side_effect)
 
-    results = await asyncio.gather(*[
-        client.request("GET", f"/w{i}", retry_auth=True) for i in range(5)
-    ])
+    results = await asyncio.gather(
+        *[client.request("GET", f"/w{i}", retry_auth=True) for i in range(5)]
+    )
     assert all(r.status == 200 for r in results)
     assert logins == 1
 
@@ -1041,19 +1104,23 @@ async def test_qbittorrent_get_torrent_parallelizes_rtts():
 @pytest.mark.anyio
 async def test_qbittorrent_add_torrent_handles_duplicates_and_hex_validation():
     from racing_sync.watchdir import _bencode
+
     cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
     client = QBittorrentClient(cfg, label="dest-qb")
 
-    torrent_blob = _bencode({
-        b"announce": b"http://tracker/announce",
-        b"info": {
-            b"name": b"Duplicate.Movie",
-            b"length": 1000,
-            b"piece length": 16384,
-            b"pieces": b"12345678901234567890",
-        },
-    })
+    torrent_blob = _bencode(
+        {
+            b"announce": b"http://tracker/announce",
+            b"info": {
+                b"name": b"Duplicate.Movie",
+                b"length": 1000,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
     from racing_sync.watchdir import _bencoded_info_hash
+
     expected_hash, _, _, _ = _bencoded_info_hash(torrent_blob)
 
     class DummyResponseContext:
@@ -1088,13 +1155,17 @@ async def test_qbittorrent_add_torrent_handles_duplicates_and_hex_validation():
     non_hex_40 = "This is an error message of 40 chars!!!!"
     assert len(non_hex_40) == 40
     client.request = AsyncMock(return_value=DummyResponseContext(non_hex_40))
-    res_non_hex = await client.add_torrent(urls=["http://example.com/test.torrent"], save_path="/downloads")
+    res_non_hex = await client.add_torrent(
+        urls=["http://example.com/test.torrent"], save_path="/downloads"
+    )
     assert res_non_hex.hash is None
 
     # 4. 40-character hex response -> hash is parsed
     hex_40 = "a" * 40
     client.request = AsyncMock(return_value=DummyResponseContext(hex_40))
-    res_hex = await client.add_torrent(urls=["http://example.com/test.torrent"], save_path="/downloads")
+    res_hex = await client.add_torrent(
+        urls=["http://example.com/test.torrent"], save_path="/downloads"
+    )
     assert res_hex.hash == hex_40
     assert res_hex.accepted is True
 
@@ -1130,8 +1201,7 @@ async def test_qbittorrent_add_magnet_hash_resolution():
 
     client.list_torrents = fake_list
     hex32 = "ab12cd34ef56ab12cd34ef56ab12cd34ef56"[:32]
-    res = await client.add_torrent(
-        urls=[f"magnet:?xt=urn:btih:{hex32}"], save_path="/downloads")
+    res = await client.add_torrent(urls=[f"magnet:?xt=urn:btih:{hex32}"], save_path="/downloads")
     assert res.accepted is True
     assert res.hash == hex32.lower()
     assert seen == [hex32.lower()]
@@ -1139,11 +1209,9 @@ async def test_qbittorrent_add_magnet_hash_resolution():
     # 2. Genuine 32-char base32 still decodes to 20 bytes.
     raw20 = bytes(range(20))
     b32 = base64.b32encode(raw20).decode().rstrip("=")
-    assert len(b32) == 32 and not all(
-        c in "0123456789ABCDEF" for c in b32)
+    assert len(b32) == 32 and not all(c in "0123456789ABCDEF" for c in b32)
     seen.clear()
-    res = await client.add_torrent(
-        urls=[f"magnet:?xt=urn:btih:{b32}"], save_path="/downloads")
+    res = await client.add_torrent(urls=[f"magnet:?xt=urn:btih:{b32}"], save_path="/downloads")
     assert res.accepted is True
     assert res.hash == raw20.hex()
 
@@ -1157,8 +1225,7 @@ async def test_qbittorrent_add_magnet_hash_resolution():
         return [MagicMock()] if h == v2[:40] else []
 
     client.list_torrents = fake_list2
-    res = await client.add_torrent(
-        urls=[f"magnet:?xt=urn:btih:{v2}"], save_path="/downloads")
+    res = await client.add_torrent(urls=[f"magnet:?xt=urn:btih:{v2}"], save_path="/downloads")
     assert res.accepted is True
     assert res.hash == v2[:40]
     assert calls == [v2, v2[:40]]
@@ -1171,10 +1238,12 @@ async def test_qbittorrent_add_ok_reports_blob_hash():
 
     cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
     client = QBittorrentClient(cfg, label="dest-qb")
-    blob = _bencode({
-        b"announce": b"http://tracker/announce",
-        b"info": {b"name": b"Known.Bytes", b"length": 100},
-    })
+    blob = _bencode(
+        {
+            b"announce": b"http://tracker/announce",
+            b"info": {b"name": b"Known.Bytes", b"length": 100},
+        }
+    )
     expected, _, _, _ = _bencoded_info_hash(blob)
 
     class DummyResponseContext:
@@ -1205,10 +1274,12 @@ async def test_qbittorrent_add_checks_every_blob_for_duplicates():
     client = QBittorrentClient(cfg, label="dest-qb")
 
     def _blob(name):
-        return _bencode({
-            b"announce": b"http://tracker/announce",
-            b"info": {b"name": name.encode(), b"length": 100},
-        })
+        return _bencode(
+            {
+                b"announce": b"http://tracker/announce",
+                b"info": {b"name": name.encode(), b"length": 100},
+            }
+        )
 
     fresh = _blob("Fresh.Release")
     dup = _blob("Dup.Release")
@@ -1280,8 +1351,9 @@ async def test_deluge_rpc_expiry_resets_authed():
     client._authed = True
 
     async def mock_request(*args, **kwargs):
-        return _JsonResp({"error": {"message": "Not authenticated", "code": 1},
-                          "id": 1, "result": None})
+        return _JsonResp(
+            {"error": {"message": "Not authenticated", "code": 1}, "id": 1, "result": None}
+        )
 
     client.request = mock_request
     with pytest.raises(AuthError, match="session expired"):
@@ -1374,8 +1446,7 @@ async def test_qbittorrent_request_json_no_reauth_on_corrupt_json():
     class DummyCtx:
         async def __aenter__(self):
             resp = MagicMock()
-            resp.json = AsyncMock(side_effect=json.JSONDecodeError(
-                "corrupt", '{"half": ', 0))
+            resp.json = AsyncMock(side_effect=json.JSONDecodeError("corrupt", '{"half": ', 0))
             resp.text = AsyncMock(return_value='{"half": ')
             return resp
 
@@ -1409,8 +1480,9 @@ async def test_deluge_rpc_retries_once_after_expiry():
     async def mock_request(*args, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            return _JsonResp({"error": {"message": "Not authenticated", "code": 1},
-                              "id": 1, "result": None})
+            return _JsonResp(
+                {"error": {"message": "Not authenticated", "code": 1}, "id": 1, "result": None}
+            )
         return _JsonResp({"error": None, "id": 1, "result": {"ok": 1}})
 
     async def mock_auth(force=False):
@@ -1436,14 +1508,18 @@ def test_qb_parses_dlspeed_best_effort():
     """qB download rate feeds the active-tasks speed display."""
     from racing_sync.clients.qbittorrent import _torrent_from_qb
 
-    t = _torrent_from_qb({
-        "hash": "a" * 40, "name": "S", "progress": 0.5,
-        "dlspeed": 1234567, "upspeed": 9,
-    })
+    t = _torrent_from_qb(
+        {
+            "hash": "a" * 40,
+            "name": "S",
+            "progress": 0.5,
+            "dlspeed": 1234567,
+            "upspeed": 9,
+        }
+    )
     assert t.dlspeed_bps == 1234567
     assert t.upspeed_bps == 9
-    assert _torrent_from_qb(
-        {"hash": "b" * 40, "name": "S"}).dlspeed_bps == 0
+    assert _torrent_from_qb({"hash": "b" * 40, "name": "S"}).dlspeed_bps == 0
 
 
 @pytest.mark.anyio
@@ -1462,12 +1538,14 @@ async def test_qb_trackers_survive_bad_rows_and_auth_propagates():
 
     cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
     client = QBittorrentClient(cfg, label="dest-qb")
-    client._request_json = AsyncMock(return_value=[
-        {"url": "http://t.example/a"},
-        "garbage",
-        {"url": "**DHT**"},
-        {"url": "http://t.example/a"},
-    ])
+    client._request_json = AsyncMock(
+        return_value=[
+            {"url": "http://t.example/a"},
+            "garbage",
+            {"url": "**DHT**"},
+            {"url": "http://t.example/a"},
+        ]
+    )
     assert await client.get_trackers("a" * 40) == ["http://t.example/a"]
     client._request_json = AsyncMock(side_effect=AuthError("expired"))
     with pytest.raises(AuthError):
@@ -1494,8 +1572,8 @@ async def test_qb_pause_probes_version_once():
         seen.append(path)
         if path == "/api/v2/torrents/stop":
             raise aiohttp.ClientResponseError(
-                request_info=MagicMock(), history=(),
-                status=404, message="not found")
+                request_info=MagicMock(), history=(), status=404, message="not found"
+            )
         return DummyCtx()
 
     import aiohttp
@@ -1503,8 +1581,7 @@ async def test_qb_pause_probes_version_once():
     client.request = mock_request
     await client.pause("a" * 40)
     await client.pause("a" * 40)
-    assert seen == ["/api/v2/torrents/stop", "/api/v2/torrents/pause",
-                    "/api/v2/torrents/pause"]
+    assert seen == ["/api/v2/torrents/stop", "/api/v2/torrents/pause", "/api/v2/torrents/pause"]
     assert client._legacy_pause_api is True
 
 
@@ -1515,10 +1592,12 @@ async def test_qb_prio_failure_logs_applied_and_raises():
 
     cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
     client = QBittorrentClient(cfg, label="dest-qb")
-    client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="a.mkv", size_bytes=100, progress=1.0),
-        TorrentFile(name="b.mkv", size_bytes=100, progress=1.0),
-    ])
+    client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="a.mkv", size_bytes=100, progress=1.0),
+            TorrentFile(name="b.mkv", size_bytes=100, progress=1.0),
+        ]
+    )
     calls = []
 
     class DummyCtx:
@@ -1535,8 +1614,8 @@ async def test_qb_prio_failure_logs_applied_and_raises():
         calls.append(path)
         if len(calls) > 1:
             raise aiohttp.ClientResponseError(
-                request_info=MagicMock(), history=(),
-                status=404, message="gone")
+                request_info=MagicMock(), history=(), status=404, message="gone"
+            )
         return DummyCtx()
 
     client.request = mock_request
@@ -1550,13 +1629,11 @@ def test_qb_mapping_size_fallback_and_magnet_hash():
 
     from racing_sync.clients.qbittorrent import _torrent_from_qb
 
-    t = _torrent_from_qb({"hash": "a" * 40, "name": "S",
-                          "size": None, "total_size": 700})
+    t = _torrent_from_qb({"hash": "a" * 40, "name": "S", "size": None, "total_size": 700})
     assert t.size_bytes == 700
     raw20 = bytes(range(20))
     b32 = base64.b32encode(raw20).decode().rstrip("=")
-    t = _torrent_from_qb({"name": "S",
-                          "magnet_uri": f"magnet:?xt=urn:btih:{b32}"})
+    t = _torrent_from_qb({"name": "S", "magnet_uri": f"magnet:?xt=urn:btih:{b32}"})
     assert t.hash == raw20.hex()
     with pytest.raises(ValueError, match="missing infohash"):
         _torrent_from_qb({"name": "S"})
@@ -1570,7 +1647,12 @@ def _deluge_test_client():
         type="deluge",
         host="http://localhost:8112",
         password="secret",
-        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1", "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+        deluge_sftp={
+            "enabled": True,
+            "ssh_host": "127.0.0.1",
+            "ssh_password": "pwd",
+            "state_dir": "/var/lib/deluged/state",
+        },
     )
     return DelugeClient(cfg)
 
@@ -1581,14 +1663,15 @@ async def test_deluge_prio_warns_and_skips_unknown():
     from unittest.mock import AsyncMock
 
     client = _deluge_test_client()
-    client._rpc = AsyncMock(return_value={
-        "files": [{"path": "a.mkv", "index": 0}],
-        "file_priorities": [1],
-    })
+    client._rpc = AsyncMock(
+        return_value={
+            "files": [{"path": "a.mkv", "index": 0}],
+            "file_priorities": [1],
+        }
+    )
     # Valid map applies (qB 6 down-mapped silently, unknown name warned).
     await client.set_file_priorities("a" * 40, {"a.mkv": 6, "ghost.mkv": 1})
-    client._rpc.assert_awaited_with(
-        "core.set_torrent_file_priorities", ["a" * 40, [1]])
+    client._rpc.assert_awaited_with("core.set_torrent_file_priorities", ["a" * 40, [1]])
     # Garbage-only map refuses instead of downloading unfiltered.
     with pytest.raises(RuntimeError, match="no valid files"):
         await client.set_file_priorities("a" * 40, {"ghost.mkv": 1})
@@ -1608,8 +1691,7 @@ async def test_deluge_not_found_reraise_auth():
 
     client = _deluge_test_client()
     with pytest.raises(AuthError):
-        await client._not_found_is_gone(
-            "delete", "a" * 40, _failing(AuthError("expired")))
+        await client._not_found_is_gone("delete", "a" * 40, _failing(AuthError("expired")))
 
 
 @pytest.mark.anyio
@@ -1637,10 +1719,13 @@ async def test_deluge_daemon_busy_maps_to_timeout():
         class _Ctx:
             async def __aenter__(self):
                 resp = MagicMock()
-                resp.json = AsyncMock(return_value={
-                    "result": None, "error": "daemon busy, try again",
-                    "id": 1,
-                })
+                resp.json = AsyncMock(
+                    return_value={
+                        "result": None,
+                        "error": "daemon busy, try again",
+                        "id": 1,
+                    }
+                )
                 return resp
 
             async def __aexit__(self, *args):
@@ -1705,11 +1790,13 @@ async def test_deluge_web_connected_false_without_hosts_fails_auth():
         return client
 
     # auth.login ok, web.connected false, web.get_hosts empty -> AuthError.
-    empty = make_client([
-        ({"result": True}, 200),    # auth.login
-        ({"result": False}, 200),   # web.connected: no daemon
-        ({"result": []}, 200),      # web.get_hosts: nothing configured
-    ])
+    empty = make_client(
+        [
+            ({"result": True}, 200),  # auth.login
+            ({"result": False}, 200),  # web.connected: no daemon
+            ({"result": []}, 200),  # web.get_hosts: nothing configured
+        ]
+    )
     with pytest.raises(AuthError, match="no daemon") as exc:
         await empty._do_client_auth()
     assert "localhost:8112" in str(exc.value)
@@ -1717,13 +1804,13 @@ async def test_deluge_web_connected_false_without_hosts_fails_auth():
     assert empty._session.post.call_count == 3
 
     # A non-200 web.get_hosts also fails auth instead of passing silently.
-    broken = make_client([
-        ({"result": True}, 200),
-        ({"result": False}, 200),
-        ({"result": []}, 503),      # web.get_hosts broke
-    ])
+    broken = make_client(
+        [
+            ({"result": True}, 200),
+            ({"result": False}, 200),
+            ({"result": []}, 503),  # web.get_hosts broke
+        ]
+    )
     with pytest.raises(AuthError, match="503"):
         await broken._do_client_auth()
     assert broken._session.post.call_count == 3
-
-

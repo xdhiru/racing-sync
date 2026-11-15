@@ -4,6 +4,7 @@ Operator moved the bytes to the remote by hand; the command verifies
 fuse readiness first and changes nothing unless every member verifies:
 tracked rows keep their prior state, untracked groups gain no row.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -31,16 +32,24 @@ TRACKER2 = "https://beta.example/announce?passkey=BBB"
 
 def _torrent(h, tracker, size=500):
     return Torrent(
-        hash=h, name=NAME, category="", save_path="/vps1",
-        size_bytes=size, state="seeding", progress=1.0,
-        trackers=[tracker], files=[],
+        hash=h,
+        name=NAME,
+        category="",
+        save_path="/vps1",
+        size_bytes=size,
+        state="seeding",
+        progress=1.0,
+        trackers=[tracker],
+        files=[],
     )
 
 
 def _blob(fname="Solo.mkv", size=500):
-    return _bencode({
-        b"info": {b"name": fname.encode(), b"length": size},
-    })
+    return _bencode(
+        {
+            b"info": {b"name": fname.encode(), b"length": size},
+        }
+    )
 
 
 def _coord(tmp_path, torrents, store=None):
@@ -79,8 +88,7 @@ def _bot(store, coord=None, **kw):
     bot._pending_pick = None
     bot._last_active_cache = None
     bot._bot = SimpleNamespace(
-        send_message=AsyncMock(
-            return_value=SimpleNamespace(message_id=7)),
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=7)),
     )
     for k, v in kw.items():
         setattr(bot, k, v)
@@ -92,16 +100,19 @@ def _cmd(text, mid=51):
         chat=SimpleNamespace(id="1"),
         from_user=SimpleNamespace(id="9"),
         message_id=mid,
-        text=text, caption=None, document=None,
+        text=text,
+        caption=None,
+        document=None,
         reply_to_message=None,
     )
 
+
 def _sent_texts(bot):
-    return [str(c.args[1]) for c in
-            bot._bot.send_message.await_args_list]
+    return [str(c.args[1]) for c in bot._bot.send_message.await_args_list]
 
 
 # ---- state edges ----
+
 
 def test_allowed_edges_for_injectfuse():
     assert State.RE_ADDING in ALLOWED[State.WAITING_INDEXER]
@@ -111,6 +122,7 @@ def test_allowed_edges_for_injectfuse():
 
 
 # ---- coordinator core ----
+
 
 @pytest.mark.anyio
 async def test_resolve_unknown_hash(tmp_path):
@@ -136,12 +148,13 @@ async def test_resolve_ignored_group_still_resolves(tmp_path):
 
 @pytest.mark.anyio
 async def test_resolve_finds_row_by_sibling_hash(tmp_path):
-    coord, _, _ = _coord(
-        tmp_path, [_torrent(H1, TRACKER1), _torrent(H2, TRACKER2)])
+    coord, _, _ = _coord(tmp_path, [_torrent(H1, TRACKER1), _torrent(H2, TRACKER2)])
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.WAITING_INDEXER))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1, source_name=NAME, total_bytes=500, state=State.WAITING_INDEXER
+            )
+        )
         resolved = await coord.injectfuse_resolve(H2)
         assert len(resolved["members"]) == 2
         assert resolved["row"] is not None
@@ -158,9 +171,11 @@ async def test_verify_ready_no_state_change(tmp_path):
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.WAITING_INDEXER))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1, source_name=NAME, total_bytes=500, state=State.WAITING_INDEXER
+            )
+        )
         resolved = await coord.injectfuse_resolve(H1)
         verified = await coord.injectfuse_verify(resolved["members"])
         assert verified["ready"] is True
@@ -186,9 +201,11 @@ async def test_verify_broken_fuse_cfg_fails_closed(tmp_path):
 
     coord.cfg.rclone.fuse = _BrokenFuse()
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.WAITING_INDEXER))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1, source_name=NAME, total_bytes=500, state=State.WAITING_INDEXER
+            )
+        )
         resolved = await coord.injectfuse_resolve(H1)
         verified = await coord.injectfuse_verify(resolved["members"])
         assert verified["ready"] is False
@@ -204,9 +221,11 @@ async def test_verify_missing_no_state_change(tmp_path):
     blob = _blob()
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.WAITING_INDEXER))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1, source_name=NAME, total_bytes=500, state=State.WAITING_INDEXER
+            )
+        )
         resolved = await coord.injectfuse_resolve(H1)
         verified = await coord.injectfuse_verify(resolved["members"])
         assert verified["ready"] is False
@@ -223,9 +242,11 @@ async def test_confirmed_drives_waiting_row(tmp_path):
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.WAITING_INDEXER))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1, source_name=NAME, total_bytes=500, state=State.WAITING_INDEXER
+            )
+        )
         out = await coord.injectfuse_confirmed([H1])
         assert out.startswith("injecting")
         assert coord.store.get(H1).state == State.RE_ADDING
@@ -244,9 +265,15 @@ async def test_confirmed_keeps_existing_blob(tmp_path):
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.WAITING_INDEXER, cross_seed_blob=other))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1,
+                source_name=NAME,
+                total_bytes=500,
+                state=State.WAITING_INDEXER,
+                cross_seed_blob=other,
+            )
+        )
         out = await coord.injectfuse_confirmed([H1])
         assert out.startswith("injecting")
         assert bytes(coord.store.get_blob(H1)) == other
@@ -260,9 +287,11 @@ async def test_confirmed_missing_keeps_prior_state(tmp_path):
     blob = _blob()
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.WAITING_INDEXER))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1, source_name=NAME, total_bytes=500, state=State.WAITING_INDEXER
+            )
+        )
         out = await coord.injectfuse_confirmed([H1])
         assert out.startswith("Not injected")
         assert "still waiting_indexer" in out
@@ -279,9 +308,11 @@ async def test_confirmed_preempts_active_download(tmp_path):
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.DOWNLOADING))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1, source_name=NAME, total_bytes=500, state=State.DOWNLOADING
+            )
+        )
         out = await coord.injectfuse_confirmed([H1])
         assert out.startswith("injecting")
         assert "SSD downloading stopped" in out
@@ -297,9 +328,11 @@ async def test_confirmed_lifts_cancel(tmp_path):
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.WAITING_INDEXER))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1, source_name=NAME, total_bytes=500, state=State.WAITING_INDEXER
+            )
+        )
         coord.store.ignore_torrent(H1, NAME)
         coord.store.tombstone(H1)
         out = await coord.injectfuse_confirmed([H1])
@@ -348,9 +381,9 @@ async def test_confirmed_done_noop(tmp_path):
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.DONE))
+        coord.store.upsert(
+            TorrentState(source_infohash=H1, source_name=NAME, total_bytes=500, state=State.DONE)
+        )
         out = await coord.injectfuse_confirmed([H1])
         assert "already done" in out
         assert coord.store.get(H1).state == State.DONE
@@ -359,6 +392,7 @@ async def test_confirmed_done_noop(tmp_path):
 
 
 # ---- telegram layer ----
+
 
 def test_regexes():
     assert INJECTFUSE_CMD_RE.match("/injectfuse_3")
@@ -373,13 +407,18 @@ def test_no_pending_machine_left():
     """The snapshot/pending protocol is gone: no related names survive."""
     import racing_sync.telegram_bot as _mod
 
-    for _name in ("pick_snapshot", "render_pending_question",
-                  "_PENDING_TTL_S"):
+    for _name in ("pick_snapshot", "render_pending_question", "_PENDING_TTL_S"):
         assert not hasattr(_mod, _name), _name
-    for _name in ("_pending_live", "_pending_pick", "_next_seq",
-                  "_set_pending_pick", "_set_pending_keepq",
-                  "_set_pending_injectq", "_pending_section",
-                  "_tg_pending_owner_ok"):
+    for _name in (
+        "_pending_live",
+        "_pending_pick",
+        "_next_seq",
+        "_set_pending_pick",
+        "_set_pending_keepq",
+        "_set_pending_injectq",
+        "_pending_section",
+        "_tg_pending_owner_ok",
+    ):
         assert not hasattr(_mod.TelegramBot, _name), _name
 
 
@@ -395,8 +434,13 @@ async def test_chat_hash_unknown_replies(tmp_path):
             SimpleNamespace(
                 chat=SimpleNamespace(id="1"),
                 from_user=SimpleNamespace(id="9"),
-                message_id=51, text=f"/injectfuse {H1}",
-                caption=None, document=None, reply_to_message=None))
+                message_id=51,
+                text=f"/injectfuse {H1}",
+                caption=None,
+                document=None,
+                reply_to_message=None,
+            )
+        )
         texts = _sent_texts(bot)
         assert any("not on VPS1" in t for t in texts)
         assert bot._pending_pick is None
@@ -410,8 +454,7 @@ async def test_chat_hash_arms_question(tmp_path):
     try:
         coord = make_coordinator()
         coord.source_client = AsyncMock()
-        coord.source_client.list_torrents = AsyncMock(
-            return_value=[_torrent(H1, TRACKER1)])
+        coord.source_client.list_torrents = AsyncMock(return_value=[_torrent(H1, TRACKER1)])
         coord.store = store
         bot = _bot(store, coord=coord)
         bot._refresh_active_message = AsyncMock()
@@ -419,13 +462,17 @@ async def test_chat_hash_arms_question(tmp_path):
             SimpleNamespace(
                 chat=SimpleNamespace(id="1"),
                 from_user=SimpleNamespace(id="9"),
-                message_id=51, text=f"/injectfuse {H1}",
-                caption=None, document=None, reply_to_message=None))
+                message_id=51,
+                text=f"/injectfuse {H1}",
+                caption=None,
+                document=None,
+                reply_to_message=None,
+            )
+        )
         texts = _sent_texts(bot)
         assert any("to fuse seeding? " in t for t in texts)
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         assert f"inject:{H1}:yes" in _data
     finally:
         store.close()
@@ -436,22 +483,27 @@ async def test_group_number_arms_question(tmp_path):
     """`/injectfuse_1` on a listed waiting group asks Yes/No, changes nothing."""
     coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.WAITING_INDEXER))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1, source_name=NAME, total_bytes=500, state=State.WAITING_INDEXER
+            )
+        )
         bot = _bot(coord.store, coord=coord)
         bot._refresh_active_message = AsyncMock()
         msg = SimpleNamespace(
             chat=SimpleNamespace(id="1"),
             from_user=SimpleNamespace(id="9"),
-            message_id=51, text="/injectfuse_1",
-            caption=None, document=None, reply_to_message=None)
+            message_id=51,
+            text="/injectfuse_1",
+            caption=None,
+            document=None,
+            reply_to_message=None,
+        )
         await bot._handle_chat_message(msg)
         texts = _sent_texts(bot)
         assert any("to fuse seeding? " in t for t in texts)
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         assert f"inject:{H1}:yes" in _data
         assert coord.store.get(H1).state == State.WAITING_INDEXER
     finally:
@@ -463,16 +515,22 @@ async def test_underscore_hash_tracked_arms_question(tmp_path):
     """/injectfuse_<full-hash> on a tracked row resolves like the hash form."""
     coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.WAITING_INDEXER))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1, source_name=NAME, total_bytes=500, state=State.WAITING_INDEXER
+            )
+        )
         bot = _bot(coord.store, coord=coord)
         bot._refresh_active_message = AsyncMock()
         msg = SimpleNamespace(
             chat=SimpleNamespace(id="1"),
             from_user=SimpleNamespace(id="9"),
-            message_id=51, text=f"/injectfuse_{H1}",
-            caption=None, document=None, reply_to_message=None)
+            message_id=51,
+            text=f"/injectfuse_{H1}",
+            caption=None,
+            document=None,
+            reply_to_message=None,
+        )
         await bot._handle_chat_message(msg)
         texts = _sent_texts(bot)
         assert any("to fuse seeding? " in t for t in texts)
@@ -565,25 +623,29 @@ async def test_dispatcher_routes_inject_callbacks(tmp_path):
 @pytest.mark.anyio
 async def test_group_question_names_live_vps1_count(tmp_path):
     """Later VPS1 additions join the question, not just the tracked row."""
-    coord, _, _fuse = _coord(
-        tmp_path, [_torrent(H1, TRACKER1), _torrent(H2, TRACKER2)])
+    coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1), _torrent(H2, TRACKER2)])
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.WAITING_INDEXER))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1, source_name=NAME, total_bytes=500, state=State.WAITING_INDEXER
+            )
+        )
         bot = _bot(coord.store, coord=coord)
         bot._refresh_active_message = AsyncMock()
         msg = SimpleNamespace(
             chat=SimpleNamespace(id="1"),
             from_user=SimpleNamespace(id="9"),
-            message_id=51, text="/injectfuse_1",
-            caption=None, document=None, reply_to_message=None)
+            message_id=51,
+            text="/injectfuse_1",
+            caption=None,
+            document=None,
+            reply_to_message=None,
+        )
         await bot._handle_chat_message(msg)
         texts = _sent_texts(bot)
         assert any("(2 copies)" in t for t in texts)
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         assert f"inject:{H1}:yes" in _data
         assert coord.store.get(H1).state == State.WAITING_INDEXER
     finally:
@@ -595,22 +657,27 @@ async def test_group_question_falls_back_when_vps1_gone(tmp_path):
     """VPS1 entry removed: question still asks from the tracked row."""
     coord, _, fuse = _coord(tmp_path, [])
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.WAITING_INDEXER))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1, source_name=NAME, total_bytes=500, state=State.WAITING_INDEXER
+            )
+        )
         bot = _bot(coord.store, coord=coord)
         bot._refresh_active_message = AsyncMock()
         msg = SimpleNamespace(
             chat=SimpleNamespace(id="1"),
             from_user=SimpleNamespace(id="9"),
-            message_id=51, text="/injectfuse_1",
-            caption=None, document=None, reply_to_message=None)
+            message_id=51,
+            text="/injectfuse_1",
+            caption=None,
+            document=None,
+            reply_to_message=None,
+        )
         await bot._handle_chat_message(msg)
         texts = _sent_texts(bot)
         assert any("to fuse seeding? " in t for t in texts)
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         assert f"inject:{H1}:yes" in _data
         assert coord.store.get(H1).state == State.WAITING_INDEXER
     finally:
@@ -620,8 +687,7 @@ async def test_group_question_falls_back_when_vps1_gone(tmp_path):
 @pytest.mark.anyio
 async def test_verify_members_run_concurrently(tmp_path):
     """Group members verify in parallel, not one fetch+stat at a time."""
-    coord, _, fuse = _coord(
-        tmp_path, [_torrent(H1, TRACKER1), _torrent(H2, TRACKER2)])
+    coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1), _torrent(H2, TRACKER2)])
     blob = _blob()
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)
@@ -664,9 +730,15 @@ async def test_preempt_deletes_ssd_entry_under_rpc_budget(tmp_path):
     coord.dest_client.list_torrents = AsyncMock(return_value=[_ssd_entry])
     coord.dest_client.delete = AsyncMock()
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.DOWNLOADING, dest_infohash=dest_h))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1,
+                source_name=NAME,
+                total_bytes=500,
+                state=State.DOWNLOADING,
+                dest_infohash=dest_h,
+            )
+        )
         out = await coord.injectfuse_confirmed([H1])
         assert out.startswith("injecting")
         coord.dest_client.list_torrents.assert_awaited_once()
@@ -686,9 +758,11 @@ async def test_apply_active_row_without_blob_preempts_nothing(tmp_path):
     coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     coord.dest_client.delete = AsyncMock()
     try:
-        coord.store.upsert(TorrentState(
-            source_infohash=H1, source_name=NAME, total_bytes=500,
-            state=State.DOWNLOADING))
+        coord.store.upsert(
+            TorrentState(
+                source_infohash=H1, source_name=NAME, total_bytes=500, state=State.DOWNLOADING
+            )
+        )
         resolved = await coord.injectfuse_resolve(H1)
         with pytest.raises(LookupError):
             await coord.injectfuse_apply(resolved, {})
@@ -726,12 +800,28 @@ async def test_confirmed_untracked_routes_via_new_and_transition(tmp_path):
 @pytest.mark.anyio
 async def test_confirmed_drives_every_hash(tmp_path):
     """Two distinct confirmed groups both drive (no silent clean[0] drop)."""
-    t1 = Torrent(hash=H1, name="First.Release.1080p", category="",
-                 save_path="/vps1", size_bytes=500, state="seeding",
-                 progress=1.0, trackers=[TRACKER1], files=[])
-    t2 = Torrent(hash=H2, name="Second.Release.1080p", category="",
-                 save_path="/vps1", size_bytes=500, state="seeding",
-                 progress=1.0, trackers=[TRACKER2], files=[])
+    t1 = Torrent(
+        hash=H1,
+        name="First.Release.1080p",
+        category="",
+        save_path="/vps1",
+        size_bytes=500,
+        state="seeding",
+        progress=1.0,
+        trackers=[TRACKER1],
+        files=[],
+    )
+    t2 = Torrent(
+        hash=H2,
+        name="Second.Release.1080p",
+        category="",
+        save_path="/vps1",
+        size_bytes=500,
+        state="seeding",
+        progress=1.0,
+        trackers=[TRACKER2],
+        files=[],
+    )
     coord, _, fuse = _coord(tmp_path, [t1, t2])
     blob = _blob()
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
@@ -749,8 +839,7 @@ async def test_confirmed_drives_every_hash(tmp_path):
 @pytest.mark.anyio
 async def test_confirmed_same_group_drives_once(tmp_path):
     """Two hashes in one content group drive once, not twice."""
-    coord, _, fuse = _coord(
-        tmp_path, [_torrent(H1, TRACKER1), _torrent(H2, TRACKER2)])
+    coord, _, fuse = _coord(tmp_path, [_torrent(H1, TRACKER1), _torrent(H2, TRACKER2)])
     blob = _blob()
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
     (fuse / "Solo.mkv").write_bytes(b"x" * 500)

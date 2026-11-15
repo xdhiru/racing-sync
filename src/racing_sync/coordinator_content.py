@@ -42,10 +42,22 @@ def normalize_content_name(name: str, *, unify_separators: bool = False) -> str:
         prev = s
         s = re.sub(r"\.torrent$", "", s, flags=re.IGNORECASE).strip()
         s = re.sub(r"\s*\[[^\]]+\]\s*$", "", s).strip()
-        for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v",
-                    ".iso", ".m2ts", ".mts", ".wmv", ".mov", ".flv", ".webm"):
+        for ext in (
+            ".mkv",
+            ".mp4",
+            ".avi",
+            ".ts",
+            ".m4v",
+            ".iso",
+            ".m2ts",
+            ".mts",
+            ".wmv",
+            ".mov",
+            ".flv",
+            ".webm",
+        ):
             if s.lower().endswith(ext):
-                s = s[:-len(ext)].strip()
+                s = s[: -len(ext)].strip()
                 break
         if s == prev:
             break
@@ -78,8 +90,7 @@ def size_within_tolerance(hit_size: int, target_size: int, *, kind: str | None =
     """
     if hit_size > 0 and target_size > 0:
         try:
-            cap, frac = _SIZE_TOLERANCE_BY_KIND.get(
-                (kind or "").lower(), _SIZE_TOLERANCE_DEFAULT)
+            cap, frac = _SIZE_TOLERANCE_BY_KIND.get((kind or "").lower(), _SIZE_TOLERANCE_DEFAULT)
             tolerance = min(int(cap), int(target_size * float(frac)))
         except (TypeError, ValueError):
             tolerance = min(1024 * 1024 * 50, int(target_size * 0.02))
@@ -87,8 +98,15 @@ def size_within_tolerance(hit_size: int, target_size: int, *, kind: str | None =
     return True
 
 
-def _matches_release(hit_title: str, hit_size: int, target_name: str, target_size: int,
-                     *, kind: str | None = None, unify_separators: bool = False) -> bool:
+def _matches_release(
+    hit_title: str,
+    hit_size: int,
+    target_name: str,
+    target_size: int,
+    *,
+    kind: str | None = None,
+    unify_separators: bool = False,
+) -> bool:
     """Check if a Prowlarr hit matches the target release by title and size.
 
     Single predicate for index selection and supplement matching (the old
@@ -104,7 +122,11 @@ def _matches_release(hit_title: str, hit_size: int, target_name: str, target_siz
 
 
 def _verified_cross_seed_blob(
-    blob: bytes | None, *, target_name: str, target_size: int, hit_title: str,
+    blob: bytes | None,
+    *,
+    target_name: str,
+    target_size: int,
+    hit_title: str,
     kind: str | None = None,
 ) -> tuple[bytes, str, str] | None:
     """Decode downloaded cross-seed bytes and prove they are the exact release.
@@ -120,28 +142,30 @@ def _verified_cross_seed_blob(
         return None
     try:
         from .watchdir import _bencoded_info_hash
+
         real_hash, blob_name, blob_size, announce = _bencoded_info_hash(blob)
     except Exception:
-        log.warning("cross-seed download for %s is not a decodable torrent; ignoring",
-                    target_name)
+        log.warning("cross-seed download for %s is not a decodable torrent; ignoring", target_name)
         return None
     if not blob_name or not blob_size:
         # A decodable torrent with no name/size proves nothing about the
         # payload: falling back to the index title/size would verify the
         # listing, not the bytes. Park for retry instead of downloading on.
-        log.warning("cross-seed download for %s has no name/size inside; ignoring",
-                    target_name)
+        log.warning("cross-seed download for %s has no name/size inside; ignoring", target_name)
         return None
     try:
         from .prowlarr import release_title_matches
-        ok = release_title_matches(blob_name, blob_size,
-                                   target_name, target_size, kind=kind)
+
+        ok = release_title_matches(blob_name, blob_size, target_name, target_size, kind=kind)
     except Exception:
         ok = False
     if not ok:
-        log.warning("cross-seed mismatch for %s: got %r (%d B), want the exact "
-                    "release; ignoring download",
-                    target_name, blob_name, blob_size)
+        log.warning(
+            "cross-seed mismatch for %s: got %r (%d B), want the exact release; ignoring download",
+            target_name,
+            blob_name,
+            blob_size,
+        )
         return None
     return blob, (real_hash or "").lower(), announce or ""
 
@@ -231,15 +255,17 @@ def indexer_slug(name: str) -> str:
 
 # Telegram notification filter: only certain state transitions deserve
 # a chat message. Passive discoveries (NEW on first tick) don't.
-_TELEGRAM_NOTIFY_STATES = frozenset({
-    State.QUEUED,
-    State.DOWNLOADING,
-    State.MOVING,
-    State.RE_ADDING,
-    State.DONE,
-    State.FAILED,
-    State.WAITING_INDEXER,
-})
+_TELEGRAM_NOTIFY_STATES = frozenset(
+    {
+        State.QUEUED,
+        State.DOWNLOADING,
+        State.MOVING,
+        State.RE_ADDING,
+        State.DONE,
+        State.FAILED,
+        State.WAITING_INDEXER,
+    }
+)
 
 
 def _should_notify_telegram(prev: State, dst: State) -> bool:
@@ -261,11 +287,23 @@ def _should_notify_telegram(prev: State, dst: State) -> bool:
 
 
 PUBLIC_TRACKER_HOSTS = (
-    "publicbt", "tracker.public", "tracker.openbittorrent",
-    "opentrackr", "academictorrents", "bt.archlinux",
-    "linuxmint", "ubuntu-releases", "nyaa", "animetosho",
-    "tokyotosho", "torrentgalaxy", "1337x", "piratebay",
-    "coppersurfer", "leechers-paradise", "open.stealth.si",
+    "publicbt",
+    "tracker.public",
+    "tracker.openbittorrent",
+    "opentrackr",
+    "academictorrents",
+    "bt.archlinux",
+    "linuxmint",
+    "ubuntu-releases",
+    "nyaa",
+    "animetosho",
+    "tokyotosho",
+    "torrentgalaxy",
+    "1337x",
+    "piratebay",
+    "coppersurfer",
+    "leechers-paradise",
+    "open.stealth.si",
 )
 
 #: Every `cross_seed_source` value a watch-dir row can carry. The label is
@@ -273,14 +311,24 @@ PUBLIC_TRACKER_HOSTS = (
 #: accept the whole set (plus the persisted blob dir), never one label.
 #: "telegram" rows are .torrent files received in chat via /add —
 #: same pipeline as a manual drop (label only records the origin).
-WATCH_ORIGIN_LABELS = frozenset({
-    "watch-dir", "public-watch-dir", "public-prowlarr", "telegram",
-})
+WATCH_ORIGIN_LABELS = frozenset(
+    {
+        "watch-dir",
+        "public-watch-dir",
+        "public-prowlarr",
+        "telegram",
+    }
+)
 
 #: Watch rows holding SSD/client presence lock election ownership.
-WATCH_ELECTION_LOCKED_STATES = frozenset({
-    State.QUEUED, State.DOWNLOADING, State.MOVING, State.RE_ADDING,
-})
+WATCH_ELECTION_LOCKED_STATES = frozenset(
+    {
+        State.QUEUED,
+        State.DOWNLOADING,
+        State.MOVING,
+        State.RE_ADDING,
+    }
+)
 
 #: Watch rows that can still be waiting on an owner.
 WATCH_ELECTION_WAITER_STATES = frozenset({State.NEW, State.WAITING_DISK})
@@ -363,9 +411,7 @@ def watch_rank(row: TorrentState, cfg) -> int:
     except Exception:
         pass
     try:
-        if cfg.prowlarr.enabled and any(
-            cfg.prowlarr.is_download_indexer(u) for u in tracker_list
-        ):
+        if cfg.prowlarr.enabled and any(cfg.prowlarr.is_download_indexer(u) for u in tracker_list):
             return 1
     except Exception:
         pass
@@ -425,8 +471,10 @@ def watch_election_winner(rows, ts: TorrentState, cfg) -> TorrentState | None:
                     continue
                 if _same_content is not None:
                     if not _same_content(
-                        p.source_name or "", p.total_bytes or 0,
-                        ts.source_name or "", ts.total_bytes or 0,
+                        p.source_name or "",
+                        p.total_bytes or 0,
+                        ts.source_name or "",
+                        ts.total_bytes or 0,
                         require_size=True,
                     ):
                         continue
@@ -454,12 +502,11 @@ def watch_election_winner(rows, ts: TorrentState, cfg) -> TorrentState | None:
                 rank = watch_rank(p, cfg)
             except Exception:
                 rank = 2
-            return (rank, _created_ts(p),
-                    (p.source_infohash or "").lower())
+            return (rank, _created_ts(p), (p.source_infohash or "").lower())
 
-        ordered = sorted([ts, *[p for p in peers
-                                  if p.state in WATCH_ELECTION_WAITER_STATES]],
-                         key=_wkey)
+        ordered = sorted(
+            [ts, *[p for p in peers if p.state in WATCH_ELECTION_WAITER_STATES]], key=_wkey
+        )
         winner = ordered[0]
         if (winner.source_infohash or "").lower() == self_hash:
             return None

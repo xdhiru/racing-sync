@@ -25,16 +25,35 @@ from .config import AppConfig
 log = logging.getLogger(__name__)
 
 NON_VIDEO_EXTENSIONS = {
-    ".nfo", ".srt", ".sub", ".idx", ".txt", ".jpg", ".jpeg", ".png",
-    ".torrent", ".sfv", ".md5", ".sha", ".sha1",
-    ".ass", ".ssa", ".vtt", ".smi", ".sup",
-    ".rar", ".zip", ".par2", ".cue", ".m3u",
+    ".nfo",
+    ".srt",
+    ".sub",
+    ".idx",
+    ".txt",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".torrent",
+    ".sfv",
+    ".md5",
+    ".sha",
+    ".sha1",
+    ".ass",
+    ".ssa",
+    ".vtt",
+    ".smi",
+    ".sup",
+    ".rar",
+    ".zip",
+    ".par2",
+    ".cue",
+    ".m3u",
 }
 
 
 @dataclass(slots=True)
 class Episode:
-    file_name: str            # exact file path inside the torrent
+    file_name: str  # exact file path inside the torrent
     season: int
     episode: int
     size_bytes: int
@@ -42,9 +61,9 @@ class Episode:
 
 @dataclass(slots=True)
 class Classification:
-    kind: str                 # "movie" | "season" | "episode" | "mixed" | "unknown"
-    episodes: list[Episode]   # populated for season / episode / mixed
-    single_file: str | None   # populated for movie and episode
+    kind: str  # "movie" | "season" | "episode" | "mixed" | "unknown"
+    episodes: list[Episode]  # populated for season / episode / mixed
+    single_file: str | None  # populated for movie and episode
     total_bytes: int
 
 
@@ -54,25 +73,22 @@ _DELIM_END = r"(?:(?=[._\-\s\]\)/\\])|$)"
 _BLACKLIST_TAGS_RE = re.compile(
     r"(?i)(?:(?<=[._\-\s\[\(/\\])|^)"
     r"(?:"
-    r"\d{3,4}x\d{3,4}"                   # 1920x1080, 3840x2160, 1280x720, etc.
-    r"|\d{3,4}[pi]"                      # 720p, 1080p, 1080i, 2160p, 480p, 576p
-    r"|[xh]\.?26[45]"                    # x264, x265, h264, h265, x.264
-    r"|(?:5\.1|7\.1|2\.0)"               # audio channels (narrow: avoid matching versions like 1.0)
-    r"|4k|8k"                            # 4k, 8k
+    r"\d{3,4}x\d{3,4}"  # 1920x1080, 3840x2160, 1280x720, etc.
+    r"|\d{3,4}[pi]"  # 720p, 1080p, 1080i, 2160p, 480p, 576p
+    r"|[xh]\.?26[45]"  # x264, x265, h264, h265, x.264
+    r"|(?:5\.1|7\.1|2\.0)"  # audio channels (narrow: avoid matching versions like 1.0)
+    r"|4k|8k"  # 4k, 8k
     r")"
     r"(?:(?=[._\-\s\]\)/\\])|$)"
 )
 
 EP_RE = re.compile(
-    r"(?i)"
-    + _DELIM_START
-    + r"(?:"
+    r"(?i)" + _DELIM_START + r"(?:"
     r"[Ss](\d{1,2})[._\-\s]*[Ee][Pp]?(\d{1,3})"
     r"|(?<!\d)(\d{1,2})x(\d{1,2})(?!\d)"
     r"|(?:[Ee][Pp]?|[Ee]pisode)[._\-\s]*(\d{1,3})(?!\d)"
     r"|[Ss]eason[._\-\s]*(\d{1,2})[._\-\s]*[Ee]pisode[._\-\s]*(\d{1,3})"
-    r")"
-    + _DELIM_END
+    r")" + _DELIM_END
 )
 
 
@@ -174,8 +190,7 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
     # Operates on coerced (name, size) pairs so hostile entries can't crash
     # the suffix/parse path; Episode file_names stay client-identical for
     # well-formed inputs.
-    video = [(f, n, s) for f, n, s in normed
-             if Path(n).suffix.lower() not in NON_VIDEO_EXTENSIONS]
+    video = [(f, n, s) for f, n, s in normed if Path(n).suffix.lower() not in NON_VIDEO_EXTENSIONS]
     eval_trip = video if video else normed
 
     # Check for episode matches across evaluated files
@@ -213,8 +228,7 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
             # wiped with the folder, and the fuse gate parks forever.
             return Classification(
                 kind="episode",
-                episodes=[e for e in deduped_eps
-                          if (e.season, e.episode) == sole_key],
+                episodes=[e for e in deduped_eps if (e.season, e.episode) == sole_key],
                 single_file=main_ep.file_name,
                 total_bytes=total,
             )
@@ -228,14 +242,22 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
             if size > cfg.ssd.skip_movie_larger_than_bytes:
                 log.warning(
                     "movie '%s' (%d B) exceeds skip threshold (%d B)",
-                    name, size, cfg.ssd.skip_movie_larger_than_bytes,
+                    name,
+                    size,
+                    cfg.ssd.skip_movie_larger_than_bytes,
                 )
             return Classification(
-                kind="movie", episodes=[], single_file=name, total_bytes=total,
+                kind="movie",
+                episodes=[],
+                single_file=name,
+                total_bytes=total,
             )
         # Multi-file but no episode tag -> treat as movie bundle (default remote)
         return Classification(
-            kind="movie", episodes=[], single_file=None, total_bytes=total,
+            kind="movie",
+            episodes=[],
+            single_file=None,
+            total_bytes=total,
         )
 
     # Case 3: Multiple distinct episodes found (len(distinct_eps) >= 2) -> full season pack
@@ -244,7 +266,9 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
     # NOTE: use pre-dedup `eps` count — deduped count undercounts when 2 files
     # map to the same (season, episode) (e.g. mkv + mp4 per episode).
     if len(eps) >= max(1, int(-(-len(eval_trip) * 9 // 10))):
-        return Classification(kind="season", episodes=deduped_eps, single_file=None, total_bytes=total)
+        return Classification(
+            kind="season", episodes=deduped_eps, single_file=None, total_bytes=total
+        )
 
     # Mixed (rare): multiple episodes with lots of non-episode files
     return Classification(kind="mixed", episodes=deduped_eps, single_file=None, total_bytes=total)

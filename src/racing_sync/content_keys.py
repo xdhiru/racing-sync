@@ -51,8 +51,12 @@ def same_release_name(a_name: str, b_name: str) -> bool:
 
 
 def same_content(
-    a_name: str, a_size: int, b_name: str, b_size: int,
-    *, require_size: bool = False,
+    a_name: str,
+    a_size: int,
+    b_name: str,
+    b_size: int,
+    *,
+    require_size: bool = False,
 ) -> bool:
     """Watch/inflight rule: same normalized name AND same size when both known.
 

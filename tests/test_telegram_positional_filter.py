@@ -7,6 +7,7 @@ store list. With a DL filter and a MOVING row first in that raw list,
 `/act_1` (or `/cancel_1`) hit the MOVING torrent while the displayed
 #1 was the DOWNLOADING one.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -23,11 +24,18 @@ DOWNLOADING_HASH = "d" * 40
 
 def _store_rows():
     return [
-        TorrentState(source_infohash=MOVING_HASH, source_name="Moving.Show",
-                     state=State.MOVING, total_bytes=1000),
-        TorrentState(source_infohash=DOWNLOADING_HASH,
-                     source_name="Downloading.Show",
-                     state=State.DOWNLOADING, total_bytes=2000),
+        TorrentState(
+            source_infohash=MOVING_HASH,
+            source_name="Moving.Show",
+            state=State.MOVING,
+            total_bytes=1000,
+        ),
+        TorrentState(
+            source_infohash=DOWNLOADING_HASH,
+            source_name="Downloading.Show",
+            state=State.DOWNLOADING,
+            total_bytes=2000,
+        ),
     ]
 
 
@@ -85,8 +93,8 @@ async def test_now_positional_resolves_within_status_filter():
     bot = _bot()
     bot._live_notes_for = MagicMock(return_value={})
     bot._now_eligible_hashes = MagicMock(
-        side_effect=lambda members, notes: [
-            r.source_infohash for r in members])
+        side_effect=lambda members, notes: [r.source_infohash for r in members]
+    )
     bot._fetch_torrent = AsyncMock(return_value="Fetching original")
 
     bot._status_filter = "dl"

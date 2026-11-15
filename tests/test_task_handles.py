@@ -1,4 +1,5 @@
 """P2: TaskHandle cancel/registry, stop_workers_for via handles, statuses."""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,8 +13,7 @@ async def test_handle_cancel_task_lifecycle():
 
     task = asyncio.ensure_future(asyncio.sleep(60))
     try:
-        hd = TaskHandle(infohash="a" * 40, gid="a" * 12,
-                        kind="downloading", task=task)
+        hd = TaskHandle(infohash="a" * 40, gid="a" * 12, kind="downloading", task=task)
         assert hd.cancel() is True
         assert hd.cancelled is True
         assert hd.event.is_set()
@@ -42,8 +42,7 @@ async def test_handle_cancel_aborts_owned_tree():
     proc.wait = AsyncMock(return_value=0)
     try:
         rclone_ops._ACTIVE_MOVES["tk"] = proc
-        hd = TaskHandle(infohash="a" * 40, gid="a" * 12, kind="move",
-                        tree_key="tk")
+        hd = TaskHandle(infohash="a" * 40, gid="a" * 12, kind="move", tree_key="tk")
         assert hd.cancel() is True
         proc.terminate.assert_called_once()
     finally:
@@ -71,7 +70,10 @@ def test_abort_move_tree_edge_cases():
 def test_registry_register_and_unregister():
     from types import SimpleNamespace
     from racing_sync.task import (
-        TaskHandle, handles_for, register_handle, unregister_handle,
+        TaskHandle,
+        handles_for,
+        register_handle,
+        unregister_handle,
     )
 
     coord = SimpleNamespace()
@@ -101,8 +103,8 @@ async def test_stop_workers_for_cancels_via_handles():
 
     coord._process_torrent = AsyncMock(side_effect=_work)
     from racing_sync.state import State, TorrentState
-    ts = TorrentState(source_infohash="a" * 40, source_name="Show",
-                      state=State.DOWNLOADING)
+
+    ts = TorrentState(source_infohash="a" * 40, source_name="Show", state=State.DOWNLOADING)
     coord._spawn_worker(ts)
     await asyncio.sleep(0.05)
     hd = handles_for(coord, "a" * 40)[0]
@@ -119,33 +121,43 @@ def test_status_for_lanes():
     from unittest.mock import MagicMock
     from racing_sync.state import State, TorrentState
     from racing_sync.task_status import (
-        DownloadStatus, MoveStatus, QueueStatus, ReaddStatus,
-        status_counts, status_for,
+        DownloadStatus,
+        MoveStatus,
+        QueueStatus,
+        ReaddStatus,
+        status_counts,
+        status_for,
     )
 
     coord = MagicMock()
     coord.live_progress_map.return_value = {"a" * 40: 0.5}
     coord.live_speed_map.return_value = {"a" * 40: 1000}
     coord.rclone_move_progress_map.return_value = {}
-    dl = status_for(coord, TorrentState(
-        source_infohash="a" * 40, source_name="D", state=State.DOWNLOADING))
+    dl = status_for(
+        coord, TorrentState(source_infohash="a" * 40, source_name="D", state=State.DOWNLOADING)
+    )
     assert isinstance(dl, DownloadStatus)
     assert dl.progress == 0.5 and dl.speed_bps == 1000
-    mv = status_for(coord, TorrentState(
-        source_infohash="b" * 40, source_name="M", state=State.MOVING))
+    mv = status_for(
+        coord, TorrentState(source_infohash="b" * 40, source_name="M", state=State.MOVING)
+    )
     assert isinstance(mv, MoveStatus) and mv.progress is None
-    assert isinstance(status_for(coord, TorrentState(
-        source_infohash="c" * 40, source_name="R",
-        state=State.RE_ADDING)), ReaddStatus)
-    q = status_for(coord, TorrentState(
-        source_infohash="d" * 40, source_name="Q", state=State.QUEUED))
+    assert isinstance(
+        status_for(
+            coord, TorrentState(source_infohash="c" * 40, source_name="R", state=State.RE_ADDING)
+        ),
+        ReaddStatus,
+    )
+    q = status_for(
+        coord, TorrentState(source_infohash="d" * 40, source_name="Q", state=State.QUEUED)
+    )
     assert isinstance(q, QueueStatus) and q.label == "Queued"
     # Doubles never crash the projection.
     assert status_for(None, MagicMock()).label != ""
-    rows = [TorrentState(source_infohash="a" * 40, source_name="D",
-                         state=State.DOWNLOADING),
-            TorrentState(source_infohash="d" * 40, source_name="Q",
-                         state=State.QUEUED)]
+    rows = [
+        TorrentState(source_infohash="a" * 40, source_name="D", state=State.DOWNLOADING),
+        TorrentState(source_infohash="d" * 40, source_name="Q", state=State.QUEUED),
+    ]
     assert status_counts(coord, rows) == {"Downloading": 1, "Queued": 1}
 
 
@@ -156,10 +168,13 @@ def test_status_for_move_reads_rclone_map():
 
     prog = SimpleNamespace(percent=25.0, speed_bps=2000, eta_seconds=60)
     coord = SimpleNamespace(
-        live_progress_map=lambda: {}, live_speed_map=lambda: {},
-        rclone_move_progress_map=lambda: {"b" * 40: prog})
-    mv = status_for(coord, TorrentState(
-        source_infohash="b" * 40, source_name="M", state=State.MOVING))
+        live_progress_map=lambda: {},
+        live_speed_map=lambda: {},
+        rclone_move_progress_map=lambda: {"b" * 40: prog},
+    )
+    mv = status_for(
+        coord, TorrentState(source_infohash="b" * 40, source_name="M", state=State.MOVING)
+    )
     assert mv.progress == 0.25
     assert mv.speed_bps == 2000
     assert mv.eta_seconds == 60

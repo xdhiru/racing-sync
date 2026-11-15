@@ -1,4 +1,5 @@
 """H1: production loop lane heartbeats, /readyz freshness, /metrics lanes."""
+
 from __future__ import annotations
 
 import asyncio
@@ -18,12 +19,10 @@ def _lane_coord(tmp_path):
     """Bare real Coordinator + real config namespace (strict lane methods)."""
     coord = make_coordinator()
     cfg = SimpleNamespace(
-        api=APIConfig(enabled=True, api_token="secret",
-                      trust_nginx_header=False),
+        api=APIConfig(enabled=True, api_token="secret", trust_nginx_header=False),
         rclone=SimpleNamespace(fuse=SimpleNamespace(mount=str(tmp_path))),
         ssd=SimpleNamespace(path=str(tmp_path)),
-        general=SimpleNamespace(source_poll_interval=30,
-                                dest_poll_interval=30),
+        general=SimpleNamespace(source_poll_interval=30, dest_poll_interval=30),
     )
     coord.cfg = cfg
     coord.source_client = MagicMock()
@@ -48,13 +47,15 @@ def test_lane_health_map_replaces_non_dict_double():
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("loop_name,step_name,lane", [
-    ("_poller_loop", "_poll_source_step", "poller"),
-    ("_scheduler_loop", "_schedule_step", "scheduler"),
-    ("_janitor_loop", "_janitor_step", "janitor"),
-])
-async def test_loops_record_lane_success(anyio_backend, loop_name, step_name,
-                                         lane):
+@pytest.mark.parametrize(
+    "loop_name,step_name,lane",
+    [
+        ("_poller_loop", "_poll_source_step", "poller"),
+        ("_scheduler_loop", "_schedule_step", "scheduler"),
+        ("_janitor_loop", "_janitor_step", "janitor"),
+    ],
+)
+async def test_loops_record_lane_success(anyio_backend, loop_name, step_name, lane):
     coord = make_coordinator()
     coord._stop = False
     coord.cfg.general.source_poll_interval = 9999
@@ -97,12 +98,14 @@ async def test_poller_loop_records_failure(anyio_backend):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("loop_name,step_name,lane", [
-    ("_poller_loop", "_poll_source_step", "poller"),
-    ("_scheduler_loop", "_schedule_step", "scheduler"),
-])
-async def test_loop_cancel_is_not_a_failure(anyio_backend, loop_name,
-                                            step_name, lane):
+@pytest.mark.parametrize(
+    "loop_name,step_name,lane",
+    [
+        ("_poller_loop", "_poll_source_step", "poller"),
+        ("_scheduler_loop", "_schedule_step", "scheduler"),
+    ],
+)
+async def test_loop_cancel_is_not_a_failure(anyio_backend, loop_name, step_name, lane):
     coord = make_coordinator()
     coord._stop = False
     coord.cfg.general.source_poll_interval = 9999
@@ -126,8 +129,7 @@ def test_readyz_200_with_fresh_required_lanes(tmp_path):
     coord = _lane_coord(tmp_path)
     coord._started_at = time.monotonic() - 5.0
     for name in ("poller", "scheduler"):
-        coord._lane_note_success(
-            name, coord._lane_note_attempt(name) - 0.1)
+        coord._lane_note_success(name, coord._lane_note_attempt(name) - 0.1)
 
     resp = _readyz(coord)
     assert resp.status_code == 200
@@ -305,9 +307,7 @@ def test_metrics_exposes_lane_and_derived_tick_aliases(tmp_path):
     assert 'racing_sync_lane_consecutive_failures{lane="janitor"} 3' in body
     # Legacy aliases derive from lane health when _last_tick_* is unset.
     assert "racing_sync_tick_latency_seconds 2.500" in body
-    line = next(
-        ln for ln in body.splitlines()
-        if ln.startswith("racing_sync_tick_age_seconds "))
+    line = next(ln for ln in body.splitlines() if ln.startswith("racing_sync_tick_age_seconds "))
     assert 20.0 <= float(line.split()[1]) <= 30.0
     # A lane with no data emits nothing.
     assert 'lane="qb_listener"' not in body

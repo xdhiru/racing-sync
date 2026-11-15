@@ -78,8 +78,10 @@ def _ensure_base_url(host: str) -> str:
         # Credentials in the URL would flow into AuthError messages and
         # request logs via host interpolation — refuse (message deliberately
         # omits the host so the secret never lands in logs either).
-        raise ValueError("host must not embed credentials (user:pass@); "
-                         "use the username/password settings instead")
+        raise ValueError(
+            "host must not embed credentials (user:pass@); "
+            "use the username/password settings instead"
+        )
     return host.rstrip("/") + "/"
 
 
@@ -106,7 +108,11 @@ def _add_single_file_field(fd: aiohttp.FormData, field_name: str, file_spec: Any
             encoding = (
                 file_spec[3]
                 if isinstance(file_spec[3], str)
-                else (file_spec[3].get("Content-Transfer-Encoding") if isinstance(file_spec[3], dict) else None)
+                else (
+                    file_spec[3].get("Content-Transfer-Encoding")
+                    if isinstance(file_spec[3], dict)
+                    else None
+                )
             )
             fd.add_field(
                 field_name,
@@ -197,9 +203,6 @@ def _clone_formdata(fd: aiohttp.FormData) -> aiohttp.FormData:
     return out
 
 
-
-
-
 # Transient gateway / rate-limit statuses worth retrying.
 # NOTE: deliberately excludes 500 — qB returns 500 for application errors
 # (e.g. missing torrent) that must surface immediately, not be retried.
@@ -235,6 +238,7 @@ def _retry_after_delay(headers: Any, default: float) -> float:
     try:
         from email.utils import parsedate_to_datetime as _p2d
         import datetime as _dt
+
         _dtv = _p2d(str(retry_after).strip())
         if _dtv is not None:
             if _dtv.tzinfo is None:
@@ -245,6 +249,7 @@ def _retry_after_delay(headers: Any, default: float) -> float:
         pass
     return default
 
+
 # Deluge/JSON-RPC method prefixes that only read server state. Everything
 # runs over POST, so the HTTP method alone cannot tell reads from writes:
 # these prefixes keep their retries while mutating RPCs (core.add_*,
@@ -254,8 +259,7 @@ def _retry_after_delay(headers: Any, default: float) -> float:
 _READ_RPC_PREFIXES = ("core.get", "web.", "auth.", "system.")
 
 
-def _is_idempotent_request(method: object, path: object,
-                           json_body: object) -> bool:
+def _is_idempotent_request(method: object, path: object, json_body: object) -> bool:
     """True when blindly re-sending this request cannot double-apply it.
 
     A lost response does not prove the server didn't process the call, so
@@ -283,9 +287,9 @@ def _is_idempotent_request(method: object, path: object,
 
 class HTTPClientBase:
     """Wraps aiohttp with:
-      - persistent cookie jar
-      - optional nginx basic-auth bypass (POST creds, reuse session cookie)
-      - 401/403 retry with re-login
+    - persistent cookie jar
+    - optional nginx basic-auth bypass (POST creds, reuse session cookie)
+    - 401/403 retry with re-login
     """
 
     def __init__(self, cfg: HTTPClientConfig, label: str = "client"):
@@ -312,7 +316,12 @@ class HTTPClientBase:
         # other proxy that follows RFC 7617.
         if self._cfg.nginx_mode == "basic" and self._cfg.username:
             import base64
-            pw = self._cfg.password.get_secret_value() if hasattr(self._cfg.password, "get_secret_value") else str(self._cfg.password)
+
+            pw = (
+                self._cfg.password.get_secret_value()
+                if hasattr(self._cfg.password, "get_secret_value")
+                else str(self._cfg.password)
+            )
             creds = f"{self._cfg.username}:{pw}".encode()
             headers["Authorization"] = "Basic " + base64.b64encode(creds).decode()
         # Set Origin and Referer to satisfy WebUI CSRF protection (e.g. qBittorrent)
@@ -368,17 +377,16 @@ class HTTPClientBase:
                 return
             if self._cfg.nginx_mode == "form_post":
                 if not self._cfg.nginx_url:
-                    raise AuthError(
-                        f"[{self._label}] nginx_mode=form_post but no nginx_url"
-                    )
+                    raise AuthError(f"[{self._label}] nginx_mode=form_post but no nginx_url")
                 try:
-                    _parsed_nginx = urllib.parse.urlsplit(
-                        str(self._cfg.nginx_url).strip())
+                    _parsed_nginx = urllib.parse.urlsplit(str(self._cfg.nginx_url).strip())
                 except Exception:
                     _parsed_nginx = None
-                if (_parsed_nginx is None
-                        or _parsed_nginx.scheme not in ("http", "https")
-                        or not _parsed_nginx.hostname):
+                if (
+                    _parsed_nginx is None
+                    or _parsed_nginx.scheme not in ("http", "https")
+                    or not _parsed_nginx.hostname
+                ):
                     # Credentials ride this POST and redirects forward
                     # them, so a schemeless/hostless URL must fail here
                     # instead of leaking somewhere surprising.
@@ -386,20 +394,20 @@ class HTTPClientBase:
                         f"[{self._label}] nginx_url must be an http(s) URL "
                         f"with a host, got {self._cfg.nginx_url!r}"
                     )
-                log.debug(
-                    "[%s] nginx form POST %s", self._label, self._cfg.nginx_url
-                )
+                log.debug("[%s] nginx form POST %s", self._label, self._cfg.nginx_url)
                 form = dict(self._cfg.nginx_extra_fields)
                 form[self._cfg.nginx_user_field] = self._cfg.username
-                pw = self._cfg.password.get_secret_value() if hasattr(self._cfg.password, "get_secret_value") else str(self._cfg.password)
+                pw = (
+                    self._cfg.password.get_secret_value()
+                    if hasattr(self._cfg.password, "get_secret_value")
+                    else str(self._cfg.password)
+                )
                 form[self._cfg.nginx_pass_field] = pw
                 async with self.session.post(
                     self._cfg.nginx_url, data=form, allow_redirects=True
                 ) as r:
                     if r.status >= 400:
-                        raise AuthError(
-                            f"nginx auth failed for {self._label}: HTTP {r.status}"
-                        )
+                        raise AuthError(f"nginx auth failed for {self._label}: HTTP {r.status}")
                     # NOTE: do NOT check for bare `type="password"` here —
                     # the qBittorrent login page legitimately contains a
                     # password input even after successful nginx auth, which
@@ -455,12 +463,14 @@ class HTTPClientBase:
                         # otherwise surface as "exception never retrieved"
                         # on the loop (followers awaiting still raise it).
                         try:
+
                             def _consume(_f, _log=log):
                                 try:
                                     if not _f.cancelled():
                                         _f.exception()
                                 except Exception:
                                     pass
+
                             fut.add_done_callback(_consume)
                         except Exception:
                             pass
@@ -506,17 +516,20 @@ class HTTPClientBase:
                 except AuthError as e:
                     log.warning(
                         "[%s] re-auth attempt %d/3 refused (%s)",
-                        self._label, attempt + 1, e,
+                        self._label,
+                        attempt + 1,
+                        e,
                     )
-                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    await asyncio.sleep(0.5 * (2**attempt))
                     continue
-                except (aiohttp.ClientError, asyncio.TimeoutError,
-                        OSError) as e:
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
                     log.warning(
                         "[%s] re-auth attempt %d/3 hit transient error (%s)",
-                        self._label, attempt + 1, e,
+                        self._label,
+                        attempt + 1,
+                        e,
                     )
-                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    await asyncio.sleep(0.5 * (2**attempt))
                     continue
                 except RuntimeError as e:
                     # Programming/test state (session never started):
@@ -524,7 +537,8 @@ class HTTPClientBase:
                     # burning 3.5s of backoff then failing anyway.
                     log.warning(
                         "[%s] re-auth misconfigured (%s); not retrying",
-                        self._label, e,
+                        self._label,
+                        e,
                     )
                     if not fut.done():
                         fut.set_exception(AuthError(str(e)))
@@ -536,8 +550,7 @@ class HTTPClientBase:
                     fut.set_result(True)
                 return True
             if not fut.done():
-                fut.set_exception(AuthError(
-                    f"[{self._label}] re-auth failed after 3 attempts"))
+                fut.set_exception(AuthError(f"[{self._label}] re-auth failed after 3 attempts"))
             return False
         except asyncio.CancelledError:
             if not fut.done():
@@ -549,8 +562,7 @@ class HTTPClientBase:
         except Exception as e:  # noqa: BLE001
             if not fut.done():
                 try:
-                    fut.set_exception(
-                        e if isinstance(e, AuthError) else AuthError(str(e)))
+                    fut.set_exception(e if isinstance(e, AuthError) else AuthError(str(e)))
                 except Exception:
                     pass
             return False
@@ -584,9 +596,7 @@ class HTTPClientBase:
             except AuthError as e:
                 raise e
             if not _ok:
-                raise AuthError(
-                    f"[{self._label}] initial authentication failed for {path}"
-                )
+                raise AuthError(f"[{self._label}] initial authentication failed for {path}")
 
         def _get_request_data() -> Any:
             if files is not None:
@@ -615,8 +625,8 @@ class HTTPClientBase:
         # Only pass an explicit timeout when set: timeout=None would
         # replace the session default instead of keeping it.
         _timeout_kw: dict[str, Any] = (
-            {"timeout": aiohttp.ClientTimeout(total=_timeout)}
-            if _timeout is not None else {})
+            {"timeout": aiohttp.ClientTimeout(total=_timeout)} if _timeout is not None else {}
+        )
 
         async def _do() -> aiohttp.ClientResponse:
             for attempt in range(3 if idempotent else 1):
@@ -642,7 +652,11 @@ class HTTPClientBase:
                     _wait = _backoff_delay(attempt)
                     log.warning(
                         "[%s] %s %s network error (%s); retrying in %.1fs",
-                        self._label, method, path, e, _wait,
+                        self._label,
+                        method,
+                        path,
+                        e,
+                        _wait,
                     )
                     await asyncio.sleep(_wait)
             raise RuntimeError("unreachable")
@@ -654,11 +668,15 @@ class HTTPClientBase:
         for attempt in range(3 if idempotent else 0):
             if r.status not in self._transient_statuses:
                 break
-            delay = _retry_after_delay(
-                r.headers, _backoff_delay(attempt))
+            delay = _retry_after_delay(r.headers, _backoff_delay(attempt))
             log.warning(
                 "[%s] %s %s -> HTTP %d; retrying in %.1fs (attempt %d/3)",
-                self._label, method, path, r.status, delay, attempt + 1,
+                self._label,
+                method,
+                path,
+                r.status,
+                delay,
+                attempt + 1,
             )
             try:
                 await r.read()
@@ -670,7 +688,10 @@ class HTTPClientBase:
         if r.status in (401, 403) and retry_auth:
             log.warning(
                 "[%s] %s %s -> %d; re-authenticating",
-                self._label, method, path, r.status,
+                self._label,
+                method,
+                path,
+                r.status,
             )
             try:
                 await r.read()
@@ -686,13 +707,11 @@ class HTTPClientBase:
                     _ok = await self._login_singleflight(force=True)
                 except AuthError as e:
                     last_exc = e
-                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    await asyncio.sleep(0.5 * (2**attempt))
                     continue
                 if not _ok:
-                    last_exc = AuthError(
-                        f"[{self._label}] re-auth failed for {path}"
-                    )
-                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    last_exc = AuthError(f"[{self._label}] re-auth failed for {path}")
+                    await asyncio.sleep(0.5 * (2**attempt))
                     continue
                 r2 = await _do()
                 if r2.status == 401:
@@ -703,10 +722,8 @@ class HTTPClientBase:
                     # Session rotated again under us: invalidate so the
                     # next round really re-logs in, then retry once more.
                     self._authed = False
-                    last_exc = AuthError(
-                        f"[{self._label}] auth failed: HTTP 401 on {path}"
-                    )
-                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    last_exc = AuthError(f"[{self._label}] auth failed: HTTP 401 on {path}")
+                    await asyncio.sleep(0.5 * (2**attempt))
                     continue
                 elif r2.status == 403:
                     # 403 after successful login indicates permission/CSRF denial,
@@ -727,11 +744,15 @@ class HTTPClientBase:
         for attempt in range(3 if idempotent else 0):
             if r.status not in self._transient_statuses:
                 break
-            delay = _retry_after_delay(
-                r.headers, _backoff_delay(attempt))
+            delay = _retry_after_delay(r.headers, _backoff_delay(attempt))
             log.warning(
                 "[%s] %s %s -> HTTP %d after re-auth; retrying in %.1fs (attempt %d/3)",
-                self._label, method, path, r.status, delay, attempt + 1,
+                self._label,
+                method,
+                path,
+                r.status,
+                delay,
+                attempt + 1,
             )
             try:
                 await r.read()
@@ -791,8 +812,6 @@ async def get_bytes_async(client: HTTPClientBase, path: str, **params: Any) -> b
         async for chunk in r.content.iter_chunked(64 * 1024):
             total += len(chunk)
             if total > MAX_TORRENT_BYTES:
-                raise ValueError(
-                    f"GET {path} exceeds {MAX_TORRENT_BYTES} bytes"
-                )
+                raise ValueError(f"GET {path} exceeds {MAX_TORRENT_BYTES} bytes")
             chunks.append(chunk)
         return b"".join(chunks)

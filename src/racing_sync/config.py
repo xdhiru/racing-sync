@@ -159,9 +159,7 @@ class DelugeSFTPConfig(BaseModel):
             else str(self.ssh_password).strip()
         )
         if self.enabled and not self.ssh_key_path and not has_pwd:
-            raise ValueError(
-                "Deluge SFTP requires ssh_password or ssh_key_path when enabled"
-            )
+            raise ValueError("Deluge SFTP requires ssh_password or ssh_key_path when enabled")
         return self
 
 
@@ -208,9 +206,7 @@ class SourceConfig(BaseModel):
 
     @model_validator(mode="after")
     def _deluge_needs_sftp(self) -> "SourceConfig":
-        if self.type == "deluge" and (
-            self.deluge_sftp is None or not self.deluge_sftp.enabled
-        ):
+        if self.type == "deluge" and (self.deluge_sftp is None or not self.deluge_sftp.enabled):
             raise ValueError("Deluge source requires [source.deluge_sftp] enabled")
         return self
 
@@ -219,20 +215,18 @@ class SourceConfig(BaseModel):
         """Fail fast on unusable WebUI origins (not at first RPC)."""
         host = (self.host or "").strip()
         if not host.startswith(("http://", "https://")):
-            raise ValueError(
-                "source.host must start with http(s):// "
-                f"(got: {host!r})"
-            )
+            raise ValueError(f"source.host must start with http(s):// (got: {host!r})")
         try:
             from urllib.parse import urlsplit as _us
+
             _p = _us(host)
             if _p.username or _p.password:
                 raise ValueError(
                     "source.host must not embed userinfo "
-                    "(creds would leak to logs — use username/password)")
+                    "(creds would leak to logs — use username/password)"
+                )
             if _p.query or _p.fragment:
-                raise ValueError(
-                    "source.host must be a bare origin (no query/fragment)")
+                raise ValueError("source.host must be a bare origin (no query/fragment)")
             if not _p.hostname:
                 raise ValueError("source.host must include a host")
         except ValueError:
@@ -241,19 +235,19 @@ class SourceConfig(BaseModel):
             raise ValueError(f"source.host is not a valid URL: {e}")
         for label, secret in (
             ("username", self.username),
-            ("password", self.password.get_secret_value()
-             if isinstance(self.password, SecretStr) else str(self.password or "")),
+            (
+                "password",
+                self.password.get_secret_value()
+                if isinstance(self.password, SecretStr)
+                else str(self.password or ""),
+            ),
         ):
             try:
                 text = str(secret or "").strip()
             except Exception:
                 continue
-            if text and text.upper() in (
-                    "CHANGE_ME", "YOUR_USERNAME", "YOUR_PASSWORD"):
-                raise ValueError(
-                    f"source.{label} looks like an unedited placeholder "
-                    f"({text!r})"
-                )
+            if text and text.upper() in ("CHANGE_ME", "YOUR_USERNAME", "YOUR_PASSWORD"):
+                raise ValueError(f"source.{label} looks like an unedited placeholder ({text!r})")
         return self
 
 
@@ -291,26 +285,20 @@ class RemoteConfig(BaseModel):
         v = v.strip()
         m = re.match(r"^([A-Za-z0-9_\-]+):(.*)$", v)
         if not m:
-            raise ValueError(
-                f"rclone remote path must be of form 'name:path', got: {v!r}"
-            )
+            raise ValueError(f"rclone remote path must be of form 'name:path', got: {v!r}")
         name, path = m.group(1), m.group(2)
         # Reject Windows drive letters (C:/, C:\) mistaken for remotes — and
         # drive-relative paths (C:foo), which rclone would treat as local
         # paths and misdirect moves.
         if len(name) == 1 and path.startswith(("/", "\\")):
-            raise ValueError(
-                f"rclone remote path looks like a Windows drive, got: {v!r}"
-            )
+            raise ValueError(f"rclone remote path looks like a Windows drive, got: {v!r}")
         if len(name) == 1 and not path.startswith("/"):
             raise ValueError(
                 f"single-character rclone remote names are ambiguous with "
                 f"Windows drive letters; rename the remote (got: {v!r})"
             )
         if not path or path.strip() in ("", "/"):
-            raise ValueError(
-                f"rclone remote path must include a path after 'name:', got: {v!r}"
-            )
+            raise ValueError(f"rclone remote path must include a path after 'name:', got: {v!r}")
         # NOTE: a leading '/' after the colon (`remote:/media/`) is valid
         # rclone addressing the remote root — only `..` escapes are refused.
         if ".." in [seg for seg in path.replace("\\", "/").split("/")]:
@@ -331,11 +319,13 @@ class RemoteConfig(BaseModel):
         remote (`remote:qb/` + `remote:qb/unsorted/`) are the documented
         layout and stay allowed.
         """
+
         def _parts(v: str) -> tuple[str, str]:
             m = re.match(r"^([A-Za-z0-9_\-]+):(.*)$", (v or "").strip())
             if not m:
                 return "", ""
             return m.group(1), m.group(2).rstrip("/")
+
         d_name, d_path = _parts(self.default)
         u_name, u_path = _parts(self.unsorted)
         if d_name and d_name == u_name and d_path == u_path:
@@ -378,17 +368,14 @@ def _redos_probe(pattern: str) -> None:
         "S01E01" * 150 + "!",
         "a" * 150 + "b" * 150 + "!",
     )
-    _prog = (
-        "import re, sys;"
-        "rx = re.compile(sys.argv[1]);"
-        "[rx.search(x) for x in sys.argv[2:]]"
-    )
+    _prog = "import re, sys;rx = re.compile(sys.argv[1]);[rx.search(x) for x in sys.argv[2:]]"
     try:
         import subprocess as _sp
         import sys as _sys
 
-        _res = _sp.run([_sys.executable, "-c", _prog, pattern, *_evil_inputs],
-                       timeout=5.0, capture_output=True)
+        _res = _sp.run(
+            [_sys.executable, "-c", _prog, pattern, *_evil_inputs], timeout=5.0, capture_output=True
+        )
         if _res.returncode != 0:
             raise ValueError(
                 "episode_regex probe errored in the worker "
@@ -410,21 +397,46 @@ def _redos_probe(pattern: str) -> None:
 #: Exact-match rclone flags that hijack config/credentials/filters.
 #: Shared with rclone_ops._reject_hijack_flags (runtime defense in depth)
 #: so the two gates cannot drift.
-_RCLONE_HIJACK_EXACT = frozenset({
-    "config", "password-command", "ask-password",
-    "config-file", "c",
-    "log-file", "log-file-max-size", "syslog", "syslog-facility",
-    "password",
-    "s3-access-key-id", "s3-secret-access-key", "s3-session-token",
-    "drive-client-id", "drive-client-secret", "drive-token",
-    "gcs-client-id", "gcs-client-secret", "gcs-token",
-    "b2-account", "b2-key",
-    "dropbox-client-id", "dropbox-client-secret", "dropbox-token",
-    "onedrive-client-id", "onedrive-client-secret", "onedrive-token",
-    "box-client-id", "box-client-secret", "box-token",
-    "files-from", "files-from-raw", "files-from-encoding",
-    "filter-from", "exclude-file", "include-file",
-})
+_RCLONE_HIJACK_EXACT = frozenset(
+    {
+        "config",
+        "password-command",
+        "ask-password",
+        "config-file",
+        "c",
+        "log-file",
+        "log-file-max-size",
+        "syslog",
+        "syslog-facility",
+        "password",
+        "s3-access-key-id",
+        "s3-secret-access-key",
+        "s3-session-token",
+        "drive-client-id",
+        "drive-client-secret",
+        "drive-token",
+        "gcs-client-id",
+        "gcs-client-secret",
+        "gcs-token",
+        "b2-account",
+        "b2-key",
+        "dropbox-client-id",
+        "dropbox-client-secret",
+        "dropbox-token",
+        "onedrive-client-id",
+        "onedrive-client-secret",
+        "onedrive-token",
+        "box-client-id",
+        "box-client-secret",
+        "box-token",
+        "files-from",
+        "files-from-raw",
+        "files-from-encoding",
+        "filter-from",
+        "exclude-file",
+        "include-file",
+    }
+)
 
 
 def _is_rclone_hijack_flag(item: object) -> bool:
@@ -446,8 +458,7 @@ def _is_rclone_hijack_flag(item: object) -> bool:
         return True
     if norm == "rc" or norm.startswith("rc-"):
         return True
-    if (norm.endswith("-token") or norm.endswith("-client-id")
-            or norm.endswith("-client-secret")):
+    if norm.endswith("-token") or norm.endswith("-client-id") or norm.endswith("-client-secret"):
         return True
     return False
 
@@ -571,6 +582,7 @@ class TelegramConfig(BaseModel):
     App logging goes to local files only — there is no log forwarding
     to Telegram.
     """
+
     enabled: bool = False
     bot_token: SecretStr = SecretStr("")
     chat_id: str = ""
@@ -604,15 +616,20 @@ class TelegramConfig(BaseModel):
     # (admin in groups); without them the bot warns and the operator
     # removes the file by hand. False keeps the file message in place.
     delete_processed_torrent: bool = True
+
     @model_validator(mode="after")
     def _validate(self) -> "TelegramConfig":
         if self.enabled:
             token = self.bot_token.get_secret_value().strip()
             if not token or token.upper() in ("CHANGE_ME", "YOUR_BOT_TOKEN"):
-                raise ValueError("telegram.bot_token is required and cannot be a placeholder when enabled")
+                raise ValueError(
+                    "telegram.bot_token is required and cannot be a placeholder when enabled"
+                )
             chat = self.chat_id.strip()
             if not chat or chat.upper() in ("CHANGE_ME", "YOUR_CHAT_ID"):
-                raise ValueError("telegram.chat_id is required and cannot be a placeholder when enabled")
+                raise ValueError(
+                    "telegram.chat_id is required and cannot be a placeholder when enabled"
+                )
         # Fail at startup, not at first tap: a bad allowlist entry makes
         # _tg_actor_allowed fail closed for everyone (int() raises), so
         # validate here. Telegram user ids are positive; duplicates are
@@ -631,11 +648,14 @@ class TelegramConfig(BaseModel):
                 _product = 0
             if _product > 100:
                 import logging as _logging
+
                 _logging.getLogger(__name__).warning(
                     "telegram: outbound_rate (%d) × status_update_interval (%ds) = %d "
                     "edits per pinned-message cycle — expect Telegram 429 "
                     "flood-control; lower the rate or lengthen the interval",
-                    self.outbound_rate, self.status_update_interval, _product,
+                    self.outbound_rate,
+                    self.status_update_interval,
+                    _product,
                 )
             try:
                 _repost = int(self.active_repost_interval_seconds or 0)
@@ -643,6 +663,7 @@ class TelegramConfig(BaseModel):
                 _repost = 0
             if 1 <= _repost <= 4:
                 import logging as _logging
+
                 _logging.getLogger(__name__).warning(
                     "telegram: active_repost_interval_seconds=%d is clamped to 5 "
                     "at runtime to respect rate limits; set 0 (off) or >= 5",
@@ -655,9 +676,7 @@ class LoggingSinkConfig(BaseModel):
     enabled: bool = False
     url: str = ""
     auth_token: SecretStr = SecretStr("")
-    forward_min_level: Literal[
-        "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
-    ] = "INFO"
+    forward_min_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     # Plaintext http:// to a non-local host ships log bodies unencrypted:
     # fail closed unless the operator explicitly opts in.
     allow_plaintext: bool = False
@@ -671,9 +690,11 @@ class LoggingSinkConfig(BaseModel):
                 from urllib.parse import urlsplit as _split
 
                 parts = _split(self.url.strip())
-                if (parts.scheme == "http"
-                        and parts.hostname not in ("localhost", "127.0.0.1", "::1")
-                        and not self.allow_plaintext):
+                if (
+                    parts.scheme == "http"
+                    and parts.hostname not in ("localhost", "127.0.0.1", "::1")
+                    and not self.allow_plaintext
+                ):
                     raise ValueError(
                         "logging_sink.url is plaintext http:// to a non-local host: "
                         "log bodies would ship unencrypted — use https:// or set "
@@ -742,18 +763,23 @@ class ProwlarrTrackerMap(BaseModel):
     @classmethod
     def _flatten(cls, data: object) -> object:
         """Accept either:
-          - a flat dict:        {"alpha.cc": "Alpha (API)"}
-          - the existing shape: {"entries": {...}}
+        - a flat dict:        {"alpha.cc": "Alpha (API)"}
+        - the existing shape: {"entries": {...}}
         """
         if isinstance(data, dict):
             # Detect the OLD schema (which had `_substr` / `_index`
             # fields or a nested `overrides` table) and fail loudly so
             # users get a clear migration error instead of silently
             # broken cross-seed matching.
-            for forbidden in ("overrides", "beta_substr",
-                              "beta_index", "alpha_substr",
-                              "alpha_index", "gamma_substr",
-                              "gamma_index"):
+            for forbidden in (
+                "overrides",
+                "beta_substr",
+                "beta_index",
+                "alpha_substr",
+                "alpha_index",
+                "gamma_substr",
+                "gamma_index",
+            ):
                 if forbidden in data:
                     raise ValueError(
                         f"[prowlarr.tracker_map] uses the old schema. "
@@ -836,7 +862,7 @@ class ProwlarrConfig(BaseModel):
     """req #5 + #6: Prowlarr integration."""
 
     enabled: bool = False
-    base_url: str = ""       # e.g. http://127.0.0.1:9696
+    base_url: str = ""  # e.g. http://127.0.0.1:9696
     api_key: SecretStr = SecretStr("")
     # req #6: ordered SSD download-target indexers used for SSD downloads +
     # cross-seed searches (first entry = highest priority; each is tried in
@@ -917,24 +943,29 @@ class ProwlarrConfig(BaseModel):
                 raise ValueError("prowlarr.base_url must start with http(s)://")
             try:
                 from urllib.parse import urlsplit as _us
+
                 _p = _us(self.base_url)
                 if _p.username or _p.password:
                     raise ValueError(
-                        "prowlarr.base_url must not embed userinfo "
-                        "(creds would leak to logs)")
+                        "prowlarr.base_url must not embed userinfo (creds would leak to logs)"
+                    )
                 if _p.query or _p.fragment:
-                    raise ValueError(
-                        "prowlarr.base_url must be a bare origin "
-                        "(no query/fragment)")
+                    raise ValueError("prowlarr.base_url must be a bare origin (no query/fragment)")
                 if not _p.hostname:
                     raise ValueError("prowlarr.base_url must include a host")
             except ValueError:
                 raise
             except Exception as e:
                 raise ValueError(f"prowlarr.base_url is not a valid URL: {e}")
-            key = self.api_key.get_secret_value().strip() if isinstance(self.api_key, SecretStr) else str(self.api_key).strip()
+            key = (
+                self.api_key.get_secret_value().strip()
+                if isinstance(self.api_key, SecretStr)
+                else str(self.api_key).strip()
+            )
             if not key or key.upper() in ("CHANGE_ME", "YOUR_PROWLARR_API_KEY"):
-                raise ValueError("prowlarr.api_key required and cannot be a placeholder when enabled")
+                raise ValueError(
+                    "prowlarr.api_key required and cannot be a placeholder when enabled"
+                )
             if not entries:
                 raise ValueError(
                     "prowlarr enabled but no download-target indexer is configured. "
@@ -944,6 +975,7 @@ class ProwlarrConfig(BaseModel):
                 )
             if not any(e.announce_substrings for e in entries):
                 import logging as _logging
+
                 _logging.getLogger(__name__).warning(
                     "prowlarr enabled but no download indexer has "
                     "announce_substrings — is_download_indexer() will always "
@@ -971,7 +1003,7 @@ class CrossSeedConfig(BaseModel):
     # the *indexers* queried are whatever the user configured under
     # [[prowlarr.download_indexers]], tried in priority order.
     prowlarr_retry_interval_seconds: int = Field(default=1800, ge=60)  # 30 min
-    prowlarr_max_age_seconds: int = Field(default=86400, ge=3600)       # 24 h
+    prowlarr_max_age_seconds: int = Field(default=86400, ge=3600)  # 24 h
     # VPS1 public-torrent export retry cadence: a public racing torrent
     # whose .torrent can't be exported (transient SFTP/export glitch)
     # retries on its own schedule with NO max-age clock — the source
@@ -1048,7 +1080,9 @@ class CrossSeedConfig(BaseModel):
                 "requires allow_ssh_export=true (the fallback fetches the "
                 "racing torrent's own bytes via SFTP / export endpoint)."
             )
-        if int(self.prowlarr_retry_interval_seconds or 0) >= int(self.prowlarr_max_age_seconds or 0):
+        if int(self.prowlarr_retry_interval_seconds or 0) >= int(
+            self.prowlarr_max_age_seconds or 0
+        ):
             raise ValueError(
                 "cross_seed: prowlarr_retry_interval_seconds "
                 f"({self.prowlarr_retry_interval_seconds}) must be less than "
@@ -1087,7 +1121,6 @@ class RecoveryConfig(BaseModel):
     max_failed_retries: int = Field(default=3, ge=0, le=100)
 
 
-
 class CleanupConfig(BaseModel):
     """VPS1 racing-client cleanup: reclaim disk after VPS2 owns the content.
 
@@ -1120,7 +1153,7 @@ class CleanupConfig(BaseModel):
     max_grace_hours: float = Field(default=72.0, ge=0)
     # Free-space watermarks on VPS1 (bytes). At/below low -> min grace and
     # biggest-first ordering; at/above high -> max grace, oldest-first.
-    low_watermark_free_bytes: int = Field(default=16106127360, ge=0)   # 15 GiB
+    low_watermark_free_bytes: int = Field(default=16106127360, ge=0)  # 15 GiB
     high_watermark_free_bytes: int = Field(default=42949672960, ge=0)  # 40 GiB
     # Below this, log loudly; grace stays floored at min (never zero).
     critical_watermark_free_bytes: int = Field(default=8589934592, ge=0)  # 8 GiB
@@ -1177,9 +1210,7 @@ class CleanupConfig(BaseModel):
                 "cleanup: critical_watermark_free_bytes must be <= low_watermark_free_bytes"
             )
         if self.burst_arrivals_per_hour <= self.calm_arrivals_per_hour:
-            raise ValueError(
-                "cleanup: burst_arrivals_per_hour must be > calm_arrivals_per_hour"
-            )
+            raise ValueError("cleanup: burst_arrivals_per_hour must be > calm_arrivals_per_hour")
         return self
 
 
@@ -1194,6 +1225,7 @@ class APIConfig(BaseModel):
         proxy_set_header X-Authenticated-User $remote_user;
     Otherwise, an untrusted client can spoof the header and bypass authentication.
     """
+
     enabled: bool = False
     host: str = "127.0.0.1"
     port: int = Field(default=8765, ge=1, le=65535)
@@ -1219,7 +1251,8 @@ class APIConfig(BaseModel):
                     "api.api_token is required when api is enabled and trust_nginx_header is False"
                 )
             if token and token.upper() in (
-                "CHANGE_ME", "YOUR_API_TOKEN",
+                "CHANGE_ME",
+                "YOUR_API_TOKEN",
                 # The literal shipped in config.example.toml: public to
                 # everyone who reads the repo, so never a real credential.
                 "GENERATE_A_RANDOM_TOKEN_HERE",
@@ -1244,7 +1277,8 @@ class APIConfig(BaseModel):
                     if not text:
                         raise ValueError(
                             "api.trusted_proxies has a blank entry "
-                            "(blank matches nothing; remove it)")
+                            "(blank matches nothing; remove it)"
+                        )
                     if text.lower() == "localhost":
                         continue
                     try:
@@ -1257,11 +1291,13 @@ class APIConfig(BaseModel):
                     except ValueError:
                         raise ValueError(
                             f"api.trusted_proxies entry {entry!r} is not an "
-                            f"IP, CIDR range, or 'localhost'")
+                            f"IP, CIDR range, or 'localhost'"
+                        )
                     if net.prefixlen == 0:
                         raise ValueError(
                             f"api.trusted_proxies entry {entry!r} trusts the "
-                            f"whole internet (prefix /0) — refusing")
+                            f"whole internet (prefix /0) — refusing"
+                        )
         return self
 
 
@@ -1338,14 +1374,17 @@ class AppConfig(BaseModel):
         # (and noisy) there.
         try:
             import os as _os
+
             if _os.name == "posix":
                 _mode = _os.stat(path).st_mode & 0o077
                 if _mode:
                     import logging as _logging
+
                     _logging.getLogger(__name__).warning(
                         "config file %s is readable by group/other (mode %o); "
                         "consider chmod 600 — it holds secrets",
-                        path, _os.stat(path).st_mode & 0o777,
+                        path,
+                        _os.stat(path).st_mode & 0o777,
                     )
         except Exception:
             pass
@@ -1394,11 +1433,14 @@ class AppConfig(BaseModel):
         """
         try:
             import logging as _logging
+
             _log = _logging.getLogger(__name__)
             try:
                 _rpc = int(self.general.client_rpc_timeout_seconds or 0)
-                _poll = min(int(self.general.source_poll_interval or 0),
-                            int(self.general.dest_poll_interval or 0))
+                _poll = min(
+                    int(self.general.source_poll_interval or 0),
+                    int(self.general.dest_poll_interval or 0),
+                )
             except (TypeError, ValueError):
                 _rpc, _poll = 0, 0
             if _rpc and _poll and _rpc > _poll:
@@ -1406,7 +1448,8 @@ class AppConfig(BaseModel):
                     "config: [general].client_rpc_timeout_seconds (%d) exceeds "
                     "the poll interval (%ds) — a hung RPC outlives its tick; "
                     "lower the timeout or raise the poll interval",
-                    _rpc, _poll,
+                    _rpc,
+                    _poll,
                 )
             try:
                 if self.general.max_active_downloads is not None:
@@ -1442,9 +1485,11 @@ class AppConfig(BaseModel):
         resolve (symlinks, `..`, case) before comparison so an SSD
         symlinked into a fuse mount cannot slip past string matching.
         """
+
         def _norm(p: object) -> str:
             try:
                 import os as _os
+
                 resolved = str(Path(str(p or "")).resolve())
                 if _os.name == "nt":
                     return resolved.lower()
@@ -1461,14 +1506,12 @@ class AppConfig(BaseModel):
         except Exception:
             return self
         try:
-            fuse = [_norm(self.rclone.fuse.mount),
-                    _norm(self.rclone.fuse.mount_unsorted)]
+            fuse = [_norm(self.rclone.fuse.mount), _norm(self.rclone.fuse.mount_unsorted)]
         except Exception:
             return self
         for s in ssd_dirs:
             for fm in fuse:
-                if s and fm and (s == fm or s.startswith(fm + "/")
-                                 or fm.startswith(s + "/")):
+                if s and fm and (s == fm or s.startswith(fm + "/") or fm.startswith(s + "/")):
                     raise ValueError(
                         f"storage overlap: SSD path {s!r} overlaps fuse mount "
                         f"{fm!r} — use disjoint paths ([ssd].path/[dest].save_path "
@@ -1501,7 +1544,8 @@ def _warn_unknown_keys(model: type[BaseModel], data: object, prefix: str = "") -
             if key not in fields:
                 _logging.getLogger(__name__).warning(
                     "config: unknown key %r%s — ignored (possible typo)",
-                    key, f" in [{prefix}]" if prefix else "",
+                    key,
+                    f" in [{prefix}]" if prefix else "",
                 )
                 continue
             try:

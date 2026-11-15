@@ -1,4 +1,5 @@
 """Telegram resilience: uncertain sends don't duplicate; terminal cards heal."""
+
 from __future__ import annotations
 
 import asyncio
@@ -16,8 +17,7 @@ from racing_sync.telegram_refresh import _ACTIVE_PROBE_EVERY
 
 def _bot(**kw):
     bot = object.__new__(TelegramBot)
-    bot._cfg = SimpleNamespace(chat_id="1", page_size=5,
-                               status_update_interval=15)
+    bot._cfg = SimpleNamespace(chat_id="1", page_size=5, status_update_interval=15)
     bot._callback_times = {}
     bot._current_page = 0
     bot._active_msg_id = None
@@ -29,8 +29,7 @@ def _bot(**kw):
     bot._coord = MagicMock()
     bot._coord.live_progress_map = MagicMock(return_value={})
     bot._bot = MagicMock()
-    bot._bot.send_message = AsyncMock(
-        return_value=SimpleNamespace(message_id=7))
+    bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=7))
     bot._bot.edit_message_text = AsyncMock()
     bot._bot.delete_message = AsyncMock()
     for k, v in kw.items():
@@ -92,11 +91,10 @@ async def test_active_send_timeout_records_uncertain_then_skips(tmp_path):
         await bot._refresh_active_message_inner()
         assert bot._bot.send_message.await_count == 2
         # Changed text (new row appears): send proceeds.
-        store.upsert(TorrentState(
-            source_infohash="n" * 40, source_name="New Show",
-            state=State.NEW))
-        bot._bot.send_message = AsyncMock(
-            return_value=SimpleNamespace(message_id=9))
+        store.upsert(
+            TorrentState(source_infohash="n" * 40, source_name="New Show", state=State.NEW)
+        )
+        bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=9))
         await bot._refresh_active_message_inner()
         assert bot._bot.send_message.await_count == 1
         assert bot._active_msg_id == 9
@@ -110,14 +108,11 @@ async def test_done_card_timeout_records_terminal_retry(tmp_path):
     store = StateStore(tmp_path / "state.db")
     try:
         h = "d" * 40
-        store.upsert(TorrentState(
-            source_infohash=h, source_name="Done Show",
-            state=State.DONE))
+        store.upsert(TorrentState(source_infohash=h, source_name="Done Show", state=State.DONE))
         store.set_telegram_message_id(h, 99)
         bot = _bot()
         bot._store = store
-        bot._bot.edit_message_text = AsyncMock(
-            side_effect=TimedOut("slow route"))
+        bot._bot.edit_message_text = AsyncMock(side_effect=TimedOut("slow route"))
         bot._mark_detail_sent(h, "moving")  # card shows pre-DONE state
 
         await bot._send_one_detail(h, None)
@@ -134,9 +129,7 @@ async def test_terminal_net_requeues_until_card_lands(tmp_path):
     store = StateStore(tmp_path / "state.db")
     try:
         h = "d" * 40
-        store.upsert(TorrentState(
-            source_infohash=h, source_name="Done Show",
-            state=State.DONE))
+        store.upsert(TorrentState(source_infohash=h, source_name="Done Show", state=State.DONE))
         store.set_telegram_message_id(h, 99)
         bot = _bot()
         bot._store = store
@@ -164,14 +157,13 @@ async def test_transient_streak_caps_immediate_requeue(tmp_path):
     store = StateStore(tmp_path / "state.db")
     try:
         h = "d" * 40
-        store.upsert(TorrentState(
-            source_infohash=h, source_name="Flaky Show",
-            state=State.DOWNLOADING))
+        store.upsert(
+            TorrentState(source_infohash=h, source_name="Flaky Show", state=State.DOWNLOADING)
+        )
         store.set_telegram_message_id(h, 99)
         bot = _bot()
         bot._store = store
-        bot._bot.edit_message_text = AsyncMock(
-            side_effect=TimedOut("dead route"))
+        bot._bot.edit_message_text = AsyncMock(side_effect=TimedOut("dead route"))
 
         for _ in range(8):
             await bot._send_one_detail(h, None)
@@ -208,10 +200,9 @@ async def test_repost_delete_flood_keeps_old_without_send(tmp_path):
         bot = _repost_bot(_active_msg_id=111, _prev_active_msg_id=111)
         bot._store = store
         bot._bot.delete_message = AsyncMock(
-            side_effect=TelegramError(
-                "Flood control exceeded. Retry in 12 seconds"))
-        bot._bot.send_message = AsyncMock(
-            return_value=SimpleNamespace(message_id=222))
+            side_effect=TelegramError("Flood control exceeded. Retry in 12 seconds")
+        )
+        bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=222))
 
         await bot._repost_active_message("text", None, ("p", 1, "text"))
 
@@ -230,8 +221,7 @@ async def test_repost_delete_timeout_keeps_old_without_send(tmp_path):
         bot = _repost_bot(_active_msg_id=111, _prev_active_msg_id=111)
         bot._store = store
         bot._bot.delete_message = AsyncMock(side_effect=TimedOut("slow"))
-        bot._bot.send_message = AsyncMock(
-            return_value=SimpleNamespace(message_id=222))
+        bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=222))
 
         await bot._repost_active_message("text", None, ("p", 1, "text"))
 
@@ -249,9 +239,9 @@ async def test_repost_delete_gone_still_resends(tmp_path):
         bot = _repost_bot(_active_msg_id=111, _prev_active_msg_id=111)
         bot._store = store
         bot._bot.delete_message = AsyncMock(
-            side_effect=TelegramError("Bad Request: message to delete not found"))
-        bot._bot.send_message = AsyncMock(
-            return_value=SimpleNamespace(message_id=222))
+            side_effect=TelegramError("Bad Request: message to delete not found")
+        )
+        bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=222))
 
         await bot._repost_active_message("text", None, ("p", 1, "text"))
 
@@ -310,8 +300,7 @@ async def test_repost_send_failure_does_not_strand_the_card(tmp_path):
 
         # The next refreshes must bring the card back (the uncertain-send
         # guard retries a throttled send while no message is known).
-        bot._bot.send_message = AsyncMock(
-            return_value=SimpleNamespace(message_id=222))
+        bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=222))
         bot._active_footer = AsyncMock(return_value="")
         bot._store = store
         for _ in range(5):
@@ -343,10 +332,9 @@ async def test_card_deleted_from_chat_is_detected_by_the_probe(tmp_path):
         # The card is deleted from the chat: edits now fail with
         # "message to edit not found".
         bot._bot.edit_message_text = AsyncMock(
-            side_effect=TelegramError(
-                "Bad Request: message to edit not found"))
-        bot._bot.send_message = AsyncMock(
-            return_value=SimpleNamespace(message_id=8))
+            side_effect=TelegramError("Bad Request: message to edit not found")
+        )
+        bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=8))
 
         # Unchanged card: no resend before the probe is due.
         for _ in range(3):
@@ -370,11 +358,10 @@ async def test_fresh_send_prev_delete_flood_aborts_send(tmp_path):
         bot = _repost_bot(_active_msg_id=None, _prev_active_msg_id=42)
         bot._store = store
         bot._active_footer = AsyncMock(return_value="")
-        bot._bot.send_message = AsyncMock(
-            return_value=SimpleNamespace(message_id=77))
+        bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=77))
         bot._bot.delete_message = AsyncMock(
-            side_effect=TelegramError(
-                "Flood control exceeded. Retry in 16 seconds"))
+            side_effect=TelegramError("Flood control exceeded. Retry in 16 seconds")
+        )
 
         await bot._refresh_active_message_inner()
 
@@ -394,10 +381,10 @@ async def test_fresh_send_prev_gone_still_sends(tmp_path):
         bot = _repost_bot(_active_msg_id=None, _prev_active_msg_id=42)
         bot._store = store
         bot._active_footer = AsyncMock(return_value="")
-        bot._bot.send_message = AsyncMock(
-            return_value=SimpleNamespace(message_id=77))
+        bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=77))
         bot._bot.delete_message = AsyncMock(
-            side_effect=TelegramError("Bad Request: message to delete not found"))
+            side_effect=TelegramError("Bad Request: message to delete not found")
+        )
 
         await bot._refresh_active_message_inner()
 
@@ -420,8 +407,7 @@ async def test_orphan_sweep_deletes_then_drops(tmp_path):
 
         await bot._sweep_orphan_active_messages()
 
-        bot._bot.delete_message.assert_awaited_once_with(
-            chat_id="1", message_id=42)
+        bot._bot.delete_message.assert_awaited_once_with(chat_id="1", message_id=42)
         assert bot._orphan_ids() == []
     finally:
         store.close()
@@ -435,10 +421,12 @@ async def test_orphan_sweep_keeps_flooded_and_drops_gone(tmp_path):
         bot = _repost_bot(_active_msg_id=77)
         bot._store = store
         bot._orphan_active_ids = [42, 43]
-        bot._bot.delete_message = AsyncMock(side_effect=[
-            TelegramError("Flood control exceeded. Retry in 12 seconds"),
-            TelegramError("Bad Request: message to delete not found"),
-        ])
+        bot._bot.delete_message = AsyncMock(
+            side_effect=[
+                TelegramError("Flood control exceeded. Retry in 12 seconds"),
+                TelegramError("Bad Request: message to delete not found"),
+            ]
+        )
 
         await bot._sweep_orphan_active_messages()
 

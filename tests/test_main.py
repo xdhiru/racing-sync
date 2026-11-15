@@ -92,8 +92,10 @@ def test_main_run_startup_failure_is_clean(tmp_path: Path, capsys):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(MINIMAL_CONFIG)
 
-    with patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
-         patch("racing_sync.__main__.setup_logging"):
+    with (
+        patch("racing_sync.__main__.Coordinator") as mock_coord_cls,
+        patch("racing_sync.__main__.setup_logging"),
+    ):
         mock_coord = MagicMock()
 
         async def fake_run():
@@ -134,9 +136,11 @@ def test_main_run_reset_clears_state_db_and_logs(tmp_path: Path):
     cfg.general.state_db = state_db
     cfg.general.log_dir = log_dir
 
-    with patch("racing_sync.__main__.AppConfig") as mock_cfg_cls, \
-         patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
-         patch("racing_sync.__main__.setup_logging"):
+    with (
+        patch("racing_sync.__main__.AppConfig") as mock_cfg_cls,
+        patch("racing_sync.__main__.Coordinator") as mock_coord_cls,
+        patch("racing_sync.__main__.setup_logging"),
+    ):
         mock_cfg_cls.from_toml.return_value = cfg
         mock_coord = MagicMock()
 
@@ -184,11 +188,12 @@ def test_run_reset_refuses_when_backup_fails_and_db_exists(tmp_path: Path, capsy
     cfg.general.state_db = state_db
     cfg.general.log_dir = log_dir
 
-    with patch("racing_sync.__main__.AppConfig") as mock_cfg_cls, \
-         patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
-         patch("racing_sync.__main__.setup_logging"), \
-         patch("racing_sync.safety.backup_db",
-               return_value=(None, "snapshot failed: disk full")):
+    with (
+        patch("racing_sync.__main__.AppConfig") as mock_cfg_cls,
+        patch("racing_sync.__main__.Coordinator") as mock_coord_cls,
+        patch("racing_sync.__main__.setup_logging"),
+        patch("racing_sync.safety.backup_db", return_value=(None, "snapshot failed: disk full")),
+    ):
         mock_cfg_cls.from_toml.return_value = cfg
         mock_coord_cls.return_value = MagicMock()
         rc = main(["run", "--config", str(cfg_file), "--reset", "--yes"])
@@ -211,11 +216,12 @@ def test_run_reset_proceeds_without_backup_when_no_db(tmp_path: Path):
     cfg.general.state_db = state_db
     cfg.general.log_dir = log_dir
 
-    with patch("racing_sync.__main__.AppConfig") as mock_cfg_cls, \
-         patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
-         patch("racing_sync.__main__.setup_logging"), \
-         patch("racing_sync.safety.backup_db",
-               return_value=(None, "no-db")):
+    with (
+        patch("racing_sync.__main__.AppConfig") as mock_cfg_cls,
+        patch("racing_sync.__main__.Coordinator") as mock_coord_cls,
+        patch("racing_sync.__main__.setup_logging"),
+        patch("racing_sync.safety.backup_db", return_value=(None, "no-db")),
+    ):
         mock_cfg_cls.from_toml.return_value = cfg
         mock_coord = MagicMock()
 
@@ -292,8 +298,10 @@ def test_signal_handler_fallback_on_not_implemented(tmp_path: Path):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(MINIMAL_CONFIG)
 
-    with patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
-         patch("racing_sync.__main__.setup_logging"):
+    with (
+        patch("racing_sync.__main__.Coordinator") as mock_coord_cls,
+        patch("racing_sync.__main__.setup_logging"),
+    ):
         mock_coord = MagicMock()
 
         async def fake_run():
@@ -337,8 +345,7 @@ def test_app_config_rejects_ssd_fuse_overlap(tmp_path: Path):
 
     from racing_sync.config import AppConfig
 
-    bad = MINIMAL_CONFIG.replace('mount = "/mnt/fuse"',
-                                 'mount = "/downloads"')
+    bad = MINIMAL_CONFIG.replace('mount = "/mnt/fuse"', 'mount = "/downloads"')
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(bad)
     with pytest.raises(pydantic.ValidationError, match="overlap"):
@@ -352,8 +359,9 @@ def test_check_config_flags_same_remote_and_cap(tmp_path: Path):
     from racing_sync.__main__ import _check_config_env
     from racing_sync.config import AppConfig
 
-    same_remote = MINIMAL_CONFIG.replace('unsorted = "remote:unsorted/"',
-                                         'unsorted = "remote:movies/"')
+    same_remote = MINIMAL_CONFIG.replace(
+        'unsorted = "remote:unsorted/"', 'unsorted = "remote:movies/"'
+    )
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(same_remote)
     with pytest.raises(ValidationError, match="same tree"):
@@ -362,8 +370,7 @@ def test_check_config_flags_same_remote_and_cap(tmp_path: Path):
     cfg = AppConfig.from_toml(cfg_file)
     from types import SimpleNamespace
 
-    with patch("shutil.disk_usage",
-               return_value=SimpleNamespace(total=10**8, used=0, free=10**8)):
+    with patch("shutil.disk_usage", return_value=SimpleNamespace(total=10**8, used=0, free=10**8)):
         problems = _check_config_env(cfg)
     assert any("max_inflight_bytes" in p for p in problems)
 
@@ -380,15 +387,16 @@ def test_main_full_requires_yes(tmp_path: Path, capsys):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(MINIMAL_CONFIG)
 
-    with patch("racing_sync.__main__.Coordinator"), \
-         patch("racing_sync.__main__.setup_logging"):
+    with patch("racing_sync.__main__.Coordinator"), patch("racing_sync.__main__.setup_logging"):
         rc = main(["run", "--config", str(cfg_file), "--full"])
         assert rc == 2
         out = capsys.readouterr()
         assert "--yes" in out.err
 
-    with patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
-         patch("racing_sync.__main__.setup_logging"):
+    with (
+        patch("racing_sync.__main__.Coordinator") as mock_coord_cls,
+        patch("racing_sync.__main__.setup_logging"),
+    ):
         mock_coord = MagicMock()
 
         async def fake_run():
@@ -409,15 +417,17 @@ def test_check_config_warns_not_fails_on_down_fuse_mount(tmp_path: Path):
     from racing_sync.__main__ import _check_config_env, _check_config_warnings
     from racing_sync.config import AppConfig
 
-    text = MINIMAL_CONFIG.replace('mount = "/mnt/fuse"',
-                                  f'mount = "{(tmp_path / "no-such-mount").as_posix()}"')
-    text = text.replace('mount_unsorted = "/mnt/fuse/unsorted"',
-                        f'mount_unsorted = "{(tmp_path / "no-such-mount-unsorted").as_posix()}"')
+    text = MINIMAL_CONFIG.replace(
+        'mount = "/mnt/fuse"', f'mount = "{(tmp_path / "no-such-mount").as_posix()}"'
+    )
+    text = text.replace(
+        'mount_unsorted = "/mnt/fuse/unsorted"',
+        f'mount_unsorted = "{(tmp_path / "no-such-mount-unsorted").as_posix()}"',
+    )
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(text)
     cfg = AppConfig.from_toml(cfg_file)
-    assert _check_config_env(cfg) == [] or all(
-        "fuse" not in p for p in _check_config_env(cfg))
+    assert _check_config_env(cfg) == [] or all("fuse" not in p for p in _check_config_env(cfg))
     warnings = _check_config_warnings(cfg)
     assert len(warnings) == 2
     assert all("parks" in w for w in warnings)
@@ -560,8 +570,10 @@ def test_run_prints_startup_environment_warnings(tmp_path: Path, capsys):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(MINIMAL_CONFIG)
 
-    with patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
-         patch("racing_sync.__main__.setup_logging"):
+    with (
+        patch("racing_sync.__main__.Coordinator") as mock_coord_cls,
+        patch("racing_sync.__main__.setup_logging"),
+    ):
         mock_coord = MagicMock()
 
         async def fake_run():
@@ -611,9 +623,11 @@ def test_run_reset_aborts_on_db_refusal(tmp_path: Path, capsys):
     cfg.general.state_db = victim
     cfg.general.log_dir = log_dir
 
-    with patch("racing_sync.__main__.AppConfig") as mock_cfg_cls, \
-         patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
-         patch("racing_sync.__main__.setup_logging"):
+    with (
+        patch("racing_sync.__main__.AppConfig") as mock_cfg_cls,
+        patch("racing_sync.__main__.Coordinator") as mock_coord_cls,
+        patch("racing_sync.__main__.setup_logging"),
+    ):
         mock_cfg_cls.from_toml.return_value = cfg
         mock_coord = MagicMock()
 
@@ -654,13 +668,14 @@ def test_run_full_aborts_on_unreachable_dest(tmp_path: Path, capsys):
     cfg.ssd.path = ssd
     cfg.dest.save_path = ssd
 
-    with patch("racing_sync.__main__.AppConfig") as mock_cfg_cls, \
-         patch("racing_sync.__main__.Coordinator") as mock_coord_cls, \
-         patch("racing_sync.__main__.setup_logging"), \
-         patch("racing_sync.clients.qbittorrent.QBittorrentClient") as mock_qb:
+    with (
+        patch("racing_sync.__main__.AppConfig") as mock_cfg_cls,
+        patch("racing_sync.__main__.Coordinator") as mock_coord_cls,
+        patch("racing_sync.__main__.setup_logging"),
+        patch("racing_sync.clients.qbittorrent.QBittorrentClient") as mock_qb,
+    ):
         mock_cfg_cls.from_toml.return_value = cfg
-        mock_qb.return_value.start = AsyncMock(
-            side_effect=ConnectionError("refused"))
+        mock_qb.return_value.start = AsyncMock(side_effect=ConnectionError("refused"))
         mock_coord = MagicMock()
 
         async def fake_run():

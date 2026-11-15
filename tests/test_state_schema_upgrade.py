@@ -87,10 +87,7 @@ def test_state_store_upgrades_pre_1_0_0_db(tmp_path: Path):
         assert {"ix_public_export_retry", "ix_active_updated"} <= indexes
 
         columns = {
-            row[1]
-            for row in store._conn.execute(
-                "PRAGMA table_info(torrent_state)"
-            ).fetchall()
+            row[1] for row in store._conn.execute("PRAGMA table_info(torrent_state)").fetchall()
         }
         assert {
             "deleted_at",

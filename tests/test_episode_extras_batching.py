@@ -6,6 +6,7 @@ footprint fell back to sum(files). When extras pushed that over the cap
 while each file fit, the refine-to-real grow failed every cycle and the
 row looped in WAITING_DISK forever.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
@@ -23,15 +24,21 @@ async def test_episode_with_extras_over_cap_is_batched(tmp_path):
     cap = 10_000
     coord = _coord_with_cap(tmp_path, cap)
     coord.dest_client = AsyncMock()
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="Show.S01E01.mkv", size_bytes=9_000, progress=0.0),
-        TorrentFile(name="sample.mkv", size_bytes=3_000, progress=0.0),
-    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Show.S01E01.mkv", size_bytes=9_000, progress=0.0),
+            TorrentFile(name="sample.mkv", size_bytes=3_000, progress=0.0),
+        ]
+    )
     coord.dest_client.set_file_priorities = AsyncMock()
 
-    ts = TorrentState(source_infohash="e" * 40, dest_infohash="e" * 40,
-                      source_name="Show.S01E01", total_bytes=12_000,
-                      state=State.QUEUED)
+    ts = TorrentState(
+        source_infohash="e" * 40,
+        dest_infohash="e" * 40,
+        source_name="Show.S01E01",
+        total_bytes=12_000,
+        state=State.QUEUED,
+    )
 
     class _Cls:
         kind = "episode"
@@ -42,8 +49,7 @@ async def test_episode_with_extras_over_cap_is_batched(tmp_path):
         patch.object(coord, "_frozen_batch_cap", return_value=cap),
         patch.object(coord, "_fuse_skipped", AsyncMock(return_value=set())),
         patch.object(coord, "_ssd_adjust", AsyncMock(return_value=True)),
-        patch.object(coord, "_park_queued_for_download_slot",
-                     AsyncMock(return_value=False)),
+        patch.object(coord, "_park_queued_for_download_slot", AsyncMock(return_value=False)),
     ):
         await coord._setup_queued_download(ts, blob=b"")
 

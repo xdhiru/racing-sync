@@ -196,9 +196,11 @@ def allowlist_open_warning(cfg: Any) -> str | None:
             return None
         allowed = getattr(cfg, "admin_user_ids", None) or []
         if isinstance(allowed, (list, tuple, set)) and len(list(allowed)) == 0:
-            return ("telegram admin_user_ids is empty: anyone in the "
-                    "authorized chat may tap destructive buttons "
-                    "(cancel/inject). Set admin_user_ids to restrict.")
+            return (
+                "telegram admin_user_ids is empty: anyone in the "
+                "authorized chat may tap destructive buttons "
+                "(cancel/inject). Set admin_user_ids to restrict."
+            )
     except Exception:
         # Fail closed: a broken allowlist must not open destructive flows.
         return False
@@ -252,6 +254,7 @@ def _is_auth_failure(e: BaseException) -> bool:
     """
     try:
         from telegram.error import InvalidToken, Unauthorized
+
         if isinstance(e, (InvalidToken, Unauthorized)):
             return True
     except Exception:
@@ -277,6 +280,7 @@ def _make_bot(token: str) -> Bot:
     """
     try:
         from telegram.request import HTTPXRequest
+
         _req = HTTPXRequest(
             connect_timeout=10.0,
             read_timeout=30.0,
@@ -290,8 +294,7 @@ def _make_bot(token: str) -> Bot:
 
 
 class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
-    def __init__(self, cfg: TelegramConfig, coord: Coordinator,
-                 store: StateStore):
+    def __init__(self, cfg: TelegramConfig, coord: Coordinator, store: StateStore):
         self._cfg = cfg
         self._coord = coord
         self._store = store
@@ -358,7 +361,11 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                 log.warning("telegram: %s", _warn)
         except Exception:
             pass
-        bot_token = self._cfg.bot_token.get_secret_value() if hasattr(self._cfg.bot_token, "get_secret_value") else str(self._cfg.bot_token)
+        bot_token = (
+            self._cfg.bot_token.get_secret_value()
+            if hasattr(self._cfg.bot_token, "get_secret_value")
+            else str(self._cfg.bot_token)
+        )
         self._bot = _make_bot(bot_token)
         # Publish the / menu (best-effort): operators discover /add by
         # typing `/` instead of remembering the exact shape.
@@ -407,7 +414,8 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         # proves otherwise — avoids an instant delete+resend on restart.
         self._newest_outbound_id = self._active_msg_id
         self._detail_worker = asyncio.create_task(
-            self._detail_worker_loop(), name="rs-telegram-detail",
+            self._detail_worker_loop(),
+            name="rs-telegram-detail",
         )
         try:
             # Debounced "online" ping: a crash-loop restart must not spam
@@ -416,8 +424,7 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
             try:
                 _get_meta = getattr(self._store, "get_meta", None)
                 if callable(_get_meta):
-                    _ping_at = await asyncio.to_thread(
-                        _get_meta, "telegram_online_ping_at")
+                    _ping_at = await asyncio.to_thread(_get_meta, "telegram_online_ping_at")
             except Exception:
                 _ping_at = None
             _recent = False
@@ -433,8 +440,8 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                     _set_meta = getattr(self._store, "set_meta", None)
                     if callable(_set_meta):
                         await asyncio.to_thread(
-                            _set_meta, "telegram_online_ping_at",
-                            str(time.time()))
+                            _set_meta, "telegram_online_ping_at", str(time.time())
+                        )
                 except Exception:
                     pass
         except TelegramError as e:
@@ -442,14 +449,17 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                 # 401/Unauthorized: the token is dead — every later call
                 # fails the same way. Fail fast (no loops) so the config
                 # error surfaces instead of hiding behind retries.
-                log.error("telegram token rejected (%s); fix bot_token "
-                          "and restart — not starting telegram loops", e)
-                raise RuntimeError(
-                    f"telegram bot_token rejected: {e}") from e
+                log.error(
+                    "telegram token rejected (%s); fix bot_token "
+                    "and restart — not starting telegram loops",
+                    e,
+                )
+                raise RuntimeError(f"telegram bot_token rejected: {e}") from e
             log.warning("telegram probe failed: %s", e)
         self._task = asyncio.create_task(self._loop(), name="rs-telegram")
         self._callback_task = asyncio.create_task(
-            self._callback_loop(), name="rs-telegram-callbacks",
+            self._callback_loop(),
+            name="rs-telegram-callbacks",
         )
 
     async def stop(self) -> None:
@@ -521,15 +531,16 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                 await self._refresh_active_message()
                 await self._reconcile_pinned()
             except (TimedOut, NetworkError) as e:
-                log.warning("telegram loop transient network error (%s); will retry next interval", e)
+                log.warning(
+                    "telegram loop transient network error (%s); will retry next interval", e
+                )
             except Exception as e:  # noqa: BLE001
                 log.warning("telegram loop error: %s", e)
             await asyncio.sleep(self._cfg.status_update_interval)
 
     # ---- per-torrent: detail message ----
 
-    async def ensure_detail_message(self, ts: TorrentState,
-                                     progress: float | None = None) -> None:
+    async def ensure_detail_message(self, ts: TorrentState, progress: float | None = None) -> None:
         """Queue a per-torrent detail-message update.
 
         The actual send happens in a background worker that respects
@@ -616,7 +627,8 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                 batch: dict[str, float | None] = {}
                 try:
                     first_hash, first_prog = await asyncio.wait_for(
-                        self._detail_queue.get(), timeout=interval,
+                        self._detail_queue.get(),
+                        timeout=interval,
                     )
                     batch[first_hash] = first_prog
                 except asyncio.TimeoutError:
@@ -635,7 +647,8 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                         log.warning(
                             "telegram detail batch flood; backing off "
                             "for %ds (%d card(s) requeued)",
-                            int(_fb.seconds), len(pending) - _i,
+                            int(_fb.seconds),
+                            len(pending) - _i,
                         )
                         await asyncio.sleep(_fb.seconds)
                         for _rh, _rp in pending[_i:]:
@@ -704,7 +717,10 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
             return {}
 
     def _note_detail_transient_failure(
-        self, infohash: str, progress: float | None, state_value: str,
+        self,
+        infohash: str,
+        progress: float | None,
+        state_value: str,
     ) -> None:
         """Requeue a transiently-failed card update (bounded fast retries).
 
@@ -733,8 +749,7 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         if n <= 5:
             self._enqueue_detail(infohash, progress)
 
-    async def _send_one_detail(self, infohash: str,
-                               progress: float | None) -> None:
+    async def _send_one_detail(self, infohash: str, progress: float | None) -> None:
         """Send or edit the detail message for a single torrent."""
         if self._bot is None:
             return
@@ -777,7 +792,8 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                 return None
             log.warning(
                 "telegram detail rate-limited for %s; backing off %ds",
-                infohash[:10], int(_wait),
+                infohash[:10],
+                int(_wait),
             )
             return _wait
 
@@ -785,13 +801,15 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
             if msg_id is None:
                 try:
                     sent = await self._bot.send_message(
-                        self._cfg.chat_id, text,
+                        self._cfg.chat_id,
+                        text,
                         parse_mode=ParseMode.MARKDOWN,
                     )
                 except TelegramError as e:
                     if _is_parse_error(e):
                         sent = await self._bot.send_message(
-                            self._cfg.chat_id, text,
+                            self._cfg.chat_id,
+                            text,
                         )
                     else:
                         raise
@@ -799,7 +817,8 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                 self._detail_cache[infohash] = sent.message_id
                 await asyncio.to_thread(
                     self._store.set_telegram_message_id,
-                    infohash, sent.message_id,
+                    infohash,
+                    sent.message_id,
                 )
                 self._mark_detail_sent(infohash, state_value)
             else:
@@ -820,13 +839,15 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                         # Message was deleted; resend.
                         try:
                             sent = await self._bot.send_message(
-                                self._cfg.chat_id, text,
+                                self._cfg.chat_id,
+                                text,
                                 parse_mode=ParseMode.MARKDOWN,
                             )
                         except TelegramError as e2:
                             if _is_parse_error(e2):
                                 sent = await self._bot.send_message(
-                                    self._cfg.chat_id, text,
+                                    self._cfg.chat_id,
+                                    text,
                                 )
                             else:
                                 raise
@@ -834,7 +855,8 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                         self._detail_cache[infohash] = sent.message_id
                         await asyncio.to_thread(
                             self._store.set_telegram_message_id,
-                            infohash, sent.message_id,
+                            infohash,
+                            sent.message_id,
                         )
                         self._mark_detail_sent(infohash, state_value)
                     elif _is_parse_error(e):
@@ -853,14 +875,15 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                         # bounded instead of dropping the update.
                         log.warning(
                             "telegram detail edit timed out for %s (%s); requeueing",
-                            infohash[:10], e,
+                            infohash[:10],
+                            e,
                         )
-                        self._note_detail_transient_failure(
-                            infohash, progress, state_value)
+                        self._note_detail_transient_failure(infohash, progress, state_value)
                     else:
                         log.warning(
                             "telegram detail edit failed for %s: %s",
-                            infohash[:10], e,
+                            infohash[:10],
+                            e,
                         )
         except RetryAfter as e:
             if isinstance(e.retry_after, dt.timedelta):
@@ -873,14 +896,14 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
             log.warning("telegram detail send timed out (%s); will retry next interval", e)
             self._note_detail_transient_failure(infohash, progress, state_value)
         except TelegramError as e:
-            if ((_w2 := _flood_wait_seconds(e)) is not None):
+            if (_w2 := _flood_wait_seconds(e)) is not None:
                 log.warning(
                     "telegram detail rate-limited for %s; backing off %ds",
-                    infohash[:10], int(_w2),
+                    infohash[:10],
+                    int(_w2),
                 )
                 raise _FloodBackoff(_w2) from e
-            log.warning("telegram detail send failed for %s: %s",
-                        infohash[:10], e)
+            log.warning("telegram detail send failed for %s: %s", infohash[:10], e)
 
     # ---- active tasks pagination & callback handling ----
 
@@ -901,14 +924,14 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         active filter renders bracketed.
         """
         if total_pages <= 1:
-            buttons = [
-                [InlineKeyboardButton("🔄 Refresh", callback_data="page:refresh")]
-            ]
+            buttons = [[InlineKeyboardButton("🔄 Refresh", callback_data="page:refresh")]]
         else:
             buttons = [
                 [
                     InlineKeyboardButton("◀️ Prev", callback_data="page:prev"),
-                    InlineKeyboardButton(f"{current_page + 1} / {total_pages}", callback_data="page:refresh"),
+                    InlineKeyboardButton(
+                        f"{current_page + 1} / {total_pages}", callback_data="page:refresh"
+                    ),
                     InlineKeyboardButton("Next ▶️", callback_data="page:next"),
                 ],
                 [
@@ -918,22 +941,21 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         try:
             for _row in validate_rows(extra_rows):
                 _btns = []
-                for (_label, _data) in _row:
-                    _btns.append(InlineKeyboardButton(
-                        _label, callback_data=_data))
+                for _label, _data in _row:
+                    _btns.append(InlineKeyboardButton(_label, callback_data=_data))
                 if _btns:
                     buttons.append(_btns)
         except Exception:
             pass
         try:
             from .telegram_protocol import _STATUS_FILTER_BUTTONS
-            _cur = (status_filter or "all")
+
+            _cur = status_filter or "all"
             _frow = []
-            for (_key, _label) in _STATUS_FILTER_BUTTONS:
+            for _key, _label in _STATUS_FILTER_BUTTONS:
                 try:
                     _txt = f"·{_label}·" if _key == _cur else _label
-                    _frow.append(InlineKeyboardButton(
-                        _txt, callback_data=f"status:{_key}"))
+                    _frow.append(InlineKeyboardButton(_txt, callback_data=f"status:{_key}"))
                 except Exception:
                     continue
             if _frow:
@@ -975,17 +997,20 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
             out: list[str] = []
             for _r in rows or []:
                 try:
-                    _rh = ((_r.source_infohash or "").lower())
+                    _rh = (_r.source_infohash or "").lower()
                     if not _rh:
                         continue
                     if _same is not None:
-                        if not _same(_r.source_name or "",
-                                     _r.total_bytes or 0,
-                                     leader.source_name or "",
-                                     leader.total_bytes or 0):
+                        if not _same(
+                            _r.source_name or "",
+                            _r.total_bytes or 0,
+                            leader.source_name or "",
+                            leader.total_bytes or 0,
+                        ):
                             continue
-                    elif ((_r.source_name or "").strip().lower()
-                            != (leader.source_name or "").strip().lower()):
+                    elif (_r.source_name or "").strip().lower() != (
+                        leader.source_name or ""
+                    ).strip().lower():
                         continue
                     out.append(_rh)
                 except Exception:
@@ -995,13 +1020,18 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
             return []
 
     def _now_eligible_hashes(
-        self, members, notes: dict | None = None,
+        self,
+        members,
+        notes: dict | None = None,
     ) -> list[str]:
         """Member hashes that may start at once (old fetch ∪ prefer sets)."""
         return _now_eligible_hashes(members, notes)
 
     async def _send_sheet(
-        self, text: str, rows: list, reply_to: Any = None,
+        self,
+        text: str,
+        rows: list,
+        reply_to: Any = None,
     ) -> None:
         """Best-effort sheet reply with action buttons (plain text).
 
@@ -1016,9 +1046,8 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
             _btns = []
             for _row in validate_rows(rows):
                 _line = []
-                for (_label, _data) in _row:
-                    _line.append(InlineKeyboardButton(
-                        _label, callback_data=_data))
+                for _label, _data in _row:
+                    _line.append(InlineKeyboardButton(_label, callback_data=_data))
                 if _line:
                     _btns.append(_line)
             kwargs: dict[str, Any] = {}
@@ -1030,8 +1059,7 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                 pass
             if _btns:
                 kwargs["reply_markup"] = InlineKeyboardMarkup(_btns)
-            sent = await bot.send_message(
-                self._cfg.chat_id, text, **kwargs)
+            sent = await bot.send_message(self._cfg.chat_id, text, **kwargs)
             self._note_outbound(getattr(sent, "message_id", None))
         except Exception as e:  # noqa: BLE001
             log.debug("sheet reply failed: %s", e)
@@ -1100,8 +1128,7 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
             try:
                 for h in hashes or []:
                     _h = (h or "").strip().lower()
-                    if len(_h) == 40 and all(
-                            c in "0123456789abcdef" for c in _h):
+                    if len(_h) == 40 and all(c in "0123456789abcdef" for c in _h):
                         wanted.append(_h)
             except Exception:
                 pass
@@ -1129,8 +1156,7 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
             try:
                 for _h in wanted:
                     try:
-                        _name, _err = await asyncio.to_thread(
-                            self._unignore_core, _h)
+                        _name, _err = await asyncio.to_thread(self._unignore_core, _h)
                     except Exception:
                         continue
                     if _name:
@@ -1138,15 +1164,15 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
             except Exception:
                 pass
             if not tracked and not lifted:
-                return ("Already gone from tracking"
-                        if not unskip_text else unskip_text)
+                return "Already gone from tracking" if not unskip_text else unskip_text
             reply = (unskip_text or "").strip()
             if lifted:
                 shown = ", ".join(lifted[:3])
                 if len(lifted) > 3:
                     shown += f" (+{len(lifted) - 3} more)"
-                extra = (f"Unignored {shown} — re-send .torrent via /add "
-                         f"(or re-drop) to track again.")
+                extra = (
+                    f"Unignored {shown} — re-send .torrent via /add (or re-drop) to track again."
+                )
                 reply = f"{reply} {extra}".strip() if reply else extra
             return reply or "Resume failed: nothing changed."
         except Exception as e:  # noqa: BLE001

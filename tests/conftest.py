@@ -13,9 +13,7 @@ from racing_sync.coordinator import Coordinator
 
 @pytest.fixture(scope="session")
 def example_config() -> AppConfig:
-    return AppConfig.from_toml(
-        Path(__file__).parent.parent / "config.example.toml"
-    )
+    return AppConfig.from_toml(Path(__file__).parent.parent / "config.example.toml")
 
 
 @pytest.fixture

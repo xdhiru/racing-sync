@@ -9,9 +9,9 @@ from dataclasses import dataclass, field
 
 @dataclass(slots=True)
 class TorrentFile:
-    name: str                # path inside the torrent (relative)
+    name: str  # path inside the torrent (relative)
     size_bytes: int
-    priority: int = 1        # qBittorrent: 0=do not download, 1=normal, 6=high, 7=max
+    priority: int = 1  # qBittorrent: 0=do not download, 1=normal, 6=high, 7=max
     progress: float = 0.0
 
 
@@ -120,9 +120,7 @@ class TorrentClient(ABC):
     ) -> AddResult: ...
 
     @abstractmethod
-    async def set_file_priorities(
-        self, torrent_hash: str, priorities: dict[str, int]
-    ) -> None: ...
+    async def set_file_priorities(self, torrent_hash: str, priorities: dict[str, int]) -> None: ...
 
     @abstractmethod
     async def pause(self, torrent_hash: str) -> None: ...
@@ -131,9 +129,7 @@ class TorrentClient(ABC):
     async def resume(self, torrent_hash: str) -> None: ...
 
     @abstractmethod
-    async def delete(
-        self, torrent_hash: str, *, delete_files: bool = False
-    ) -> None: ...
+    async def delete(self, torrent_hash: str, *, delete_files: bool = False) -> None: ...
 
     @abstractmethod
     async def recheck(self, torrent_hash: str) -> None: ...

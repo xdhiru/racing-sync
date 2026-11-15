@@ -144,6 +144,7 @@ def _scrubbed(e: object) -> str:
     """Sanitized exception text (no `Action failed:` prefix)."""
     try:
         from .logging_setup import sanitize_log_text
+
         return sanitize_log_text(str(e))
     except Exception:
         try:
@@ -173,6 +174,7 @@ class _ChatCommand(NamedTuple):
     (the class of bug that once left `forget:` taps unrouted).
     `handle` is an unbound ``async (bot, match, message)`` function.
     """
+
     name: str
     pattern: re.Pattern
     handle: Any
@@ -180,8 +182,10 @@ class _ChatCommand(NamedTuple):
 
 def _cmd_group(kind: str):
     """Handler factory: ``/verb_<token>`` via the group command."""
+
     async def _run(bot, match, message):
         await bot._start_group_command(kind, match.group(1), message)
+
     _run.__name__ = f"_cmd_group_{kind}"
     return _run
 
@@ -193,8 +197,7 @@ async def _cmd_resume(bot, match, message):
 
 async def _cmd_single_injectfuse(bot, match, message):
     """`/injectfuse <full-hash>` (manual form)."""
-    await bot._start_single_command(
-        "injectfuse", match.group(1).lower(), message)
+    await bot._start_single_command("injectfuse", match.group(1).lower(), message)
 
 
 async def _cmd_act(bot, match, message):
@@ -223,8 +226,7 @@ async def _cmd_pause_intake(bot, match, message):
     setter = getattr(coord, "set_intake_paused", None)
     if coord is None or not callable(setter):
         try:
-            await bot._reply("Action failed: bot not attached.",
-                             reply_to=message)
+            await bot._reply("Action failed: bot not attached.", reply_to=message)
         except Exception:
             pass
         return
@@ -241,7 +243,8 @@ async def _cmd_pause_intake(bot, match, message):
             "Intake paused — no new downloads start until "
             "/resume_intake. In-flight rows drain normally "
             "(resets on restart).",
-            reply_to=message)
+            reply_to=message,
+        )
     except Exception:
         pass
 
@@ -252,8 +255,7 @@ async def _cmd_resume_intake(bot, match, message):
     setter = getattr(coord, "set_intake_paused", None)
     if coord is None or not callable(setter):
         try:
-            await bot._reply("Action failed: bot not attached.",
-                             reply_to=message)
+            await bot._reply("Action failed: bot not attached.", reply_to=message)
         except Exception:
             pass
         return
@@ -266,8 +268,7 @@ async def _cmd_resume_intake(bot, match, message):
             pass
         return
     try:
-        await bot._reply("Intake resumed — NEW rows start workers again.",
-                         reply_to=message)
+        await bot._reply("Intake resumed — NEW rows start workers again.", reply_to=message)
     except Exception:
         pass
 
@@ -278,8 +279,7 @@ async def _cmd_tick(bot, match, message):
     step = getattr(coord, "_tick_inner", None)
     if coord is None or not callable(step):
         try:
-            await bot._reply("Action failed: bot not attached.",
-                             reply_to=message)
+            await bot._reply("Action failed: bot not attached.", reply_to=message)
         except Exception:
             pass
         return
@@ -307,8 +307,7 @@ async def _cmd_active(bot, match, message):
     render = getattr(bot, "render_active_now", None)
     if not callable(render):
         try:
-            await bot._reply("Action failed: bot not attached.",
-                             reply_to=message)
+            await bot._reply("Action failed: bot not attached.", reply_to=message)
         except Exception:
             pass
         return
@@ -322,18 +321,23 @@ async def _cmd_active(bot, match, message):
         return
     try:
         await bot._reply(
-            "Active tasks sent." if ok
-            else "Active tasks could not be sent — see the log.",
-            reply_to=message)
+            "Active tasks sent." if ok else "Active tasks could not be sent — see the log.",
+            reply_to=message,
+        )
     except Exception:
         pass
 
 
 _STATS_ORDER = (
-    ("new", "NEW"), ("queued", "QUEUED"), ("downloading", "DL"),
-    ("moving", "MOVING"), ("waiting_indexer", "WAIT-IDX"),
-    ("waiting_disk", "WAIT-SSD"), ("re_adding", "RE-ADDING"),
-    ("done", "DONE"), ("failed", "FAILED"),
+    ("new", "NEW"),
+    ("queued", "QUEUED"),
+    ("downloading", "DL"),
+    ("moving", "MOVING"),
+    ("waiting_indexer", "WAIT-IDX"),
+    ("waiting_disk", "WAIT-SSD"),
+    ("re_adding", "RE-ADDING"),
+    ("done", "DONE"),
+    ("failed", "FAILED"),
 )
 
 
@@ -342,8 +346,7 @@ async def _cmd_stats(bot, match, message):
     store = getattr(bot, "_store", None)
     if store is None:
         try:
-            await bot._reply("Action failed: bot not attached.",
-                             reply_to=message)
+            await bot._reply("Action failed: bot not attached.", reply_to=message)
         except Exception:
             pass
         return
@@ -370,8 +373,7 @@ async def _cmd_stats(bot, match, message):
     except Exception:
         _workers = 0
     try:
-        _paused = bool(getattr(getattr(bot, "_coord", None),
-                               "_intake_paused", False))
+        _paused = bool(getattr(getattr(bot, "_coord", None), "_intake_paused", False))
     except Exception:
         _paused = False
     try:
@@ -379,11 +381,13 @@ async def _cmd_stats(bot, match, message):
         _ignored = len(_ign() or []) if callable(_ign) else 0
     except Exception:
         _ignored = 0
-    _lines = ["📊 Stats",
-              " · ".join(_parts),
-              f"workers {_workers} · intake "
-              f"{'paused' if _paused else 'running'} · held {skipped} · "
-              f"ignored {_ignored}"]
+    _lines = [
+        "📊 Stats",
+        " · ".join(_parts),
+        f"workers {_workers} · intake "
+        f"{'paused' if _paused else 'running'} · held {skipped} · "
+        f"ignored {_ignored}",
+    ]
     try:
         _ovfn = getattr(bot, "_overview_line", None)
         _ovl = _ovfn() if callable(_ovfn) else ""
@@ -402,8 +406,8 @@ async def _cmd_stats(bot, match, message):
     # effort — an unwired buffer simply yields no tail.
     try:
         from .logging_setup import get_ring_buffer
-        _events = get_ring_buffer().snapshot(last=3,
-                                             min_level=logging.WARNING)
+
+        _events = get_ring_buffer().snapshot(last=3, min_level=logging.WARNING)
     except Exception:
         _events = []
     for _ev in _events or []:
@@ -432,9 +436,10 @@ async def _cmd_find(bot, match, message):
     q = ((match.group(1) if match else "") or "").strip()
     if not q:
         try:
-            await bot._reply("Send /find <release name> to search the "
-                             "download-target indexers (read-only).",
-                             reply_to=message)
+            await bot._reply(
+                "Send /find <release name> to search the download-target indexers (read-only).",
+                reply_to=message,
+            )
         except Exception:
             pass
         return
@@ -442,8 +447,7 @@ async def _cmd_find(bot, match, message):
     finder = getattr(coord, "find_release", None)
     if coord is None or not callable(finder):
         try:
-            await bot._reply("Action failed: bot not attached.",
-                             reply_to=message)
+            await bot._reply("Action failed: bot not attached.", reply_to=message)
         except Exception:
             pass
         return
@@ -465,12 +469,9 @@ async def _cmd_find(bot, match, message):
         _idx = res.get("indexers") or []
         _total = sum(i.get("total", 0) for i in _idx)
         if not _total:
-            await bot._reply(
-                f"No hits for '{q[:60]}' on {len(_idx)} indexer(s).",
-                reply_to=message)
+            await bot._reply(f"No hits for '{q[:60]}' on {len(_idx)} indexer(s).", reply_to=message)
             return
-        _lines = [f"🔍 '{q[:60]}' — {_total} hit(s) "
-                   f"on {len(_idx)} indexer(s):"]
+        _lines = [f"🔍 '{q[:60]}' — {_total} hit(s) on {len(_idx)} indexer(s):"]
         for entry in _idx:
             _hs = entry.get("hits") or []
             if not _hs:
@@ -483,9 +484,7 @@ async def _cmd_find(bot, match, message):
                     continue
                 _lines.append(f"• {entry.get('name', '?')}: {_t} ({_s})")
             if entry.get("total", 0) > len(_hs):
-                _lines.append(
-                    f"  +{entry['total'] - len(_hs)} more on "
-                    f"{entry.get('name', '?')}")
+                _lines.append(f"  +{entry['total'] - len(_hs)} more on {entry.get('name', '?')}")
         _lines.append("Read-only — nothing queued.")
         await bot._reply("\n".join(_lines)[:1500], reply_to=message)
     except Exception as e:  # noqa: BLE001
@@ -502,15 +501,13 @@ _CHAT_COMMANDS: tuple = (
     _ChatCommand("fetch", FETCH_CMD_RE, _cmd_group("fetch")),
     _ChatCommand("prefer", PREFER_CMD_RE, _cmd_group("prefer")),
     _ChatCommand("now", NOW_CMD_RE, _cmd_group("now")),
-    _ChatCommand("forcestart", FORCESTART_CMD_RE,
-                 _cmd_group("forcestart")),
+    _ChatCommand("forcestart", FORCESTART_CMD_RE, _cmd_group("forcestart")),
     _ChatCommand("skip", SKIP_CMD_RE, _cmd_group("skip")),
     _ChatCommand("unskip", UNSKIP_CMD_RE, _cmd_resume),
     _ChatCommand("resume", RESUME_CMD_RE, _cmd_resume),
     _ChatCommand("unignore", UNIGNORE_CMD_RE, _cmd_resume),
     _ChatCommand("unignore_hash", UNIGNORE_HASH_RE, _cmd_resume),
-    _ChatCommand("injectfuse_hash", INJECTFUSE_HASH_RE,
-                 _cmd_single_injectfuse),
+    _ChatCommand("injectfuse_hash", INJECTFUSE_HASH_RE, _cmd_single_injectfuse),
     _ChatCommand("injectfuse", INJECTFUSE_CMD_RE, _cmd_group("injectfuse")),
     _ChatCommand("act", ACT_CMD_RE, _cmd_act),
     _ChatCommand("cancel_match", CANCEL_MATCH_RE, _cmd_cancel_match),
@@ -548,8 +545,12 @@ _STATUS_FILTERS: dict[str, frozenset | None] = {
 #: Filter keyboard buttons in order: (key, label). `ov` is the aggregate
 #: overview (not a filter) and shares the `status:` callback namespace.
 _STATUS_FILTER_BUTTONS: tuple = (
-    ("all", "All"), ("dl", "DL"), ("mv", "MV"), ("rd", "RD"),
-    ("qd", "QD"), ("ov", "📊"),
+    ("all", "All"),
+    ("dl", "DL"),
+    ("mv", "MV"),
+    ("rd", "RD"),
+    ("qd", "QD"),
+    ("ov", "📊"),
 )
 
 
@@ -574,8 +575,7 @@ def _is_bulk_scope(h: str) -> bool:
     live set, so no stored pending state exists to expire.
     """
     try:
-        return (h == "stalled" or h.startswith("match:")
-                or h.startswith("status:"))
+        return h == "stalled" or h.startswith("match:") or h.startswith("status:")
     except Exception:
         return False
 
@@ -621,8 +621,8 @@ class CancelScope(NamedTuple):
             if h == "stalled":
                 return cls("stalled", "")
             if h.startswith("status:"):
-                return cls("status", h[len("status:"):])
-            return cls("match", h[len("match:"):])
+                return cls("status", h[len("status:") :])
+            return cls("match", h[len("match:") :])
         if all:
             return cls("group", h)
         return cls("single", h)
@@ -645,20 +645,17 @@ class CancelScope(NamedTuple):
         if self.kind == "single":
             get = getattr(store, "get", None) if store else None
             try:
-                row = await asyncio.to_thread(get, self.key) \
-                    if callable(get) else None
+                row = await asyncio.to_thread(get, self.key) if callable(get) else None
             except Exception as e:  # noqa: BLE001
                 raise RuntimeError(f"resolve failed: {e}") from e
             if row is None:
                 raise ScopeGone()
-            title = str(getattr(row, "source_name", "")
-                        or self.key[:10])[:60]
+            title = str(getattr(row, "source_name", "") or self.key[:10])[:60]
             return ResolvedScope(title, "", self.key, title, [self.key])
         if self.kind == "group":
             fn = getattr(bot, "_live_group_hashes", None)
             try:
-                hashes = await asyncio.to_thread(fn, self.key) \
-                    if callable(fn) else []
+                hashes = await asyncio.to_thread(fn, self.key) if callable(fn) else []
             except Exception as e:  # noqa: BLE001
                 raise RuntimeError(f"resolve failed: {e}") from e
             if not hashes:
@@ -668,13 +665,12 @@ class CancelScope(NamedTuple):
                 get = getattr(store, "get", None) if store else None
                 leader = get(self.key) if callable(get) else None
                 if leader is not None:
-                    title = str(getattr(leader, "source_name", "")
-                                or self.key[:10])[:60]
+                    title = str(getattr(leader, "source_name", "") or self.key[:10])[:60]
             except Exception:
                 pass
             return ResolvedScope(
-                title, f" · all {len(hashes)} copies",
-                f"all:{self.key}", title, list(hashes))
+                title, f" · all {len(hashes)} copies", f"all:{self.key}", title, list(hashes)
+            )
         if self.kind == "match":
             return await self._resolve_match(bot)
         if self.kind == "stalled":
@@ -687,9 +683,11 @@ class CancelScope(NamedTuple):
             total = sum(len(hs) for (_, hs) in groups)
             return ResolvedScope(
                 f"{len(groups)} stalled downloads",
-                f" · {total} copies", "stalled",
+                f" · {total} copies",
+                "stalled",
                 f"{len(groups)} stalled groups",
-                [h for (_, hs) in groups for h in hs or []])
+                [h for (_, hs) in groups for h in hs or []],
+            )
         if self.kind == "status":
             # Fail closed: only the lane keys cancel. An unknown key
             # (all/ov/garbage) must never resolve to the whole list —
@@ -697,11 +695,9 @@ class CancelScope(NamedTuple):
             if self.key not in ("dl", "mv", "rd", "qd"):
                 raise ScopeGone()
             _label = dict(_STATUS_FILTER_BUTTONS).get(self.key, self.key)
-            _get_all = getattr(store, "list_active_inflight", None) \
-                if store else None
+            _get_all = getattr(store, "list_active_inflight", None) if store else None
             try:
-                rows = await asyncio.to_thread(_get_all) \
-                    if callable(_get_all) else []
+                rows = await asyncio.to_thread(_get_all) if callable(_get_all) else []
             except Exception as e:  # noqa: BLE001
                 raise RuntimeError(f"resolve failed: {e}") from e
             hashes = []
@@ -718,10 +714,8 @@ class CancelScope(NamedTuple):
             if not hashes:
                 raise ScopeGone()
             _n = len(hashes)
-            _title = (f"{_n} {_label} "
-                      f"{'copy' if _n == 1 else 'copies'}")
-            return ResolvedScope(
-                _title, "", f"status:{self.key}", _title, hashes)
+            _title = f"{_n} {_label} {'copy' if _n == 1 else 'copies'}"
+            return ResolvedScope(_title, "", f"status:{self.key}", _title, hashes)
         raise ScopeGone()
 
     async def _resolve_match(self, bot: Any) -> ResolvedScope:
@@ -729,8 +723,7 @@ class CancelScope(NamedTuple):
         q = _match_query(self.key)
         fn = getattr(bot, "_live_match", None)
         try:
-            matches = await asyncio.to_thread(fn, q) \
-                if (callable(fn) and q) else []
+            matches = await asyncio.to_thread(fn, q) if (callable(fn) and q) else []
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"match resolve failed: {e}") from e
         if not matches:
@@ -738,22 +731,30 @@ class CancelScope(NamedTuple):
         total = sum(len(hs) for (_, hs) in matches)
         return ResolvedScope(
             f"{len(matches)} groups matching '{q[:40]}'",
-            f" · {total} copies", f"match:{self.key}",
+            f" · {total} copies",
+            f"match:{self.key}",
             f"{len(matches)} matched groups",
-            [h for (_, hs) in matches for h in hs or []])
+            [h for (_, hs) in matches for h in hs or []],
+        )
 
     def remember_sheet(self, subject: str) -> tuple[str, list]:
         """Q1 remember question for the scope (subject pre-sanitized)."""
         from .telegram_buttons import ButtonMaker
 
         scope = self.to_data()
-        text = (f"{subject}\n"
-                "🚫 Ignore blocks it from coming back; "
-                "👻 Just forget allows re-adding it later.")
-        rows = (ButtonMaker()
-                .add("🚫 Ignore + forget", f"forget:{scope}:1")
-                .add("👻 Just forget", f"forget:{scope}:0")
-                .newline().add("Close", "abort").rows())
+        text = (
+            f"{subject}\n"
+            "🚫 Ignore blocks it from coming back; "
+            "👻 Just forget allows re-adding it later."
+        )
+        rows = (
+            ButtonMaker()
+            .add("🚫 Ignore + forget", f"forget:{scope}:1")
+            .add("👻 Just forget", f"forget:{scope}:0")
+            .newline()
+            .add("Close", "abort")
+            .rows()
+        )
         return text, rows
 
 
@@ -767,8 +768,9 @@ def _slow_tap(data: str) -> bool:
     (or worse, before it existed, into a duplicate execution).
     """
     try:
-        return (data.startswith("keep:") and data.endswith(":no")) or \
-            (data.startswith("inject:") and data.endswith(":yes"))
+        return (data.startswith("keep:") and data.endswith(":no")) or (
+            data.startswith("inject:") and data.endswith(":yes")
+        )
     except Exception:
         return False
 
@@ -874,10 +876,20 @@ def _flood_wait_seconds(e: BaseException, default: int = 5) -> int | None:
         msg = str(e or "").lower()
     except Exception:
         return None
-    if not any(k in msg for k in (
-        "flood", "too many requests", "rate limit", "ratelimit",
-        "slow mode", "slowmode",
-    )) and re.search(r"retry (?:in|after) \d+", msg) is None:
+    if (
+        not any(
+            k in msg
+            for k in (
+                "flood",
+                "too many requests",
+                "rate limit",
+                "ratelimit",
+                "slow mode",
+                "slowmode",
+            )
+        )
+        and re.search(r"retry (?:in|after) \d+", msg) is None
+    ):
         return None
     try:
         m = re.search(r"retry (?:in|after) (\d+)", msg)
@@ -918,10 +930,18 @@ def _is_transient_tg_error(e: BaseException) -> bool:
         m = str(e).lower()
     except Exception:
         return False
-    return any(s in m for s in (
-        "timed out", "timeout", "connection", "temporary",
-        "service unavailable", "bad gateway", "gateway timeout",
-    ))
+    return any(
+        s in m
+        for s in (
+            "timed out",
+            "timeout",
+            "connection",
+            "temporary",
+            "service unavailable",
+            "bad gateway",
+            "gateway timeout",
+        )
+    )
 
 
 def _is_hex40(s: object) -> bool:
@@ -954,79 +974,81 @@ def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
         parts = str(data or "").split(":")
         if parts == ["abort"]:
             return ("abort", False, "", "", None)
-        if len(parts) == 2 and parts[0] in (
-                "go", "cancel", "inject", "skip", "resume", "forget"):
+        if len(parts) == 2 and parts[0] in ("go", "cancel", "inject", "skip", "resume", "forget"):
             if _is_hex40(parts[1]):
                 return (parts[0], False, parts[1].lower(), "", None)
-        if len(parts) == 3 and parts[0] in (
-                "cancel", "keep", "inject", "skip", "resume",
-                "go", "forget") and parts[1] == "all":
+        if (
+            len(parts) == 3
+            and parts[0] in ("cancel", "keep", "inject", "skip", "resume", "go", "forget")
+            and parts[1] == "all"
+        ):
             if _is_hex40(parts[2]):
                 return (parts[0], True, parts[2].lower(), "", None)
         if len(parts) == 3 and parts[0] in ("keep", "inject"):
             if _is_hex40(parts[1]) and parts[2] in ("yes", "no"):
                 return (parts[0], False, parts[1].lower(), parts[2], True)
         if len(parts) == 4 and parts[0] in ("keep", "inject"):
-            if _is_hex40(parts[1]) and parts[2] in ("0", "1") \
-                    and parts[3] in ("yes", "no"):
-                return (parts[0], False, parts[1].lower(), parts[3],
-                        parts[2] == "1")
+            if _is_hex40(parts[1]) and parts[2] in ("0", "1") and parts[3] in ("yes", "no"):
+                return (parts[0], False, parts[1].lower(), parts[3], parts[2] == "1")
         if len(parts) == 5 and parts[0] in ("keep", "inject"):
-            if parts[1] == "all" and _is_hex40(parts[2]) \
-                    and parts[3] in ("0", "1") \
-                    and parts[4] in ("yes", "no"):
-                return (parts[0], True, parts[2].lower(), parts[4],
-                        parts[3] == "1")
+            if (
+                parts[1] == "all"
+                and _is_hex40(parts[2])
+                and parts[3] in ("0", "1")
+                and parts[4] in ("yes", "no")
+            ):
+                return (parts[0], True, parts[2].lower(), parts[4], parts[3] == "1")
         if len(parts) == 3 and parts[0] == "forget":
             if _is_hex40(parts[1]) and parts[2] in ("0", "1"):
-                return (parts[0], False, parts[1].lower(), "",
-                        parts[2] == "1")
+                return (parts[0], False, parts[1].lower(), "", parts[2] == "1")
         if len(parts) == 4 and parts[0] == "forget":
-            if parts[1] == "all" and _is_hex40(parts[2]) \
-                    and parts[3] in ("0", "1"):
-                return (parts[0], True, parts[2].lower(), "",
-                        parts[3] == "1")
+            if parts[1] == "all" and _is_hex40(parts[2]) and parts[3] in ("0", "1"):
+                return (parts[0], True, parts[2].lower(), "", parts[3] == "1")
         # Bulk-match scope: the substring travels base64url-encoded and is
         # re-resolved live at every tap (`match:<tok>` in the hash slot).
         if len(parts) == 4 and parts[0] == "forget":
-            if parts[1] == "match" and parts[3] in ("0", "1") \
-                    and _MATCH_TOKEN_RE.match(parts[2] or ""):
-                return (parts[0], False, f"match:{parts[2]}", "",
-                        parts[3] == "1")
+            if (
+                parts[1] == "match"
+                and parts[3] in ("0", "1")
+                and _MATCH_TOKEN_RE.match(parts[2] or "")
+            ):
+                return (parts[0], False, f"match:{parts[2]}", "", parts[3] == "1")
         if len(parts) == 5 and parts[0] == "keep":
-            if parts[1] == "match" and parts[3] in ("0", "1") \
-                    and parts[4] in ("yes", "no") \
-                    and _MATCH_TOKEN_RE.match(parts[2] or ""):
-                return (parts[0], False, f"match:{parts[2]}", parts[4],
-                        parts[3] == "1")
+            if (
+                parts[1] == "match"
+                and parts[3] in ("0", "1")
+                and parts[4] in ("yes", "no")
+                and _MATCH_TOKEN_RE.match(parts[2] or "")
+            ):
+                return (parts[0], False, f"match:{parts[2]}", parts[4], parts[3] == "1")
         # Predicate scope: fixed predicate, no token to carry.
         if len(parts) == 3 and parts[0] == "forget":
             if parts[1] == "stalled" and parts[2] in ("0", "1"):
-                return (parts[0], False, "stalled", "",
-                        parts[2] == "1")
+                return (parts[0], False, "stalled", "", parts[2] == "1")
         if len(parts) == 4 and parts[0] == "keep":
-            if parts[1] == "stalled" and parts[2] in ("0", "1") \
-                    and parts[3] in ("yes", "no"):
-                return (parts[0], False, "stalled", parts[3],
-                        parts[2] == "1")
+            if parts[1] == "stalled" and parts[2] in ("0", "1") and parts[3] in ("yes", "no"):
+                return (parts[0], False, "stalled", parts[3], parts[2] == "1")
         # Status scope: lane filter key, re-resolved live like stalled.
         # Only the cancellable lane keys (never all/ov/unknown — those
         # must not resolve to the whole list).
         if len(parts) == 3 and parts[0] == "cancel":
-            if parts[1] == "status" and parts[2] in (
-                    "dl", "mv", "rd", "qd"):
+            if parts[1] == "status" and parts[2] in ("dl", "mv", "rd", "qd"):
                 return (parts[0], False, f"status:{parts[2]}", "", None)
         if len(parts) == 4 and parts[0] == "forget":
-            if parts[1] == "status" and parts[3] in ("0", "1") \
-                    and parts[2] in ("dl", "mv", "rd", "qd"):
-                return (parts[0], False, f"status:{parts[2]}", "",
-                        parts[3] == "1")
+            if (
+                parts[1] == "status"
+                and parts[3] in ("0", "1")
+                and parts[2] in ("dl", "mv", "rd", "qd")
+            ):
+                return (parts[0], False, f"status:{parts[2]}", "", parts[3] == "1")
         if len(parts) == 5 and parts[0] == "keep":
-            if parts[1] == "status" and parts[3] in ("0", "1") \
-                    and parts[4] in ("yes", "no") \
-                    and parts[2] in ("dl", "mv", "rd", "qd"):
-                return (parts[0], False, f"status:{parts[2]}", parts[4],
-                        parts[3] == "1")
+            if (
+                parts[1] == "status"
+                and parts[3] in ("0", "1")
+                and parts[4] in ("yes", "no")
+                and parts[2] in ("dl", "mv", "rd", "qd")
+            ):
+                return (parts[0], False, f"status:{parts[2]}", parts[4], parts[3] == "1")
     except Exception:
         pass
     return ("", False, "", "", None)
@@ -1041,42 +1063,51 @@ def _bot_command_menu() -> list:
     keep the menu short.
     """
     try:
-        return [BotCommand(
-            "add",
-            "Add a .torrent file — reply to it with /add, or send it with "
-            "/add as caption",
-        ), BotCommand(
-            "cancel_match",
-            "Cancel every active group whose title contains <text> — "
-            "/cancel_match <text>",
-        ), BotCommand(
-            "cancel_stalled",
-            "Cancel every downloading group with no seeders — "
-            "/cancel_stalled",
-        ), BotCommand(
-            "cancel_status",
-            "Cancel a whole lane (DL/MV/RD/QD) — /cancel_status",
-        ), BotCommand(
-            "pause_intake",
-            "Pause intake — no new downloads start until /resume_intake",
-        ), BotCommand(
-            "resume_intake",
-            "Resume intake of new downloads",
-        ), BotCommand(
-            "tick",
-            "Run one pipeline tick now (poll + schedule + janitor)",
-        ), BotCommand(
-            "active",
-            "Send a fresh Active Tasks card now",
-        ), BotCommand(
-            "stats",
-            "Pipeline snapshot — rows by state, workers, storage",
-        ), BotCommand(
-            "find",
-            "Search download-target indexers (read-only) — /find <text>",
-        ), BotCommand(
-            "files",
-            "List a torrent's files (read-only) — /files_<n|hash>",
-        )]
+        return [
+            BotCommand(
+                "add",
+                "Add a .torrent file — reply to it with /add, or send it with /add as caption",
+            ),
+            BotCommand(
+                "cancel_match",
+                "Cancel every active group whose title contains <text> — /cancel_match <text>",
+            ),
+            BotCommand(
+                "cancel_stalled",
+                "Cancel every downloading group with no seeders — /cancel_stalled",
+            ),
+            BotCommand(
+                "cancel_status",
+                "Cancel a whole lane (DL/MV/RD/QD) — /cancel_status",
+            ),
+            BotCommand(
+                "pause_intake",
+                "Pause intake — no new downloads start until /resume_intake",
+            ),
+            BotCommand(
+                "resume_intake",
+                "Resume intake of new downloads",
+            ),
+            BotCommand(
+                "tick",
+                "Run one pipeline tick now (poll + schedule + janitor)",
+            ),
+            BotCommand(
+                "active",
+                "Send a fresh Active Tasks card now",
+            ),
+            BotCommand(
+                "stats",
+                "Pipeline snapshot — rows by state, workers, storage",
+            ),
+            BotCommand(
+                "find",
+                "Search download-target indexers (read-only) — /find <text>",
+            ),
+            BotCommand(
+                "files",
+                "List a torrent's files (read-only) — /files_<n|hash>",
+            ),
+        ]
     except Exception:
         return []

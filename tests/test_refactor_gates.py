@@ -27,10 +27,8 @@ def test_same_content_size_rule_matches_unknown():
     assert same_content("Twin.Show", 0, "Twin.Show", 0)
     # ...but deferral decisions require a known size, or distinct
     # unsized releases mutually defer forever.
-    assert not same_content("Twin.Show", 0, "Twin.Show", 0,
-                            require_size=True)
-    assert same_content("Twin.Show", 0, "Twin.Show", 1000,
-                        require_size=True)
+    assert not same_content("Twin.Show", 0, "Twin.Show", 0, require_size=True)
+    assert same_content("Twin.Show", 0, "Twin.Show", 1000, require_size=True)
     # Different names never match, even with unknown sizes.
     assert not same_content("A.Show", 0, "B.Show", 0)
 
@@ -60,8 +58,7 @@ async def test_intake_handoff_off_for_bare_doubles():
     from racing_sync.state import TorrentState, State
 
     coord = make_coordinator()
-    ts = TorrentState(source_infohash="a" * 40, source_name="Fresh",
-                      state=State.NEW)
+    ts = TorrentState(source_infohash="a" * 40, source_name="Fresh", state=State.NEW)
     assert await coord._drain_intake([ts], []) == 0
 
 
@@ -78,10 +75,10 @@ async def test_intake_handoff_spawns_fresh_new_when_started():
     coord = make_coordinator()
     coord._coordinator_started = True
     coord._spawn_worker = MagicMock()
-    fresh = TorrentState(source_infohash="b" * 40, source_name="Fresh",
-                         state=State.NEW)
-    parked = TorrentState(source_infohash="c" * 40, source_name="Parked",
-                          state=State.WAITING_INDEXER)
+    fresh = TorrentState(source_infohash="b" * 40, source_name="Fresh", state=State.NEW)
+    parked = TorrentState(
+        source_infohash="c" * 40, source_name="Parked", state=State.WAITING_INDEXER
+    )
     assert await coord._drain_intake([fresh, parked, None], []) == 1
     coord._spawn_worker.assert_called_once_with(fresh)
 
@@ -99,10 +96,8 @@ async def test_intake_handoff_skips_running_and_held():
     coord._coordinator_started = True
     coord._spawn_worker = MagicMock()
     coord._running_infohashes.add("d" * 40)
-    running = TorrentState(source_infohash="d" * 40, source_name="Run",
-                           state=State.NEW)
-    held = TorrentState(source_infohash="e" * 40, source_name="Held",
-                        state=State.NEW, skipped=1)
+    running = TorrentState(source_infohash="d" * 40, source_name="Run", state=State.NEW)
+    held = TorrentState(source_infohash="e" * 40, source_name="Held", state=State.NEW, skipped=1)
     assert await coord._drain_intake([running, held], []) == 0
     coord._spawn_worker.assert_not_called()
 
@@ -121,8 +116,7 @@ async def test_intake_pause_holds_new_and_resumes():
     assert coord._intake_paused is False
     coord._coordinator_started = True
     coord._spawn_worker = MagicMock()
-    fresh = TorrentState(source_infohash="f" * 40, source_name="Fresh",
-                         state=State.NEW)
+    fresh = TorrentState(source_infohash="f" * 40, source_name="Fresh", state=State.NEW)
     assert coord.set_intake_paused(True) is True
     assert await coord._drain_intake([fresh], []) == 0
     coord._spawn_worker.assert_not_called()
@@ -144,8 +138,7 @@ async def test_schedule_step_paused_intake_parks_new(tmp_path):
     try:
         coord = make_coordinator(store)
         coord.set_intake_paused(True)
-        store.upsert(TorrentState(source_infohash="a" * 40,
-                                  source_name="New", state=State.NEW))
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="New", state=State.NEW))
         await coord._schedule_step()
         assert "a" * 40 not in coord._running_infohashes
         assert len(coord._tasks) == 0
@@ -194,13 +187,12 @@ def test_title_normalizer_is_single_implementation():
         "Example.Outpost.S04E08",
     ]
     for t in titles:
-        assert _norm_title_for_match(t) == normalize_content_name(
-            t, unify_separators=True)
+        assert _norm_title_for_match(t) == normalize_content_name(t, unify_separators=True)
     # Unification only affects separators; grouping default stays strict.
     assert normalize_content_name("Show.S01") != normalize_content_name("Show S01")
-    assert normalize_content_name(
-        "Show.S01", unify_separators=True) == normalize_content_name(
-            "Show S01", unify_separators=True)
+    assert normalize_content_name("Show.S01", unify_separators=True) == normalize_content_name(
+        "Show S01", unify_separators=True
+    )
 
 
 def test_size_tolerance_per_kind():
@@ -231,14 +223,12 @@ def test_matches_release_kind_and_separators():
 
     # Punctuation variants need the opt-in.
     assert not _matches_release("Show.S01", 1000, "Show S01", 1000)
-    assert _matches_release("Show.S01", 1000, "Show S01", 1000,
-                            unify_separators=True)
+    assert _matches_release("Show.S01", 1000, "Show S01", 1000, unify_separators=True)
     # Repack-scale episode diffs admit with kind, park without.
     target = 10_000_000_000
-    assert not _matches_release("Show.S01", target, "Show.S01",
-                                target + 60_000_000)
-    assert _matches_release("Show.S01", target, "Show.S01",
-                            target + 60_000_000, kind="episode")
+    assert not _matches_release("Show.S01", target, "Show.S01", target + 60_000_000)
+    assert _matches_release("Show.S01", target, "Show.S01", target + 60_000_000, kind="episode")
     # Release groups still discriminate.
-    assert not _matches_release("Show.S01-GRP1", target, "Show.S01-GRP2",
-                                target, kind="episode", unify_separators=True)
+    assert not _matches_release(
+        "Show.S01-GRP1", target, "Show.S01-GRP2", target, kind="episode", unify_separators=True
+    )

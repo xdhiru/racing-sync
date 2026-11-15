@@ -209,12 +209,13 @@ def _elect_primary_torrent(group: list) -> object:
     """
     ordered = sorted(
         group,
-        key=lambda t: ((getattr(t, "size_bytes", 0) or 0),
-                       (getattr(t, "name", "") or ""),
-                       (getattr(t, "infohash", "") or "").lower()),
+        key=lambda t: (
+            (getattr(t, "size_bytes", 0) or 0),
+            (getattr(t, "name", "") or ""),
+            (getattr(t, "infohash", "") or "").lower(),
+        ),
     )
-    return next((t for t in ordered if _looks_public(t.trackers)),
-                ordered[0])
+    return next((t for t in ordered if _looks_public(t.trackers)), ordered[0])
 
 
 # --------------------------------------------------------------------------- #
@@ -238,9 +239,13 @@ _SOURCE_STALE_EXPIRY_S = 300.0
 _STOP_WORKERS_TIMEOUT_S = 30.0
 
 
-async def _start_with_backoff(label: str, factory, *,
-                              attempts: int = _STARTUP_ATTEMPTS,
-                              delays: tuple[float, ...] = _STARTUP_BACKOFF_S):
+async def _start_with_backoff(
+    label: str,
+    factory,
+    *,
+    attempts: int = _STARTUP_ATTEMPTS,
+    delays: tuple[float, ...] = _STARTUP_BACKOFF_S,
+):
     """Run an I/O-doing boot step, retrying transient failures.
 
     `factory` is a no-arg async callable or a blocking sync callable
@@ -269,8 +274,14 @@ async def _start_with_backoff(label: str, factory, *,
                 delay = float(delays[min(attempt - 1, len(delays) - 1)])
             except (TypeError, ValueError, IndexError):
                 delay = 2.0
-            log.warning("startup: %s failed (%s); retrying in %.0fs (%d/%d)",
-                        label, e, delay, attempt, tries)
+            log.warning(
+                "startup: %s failed (%s); retrying in %.0fs (%d/%d)",
+                label,
+                e,
+                delay,
+                attempt,
+                tries,
+            )
             await asyncio.sleep(max(0.0, delay))
     assert last is not None
     raise last
@@ -301,9 +312,18 @@ _SOURCE_GONE = object()
 
 
 @dataclass
-class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
-                    InjectMixin, ReaddMixin, FuseMixin, DownloadMixin, MoveMixin,
-                    AdmitMixin):
+class Coordinator(
+    SSDLedgerMixin,
+    CleanupMixin,
+    WatchdogMixin,
+    LiveStatusMixin,
+    InjectMixin,
+    ReaddMixin,
+    FuseMixin,
+    DownloadMixin,
+    MoveMixin,
+    AdmitMixin,
+):
     cfg: AppConfig
     store: StateStore = field(init=False)
     source_client: TorrentClient = field(init=False)
@@ -431,6 +451,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             fuse = [str(self.cfg.rclone.fuse.mount), str(self.cfg.rclone.fuse.mount_unsorted)]
         except Exception:
             return
+
         def _norm(p: str) -> str:
             return p.rstrip("/\\").replace("\\", "/")
 
@@ -441,7 +462,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     log.warning(
                         "storage overlap: SSD path %s overlaps fuse mount %s — "
                         "on_fuse detection and moves will misbehave; use disjoint paths",
-                        s, fm,
+                        s,
+                        fm,
                     )
 
     def _warn_if_log_dir_on_data_mount(self) -> None:
@@ -476,7 +498,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                             "log dir %s shares a filesystem with data path %s — "
                             "a full SSD will take down logging and state.db; "
                             "put logs on a separate mount with retention",
-                            log_dir, dp,
+                            log_dir,
+                            dp,
                         )
                         break
                 except OSError:
@@ -505,25 +528,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         )
         try:
             if self.cfg.source.type == "qbittorrent":
-                self.source_client = QBittorrentClient(
-                    self.cfg.source, label="source-qb"
-                )
+                self.source_client = QBittorrentClient(self.cfg.source, label="source-qb")
             else:
                 self.source_client = DelugeClient(self.cfg.source)
             await self.source_client.start()
 
-            self.dest_client = QBittorrentClient(
-                self.cfg.dest, label="dest-qb"
-            )
+            self.dest_client = QBittorrentClient(self.cfg.dest, label="dest-qb")
             await self.dest_client.start()
 
             if self.cfg.prowlarr.enabled:
                 self.prowlarr = ProwlarrClient(self.cfg.prowlarr)
                 await _start_with_backoff("prowlarr", self.prowlarr.start)
 
-            if (self.cfg.source.type == "deluge"
-                    and self.cfg.source.deluge_sftp
-                    and self.cfg.source.deluge_sftp.enabled):
+            if (
+                self.cfg.source.type == "deluge"
+                and self.cfg.source.deluge_sftp
+                and self.cfg.source.deluge_sftp.enabled
+            ):
                 self.sftp = SFTPExporter(self.cfg.source.deluge_sftp)
                 await _start_with_backoff("sftp", self.sftp.connect)
                 # Reuse the shared connection for Deluge .torrent fallback
@@ -544,6 +565,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
 
             if self.cfg.recovery.run_on_startup:
                 from .recovery import _reconcile_snapshot
+
                 # Refactor (lazy recovery): fast snapshot only (no per-row
                 # RPC verification), daemon serves in seconds. Byte
                 # verification, classification, blob export and orphan
@@ -556,7 +578,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 # as a background task (no shutdown race, no 4-wide
                 # per-row storm at boot).
                 await _reconcile_snapshot(
-                    self.cfg, dest=self.dest_client, store=self.store,
+                    self.cfg,
+                    dest=self.dest_client,
+                    store=self.store,
                     verify=False,
                 )
                 self._recovery_task = None
@@ -570,16 +594,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     _all_rows = await offload(self.store.all)
                 except Exception:
                     _all_rows = []
-                failed_rows = [
-                    ts for ts in (_all_rows or [])
-                    if ts.state == State.FAILED
-                ]
+                failed_rows = [ts for ts in (_all_rows or []) if ts.state == State.FAILED]
                 max_retries = getattr(self.cfg.recovery, "max_failed_retries", 3)
                 for ts in failed_rows:
                     if ts.failed_retries >= max_retries:
                         log.warning(
                             "skipping auto-retry for %s: reached max retries (%d/%d)",
-                            ts.source_name, ts.failed_retries, max_retries,
+                            ts.source_name,
+                            ts.failed_retries,
+                            max_retries,
                         )
                         continue
                     try:
@@ -600,16 +623,20 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     try:
                         self.store.upsert(ts)
                     except AbandonedError:
-                        log.info("auto-retry: row gone for %s; skipping",
-                                 (ts.source_infohash or "")[:10])
+                        log.info(
+                            "auto-retry: row gone for %s; skipping", (ts.source_infohash or "")[:10]
+                        )
                         continue
                     except Exception:
                         continue
                     try:
                         self.transition(ts, State.NEW)
                     except (AbandonedError, ValueError) as e:
-                        log.info("auto-retry: cannot revive %s (%s); skipping",
-                                 (ts.source_infohash or "")[:10], e)
+                        log.info(
+                            "auto-retry: cannot revive %s (%s); skipping",
+                            (ts.source_infohash or "")[:10],
+                            e,
+                        )
                         continue
 
             # Optional Telegram bot (lazy import: python-telegram-bot is
@@ -643,16 +670,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             self._tg = None
             if self.cfg.telegram.enabled:
                 from .telegram_bot import TelegramBot
+
                 self._tg = TelegramBot(self.cfg.telegram, self, self.store)
                 await self._tg.start()
 
             # Optional FastAPI control plane
             from .api import serve
+
             self._api_task: asyncio.Task | None = None
             if self.cfg.api.enabled:
-                self._api_task = asyncio.create_task(
-                    serve(self), name="rs-api"
-                )
+                self._api_task = asyncio.create_task(serve(self), name="rs-api")
                 try:
                     self._api_task.add_done_callback(_log_api_task_done)
                 except Exception:
@@ -730,22 +757,26 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 if not force_refresh and (now_mono - self._source_torrents_cached_at) < 45.0:
                     return list(self._source_torrents_cache)
                 return await self._list_source_torrents_locked(
-                    force_refresh=force_refresh, now_mono=now_mono)
+                    force_refresh=force_refresh, now_mono=now_mono
+                )
         return await self._list_source_torrents_locked(
-            force_refresh=force_refresh, now_mono=now_mono)
+            force_refresh=force_refresh, now_mono=now_mono
+        )
 
     async def _list_source_torrents_locked(
-        self, *, force_refresh: bool = False, now_mono: float = 0.0,
+        self,
+        *,
+        force_refresh: bool = False,
+        now_mono: float = 0.0,
     ) -> list:
         """Source list body: caller holds `_source_list_lock` (or none)."""
         now_mono = now_mono or time.monotonic()
 
         try:
             all_torrents = await rpc(
-                self.source_client.list_torrents(
-                    category=self.cfg.source.category
-                ),
-                getattr(self, "cfg", None), "source list_torrents",
+                self.source_client.list_torrents(category=self.cfg.source.category),
+                getattr(self, "cfg", None),
+                "source list_torrents",
             )
         except AuthError:
             # Bad credentials never heal by retrying, and hammering risks
@@ -755,8 +786,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             # _process_torrent AuthError arm — rows must never fail over
             # an ops incident.
             raise
-        except (TimeoutError, asyncio.TimeoutError, OSError,
-                ValueError, RuntimeError) as e:
+        except (TimeoutError, asyncio.TimeoutError, OSError, ValueError, RuntimeError) as e:
             # Wedged/unreachable VPS1 poll: serve the stale cache when
             # there is one, else an empty view — a source outage must
             # degrade the poll, never fail rows or abort the tick from
@@ -766,18 +796,25 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             _stale = getattr(self, "_source_torrents_cache", None) or []
             try:
                 _stale_age = now_mono - float(
-                    getattr(self, "_source_last_success_mono", 0.0) or 0.0)
+                    getattr(self, "_source_last_success_mono", 0.0) or 0.0
+                )
             except (TypeError, ValueError):
                 _stale_age = 0.0
             if _stale and _stale_age > _SOURCE_STALE_EXPIRY_S:
                 log.error(
-                    "source poll failed (%s) for %ds; expiring stale "
-                    "view (%d torrent(s)): %s",
-                    type(e).__name__, int(_stale_age), len(_stale), e)
+                    "source poll failed (%s) for %ds; expiring stale view (%d torrent(s)): %s",
+                    type(e).__name__,
+                    int(_stale_age),
+                    len(_stale),
+                    e,
+                )
                 return []
-            log.warning("source poll failed (%s); using %s view: %s",
-                        type(e).__name__,
-                        "stale cache" if _stale else "empty", e)
+            log.warning(
+                "source poll failed (%s); using %s view: %s",
+                type(e).__name__,
+                "stale cache" if _stale else "empty",
+                e,
+            )
             return list(_stale)
         min_age = self.cfg.source.min_age_seconds
         if min_age <= 0:
@@ -812,8 +849,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         and discovery keeps recording arrivals for the resume.
         """
         self._intake_paused = bool(paused)
-        log.warning("intake %s by operator",
-                    "paused" if self._intake_paused else "resumed")
+        log.warning("intake %s by operator", "paused" if self._intake_paused else "resumed")
         return self._intake_paused
 
     async def shutdown(self) -> None:
@@ -945,8 +981,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 return False
             if _api_err is None:
                 return False
-            log.error("API server died (%s); stopping instead of "
-                      "running headless", _api_err)
+            log.error("API server died (%s); stopping instead of running headless", _api_err)
             return True
         except Exception:
             return False
@@ -970,8 +1005,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     self._loop_tasks = loop_tasks
                 except Exception:
                     pass
-            factories = (self._poller_loop, self._scheduler_loop,
-                         self._janitor_loop, self._qb_listener_loop)
+            factories = (
+                self._poller_loop,
+                self._scheduler_loop,
+                self._janitor_loop,
+                self._qb_listener_loop,
+            )
             owned: dict[asyncio.Task, object] = {}
             for factory in factories:
                 try:
@@ -991,8 +1030,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             # holds the token — respawning would re-conflict).
             try:
                 _tg = getattr(self, "_tg", None)
-                if _tg is not None and not bool(
-                        getattr(_tg, "_poll_conflict_fatal", False)):
+                if _tg is not None and not bool(getattr(_tg, "_poll_conflict_fatal", False)):
                     try:
                         _tg_by_name = {
                             "rs-telegram": _tg._loop,
@@ -1001,8 +1039,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                         }
                     except Exception:
                         _tg_by_name = {}
-                    for _attr in ("_task", "_callback_task",
-                                  "_detail_worker"):
+                    for _attr in ("_task", "_callback_task", "_detail_worker"):
                         try:
                             _t = getattr(_tg, _attr, None)
                         except Exception:
@@ -1051,22 +1088,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                             except asyncio.CancelledError:
                                 pass
                             except Exception as e:  # noqa: BLE001
-                                log.error("loop task died; respawning: %s", e,
-                                          exc_info=True)
+                                log.error("loop task died; respawning: %s", e, exc_info=True)
                             if factory is not None and not self._stop:
                                 try:
-                                    _fself = getattr(factory, "__self__",
-                                                     None)
-                                    _fconflict = bool(getattr(
-                                        _fself, "_poll_conflict_fatal",
-                                        False)) if _fself is not None else False
+                                    _fself = getattr(factory, "__self__", None)
+                                    _fconflict = (
+                                        bool(getattr(_fself, "_poll_conflict_fatal", False))
+                                        if _fself is not None
+                                        else False
+                                    )
                                 except Exception:
                                     _fconflict = False
                                 if _fconflict:
                                     log.error(
                                         "telegram poll conflict-fatal; not "
                                         "respawning (another session holds "
-                                        "the token)")
+                                        "the token)"
+                                    )
                                     continue
                                 try:
                                     new_task = asyncio.create_task(factory())
@@ -1114,12 +1152,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             ingested = False
             # Sync store I/O rides a worker thread: a WAL stall must not
             # block the poller loop behind the GIL.
-            _existing = await asyncio.to_thread(
-                self.store.get, item_hash, include_blob=False)
+            _existing = await asyncio.to_thread(self.store.get, item_hash, include_blob=False)
             if _existing is None:
                 try:
-                    _ignored = await asyncio.to_thread(
-                        self.store.is_ignored, item_hash) is True
+                    _ignored = await asyncio.to_thread(self.store.is_ignored, item_hash) is True
                 except Exception:
                     _ignored = False
                 if _ignored:
@@ -1127,8 +1163,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     # instead of re-ingesting. The file is left in place
                     # (never destroy what we didn't consume); unignore to
                     # reprocess it.
-                    log.info("watch-dir: ignoring cancelled drop %s (%s)",
-                             item.name[:60], item.infohash[:10])
+                    log.info(
+                        "watch-dir: ignoring cancelled drop %s (%s)",
+                        item.name[:60],
+                        item.infohash[:10],
+                    )
                     continue
                 ts = TorrentState(
                     source_infohash=item_hash,
@@ -1149,7 +1188,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     log.warning(
                         "watch-dir: release is tombstoned, leaving drop in "
                         "place: %s (%s); run unignore first",
-                        item.name[:60], item.infohash,
+                        item.name[:60],
+                        item.infohash,
                     )
                 else:
                     ingested = True
@@ -1168,23 +1208,24 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 try:
                     await asyncio.to_thread(
                         self.revive_failed_row,
-                        infohash=item_hash, name=item.name,
+                        infohash=item_hash,
+                        name=item.name,
                         size=item.size_bytes,
                         announce=item.announce_url or "",
                         blob=item.torrent_bytes,
-                        source_label="watch-dir")
+                        source_label="watch-dir",
+                    )
                 except LookupError as e:
-                    log.info("watch-dir: re-drop of failed %s not revived: %s",
-                             item.name[:60], e)
+                    log.info("watch-dir: re-drop of failed %s not revived: %s", item.name[:60], e)
                     continue
                 except Exception as e:  # noqa: BLE001
-                    log.warning("watch-dir: revive failed for %s: %s",
-                                item.name[:60], e)
+                    log.warning("watch-dir: revive failed for %s: %s", item.name[:60], e)
                     continue
                 ingested = True
                 log.info(
                     "watch-dir: re-queued failed release %s (%s)",
-                    item.name[:60], item.infohash[:10],
+                    item.name[:60],
+                    item.infohash[:10],
                 )
             elif getattr(_existing, "skipped", 0):
                 # A re-dropped file for a held row is the operator
@@ -1194,14 +1235,18 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 # Fail-open: a write failure just leaves it held for an
                 # explicit /unskip.
                 try:
-                    _resumed = bool(await asyncio.to_thread(
-                        self.store.update_columns, item_hash, {"skipped": 0}))
+                    _resumed = bool(
+                        await asyncio.to_thread(
+                            self.store.update_columns, item_hash, {"skipped": 0}
+                        )
+                    )
                 except Exception:
                     _resumed = False
                 if _resumed:
                     log.info(
                         "watch-dir: re-drop resumes held release %s (%s)",
-                        item.name[:60], item.infohash[:10],
+                        item.name[:60],
+                        item.infohash[:10],
                     )
                     ingested = True
             # Delete only what this scan ingested: an already-tracked drop
@@ -1223,7 +1268,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     if existing is not None and existing.state == State.DONE:
                         log.info(
                             "watch-dir: %s (%s) already done; removing duplicate drop",
-                            item.name[:60], item.infohash[:10],
+                            item.name[:60],
+                            item.infohash[:10],
                         )
                         await self.watch.delete_picked_up(item)
         return items
@@ -1259,13 +1305,14 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             pass
         try:
             from .task import TaskHandle, register_handle, short_gid
+
             try:
-                _kind = str(getattr(getattr(ts, "state", None),
-                                    "value", "") or "").lower() or "worker"
+                _kind = (
+                    str(getattr(getattr(ts, "state", None), "value", "") or "").lower() or "worker"
+                )
             except Exception:
                 _kind = "worker"
-            _handle = TaskHandle(infohash=h, gid=short_gid(h),
-                                 kind=_kind, task=task)
+            _handle = TaskHandle(infohash=h, gid=short_gid(h), kind=_kind, task=task)
             try:
                 _trees = getattr(self, "_moving_tree", None)
                 if isinstance(_trees, dict) and h in _trees:
@@ -1275,6 +1322,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             register_handle(self, _handle)
         except Exception:
             _handle = None  # type: ignore[assignment]
+
         def _done_cb(t: asyncio.Task, infohash: str = h) -> None:
             self._tasks.discard(t)
             self._running_infohashes.discard(infohash)
@@ -1291,6 +1339,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             try:
                 if _handle is not None:
                     from .task import unregister_handle
+
                     unregister_handle(self, _handle)
             except Exception:
                 pass
@@ -1303,8 +1352,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 except BaseException:
                     exc = None
                 if exc is not None:
-                    log.debug("worker for %s ended with %r",
-                              (infohash or "")[:10], exc)
+                    log.debug("worker for %s ended with %r", (infohash or "")[:10], exc)
+
         task.add_done_callback(_done_cb)
 
     async def stop_workers_for(self, infohash: str) -> bool:
@@ -1330,6 +1379,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 return False
             try:
                 from .task import handles_for
+
                 _handles = handles_for(self, h)
             except Exception:
                 _handles = []
@@ -1371,11 +1421,12 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*_live_tasks, return_exceptions=True),
-                    timeout=_STOP_WORKERS_TIMEOUT_S)
+                    timeout=_STOP_WORKERS_TIMEOUT_S,
+                )
             except (TimeoutError, asyncio.TimeoutError):
                 log.warning(
-                    "stop_workers_for %s timed out; %d worker(s) linger",
-                    h[:10], len(_live_tasks))
+                    "stop_workers_for %s timed out; %d worker(s) linger", h[:10], len(_live_tasks)
+                )
             except Exception:
                 pass
             return True if (_stopped or _live_tasks) else False
@@ -1435,8 +1486,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     _gname = group[0].name[:60] if group and group[0].name else "?"
                 except Exception:
                     _gname = "?"
-                log.warning("source group %s failed; continuing with next group: %s",
-                            _gname, e)
+                log.warning("source group %s failed; continuing with next group: %s", _gname, e)
         return fresh
 
     async def _process_source_group(self, group: list[Torrent]) -> TorrentState | None:
@@ -1449,7 +1499,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         if _group_is_ignored(group, getattr(self, "store", None)):
             log.info(
                 "ignoring cancelled release: %s (%d duplicate(s))",
-                group[0].name[:60], len(group),
+                group[0].name[:60],
+                len(group),
             )
             return None
         # Check if any torrent in this release group is already tracked in state store
@@ -1458,10 +1509,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         # get per member; first group member present wins, as before.
         existing_ts: TorrentState | None = None
         try:
-            _hashes = [(_t.infohash or "").lower() for _t in group
-                       if (_t.infohash or "").strip()]
-            _by_hash = await asyncio.to_thread(
-                self.store.get_many, _hashes) if _hashes else {}
+            _hashes = [(_t.infohash or "").lower() for _t in group if (_t.infohash or "").strip()]
+            _by_hash = await asyncio.to_thread(self.store.get_many, _hashes) if _hashes else {}
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1486,8 +1535,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 # Off the loop but still fatal to the group: a failed
                 # dedup lookup must not ingest a possible duplicate
                 # (the caller isolates groups; the next poll retries).
-                matches = await asyncio.to_thread(
-                    self.store.find_by_name, _nm)
+                matches = await asyncio.to_thread(self.store.find_by_name, _nm)
                 if matches:
                     # find_by_name is a fuzzy LIKE: require the same
                     # normalized release AND (when both known) the same
@@ -1495,10 +1543,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     # prefixes ("Show.S01" vs "Show.S01E02") would be
                     # swallowed as duplicates and never downloaded.
                     same = [
-                        m for m in matches
+                        m
+                        for m in matches
                         if _same_content_key(
-                            m.source_name or "", m.total_bytes or 0,
-                            t.name, t.size_bytes or 0,
+                            m.source_name or "",
+                            m.total_bytes or 0,
+                            t.name,
+                            t.size_bytes or 0,
                         )
                     ]
                     if same:
@@ -1514,7 +1565,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     await asyncio.to_thread(self.store.upsert, existing_ts)
                 except Exception:  # noqa: BLE001
                     pass
-            if existing_ts.state == State.DONE and self.cfg.cross_seed.inject_racing_torrents_to_fuse:
+            if (
+                existing_ts.state == State.DONE
+                and self.cfg.cross_seed.inject_racing_torrents_to_fuse
+            ):
                 if not getattr(existing_ts, "skipped", 0):
                     await self._check_and_inject_late_cross_seeds(existing_ts, group)
             return None
@@ -1587,7 +1641,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         if now - self._last_source_log_ts > 300:
             log.info(
                 "source poll: %d torrent(s) matching category=%r min_age=%ds",
-                len(src_torrents), self.cfg.source.category,
+                len(src_torrents),
+                self.cfg.source.category,
                 self.cfg.source.min_age_seconds,
             )
             self._last_source_log_ts = now
@@ -1671,7 +1726,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             _max_workers = 12
         try:
             _tasks = getattr(self, "_tasks", None)
-            _inflight = max(0, _max_workers - len(_tasks)) if isinstance(_tasks, set) else _max_workers
+            _inflight = (
+                max(0, _max_workers - len(_tasks)) if isinstance(_tasks, set) else _max_workers
+            )
         except Exception:
             _inflight = _max_workers
         spawned = 0
@@ -1744,8 +1801,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
-                log.warning("indexer wakeup for %s failed; continuing: %s",
-                            (getattr(ts, "source_infohash", "") or "")[:10], e)
+                log.warning(
+                    "indexer wakeup for %s failed; continuing: %s",
+                    (getattr(ts, "source_infohash", "") or "")[:10],
+                    e,
+                )
                 continue
 
         # 4. Schedule workers for active states that have no live task.
@@ -1783,8 +1843,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 for _hk, _hs in list(_reg.items()):
                     try:
                         if isinstance(_hs, set) and any(
-                                getattr(_x, "queued", False)
-                                for _x in list(_hs)):
+                            getattr(_x, "queued", False) for _x in list(_hs)
+                        ):
                             _parked.add(_hk)
                     except Exception:
                         continue
@@ -1792,13 +1852,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             _parked = set()
 
         active_downloads = sum(
-            1 for t in active
+            1
+            for t in active
             if (t.source_infohash or "").lower() in self._running_infohashes
             and t.state in (State.QUEUED, State.DOWNLOADING)
             and (t.source_infohash or "").lower() not in _parked
         )
         active_moves = sum(
-            1 for t in active
+            1
+            for t in active
             if (t.source_infohash or "").lower() in self._running_infohashes
             and t.state == State.MOVING
             and (t.source_infohash or "").lower() not in _parked
@@ -1809,7 +1871,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         # intake, checks and re-adds share a bounded misc budget; the
         # global worker count stays only as a backstop.
         live_misc = sum(
-            1 for t in active
+            1
+            for t in active
             if (t.source_infohash or "").lower() in self._running_infohashes
             and t.state not in (State.QUEUED, State.DOWNLOADING, State.MOVING)
             and (t.source_infohash or "").lower() not in _parked
@@ -1829,8 +1892,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
 
             # Operator intake pause (/pause_intake): NEW rows wait until
             # resumed; every other state keeps draining normally.
-            if getattr(ts, "state", None) == State.NEW and getattr(
-                    self, "_intake_paused", False):
+            if getattr(ts, "state", None) == State.NEW and getattr(self, "_intake_paused", False):
                 continue
 
             # Skip WAITING_INDEXER rows: they are parked and woken up exclusively
@@ -1861,22 +1923,28 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             # spawning over cap just parks inside _try_admit after burning
             # a worker plus a dest list_torrents storm. Force-start bypasses
             # (operator override; the worker still honors admission).
-            if (ts.state in (State.QUEUED, State.DOWNLOADING)
-                    and active_downloads >= self.cfg.max_active_downloads
-                    and not self._is_forced(_tkey)):
+            if (
+                ts.state in (State.QUEUED, State.DOWNLOADING)
+                and active_downloads >= self.cfg.max_active_downloads
+                and not self._is_forced(_tkey)
+            ):
                 continue
 
             # Limit concurrent active rclone move commands
-            if (ts.state == State.MOVING
-                    and active_moves >= self.cfg.max_concurrent_moves
-                    and not self._is_forced(_tkey)):
+            if (
+                ts.state == State.MOVING
+                and active_moves >= self.cfg.max_concurrent_moves
+                and not self._is_forced(_tkey)
+            ):
                 continue
 
             # All other states (NEW intake, WAITING_DISK checks, RE_ADDING,
             # DONE/FAILED drains) share the misc budget: unbounded intake
             # bursts must not flood the loop with Prowlarr picks either.
-            if (ts.state not in (State.QUEUED, State.DOWNLOADING, State.MOVING)
-                    and live_misc >= _MISC_WORKER_BUDGET):
+            if (
+                ts.state not in (State.QUEUED, State.DOWNLOADING, State.MOVING)
+                and live_misc >= _MISC_WORKER_BUDGET
+            ):
                 continue
 
             try:
@@ -1884,8 +1952,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
-                log.warning("scheduling worker for %s failed; continuing: %s",
-                            _tkey[:10], e)
+                log.warning("scheduling worker for %s failed; continuing: %s", _tkey[:10], e)
                 continue
 
             if ts.state in (State.QUEUED, State.DOWNLOADING):
@@ -1914,8 +1981,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             _log(
                 "scheduled %d worker(s) (active downloads=%d/%d, moves=%d/%d)",
                 scheduled,
-                active_downloads, self.cfg.max_active_downloads,
-                active_moves, self.cfg.max_concurrent_moves,
+                active_downloads,
+                self.cfg.max_active_downloads,
+                active_moves,
+                self.cfg.max_concurrent_moves,
             )
 
         # 4. Refresh live status (used by the Telegram bot). Isolated: a
@@ -1970,16 +2039,15 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         Each step is isolated: one step throwing must not starve the
         others (a source outage skips scheduling/janitor otherwise).
         """
-        for _step in (self._poll_source_step,
-                      self._schedule_step,
-                      self._janitor_step):
+        for _step in (self._poll_source_step, self._schedule_step, self._janitor_step):
             try:
                 await _step()
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
-                log.warning("tick step %s failed; continuing: %s",
-                            getattr(_step, "__name__", "?"), e)
+                log.warning(
+                    "tick step %s failed; continuing: %s", getattr(_step, "__name__", "?"), e
+                )
 
     # ---- per-lane health (production loop heartbeats) ----
 
@@ -2025,8 +2093,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             entry = self._lane_entry(name)
             entry["last_success_at"] = now
             _start = _strict_lane_number(started_at)
-            entry["last_duration_s"] = (
-                max(0.0, now - _start) if _start is not None else 0.0)
+            entry["last_duration_s"] = max(0.0, now - _start) if _start is not None else 0.0
             entry["consecutive_failures"] = 0
             entry["last_error"] = ""
         except Exception:
@@ -2069,14 +2136,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 if not isinstance(error, str):
                     error = ""
                 out[name] = {
-                    "last_attempt_at": _strict_lane_number(
-                        raw.get("last_attempt_at")),
-                    "last_success_at": _strict_lane_number(
-                        raw.get("last_success_at")),
-                    "last_failure_at": _strict_lane_number(
-                        raw.get("last_failure_at")),
-                    "last_duration_s": (
-                        max(0.0, duration) if duration is not None else None),
+                    "last_attempt_at": _strict_lane_number(raw.get("last_attempt_at")),
+                    "last_success_at": _strict_lane_number(raw.get("last_success_at")),
+                    "last_failure_at": _strict_lane_number(raw.get("last_failure_at")),
+                    "last_duration_s": (max(0.0, duration) if duration is not None else None),
                     "consecutive_failures": max(0, failures),
                     "last_error": error[:300],
                 }
@@ -2123,15 +2186,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 log.warning("poller: timed out; backing off: %s", e)
             except Exception as e:  # noqa: BLE001
                 self._lane_note_failure("poller", e)
-                log.error("poller: unexpected error; backing off: %s",
-                          e, exc_info=True)
+                log.error("poller: unexpected error; backing off: %s", e, exc_info=True)
             else:
                 self._lane_note_success("poller", _lane_started)
             if self._stop:
                 break
             try:
-                await asyncio.sleep(
-                    max(1, int(float(self.cfg.general.source_poll_interval or 30))))
+                await asyncio.sleep(max(1, int(float(self.cfg.general.source_poll_interval or 30))))
             except (TypeError, ValueError):
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
@@ -2158,15 +2219,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 log.warning("scheduler: timed out; backing off: %s", e)
             except Exception as e:  # noqa: BLE001
                 self._lane_note_failure("scheduler", e)
-                log.error("scheduler: unexpected error; backing off: %s",
-                          e, exc_info=True)
+                log.error("scheduler: unexpected error; backing off: %s", e, exc_info=True)
             else:
                 self._lane_note_success("scheduler", _lane_started)
             if self._stop:
                 break
             try:
-                await asyncio.sleep(
-                    max(1, int(float(self.cfg.general.dest_poll_interval or 30))))
+                await asyncio.sleep(max(1, int(float(self.cfg.general.dest_poll_interval or 30))))
             except (TypeError, ValueError):
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
@@ -2189,17 +2248,23 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 break
             except Exception as e:  # noqa: BLE001
                 self._lane_note_failure("janitor", e)
-                log.error("janitor: unexpected error; backing off: %s",
-                          e, exc_info=True)
+                log.error("janitor: unexpected error; backing off: %s", e, exc_info=True)
             else:
                 self._lane_note_success("janitor", _lane_started)
             if self._stop:
                 break
             try:
                 await asyncio.sleep(
-                    max(300, int(getattr(
-                        getattr(self.cfg, "cleanup", None),
-                        "janitor_interval_seconds", 3600) or 3600)))
+                    max(
+                        300,
+                        int(
+                            getattr(
+                                getattr(self.cfg, "cleanup", None), "janitor_interval_seconds", 3600
+                            )
+                            or 3600
+                        ),
+                    )
+                )
             except (TypeError, ValueError):
                 await asyncio.sleep(300)
             except asyncio.CancelledError:
@@ -2237,7 +2302,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 if _fresh.state != ts.state:
                     log.info(
                         "worker: %s moved %s -> %s by another actor; skipping stale worker",
-                        ts.source_infohash[:10], ts.state.value, _fresh.state.value,
+                        ts.source_infohash[:10],
+                        ts.state.value,
+                        _fresh.state.value,
                     )
                     return
                 try:
@@ -2252,7 +2319,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     # respawns with a fresh snapshot.
                     log.info(
                         "worker: %s version %d -> %d under us; skipping stale worker",
-                        ts.source_infohash[:10], _snap_v, _fresh_v,
+                        ts.source_infohash[:10],
+                        _snap_v,
+                        _fresh_v,
                     )
                     return
             try:
@@ -2263,16 +2332,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             # The DB row is gone (forget/cancel removed it mid-flight):
             # unwind quietly. Failing here would upsert-resurrect the
             # deliberately deleted row as a zombie FAILED row.
-            log.info("worker: %s abandoned (%s); stopping",
-                     ts.source_infohash[:10], e)
+            log.info("worker: %s abandoned (%s); stopping", ts.source_infohash[:10], e)
             return
         except (RcloneTimeoutError, RcloneTransientError) as e:
             # Last-resort net: a timed-out or transiently-failed move from
             # any path parks the row (source bytes intact) instead of
             # failing it. The two expected sites handle this directly with
             # better context; this only fires for future call paths.
-            log.error("rclone move issue for %s: %s (parking, not failing)",
-                      ts.source_infohash[:10], e)
+            log.error(
+                "rclone move issue for %s: %s (parking, not failing)", ts.source_infohash[:10], e
+            )
             try:
                 if ts.state == State.MOVING:
                     self._park_moving(ts, f"rclone move timed out: {e}")
@@ -2281,14 +2350,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                         _gone = (
                             getattr(self, "store", None) is not None
                             and hasattr(self.store, "get")
-                            and self.store.get(ts.source_infohash,
-                                               include_blob=False) is None
+                            and self.store.get(ts.source_infohash, include_blob=False) is None
                         )
                     except Exception:
                         _gone = False
                     if _gone:
-                        log.info("worker: row gone for %s; dropping timeout (%s)",
-                                 ts.source_infohash[:10], e)
+                        log.info(
+                            "worker: row gone for %s; dropping timeout (%s)",
+                            ts.source_infohash[:10],
+                            e,
+                        )
                         return
                     try:
                         ts.last_error = f"rclone timed out: {e}"[:500]
@@ -2303,8 +2374,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             # and hammering risks lockout). Leave the row untouched for
             # the next tick; the poller/scheduler loops page loudly via
             # their own AuthError arms.
-            log.error("worker: auth failure for %s (%s); leaving row for next tick",
-                      ts.source_infohash[:10], e)
+            log.error(
+                "worker: auth failure for %s (%s); leaving row for next tick",
+                ts.source_infohash[:10],
+                e,
+            )
             return
         except Exception as e:  # noqa: BLE001
             # Backstop for the same abandonment race on every other path:
@@ -2318,8 +2392,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             except Exception:
                 _row_gone = False
             if _row_gone:
-                log.info("worker: row gone for %s; dropping error (%s)",
-                         ts.source_infohash[:10], e)
+                log.info("worker: row gone for %s; dropping error (%s)", ts.source_infohash[:10], e)
                 return
             log.exception("worker failed for %s", ts.source_infohash[:10])
             if ts.state == State.DONE:
@@ -2327,7 +2400,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 # must never corrupt the row with a failure string.
                 log.warning(
                     "late failure after DONE for %s (%s); keeping DONE",
-                    ts.source_infohash[:10], e,
+                    ts.source_infohash[:10],
+                    e,
                 )
             elif ts.state != State.FAILED:
                 try:
@@ -2335,7 +2409,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 except ValueError as ve:
                     log.warning(
                         "could not transition %s (%s) to FAILED: %s",
-                        ts.source_infohash[:10], ts.state.value, ve,
+                        ts.source_infohash[:10],
+                        ts.state.value,
+                        ve,
                     )
                     ts.last_error = str(e)[:500]
                     self.store.upsert(ts)
@@ -2355,8 +2431,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 progress = self.live_progress_map().get((ts.source_infohash or "").lower())
             await tg.ensure_detail_message(ts, progress=progress)
         except Exception as e:  # noqa: BLE001
-            log.warning("telegram notify failed for %s: %s",
-                        ts.source_infohash[:10], e)
+            log.warning("telegram notify failed for %s: %s", ts.source_infohash[:10], e)
 
     def _abandoned(self, ts: TorrentState) -> bool:
         """True when the DB row was deleted after the tick snapshot.
@@ -2376,7 +2451,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             return False
 
     async def find_release(
-        self, query: str, *, per_indexer: int = 3, max_indexers: int = 10,
+        self,
+        query: str,
+        *,
+        per_indexer: int = 3,
+        max_indexers: int = 10,
     ) -> dict:
         """Read-only Prowlarr search for the operator (/find command).
 
@@ -2392,11 +2471,9 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         if prow is None:
             raise LookupError("Prowlarr is not configured.")
         try:
-            _skip = getattr(getattr(prow, "_cfg", None),
-                            "should_skip_title", None)
+            _skip = getattr(getattr(prow, "_cfg", None), "should_skip_title", None)
             if callable(_skip) and _skip(q):
-                raise LookupError(
-                    f"{q!r} is skipped by config (skip_query_substrings).")
+                raise LookupError(f"{q!r} is skipped by config (skip_query_substrings).")
         except LookupError:
             raise
         except Exception:
@@ -2407,7 +2484,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             raise LookupError(f"indexer list unavailable: {e}") from e
         if not indexers:
             raise LookupError("No download-target indexers configured.")
-        indexers = indexers[:max(1, max_indexers)]
+        indexers = indexers[: max(1, max_indexers)]
         try:
             per = max(1, int(per_indexer or 3))
         except (TypeError, ValueError):
@@ -2424,21 +2501,26 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                     hits.get(name.lower(), []) or [],
                     key=lambda h: -(getattr(h, "size_bytes", 0) or 0),
                 )
-                out.append({
-                    "name": name,
-                    "total": len(hs),
-                    "hits": [
-                        {"title": str(getattr(h, "title", "") or ""),
-                         "size_bytes": int(getattr(h, "size_bytes", 0) or 0)}
-                        for h in hs[:per]
-                    ],
-                })
+                out.append(
+                    {
+                        "name": name,
+                        "total": len(hs),
+                        "hits": [
+                            {
+                                "title": str(getattr(h, "title", "") or ""),
+                                "size_bytes": int(getattr(h, "size_bytes", 0) or 0),
+                            }
+                            for h in hs[:per]
+                        ],
+                    }
+                )
             except Exception:
                 continue
         return {"query": q, "indexers": out}
 
-    def transition(self, ts: TorrentState, dst: State,
-                   *, error: str = "", batch_index: int | None = None) -> None:
+    def transition(
+        self, ts: TorrentState, dst: State, *, error: str = "", batch_index: int | None = None
+    ) -> None:
         """Wrap store.transition + log + queue a Telegram update.
 
         Local log file gets one concise line per transition; Telegram
@@ -2533,13 +2615,13 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         # a worker spawned for NEW that reaches QUEUED counts as queued.
         try:
             from .task import handles_for
+
             try:
                 _dk = str(getattr(dst, "value", "") or "").lower()
             except Exception:
                 _dk = ""
             if _dk:
-                for _hd in handles_for(
-                        self, ts.source_infohash or ""):
+                for _hd in handles_for(self, ts.source_infohash or ""):
                     try:
                         _hd.kind = _dk
                     except Exception:
@@ -2561,7 +2643,8 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             ts.source_name[:60],
             prev.value,
             dst.value,
-            ts.batch_index, ts.batches_total,
+            ts.batch_index,
+            ts.batches_total,
         )
         if _should_notify_telegram(prev, dst):
             self._schedule_telegram_update(ts)
@@ -2610,9 +2693,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             _entry_state = None
         if ts.state == State.NEW:
             await self._do_new(ts)
-        if ts.state == State.WAITING_INDEXER and _entry_state in (
-            State.WAITING_INDEXER,
-        ):
+        if ts.state == State.WAITING_INDEXER and _entry_state in (State.WAITING_INDEXER,):
             # Refactor: timer-elapsed WAITING_INDEXER rows work directly.
             # The retired QUERYING hop is gone (see state.py migration);
             # the scheduler wakes due rows and the worker picks them up
@@ -2667,9 +2748,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             return
         ts = fresh
         try:
-            _public_mode = bool(
-                ts.public_export_next_retry_at
-                and not ts.indexer_next_retry_at)
+            _public_mode = bool(ts.public_export_next_retry_at and not ts.indexer_next_retry_at)
         except Exception:
             _public_mode = False
         log.info(
@@ -2715,8 +2794,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             # instead of each paying an O(N) scan.
             try:
                 _memo = getattr(self, "_source_cache_index", None)
-                if (not isinstance(_memo, tuple) or len(_memo) != 2
-                        or _memo[0] != id(cache)):
+                if not isinstance(_memo, tuple) or len(_memo) != 2 or _memo[0] != id(cache):
                     _idx: dict[str, object] = {}
                     for _st in cache:
                         try:
@@ -2732,8 +2810,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 st = None
             if st is None:
                 return None
-            _is_deluge = isinstance(
-                getattr(self, "source_client", None), DelugeClient)
+            _is_deluge = isinstance(getattr(self, "source_client", None), DelugeClient)
             try:
                 if _is_deluge:
                     return st
@@ -2802,10 +2879,16 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         except Exception:
             return None
 
-    def revive_failed_row(self, *, infohash: str, name: str = "",
-                            size: int = 0, announce: str = "",
-                            blob: bytes | None = None,
-                            source_label: str = "") -> TorrentState:
+    def revive_failed_row(
+        self,
+        *,
+        infohash: str,
+        name: str = "",
+        size: int = 0,
+        announce: str = "",
+        blob: bytes | None = None,
+        source_label: str = "",
+    ) -> TorrentState:
         """Re-queue a FAILED row from freshly provided .torrent bytes.
 
         Operator intent (Telegram /add, watch-dir re-drop) explicitly
@@ -2825,11 +2908,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         if store is None or not hasattr(store, "get"):
             raise LookupError("state store unavailable")
         try:
-            if callable(getattr(store, "is_ignored", None)) \
-                    and store.is_ignored(norm) is True:
+            if callable(getattr(store, "is_ignored", None)) and store.is_ignored(norm) is True:
                 raise LookupError(
-                    "Ignored (previously cancelled): unignore it first, "
-                    "then add again")
+                    "Ignored (previously cancelled): unignore it first, then add again"
+                )
         except LookupError:
             raise
         except Exception:
@@ -2849,9 +2931,7 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 label = state.value
             except Exception:
                 label = "tracked"
-            raise LookupError(
-                f"Already tracked: {(ts.source_name or norm[:10])[:50]} "
-                f"({label})")
+            raise LookupError(f"Already tracked: {(ts.source_name or norm[:10])[:50]} ({label})")
         if name:
             ts.source_name = name
         if size:
@@ -2896,8 +2976,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         ts.batch_index = 0
         ts.batches_total = 0
         self.transition(ts, State.NEW)
-        log.info("revived failed row %s (%s) -> NEW via operator re-add",
-                 (ts.source_name or norm[:10])[:60], norm[:10])
+        log.info(
+            "revived failed row %s (%s) -> NEW via operator re-add",
+            (ts.source_name or norm[:10])[:60],
+            norm[:10],
+        )
         return ts
 
     async def _fetch_source_or_fail(self, ts: TorrentState):
@@ -2933,13 +3016,17 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         try:
             st = await rpc(
                 self.source_client.get_torrent(ts.source_infohash),
-                getattr(self, "cfg", None), "source get_torrent",
+                getattr(self, "cfg", None),
+                "source get_torrent",
             )
         except (TimeoutError, asyncio.TimeoutError) as e:
             # Hung VPS1 lookup degrades to a quiet retry next tick —
             # never a terminal FAILED over one wedged poll.
-            log.warning("source lookup timed out for %s (%s); retry next tick",
-                        (ts.source_infohash or "")[:10], e)
+            log.warning(
+                "source lookup timed out for %s (%s); retry next tick",
+                (ts.source_infohash or "")[:10],
+                e,
+            )
             return None
         if st is None:
             try:
@@ -2956,8 +3043,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
             except Exception:
                 _n = 3
             if _n < 3:
-                log.warning("source torrent %s unseen (miss %d/3); keeping row",
-                            (ts.source_infohash or "")[:10], _n)
+                log.warning(
+                    "source torrent %s unseen (miss %d/3); keeping row",
+                    (ts.source_infohash or "")[:10],
+                    _n,
+                )
                 return None
             try:
                 _misses.pop(_key, None)
@@ -2968,11 +3058,11 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
                 # still supply the SSD bytes: park (24h max-age backstop
                 # still applies) and let the caller pick from persisted
                 # metadata instead of failing a recoverable row.
-                log.warning("source torrent %s gone from VPS1; parking "
-                            "for Prowlarr cross-seed",
-                            (ts.source_infohash or "")[:10])
-                self._park_for_indexer_retry(
-                    ts, reason="source vanished from VPS1")
+                log.warning(
+                    "source torrent %s gone from VPS1; parking for Prowlarr cross-seed",
+                    (ts.source_infohash or "")[:10],
+                )
+                self._park_for_indexer_retry(ts, reason="source vanished from VPS1")
                 if ts.state == State.FAILED:
                     # Max-age tripped inside the park: the row just failed.
                     # Report plain None (parked/failed) — the caller must
@@ -2999,10 +3089,10 @@ class Coordinator(SSDLedgerMixin, CleanupMixin, WatchdogMixin, LiveStatusMixin,
         Delegates to content_keys.same_release_name (single rule).
         """
         return [
-            t for t in all_source
-            if t.infohash != st.infohash and (
-                t.name == st.name or _same_release_name(t.name, st.name)
-            )
+            t
+            for t in all_source
+            if t.infohash != st.infohash
+            and (t.name == st.name or _same_release_name(t.name, st.name))
         ]
 
     async def _operator_supplied_decision(self, ts: TorrentState):

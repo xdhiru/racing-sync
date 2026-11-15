@@ -1,4 +1,5 @@
 """Worker loop-level flood backoff, 401 fail-fast, narrow prefill, poll conflict."""
+
 from __future__ import annotations
 
 import asyncio
@@ -15,8 +16,7 @@ async def test_worker_loop_backs_off_once_and_requeues_remainder():
     from unittest.mock import AsyncMock, MagicMock
 
     bot = object.__new__(TelegramBot)
-    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123",
-                              outbound_rate=30.0)
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123", outbound_rate=30.0)
     bot._bot = MagicMock()
     bot._detail_queue = asyncio.Queue()
     bot._detail_queue.put_nowait(("a" * 40, None))
@@ -67,7 +67,8 @@ async def test_start_fails_fast_on_401():
     with patch("racing_sync.telegram_bot.Bot") as mock_bot_cls:
         mock_bot = MagicMock()
         mock_bot.send_message = AsyncMock(
-            side_effect=TelegramError("Unauthorized: bot token invalid"))
+            side_effect=TelegramError("Unauthorized: bot token invalid")
+        )
         mock_bot_cls.return_value = mock_bot
         with pytest.raises(RuntimeError, match="bot_token rejected"):
             await bot.start()
@@ -120,9 +121,12 @@ async def test_callback_loop_fails_fast_on_repeated_conflict():
     bot._stopped = False
     bot._bot = MagicMock()
     bot._bot.get_updates = AsyncMock(
-        side_effect=[Exception("Conflict: terminated by other getUpdates"),
-                     Exception("Conflict: terminated by other getUpdates"),
-                     Exception("Conflict: terminated by other getUpdates")])
+        side_effect=[
+            Exception("Conflict: terminated by other getUpdates"),
+            Exception("Conflict: terminated by other getUpdates"),
+            Exception("Conflict: terminated by other getUpdates"),
+        ]
+    )
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         await bot._callback_loop()
     assert bot._poll_conflicts == 3
@@ -138,10 +142,15 @@ def test_state_prefill_query_is_narrow(tmp_path):
 
     store = StateStore(tmp_path / "t.db")
     try:
-        store.upsert(TorrentState(
-            source_infohash="a" * 40, source_name="Show",
-            state=State.DONE, total_bytes=100,
-            telegram_message_id=77))
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Show",
+                state=State.DONE,
+                total_bytes=100,
+                telegram_message_id=77,
+            )
+        )
         rows = store.all_card_prefill()
     finally:
         try:

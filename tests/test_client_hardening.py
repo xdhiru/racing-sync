@@ -1,4 +1,5 @@
 """Client hardening: URL gates, fail-closed daemon check, progress clamp."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -24,8 +25,14 @@ def test_fetchable_blocks_numeric_loopbacks():
 def test_qb_progress_clamped():
     from racing_sync.clients.qbittorrent import _torrent_from_qb
 
-    base = {"hash": "a" * 40, "name": "T", "save_path": "/s",
-            "size": 100, "state": "downloading", "ratio": 2.5}
+    base = {
+        "hash": "a" * 40,
+        "name": "T",
+        "save_path": "/s",
+        "size": 100,
+        "state": "downloading",
+        "ratio": 2.5,
+    }
     assert _torrent_from_qb({**base, "progress": 1.5}).progress == 1.0
     assert _torrent_from_qb({**base, "progress": -0.5}).progress == 0.0
     assert _torrent_from_qb({**base, "progress": 0.5}).progress == 0.5
@@ -43,18 +50,15 @@ async def test_qb_add_rejects_bad_urls():
 
     http_cfg = MagicMock()  # plain: spec'd mocks hide real attrs
     from racing_sync.clients.http_base import HTTPClientBase
+
     HTTPClientBase.__init__(client, http_cfg, label="t")
     client._add_lock = __import__("asyncio").Lock()
     client.request = AsyncMock()
-    for bad in ("file:///etc/passwd",
-                "http:///no-host/x",
-                "gopher://x/y",
-                "not a url at all"):
+    for bad in ("file:///etc/passwd", "http:///no-host/x", "gopher://x/y", "not a url at all"):
         with pytest.raises(ValueError):
             await client.add_torrent(urls=[bad], save_path="/s")
     assert client.request.await_count == 0
-    for good in ("magnet:?xt=urn:btih:" + "a" * 40,
-                 "https://tracker.example/x"):
+    for good in ("magnet:?xt=urn:btih:" + "a" * 40, "https://tracker.example/x"):
         client.request = AsyncMock(return_value=_Resp("Ok."))
         res = await client.add_torrent(urls=[good], save_path="/s")
         assert res.accepted is True
@@ -82,21 +86,25 @@ async def test_deluge_health_check_failure_is_auth_error():
     from racing_sync.config import SourceConfig
 
     src = SourceConfig(
-        type="deluge", host="http://127.0.0.1:8112", password="secret",
-        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1",
-                     "ssh_password": "pwd",
-                     "state_dir": "/var/lib/deluged/state"},
+        type="deluge",
+        host="http://127.0.0.1:8112",
+        password="secret",
+        deluge_sftp={
+            "enabled": True,
+            "ssh_host": "127.0.0.1",
+            "ssh_password": "pwd",
+            "state_dir": "/var/lib/deluged/state",
+        },
     )
     client = DelugeClient.__new__(DelugeClient)
     from racing_sync.config import HTTPClientConfig
     from racing_sync.clients.http_base import HTTPClientBase
-    HTTPClientBase.__init__(
-        client, HTTPClientConfig.from_source(src), label="t")
+
+    HTTPClientBase.__init__(client, HTTPClientConfig.from_source(src), label="t")
 
     login = MagicMock()
     login.status = 200
-    login.json = AsyncMock(
-        return_value={"result": True, "error": None, "id": 1})
+    login.json = AsyncMock(return_value={"result": True, "error": None, "id": 1})
 
     def _post(url, **kw):
         m = kw.get("json") or {}
@@ -143,10 +151,17 @@ def test_deluge_scan_lock_eager():
     from racing_sync.config import SourceConfig
     import asyncio
 
-    client = DelugeClient(SourceConfig(
-        type="deluge", host="http://127.0.0.1:8112", password="secret",
-        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1",
-                     "ssh_password": "pwd",
-                     "state_dir": "/var/lib/deluged/state"},
-    ))
+    client = DelugeClient(
+        SourceConfig(
+            type="deluge",
+            host="http://127.0.0.1:8112",
+            password="secret",
+            deluge_sftp={
+                "enabled": True,
+                "ssh_host": "127.0.0.1",
+                "ssh_password": "pwd",
+                "state_dir": "/var/lib/deluged/state",
+            },
+        )
+    )
     assert isinstance(client._scan_lock, asyncio.Lock)

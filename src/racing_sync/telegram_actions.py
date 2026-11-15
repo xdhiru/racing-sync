@@ -62,15 +62,18 @@ class ActionsMixin:
             return full
         try:
             from .telegram_protocol import match_status_filter
+
             return [
-                _r for _r in full
-                if match_status_filter(
-                    getattr(getattr(_r, "state", None), "value", ""), flt)]
+                _r
+                for _r in full
+                if match_status_filter(getattr(getattr(_r, "state", None), "value", ""), flt)
+            ]
         except Exception:
             return full
 
-    async def _execute_cancel_one(self, infohash: str, *, delete_files: bool,
-                                    remember: bool = True) -> str:
+    async def _execute_cancel_one(
+        self, infohash: str, *, delete_files: bool, remember: bool = True
+    ) -> str:
         """Forget one release; files kept iff not `delete_files`.
 
         `remember=False` skips the ignore entry and hard-deletes the row
@@ -78,10 +81,15 @@ class ActionsMixin:
         upsert resurrects it, and a later re-drop re-ingests from scratch.
         """
         _verb = "Cancelled" if delete_files else "Kept files for"
-        _done = ("(removed + ignored)" if remember
-                 else "(removed, can be re-added)") if delete_files else (
-            "untracked + ignored, data left in place" if remember else
-            "untracked, data left in place (can be re-added)")
+        _done = (
+            ("(removed + ignored)" if remember else "(removed, can be re-added)")
+            if delete_files
+            else (
+                "untracked + ignored, data left in place"
+                if remember
+                else "untracked, data left in place (can be re-added)"
+            )
+        )
         try:
             from .api import _hold_ops_lock
         except Exception:
@@ -109,8 +117,7 @@ class ActionsMixin:
                 if isinstance(cached_id, int) and cached_id > 0:
                     detail_msg_id = cached_id
             if detail_msg_id is None:
-                detail_msg_id = await asyncio.to_thread(
-                    store.get_telegram_message_id, infohash)
+                detail_msg_id = await asyncio.to_thread(store.get_telegram_message_id, infohash)
         except Exception:
             detail_msg_id = None
         try:
@@ -121,26 +128,34 @@ class ActionsMixin:
             if _hold_ops_lock is not None:
                 async with _hold_ops_lock(coord):
                     result = await forget_torrent(
-                        cfg, dest=dest, store=store, target=infohash,
-                        apply=True, delete_files=delete_files,
-                        ignore=remember, hard=not remember,
+                        cfg,
+                        dest=dest,
+                        store=store,
+                        target=infohash,
+                        apply=True,
+                        delete_files=delete_files,
+                        ignore=remember,
+                        hard=not remember,
                         stop_workers=_stop_cb,
                     )
                     try:
-                        await coord._ssd_release(
-                            result.get("source_infohash") or infohash)
+                        await coord._ssd_release(result.get("source_infohash") or infohash)
                     except Exception:
                         pass
             else:
                 result = await forget_torrent(
-                    cfg, dest=dest, store=store, target=infohash,
-                    apply=True, delete_files=delete_files,
-                    ignore=remember, hard=not remember,
+                    cfg,
+                    dest=dest,
+                    store=store,
+                    target=infohash,
+                    apply=True,
+                    delete_files=delete_files,
+                    ignore=remember,
+                    hard=not remember,
                     stop_workers=_stop_cb,
                 )
                 try:
-                    await coord._ssd_release(
-                        result.get("source_infohash") or infohash)
+                    await coord._ssd_release(result.get("source_infohash") or infohash)
                 except Exception:
                     pass
         except LookupError:
@@ -175,9 +190,12 @@ class ActionsMixin:
         pair_note = ""
         if pairs:
             pair_note = " + {} waiting pair{}: {}".format(
-                len(pairs), "" if len(pairs) == 1 else "s",
-                ", ".join(str(p.get("source_name") or p.get("source_infohash", "")[:10])[:40]
-                          for p in pairs[:3]),
+                len(pairs),
+                "" if len(pairs) == 1 else "s",
+                ", ".join(
+                    str(p.get("source_name") or p.get("source_infohash", "")[:10])[:40]
+                    for p in pairs[:3]
+                ),
             )
             if len(pairs) > 3:
                 pair_note += f" (+{len(pairs) - 3} more)"
@@ -186,9 +204,9 @@ class ActionsMixin:
             return f"{_verb} {name}{pair_note} with {len(errs)} error(s); check logs"
         return f"{_verb} {name}{pair_note} {_done}"
 
-    async def _execute_snapshot_cancel(self, hashes: list[str], title: str,
-                                         *, delete_files: bool,
-                                         remember: bool = True) -> str:
+    async def _execute_snapshot_cancel(
+        self, hashes: list[str], title: str, *, delete_files: bool, remember: bool = True
+    ) -> str:
         """Forget resolved hashes (liveness re-checked each).
 
         `remember=False` forgets without the ignore entry and hard-deletes
@@ -201,8 +219,7 @@ class ActionsMixin:
         double-forgetting it.
         """
         _flag = f"{'1' if remember else '0'}:{'del' if delete_files else 'keep'}"
-        _hashes = sorted({(h or "").lower()
-                          for h in hashes or [] if (h or "").strip()})
+        _hashes = sorted({(h or "").lower() for h in hashes or [] if (h or "").strip()})
         _claimed: list[str] = []
         try:
             for _h in _hashes:
@@ -227,8 +244,7 @@ class ActionsMixin:
                 except Exception as e:  # noqa: BLE001
                     # A failed read is not a gone row: reporting "gone"
                     # here strands a live torrent with no way forward.
-                    log.warning("cancel liveness read failed for %s: %s",
-                                (h or "")[:10], e)
+                    log.warning("cancel liveness read failed for %s: %s", (h or "")[:10], e)
                     return _action_error_text(e)
                 if row is not None:
                     live.append(h)
@@ -246,14 +262,16 @@ class ActionsMixin:
                     except Exception:
                         pass
                 try:
-                    outs.append(await self._execute_cancel_one(
-                        h, delete_files=delete_files, remember=remember))
+                    outs.append(
+                        await self._execute_cancel_one(
+                            h, delete_files=delete_files, remember=remember
+                        )
+                    )
                 except Exception as e:  # noqa: BLE001
                     outs.append(_action_error_text(e))
             if len(outs) == 1:
                 return outs[0]
-            ok = sum(1 for o in outs
-                     if o.startswith(("Cancelled", "Kept files")))
+            ok = sum(1 for o in outs if o.startswith(("Cancelled", "Kept files")))
             verb = "Cancelled" if delete_files else "Kept files for"
             suffix = "" if delete_files else " (data left in place)"
             return f"{verb} {title} ({ok}/{len(outs)} copies){suffix}"
@@ -270,8 +288,7 @@ class ActionsMixin:
         """Wait-note map for prefer eligibility (best-effort, str-only)."""
         notes: dict[str, str] = {}
         try:
-            fn = getattr(getattr(self, "_coord", None),
-                         "_watch_wait_note", None)
+            fn = getattr(getattr(self, "_coord", None), "_watch_wait_note", None)
             if not callable(fn):
                 return notes
             for m in members or []:
@@ -297,20 +314,20 @@ class ActionsMixin:
         dest = getattr(getattr(self, "_coord", None), "dest_client", None)
         if dest is None:
             try:
-                await self._reply("Action failed: bot not attached.",
-                                  reply_to=message)
+                await self._reply("Action failed: bot not attached.", reply_to=message)
             except Exception:
                 pass
             return
         try:
-            h = ((getattr(row, "dest_infohash", "") or "")
-                 or (getattr(row, "source_infohash", "") or "")).lower()
+            h = (
+                (getattr(row, "dest_infohash", "") or "")
+                or (getattr(row, "source_infohash", "") or "")
+            ).lower()
         except Exception:
             h = ""
         if not h:
             try:
-                await self._reply("No client entry for this row.",
-                                  reply_to=message)
+                await self._reply("No client entry for this row.", reply_to=message)
             except Exception:
                 pass
             return
@@ -324,8 +341,7 @@ class ActionsMixin:
             return
         if not files:
             try:
-                await self._reply("No files listed yet (nothing "
-                                  "downloaded?).", reply_to=message)
+                await self._reply("No files listed yet (nothing downloaded?).", reply_to=message)
             except Exception:
                 pass
             return
@@ -385,8 +401,7 @@ class ActionsMixin:
             # Same rule as the snapshot cancel: a failed read is not a
             # gone row — say so instead of stranding a live torrent.
             try:
-                await self._reply(_action_error_text(e)[:300],
-                                  reply_to=message)
+                await self._reply(_action_error_text(e)[:300], reply_to=message)
             except Exception:
                 pass
             return
@@ -417,6 +432,7 @@ class ActionsMixin:
                         pass
                 _forced.add(_hh)
                 from .task import handles_for
+
                 _woke = 0
                 for _hd in handles_for(self, _hh):
                     try:
@@ -426,9 +442,11 @@ class ActionsMixin:
                         _woke += 1
                     except Exception:
                         continue
-                result = (f"Force-start armed for {title}"
-                          f"{f' ({_woke} waiter(s) woken)' if _woke else ''} "
-                          f"— bypasses slot caps until it leaves the lane.")
+                result = (
+                    f"Force-start armed for {title}"
+                    f"{f' ({_woke} waiter(s) woken)' if _woke else ''} "
+                    f"— bypasses slot caps until it leaves the lane."
+                )
             except (LookupError, ValueError) as e:
                 result = _scrubbed(e)[:300]
             except Exception as e:  # noqa: BLE001
@@ -449,13 +467,11 @@ class ActionsMixin:
             # anymore). See _group_hashes_for for why the hold covers
             # the release, not the tracker copy.
             try:
-                _gh = await asyncio.to_thread(
-                    self._group_hashes_for, full_hash)
+                _gh = await asyncio.to_thread(self._group_hashes_for, full_hash)
             except Exception:
                 _gh = None
             try:
-                result = await self._skip_torrents(
-                    _gh or [full_hash], hold=(kind == "skip"))
+                result = await self._skip_torrents(_gh or [full_hash], hold=(kind == "skip"))
             except Exception as e:  # noqa: BLE001
                 result = _action_error_text(e)
             try:
@@ -469,8 +485,7 @@ class ActionsMixin:
                 pass
             return
         if kind == "cancel":
-            _text, _rows = CancelScope("single", full_hash).remember_sheet(
-                f"Forget {title}?")
+            _text, _rows = CancelScope("single", full_hash).remember_sheet(f"Forget {title}?")
             try:
                 await self._send_sheet(_text, _rows, reply_to=message)
             except Exception:
@@ -542,15 +557,15 @@ class ActionsMixin:
             _lead = ""
             try:
                 _m0 = members[0] if members else None
-                _lead = ((getattr(_m0, "infohash", "") or "")
-                         or (getattr(_m0, "source_infohash", "") or ""))
+                _lead = (getattr(_m0, "infohash", "") or "") or (
+                    getattr(_m0, "source_infohash", "") or ""
+                )
                 _lead = _lead.lower() if _lead else ""
             except Exception:
                 _lead = ""
             if not _lead:
                 try:
-                    await self._reply("Nothing to inject (group changed).",
-                                      reply_to=message)
+                    await self._reply("Nothing to inject (group changed).", reply_to=message)
                 except Exception:
                     pass
                 return
@@ -570,13 +585,20 @@ class ActionsMixin:
                         extra = " Prior cancel will be lifted."
                 except Exception:
                     pass
-            _text = (f"Inject {title} ({_n} cop{'y' if _n == 1 else 'ies'}) "
-                     "to fuse seeding? Files must already be at the "
-                     f"remote.{extra} Choose below.")
-            _rows = (ButtonMaker()
-                     .add("✔ Yes, inject", f"inject:{_lead}:yes").newline()
-                     .add("✖ No", f"inject:{_lead}:no").newline()
-                     .add("Close", "abort").rows())
+            _text = (
+                f"Inject {title} ({_n} cop{'y' if _n == 1 else 'ies'}) "
+                "to fuse seeding? Files must already be at the "
+                f"remote.{extra} Choose below."
+            )
+            _rows = (
+                ButtonMaker()
+                .add("✔ Yes, inject", f"inject:{_lead}:yes")
+                .newline()
+                .add("✖ No", f"inject:{_lead}:no")
+                .newline()
+                .add("Close", "abort")
+                .rows()
+            )
             await self._send_sheet(_text, _rows, reply_to=message)
         except Exception as e:  # noqa: BLE001
             log.debug("inject ask failed: %s", e)
@@ -594,8 +616,7 @@ class ActionsMixin:
         coord = getattr(self, "_coord", None)
         if coord is None:
             try:
-                await self._reply("Action failed: bot not attached.",
-                                  reply_to=message)
+                await self._reply("Action failed: bot not attached.", reply_to=message)
             except Exception:
                 pass
             return
@@ -622,8 +643,8 @@ class ActionsMixin:
         if state in (State.DONE, State.RE_ADDING):
             try:
                 await self._reply(
-                    f"already {state.value}: {title} (fuse gate runs next tick)",
-                    reply_to=message)
+                    f"already {state.value}: {title} (fuse gate runs next tick)", reply_to=message
+                )
             except Exception:
                 pass
             return
@@ -631,8 +652,7 @@ class ActionsMixin:
         snap = self._injectfuse_snap(members)
         if not snap:
             try:
-                await self._reply("Nothing to inject (group changed).",
-                                  reply_to=message)
+                await self._reply("Nothing to inject (group changed).", reply_to=message)
             except Exception:
                 pass
             return
@@ -655,8 +675,7 @@ class ActionsMixin:
         await self._inject_ask_send(_resolved_for_ask, message)
         try:
             if members:
-                return _safe_display_name(
-                    str(getattr(members[0], "source_name", "") or "")[:60])
+                return _safe_display_name(str(getattr(members[0], "source_name", "") or "")[:60])
         except Exception:
             pass
         return "?"
@@ -676,11 +695,10 @@ class ActionsMixin:
             if not norm:
                 return None
             rows = self._store.list_active_inflight()
-            for (_key, _members) in _group_active_items(
-                    [(_r, None) for _r in rows or []]):
+            for _key, _members in _group_active_items([(_r, None) for _r in rows or []]):
                 _hs: list[str] = []
                 _hit = False
-                for (_t, _p) in _members or []:
+                for _t, _p in _members or []:
                     try:
                         _h = _member_hash(_t)
                     except Exception:
@@ -707,8 +725,7 @@ class ActionsMixin:
             store = getattr(self, "_store", None)
             if store is None:
                 try:
-                    await self._reply("Action failed: bot not attached.",
-                                      reply_to=message)
+                    await self._reply("Action failed: bot not attached.", reply_to=message)
                 except Exception:
                     pass
                 return
@@ -723,8 +740,8 @@ class ActionsMixin:
                 return
             try:
                 groups = _group_active_items(
-                    [(_r, None)
-                     for _r in self._positional_active_rows(rows)])
+                    [(_r, None) for _r in self._positional_active_rows(rows)]
+                )
             except Exception:
                 groups = []
             members: list = []
@@ -746,8 +763,7 @@ class ActionsMixin:
             _gen_warn = ""
             if _positional:
                 try:
-                    _rendered = int(
-                        getattr(self, "_last_rendered_groups", 0) or 0)
+                    _rendered = int(getattr(self, "_last_rendered_groups", 0) or 0)
                 except Exception:
                     _rendered = 0
                 try:
@@ -758,7 +774,8 @@ class ActionsMixin:
                     _gen_warn = (
                         f"⚠️ List changed since render "
                         f"({_rendered}→{_live_n} titles) — confirm this "
-                        f"is the file you meant.\n")
+                        f"is the file you meant.\n"
+                    )
             if not members and norm:
                 try:
                     _by_gid = _live_group_by_gid(list(rows or []), norm)
@@ -768,14 +785,12 @@ class ActionsMixin:
                     members = list(_by_gid[1])
             if not members and norm:
                 try:
-                    target = await asyncio.to_thread(
-                        self._resolve_cancel_target, norm, cmd="act")
+                    target = await asyncio.to_thread(self._resolve_cancel_target, norm, cmd="act")
                     _gh = await asyncio.to_thread(
-                        self._group_hashes_for,
-                        (target.source_infohash or "").lower())
+                        self._group_hashes_for, (target.source_infohash or "").lower()
+                    )
                     if _gh:
-                        _all = {(_r.source_infohash or "").lower(): _r
-                                for _r in rows or []}
+                        _all = {(_r.source_infohash or "").lower(): _r for _r in rows or []}
                         members = [_all[h] for h in _gh if h in _all]
                     else:
                         members = [target]
@@ -793,8 +808,7 @@ class ActionsMixin:
                     return
             if not members:
                 try:
-                    await self._reply("No live group — refresh the list.",
-                                      reply_to=message)
+                    await self._reply("No live group — refresh the list.", reply_to=message)
                 except Exception:
                     pass
                 return
@@ -805,8 +819,8 @@ class ActionsMixin:
                 notes = {}
             try:
                 _text, _rows = self._sheet_text_and_rows(
-                    members, title, getattr(members[0], "total_bytes", 0)
-                    if members else 0, notes)
+                    members, title, getattr(members[0], "total_bytes", 0) if members else 0, notes
+                )
                 if _gen_warn:
                     _text = _gen_warn + _text
             except Exception as e:  # noqa: BLE001
@@ -840,8 +854,7 @@ class ActionsMixin:
             _all = getattr(store, "list_active_inflight", None)
             rows = _all() if callable(_all) else []
             out: list[tuple[str, list[str]]] = []
-            for (_key, _members) in _group_active_items(
-                    [(_r, None) for _r in rows or []]):
+            for _key, _members in _group_active_items([(_r, None) for _r in rows or []]):
                 try:
                     _rows = [_t for (_t, _) in _members or []]
                     if not _rows:
@@ -849,8 +862,7 @@ class ActionsMixin:
                     _name = str(getattr(_rows[0], "source_name", "") or "")
                     if q not in _name.casefold():
                         continue
-                    _hashes = [_h for _h in
-                               (_member_hash(_t) for _t in _rows) if _h]
+                    _hashes = [_h for _h in (_member_hash(_t) for _t in _rows) if _h]
                     if _hashes:
                         out.append((self._group_title(_rows), _hashes))
                 except Exception:
@@ -879,8 +891,11 @@ class ActionsMixin:
         dest = getattr(coord, "dest_client", None) if coord else None
         if store is None or dest is None:
             raise RuntimeError("stalled check unavailable: bot not attached")
-        rows = [r for r in (store.list_active_inflight() or [])
-                if getattr(r, "state", None) == State.DOWNLOADING]
+        rows = [
+            r
+            for r in (store.list_active_inflight() or [])
+            if getattr(r, "state", None) == State.DOWNLOADING
+        ]
         if not rows:
             return []
         known: dict[str, object] = {}
@@ -913,9 +928,11 @@ class ActionsMixin:
                 except (TypeError, ValueError):
                     _seeds = 0
                 try:
-                    _done = bool(t.is_complete()) \
-                        if callable(getattr(t, "is_complete", None)) \
+                    _done = (
+                        bool(t.is_complete())
+                        if callable(getattr(t, "is_complete", None))
                         else float(getattr(t, "progress", 1) or 1) >= 0.999
+                    )
                 except (TypeError, ValueError):
                     continue
                 if _seeds == 0 and not _done:
@@ -923,22 +940,19 @@ class ActionsMixin:
             except Exception:
                 continue
         out: list[tuple[str, list[str]]] = []
-        for (_key, _members) in _group_active_items(
-                [(_r, None) for _r in stalled]):
+        for _key, _members in _group_active_items([(_r, None) for _r in stalled]):
             try:
                 _rows = [_t for (_t, _) in _members or []]
                 if not _rows:
                     continue
-                _hashes = [_h for _h in
-                           (_member_hash(_t) for _t in _rows) if _h]
+                _hashes = [_h for _h in (_member_hash(_t) for _t in _rows) if _h]
                 if _hashes:
                     out.append((self._group_title(_rows), _hashes))
             except Exception:
                 continue
         return out
 
-    async def _cancel_match_command_entry(
-            self, query: str, message: Any) -> None:
+    async def _cancel_match_command_entry(self, query: str, message: Any) -> None:
         """`/cancel_match <text>`: one remember + one keep/delete for all.
 
         No match → explanatory reply. A single live copy skips straight
@@ -953,7 +967,8 @@ class ActionsMixin:
                     "Send /cancel_match <text> (at least "
                     f"{_MATCH_MIN_CHARS} characters) — cancels every "
                     "active group whose title contains <text>.",
-                    reply_to=message)
+                    reply_to=message,
+                )
             except Exception:
                 pass
             return
@@ -963,7 +978,8 @@ class ActionsMixin:
                 await self._reply(
                     "That text is too long for buttons — shorten it to "
                     f"~{_MATCH_MAX_BYTES} characters.",
-                    reply_to=message)
+                    reply_to=message,
+                )
             except Exception:
                 pass
             return
@@ -978,15 +994,13 @@ class ActionsMixin:
         if not matches:
             try:
                 await self._reply(
-                    f"No active groups match "
-                    f"'{_safe_display_name(q[:60])}'",
-                    reply_to=message)
+                    f"No active groups match '{_safe_display_name(q[:60])}'", reply_to=message
+                )
             except Exception:
                 pass
             return
         if len(matches) == 1 and len(matches[0][1]) == 1:
-            await self._start_single_command(
-                "cancel", matches[0][1][0], message)
+            await self._start_single_command("cancel", matches[0][1][0], message)
             return
         _total = sum(len(_hs) for (_, _hs) in matches)
         _shown = [f"• {_t} ({len(_hs)})" for (_t, _hs) in matches[:8]]
@@ -996,9 +1010,8 @@ class ActionsMixin:
         _text, _rows = _scope.remember_sheet(
             f"{len(matches)} groups "
             f"({_total} copies) match "
-            f"'{_safe_display_name(q[:60])}':\n"
-            + "\n".join(_shown) +
-            "\nForget them all?")
+            f"'{_safe_display_name(q[:60])}':\n" + "\n".join(_shown) + "\nForget them all?"
+        )
         try:
             await self._send_sheet(_text, _rows, reply_to=message)
         except Exception:
@@ -1025,15 +1038,14 @@ class ActionsMixin:
         if not groups:
             try:
                 await self._reply(
-                    "No stalled downloads right now — every downloading "
-                    "copy has seeders.",
-                    reply_to=message)
+                    "No stalled downloads right now — every downloading copy has seeders.",
+                    reply_to=message,
+                )
             except Exception:
                 pass
             return
         if len(groups) == 1 and len(groups[0][1]) == 1:
-            await self._start_single_command(
-                "cancel", groups[0][1][0], message)
+            await self._start_single_command("cancel", groups[0][1][0], message)
             return
         _total = sum(len(_hs) for (_, _hs) in groups)
         _shown = [f"• {_t} ({len(_hs)})" for (_t, _hs) in groups[:8]]
@@ -1042,9 +1054,8 @@ class ActionsMixin:
         _scope = CancelScope("stalled", "")
         _text, _rows = _scope.remember_sheet(
             f"{len(groups)} stalled downloads "
-            f"({_total} copies, no seeders):\n"
-            + "\n".join(_shown) +
-            "\nForget them all?")
+            f"({_total} copies, no seeders):\n" + "\n".join(_shown) + "\nForget them all?"
+        )
         try:
             await self._send_sheet(_text, _rows, reply_to=message)
         except Exception:
@@ -1059,11 +1070,10 @@ class ActionsMixin:
         each tap). Empty lanes are omitted; an empty list replies so.
         """
         try:
-            from .telegram_protocol import (
-                _STATUS_FILTER_BUTTONS, match_status_filter)
+            from .telegram_protocol import _STATUS_FILTER_BUTTONS, match_status_filter
+
             _get_all = getattr(self._store, "list_active_inflight", None)
-            rows = await asyncio.to_thread(_get_all) \
-                if callable(_get_all) else []
+            rows = await asyncio.to_thread(_get_all) if callable(_get_all) else []
         except Exception as e:  # noqa: BLE001
             try:
                 await self._reply(_action_error_text(e), reply_to=message)
@@ -1090,16 +1100,14 @@ class ActionsMixin:
             pass
         if not _counts:
             try:
-                await self._reply("Nothing live to cancel.",
-                                  reply_to=message)
+                await self._reply("Nothing live to cancel.", reply_to=message)
             except Exception:
                 pass
             return
         if len(_counts) == 1 and list(_counts.values())[0] == 1:
             _only = next(iter(_counts))
             try:
-                _solo = await asyncio.to_thread(
-                    self._store.list_active_inflight)
+                _solo = await asyncio.to_thread(self._store.list_active_inflight)
             except Exception:
                 _solo = []
             _hsolo = []
@@ -1107,10 +1115,9 @@ class ActionsMixin:
                 for _r in _solo or []:
                     try:
                         if match_status_filter(
-                                getattr(getattr(_r, "state", None),
-                                        "value", ""), _only):
-                            _rh = (getattr(_r, "source_infohash", "")
-                                   or "").lower()
+                            getattr(getattr(_r, "state", None), "value", ""), _only
+                        ):
+                            _rh = (getattr(_r, "source_infohash", "") or "").lower()
                             if _rh:
                                 _hsolo.append(_rh)
                     except Exception:
@@ -1118,11 +1125,10 @@ class ActionsMixin:
             except Exception:
                 pass
             if len(_hsolo) == 1:
-                await self._start_single_command(
-                    "cancel", _hsolo[0], message)
+                await self._start_single_command("cancel", _hsolo[0], message)
                 return
         _maker = ButtonMaker()
-        for (_key, _label) in _STATUS_FILTER_BUTTONS:
+        for _key, _label in _STATUS_FILTER_BUTTONS:
             if _key in ("all", "ov"):
                 continue
             try:
@@ -1144,8 +1150,7 @@ class ActionsMixin:
         except Exception:
             return
         try:
-            await self._send_sheet("Cancel by status - pick a lane:",
-                                   _rows, reply_to=message)
+            await self._send_sheet("Cancel by status - pick a lane:", _rows, reply_to=message)
         except Exception:
             pass
 
@@ -1163,8 +1168,7 @@ class ActionsMixin:
         # start at once).
         if kind in ("fetch", "prefer"):
             kind = "now"
-        if len(token) == 40 and all(
-                c in "0123456789abcdef" for c in token):
+        if len(token) == 40 and all(c in "0123456789abcdef" for c in token):
             await self._start_single_command(kind, token, message)
             return
         try:
@@ -1181,8 +1185,8 @@ class ActionsMixin:
             # gid/hash/prefix fallbacks below stay on the full rows.
             try:
                 groups = _group_active_items(
-                    [(_r, None)
-                     for _r in self._positional_active_rows(rows)])
+                    [(_r, None) for _r in self._positional_active_rows(rows)]
+                )
             except Exception:
                 groups = []
         found: tuple | None = None
@@ -1202,8 +1206,7 @@ class ActionsMixin:
                 found = (_gk, list(_mem))
         if found is None:
             try:
-                target = await asyncio.to_thread(
-                    self._resolve_cancel_target, token, cmd=kind)
+                target = await asyncio.to_thread(self._resolve_cancel_target, token, cmd=kind)
                 full_hash = target.source_infohash
             except LookupError as e:
                 try:
@@ -1224,8 +1227,7 @@ class ActionsMixin:
         if kind == "files":
             if not members:
                 try:
-                    await self._reply("Already gone from tracking",
-                                      reply_to=message)
+                    await self._reply("Already gone from tracking", reply_to=message)
                 except Exception:
                     pass
             else:
@@ -1237,33 +1239,32 @@ class ActionsMixin:
                 _hashes = [h for (h, _) in _labels]
                 if not _hashes:
                     try:
-                        await self._reply("Already gone from tracking",
-                                          reply_to=message)
+                        await self._reply("Already gone from tracking", reply_to=message)
                     except Exception:
                         pass
                     return
                 try:
-                    _text, _rows = CancelScope(
-                        "single", _hashes[0]).remember_sheet(
-                            f"Forget {title}?")
-                    await self._send_sheet(
-                        _text, _rows, reply_to=message)
+                    _text, _rows = CancelScope("single", _hashes[0]).remember_sheet(
+                        f"Forget {title}?"
+                    )
+                    await self._send_sheet(_text, _rows, reply_to=message)
                 except Exception:
                     pass
                 return
             _maker = ButtonMaker()
-            for (_h, _lbl) in _labels:
+            for _h, _lbl in _labels:
                 _maker.add(f"✖ Cancel {_lbl}…", f"cancel:{_h}").newline()
             _maker.add(
-                f"✖ Cancel all {len(_labels)} copies…",
-                f"cancel:all:{_labels[0][0]}").newline()
+                f"✖ Cancel all {len(_labels)} copies…", f"cancel:all:{_labels[0][0]}"
+            ).newline()
             _maker.add("Close", "abort")
             _rows = _maker.rows()
             try:
                 await self._send_sheet(
-                    f"Cancel {title} ({len(_labels)} copies): "
-                    f"pick below (tracker names).",
-                    _rows, reply_to=message)
+                    f"Cancel {title} ({len(_labels)} copies): pick below (tracker names).",
+                    _rows,
+                    reply_to=message,
+                )
             except Exception:
                 pass
             return
@@ -1283,8 +1284,7 @@ class ActionsMixin:
                     _lead_hashes.append(_mh)
             if not _lead_hashes:
                 try:
-                    await self._reply("Already gone from tracking",
-                                      reply_to=message)
+                    await self._reply("Already gone from tracking", reply_to=message)
                 except Exception:
                     pass
                 return
@@ -1311,8 +1311,7 @@ class ActionsMixin:
                         _tsz = getattr(_tracked[0], "total_bytes", 0)
                     except Exception:
                         _tsz = 0
-                    resolved = {"members": _tracked, "title": title,
-                                "size": _tsz}
+                    resolved = {"members": _tracked, "title": title, "size": _tsz}
                 except Exception:
                     try:
                         await self._reply(_scrubbed(e)[:300], reply_to=message)
@@ -1345,14 +1344,12 @@ class ActionsMixin:
                     _hashes.append(_mh)
             if not _hashes:
                 try:
-                    await self._reply("Already gone from tracking",
-                                      reply_to=message)
+                    await self._reply("Already gone from tracking", reply_to=message)
                 except Exception:
                     pass
                 return
             try:
-                result = await self._skip_torrents(
-                    _hashes, hold=(kind == "skip"))
+                result = await self._skip_torrents(_hashes, hold=(kind == "skip"))
             except Exception as e:  # noqa: BLE001
                 result = _action_error_text(e)
             try:
@@ -1380,8 +1377,7 @@ class ActionsMixin:
                     _hashes.append(_mh)
             if not _hashes:
                 try:
-                    await self._reply("Already gone from tracking",
-                                      reply_to=message)
+                    await self._reply("Already gone from tracking", reply_to=message)
                 except Exception:
                     pass
                 return
@@ -1398,6 +1394,7 @@ class ActionsMixin:
                     except Exception:
                         pass
                 from .task import handles_for
+
                 for _hh in _hashes:
                     try:
                         _forced.add(_hh)
@@ -1434,7 +1431,8 @@ class ActionsMixin:
                     f"cop{'y' if len(_hashes) == 1 else 'ies'}"
                     f"{f', {_armed} waiter(s) woken' if _armed else ''}) — "
                     f"bypasses slot caps until it leaves the lane.",
-                    reply_to=message)
+                    reply_to=message,
+                )
             except Exception:
                 pass
             try:
@@ -1449,13 +1447,12 @@ class ActionsMixin:
         # carries its copy's hash and execution re-checks eligibility.
         _notes = self._live_notes_for(members)
         _eligible = set(self._now_eligible_hashes(members, _notes))
-        _labels = [(h, lbl) for (h, lbl) in _member_button_labels(members)
-                   if h in _eligible]
+        _labels = [(h, lbl) for (h, lbl) in _member_button_labels(members) if h in _eligible]
         if not _labels:
             try:
                 await self._reply(
-                    f"Nothing to {kind} right now (states changed).",
-                    reply_to=message)
+                    f"Nothing to {kind} right now (states changed).", reply_to=message
+                )
             except Exception:
                 pass
             return
@@ -1475,14 +1472,14 @@ class ActionsMixin:
                 pass
             return
         _maker = ButtonMaker()
-        for (_h, _lbl) in _labels:
+        for _h, _lbl in _labels:
             _maker.add(f"▶ Start {_lbl} now", f"go:{_h}").newline()
         _maker.add("Close", "abort")
         _rows = _maker.rows()
         try:
             await self._send_sheet(
-                f"Start {title}: pick a copy below (tracker names).",
-                _rows, reply_to=message)
+                f"Start {title}: pick a copy below (tracker names).", _rows, reply_to=message
+            )
         except Exception:
             pass
 
@@ -1545,9 +1542,9 @@ class ActionsMixin:
                 try:
                     _upd = getattr(store, "update_columns", None)
                     if callable(_upd):
-                        _applied = bool(_upd(
-                            infohash, {"force_direct": 1},
-                            expected_state=State.NEW))
+                        _applied = bool(
+                            _upd(infohash, {"force_direct": 1}, expected_state=State.NEW)
+                        )
                     else:
                         row.force_direct = 1
                         store.upsert(row)
@@ -1556,13 +1553,15 @@ class ActionsMixin:
                     return f"Fetch failed: {_scrubbed(e)}"
                 if not _applied:
                     return (
-                        f"{(row.source_name or infohash[:10])[:50]} moved "
-                        f"state — nothing to fetch"
+                        f"{(row.source_name or infohash[:10])[:50]} moved state — nothing to fetch"
                     )
                 acted.append(infohash)
                 try:
-                    _is_watch = bool(coord._is_watch_row(row)) if callable(
-                        getattr(coord, "_is_watch_row", None)) else False
+                    _is_watch = (
+                        bool(coord._is_watch_row(row))
+                        if callable(getattr(coord, "_is_watch_row", None))
+                        else False
+                    )
                 except Exception:
                     _is_watch = False
                 if _is_watch:
@@ -1580,10 +1579,7 @@ class ActionsMixin:
                 _label = row.state.value
             except Exception:
                 _label = "unknown"
-            return (
-                f"{(row.source_name or infohash[:10])[:50]} is "
-                f"{_label} — nothing to fetch"
-            )
+            return f"{(row.source_name or infohash[:10])[:50]} is {_label} — nothing to fetch"
 
         try:
             if _hold_ops_lock is not None:
@@ -1672,8 +1668,7 @@ class ActionsMixin:
         try:
             for h in hashes or []:
                 _h = (h or "").strip().lower()
-                if len(_h) == 40 and all(
-                        c in "0123456789abcdef" for c in _h):
+                if len(_h) == 40 and all(c in "0123456789abcdef" for c in _h):
                     wanted.append(_h)
         except Exception:
             pass
@@ -1696,8 +1691,7 @@ class ActionsMixin:
                 try:
                     _upd = getattr(store, "update_columns", None)
                     if callable(_upd):
-                        _applied = bool(_upd(
-                            h, {"skipped": 1 if hold else 0}))
+                        _applied = bool(_upd(h, {"skipped": 1 if hold else 0}))
                     else:
                         row.skipped = 1 if hold else 0
                         store.upsert(row)
@@ -1716,8 +1710,7 @@ class ActionsMixin:
         except Exception as e:  # noqa: BLE001
             return f"{verb.capitalize()} failed: {_scrubbed(e)}"
         if not acted:
-            return (f"Already gone from tracking"
-                    if gone else f"Nothing to {verb} (states changed)")
+            return f"Already gone from tracking" if gone else f"Nothing to {verb} (states changed)"
         try:
             _names = []
             for h in acted:
@@ -1742,10 +1735,13 @@ class ActionsMixin:
                             continue
             except Exception:
                 log.debug("unskip wake failed; next tick picks it up")
-            return (f"Resumed {_title} — fuse/VPS checks and Prowlarr "
-                    f"cross-seed search run again next tick")
-        return (f"Skipped {_title} — held with state kept, no workers "
-                f"until {_resume_command(acted[0])}")
+            return (
+                f"Resumed {_title} — fuse/VPS checks and Prowlarr "
+                f"cross-seed search run again next tick"
+            )
+        return (
+            f"Skipped {_title} — held with state kept, no workers until {_resume_command(acted[0])}"
+        )
 
     def _unignore_core(self, target: str) -> tuple[str | None, str | None]:
         """Lift one ignore entry (+ tombstone); returns (name, error).
@@ -1759,8 +1755,7 @@ class ActionsMixin:
         except Exception:
             norm = ""
         if len(norm) != 40 or any(c not in "0123456789abcdef" for c in norm):
-            return None, ("Send /resume_<full 40-char infohash> "
-                           "(copy it from the detail card).")
+            return None, ("Send /resume_<full 40-char infohash> (copy it from the detail card).")
         store = getattr(self, "_store", None)
         if store is None:
             return None, "Action failed: bot not attached."
@@ -1806,7 +1801,9 @@ class ActionsMixin:
         try:
             await self._reply(
                 f"Unignored {name} — re-send its .torrent via /add "
-                f"(or re-drop it) to track it again.", reply_to=message)
+                f"(or re-drop it) to track it again.",
+                reply_to=message,
+            )
         except Exception:
             pass
 
@@ -1824,8 +1821,7 @@ class ActionsMixin:
             store = getattr(self, "_store", None)
             if store is None:
                 try:
-                    await self._reply("Action failed: bot not attached.",
-                                      reply_to=message)
+                    await self._reply("Action failed: bot not attached.", reply_to=message)
                 except Exception:
                     pass
                 return
@@ -1842,8 +1838,8 @@ class ActionsMixin:
                     return
                 try:
                     groups = _group_active_items(
-                        [(_r, None)
-                         for _r in self._positional_active_rows(rows)])
+                        [(_r, None) for _r in self._positional_active_rows(rows)]
+                    )
                 except Exception:
                     groups = []
                 try:
@@ -1862,13 +1858,12 @@ class ActionsMixin:
                 if not hashes:
                     try:
                         await self._reply(
-                            f"No live group #{norm} — refresh the list.",
-                            reply_to=message)
+                            f"No live group #{norm} — refresh the list.", reply_to=message
+                        )
                     except Exception:
                         pass
                     return
-            elif len(norm) == 40 and all(
-                    c in "0123456789abcdef" for c in norm):
+            elif len(norm) == 40 and all(c in "0123456789abcdef" for c in norm):
                 # Single hash: the shared core unholds tracked rows and
                 # lifts ignored hashes (each half no-ops cleanly absent).
                 hashes = [norm]
@@ -1879,10 +1874,8 @@ class ActionsMixin:
                 # hash); anything else keeps the resolver text.
                 _by_gid = None
                 try:
-                    _rows_g = await asyncio.to_thread(
-                        store.list_active_inflight)
-                    _by_gid = _live_group_by_gid(
-                        list(_rows_g or []), norm)
+                    _rows_g = await asyncio.to_thread(store.list_active_inflight)
+                    _by_gid = _live_group_by_gid(list(_rows_g or []), norm)
                 except Exception:
                     _by_gid = None
                 if _by_gid is not None:
@@ -1897,19 +1890,20 @@ class ActionsMixin:
                 if not hashes:
                     try:
                         target = await asyncio.to_thread(
-                            self._resolve_cancel_target, norm, cmd="resume")
+                            self._resolve_cancel_target, norm, cmd="resume"
+                        )
                         hashes = [(target.source_infohash or "").lower()]
                     except LookupError as e:
                         try:
-                            _hexish = bool(norm) and all(
-                                c in "0123456789abcdef" for c in norm)
+                            _hexish = bool(norm) and all(c in "0123456789abcdef" for c in norm)
                         except Exception:
                             _hexish = False
                         await self._reply(
-                            ("Send /resume_<full 40-char infohash> "
-                             "(copy it from the detail card).")
-                            if _hexish else str(e)[:300],
-                            reply_to=message)
+                            ("Send /resume_<full 40-char infohash> (copy it from the detail card).")
+                            if _hexish
+                            else str(e)[:300],
+                            reply_to=message,
+                        )
                         return
                     except Exception as e:  # noqa: BLE001
                         try:
@@ -1920,8 +1914,8 @@ class ActionsMixin:
                 if not hashes:
                     try:
                         await self._reply(
-                            f"No live group #{norm} — refresh the list.",
-                            reply_to=message)
+                            f"No live group #{norm} — refresh the list.", reply_to=message
+                        )
                     except Exception:
                         pass
                     return

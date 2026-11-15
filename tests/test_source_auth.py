@@ -1,4 +1,5 @@
-﻿"""Source-auth fail-fast: bad credentials surface loudly, rows survive."""
+"""Source-auth fail-fast: bad credentials surface loudly, rows survive."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -12,9 +13,16 @@ from racing_sync.state import State, StateStore, TorrentState
 
 
 def _src(h, trackers=("https://alpha.cc/announce/xyz",)):
-    return Torrent(hash=h, name="Show", save_path="/x", category="",
-                   state="downloading", progress=0.0, size_bytes=10,
-                   trackers=list(trackers))
+    return Torrent(
+        hash=h,
+        name="Show",
+        save_path="/x",
+        category="",
+        state="downloading",
+        progress=0.0,
+        size_bytes=10,
+        trackers=list(trackers),
+    )
 
 
 def test_cached_source_lookup_shares_index_per_tick():
@@ -39,8 +47,7 @@ async def test_source_list_auth_error_propagates():
     served as infinite stale cache."""
     coord = make_coordinator()
     coord.source_client = MagicMock()
-    coord.source_client.list_torrents = AsyncMock(
-        side_effect=AuthError("bad creds"))
+    coord.source_client.list_torrents = AsyncMock(side_effect=AuthError("bad creds"))
     coord.cfg.source.category = ""
     with pytest.raises(AuthError):
         await coord._list_source_torrents(force_refresh=True)
@@ -51,8 +58,7 @@ async def test_source_list_outage_still_serves_stale(tmp_path):
     """Non-auth outages keep the degraded stale-cache behavior."""
     coord = make_coordinator()
     coord.source_client = MagicMock()
-    coord.source_client.list_torrents = AsyncMock(
-        side_effect=TimeoutError("wedged"))
+    coord.source_client.list_torrents = AsyncMock(side_effect=TimeoutError("wedged"))
     coord.cfg.source.category = ""
     coord._source_torrents_cache = []
     coord._source_torrents_cached_at = 0.0
@@ -66,8 +72,7 @@ async def test_worker_leaves_row_on_auth_error(tmp_path):
     store = StateStore(tmp_path / "state.db")
     try:
         coord = make_coordinator(store=store)
-        ts = TorrentState(source_infohash="a" * 40, source_name="X",
-                          state=State.DOWNLOADING)
+        ts = TorrentState(source_infohash="a" * 40, source_name="X", state=State.DOWNLOADING)
         store.upsert(ts)
 
         async def _boom(_ts):
@@ -91,22 +96,27 @@ async def test_stale_source_expires_after_outage():
     def _coord_with_cache(age_s):
         coord = make_coordinator()
         coord.source_client = MagicMock()
-        coord.source_client.list_torrents = AsyncMock(
-            side_effect=TimeoutError("wedged"))
+        coord.source_client.list_torrents = AsyncMock(side_effect=TimeoutError("wedged"))
         coord.cfg.source.category = ""
         coord._source_torrents_cache = [
-            Torrent(hash="a" * 40, name="Ghost", save_path="/x", category="", state="downloading", progress=0.0,
-                    size_bytes=10)]
+            Torrent(
+                hash="a" * 40,
+                name="Ghost",
+                save_path="/x",
+                category="",
+                state="downloading",
+                progress=0.0,
+                size_bytes=10,
+            )
+        ]
         coord._source_torrents_cached_at = 0.0
         coord._source_last_success_mono = time.monotonic() - age_s
         return coord
 
     # Recent success: degraded stale view.
-    assert len(await _coord_with_cache(60)._list_source_torrents(
-        force_refresh=True)) == 1
+    assert len(await _coord_with_cache(60)._list_source_torrents(force_refresh=True)) == 1
     # Dead for 10 minutes: expired to empty.
-    assert await _coord_with_cache(600)._list_source_torrents(
-        force_refresh=True) == []
+    assert await _coord_with_cache(600)._list_source_torrents(force_refresh=True) == []
 
 
 @pytest.mark.anyio
@@ -119,12 +129,30 @@ async def test_unknown_age_fails_min_age_gate():
     coord = make_coordinator()
     now = time.time()
     coord.source_client = MagicMock()
-    coord.source_client.list_torrents = AsyncMock(return_value=[
-        Torrent(hash="a" * 40, name="Known", save_path="/x", category="", state="downloading", progress=0.0,
-                size_bytes=10, added_on=now - 3600),
-        Torrent(hash="b" * 40, name="Unknown", save_path="/x", category="", state="downloading", progress=0.0,
-                size_bytes=10, added_on=0),
-    ])
+    coord.source_client.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash="a" * 40,
+                name="Known",
+                save_path="/x",
+                category="",
+                state="downloading",
+                progress=0.0,
+                size_bytes=10,
+                added_on=now - 3600,
+            ),
+            Torrent(
+                hash="b" * 40,
+                name="Unknown",
+                save_path="/x",
+                category="",
+                state="downloading",
+                progress=0.0,
+                size_bytes=10,
+                added_on=0,
+            ),
+        ]
+    )
     coord.cfg.source.category = ""
     coord.cfg.source.min_age_seconds = 60
     got = await coord._list_source_torrents(force_refresh=True)

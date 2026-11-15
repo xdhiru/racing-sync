@@ -18,7 +18,9 @@ def test_prowlarr_config_should_skip_title():
         enabled=True,
         base_url="http://localhost:9696",
         api_key="secret",
-        download_indexers=[DownloadIndexerConfig(name="Test Indexer (API)", announce_substrings=["test-indexer"])],
+        download_indexers=[
+            DownloadIndexerConfig(name="Test Indexer (API)", announce_substrings=["test-indexer"])
+        ],
         skip_query_substrings=["dummysub", "othergroup"],
     )
     assert cfg.should_skip_title("[DummySub] Endless Voyage - 1100 (1080p)") is True
@@ -34,7 +36,9 @@ async def test_prowlarr_client_skips_search():
         enabled=True,
         base_url="http://localhost:9696",
         api_key="secret",
-        download_indexers=[DownloadIndexerConfig(name="Test Indexer (API)", announce_substrings=["test-indexer"])],
+        download_indexers=[
+            DownloadIndexerConfig(name="Test Indexer (API)", announce_substrings=["test-indexer"])
+        ],
         skip_query_substrings=["dummysub"],
     )
     client = ProwlarrClient(cfg)
@@ -171,15 +175,17 @@ async def test_pick_ssd_source_skipped_title_parks_when_no_export_path():
 
 @pytest.mark.anyio
 async def test_do_new_watch_dir_skips_prowlarr(tmp_path: Path):
-    raw_data = _bencode({
-        b"announce": b"http://privatetracker.org/announce",
-        b"info": {
-            b"name": b"[DummySub] Siege of Giants - 01",
-            b"length": 5000,
-            b"piece length": 16384,
-            b"pieces": b"12345678901234567890",
-        },
-    })
+    raw_data = _bencode(
+        {
+            b"announce": b"http://privatetracker.org/announce",
+            b"info": {
+                b"name": b"[DummySub] Siege of Giants - 01",
+                b"length": 5000,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
     infohash, name, total, announce = _bencoded_info_hash(raw_data)
 
     db_path = tmp_path / "state.db"
@@ -252,8 +258,7 @@ def test_parse_newznab_blocks_obfuscated_doctype():
 async def test_search_indexer_refuses_oversize_feed():
     """A bloated feed is refused before decode, not OOMed."""
     from unittest.mock import MagicMock
-    from racing_sync.prowlarr import (
-        Indexer, ProwlarrClient, ProwlarrError, _MAX_FEED_BYTES)
+    from racing_sync.prowlarr import Indexer, ProwlarrClient, ProwlarrError, _MAX_FEED_BYTES
 
     cfg = MagicMock()
     cfg.base_url = "http://localhost:9696"
@@ -354,7 +359,12 @@ def test_parse_newznab_extracts_namespaced_magnet_url():
 async def test_download_torrent_validates_scheme():
     from racing_sync.prowlarr import ProwlarrClient, ProwlarrError, TorrentHit
 
-    cfg = ProwlarrConfig(enabled=True, base_url="http://localhost:9696", api_key="secret", download_indexers=[DownloadIndexerConfig(name="idx")])
+    cfg = ProwlarrConfig(
+        enabled=True,
+        base_url="http://localhost:9696",
+        api_key="secret",
+        download_indexers=[DownloadIndexerConfig(name="idx")],
+    )
     client = ProwlarrClient(cfg)
     client._session = MagicMock()
 
@@ -389,7 +399,9 @@ async def test_prowlarr_best_match_ranking():
         enabled=True,
         base_url="http://127.0.0.1:9696",
         api_key="secret",
-        download_indexers=[DownloadIndexerConfig(name="Test Indexer (API)", announce_substrings=["test-indexer"])],
+        download_indexers=[
+            DownloadIndexerConfig(name="Test Indexer (API)", announce_substrings=["test-indexer"])
+        ],
     )
     client = ProwlarrClient(cfg)
     idx = Indexer(1, "Test Indexer (API)", "torrent", True, [])
@@ -441,19 +453,28 @@ async def test_prowlarr_best_match_ranking():
 
 def _hit(title: str, size: int, guid: str = "g") -> TorrentHit:
     return TorrentHit(
-        title=title, guid=guid, indexer="Test Indexer (API)", indexer_id=1,
-        size_bytes=size, download_url="http://prowlarr/dl",
-        magnet_url="", info_url="", publish_date="",
+        title=title,
+        guid=guid,
+        indexer="Test Indexer (API)",
+        indexer_id=1,
+        size_bytes=size,
+        download_url="http://prowlarr/dl",
+        magnet_url="",
+        info_url="",
+        publish_date="",
     )
 
 
 def _download_client() -> ProwlarrClient:
     from racing_sync.prowlarr import Indexer
+
     cfg = ProwlarrConfig(
         enabled=True,
         base_url="http://127.0.0.1:9696",
         api_key="secret",
-        download_indexers=[DownloadIndexerConfig(name="Test Indexer (API)", announce_substrings=["test-indexer"])],
+        download_indexers=[
+            DownloadIndexerConfig(name="Test Indexer (API)", announce_substrings=["test-indexer"])
+        ],
     )
     client = ProwlarrClient(cfg)
     idx = Indexer(1, "Test Indexer (API)", "torrent", True, [])
@@ -468,9 +489,7 @@ async def test_best_match_rejects_different_release_group():
     foreign bytes corrupts the seed."""
     client = _download_client()
     query = "Example.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-DUMMYGRP.mkv"
-    wrong_group = (
-        "Example.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-WebRip.mkv"
-    )
+    wrong_group = "Example.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-WebRip.mkv"
     size = 1_450_000_000
     client.search_indexer = AsyncMock(return_value=[_hit(wrong_group, size + 5_000_000)])
 
@@ -482,18 +501,27 @@ async def test_best_match_accepts_punctuation_variants_and_strips_tags():
     client = _download_client()
     size = 1_450_000_000
     # Dots vs spaces must not split the same release...
-    client.search_indexer = AsyncMock(return_value=[
-        _hit("Example.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-DUMMYGRP", size),
-    ])
-    query = ("Example Outpost S04E08 Signal in the Dark 1080p "
-             "AMZN WEB-DL DDP5.1 H.264-DUMMYGRP")
+    client.search_indexer = AsyncMock(
+        return_value=[
+            _hit(
+                "Example.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-DUMMYGRP",
+                size,
+            ),
+        ]
+    )
+    query = (
+        "Example Outpost S04E08 Signal in the Dark 1080p "
+        "AMZN WEB-DL DDP5.1 H.264-DUMMYGRP"
+    )
     best = await client.best_match(query, target_size=size)
     assert best is not None
 
     # ...while trailing indexer tags and media extensions are ignored.
-    client.search_indexer = AsyncMock(return_value=[
-        _hit("[DummySub] Moonweaver - 28 (1080p) [A1B2C3D4].mkv", size),
-    ])
+    client.search_indexer = AsyncMock(
+        return_value=[
+            _hit("[DummySub] Moonweaver - 28 (1080p) [A1B2C3D4].mkv", size),
+        ]
+    )
     best = await client.best_match("[DummySub] Moonweaver - 28 (1080p)", target_size=size)
     assert best is not None
 
@@ -554,6 +582,7 @@ async def test_prowlarr_headers_not_leaked_to_external_hosts():
     class _MockAsyncChunks:
         def __aiter__(self):
             return self
+
         async def __anext__(self):
             if not hasattr(self, "_done"):
                 self._done = True
@@ -602,6 +631,7 @@ async def test_prowlarr_download_url_scrubbed_in_exceptions():
     class _MockErrorChunks:
         def __aiter__(self):
             return self
+
         async def __anext__(self):
             if not hasattr(self, "_done"):
                 self._done = True
@@ -653,6 +683,7 @@ async def test_prowlarr_download_url_scrubbed_in_exceptions():
 @pytest.mark.anyio
 async def test_pick_ssd_source_public_failure_does_not_fall_through():
     from racing_sync.clients.abstract import Torrent
+
     cfg = MagicMock()
     cfg.cross_seed.allow_ssh_export = False
     cfg.cross_seed.refetch_public_via_prowlarr = False
@@ -690,6 +721,7 @@ async def test_pick_ssd_source_public_failure_does_not_fall_through():
 @pytest.mark.anyio
 async def test_pick_ssd_source_sftp_error_handled_gracefully():
     from racing_sync.clients.abstract import Torrent
+
     cfg = MagicMock()
     cfg.cross_seed.allow_ssh_export = True
     cfg.cross_seed.refetch_public_via_prowlarr = False
@@ -728,21 +760,24 @@ async def test_pick_ssd_source_sftp_error_handled_gracefully():
 async def test_pick_ssd_source_extracts_announce_url():
     from racing_sync.clients.abstract import Torrent
     from racing_sync.watchdir import _bencode
+
     cfg = MagicMock()
     cfg.prowlarr.enabled = True
     cfg.prowlarr.should_skip_title.return_value = False
     cfg.prowlarr.download_indexer_names = ["Test Indexer (API)"]
     cfg.cross_seed.allow_prowlarr_cross_seed = True
 
-    blob = _bencode({
-        b"announce": b"http://tracker.test-indexer.example/announce",
-        b"info": {
-            b"name": b"Private.Release",
-            b"length": 5000,
-            b"piece length": 16384,
-            b"pieces": b"12345678901234567890",
-        },
-    })
+    blob = _bencode(
+        {
+            b"announce": b"http://tracker.test-indexer.example/announce",
+            b"info": {
+                b"name": b"Private.Release",
+                b"length": 5000,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
     hit = MagicMock(
         title="Private.Release",
         size_bytes=5000,
@@ -785,6 +820,7 @@ async def test_pick_ssd_source_extracts_announce_url():
 @pytest.mark.anyio
 async def test_pick_ssd_source_private_sftp_fallback_when_not_attempting_prowlarr():
     from racing_sync.clients.abstract import Torrent
+
     cfg = MagicMock()
     cfg.cross_seed.allow_ssh_export = True
     sftp = MagicMock()
@@ -825,15 +861,17 @@ async def test_pick_rejects_hit_whose_payload_is_another_release():
     src_show = "Example.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-DUMMYGRP.mkv"
     hit_show = "Example.Outpost.S04E08.Signal.in.the.Dark.1080p.AMZN.WEB-DL.DDP5.1.H.264-WebRip.mkv"
     size = 1_450_000_000
-    hit_blob = _bencode({
-        b"announce": b"http://tracker.test-indexer.example/announce",
-        b"info": {
-            b"name": hit_show.encode(),
-            b"length": size,
-            b"piece length": 262144,
-            b"pieces": b"12345678901234567890",
-        },
-    })
+    hit_blob = _bencode(
+        {
+            b"announce": b"http://tracker.test-indexer.example/announce",
+            b"info": {
+                b"name": hit_show.encode(),
+                b"length": size,
+                b"piece length": 262144,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
 
     cfg = MagicMock()
     cfg.prowlarr.should_skip_title.return_value = False
@@ -846,17 +884,28 @@ async def test_pick_rejects_hit_whose_payload_is_another_release():
         return_value=[Indexer(9, "Test Indexer (API)", "torrent", True, [])]
     )
     prowlarr.best_match.return_value = TorrentHit(
-        title=hit_show, guid="9", indexer="Test Indexer (API)", indexer_id=1,
-        size_bytes=size, download_url="http://prowlarr/9",
-        magnet_url="", info_url="", publish_date="",
+        title=hit_show,
+        guid="9",
+        indexer="Test Indexer (API)",
+        indexer_id=1,
+        size_bytes=size,
+        download_url="http://prowlarr/9",
+        magnet_url="",
+        info_url="",
+        publish_date="",
     )
     prowlarr.download_torrent.return_value = hit_blob
 
     dec = await pick_ssd_source_for_racing(
         cfg=cfg,
         source_torrent=Torrent(
-            hash="srchash", name=src_show, category="racing",
-            save_path="", size_bytes=size, state="seeding", progress=1.0,
+            hash="srchash",
+            name=src_show,
+            category="racing",
+            save_path="",
+            size_bytes=size,
+            state="seeding",
+            progress=1.0,
             trackers=["https://alpha.cc/announce"],
         ),
         other_source_torrents=[],
@@ -941,12 +990,14 @@ def _multi_client() -> ProwlarrClient:
 
 def test_get_download_indexers_preserves_priority_order():
     assert [i.name for i in _multi_client().get_download_indexers()] == [
-        "First (API)", "Second (API)",
+        "First (API)",
+        "Second (API)",
     ]
 
 
 def test_get_download_indexers_skips_unusable_and_raises_when_none():
     from racing_sync.prowlarr import ProwlarrError
+
     client = _multi_client()
     client._indexers_by_name = {
         "second (api)": Indexer(2, "Second (API)", "torrent", False, []),
@@ -968,9 +1019,15 @@ async def test_best_match_falls_through_to_second_indexer():
 
     def _mk(title, idx_name, idx_id):
         return TorrentHit(
-            title=title, guid=str(idx_id), indexer=idx_name, indexer_id=idx_id,
-            size_bytes=size, download_url=f"http://prowlarr/{idx_id}",
-            magnet_url="", info_url="", publish_date="",
+            title=title,
+            guid=str(idx_id),
+            indexer=idx_name,
+            indexer_id=idx_id,
+            size_bytes=size,
+            download_url=f"http://prowlarr/{idx_id}",
+            magnet_url="",
+            info_url="",
+            publish_date="",
         )
 
     async def _search(idx, query_text, *, limit=None):
@@ -992,11 +1049,19 @@ async def test_best_match_prefers_first_indexer_on_tie():
     size = 1_000_000_000
 
     async def _search(idx, query_text, *, limit=None):
-        return [TorrentHit(
-            title=query, guid=str(idx.id), indexer=idx.name, indexer_id=idx.id,
-            size_bytes=size, download_url=f"http://prowlarr/{idx.id}",
-            magnet_url="", info_url="", publish_date="",
-        )]
+        return [
+            TorrentHit(
+                title=query,
+                guid=str(idx.id),
+                indexer=idx.name,
+                indexer_id=idx.id,
+                size_bytes=size,
+                download_url=f"http://prowlarr/{idx.id}",
+                magnet_url="",
+                info_url="",
+                publish_date="",
+            )
+        ]
 
     client.search_indexer = _search
     best = await client.best_match(query, target_size=size)
@@ -1016,32 +1081,44 @@ async def test_pick_ssd_source_labels_indexer_slug():
     cfg.prowlarr.download_indexer_names = ["Second Indexer (API)"]
     cfg.cross_seed.allow_prowlarr_cross_seed = True
 
-    blob = _bencode({
-        b"announce": b"http://tracker.second.example/announce",
-        b"info": {
-            b"name": b"Private.Release",
-            b"length": 5000,
-            b"piece length": 16384,
-            b"pieces": b"12345678901234567890",
-        },
-    })
+    blob = _bencode(
+        {
+            b"announce": b"http://tracker.second.example/announce",
+            b"info": {
+                b"name": b"Private.Release",
+                b"length": 5000,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
     prowlarr = AsyncMock()
     prowlarr.get_download_indexers = MagicMock(
         return_value=[Indexer(7, "Second Indexer (API)", "torrent", True, [])]
     )
     prowlarr.best_match.return_value = TorrentHit(
-        title="Private.Release", guid="7", indexer="Second Indexer (API)",
-        indexer_id=7, size_bytes=5000,
+        title="Private.Release",
+        guid="7",
+        indexer="Second Indexer (API)",
+        indexer_id=7,
+        size_bytes=5000,
         download_url="http://prowlarr.local/dl/7",
-        magnet_url="", info_url="", publish_date="",
+        magnet_url="",
+        info_url="",
+        publish_date="",
     )
     prowlarr.download_torrent.return_value = blob
 
     dec = await pick_ssd_source_for_racing(
         cfg=cfg,
         source_torrent=Torrent(
-            hash="privhash999", name="Private.Release", category="racing",
-            save_path="", size_bytes=5000, state="racing", progress=1.0,
+            hash="privhash999",
+            name="Private.Release",
+            category="racing",
+            save_path="",
+            size_bytes=5000,
+            state="racing",
+            progress=1.0,
             trackers=["https://alpha.cc/announce"],
         ),
         other_source_torrents=[],
@@ -1063,47 +1140,74 @@ def test_verified_blob_requires_name_and_size():
     from racing_sync.coordinator_content import _verified_cross_seed_blob
 
     # No name key at all.
-    nameless = _bencode({
-        b"announce": b"http://x/announce",
-        b"info": {b"length": 100, b"piece length": 16384,
-                  b"pieces": b"12345678901234567890"},
-    })
-    assert _verified_cross_seed_blob(
-        nameless, target_name="Show.S01E01", target_size=100,
-        hit_title="Show.S01E01") is None
+    nameless = _bencode(
+        {
+            b"announce": b"http://x/announce",
+            b"info": {b"length": 100, b"piece length": 16384, b"pieces": b"12345678901234567890"},
+        }
+    )
+    assert (
+        _verified_cross_seed_blob(
+            nameless, target_name="Show.S01E01", target_size=100, hit_title="Show.S01E01"
+        )
+        is None
+    )
     # Zero size with a good name.
-    zero_size = _bencode({
-        b"announce": b"http://x/announce",
-        b"info": {b"name": b"Show.S01E01", b"length": 0,
-                  b"piece length": 16384, b"pieces": b"12345678901234567890"},
-    })
-    assert _verified_cross_seed_blob(
-        zero_size, target_name="Show.S01E01", target_size=100,
-        hit_title="Show.S01E01") is None
+    zero_size = _bencode(
+        {
+            b"announce": b"http://x/announce",
+            b"info": {
+                b"name": b"Show.S01E01",
+                b"length": 0,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
+    assert (
+        _verified_cross_seed_blob(
+            zero_size, target_name="Show.S01E01", target_size=100, hit_title="Show.S01E01"
+        )
+        is None
+    )
     # Well-formed blob still verifies.
-    good = _bencode({
-        b"announce": b"http://x/announce",
-        b"info": {b"name": b"Show.S01E01", b"length": 100,
-                  b"piece length": 16384, b"pieces": b"12345678901234567890"},
-    })
-    assert _verified_cross_seed_blob(
-        good, target_name="Show.S01E01", target_size=100,
-        hit_title="Show.S01E01") is not None
+    good = _bencode(
+        {
+            b"announce": b"http://x/announce",
+            b"info": {
+                b"name": b"Show.S01E01",
+                b"length": 100,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
+    assert (
+        _verified_cross_seed_blob(
+            good, target_name="Show.S01E01", target_size=100, hit_title="Show.S01E01"
+        )
+        is not None
+    )
 
 
 @pytest.mark.anyio
 async def test_pick_download_fetch_failure_parks_instead_of_failing():
     """A 500 fetching the payload parks for retry, never FAILED."""
     hit = TorrentHit(
-        title="Priv.Movie", guid="9", indexer="Test Indexer (API)",
-        indexer_id=1, size_bytes=1000, download_url="http://prowlarr/9",
-        magnet_url="", info_url="", publish_date="",
+        title="Priv.Movie",
+        guid="9",
+        indexer="Test Indexer (API)",
+        indexer_id=1,
+        size_bytes=1000,
+        download_url="http://prowlarr/9",
+        magnet_url="",
+        info_url="",
+        publish_date="",
     )
     prowlarr = AsyncMock()
     prowlarr.get_download_indexers = MagicMock(return_value=[])
     prowlarr.best_match = AsyncMock(return_value=hit)
-    prowlarr.download_torrent = AsyncMock(
-        side_effect=RuntimeError("indexer 500"))
+    prowlarr.download_torrent = AsyncMock(side_effect=RuntimeError("indexer 500"))
 
     cfg = MagicMock()
     cfg.prowlarr.should_skip_title.return_value = False
@@ -1111,8 +1215,13 @@ async def test_pick_download_fetch_failure_parks_instead_of_failing():
     cfg.cross_seed.allow_ssh_export = False
 
     t_priv = Torrent(
-        hash="hpriv", name="Priv.Movie", category="",
-        save_path="", size_bytes=1000, state="racing", progress=1.0,
+        hash="hpriv",
+        name="Priv.Movie",
+        category="",
+        save_path="",
+        size_bytes=1000,
+        state="racing",
+        progress=1.0,
         trackers=["https://alpha.cc/announce/passkey"],
     )
     dec = await pick_ssd_source_for_racing(
@@ -1137,8 +1246,7 @@ def test_example_config_prowlarr_keys_not_nested(example_config):
     """
     import tomllib
 
-    raw = tomllib.load(
-        open(Path(__file__).parent.parent / "config.example.toml", "rb"))
+    raw = tomllib.load(open(Path(__file__).parent.parent / "config.example.toml", "rb"))
     top = raw["prowlarr"]
     assert top["skip_query_substrings"] == ["dummysub"]
     assert top["timeout_seconds"] == 30.0
@@ -1151,9 +1259,15 @@ def _dl_hit(url):
     from racing_sync.prowlarr import TorrentHit
 
     return TorrentHit(
-        title="Test", guid="1", indexer="indexer1", indexer_id=1,
-        size_bytes=100, download_url=url, magnet_url="",
-        info_url="", publish_date="",
+        title="Test",
+        guid="1",
+        indexer="indexer1",
+        indexer_id=1,
+        size_bytes=100,
+        download_url=url,
+        magnet_url="",
+        info_url="",
+        publish_date="",
     )
 
 
@@ -1202,16 +1316,22 @@ async def test_download_torrent_retries_transient_then_succeeds():
     client._session = MagicMock()
 
     fail = _dl_resp(b"")
-    fail.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(
-        request_info=MagicMock(), history=(), status=429,
-        headers={"Retry-After": "0"},
-    ))
+    fail.raise_for_status = MagicMock(
+        side_effect=aiohttp.ClientResponseError(
+            request_info=MagicMock(),
+            history=(),
+            status=429,
+            headers={"Retry-After": "0"},
+        )
+    )
     client._session.get.side_effect = [
-        _dl_cm(fail), _dl_cm(_dl_resp(b"d8:announcee")),
+        _dl_cm(fail),
+        _dl_cm(_dl_resp(b"d8:announcee")),
     ]
 
     data = await client.download_torrent(
-        _dl_hit("https://external.tracker.org/download.php?id=123"))
+        _dl_hit("https://external.tracker.org/download.php?id=123")
+    )
     assert data == b"d8:announcee"
     assert client._session.get.call_count == 2
 
@@ -1231,8 +1351,7 @@ async def test_download_torrent_sends_key_to_same_host_only():
     client._session = MagicMock()
     client._session.get.return_value = _dl_cm(_dl_resp(b"d8:announcee"))
 
-    await client.download_torrent(
-        _dl_hit("http://prowlarr.local:9696/api/v1/download/1"))
+    await client.download_torrent(_dl_hit("http://prowlarr.local:9696/api/v1/download/1"))
     call_args = client._session.get.call_args
     assert call_args.kwargs.get("headers") == {"X-Api-Key": "prowlarr_key"}
 
@@ -1258,19 +1377,32 @@ async def test_parallel_search_overall_deadline(monkeypatch):
     client.search_indexer = _hung
     monkeypatch.setattr(ProwlarrClient, "_PARALLEL_SEARCH_TIMEOUT_S", 0.05)
     import time
+
     t0 = time.monotonic()
-    assert await client.search_indexers_parallel(
-        [Indexer(id=1, name="Slow (API)", protocol="torrent",
-                 enable=True, capabilities=[])], "Some.Release") == {}
+    assert (
+        await client.search_indexers_parallel(
+            [Indexer(id=1, name="Slow (API)", protocol="torrent", enable=True, capabilities=[])],
+            "Some.Release",
+        )
+        == {}
+    )
     assert time.monotonic() - t0 < 10
 
 
 def _find_hit(title, size, indexer="Alpha"):
     from racing_sync.prowlarr import TorrentHit
 
-    return TorrentHit(title=title, guid="g", indexer=indexer, indexer_id=1,
-                      size_bytes=size, download_url="http://x/y.torrent",
-                      magnet_url="", info_url="", publish_date="")
+    return TorrentHit(
+        title=title,
+        guid="g",
+        indexer=indexer,
+        indexer_id=1,
+        size_bytes=size,
+        download_url="http://x/y.torrent",
+        magnet_url="",
+        info_url="",
+        publish_date="",
+    )
 
 
 @pytest.mark.anyio
@@ -1284,26 +1416,32 @@ async def test_find_release_readout_structure():
     prow = MagicMock()
     prow._cfg = MagicMock()
     prow._cfg.should_skip_title = MagicMock(return_value=False)
-    prow.get_download_indexers = MagicMock(return_value=[
-        Indexer(id=1, name="Alpha", protocol="torrent", enable=True,
-                capabilities=[]),
-        Indexer(id=2, name="Beta", protocol="torrent", enable=True,
-                capabilities=[]),
-    ])
-    prow.search_indexers_parallel = AsyncMock(return_value={
-        "alpha": [_find_hit("Show.S01E01.1080p-GRP", 1000),
-                  _find_hit("Show.S01E01.720p-GRP", 500),
-                  _find_hit("Show.S01E01.480p-GRP", 200),
-                  _find_hit("Show.S01E01.360p-GRP", 100)],
-        "beta": [],
-    })
+    prow.get_download_indexers = MagicMock(
+        return_value=[
+            Indexer(id=1, name="Alpha", protocol="torrent", enable=True, capabilities=[]),
+            Indexer(id=2, name="Beta", protocol="torrent", enable=True, capabilities=[]),
+        ]
+    )
+    prow.search_indexers_parallel = AsyncMock(
+        return_value={
+            "alpha": [
+                _find_hit("Show.S01E01.1080p-GRP", 1000),
+                _find_hit("Show.S01E01.720p-GRP", 500),
+                _find_hit("Show.S01E01.480p-GRP", 200),
+                _find_hit("Show.S01E01.360p-GRP", 100),
+            ],
+            "beta": [],
+        }
+    )
     coord.prowlarr = prow
     res = await coord.find_release("Show.S01E01", per_indexer=2)
     assert res["query"] == "Show.S01E01"
     assert [i["name"] for i in res["indexers"]] == ["Alpha", "Beta"]
     assert res["indexers"][0]["total"] == 4
     assert [h["title"] for h in res["indexers"][0]["hits"]] == [
-        "Show.S01E01.1080p-GRP", "Show.S01E01.720p-GRP"]
+        "Show.S01E01.1080p-GRP",
+        "Show.S01E01.720p-GRP",
+    ]
     assert res["indexers"][1]["hits"] == []
 
 
@@ -1344,9 +1482,16 @@ def _pick_cfg(**kw):
 
 
 def _pick_torrent(h, trackers, size=1000, name="Show"):
-    return Torrent(hash=h, name=name, category="", save_path="",
-                   size_bytes=size, state="seeding", progress=1.0,
-                   trackers=trackers)
+    return Torrent(
+        hash=h,
+        name=name,
+        category="",
+        save_path="",
+        size_bytes=size,
+        state="seeding",
+        progress=1.0,
+        trackers=trackers,
+    )
 
 
 @pytest.mark.anyio
@@ -1355,10 +1500,8 @@ async def test_public_unreachable_falls_through_to_direct():
     same-content download-indexer sibling supplies VPS2-leechable bytes
     instead of parking with options unspent."""
     cfg = _pick_cfg()
-    pub = _pick_torrent(
-        "p" * 40, ["udp://tracker.opentrackr.org:1337/announce"])
-    sib = _pick_torrent(
-        "d" * 40, ["https://dl-indexer.example.net/announce"])
+    pub = _pick_torrent("p" * 40, ["udp://tracker.opentrackr.org:1337/announce"])
+    sib = _pick_torrent("d" * 40, ["https://dl-indexer.example.net/announce"])
     sftp = MagicMock()
     sftp.fetch_torrent = MagicMock(return_value=None)
     source_client = AsyncMock()
@@ -1369,8 +1512,13 @@ async def test_public_unreachable_falls_through_to_direct():
     source_client.export_torrent = AsyncMock(side_effect=_export)
 
     dec = await pick_ssd_source_for_racing(
-        cfg=cfg, source_torrent=pub, other_source_torrents=[sib],
-        prowlarr=MagicMock(), sftp=sftp, source_client=source_client)
+        cfg=cfg,
+        source_torrent=pub,
+        other_source_torrents=[sib],
+        prowlarr=MagicMock(),
+        sftp=sftp,
+        source_client=source_client,
+    )
     assert dec is not None
     assert dec.infohash == "d" * 40
     assert dec.preferred is True
@@ -1380,18 +1528,21 @@ async def test_public_unreachable_falls_through_to_direct():
 async def test_direct_sibling_size_mismatch_falls_back():
     """A same-name repack of a different size must not supply bytes."""
     cfg = _pick_cfg()
-    pub = _pick_torrent(
-        "p" * 40, ["udp://tracker.opentrackr.org:1337/announce"])
-    sib = _pick_torrent(
-        "d" * 40, ["https://dl-indexer.example.net/announce"], size=2000)
+    pub = _pick_torrent("p" * 40, ["udp://tracker.opentrackr.org:1337/announce"])
+    sib = _pick_torrent("d" * 40, ["https://dl-indexer.example.net/announce"], size=2000)
     sftp = MagicMock()
     sftp.fetch_torrent = MagicMock(return_value=None)
     source_client = AsyncMock()
     source_client.export_torrent = AsyncMock(return_value=None)
 
     dec = await pick_ssd_source_for_racing(
-        cfg=cfg, source_torrent=pub, other_source_torrents=[sib],
-        prowlarr=MagicMock(), sftp=sftp, source_client=source_client)
+        cfg=cfg,
+        source_torrent=pub,
+        other_source_torrents=[sib],
+        prowlarr=MagicMock(),
+        sftp=sftp,
+        source_client=source_client,
+    )
     assert dec is None
 
 
@@ -1408,14 +1559,19 @@ async def test_picker_deadline_parks():
     real = _picker._PICKER_DEADLINE_S
     _picker._PICKER_DEADLINE_S = 0.1
     try:
+
         async def _hang(**kw):
             await asyncio.sleep(3600)
 
         with patch.object(_picker, "_pick_ssd_source_inner", new=_hang):
             dec = await _picker.pick_ssd_source_for_racing(
-                cfg=MagicMock(), source_torrent=SimpleNamespace(name="X"),
-                other_source_torrents=[], prowlarr=None, sftp=None,
-                source_client=MagicMock())
+                cfg=MagicMock(),
+                source_torrent=SimpleNamespace(name="X"),
+                other_source_torrents=[],
+                prowlarr=None,
+                sftp=None,
+                source_client=MagicMock(),
+            )
         assert dec is None
     finally:
         _picker._PICKER_DEADLINE_S = real
@@ -1446,8 +1602,11 @@ def _err_cm(status: int, retry_after: str | None = None):
 
     resp = MagicMock()
     headers = {"Retry-After": retry_after} if retry_after else {}
-    resp.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(
-        request_info=MagicMock(), history=(), status=status, headers=headers))
+    resp.raise_for_status = MagicMock(
+        side_effect=aiohttp.ClientResponseError(
+            request_info=MagicMock(), history=(), status=status, headers=headers
+        )
+    )
     cm = MagicMock()
     cm.__aenter__ = AsyncMock(return_value=resp)
     cm.__aexit__ = AsyncMock(return_value=False)
@@ -1457,11 +1616,11 @@ def _err_cm(status: int, retry_after: str | None = None):
 _XML_ONE_HIT = (
     b'<?xml version="1.0" encoding="UTF-8"?>'
     b'<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">'
-    b'<channel><item>'
-    b'<title>Show.S01E01.1080p</title>'
-    b'<guid>abc</guid>'
+    b"<channel><item>"
+    b"<title>Show.S01E01.1080p</title>"
+    b"<guid>abc</guid>"
     b'<enclosure url="http://idx.example/dl/1.torrent" length="1000" type="application/x-bittorrent"/>'
-    b'</item></channel></rss>'
+    b"</item></channel></rss>"
 )
 
 
@@ -1488,13 +1647,16 @@ async def test_refresh_retries_transient_429():
 
     ok = MagicMock()
     ok.raise_for_status = MagicMock()
-    ok.json = AsyncMock(return_value=[
-        {"id": 1, "name": "indexer1", "protocol": "torrent", "enable": True}])
+    ok.json = AsyncMock(
+        return_value=[{"id": 1, "name": "indexer1", "protocol": "torrent", "enable": True}]
+    )
     ok_cm = MagicMock()
     ok_cm.__aenter__ = AsyncMock(return_value=ok)
     ok_cm.__aexit__ = AsyncMock(return_value=False)
     client._session.get.side_effect = [
-        _err_cm(429), _err_cm(503), ok_cm,
+        _err_cm(429),
+        _err_cm(503),
+        ok_cm,
     ]
     await client._refresh_indexers()
     assert client._session.get.call_count == 3
@@ -1507,7 +1669,8 @@ async def test_search_retries_500_then_succeeds():
     client = _refresh_client()
     idx = Indexer(1, "indexer1", "torrent", True, [])
     client._session.get.side_effect = [
-        _err_cm(500), _search_cm(_XML_ONE_HIT),
+        _err_cm(500),
+        _search_cm(_XML_ONE_HIT),
     ]
     hits = await client.search_indexer(idx, "Show.S01E01.1080p")
     assert len(hits) == 1
@@ -1523,7 +1686,8 @@ async def test_search_honors_retry_after_without_sleeping():
     client = _refresh_client()
     idx = Indexer(1, "indexer1", "torrent", True, [])
     client._session.get.side_effect = [
-        _err_cm(429, retry_after="0"), _search_cm(_XML_ONE_HIT),
+        _err_cm(429, retry_after="0"),
+        _search_cm(_XML_ONE_HIT),
     ]
     t0 = time.monotonic()
     hits = await client.search_indexer(idx, "Show.S01E01.1080p")
@@ -1574,8 +1738,12 @@ def test_parallel_bounds_explicit_config_wins():
     )
     assert ProwlarrClient(cfg)._parallel_bounds() == (2, 7.5)
 
-    plain = ProwlarrClient(ProwlarrConfig(
-        enabled=True, base_url="http://prowlarr.local:9696",
-        api_key="prowlarr_key",
-        download_indexers=[DownloadIndexerConfig(name="indexer1")]))
+    plain = ProwlarrClient(
+        ProwlarrConfig(
+            enabled=True,
+            base_url="http://prowlarr.local:9696",
+            api_key="prowlarr_key",
+            download_indexers=[DownloadIndexerConfig(name="indexer1")],
+        )
+    )
     assert plain._parallel_bounds() == (4, 90.0)

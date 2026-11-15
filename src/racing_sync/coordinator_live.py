@@ -51,10 +51,14 @@ class LiveStatusMixin:
 
         async def _one(_chunk):
             async with _sem:
-                return await rpc(
-                    self.dest_client.list_torrents(hashes=_chunk),
-                    getattr(self, "cfg", None), "dest live list_torrents",
-                ) or []
+                return (
+                    await rpc(
+                        self.dest_client.list_torrents(hashes=_chunk),
+                        getattr(self, "cfg", None),
+                        "dest live list_torrents",
+                    )
+                    or []
+                )
 
         try:
             _parts = await asyncio.gather(*(_one(c) for c in _chunks))
@@ -72,6 +76,7 @@ class LiveStatusMixin:
             self._live_last = _snap
             try:
                 import time as _time
+
                 self._live_last_at = _time.monotonic()
             except Exception:
                 pass
@@ -101,6 +106,7 @@ class LiveStatusMixin:
         """
         try:
             import time as _time
+
             _at = float(getattr(self, "_live_last_at", 0.0) or 0.0)
             if _time.monotonic() - _at > _LIVE_SNAPSHOT_STALE_S:
                 return None
@@ -146,13 +152,19 @@ class LiveStatusMixin:
                 return
             try:
                 import time as _time
+
                 _now = _time.monotonic()
             except Exception:
                 _now = 0.0
             try:
-                _stall_timeout = float(getattr(
-                    getattr(getattr(self, "cfg", None), "general", None),
-                    "download_stall_timeout_seconds", 0) or 0)
+                _stall_timeout = float(
+                    getattr(
+                        getattr(getattr(self, "cfg", None), "general", None),
+                        "download_stall_timeout_seconds",
+                        0,
+                    )
+                    or 0
+                )
             except (TypeError, ValueError):
                 _stall_timeout = 0.0
             except Exception:
@@ -177,16 +189,21 @@ class LiveStatusMixin:
                     if not _dh:
                         continue
                     _item = (getattr(self, "_live", None) or {}).get(_dh)
-                    _src = ((getattr(_item, "source_infohash", "") or "")
-                            .lower()) if _item is not None else ""
+                    _src = (
+                        ((getattr(_item, "source_infohash", "") or "").lower())
+                        if _item is not None
+                        else ""
+                    )
                     _state = str(getattr(t, "state", "") or "").lower()
                     try:
                         _prog = float(getattr(t, "progress", 0.0) or 0.0)
                     except (TypeError, ValueError):
                         _prog = 0.0
                     try:
-                        _done = bool(getattr(t, "is_complete", None)
-                                     and t.is_complete()) or _prog >= 1.0
+                        _done = (
+                            bool(getattr(t, "is_complete", None) and t.is_complete())
+                            or _prog >= 1.0
+                        )
                     except Exception:
                         _done = _prog >= 1.0
                     _verdict: str | None = None
@@ -199,11 +216,12 @@ class LiveStatusMixin:
                     else:
                         try:
                             _prev = _still.get(_dh)
-                            if (isinstance(_prev, (list, tuple))
-                                    and len(_prev) == 2
-                                    and abs(float(_prev[0]) - _prog) < 1e-9):
-                                if (_stall_timeout > 0 and _now - float(
-                                        _prev[1]) > _stall_timeout):
+                            if (
+                                isinstance(_prev, (list, tuple))
+                                and len(_prev) == 2
+                                and abs(float(_prev[0]) - _prog) < 1e-9
+                            ):
+                                if _stall_timeout > 0 and _now - float(_prev[1]) > _stall_timeout:
                                     _verdict = "stalled"
                             else:
                                 _still[_dh] = [_prog, _now]
@@ -217,6 +235,7 @@ class LiveStatusMixin:
                         if _src:
                             try:
                                 from .task import handles_for
+
                                 for _hd in handles_for(self, _src):
                                     try:
                                         _hd.event.set()
@@ -338,8 +357,11 @@ class LiveStatusMixin:
             live = getattr(self, "_live", None)
             if not want or not isinstance(live, dict) or not live:
                 return
-            for k in [k for k, v in live.items()
-                      if (getattr(v, "source_infohash", "") or "").lower() == want]:
+            for k in [
+                k
+                for k, v in live.items()
+                if (getattr(v, "source_infohash", "") or "").lower() == want
+            ]:
                 live.pop(k, None)
         except Exception:
             pass

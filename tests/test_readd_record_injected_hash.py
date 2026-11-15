@@ -6,6 +6,7 @@ RE_ADDING cycle then paid a duplicate add/verify (the early-return guards
 check `ts.injected_private_hashes`). On success the row must now remember
 the hash and persist it.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -20,14 +21,16 @@ SRC = "c" * 40
 
 
 def _blob() -> bytes:
-    return _bencode({
-        b"info": {
-            b"name": b"Show.Batch",
-            b"length": 100,
-            b"piece length": 16384,
-            b"pieces": b"12345678901234567890",
-        },
-    })
+    return _bencode(
+        {
+            b"info": {
+                b"name": b"Show.Batch",
+                b"length": 100,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
 
 
 def _scaffold(tmp_path):
@@ -39,8 +42,7 @@ def _scaffold(tmp_path):
     coord._target_mount_for = MagicMock(return_value=tmp_path / "fuse")
     coord._target_mount_for_blob = MagicMock(return_value=tmp_path / "fuse")
     coord._ensure_fuse_entry = AsyncMock(return_value=(True, "Ok."))
-    coord.transition = MagicMock(
-        side_effect=lambda t, s, error="": setattr(t, "state", s))
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
 
     ts = TorrentState(
         source_infohash=SRC,

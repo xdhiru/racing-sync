@@ -62,9 +62,13 @@ _LEGACY_MOVE_FAIL_PARKS = 5
 _MOVE_STAGE_MOVED = "moved"
 _MOVE_STAGE_ENTRY_DELETED = "entry_deleted"
 _MOVE_STAGE_WIPED = "wiped"
-_MOVE_STAGES = frozenset({
-    _MOVE_STAGE_MOVED, _MOVE_STAGE_ENTRY_DELETED, _MOVE_STAGE_WIPED,
-})
+_MOVE_STAGES = frozenset(
+    {
+        _MOVE_STAGE_MOVED,
+        _MOVE_STAGE_ENTRY_DELETED,
+        _MOVE_STAGE_WIPED,
+    }
+)
 _MOVE_PLAN_VERSION = 1
 
 
@@ -151,8 +155,7 @@ class MoveMixin:
         try:
             _up = getattr(self.store, "update_columns", None)
             if callable(_up):
-                _nv = _up((ts.source_infohash or ""),
-                          {"last_error": ts.last_error})
+                _nv = _up((ts.source_infohash or ""), {"last_error": ts.last_error})
                 if isinstance(_nv, int) and _nv > 0:
                     try:
                         ts.version = _nv
@@ -160,8 +163,7 @@ class MoveMixin:
                         pass
                 elif self._abandoned(ts):
                     raise AbandonedError(
-                        f"row gone for {(ts.source_infohash or '')[:10]}; "
-                        "not parking in MOVING"
+                        f"row gone for {(ts.source_infohash or '')[:10]}; not parking in MOVING"
                     )
                 else:
                     self.store.upsert(ts)
@@ -174,22 +176,29 @@ class MoveMixin:
         if quiet:
             log.debug(
                 "MOVING parked (quiet) for %s: %s (parked %dx)",
-                ts.source_name[:60], reason, n,
+                ts.source_name[:60],
+                reason,
+                n,
             )
         elif n >= 5 and (n == 5 or (n - 5) % 20 == 0):
             log.error(
                 "MOVING stalled for %s: %s (parked %dx, still retrying)",
-                ts.source_name[:60], reason, n,
+                ts.source_name[:60],
+                reason,
+                n,
             )
         elif n >= 5:
             log.debug(
                 "MOVING still parked for %s: %s (parked %dx)",
-                ts.source_name[:60], reason, n,
+                ts.source_name[:60],
+                reason,
+                n,
             )
         else:
             log.warning(
                 "staying in MOVING for %s: %s",
-                ts.source_name[:60], reason,
+                ts.source_name[:60],
+                reason,
             )
 
     def _single_on_fuse(self, files: list, single_file: str, ts) -> bool:
@@ -205,8 +214,11 @@ class MoveMixin:
         if not norm or norm == ".":
             return False
         match = next(
-            (f for f in files
-             if str(_safe_ssd_join(Path("."), getattr(f, "name", "") or "") or "") == norm),
+            (
+                f
+                for f in files
+                if str(_safe_ssd_join(Path("."), getattr(f, "name", "") or "") or "") == norm
+            ),
             None,
         )
         if match is None:
@@ -232,8 +244,11 @@ class MoveMixin:
         """
         try:
             _ri = getattr(self, "_recheck_in_flight", None)
-            if (isinstance(_ri, (list, tuple)) and len(_ri) == 2
-                    and _ri[0] == (ts.source_infohash or "").lower()):
+            if (
+                isinstance(_ri, (list, tuple))
+                and len(_ri) == 2
+                and _ri[0] == (ts.source_infohash or "").lower()
+            ):
                 self._recheck_in_flight = None
         except Exception:
             pass
@@ -250,8 +265,7 @@ class MoveMixin:
         try:
             _key = (ts.source_infohash or "").lower()
             _ri = getattr(self, "_recheck_in_flight", None)
-            if (isinstance(_ri, (list, tuple)) and len(_ri) == 2
-                    and _key and _ri[0] == _key):
+            if isinstance(_ri, (list, tuple)) and len(_ri) == 2 and _key and _ri[0] == _key:
                 self._recheck_in_flight = [_key, time.monotonic()]
         except Exception:
             pass
@@ -303,8 +317,7 @@ class MoveMixin:
             pass
         return out
 
-    def _register_checking_park(self, ts: TorrentState,
-                                  progress: float = 0.0) -> str | None:
+    def _register_checking_park(self, ts: TorrentState, progress: float = 0.0) -> str | None:
         """Record a checking park against the check-progress watchdog.
 
         A healthy hash check climbs steadily; a wedged one sits still —
@@ -327,15 +340,19 @@ class MoveMixin:
         except (TypeError, ValueError):
             _prog = 0.0
         try:
-            _stall = float(getattr(
-                getattr(self.cfg, "general", None),
-                "download_check_stall_seconds", 1800) or 0)
+            _stall = float(
+                getattr(getattr(self.cfg, "general", None), "download_check_stall_seconds", 1800)
+                or 0
+            )
         except (TypeError, ValueError):
             _stall = 1800.0
         try:
-            _abscap = float(getattr(
-                getattr(self.cfg, "general", None),
-                "download_max_check_wait_seconds", 43200) or 0)
+            _abscap = float(
+                getattr(
+                    getattr(self.cfg, "general", None), "download_max_check_wait_seconds", 43200
+                )
+                or 0
+            )
         except (TypeError, ValueError):
             _abscap = 43200.0
         _ckey = (ts.source_infohash or "").lower()
@@ -347,9 +364,11 @@ class MoveMixin:
                 _csd = {}
                 self._checking_track = _csd  # type: ignore[attr-defined]
             _raw = _csd.get(_ckey)
-            if (isinstance(_raw, (list, tuple)) and len(_raw) == 3
-                    and all(isinstance(v, (int, float))
-                            and not isinstance(v, bool) for v in _raw)):
+            if (
+                isinstance(_raw, (list, tuple))
+                and len(_raw) == 3
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in _raw)
+            ):
                 _rec = [float(_raw[0]), float(_raw[1]), float(_raw[2])]
         except Exception:
             _csd, _rec = {}, None
@@ -371,16 +390,20 @@ class MoveMixin:
                     _csd.pop(_ckey, None)
             except Exception:
                 pass
-            return (f"client hash check made no progress for {int(_stall)}s; "
-                    f"failing for operator attention")
+            return (
+                f"client hash check made no progress for {int(_stall)}s; "
+                f"failing for operator attention"
+            )
         if _abscap > 0 and _now_m - _rec[0] > _abscap:
             try:
                 if isinstance(_csd, dict):
                     _csd.pop(_ckey, None)
             except Exception:
                 pass
-            return (f"client hash check exceeded {int(_abscap)}s overall; "
-                    f"failing for operator attention")
+            return (
+                f"client hash check exceeded {int(_abscap)}s overall; "
+                f"failing for operator attention"
+            )
         try:
             _csd[_ckey] = _rec
             if isinstance(_csd, dict) and len(_csd) > 5000:
@@ -392,8 +415,7 @@ class MoveMixin:
 
     # ---- durable MOVING checkpoint ----
 
-    def _persist_move_stage(self, ts: TorrentState, stage: str,
-                            plan: str | None = None) -> bool:
+    def _persist_move_stage(self, ts: TorrentState, stage: str, plan: str | None = None) -> bool:
         """Checkpoint a move stage under a narrow MOVING-guarded write.
 
         Returns False (and leaves the in-memory row at its previous stage)
@@ -479,8 +501,7 @@ class MoveMixin:
             raise ValueError(f"{label} path is not a non-empty string")
         joined = _safe_ssd_join(root, rel)
         if joined is None:
-            raise ValueError(
-                f"{label} path {rel!r} is absolute or traverses outside the SSD root")
+            raise ValueError(f"{label} path {rel!r} is absolute or traverses outside the SSD root")
         norm = rel.replace("\\", "/").strip("/")
         cur = root
         try:
@@ -498,7 +519,9 @@ class MoveMixin:
         return joined
 
     def _load_move_plan(
-        self, ts: TorrentState, stage: str,
+        self,
+        ts: TorrentState,
+        stage: str,
     ) -> tuple[Path, dict] | None:
         """Parse, schema-check and path-validate the persisted move plan.
 
@@ -524,8 +547,7 @@ class MoveMixin:
         if not isinstance(plan, dict):
             self._park_moving(
                 ts,
-                f"move checkpoint {stage!r} plan is corrupt (not an object); "
-                f"refusing unsafe wipe",
+                f"move checkpoint {stage!r} plan is corrupt (not an object); refusing unsafe wipe",
             )
             return None
         try:
@@ -538,11 +560,9 @@ class MoveMixin:
             keep = plan.get("keep", [])
             flat = plan.get("flat", [])
             folder = plan.get("folder", "")
-            if not isinstance(keep, list) or not all(
-                    isinstance(v, str) for v in keep):
+            if not isinstance(keep, list) or not all(isinstance(v, str) for v in keep):
                 raise ValueError("keep is not a list of strings")
-            if not isinstance(flat, list) or not all(
-                    isinstance(v, str) for v in flat):
+            if not isinstance(flat, list) or not all(isinstance(v, str) for v in flat):
                 raise ValueError("flat is not a list of strings")
             if not isinstance(folder, str):
                 raise ValueError("folder is not a string")
@@ -551,8 +571,7 @@ class MoveMixin:
         except ValueError as e:
             self._park_moving(
                 ts,
-                f"move checkpoint {stage!r} plan is corrupt ({e}); "
-                f"refusing unsafe wipe",
+                f"move checkpoint {stage!r} plan is corrupt ({e}); refusing unsafe wipe",
             )
             return None
         try:
@@ -574,8 +593,7 @@ class MoveMixin:
         except ValueError as e:
             self._park_moving(
                 ts,
-                f"move checkpoint {stage!r} plan is unsafe ({e}); "
-                f"refusing unsafe wipe",
+                f"move checkpoint {stage!r} plan is unsafe ({e}); refusing unsafe wipe",
             )
             return None
         return root, {
@@ -586,7 +604,10 @@ class MoveMixin:
         }
 
     def _build_move_plan(
-        self, src_dir: Path, folder: Path | None, keep: set[str],
+        self,
+        src_dir: Path,
+        folder: Path | None,
+        keep: set[str],
         flat: list[str],
     ) -> str:
         """Build+validate the compact relative-path cleanup plan."""
@@ -607,10 +628,7 @@ class MoveMixin:
             except OSError:
                 folder_rel = ""
         layout = "folder" if folder_rel else "flat"
-        keep_rel = sorted({
-            k for k in (keep or set())
-            if isinstance(k, str) and k
-        })
+        keep_rel = sorted({k for k in (keep or set()) if isinstance(k, str) and k})
         flat_rel: list[str] = []
         seen: set[str] = set()
         for rel in flat or []:
@@ -645,7 +663,8 @@ class MoveMixin:
         self._release_recheck_holder(ts)
 
     async def _cleanup_move_checkpoint(
-        self, ts: TorrentState,
+        self,
+        ts: TorrentState,
         loaded: tuple[Path, dict] | None = None,
     ) -> bool:
         """Run (or retry) the persisted cleanup. True only when fully done."""
@@ -661,16 +680,14 @@ class MoveMixin:
             if folder is None:
                 self._park_moving(
                     ts,
-                    f"move checkpoint {stage!r} folder is unsafe; "
-                    f"refusing unsafe wipe",
+                    f"move checkpoint {stage!r} folder is unsafe; refusing unsafe wipe",
                 )
                 return False
             try:
                 if not folder.exists():
                     return True
                 if plan["keep"]:
-                    if not await self._wipe_folder_except(
-                            folder, set(plan["keep"]), root):
+                    if not await self._wipe_folder_except(folder, set(plan["keep"]), root):
                         self._park_moving(
                             ts,
                             f"folder wipe left file(s) it owns under "
@@ -741,8 +758,7 @@ class MoveMixin:
             try:
                 await self.dest_client.delete(h, delete_files=False)
             except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "could not delete old torrent from client after move: %s", e)
+                log.warning("could not delete old torrent from client after move: %s", e)
                 self._park_moving(
                     ts,
                     f"client entry delete failed after move ({e}); staying in "
@@ -808,17 +824,17 @@ class MoveMixin:
                     except Exception:
                         pass
                     await self._fail_downloading_row(
-                        ts, h,
-                        f"repeated unreadable-mount errors ({e}); failing "
-                        f"for operator attention",
-                        delete_files=False)
+                        ts,
+                        h,
+                        f"repeated unreadable-mount errors ({e}); failing for operator attention",
+                        delete_files=False,
+                    )
                     return
             # Every other phase parks on transient client trouble; a single
             # qB timeout here must not fail a fully-downloaded row.
             self._park_moving(
                 ts,
-                f"could not list files for {h[:10]} before move "
-                f"({e}); will retry on next tick",
+                f"could not list files for {h[:10]} before move ({e}); will retry on next tick",
             )
             return
         try:
@@ -848,7 +864,10 @@ class MoveMixin:
         elif cls.kind and cls.kind != pinned_kind:
             log.warning(
                 "classification flipped %s -> %s for %s after queue; keeping pinned %s for routing",
-                pinned_kind, cls.kind, ts.source_name, pinned_kind,
+                pinned_kind,
+                cls.kind,
+                ts.source_name,
+                pinned_kind,
             )
         # Branch the move on the PINNED kind (falling back to the fresh one
         # when nothing was ever pinned): batches were downloaded and routed
@@ -869,7 +888,9 @@ class MoveMixin:
         try:
             _pre = await rpc(
                 self.dest_client.list_torrents(hashes=[h]),
-                getattr(self, "cfg", None), "dest pre-move state")
+                getattr(self, "cfg", None),
+                "dest pre-move state",
+            )
             _pre_state = _pre[0].state if _pre else ""
         except Exception:
             _pre = None
@@ -900,10 +921,12 @@ class MoveMixin:
                 except Exception:
                     pass
                 await self._fail_downloading_row(
-                    ts, h,
+                    ts,
+                    h,
                     "legacy MOVING row has no checkpoint and no dest "
                     "entry; failing for operator attention",
-                    delete_files=False)
+                    delete_files=False,
+                )
                 return
             self._park_moving(
                 ts,
@@ -934,16 +957,18 @@ class MoveMixin:
             _terminal = self._register_checking_park(ts, _pre_prog)
             if _terminal is not None:
                 await self._fail_downloading_row(
-                    ts, h, f"{_terminal} ({_pre_state})",
+                    ts,
+                    h,
+                    f"{_terminal} ({_pre_state})",
                     # MOVING bytes are complete on SSD: drop only the
                     # client entry, never the data.
-                    delete_files=False)
+                    delete_files=False,
+                )
                 return
             self._heartbeat_recheck_holder(ts)
             self._park_moving(
                 ts,
-                f"client hash check running ({_pre_state}); "
-                f"waiting it out without touching it",
+                f"client hash check running ({_pre_state}); waiting it out without touching it",
                 quiet=True,
             )
             return
@@ -962,18 +987,19 @@ class MoveMixin:
                 # clock: a check that never finishes fails loudly instead
                 # of waiting forever.
                 try:
-                    _pe_prog = float(
-                        getattr(pause_err, "progress", 0.0) or 0.0)
+                    _pe_prog = float(getattr(pause_err, "progress", 0.0) or 0.0)
                 except (TypeError, ValueError):
                     _pe_prog = 0.0
                 _terminal = self._register_checking_park(ts, _pe_prog)
                 if _terminal is not None:
                     await self._fail_downloading_row(
-                        ts, h,
+                        ts,
+                        h,
                         f"{_terminal} ({pause_err.client_state})",
                         # MOVING bytes are complete on SSD: drop only the
                         # client entry, never the data.
-                        delete_files=False)
+                        delete_files=False,
+                    )
                     return
                 self._heartbeat_recheck_holder(ts)
                 self._park_moving(
@@ -999,9 +1025,7 @@ class MoveMixin:
             if ts.save_path
             else Path(self.cfg.dest.save_path).resolve()
         )
-        folder = self._season_folder_for(
-            cls_files, ts.source_name, base_path=src_dir
-        )
+        folder = self._season_folder_for(cls_files, ts.source_name, base_path=src_dir)
 
         completed_files: list[TorrentFile] = []
         incomplete_files: list[TorrentFile] = []
@@ -1030,8 +1054,7 @@ class MoveMixin:
                     _size = int(f.size_bytes or 0)
                 except (TypeError, ValueError):
                     _size = 0
-                missing_on_disk.append(
-                    (f.name, _size, _complete, getattr(f, "priority", None)))
+                missing_on_disk.append((f.name, _size, _complete, getattr(f, "priority", None)))
                 continue
             # Client-verified complete AND present on disk at full size: the
             # ONLY set ever moved to remote.
@@ -1058,7 +1081,8 @@ class MoveMixin:
                     log.warning(
                         "could not stat file %s on SSD (%s); leaving it "
                         "unverified (never moved, never deleted)",
-                        f.name, e,
+                        f.name,
+                        e,
                     )
                     uncertain_files.append(f)
                     continue
@@ -1079,13 +1103,17 @@ class MoveMixin:
                         oversized_names.add(_onorm)
                     log.warning(
                         "file %s oversized on SSD (%d/%d B); leaving for folder wipe, never moving",
-                        f.name, max(_on_disk, 0), f.size_bytes,
+                        f.name,
+                        max(_on_disk, 0),
+                        f.size_bytes,
                     )
                     uncertain_files.append(f)
                     continue
                 log.warning(
                     "file %s reports complete but is short on SSD (%d/%d B); not moving",
-                    f.name, max(_on_disk, 0), f.size_bytes,
+                    f.name,
+                    max(_on_disk, 0),
+                    f.size_bytes,
                 )
                 incomplete_files.append(f)
                 continue
@@ -1097,7 +1125,8 @@ class MoveMixin:
                 log.warning(
                     "could not stat file %s on SSD (%s); leaving it "
                     "unverified (never moved, never deleted)",
-                    f.name, e,
+                    f.name,
+                    e,
                 )
                 uncertain_files.append(f)
                 continue
@@ -1111,13 +1140,15 @@ class MoveMixin:
             log.info(
                 "leaving %d unverified file(s) for folder wipe (not individually "
                 "deleted, never moved): e.g. %s",
-                len(uncertain_files), uncertain_files[0].name,
+                len(uncertain_files),
+                uncertain_files[0].name,
             )
         if missing_on_disk:
             log.warning(
                 "move found %d file(s) missing on SSD (e.g. %s); they move nowhere "
                 "and the fuse gate must still pass before re-add",
-                len(missing_on_disk), missing_on_disk[0][0],
+                len(missing_on_disk),
+                missing_on_disk[0][0],
             )
 
         # 3. Clean up incomplete piece-boundary files so they are NOT moved to remote
@@ -1134,7 +1165,8 @@ class MoveMixin:
                 _post = await rpc(
                     self.dest_client.list_torrents(hashes=[h]),
                     getattr(self, "cfg", None),
-                    "dest post-list checking state")
+                    "dest post-list checking state",
+                )
                 _post_state = str((_post[0].state if _post else "") or "")
                 _post_checking = _post_state.lower().startswith("check")
             except Exception:
@@ -1143,8 +1175,10 @@ class MoveMixin:
                 log.info(
                     "client hash check started mid-move for %s; keeping %d "
                     "incomplete file(s) this tick without deleting",
-                    h[:10], len(incomplete_files))
-        for f in ([] if _post_checking else incomplete_files):
+                    h[:10],
+                    len(incomplete_files),
+                )
+        for f in [] if _post_checking else incomplete_files:
             file_path = _safe_ssd_join(src_dir, f.name)
             if file_path is None:
                 continue
@@ -1163,7 +1197,9 @@ class MoveMixin:
             if file_path.exists():
                 log.info(
                     "removing incomplete piece-boundary file: %s (%d/%d B)",
-                    f.name, file_path.stat().st_size, f.size_bytes,
+                    f.name,
+                    file_path.stat().st_size,
+                    f.size_bytes,
                 )
                 try:
                     if file_path.is_file():
@@ -1193,7 +1229,10 @@ class MoveMixin:
                         temp_file = base_file.parent / f"{base_file.name}{ext}"
                         try:
                             resolved_tmp = temp_file.resolve()
-                            if resolved_tmp != src_dir.resolve() and not resolved_tmp.is_relative_to(src_dir.resolve()):
+                            if (
+                                resolved_tmp != src_dir.resolve()
+                                and not resolved_tmp.is_relative_to(src_dir.resolve())
+                            ):
                                 continue
                         except OSError:
                             continue
@@ -1222,9 +1261,15 @@ class MoveMixin:
         if ts.batches_total > 1:
             _top_join = _safe_ssd_join(src_dir, ts.source_name)
             _top_exists = _top_join is not None and _top_join.exists()
-            local_folder = folder if (folder and folder.exists()) else (_top_join if _top_exists else None)
+            local_folder = (
+                folder if (folder and folder.exists()) else (_top_join if _top_exists else None)
+            )
             remaining_payload: list[Path] = []
-            if local_folder and local_folder.exists() and local_folder.resolve() != src_dir.resolve():
+            if (
+                local_folder
+                and local_folder.exists()
+                and local_folder.resolve() != src_dir.resolve()
+            ):
                 # Bounded, symlink-safe walk: rglob follows directory symlinks
                 # (escape + loop risk), so skip links, contain results to
                 # the folder, and cap the listing. Filter during iteration:
@@ -1276,12 +1321,12 @@ class MoveMixin:
                         log.error(
                             "cannot scope leftover move for %s under %s; "
                             "staying in MOVING without moving",
-                            ts.source_name, src_dir,
+                            ts.source_name,
+                            src_dir,
                         )
                         self._park_moving(
                             ts,
-                            "leftover move scope indeterminate; staying in "
-                            "MOVING without moving",
+                            "leftover move scope indeterminate; staying in MOVING without moving",
                         )
                         return
                     leftover_names: list[str] = []
@@ -1304,21 +1349,24 @@ class MoveMixin:
                         log.info(
                             "multi-batch torrent %s: no verified-complete leftovers to move "
                             "(%d remaining file(s) are incomplete boundary data); skipping remote move",
-                            ts.source_name, len(remaining_payload),
+                            ts.source_name,
+                            len(remaining_payload),
                         )
                     else:
                         log.info(
                             "multi-batch torrent %s: moving %d verified-complete leftover file(s) "
                             "(batch %d/%d, %d remaining file(s) total)",
-                            ts.source_name, len(leftover_files),
-                            ts.batch_index, ts.batches_total, len(remaining_payload),
+                            ts.source_name,
+                            len(leftover_files),
+                            ts.batch_index,
+                            ts.batches_total,
+                            len(remaining_payload),
                         )
                         await self._rclone_move(src_dir, remote, ts, files_from=leftover_files)
                         # Same 0-transfer hazard as batch moves (rclone exits 0
                         # even when it transferred nothing): proceeding to the
                         # folder wipe below would destroy unmoved data. Stay MOVING.
-                        stuck = await asyncio.to_thread(
-                            left_on_disk_many, src_dir, leftover_files)
+                        stuck = await asyncio.to_thread(left_on_disk_many, src_dir, leftover_files)
                         if stuck:
                             self._park_moving(
                                 ts,
@@ -1347,18 +1395,24 @@ class MoveMixin:
                         if _alt is not None and _alt.exists():
                             local = _alt
                         elif self._single_on_fuse(cls_files, cls.single_file, ts):
-                            log.info("single file %s already on remote; skipping move",
-                                     cls.single_file)
+                            log.info(
+                                "single file %s already on remote; skipping move", cls.single_file
+                            )
                             local = None
                         else:
-                            raise FileNotFoundError(f"completed {cls.kind} file not found on SSD: {src_dir}/{cls.single_file}")
+                            raise FileNotFoundError(
+                                f"completed {cls.kind} file not found on SSD: {src_dir}/{cls.single_file}"
+                            )
                     elif self._single_on_fuse(cls_files, cls.single_file, ts):
-                        log.info("single file %s already on remote; skipping move",
-                                 cls.single_file)
+                        log.info("single file %s already on remote; skipping move", cls.single_file)
                         local = None
                     else:
-                        raise FileNotFoundError(f"completed {cls.kind} file not found on SSD: {src_dir}/{cls.single_file}")
-            elif branch_kind in ("season", "unknown") or (branch_kind == "movie" and not cls.single_file):
+                        raise FileNotFoundError(
+                            f"completed {cls.kind} file not found on SSD: {src_dir}/{cls.single_file}"
+                        )
+            elif branch_kind in ("season", "unknown") or (
+                branch_kind == "movie" and not cls.single_file
+            ):
                 _src_top = _safe_ssd_join(src_dir, ts.source_name)
                 if folder and folder.exists():
                     local = folder
@@ -1405,8 +1459,7 @@ class MoveMixin:
                 if folder_names:
                     await self._rclone_move(src_dir, remote, ts, files_from=folder_names)
                     # A 0-transfer folder move must not proceed to the wipe below.
-                    stuck = await asyncio.to_thread(
-                        left_on_disk_many, src_dir, folder_names)
+                    stuck = await asyncio.to_thread(left_on_disk_many, src_dir, folder_names)
                     if stuck:
                         self._park_moving(
                             ts,
@@ -1428,7 +1481,9 @@ class MoveMixin:
                         except Exception as e:  # noqa: BLE001
                             log.warning(
                                 "could not resume incomplete folder %s for %s: %s",
-                                local, ts.source_name, e,
+                                local,
+                                ts.source_name,
+                                e,
                             )
                         if resumed:
                             # Bytes still downloading: hand back to the
@@ -1437,7 +1492,8 @@ class MoveMixin:
                             log.warning(
                                 "folder %s for %s not verified complete; "
                                 "resumed to finish downloading",
-                                local, ts.source_name,
+                                local,
+                                ts.source_name,
                             )
                             self._release_recheck_holder(ts)
                             self.transition(ts, State.DOWNLOADING)
@@ -1446,8 +1502,10 @@ class MoveMixin:
                             "folder %s for %s has no verified-complete files "
                             "(%d incomplete, %d unverified); resume failed, "
                             "staying in MOVING without moving",
-                            local, ts.source_name,
-                            len(incomplete_files), len(uncertain_files),
+                            local,
+                            ts.source_name,
+                            len(incomplete_files),
+                            len(uncertain_files),
                         )
                         self._park_moving(
                             ts,
@@ -1460,7 +1518,8 @@ class MoveMixin:
                     log.info(
                         "folder %s for %s has no verified-complete files to move "
                         "(already remote or incomplete boundary data)",
-                        local, ts.source_name,
+                        local,
+                        ts.source_name,
                     )
                 local = None
             else:
@@ -1468,7 +1527,9 @@ class MoveMixin:
                 if cand is not None and cand.exists():
                     local = cand
                 else:
-                    raise FileNotFoundError(f"completed content not found on SSD: {src_dir}/{ts.source_name}")
+                    raise FileNotFoundError(
+                        f"completed content not found on SSD: {src_dir}/{ts.source_name}"
+                    )
             if (
                 branch_kind in ("movie", "episode")
                 and cls.single_file
@@ -1541,12 +1602,11 @@ class MoveMixin:
                         _cur = await rpc(
                             self.dest_client.list_torrents(hashes=[h]),
                             getattr(self, "cfg", None),
-                            "dest check-guard state")
+                            "dest check-guard state",
+                        )
                         if _cur:
-                            _check_state_now = str(
-                                getattr(_cur[0], "state", "") or "")
-                            _check_now = _check_state_now.lower().startswith(
-                                "check")
+                            _check_state_now = str(getattr(_cur[0], "state", "") or "")
+                            _check_now = _check_state_now.lower().startswith("check")
                     except Exception:
                         _check_now = False
                     if _check_now:
@@ -1572,13 +1632,15 @@ class MoveMixin:
                     # states fail open toward the historic recheck.
                     if _full_on_disk:
                         try:
-                            _flush_state = str(
-                                _check_state_now or "").lower().replace(
-                                    " ", "").replace("_", "")
+                            _flush_state = (
+                                str(_check_state_now or "")
+                                .lower()
+                                .replace(" ", "")
+                                .replace("_", "")
+                            )
                         except Exception:
                             _flush_state = ""
-                        if _flush_state in ("downloading", "stalleddl",
-                                            "forceddl"):
+                        if _flush_state in ("downloading", "stalleddl", "forceddl"):
                             self._park_moving(
                                 ts,
                                 f"client still finalizing download "
@@ -1593,8 +1655,7 @@ class MoveMixin:
                         _rh = ""
                     try:
                         _rc0 = getattr(self, "_settle_rechecked", None)
-                        _already_rechecked = bool(
-                            _rh and isinstance(_rc0, set) and _rh in _rc0)
+                        _already_rechecked = bool(_rh and isinstance(_rc0, set) and _rh in _rc0)
                     except Exception:
                         _already_rechecked = False
                     _rechecked_now = False
@@ -1614,11 +1675,14 @@ class MoveMixin:
                         try:
                             _now_m2 = time.monotonic()
                             _holder = getattr(self, "_recheck_in_flight", None)
-                            if (isinstance(_holder, (list, tuple))
-                                    and len(_holder) == 2
-                                    and _holder[0] and _holder[0] != _rh
-                                    and isinstance(_holder[1], (int, float))
-                                    and _now_m2 - float(_holder[1]) < 1800.0):
+                            if (
+                                isinstance(_holder, (list, tuple))
+                                and len(_holder) == 2
+                                and _holder[0]
+                                and _holder[0] != _rh
+                                and isinstance(_holder[1], (int, float))
+                                and _now_m2 - float(_holder[1]) < 1800.0
+                            ):
                                 _holder_blocked = True
                         except Exception:
                             _holder_blocked = False
@@ -1641,7 +1705,8 @@ class MoveMixin:
                         except Exception as e:  # noqa: BLE001
                             log.debug(
                                 "settle recheck failed for %s: %s",
-                                ts.source_name[:60], e,
+                                ts.source_name[:60],
+                                e,
                             )
                         if _recheck_ok:
                             _rechecked_now = True
@@ -1660,7 +1725,9 @@ class MoveMixin:
                                 pass
                             try:
                                 self._recheck_in_flight = [  # type: ignore[attr-defined]
-                                    _rh, time.monotonic()]
+                                    _rh,
+                                    time.monotonic(),
+                                ]
                             except Exception:
                                 pass
                     if _holder_blocked:
@@ -1669,8 +1736,9 @@ class MoveMixin:
                         # could abort theirs. Park quietly; the holder
                         # clears on settle (or ages out after 30 min).
                         resumed = False
-                        _resume_note = ("not resumed (another row's hash check "
-                                        "in flight; waiting turn),")
+                        _resume_note = (
+                            "not resumed (another row's hash check in flight; waiting turn),"
+                        )
                     elif (not _full_on_disk) or (_full_on_disk and _already_rechecked):
                         # Resume only when it can help: short files needing
                         # bytes, or full files whose check already ran without
@@ -1685,29 +1753,36 @@ class MoveMixin:
                         except Exception as e:  # noqa: BLE001
                             log.warning(
                                 "could not resume incomplete single file %s for %s: %s",
-                                cls.single_file, ts.source_name, e,
+                                cls.single_file,
+                                ts.source_name,
+                                e,
                             )
-                        _resume_note = ("resumed to finish downloading,"
-                                        if resumed else "resume failed,")
+                        _resume_note = (
+                            "resumed to finish downloading," if resumed else "resume failed,"
+                        )
                     else:
                         resumed = False
-                        _resume_note = ("not resumed (bytes present; hash check "
-                                        "will verify),")
+                        _resume_note = "not resumed (bytes present; hash check will verify),"
                     if resumed:
                         # Bytes still downloading: hand back to the download
                         # loop instead of flapping pause/resume in MOVING.
                         log.warning(
                             "single file %s for %s is not client-verified complete%s; "
                             "resumed to finish downloading",
-                            cls.single_file, ts.source_name, detail,
+                            cls.single_file,
+                            ts.source_name,
+                            detail,
                         )
                         self._release_recheck_holder(ts)
                         self.transition(ts, State.DOWNLOADING)
                         return
                     try:
                         _mp = getattr(self, "_moving_parks", None)
-                        _pn = int((_mp.get((ts.source_infohash or "").lower(), 0) or 0)) \
-                            if isinstance(_mp, dict) else 0
+                        _pn = (
+                            int((_mp.get((ts.source_infohash or "").lower(), 0) or 0))
+                            if isinstance(_mp, dict)
+                            else 0
+                        )
                     except Exception:
                         _pn = 0
                     # This signature (full bytes, unverified) is an expected
@@ -1718,7 +1793,9 @@ class MoveMixin:
                     _log(
                         "single file %s for %s is not client-verified complete%s; "
                         "%s staying in MOVING without moving",
-                        cls.single_file, ts.source_name, detail,
+                        cls.single_file,
+                        ts.source_name,
+                        detail,
                         _resume_note,
                     )
                     self._park_moving(
@@ -1793,20 +1870,21 @@ class MoveMixin:
                             except OSError:
                                 continue
                         _wrapped_names = files_from_names(
-                            [n for n in ([*_main_names, *_sib_names]) if n])
+                            [n for n in ([*_main_names, *_sib_names]) if n]
+                        )
                     except Exception:
                         _wrapped_names = []
                     if _wrapped_names:
                         log.info(
-                            "moving %d verified file(s) for %s preserving "
-                            "torrent layout (e.g. %s)",
-                            len(_wrapped_names), ts.source_name[:60],
+                            "moving %d verified file(s) for %s preserving torrent layout (e.g. %s)",
+                            len(_wrapped_names),
+                            ts.source_name[:60],
                             _wrapped_names[0],
                         )
-                        await self._rclone_move(
-                            src_dir, remote, ts, files_from=_wrapped_names)
+                        await self._rclone_move(src_dir, remote, ts, files_from=_wrapped_names)
                         _wrapped_stuck = await asyncio.to_thread(
-                            left_on_disk_many, src_dir, _wrapped_names)
+                            left_on_disk_many, src_dir, _wrapped_names
+                        )
                         if _wrapped_stuck:
                             self._park_moving(
                                 ts,
@@ -1860,21 +1938,18 @@ class MoveMixin:
                                 _sib_names.append(_cf.name or "")
                             except OSError:
                                 continue
-                        _sib_names = files_from_names(
-                            [n for n in _sib_names if n])
+                        _sib_names = files_from_names([n for n in _sib_names if n])
                     except Exception:
                         _sib_names = []
                     if _sib_names:
                         log.info(
-                            "moving %d verified sibling file(s) for %s "
-                            "(e.g. %s)",
-                            len(_sib_names), ts.source_name[:60],
+                            "moving %d verified sibling file(s) for %s (e.g. %s)",
+                            len(_sib_names),
+                            ts.source_name[:60],
                             _sib_names[0],
                         )
-                        await self._rclone_move(
-                            src_dir, remote, ts, files_from=_sib_names)
-                        _sib_stuck = await asyncio.to_thread(
-                            left_on_disk_many, src_dir, _sib_names)
+                        await self._rclone_move(src_dir, remote, ts, files_from=_sib_names)
+                        _sib_stuck = await asyncio.to_thread(left_on_disk_many, src_dir, _sib_names)
                         if _sib_stuck:
                             self._park_moving(
                                 ts,
@@ -1910,14 +1985,17 @@ class MoveMixin:
                 ts.batch_index = i
                 ts.batches_total = len(batches)
                 skip = await self._fuse_skipped(
-                    [(e.file_name, e.size_bytes) for e in batch.episodes], branch_kind,
+                    [(e.file_name, e.size_bytes) for e in batch.episodes],
+                    branch_kind,
                 )
                 skip_norm = {(s or "").replace("\\", "/").strip("/") for s in skip}
                 names = [n for n in batch.file_names() if n not in skip_norm]
                 if not names:
                     log.info(
                         "mixed batch %d/%d for %s already on remote; skipping move",
-                        i + 1, len(batches), ts.source_name,
+                        i + 1,
+                        len(batches),
+                        ts.source_name,
                     )
                     continue
                 await self._rclone_move(
@@ -1927,8 +2005,7 @@ class MoveMixin:
                     files_from=names,
                     extra=self.cfg.rclone.batch_move_extra_flags,
                 )
-                stuck = await asyncio.to_thread(
-                    left_on_disk_many, src_dir, names)
+                stuck = await asyncio.to_thread(left_on_disk_many, src_dir, names)
                 if stuck:
                     self._park_moving(
                         ts,
@@ -1953,7 +2030,7 @@ class MoveMixin:
         # selected (fail-closed direction).
         _blockers = []
         try:
-            for _uf in (uncertain_files or []):
+            for _uf in uncertain_files or []:
                 try:
                     _prio = getattr(_uf, "priority", None)
                     _prio = 1 if _prio is None else _prio
@@ -1968,7 +2045,9 @@ class MoveMixin:
                 # sibling collision, and stalling this row on them both
                 # wedges the pipeline and risks their deletion below.
                 try:
-                    _unorm = str((_safe_ssd_join(src_dir, _uf.name) or "").relative_to(src_dir)).replace("\\", "/")
+                    _unorm = str(
+                        (_safe_ssd_join(src_dir, _uf.name) or "").relative_to(src_dir)
+                    ).replace("\\", "/")
                 except (ValueError, AttributeError):
                     continue
                 if _unorm in oversized_names:
@@ -1984,7 +2063,9 @@ class MoveMixin:
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "could not resume %s with %d unverified file(s): %s",
-                    ts.source_name, len(_blockers), e,
+                    ts.source_name,
+                    len(_blockers),
+                    e,
                 )
             _eg = ""
             try:
@@ -1997,7 +2078,10 @@ class MoveMixin:
                 log.warning(
                     "folder %s for %s has %d unverified selected file(s) "
                     "(e.g. %s); resumed to finish downloading",
-                    folder or src_dir, ts.source_name, len(_blockers), _eg,
+                    folder or src_dir,
+                    ts.source_name,
+                    len(_blockers),
+                    _eg,
                 )
                 self._release_recheck_holder(ts)
                 self.transition(ts, State.DOWNLOADING)
@@ -2005,7 +2089,10 @@ class MoveMixin:
             log.warning(
                 "folder %s for %s has %d unverified selected file(s) "
                 "(e.g. %s); resume failed, staying in MOVING without wiping",
-                folder or src_dir, ts.source_name, len(_blockers), _eg,
+                folder or src_dir,
+                ts.source_name,
+                len(_blockers),
+                _eg,
             )
             self._park_moving(
                 ts,
@@ -2035,15 +2122,16 @@ class MoveMixin:
                     from .io_bounds import bounded as _bounded
 
                     exported = await _bounded(
-                        export_fn(h), timeout=15.0,
-                        label="dest pre-delete export")
+                        export_fn(h), timeout=15.0, label="dest pre-delete export"
+                    )
                     if isinstance(exported, (bytes, bytearray)) and exported:
                         ts.cross_seed_blob = bytes(exported)
                         ts._blob = bytes(exported)
                 except Exception as e:  # noqa: BLE001
                     log.warning(
                         "could not export .torrent for %s before deleting SSD entry: %s",
-                        h[:10], e,
+                        h[:10],
+                        e,
                     )
         if ts._blob or ts.cross_seed_blob:
             try:
@@ -2067,17 +2155,16 @@ class MoveMixin:
                     _complete_missing.append((_mn, _ms, _mp))
         except Exception:
             _complete_missing = []
-        _desync: list[tuple[str, int]] = [
-            (n, s) for (n, s, _p) in _complete_missing]
+        _desync: list[tuple[str, int]] = [(n, s) for (n, s, _p) in _complete_missing]
         if _desync and (ts.batches_total or 0) > 1:
             _moved: set[str] = set()
             try:
                 _cap = self._frozen_batch_cap(ts)
                 _batches = self._resolve_batches(
-                    cls_files, branch_kind, _cap,
-                    episodes=getattr(cls, "episodes", None))
-                for _b in (_batches or [])[:max(0, int(ts.batch_index or 0))]:
-                    for _ep in (getattr(_b, "episodes", None) or []):
+                    cls_files, branch_kind, _cap, episodes=getattr(cls, "episodes", None)
+                )
+                for _b in (_batches or [])[: max(0, int(ts.batch_index or 0))]:
+                    for _ep in getattr(_b, "episodes", None) or []:
                         _enm = getattr(_ep, "file_name", "") or ""
                         if _enm:
                             _moved.add(_enm.replace("\\", "/"))
@@ -2094,9 +2181,11 @@ class MoveMixin:
                 except (TypeError, ValueError):
                     return False
 
-            _desync = [(n, s) for (n, s, p) in _complete_missing
-                       if n.replace("\\", "/") not in _moved
-                       and not _deselected(p)]
+            _desync = [
+                (n, s)
+                for (n, s, p) in _complete_missing
+                if n.replace("\\", "/") not in _moved and not _deselected(p)
+            ]
         if _desync:
             try:
                 _mounts = []
@@ -2121,10 +2210,13 @@ class MoveMixin:
                 _desync = [(n, s) for (n, s) in _desync if n in _stillset]
         if _desync:
             await self._fail_downloading_row(
-                ts, h,
+                ts,
+                h,
                 f"{len(_desync)} client-complete file(s) missing on SSD "
                 f"(e.g. {_desync[0][0]}); data lost, not wiping",
-                delete_files=False, entry_hash=h)
+                delete_files=False,
+                entry_hash=h,
+            )
             return
 
         # 8. Build and persist the cleanup plan BEFORE deleting the client
@@ -2145,8 +2237,7 @@ class MoveMixin:
             except (OSError, ValueError, AttributeError):
                 continue
         try:
-            _plan_json = self._build_move_plan(
-                src_dir, folder, oversized_names, _flat_names)
+            _plan_json = self._build_move_plan(src_dir, folder, oversized_names, _flat_names)
         except Exception as e:  # noqa: BLE001
             self._park_moving(
                 ts,
@@ -2200,8 +2291,7 @@ class MoveMixin:
         self._finish_moving_tracking(ts)
         self.transition(ts, State.RE_ADDING)
 
-    async def _wipe_folder_except(self, folder: Path, keep: set[str],
-                                    src_dir: Path) -> bool:
+    async def _wipe_folder_except(self, folder: Path, keep: set[str], src_dir: Path) -> bool:
         """Wipe a moved folder but spare foreign (oversized) files.
 
         Deletes every file under `folder` except the keep set (SSD-relative
@@ -2209,12 +2299,10 @@ class MoveMixin:
         left empty. Returns False when an owned file could not be removed —
         callers must park at `entry_deleted` rather than claim a clean wipe.
         """
-        log.info("wiping moved folder except %d foreign file(s): %s",
-                 len(keep), folder)
+        log.info("wiping moved folder except %d foreign file(s): %s", len(keep), folder)
 
         def _kept(rel: str) -> bool:
-            return any(rel == _k or _k.startswith(rel + "/")
-                       for _k in keep)
+            return any(rel == _k or _k.startswith(rel + "/") for _k in keep)
 
         def _sweep() -> bool:
             try:
@@ -2310,6 +2398,7 @@ class MoveMixin:
                 break
             try:
                 from .task import handles_for
+
                 for _hd in handles_for(self, _mkey):
                     try:
                         _hd.queued = True
@@ -2317,11 +2406,14 @@ class MoveMixin:
                         pass
             except Exception:
                 pass
-            log.info("moves full; %s waits for a slot (no churn)",
-                     (getattr(ts, "source_name", "") or _mkey)[:60])
+            log.info(
+                "moves full; %s waits for a slot (no churn)",
+                (getattr(ts, "source_name", "") or _mkey)[:60],
+            )
             if _mev is None:
                 break
             try:
+
                 async def _wait_mev() -> None:
                     try:
                         await asyncio.wait_for(_mev.wait(), 60.0)
@@ -2339,6 +2431,7 @@ class MoveMixin:
                 pass
         try:
             from .task import handles_for as _hf2
+
             for _hd in _hf2(self, _mkey):
                 try:
                     _hd.queued = False
@@ -2352,16 +2445,24 @@ class MoveMixin:
             # returning — callers treat a normal return as a completed
             # move and would commit checkpoints. The MOVING checkpoint
             # already persisted makes a restart safe.
-            log.info("move of %s aborted: shutting down",
-                     (getattr(ts, "source_name", "") or _mkey)[:60])
+            log.info(
+                "move of %s aborted: shutting down", (getattr(ts, "source_name", "") or _mkey)[:60]
+            )
             raise asyncio.CancelledError
         async with _sem:
             if files_from is not None:
                 preview = ", ".join(files_from[:3]) + ("…" if len(files_from) > 3 else "")
-                log.info("rclone move %s -> %s (files=%d, e.g. %s)",
-                         local, remote, len(files_from), preview)
+                log.info(
+                    "rclone move %s -> %s (files=%d, e.g. %s)",
+                    local,
+                    remote,
+                    len(files_from),
+                    preview,
+                )
             else:
-                log.info("rclone move %s -> %s (include=%s, extra=%s)", local, remote, include, extra)
+                log.info(
+                    "rclone move %s -> %s (include=%s, extra=%s)", local, remote, include, extra
+                )
             # RcloneTimeoutError propagates: the child is terminated and the
             # source tree intact, so callers park the row for retry (never
             # fail — failing would loop: re-download, stall again, fail…).
@@ -2382,8 +2483,8 @@ class MoveMixin:
                 if _tkey:
                     try:
                         from .task import handles_for
-                        for _hd in handles_for(
-                                self, (ts.source_infohash or "")):
+
+                        for _hd in handles_for(self, (ts.source_infohash or "")):
                             try:
                                 _hd.tree_key = _tkey
                             except Exception:
@@ -2395,16 +2496,27 @@ class MoveMixin:
                         _trees.pop(_k, None)
             except Exception:
                 pass
-            res = await move_local_to_remote(self.cfg, local, remote, include=include,
-                                             files_from=files_from, extra=extra,
-                                             progress=True)
+            res = await move_local_to_remote(
+                self.cfg,
+                local,
+                remote,
+                include=include,
+                files_from=files_from,
+                extra=extra,
+                progress=True,
+            )
             if not res.ok:
                 err = res.stderr.strip()
                 # Headline first: rclone puts the summary up top and the
                 # detail at the bottom — keep both ends, not just the tail.
                 _lines = [ln.strip() for ln in err.splitlines() if ln.strip()]
-                last_err = f"{_lines[0]} [...] {_lines[-1]}" if len(_lines) > 1 else (_lines[0] if _lines else f"rc={res.returncode}")
+                last_err = (
+                    f"{_lines[0]} [...] {_lines[-1]}"
+                    if len(_lines) > 1
+                    else (_lines[0] if _lines else f"rc={res.returncode}")
+                )
                 if is_transient_rclone_stderr(err):
                     raise RcloneTransientError(
-                        f"rclone transient failure (rc={res.returncode}): {last_err}")
+                        f"rclone transient failure (rc={res.returncode}): {last_err}"
+                    )
                 raise RuntimeError(f"rclone failed (rc={res.returncode}): {last_err}")

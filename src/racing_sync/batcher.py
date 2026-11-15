@@ -63,7 +63,9 @@ def files_from_names(names: Iterable[str]) -> list[str]:
             log.warning("batcher: skipping drive-absolute file name for file list: %r", raw[:100])
             continue
         if "\n" in raw or "\r" in raw or "\0" in raw:
-            log.warning("batcher: skipping file name with control chars for file list: %r", raw[:100])
+            log.warning(
+                "batcher: skipping file name with control chars for file list: %r", raw[:100]
+            )
             continue
         # Normalize path separators to POSIX forward slashes
         normalized = raw.replace("\\", "/").strip("/")
@@ -91,8 +93,7 @@ class Batch:
     @property
     def size_bytes(self) -> int:
         if self._cached_size is None:
-            object.__setattr__(self, "_cached_size",
-                               sum(e.size_bytes for e in self.episodes))
+            object.__setattr__(self, "_cached_size", sum(e.size_bytes for e in self.episodes))
         return self._cached_size  # type: ignore[return-value]
 
     @property
@@ -152,12 +153,19 @@ def make_batches(
 
     log.info(
         "batched %d episodes into %d batches (cap=%d B, max_files=%d)",
-        len(episodes), len(batches), cap_bytes, max_files,
+        len(episodes),
+        len(batches),
+        cap_bytes,
+        max_files,
     )
     for i, b in enumerate(batches):
         log.debug(
             "batch %d: %s..%s, %d episodes, %d B",
-            i, b.first_season_ep, b.last_season_ep, len(b.episodes), b.size_bytes,
+            i,
+            b.first_season_ep,
+            b.last_season_ep,
+            len(b.episodes),
+            b.size_bytes,
         )
     return batches
 
@@ -174,6 +182,7 @@ def make_file_batches(
     entries (season 0) so every downstream consumer (priorities, wait
     lists, include patterns, cleanup) works unchanged.
     """
+
     def _sort_key(f: object) -> str:
         try:
             raw = getattr(f, "name", "")
@@ -187,15 +196,20 @@ def make_file_batches(
         key=_sort_key,
     )
     if len(ordered) != len(files):
-        log.warning("batcher: dropped %d nameless file(s) from batch list",
-                    len(files) - len(ordered))
+        log.warning(
+            "batcher: dropped %d nameless file(s) from batch list", len(files) - len(ordered)
+        )
     episodes: list[Episode] = []
     for idx, f in enumerate(ordered, start=1):
         try:
             raw_size = getattr(f, "size_bytes", 0) or 0
             if isinstance(raw_size, bool):
                 raise ValueError(f"file {_sort_key(f)!r} has bool size {raw_size!r}")
-            size = int(raw_size) if isinstance(raw_size, (int, float)) and raw_size == raw_size else int(float(raw_size))
+            size = (
+                int(raw_size)
+                if isinstance(raw_size, (int, float)) and raw_size == raw_size
+                else int(float(raw_size))
+            )
         except (TypeError, ValueError, OverflowError):
             log.warning("batcher: unparsable size for %r; treating as 0", _sort_key(f)[:100])
             size = 0

@@ -43,9 +43,7 @@ _ACTIVE_PROBE_EVERY = 20
 
 
 class RefreshMixin:
-    async def _mark_detail_cancelled(
-        self, message_id: int, name: str, infohash: str
-    ) -> None:
+    async def _mark_detail_cancelled(self, message_id: int, name: str, infohash: str) -> None:
         """Edit a forgotten row's detail card to CANCELLED (best-effort).
 
         The DB row is already deleted, so this uses the snapshotted message
@@ -64,14 +62,18 @@ class RefreshMixin:
         )
         try:
             await bot.edit_message_text(
-                text, chat_id=self._cfg.chat_id, message_id=message_id,
+                text,
+                chat_id=self._cfg.chat_id,
+                message_id=message_id,
                 parse_mode=ParseMode.MARKDOWN,
             )
         except TelegramError as e:
             if _is_parse_error(e):
                 try:
                     await bot.edit_message_text(
-                        text, chat_id=self._cfg.chat_id, message_id=message_id,
+                        text,
+                        chat_id=self._cfg.chat_id,
+                        message_id=message_id,
                     )
                 except Exception:
                     log.debug("cancel card plain edit failed: %s", e)
@@ -225,13 +227,16 @@ class RefreshMixin:
             try:
                 _now_s = time.monotonic()
                 _cached_s = getattr(self, "_ssd_free_cache", None)
-                if (_cached_s is not None and len(_cached_s) == 2
-                        and _now_s - float(_cached_s[0]) < _SSD_FREE_TTL_S):
+                if (
+                    _cached_s is not None
+                    and len(_cached_s) == 2
+                    and _now_s - float(_cached_s[0]) < _SSD_FREE_TTL_S
+                ):
                     ssd_free = self._valid_byte_count(_cached_s[1])
                 else:
                     from .rclone_ops import ssd_free_bytes as _ssd_free
-                    ssd_free = self._valid_byte_count(
-                        await asyncio.to_thread(_ssd_free, cfg))
+
+                    ssd_free = self._valid_byte_count(await asyncio.to_thread(_ssd_free, cfg))
                     self._ssd_free_cache = (_now_s, ssd_free)
             except Exception:
                 ssd_free = None
@@ -248,8 +253,11 @@ class RefreshMixin:
             try:
                 _now = time.monotonic()
                 _cached = getattr(self, "_vps1_free_cache", None)
-                if (_cached is not None and len(_cached) == 2
-                        and _now - float(_cached[0]) < _VPS1_FREE_TTL_S):
+                if (
+                    _cached is not None
+                    and len(_cached) == 2
+                    and _now - float(_cached[0]) < _VPS1_FREE_TTL_S
+                ):
                     vps1_free = self._valid_byte_count(_cached[1])
                 else:
                     _probe = getattr(coord, "_source_free_bytes", None)
@@ -301,8 +309,7 @@ class RefreshMixin:
         except Exception:
             speed_map = {}
         items: list[tuple[TorrentState, float | None]] = [
-            (ts, progress_map.get(ts.source_infohash.lower()))
-            for ts in rows
+            (ts, progress_map.get(ts.source_infohash.lower())) for ts in rows
         ]
         # Stale-card net: re-queue detail updates whose card drifted from
         # the row (edits lost to flood bans, restarts mid-edit). Steady
@@ -372,8 +379,7 @@ class RefreshMixin:
                         _rv = _rr.state.value if _rr is not None else ""
                     except Exception:
                         _rv = ""
-                    if (_rr is None or _rv not in ("done", "failed")
-                            or _sent2.get(_hh) == _rv):
+                    if _rr is None or _rv not in ("done", "failed") or _sent2.get(_hh) == _rv:
                         _tmap.pop(_hh, None)
                         continue
                     try:
@@ -383,8 +389,8 @@ class RefreshMixin:
                     if _ni >= 15:
                         _tmap.pop(_hh, None)
                         log.debug(
-                            "terminal card retry budget spent for %s; "
-                            "leaving card as-is", _hh[:10])
+                            "terminal card retry budget spent for %s; leaving card as-is", _hh[:10]
+                        )
                         continue
                     _tmap[_hh] = _ni + 1
                     self._enqueue_detail(_hh, None)
@@ -405,10 +411,8 @@ class RefreshMixin:
                             _n = _wait_note(_ts) or ""
                             if _n:
                                 notes[_ts.source_infohash or ""] = _n
-                    elif (_ts.state == State.WAITING_INDEXER
-                            and callable(_inflight_of)):
-                        _n = _inflight_note_for(
-                            _ts, _inflight_of(_ts)) or ""
+                    elif _ts.state == State.WAITING_INDEXER and callable(_inflight_of):
+                        _n = _inflight_note_for(_ts, _inflight_of(_ts)) or ""
                         if _n:
                             notes[_ts.source_infohash or ""] = _n
                 except Exception:
@@ -434,14 +438,15 @@ class RefreshMixin:
             _flt = "all"
         try:
             from .telegram_protocol import match_status_filter as _matchflt
+
             if _flt == "all":
                 shown = items
             else:
                 shown = [
-                    (_ts, _pg) for (_ts, _pg) in items
-                    if _matchflt(
-                        getattr(getattr(_ts, "state", None), "value", ""),
-                        _flt)]
+                    (_ts, _pg)
+                    for (_ts, _pg) in items
+                    if _matchflt(getattr(getattr(_ts, "state", None), "value", ""), _flt)
+                ]
         except Exception:
             shown = items
             try:
@@ -449,16 +454,19 @@ class RefreshMixin:
             except Exception:
                 pass
         text, cur_page, total_pages = render_active(
-            shown, page=self._current_page, page_size=self._cfg.page_size,
-            notes=notes, footer=footer, speeds=speed_map,
+            shown,
+            page=self._current_page,
+            page_size=self._cfg.page_size,
+            notes=notes,
+            footer=footer,
+            speeds=speed_map,
             move_progress=move_progress,
         )
         # Stamp the rendered generation: typed /act_N positions resolve
         # against the live list, so a count change between render and tap
         # (a group finished, a dupe arrived) warns instead of misacting.
         try:
-            self._last_rendered_groups = len(
-                _group_active_items(list(shown or [])))
+            self._last_rendered_groups = len(_group_active_items(list(shown or [])))
             self._last_rendered_page = cur_page
         except Exception:
             pass
@@ -469,8 +477,7 @@ class RefreshMixin:
             _kb_filter = getattr(self, "_status_filter", None) or "all"
         except Exception:
             _kb_filter = "all"
-        keyboard = self._build_keyboard(cur_page, total_pages,
-                                        status_filter=_kb_filter)
+        keyboard = self._build_keyboard(cur_page, total_pages, status_filter=_kb_filter)
 
         # Skip the API call if page, total_pages and text are identical
         # — unless a keep-at-bottom repost is due (position refreshes
@@ -482,11 +489,13 @@ class RefreshMixin:
             cache_key = (cur_page, total_pages, text)
 
         repost_due = self._repost_due()
-        if (cache_key == self._last_active_cache
-                and self._active_msg_id is not None
-                and not repost_due
-                and not force
-                and not self._active_probe_due()):
+        if (
+            cache_key == self._last_active_cache
+            and self._active_msg_id is not None
+            and not repost_due
+            and not force
+            and not self._active_probe_due()
+        ):
             return
         # Uncertain-send guard: a send that timed out may still have landed
         # (lost response looks identical) — resending blindly next tick mints
@@ -501,13 +510,14 @@ class RefreshMixin:
             _ukey = None
         if _ukey is not None and not repost_due and not force:
             try:
-                _same_key = (_ukey == cache_key)
+                _same_key = _ukey == cache_key
             except Exception:
                 _same_key = False
             if _same_key:
                 try:
-                    _have_id = (self._active_msg_id is not None
-                                or (self._prev_active_msg_id or 0) > 0)
+                    _have_id = (
+                        self._active_msg_id is not None or (self._prev_active_msg_id or 0) > 0
+                    )
                 except Exception:
                     _have_id = False
                 if _have_id:
@@ -550,7 +560,9 @@ class RefreshMixin:
                     log.warning(
                         "active-tasks previous message %s delete deferred "
                         "(transient %s); keeping it, will retry next "
-                        "interval", _prev_id, _prev_e,
+                        "interval",
+                        _prev_id,
+                        _prev_e,
                     )
                     # Feed the orphan sweep too: if the retry path ever
                     # stops firing, the sweep still retires this id.
@@ -563,15 +575,17 @@ class RefreshMixin:
                     _prev_msg = str(_prev_e).lower()
                     if self._delete_gone(_prev_msg):
                         log.debug(
-                            "active-tasks previous message %s already gone "
-                            "(%s); resending", _prev_id, _prev_e,
+                            "active-tasks previous message %s already gone (%s); resending",
+                            _prev_id,
+                            _prev_e,
                         )
                         self._prev_active_msg_id = None
                     elif self._delete_hopeless(_prev_msg):
                         log.warning(
                             "active-tasks previous message %s delete refused "
                             "(%s); abandoning it and resending",
-                            _prev_id, _prev_e,
+                            _prev_id,
+                            _prev_e,
                         )
                         self._prev_active_msg_id = None
                         # The sweep drops it as hopeless (or deletes it if
@@ -580,32 +594,38 @@ class RefreshMixin:
                             self._remember_orphan(_prev_id)
                         except Exception:
                             pass
-                    elif (_is_transient_tg_error(_prev_e)
-                            or "flood control" in _prev_msg
-                            or "too many requests" in _prev_msg
-                            or "timed out" in _prev_msg
-                            or "timeout" in _prev_msg
-                            or "connection" in _prev_msg
-                            or "retry after" in _prev_msg
-                            or "retry in" in _prev_msg):
+                    elif (
+                        _is_transient_tg_error(_prev_e)
+                        or "flood control" in _prev_msg
+                        or "too many requests" in _prev_msg
+                        or "timed out" in _prev_msg
+                        or "timeout" in _prev_msg
+                        or "connection" in _prev_msg
+                        or "retry after" in _prev_msg
+                        or "retry in" in _prev_msg
+                    ):
                         log.warning(
                             "active-tasks previous message %s delete "
                             "rate-limited (%s); keeping it, will retry next "
-                            "interval", _prev_id, _prev_e,
+                            "interval",
+                            _prev_id,
+                            _prev_e,
                         )
                         return
                     else:
                         log.warning(
                             "active-tasks previous message %s delete failed "
                             "(%s); keeping it, will retry next interval",
-                            _prev_id, _prev_e,
+                            _prev_id,
+                            _prev_e,
                         )
                         return
                 except Exception as _prev_e:  # noqa: BLE001
                     log.warning(
                         "active-tasks previous message %s delete failed "
                         "(%s); keeping it, will retry next interval",
-                        _prev_id, _prev_e,
+                        _prev_id,
+                        _prev_e,
                     )
                     return
 
@@ -614,7 +634,8 @@ class RefreshMixin:
             self._send_uncertain_skips = 0
             try:
                 sent = await self._bot.send_message(
-                    self._cfg.chat_id, text,
+                    self._cfg.chat_id,
+                    text,
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=keyboard,
                 )
@@ -637,7 +658,8 @@ class RefreshMixin:
                 if _is_parse_error(e):
                     try:
                         sent = await self._bot.send_message(
-                            self._cfg.chat_id, text,
+                            self._cfg.chat_id,
+                            text,
                             reply_markup=keyboard,
                         )
                         self._active_msg_id = sent.message_id
@@ -714,9 +736,7 @@ class RefreshMixin:
                         "Disabling active-tasks updates."
                     )
                     self._active_msg_id = -1
-                    await asyncio.to_thread(
-                        self._store.set_meta, "telegram_active_msg_id", ""
-                    )
+                    await asyncio.to_thread(self._store.set_meta, "telegram_active_msg_id", "")
                     return
 
                 # "Message to edit not found" / "MESSAGE_ID_INVALID" — deleted from chat
@@ -724,9 +744,7 @@ class RefreshMixin:
                     log.warning("active-tasks message not found in chat; will resend")
                     self._active_msg_id = None
                     self._last_active_cache = None
-                    await asyncio.to_thread(
-                        self._store.set_meta, "telegram_active_msg_id", ""
-                    )
+                    await asyncio.to_thread(self._store.set_meta, "telegram_active_msg_id", "")
                     return
 
                 # Other errors — keep message_id for next retry
@@ -838,13 +856,16 @@ class RefreshMixin:
             low = (msg or "").lower()
         except Exception:
             return False
-        return any(s in low for s in (
-            "message to delete not found",
-            "message to edit not found",
-            "message_id_invalid",
-            "message not found",
-            "couldn't find the message",
-        ))
+        return any(
+            s in low
+            for s in (
+                "message to delete not found",
+                "message to edit not found",
+                "message_id_invalid",
+                "message not found",
+                "couldn't find the message",
+            )
+        )
 
     @staticmethod
     def _delete_hopeless(msg: str) -> bool:
@@ -853,15 +874,18 @@ class RefreshMixin:
             low = (msg or "").lower()
         except Exception:
             return False
-        return any(s in low for s in (
-            "chat not found",
-            "not enough rights",
-            "need administrator",
-            "not an administrator",
-            "bot was kicked",
-            "bot was blocked",
-            "forbidden",
-        ))
+        return any(
+            s in low
+            for s in (
+                "chat not found",
+                "not enough rights",
+                "need administrator",
+                "not an administrator",
+                "bot was kicked",
+                "bot was blocked",
+                "forbidden",
+            )
+        )
 
     async def _sweep_orphan_active_messages(self) -> None:
         """Best-effort delete of retired active ids (bounded per refresh).
@@ -897,8 +921,9 @@ class RefreshMixin:
                             pass
                         continue
                     log.warning(
-                        "active-tasks orphan delete %s deferred (%s); "
-                        "will retry next interval", mid, e,
+                        "active-tasks orphan delete %s deferred (%s); will retry next interval",
+                        mid,
+                        e,
                     )
                     continue
                 try:
@@ -910,7 +935,9 @@ class RefreshMixin:
             pass
 
     async def _repost_active_message(
-        self, text: str, keyboard: InlineKeyboardMarkup | None,
+        self,
+        text: str,
+        keyboard: InlineKeyboardMarkup | None,
         cache_key: tuple[int, int, str],
     ) -> None:
         """Delete the old active message and resend it silently as newest.
@@ -947,7 +974,8 @@ class RefreshMixin:
             log.warning(
                 "active-tasks repost delete deferred "
                 "(transient %s); keeping old message, will retry next "
-                "interval", e,
+                "interval",
+                e,
             )
             try:
                 self._remember_orphan(old_int)
@@ -957,32 +985,34 @@ class RefreshMixin:
         except TelegramError as e:
             msg = str(e).lower()
             if self._delete_gone(msg):
-                log.debug("active-tasks repost: old message %s already "
-                          "gone; resending", old_int)
+                log.debug("active-tasks repost: old message %s already gone; resending", old_int)
                 # Already gone: the dead id must not survive as a
                 # "live" id — the guard would skip the resend forever.
                 self._prev_active_msg_id = None
             elif self._delete_hopeless(msg):
                 log.warning(
-                    "active-tasks repost delete refused (%s); keeping "
-                    "old message in place", e,
+                    "active-tasks repost delete refused (%s); keeping old message in place",
+                    e,
                 )
                 try:
                     self._last_repost_monotonic = time.monotonic()
                 except Exception:
                     pass
                 return
-            elif (_is_transient_tg_error(e)
-                    or "flood control" in msg
-                    or "too many requests" in msg
-                    or "timed out" in msg
-                    or "timeout" in msg
-                    or "connection" in msg
-                    or "retry after" in msg
-                    or "retry in" in msg):
+            elif (
+                _is_transient_tg_error(e)
+                or "flood control" in msg
+                or "too many requests" in msg
+                or "timed out" in msg
+                or "timeout" in msg
+                or "connection" in msg
+                or "retry after" in msg
+                or "retry in" in msg
+            ):
                 log.warning(
                     "active-tasks repost delete rate-limited (%s); "
-                    "keeping old message, will retry next interval", e,
+                    "keeping old message, will retry next interval",
+                    e,
                 )
                 try:
                     self._remember_orphan(old_int)
@@ -992,19 +1022,22 @@ class RefreshMixin:
             else:
                 log.warning(
                     "active-tasks repost delete failed (%s); keeping old "
-                    "message, will retry next interval", e,
+                    "message, will retry next interval",
+                    e,
                 )
                 return
         except Exception as e:  # noqa: BLE001
             log.warning(
                 "active-tasks repost delete failed (%s); keeping old "
-                "message, will retry next interval", e,
+                "message, will retry next interval",
+                e,
             )
             return
         try:
             try:
                 sent = await self._bot.send_message(
-                    self._cfg.chat_id, text,
+                    self._cfg.chat_id,
+                    text,
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=keyboard,
                     disable_notification=True,
@@ -1012,14 +1045,18 @@ class RefreshMixin:
             except TelegramError as e:
                 if _is_parse_error(e):
                     sent = await self._bot.send_message(
-                        self._cfg.chat_id, text,
+                        self._cfg.chat_id,
+                        text,
                         reply_markup=keyboard,
                         disable_notification=True,
                     )
                 else:
                     raise
         except (RetryAfter, TimedOut, NetworkError) as e:
-            log.warning("active-tasks repost skipped due to temporary network/rate-limit (%s); will retry next interval", e)
+            log.warning(
+                "active-tasks repost skipped due to temporary network/rate-limit (%s); will retry next interval",
+                e,
+            )
             self._active_msg_id = None
             # Assume the resend landed (lost responses look identical) so
             # the uncertain-send guard skips blind resends while the text
@@ -1028,9 +1065,7 @@ class RefreshMixin:
             # the guard never triggers from this path.
             self._last_active_cache = cache_key
             self._send_uncertain_key = cache_key
-            await asyncio.to_thread(
-                self._store.set_meta, "telegram_active_msg_id", ""
-            )
+            await asyncio.to_thread(self._store.set_meta, "telegram_active_msg_id", "")
             return
         except TelegramError as e:
             log.warning("active-tasks repost failed (%s); will resend next interval", e)
@@ -1041,9 +1076,7 @@ class RefreshMixin:
             else:
                 self._last_active_cache = None
                 self._send_uncertain_key = None
-            await asyncio.to_thread(
-                self._store.set_meta, "telegram_active_msg_id", ""
-            )
+            await asyncio.to_thread(self._store.set_meta, "telegram_active_msg_id", "")
             return
         self._active_msg_id = sent.message_id
         self._prev_active_msg_id = sent.message_id
@@ -1066,36 +1099,31 @@ class RefreshMixin:
         try:
             _bps, _n = 0, 0
             try:
-                _fn = getattr(getattr(self, "_coord", None),
-                              "live_totals", None)
+                _fn = getattr(getattr(self, "_coord", None), "live_totals", None)
                 _tot = _fn() if callable(_fn) else (0, 0)
-                _bps = int(_tot[0]) if not isinstance(
-                    _tot[0], bool) else 0
-                _n = int(_tot[1]) if not isinstance(
-                    _tot[1], bool) else 0
+                _bps = int(_tot[0]) if not isinstance(_tot[0], bool) else 0
+                _n = int(_tot[1]) if not isinstance(_tot[1], bool) else 0
             except Exception:
                 pass
             _rn, _rs = 0, 0
             try:
                 from .rclone_ops import rclone_progress_map
+
                 _rm = rclone_progress_map()
                 _rn = len(_rm)
                 for _rp in list(_rm.values()):
                     try:
-                        _rs += max(0, int(
-                            getattr(_rp, "speed_bps", 0) or 0))
+                        _rs += max(0, int(getattr(_rp, "speed_bps", 0) or 0))
                     except Exception:
                         continue
             except Exception:
                 pass
             _counts: dict[str, int] = {}
             try:
-                _rows = await asyncio.to_thread(
-                    self._store.list_active_inflight)
+                _rows = await asyncio.to_thread(self._store.list_active_inflight)
                 for _r in _rows or []:
                     try:
-                        _sv = getattr(getattr(_r, "state", None),
-                                      "value", "")
+                        _sv = getattr(getattr(_r, "state", None), "value", "")
                         _counts[_sv] = _counts.get(_sv, 0) + 1
                     except Exception:
                         continue
@@ -1113,11 +1141,15 @@ class RefreshMixin:
                     _rl = "0 B/s"
                 _parts.append(f"rclone {_rn} moving · {_rl}")
             _chips = []
-            for _sv, _tag in (("downloading", "DL"), ("moving", "MV"),
-                              ("re_adding", "RD"), ("queued", "Q"),
-                              ("waiting_disk", "WD"),
-                              ("waiting_indexer", "WI"),
-                              ("new", "NEW")):
+            for _sv, _tag in (
+                ("downloading", "DL"),
+                ("moving", "MV"),
+                ("re_adding", "RD"),
+                ("queued", "Q"),
+                ("waiting_disk", "WD"),
+                ("waiting_indexer", "WI"),
+                ("new", "NEW"),
+            ):
                 try:
                     if _counts.get(_sv):
                         _chips.append(f"{_tag}{_counts[_sv]}")
@@ -1151,8 +1183,7 @@ class RefreshMixin:
             if not getattr(self, "_pin_disabled_checked", False):
                 self._pin_disabled_checked = True
                 try:
-                    _dis = await asyncio.to_thread(
-                        self._store.get_meta, "telegram_pin_disabled")
+                    _dis = await asyncio.to_thread(self._store.get_meta, "telegram_pin_disabled")
                 except Exception:
                     _dis = None
                 if str(_dis or "") == "1":
@@ -1162,7 +1193,8 @@ class RefreshMixin:
             pass
         try:
             await self._bot.pin_chat_message(
-                self._cfg.chat_id, self._active_msg_id,
+                self._cfg.chat_id,
+                self._active_msg_id,
             )
             self._pinned_message_id = self._active_msg_id
         except TelegramError as e:
@@ -1181,8 +1213,7 @@ class RefreshMixin:
             except Exception:
                 pass
             try:
-                await asyncio.to_thread(
-                    self._store.set_meta, "telegram_pin_disabled", "1")
+                await asyncio.to_thread(self._store.set_meta, "telegram_pin_disabled", "1")
             except Exception:
                 pass
 
@@ -1194,7 +1225,9 @@ class RefreshMixin:
         truncated = _safe_truncate_markdown(message)
         try:
             sent = await self._bot.send_message(
-                self._cfg.chat_id, truncated, parse_mode=ParseMode.MARKDOWN,
+                self._cfg.chat_id,
+                truncated,
+                parse_mode=ParseMode.MARKDOWN,
             )
             self._note_outbound(getattr(sent, "message_id", None))
         except TelegramError as e:

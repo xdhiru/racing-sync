@@ -38,9 +38,15 @@ _MISSING_FILES_CONFIRM_S = 300.0
 class WatchdogMixin:
     """Tracker-death watchdog + sibling cascade (duck-typed ``self``)."""
 
-    async def _fail_downloading_row(self, ts: TorrentState, h: str, error: str,
-                                    *, delete_files: bool = True,
-                                    entry_hash: str | None = None) -> None:
+    async def _fail_downloading_row(
+        self,
+        ts: TorrentState,
+        h: str,
+        error: str,
+        *,
+        delete_files: bool = True,
+        entry_hash: str | None = None,
+    ) -> None:
         """Fail a DOWNLOADING row terminally and free its slot.
 
         Releases the SSD reservation (a FAILED row holds no budget),
@@ -59,8 +65,7 @@ class WatchdogMixin:
         # that no longer exists — the wrapper unwinds quietly instead.
         if self._abandoned(ts):
             raise AbandonedError(
-                f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}; "
-                "not failing it"
+                f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}; not failing it"
             )
         try:
             _csd = getattr(self, "_checking_track", None)
@@ -76,8 +81,11 @@ class WatchdogMixin:
             pass
         try:
             _ri = getattr(self, "_recheck_in_flight", None)
-            if (isinstance(_ri, (list, tuple)) and len(_ri) == 2
-                    and _ri[0] == (ts.source_infohash or "").lower()):
+            if (
+                isinstance(_ri, (list, tuple))
+                and len(_ri) == 2
+                and _ri[0] == (ts.source_infohash or "").lower()
+            ):
                 self._recheck_in_flight = None
         except Exception:
             pass
@@ -101,8 +109,7 @@ class WatchdogMixin:
             try:
                 await self.dest_client.delete(_dh, delete_files=delete_files)
             except Exception as e:  # noqa: BLE001
-                log.warning("could not delete failed dest entry %s: %s",
-                            _dh[:10], e)
+                log.warning("could not delete failed dest entry %s: %s", _dh[:10], e)
         try:
             self._live.pop((h or "").lower(), None)
         except Exception:
@@ -114,8 +121,10 @@ class WatchdogMixin:
             # while we were failing it: force-writing would upsert-resurrect
             # a hard-deleted row as a zombie FAILED row (tombstoned rows are
             # refused by upsert, hard-deleted ones are not). Never do it.
-            log.debug("row abandoned while failing %s; not resurrecting",
-                      (h or ts.source_infohash or "")[:10])
+            log.debug(
+                "row abandoned while failing %s; not resurrecting",
+                (h or ts.source_infohash or "")[:10],
+            )
             return
         except ValueError:
             # Force-assign fallback for rows the guarded write refuses
@@ -128,8 +137,10 @@ class WatchdogMixin:
                 # a non-abandon reason, so keep the historic force-write path.
                 still_there = True
             if not still_there:
-                log.debug("row vanished while failing %s; not resurrecting",
-                          (h or ts.source_infohash or "")[:10])
+                log.debug(
+                    "row vanished while failing %s; not resurrecting",
+                    (h or ts.source_infohash or "")[:10],
+                )
                 return
             # Assert the edge is legal first, so a programming error (e.g.
             # failing a DONE row) still raises loudly instead of writing an
@@ -181,8 +192,8 @@ class WatchdogMixin:
             except Exception:
                 pass
             raise RuntimeError(
-                f"torrent files missing on disk for {ts.source_name}: "
-                "client reports missingFiles")
+                f"torrent files missing on disk for {ts.source_name}: client reports missingFiles"
+            )
         try:
             _fn = getattr(self.dest_client, "get_tracker_messages", None)
             if not callable(_fn):
@@ -200,11 +211,12 @@ class WatchdogMixin:
             if verdict == "unregistered":
                 raise UnregisteredTorrentError(
                     f"{TRACKER_UNREGISTERED_MARKER} {ts.source_name} — "
-                    f"tracker says: {str(msg)[:200]}")
+                    f"tracker says: {str(msg)[:200]}"
+                )
             if verdict == "auth":
                 raise UnregisteredTorrentError(
-                    f"{TRACKER_AUTH_MARKER} {ts.source_name} — "
-                    f"tracker says: {str(msg)[:200]}")
+                    f"{TRACKER_AUTH_MARKER} {ts.source_name} — tracker says: {str(msg)[:200]}"
+                )
 
     async def _cascade_tracker_death(self, dead_ts: TorrentState, error: str) -> None:
         """Fail pre-download siblings condemned by the same tracker deletion.
@@ -223,8 +235,9 @@ class WatchdogMixin:
             want_norm = normalize_content_name(dead_ts.source_name or "")
             want_size = int(dead_ts.total_bytes or 0)
             me = (dead_ts.source_infohash or "").lower()
-            domain = (announce_domain(dead_ts.source_announce_url or "")
-                      or announce_domain(dead_ts.source_tracker or ""))
+            domain = announce_domain(dead_ts.source_announce_url or "") or announce_domain(
+                dead_ts.source_tracker or ""
+            )
         except Exception:
             return
         if not want_norm or want_size <= 0 or not domain or not me:
@@ -233,8 +246,7 @@ class WatchdogMixin:
             rows = self.store.all_active()
         except Exception:
             return
-        _CASCADE_STATES = (State.NEW, State.QUEUED,
-                           State.WAITING_DISK, State.WAITING_INDEXER)
+        _CASCADE_STATES = (State.NEW, State.QUEUED, State.WAITING_DISK, State.WAITING_INDEXER)
         done = 0
         for r in rows or []:
             if done >= 25:
@@ -251,26 +263,36 @@ class WatchdogMixin:
                     continue
                 if normalize_content_name(r.source_name or "") != want_norm:
                     continue
-                r_domain = (announce_domain(r.source_announce_url or "")
-                            or announce_domain(r.source_tracker or ""))
+                r_domain = announce_domain(r.source_announce_url or "") or announce_domain(
+                    r.source_tracker or ""
+                )
                 if not r_domain or r_domain != domain:
                     continue
             except Exception:
                 continue
-            log.error("cascading tracker deletion to %s (%s, %s)",
-                      (r.source_name or rh[:10])[:60], r.state.value, domain)
+            log.error(
+                "cascading tracker deletion to %s (%s, %s)",
+                (r.source_name or rh[:10])[:60],
+                r.state.value,
+                domain,
+            )
             try:
                 await self._fail_downloading_row(
-                    r, "",
+                    r,
+                    "",
                     f"{TRACKER_UNREGISTERED_MARKER} same {domain} release as "
                     f"{(dead_ts.source_name or '')[:60]} "
-                    f"({str(error)[:200]})")
+                    f"({str(error)[:200]})",
+                )
                 done += 1
             except Exception:
                 continue
         if done:
-            log.warning("tracker deletion of %s cascaded to %d sibling row(s)",
-                        dead_ts.source_name[:60], done)
+            log.warning(
+                "tracker deletion of %s cascaded to %d sibling row(s)",
+                dead_ts.source_name[:60],
+                done,
+            )
         # Wake surviving same-content rows promptly — best-ranked first: a
         # sibling that was deferring to the now-dead leader (or simply
         # waiting out a retry window) has no reason to sit out the rest of
@@ -312,7 +334,7 @@ class WatchdogMixin:
             _woke = 0
             _woke_indexer = False
             _woke_disk = False
-            for (_key, r) in _cands:
+            for _key, r in _cands:
                 try:
                     rh = (r.source_infohash or "").lower()
                     if r.state == State.WAITING_INDEXER and not _woke_indexer:
@@ -329,9 +351,12 @@ class WatchdogMixin:
                             _woke += 1
                             _woke_indexer = True
                             try:
-                                log.info("woke best-ranked sibling %s (rank %d) early for %s",
-                                         (r.source_name or rh[:10])[:60], _key[0],
-                                         dead_ts.source_name[:60])
+                                log.info(
+                                    "woke best-ranked sibling %s (rank %d) early for %s",
+                                    (r.source_name or rh[:10])[:60],
+                                    _key[0],
+                                    dead_ts.source_name[:60],
+                                )
                             except Exception:
                                 pass
                     elif r.state == State.WAITING_DISK and not _woke_disk:
@@ -347,7 +372,8 @@ class WatchdogMixin:
                 except Exception:
                     continue
             if _woke:
-                log.info("woke %d surviving sibling row(s) of %s early",
-                         _woke, dead_ts.source_name[:60])
+                log.info(
+                    "woke %d surviving sibling row(s) of %s early", _woke, dead_ts.source_name[:60]
+                )
         except Exception:
             pass

@@ -67,8 +67,7 @@ class ReaddMixin:
     def _readd_heal_after_seconds(self) -> float:
         """Sustained-missing window before the RE_ADDING healer fires."""
         try:
-            raw = getattr(getattr(self, "cfg", None),
-                          "fuse_readd_heal_after_seconds", 7200)
+            raw = getattr(getattr(self, "cfg", None), "fuse_readd_heal_after_seconds", 7200)
             if isinstance(raw, bool) or not isinstance(raw, (int, float)):
                 return 7200.0
             return float(raw)
@@ -76,8 +75,11 @@ class ReaddMixin:
             return 7200.0
 
     async def _maybe_heal_readd_missing(
-        self, ts: TorrentState, gate_missing: list[str],
-        gate_target: Path, gate_blob: bytes | None,
+        self,
+        ts: TorrentState,
+        gate_missing: list[str],
+        gate_target: Path,
+        gate_blob: bytes | None,
     ) -> bool:
         """Selectively re-download + move fuse-gated files missing too long.
 
@@ -100,8 +102,7 @@ class ReaddMixin:
             return False
         if self._abandoned(ts):
             raise AbandonedError(
-                f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}; "
-                "not healing re-add"
+                f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}; not healing re-add"
             )
         threshold = self._readd_heal_after_seconds()
         if threshold <= 0:
@@ -145,8 +146,9 @@ class ReaddMixin:
             return text.replace("\\", "/").strip("/")
 
         try:
-            missing_key = tuple(sorted(
-                n for n in (_base_name(m) for m in (gate_missing or [])) if n))
+            missing_key = tuple(
+                sorted(n for n in (_base_name(m) for m in (gate_missing or [])) if n)
+            )
         except Exception:
             return False
         if not missing_key:
@@ -156,8 +158,7 @@ class ReaddMixin:
             rec = track.get(key)
         except Exception:
             rec = None
-        if (not isinstance(rec, (list, tuple)) or len(rec) != 3
-                or rec[1] != missing_key):
+        if not isinstance(rec, (list, tuple)) or len(rec) != 3 or rec[1] != missing_key:
             # First sighting, or the set changed (a file landed or a new
             # one went missing): (re)start the clock, keep the attempt
             # count for this row. Never heals on the sighting that starts
@@ -176,9 +177,10 @@ class ReaddMixin:
             except Exception:
                 pass
             log.debug(
-                "re-add heal: tracking %d missing file(s) for %s "
-                "(clock started, threshold %.0fs)",
-                len(missing_key), ts.source_name[:50], threshold,
+                "re-add heal: tracking %d missing file(s) for %s (clock started, threshold %.0fs)",
+                len(missing_key),
+                ts.source_name[:50],
+                threshold,
             )
             return False
         try:
@@ -193,14 +195,18 @@ class ReaddMixin:
             log.warning(
                 "re-add heal: giving up on %s after %d attempts "
                 "(still %d missing); leaving to max-age FAIL",
-                ts.source_name[:50], attempts, len(missing_key),
+                ts.source_name[:50],
+                attempts,
+                len(missing_key),
             )
             return False
 
         # Sizes from the blob expectation (the fuse gate's own source):
         # authoritative per-file sizes for the fresh check below.
         try:
-            want_map = {n: int(s or 0) for n, s in (self._expected_fuse_files(gate_blob) or []) if n}
+            want_map = {
+                n: int(s or 0) for n, s in (self._expected_fuse_files(gate_blob) or []) if n
+            }
         except Exception:
             return False
         if not set(missing_key).issubset(set(want_map)):
@@ -251,8 +257,7 @@ class ReaddMixin:
                 pass
             return False
         try:
-            confirmed_key = tuple(sorted(
-                n for n in (_base_name(c) for c in confirmed) if n))
+            confirmed_key = tuple(sorted(n for n in (_base_name(c) for c in confirmed) if n))
         except Exception:
             return False
         if confirmed_key != missing_key:
@@ -312,9 +317,9 @@ class ReaddMixin:
         if _ssd_hit is not None:
             if _ssd_hit:
                 log.info(
-                    "re-add heal: %s still on SSD for %s "
-                    "(fuse lag, not loss); not re-downloading",
-                    _ssd_hit, ts.source_name[:50],
+                    "re-add heal: %s still on SSD for %s (fuse lag, not loss); not re-downloading",
+                    _ssd_hit,
+                    ts.source_name[:50],
                 )
             return False
 
@@ -355,7 +360,9 @@ class ReaddMixin:
             try:
                 cur = await rpc(
                     self.dest_client.list_torrents(hashes=[helper_h]),
-                    getattr(self, "cfg", None), "dest heal list_torrents")
+                    getattr(self, "cfg", None),
+                    "dest heal list_torrents",
+                )
                 entry = cur[0] if cur else None
             except Exception:
                 return False
@@ -377,7 +384,9 @@ class ReaddMixin:
                         "re-add heal: existing entry %s for %s sits at "
                         "foreign path %s (not under an SSD/dest root); "
                         "not resuming it as the heal helper",
-                        helper_h[:10], ts.source_name[:50], _entry_sp,
+                        helper_h[:10],
+                        ts.source_name[:50],
+                        _entry_sp,
                     )
                     return False
             if entry is None:
@@ -390,17 +399,21 @@ class ReaddMixin:
                             paused=True,
                             skip_check=False,
                         ),
-                        getattr(self, "cfg", None), "dest heal add_torrent")
+                        getattr(self, "cfg", None),
+                        "dest heal add_torrent",
+                    )
                 except Exception as e:  # noqa: BLE001
                     log.warning(
                         "re-add heal: re-add failed for %s: %s",
-                        ts.source_name[:50], e,
+                        ts.source_name[:50],
+                        e,
                     )
                     return False
                 if not getattr(res, "accepted", False):
                     log.warning(
                         "re-add heal: re-add rejected for %s (%s)",
-                        ts.source_name[:50], getattr(res, "detail", ""),
+                        ts.source_name[:50],
+                        getattr(res, "detail", ""),
                     )
                     return False
                 try:
@@ -416,7 +429,9 @@ class ReaddMixin:
             try:
                 files = await rpc(
                     self.dest_client.get_torrent_files(helper_h),
-                    getattr(self, "cfg", None), "dest heal get_torrent_files")
+                    getattr(self, "cfg", None),
+                    "dest heal get_torrent_files",
+                )
             except Exception:
                 return False
             if not files:
@@ -434,21 +449,27 @@ class ReaddMixin:
                         helper_h,
                         {f.name: (1 if f.name in heal_set else 0) for f in files},
                     ),
-                    getattr(self, "cfg", None), "dest heal set_file_priorities")
+                    getattr(self, "cfg", None),
+                    "dest heal set_file_priorities",
+                )
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "re-add heal: priority set failed for %s: %s",
-                    ts.source_name[:50], e,
+                    ts.source_name[:50],
+                    e,
                 )
                 return False
             try:
                 await rpc(
                     self.dest_client.resume(helper_h),
-                    getattr(self, "cfg", None), "dest heal resume")
+                    getattr(self, "cfg", None),
+                    "dest heal resume",
+                )
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "re-add heal: resume failed for %s: %s",
-                    ts.source_name[:50], e,
+                    ts.source_name[:50],
+                    e,
                 )
                 return False
             # Point the row at the helper entry on SSD for the wait below
@@ -470,7 +491,8 @@ class ReaddMixin:
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "re-add heal: download parked for %s: %s",
-                    ts.source_name[:50], e,
+                    ts.source_name[:50],
+                    e,
                 )
                 try:
                     track[key] = [now_m, missing_key, attempts + 1]
@@ -479,8 +501,8 @@ class ReaddMixin:
                 return False
             try:
                 await rpc(
-                    self.dest_client.pause(helper_h),
-                    getattr(self, "cfg", None), "dest heal pause")
+                    self.dest_client.pause(helper_h), getattr(self, "cfg", None), "dest heal pause"
+                )
             except Exception:
                 pass
             try:
@@ -488,31 +510,33 @@ class ReaddMixin:
             except Exception:
                 kind = "unknown"
             try:
-                remote = (self.cfg.rclone.remote.default
-                          if kind in ("movie", "season")
-                          else self.cfg.rclone.remote.unsorted)
+                remote = (
+                    self.cfg.rclone.remote.default
+                    if kind in ("movie", "season")
+                    else self.cfg.rclone.remote.unsorted
+                )
             except Exception:
                 return False
             try:
-                await self._rclone_move(ssd_base, remote, ts, files_from=heal_names,
-                                        heal=True)
+                await self._rclone_move(ssd_base, remote, ts, files_from=heal_names, heal=True)
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "re-add heal: move failed for %s: %s",
-                    ts.source_name[:50], e,
+                    ts.source_name[:50],
+                    e,
                 )
                 try:
                     track[key] = [now_m, missing_key, attempts + 1]
                 except Exception:
                     pass
                 return False
-            stuck = await asyncio.to_thread(
-                left_on_disk_many, ssd_base, heal_names)
+            stuck = await asyncio.to_thread(left_on_disk_many, ssd_base, heal_names)
             if stuck:
                 log.warning(
-                    "re-add heal: move left %d file(s) on disk for %s "
-                    "(e.g. %s); retry later",
-                    len(stuck), ts.source_name[:50], stuck[0],
+                    "re-add heal: move left %d file(s) on disk for %s (e.g. %s); retry later",
+                    len(stuck),
+                    ts.source_name[:50],
+                    stuck[0],
                 )
                 try:
                     track[key] = [now_m, missing_key, attempts + 1]
@@ -522,11 +546,14 @@ class ReaddMixin:
             try:
                 await rpc(
                     self.dest_client.delete(helper_h, delete_files=False),
-                    getattr(self, "cfg", None), "dest heal delete")
+                    getattr(self, "cfg", None),
+                    "dest heal delete",
+                )
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "re-add heal: helper delete failed for %s: %s",
-                    ts.source_name[:50], e,
+                    ts.source_name[:50],
+                    e,
                 )
             # Restore the pre-heal dest pointer: the helper entry is gone,
             # so its hash would dangle. Next tick re-derives from the blob.
@@ -541,7 +568,8 @@ class ReaddMixin:
             log.warning(
                 "re-add heal: recovered %d file(s) for %s "
                 "(selective re-download + move); gate re-checks next tick",
-                len(heal_names), ts.source_name[:50],
+                len(heal_names),
+                ts.source_name[:50],
             )
             # Cap attempts so a fuse that never indexes the fresh move
             # cannot trigger a second re-download: further parks either
@@ -558,7 +586,9 @@ class ReaddMixin:
             raise
         except Exception as e:  # noqa: BLE001
             log.warning(
-                "re-add heal failed for %s: %s", ts.source_name[:50], e,
+                "re-add heal failed for %s: %s",
+                ts.source_name[:50],
+                e,
             )
             return False
         finally:
@@ -580,12 +610,14 @@ class ReaddMixin:
         """
         try:
             hashes = {
-                h.lower() for h in (
+                h.lower()
+                for h in (
                     ts.dest_infohash,
                     ts.source_infohash,
                     ts.cross_seed_infohash,
                     *ts.injected_private_hashes.split(","),
-                ) if h
+                )
+                if h
             }
             if not hashes:
                 return False
@@ -593,8 +625,9 @@ class ReaddMixin:
         except (AbandonedError, asyncio.CancelledError):
             raise
         except Exception as e:  # noqa: BLE001
-            log.debug("re-add: existing fuse lookup failed for %s: %s",
-                      (ts.source_infohash or "")[:10], e)
+            log.debug(
+                "re-add: existing fuse lookup failed for %s: %s", (ts.source_infohash or "")[:10], e
+            )
             return False
         for ext in entries or []:
             h_low = (getattr(ext, "hash", "") or "").lower()
@@ -611,41 +644,42 @@ class ReaddMixin:
                 )
                 expected = [
                     (str(f.name), int(f.size_bytes or 0))
-                    for f in (files or []) if getattr(f, "name", "")
+                    for f in (files or [])
+                    if getattr(f, "name", "")
                 ]
                 if not expected:
                     continue
-                missing = await self._confirmed_fuse_missing(
-                    Path(save_path), expected)
+                missing = await self._confirmed_fuse_missing(Path(save_path), expected)
                 if missing:
                     continue
-                if not await self._select_all_fuse_files(
-                        h_low, label="existing fuse seed"):
+                if not await self._select_all_fuse_files(h_low, label="existing fuse seed"):
                     return False
             except (AbandonedError, asyncio.CancelledError):
                 raise
             except Exception as e:  # noqa: BLE001
-                log.debug("re-add: fuse-entry check failed for %s: %s",
-                          h_low[:10], e)
+                log.debug("re-add: fuse-entry check failed for %s: %s", h_low[:10], e)
                 continue
             ts.dest_infohash = h_low
             ts.save_path = save_path
             log.info(
                 "re-add: %s already seeds from fuse at %s (%s); adopting as DONE",
-                ts.source_name[:50], save_path, h_low[:10],
+                ts.source_name[:50],
+                save_path,
+                h_low[:10],
             )
             try:
                 self.transition(ts, State.DONE)
             except ValueError as e:
                 try:
-                    fresh = self.store.get(
-                        ts.source_infohash, include_blob=False)
+                    fresh = self.store.get(ts.source_infohash, include_blob=False)
                 except Exception:
                     fresh = None
                 if fresh is None or fresh.state != State.DONE:
                     log.warning(
                         "re-add: could not adopt %s from %s: %s",
-                        (ts.source_infohash or "")[:10], ts.state.value, e,
+                        (ts.source_infohash or "")[:10],
+                        ts.state.value,
+                        e,
                     )
                     return False
                 ts.state = fresh.state
@@ -692,35 +726,41 @@ class ReaddMixin:
         except Exception as e:  # noqa: BLE001
             log.warning(
                 "re-add: existing fuse adoption check failed for %s: %s",
-                ts.source_name[:50], e,
+                ts.source_name[:50],
+                e,
             )
         if ts.readd_first_attempted_at is None:
             ts.readd_first_attempted_at = now
             if store is not None:
                 store.upsert(ts)
 
-        delay = _readd_gap_seconds(
-            getattr(self.cfg, "fuse_reinject_delay_seconds", 0), 0)
+        delay = _readd_gap_seconds(getattr(self.cfg, "fuse_reinject_delay_seconds", 0), 0)
         if delay > 0 and ts.readd_attempts == 0 and ts.readd_next_retry_at is None:
             # Timer-park, never sleep: the retry instant persists in the DB
             # across restarts; a sleep would lose it (and stall the worker).
             log.info(
                 "parking %s for %ds fuse mount indexing before re-injection",
-                ts.source_name[:50], delay,
+                ts.source_name[:50],
+                delay,
             )
             ts.readd_next_retry_at = now + dt.timedelta(seconds=delay)
             if store is not None:
                 store.upsert(ts)
             return
 
-        max_age = dt.timedelta(seconds=_readd_gap_seconds(
-            getattr(self.cfg, "fuse_reinject_max_age_seconds", 86400), 86400))
+        max_age = dt.timedelta(
+            seconds=_readd_gap_seconds(
+                getattr(self.cfg, "fuse_reinject_max_age_seconds", 86400), 86400
+            )
+        )
 
         retry_gap = _readd_gap_seconds(
-            getattr(self.cfg, "fuse_reinject_retry_gap_seconds", 120), 120)
+            getattr(self.cfg, "fuse_reinject_retry_gap_seconds", 120), 120
+        )
 
         backoff_interval = _readd_gap_seconds(
-            getattr(self.cfg, "fuse_reinject_backoff_seconds", 1800), 1800)
+            getattr(self.cfg, "fuse_reinject_backoff_seconds", 1800), 1800
+        )
 
         elapsed = now - ts.readd_first_attempted_at
         if elapsed >= max_age:
@@ -752,8 +792,7 @@ class ReaddMixin:
             # persist them, and continue through the gate on this same tick
             # instead of parking until max_age.
             try:
-                healed = await self._fetch_racing_torrent_bytes(
-                    (ts.source_infohash or "").lower())
+                healed = await self._fetch_racing_torrent_bytes((ts.source_infohash or "").lower())
             except Exception:
                 healed = None
             if healed:
@@ -764,7 +803,8 @@ class ReaddMixin:
             if gate_blob and store is not None:
                 try:
                     new_rev = store.update_columns(
-                        ts.source_infohash, {"cross_seed_blob": bytes(gate_blob)})
+                        ts.source_infohash, {"cross_seed_blob": bytes(gate_blob)}
+                    )
                     if new_rev:
                         ts.version = new_rev
                 except Exception:
@@ -774,8 +814,11 @@ class ReaddMixin:
                     ts._blob = bytes(gate_blob)
                 except Exception:
                     pass
-                log.info("fuse gate: healed missing blob for %s from VPS1 (%d B)",
-                         ts.source_name[:50], len(gate_blob or b""))
+                log.info(
+                    "fuse gate: healed missing blob for %s from VPS1 (%d B)",
+                    ts.source_name[:50],
+                    len(gate_blob or b""),
+                )
         gate_expected = self._expected_fuse_files(gate_blob)
         if not gate_blob:
             # Fail closed: no blob at all means we cannot verify the fuse
@@ -801,7 +844,8 @@ class ReaddMixin:
             if _blob_len >= 128:
                 log.warning(
                     "fuse gate cannot decode %d-byte blob for %s; parking re-add",
-                    _blob_len, ts.source_name[:50],
+                    _blob_len,
+                    ts.source_name[:50],
                 )
                 ts.readd_next_retry_at = now + dt.timedelta(seconds=retry_gap)
                 if store is not None:
@@ -822,8 +866,11 @@ class ReaddMixin:
                 log.warning(
                     "fuse content not yet available for %s at %s "
                     "(%d/%d missing, e.g. %s); parking re-add instead of injecting blind",
-                    ts.source_name[:50], gate_target,
-                    len(gate_missing), len(gate_expected), preview,
+                    ts.source_name[:50],
+                    gate_target,
+                    len(gate_missing),
+                    len(gate_expected),
+                    preview,
                 )
                 # Sustained-missing healer: re-downloads + moves just the
                 # never-moved files after a long stable window (never on a
@@ -831,13 +878,15 @@ class ReaddMixin:
                 # Fail-closed: any healer trouble parks exactly as today.
                 try:
                     _healed = await self._maybe_heal_readd_missing(
-                        ts, gate_missing, gate_target, gate_blob)
+                        ts, gate_missing, gate_target, gate_blob
+                    )
                 except (AbandonedError, asyncio.CancelledError):
                     raise
                 except Exception as e:  # noqa: BLE001
                     log.warning(
                         "re-add heal failed for %s: %s",
-                        ts.source_name[:50], e,
+                        ts.source_name[:50],
+                        e,
                     )
                     _healed = False
                 if _healed:
@@ -887,7 +936,9 @@ class ReaddMixin:
                 # Use the blob-derived mount (fresh adoptions start as
                 # kind="unknown" and would otherwise record unsorted).
                 try:
-                    ts.save_path = str(self._target_mount_for_blob(gate_blob, self._target_mount_for(ts)))
+                    ts.save_path = str(
+                        self._target_mount_for_blob(gate_blob, self._target_mount_for(ts))
+                    )
                 except Exception:  # noqa: BLE001
                     pass
                 self.transition(ts, State.DONE)
@@ -918,7 +969,10 @@ class ReaddMixin:
                 log.warning(
                     "WebUI unresponsive during re-add for %s (%s); "
                     "retrying next tick in %ds (attempt %d)",
-                    ts.source_name[:50], e, retry_gap, ts.readd_attempts,
+                    ts.source_name[:50],
+                    e,
+                    retry_gap,
+                    ts.readd_attempts,
                 )
                 ts.readd_next_retry_at = now_curr + dt.timedelta(seconds=retry_gap)
                 if store is not None:
@@ -928,9 +982,13 @@ class ReaddMixin:
             log.warning(
                 "WebUI still unresponsive for %s after %d attempts (%s); "
                 "backing off for %ds (30m) until %s (elapsed=%ds, max=%ds)",
-                ts.source_name[:50], ts.readd_attempts, e, backoff_interval,
+                ts.source_name[:50],
+                ts.readd_attempts,
+                e,
+                backoff_interval,
                 ts.readd_next_retry_at.isoformat(timespec="seconds"),
-                int(elapsed_curr.total_seconds()), int(max_age.total_seconds()),
+                int(elapsed_curr.total_seconds()),
+                int(max_age.total_seconds()),
             )
             if store is not None:
                 store.upsert(ts)
@@ -960,6 +1018,7 @@ class ReaddMixin:
         blob_hash = ""
         try:
             from .watchdir import _bencoded_info_hash
+
             parsed_hash, _, _, _ = _bencoded_info_hash(blob)
             blob_hash = parsed_hash.lower()
         except Exception:
@@ -971,7 +1030,9 @@ class ReaddMixin:
 
         target_mount = self._target_mount_for_blob(blob, self._target_mount_for(ts))
         ok, detail = await self._ensure_fuse_entry(
-            blob=blob, infohash=target_hash, target_mount=target_mount,
+            blob=blob,
+            infohash=target_hash,
+            target_mount=target_mount,
             label="cross-seed torrent",
         )
 
@@ -981,7 +1042,12 @@ class ReaddMixin:
             # "already added" with no visible entry is registration lag
             # (same transient as _NOT_VISIBLE_DETAIL) — park/retry, never
             # terminal FAILED.
-            if detail == "Fails." or not detail or detail == _NOT_VISIBLE_DETAIL or "already" in (detail or "").lower():
+            if (
+                detail == "Fails."
+                or not detail
+                or detail == _NOT_VISIBLE_DETAIL
+                or "already" in (detail or "").lower()
+            ):
                 raise WebUIUnresponsiveError(err_msg)
             self.transition(ts, State.FAILED, error=err_msg)
             return
@@ -989,8 +1055,11 @@ class ReaddMixin:
         # Success: remember the injected hash so the next cycle's early
         # return guards skip the duplicate add/verify, and persist the row.
         if _record_injected_hash(ts, target_hash):
-            log.info("cross-seed re-add recorded injected hash %s for %s",
-                     target_hash[:10], ts.source_name[:60])
+            log.info(
+                "cross-seed re-add recorded injected hash %s for %s",
+                target_hash[:10],
+                ts.source_name[:60],
+            )
             try:
                 self.store.upsert(ts, expected_version=ts.version)
             except Exception:
@@ -998,8 +1067,7 @@ class ReaddMixin:
 
     async def _re_inject_watch_dir_torrents(self, ts: TorrentState) -> None:
         """Re-add every watch-dir dropped torrent and discovered cross-seeds onto FUSE."""
-        watch_cross_dir = _watch_cross_seed_dir(
-            self.cfg.general.state_db, ts.source_infohash)
+        watch_cross_dir = _watch_cross_seed_dir(self.cfg.general.state_db, ts.source_infohash)
         if watch_cross_dir is None:
             log.warning(
                 "re-inject watch-dir torrents for %s: no blob dir "
@@ -1010,7 +1078,8 @@ class ReaddMixin:
         if not watch_cross_dir.exists():
             log.warning(
                 "re-inject watch-dir torrents for %s: blob dir %s missing; skipping",
-                ts.source_name[:50], watch_cross_dir,
+                ts.source_name[:50],
+                watch_cross_dir,
             )
             return
         ts_fallback_mount = self._target_mount_for(ts)
@@ -1020,8 +1089,7 @@ class ReaddMixin:
         try:
             paths = sorted(watch_cross_dir.glob("*.torrent"))
         except Exception as e:  # noqa: BLE001
-            log.warning("re-inject watch-dir list failed for %s: %s",
-                        ts.source_name[:50], e)
+            log.warning("re-inject watch-dir list failed for %s: %s", ts.source_name[:50], e)
             return
 
         async def _load(p):
@@ -1032,6 +1100,7 @@ class ReaddMixin:
                 return (p, None, f"failed to read ({e})")
             try:
                 from .watchdir import _bencoded_info_hash
+
                 h, _, _, _ = _bencoded_info_hash(blob)
                 h_low = (h or "").lower()
             except Exception:
@@ -1043,21 +1112,21 @@ class ReaddMixin:
             target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
             watch_expected = self._expected_fuse_files(blob)
             if not watch_expected:
-                return (p, (h_low, None, None),
-                        "cannot decode file list; skipping blind injection")
-            watch_missing = await self._missing_fuse_files(
-                target_mount, watch_expected)
+                return (p, (h_low, None, None), "cannot decode file list; skipping blind injection")
+            watch_missing = await self._missing_fuse_files(target_mount, watch_expected)
             if watch_missing:
-                return (p, (h_low, None, None),
-                        f"fuse content missing at {target_mount} "
-                        f"({len(watch_missing)} files); skipping blind injection")
+                return (
+                    p,
+                    (h_low, None, None),
+                    f"fuse content missing at {target_mount} "
+                    f"({len(watch_missing)} files); skipping blind injection",
+                )
             return (p, (h_low, blob, target_mount), "")
 
         try:
             _loaded = await asyncio.gather(*(_load(p) for p in paths))
         except Exception as e:  # noqa: BLE001
-            log.warning("re-inject watch-dir load failed for %s: %s",
-                        ts.source_name[:50], e)
+            log.warning("re-inject watch-dir load failed for %s: %s", ts.source_name[:50], e)
             return
 
         async def _inject(item) -> tuple[str, bool, str]:
@@ -1069,7 +1138,9 @@ class ReaddMixin:
             """
             h_low, blob, target_mount = item
             ok, detail = await self._ensure_fuse_entry(
-                blob=blob, infohash=h_low, target_mount=target_mount,
+                blob=blob,
+                infohash=h_low,
+                target_mount=target_mount,
                 label="watch-dir torrent",
             )
             return (h_low, bool(ok), detail or "")
@@ -1083,25 +1154,26 @@ class ReaddMixin:
                     return await _inject((_h_low, _blob, _target))
 
             _results: dict[str, tuple[bool, str]] = {}
-            _pending = [(pay[0], pay[1], pay[2])
-                        for _, pay, prob in _ready
-                        if pay is not None and pay[1] is not None
-                        and pay[0] not in injected_set and not prob]
+            _pending = [
+                (pay[0], pay[1], pay[2])
+                for _, pay, prob in _ready
+                if pay is not None
+                and pay[1] is not None
+                and pay[0] not in injected_set
+                and not prob
+            ]
             if _pending:
-                _outs = await asyncio.gather(
-                    *(_one(h, b, t) for h, b, t in _pending))
+                _outs = await asyncio.gather(*(_one(h, b, t) for h, b, t in _pending))
                 for (h, _b, _t), (_h2, ok, detail) in zip(_pending, _outs):
                     _results[h] = (ok, detail)
                     injected_set.add(h)
             for p, pay, prob in _ready:
                 if pay is None:
-                    log.warning("failed to read watch-dir torrent %s: %s",
-                                p.name, prob)
+                    log.warning("failed to read watch-dir torrent %s: %s", p.name, prob)
                     continue
                 h_low = pay[0]
                 if prob:
-                    log.warning("re-inject watch-dir torrent %s: %s",
-                                h_low[:10], prob)
+                    log.warning("re-inject watch-dir torrent %s: %s", h_low[:10], prob)
                     continue
                 if h_low in injected:
                     continue
@@ -1115,13 +1187,15 @@ class ReaddMixin:
                 # states park the row for retry; a hard rejection (e.g.
                 # invalid blob) skips just this torrent so one bad .torrent
                 # can't hold the whole row (and its moved bytes) hostage.
-                if (not detail or detail == _NOT_VISIBLE_DETAIL
-                        or _is_duplicate_add_detail(detail)):
+                if not detail or detail == _NOT_VISIBLE_DETAIL or _is_duplicate_add_detail(detail):
                     log.warning("re-inject watch-dir torrent %s rejected: %s", h_low[:10], detail)
-                    raise WebUIUnresponsiveError(f"re-inject watch-dir torrent {h_low[:10]} rejected: {detail}")
+                    raise WebUIUnresponsiveError(
+                        f"re-inject watch-dir torrent {h_low[:10]} rejected: {detail}"
+                    )
                 log.warning(
                     "re-inject watch-dir torrent %s hard-rejected (%s); skipping it",
-                    h_low[:10], detail,
+                    h_low[:10],
+                    detail,
                 )
                 continue
         finally:
@@ -1157,8 +1231,7 @@ class ReaddMixin:
         matches = []
         for t in racing or []:
             try:
-                if not (t.name == ts.source_name
-                        or _same_release_name(t.name, ts.source_name)):
+                if not (t.name == ts.source_name or _same_release_name(t.name, ts.source_name)):
                     continue
             except Exception:
                 continue
@@ -1172,8 +1245,10 @@ class ReaddMixin:
             if want_size and t_size and t_size != want_size:
                 log.info(
                     "re-inject: size mismatch for %s (%s: VPS1 %d != row %d); skipping",
-                    (t.name or "")[:50], (t.infohash or "")[:10],
-                    t_size, want_size,
+                    (t.name or "")[:50],
+                    (t.infohash or "")[:10],
+                    t_size,
+                    want_size,
                 )
                 continue
             matches.append(t)
@@ -1196,9 +1271,11 @@ class ReaddMixin:
                 # SFTP clean-miss + no export endpoint (Deluge has no
                 # core.get_torrent_file) surface nowhere else — log
                 # loudly so a skipped racing seed is visible.
-                return (t, None,
-                        "no .torrent bytes available; "
-                        "skipping for now (late-seed job will retry)")
+                return (
+                    t,
+                    None,
+                    "no .torrent bytes available; skipping for now (late-seed job will retry)",
+                )
             # Per-torrent mount: ts.kind may be stale "unknown" (fresh
             # adoption); the blob's own layout is authoritative.
             target_mount = self._target_mount_for_blob(blob, ts_fallback_mount)
@@ -1207,28 +1284,29 @@ class ReaddMixin:
             # release name does not guarantee the bytes were moved).
             match_expected = self._expected_fuse_files(blob)
             if not match_expected:
-                return (t, None,
-                        "cannot decode file list; skipping blind injection")
-            match_missing = await self._missing_fuse_files(
-                target_mount, match_expected)
+                return (t, None, "cannot decode file list; skipping blind injection")
+            match_missing = await self._missing_fuse_files(target_mount, match_expected)
             if match_missing:
-                return (t, None,
-                        f"fuse content missing at {target_mount} "
-                        f"({len(match_missing)} files); skipping blind injection")
+                return (
+                    t,
+                    None,
+                    f"fuse content missing at {target_mount} "
+                    f"({len(match_missing)} files); skipping blind injection",
+                )
             return (t, (h_low, blob, target_mount), "")
 
         # Already-recorded matches skip the fetch entirely (no SFTP/export
         # round-trip for hashes known injected).
         try:
-            fresh = [t for t in matches
-                     if (getattr(t, "infohash", "") or "").lower() not in injected_set]
+            fresh = [
+                t for t in matches if (getattr(t, "infohash", "") or "").lower() not in injected_set
+            ]
         except Exception:
             fresh = list(matches)
         try:
             _loaded = await asyncio.gather(*(_load(t) for t in fresh))
         except Exception as e:  # noqa: BLE001
-            log.warning("re-inject racing load failed for %s: %s",
-                        ts.source_name[:60], e)
+            log.warning("re-inject racing load failed for %s: %s", ts.source_name[:60], e)
             return
 
         async def _inject(item) -> tuple[str, bool, str]:
@@ -1239,7 +1317,9 @@ class ReaddMixin:
             """
             h_low, blob, target_mount = item
             ok, detail = await self._ensure_fuse_entry(
-                blob=blob, infohash=h_low, target_mount=target_mount,
+                blob=blob,
+                infohash=h_low,
+                target_mount=target_mount,
                 label="racing torrent",
             )
             return (h_low, bool(ok), detail or "")
@@ -1252,13 +1332,16 @@ class ReaddMixin:
                     return await _inject((_h_low, _blob, _target))
 
             _results: dict[str, tuple[bool, str]] = {}
-            _pending = [(pay[0], pay[1], pay[2])
-                        for _, pay, prob in _loaded
-                        if pay is not None and pay[1] is not None
-                        and pay[0] not in injected_set and not prob]
+            _pending = [
+                (pay[0], pay[1], pay[2])
+                for _, pay, prob in _loaded
+                if pay is not None
+                and pay[1] is not None
+                and pay[0] not in injected_set
+                and not prob
+            ]
             if _pending:
-                _outs = await asyncio.gather(
-                    *(_one(h, b, t) for h, b, t in _pending))
+                _outs = await asyncio.gather(*(_one(h, b, t) for h, b, t in _pending))
                 for (h, _b, _t), (_h2, ok, detail) in zip(_pending, _outs):
                     _results[h] = (ok, detail)
                     injected_set.add(h)
@@ -1270,16 +1353,17 @@ class ReaddMixin:
                     _t_hash, _t_name = "?", "?"
                 if pay is None:
                     if prob == "cancelled; skipping":
-                        log.info("re-inject: skipping cancelled torrent %s (%s)",
-                                 _t_hash, (_t_name or "")[:40])
+                        log.info(
+                            "re-inject: skipping cancelled torrent %s (%s)",
+                            _t_hash,
+                            (_t_name or "")[:40],
+                        )
                     else:
-                        log.warning("re-inject: %s for %s (%s); skipping",
-                                    prob, _t_hash, _t_name)
+                        log.warning("re-inject: %s for %s (%s); skipping", prob, _t_hash, _t_name)
                     continue
                 h_low = pay[0]
                 if prob:
-                    log.warning("re-inject: %s for %s (%s); skipping",
-                                prob, _t_hash, _t_name)
+                    log.warning("re-inject: %s for %s (%s); skipping", prob, _t_hash, _t_name)
                     continue
                 if h_low in injected:
                     continue
@@ -1293,16 +1377,17 @@ class ReaddMixin:
                 # Split like _re_add_cross_seed_torrent: transient client
                 # states park the row for retry; a hard rejection skips
                 # just this torrent so the cross-seed still lands.
-                if (not detail or detail == _NOT_VISIBLE_DETAIL
-                        or _is_duplicate_add_detail(detail)):
+                if not detail or detail == _NOT_VISIBLE_DETAIL or _is_duplicate_add_detail(detail):
                     log.warning(
                         "re-inject: add %s rejected: %s",
-                        _t_hash, detail,
+                        _t_hash,
+                        detail,
                     )
                     raise WebUIUnresponsiveError(f"re-inject add {_t_hash} rejected: {detail}")
                 log.warning(
                     "re-inject: add %s hard-rejected (%s); skipping it",
-                    _t_hash, detail,
+                    _t_hash,
+                    detail,
                 )
                 continue
         finally:
@@ -1319,7 +1404,8 @@ class ReaddMixin:
                     "re-inject: 0/%d racing torrent(s) injected for %s "
                     "(VPS1 still lists them); row proceeds with cross-seed "
                     "only and the late-seed job will retry the racing injection",
-                    len(pending), ts.source_name[:60],
+                    len(pending),
+                    ts.source_name[:60],
                 )
             elif not matches:
                 log.info(
@@ -1337,8 +1423,7 @@ class ReaddMixin:
         except (asyncio.CancelledError, AbandonedError):
             raise
         except Exception as e:  # noqa: BLE001
-            log.debug("re-inject supplements failed for %s: %s",
-                      ts.source_name[:60], e)
+            log.debug("re-inject supplements failed for %s: %s", ts.source_name[:60], e)
 
     # Prowlarr supplement sweep interval (seconds): extra fuse seeds are
     # opportunistic, not urgent — one search per row per window, while
@@ -1370,16 +1455,16 @@ class ReaddMixin:
             cfg_prowlarr = getattr(getattr(self, "cfg", None), "prowlarr", None)
             if cfg_prowlarr is None:
                 return
-            if not bool(getattr(self.cfg.cross_seed,
-                               "inject_racing_torrents_to_fuse", False)):
+            if not bool(getattr(self.cfg.cross_seed, "inject_racing_torrents_to_fuse", False)):
                 return
             tmap = getattr(cfg_prowlarr, "tracker_map", None)
             entries = getattr(tmap, "entries", None)
             if not isinstance(entries, dict) or not entries:
                 return
             try:
-                if callable(getattr(cfg_prowlarr, "should_skip_title", None)) \
-                        and cfg_prowlarr.should_skip_title(ts.source_name or ""):
+                if callable(
+                    getattr(cfg_prowlarr, "should_skip_title", None)
+                ) and cfg_prowlarr.should_skip_title(ts.source_name or ""):
                     return
             except Exception:
                 pass
@@ -1434,15 +1519,13 @@ class ReaddMixin:
                 return
             try:
                 hits_by_indexer = await asyncio.wait_for(
-                    prowlarr.search_indexers_parallel(
-                        indexers, ts.source_name or ""),
+                    prowlarr.search_indexers_parallel(indexers, ts.source_name or ""),
                     timeout=30.0,
                 )
             except (asyncio.CancelledError, AbandonedError):
                 raise
             except Exception as e:  # noqa: BLE001
-                log.warning("supplement search failed for %s: %s",
-                            ts.source_name[:60], e)
+                log.warning("supplement search failed for %s: %s", ts.source_name[:60], e)
                 try:
                     memo[row_key] = time.monotonic() + self._SUPPLEMENT_FAIL_S
                 except Exception:
@@ -1450,11 +1533,14 @@ class ReaddMixin:
                 return
             try:
                 known = {
-                    (h or "").lower() for h in (
-                        ts.source_infohash, ts.dest_infohash,
+                    (h or "").lower()
+                    for h in (
+                        ts.source_infohash,
+                        ts.dest_infohash,
                         ts.cross_seed_infohash,
                         *ts.injected_private_hashes.split(","),
-                    ) if h
+                    )
+                    if h
                 }
             except Exception:
                 known = set()
@@ -1479,26 +1565,31 @@ class ReaddMixin:
                     _kind = None
                 try:
                     if not _matches_release(
-                            ht, hs, ts.source_name or "",
-                            int(ts.total_bytes or 0),
-                            kind=_kind, unify_separators=True):
+                        ht,
+                        hs,
+                        ts.source_name or "",
+                        int(ts.total_bytes or 0),
+                        kind=_kind,
+                        unify_separators=True,
+                    ):
                         return None
                 except Exception:
                     return None
                 try:
-                    blob = await asyncio.wait_for(
-                        prowlarr.download_torrent(hit), timeout=30.0)
+                    blob = await asyncio.wait_for(prowlarr.download_torrent(hit), timeout=30.0)
                 except (asyncio.CancelledError, AbandonedError):
                     raise
                 except Exception as e:  # noqa: BLE001
-                    log.debug("supplement fetch failed for %s: %s",
-                              ht[:50], e)
+                    log.debug("supplement fetch failed for %s: %s", ht[:50], e)
                     return None
                 try:
                     verified = _verified_cross_seed_blob(
-                        blob, target_name=ts.source_name or "",
+                        blob,
+                        target_name=ts.source_name or "",
                         target_size=int(ts.total_bytes or 0),
-                        hit_title=ht, kind=_kind)
+                        hit_title=ht,
+                        kind=_kind,
+                    )
                 except Exception:
                     return None
                 if verified is None:
@@ -1513,21 +1604,20 @@ class ReaddMixin:
                 return (hit, _blob, h_low)
 
             try:
-                _all_hits = [hit for idx_hits in (hits_by_indexer or {}).values()
-                             for hit in (idx_hits or [])]
+                _all_hits = [
+                    hit for idx_hits in (hits_by_indexer or {}).values() for hit in (idx_hits or [])
+                ]
                 _sem = asyncio.Semaphore(4)
 
                 async def _one(_hit):
                     async with _sem:
                         return await _fetch_hit(_hit)
 
-                _downloads = await asyncio.gather(
-                    *(_one(h) for h in _all_hits))
+                _downloads = await asyncio.gather(*(_one(h) for h in _all_hits))
             except (asyncio.CancelledError, AbandonedError):
                 raise
             except Exception as e:  # noqa: BLE001
-                log.debug("supplement fetch phase failed for %s: %s",
-                          ts.source_name[:60], e)
+                log.debug("supplement fetch phase failed for %s: %s", ts.source_name[:60], e)
                 _downloads = []
             for _item in _downloads:
                 if _item is None:
@@ -1542,18 +1632,18 @@ class ReaddMixin:
                     ht = ""
                 try:
                     if self._abandoned(ts):
-                        raise AbandonedError(
-                            f"row gone for {(ts.source_infohash or '')[:10]}")
+                        raise AbandonedError(f"row gone for {(ts.source_infohash or '')[:10]}")
                 except AbandonedError:
                     raise
                 except Exception:
                     pass
                 try:
-                    if getattr(self, "store", None) is not None and callable(
-                            getattr(self.store, "is_ignored", None)) \
-                            and self.store.is_ignored(h_low) is True:
-                        log.info("supplement: skipping cancelled torrent %s",
-                                 h_low[:10])
+                    if (
+                        getattr(self, "store", None) is not None
+                        and callable(getattr(self.store, "is_ignored", None))
+                        and self.store.is_ignored(h_low) is True
+                    ):
+                        log.info("supplement: skipping cancelled torrent %s", h_low[:10])
                         known.add(h_low)
                         continue
                 except Exception:
@@ -1565,24 +1655,23 @@ class ReaddMixin:
                 if not match_expected:
                     continue
                 try:
-                    match_mount = self._target_mount_for_blob(
-                        _blob, ts_fallback_mount)
-                    match_missing = await self._missing_fuse_files(
-                        match_mount, match_expected)
+                    match_mount = self._target_mount_for_blob(_blob, ts_fallback_mount)
+                    match_missing = await self._missing_fuse_files(match_mount, match_expected)
                 except Exception:
                     continue
                 if match_missing:
                     continue
                 try:
                     ok, _detail = await self._ensure_fuse_entry(
-                        blob=_blob, infohash=h_low,
+                        blob=_blob,
+                        infohash=h_low,
                         target_mount=match_mount,
-                        label="tracker_map supplement")
+                        label="tracker_map supplement",
+                    )
                 except (asyncio.CancelledError, AbandonedError):
                     raise
                 except Exception as e:  # noqa: BLE001
-                    log.debug("supplement inject failed for %s: %s",
-                              h_low[:10], e)
+                    log.debug("supplement inject failed for %s: %s", h_low[:10], e)
                     continue
                 if not ok:
                     continue
@@ -1590,9 +1679,12 @@ class ReaddMixin:
                     changed = True
                 known.add(h_low)
                 added += 1
-                log.info("supplement: injected %s for %s from %s",
-                         h_low[:10], ts.source_name[:60],
-                         getattr(hit, "indexer", "?"))
+                log.info(
+                    "supplement: injected %s for %s from %s",
+                    h_low[:10],
+                    ts.source_name[:60],
+                    getattr(hit, "indexer", "?"),
+                )
             # Memo only after ≥1 usable fetch: a search that yielded
             # nothing (or only known/cancelled hits) re-runs soon instead
             # of suppressing 6h. Failures already memoize short above.
@@ -1614,6 +1706,5 @@ class ReaddMixin:
         except (asyncio.CancelledError, AbandonedError):
             raise
         except Exception as e:  # noqa: BLE001
-            log.debug("re-inject supplements failed for %s: %s",
-                      ts.source_name[:60], e)
+            log.debug("re-inject supplements failed for %s: %s", ts.source_name[:60], e)
             return

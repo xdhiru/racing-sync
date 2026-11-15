@@ -29,15 +29,15 @@ async def test_setup_movie_batch_budget_park_keeps_files(tmp_path):
     coord.cfg.dest.save_path = ssd
     coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
     coord.dest_client = AsyncMock()
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="Pack/part1.bin", size_bytes=4000, progress=0.0),
-        TorrentFile(name="Pack/part2.bin", size_bytes=4000, progress=0.0),
-    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Pack/part1.bin", size_bytes=4000, progress=0.0),
+            TorrentFile(name="Pack/part2.bin", size_bytes=4000, progress=0.0),
+        ]
+    )
     coord.dest_client.delete = AsyncMock()
     coord.dest_client.resume = AsyncMock()
-    coord.transition = MagicMock(
-        side_effect=lambda t, s, error="": setattr(t, "state", s)
-    )
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
     # No usable batch cap: the branch re-checks SSD room before batching.
     coord._frozen_batch_cap = MagicMock(return_value=0)
 
@@ -56,8 +56,6 @@ async def test_setup_movie_batch_budget_park_keeps_files(tmp_path):
     # Multi-file, non-episodic -> the movie/file-group branch parked.
     assert ts.classification_kind == "movie"
     # Keep the paused entry for the retry; never wipe shared save_path data.
-    coord.dest_client.delete.assert_awaited_once_with(
-        "b" * 40, delete_files=False
-    )
+    coord.dest_client.delete.assert_awaited_once_with("b" * 40, delete_files=False)
     assert ts.state == State.WAITING_DISK
     coord.dest_client.resume.assert_not_called()

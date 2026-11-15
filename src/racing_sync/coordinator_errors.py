@@ -26,35 +26,39 @@ _WEBUI_RETRY_ERRORS = (
 # OSError errnos that are always fatal: parking them as "transient" would
 # wedge a row forever (disk full never heals by retrying) or silently
 # desert data. These fail fast and loudly instead.
-_FATAL_OS_ERRNOS = frozenset({
-    _errno.ENOSPC,
-    _errno.EACCES,
-    _errno.EPERM,
-    _errno.EROFS,
-    _errno.EFBIG,
-    _errno.ENOENT,
-    getattr(_errno, "EDQUOT", 122),
-})
+_FATAL_OS_ERRNOS = frozenset(
+    {
+        _errno.ENOSPC,
+        _errno.EACCES,
+        _errno.EPERM,
+        _errno.EROFS,
+        _errno.EFBIG,
+        _errno.ENOENT,
+        getattr(_errno, "EDQUOT", 122),
+    }
+)
 
 # OSError errnos that are genuinely transient on socket-backed clients.
 # Anything else OSError-shaped (errno None, exotic codes) preserves the
 # historical behavior: park and retry. Only the fatal set above fails.
-_TRANSIENT_OS_ERRNOS = frozenset({
-    _errno.EPIPE,
-    _errno.ECONNRESET,
-    _errno.ECONNABORTED,
-    _errno.ECONNREFUSED,
-    _errno.ETIMEDOUT,
-    _errno.ENETRESET,
-    _errno.ENETDOWN,
-    _errno.ENETUNREACH,
-    _errno.EHOSTDOWN,
-    _errno.EHOSTUNREACH,
-    _errno.EAGAIN,
-    getattr(_errno, "EWOULDBLOCK", 11),
-    _errno.EINTR,
-    getattr(_errno, "ESHUTDOWN", 108),
-})
+_TRANSIENT_OS_ERRNOS = frozenset(
+    {
+        _errno.EPIPE,
+        _errno.ECONNRESET,
+        _errno.ECONNABORTED,
+        _errno.ECONNREFUSED,
+        _errno.ETIMEDOUT,
+        _errno.ENETRESET,
+        _errno.ENETDOWN,
+        _errno.ENETUNREACH,
+        _errno.EHOSTDOWN,
+        _errno.EHOSTUNREACH,
+        _errno.EAGAIN,
+        getattr(_errno, "EWOULDBLOCK", 11),
+        _errno.EINTR,
+        getattr(_errno, "ESHUTDOWN", 108),
+    }
+)
 
 
 def is_fatal_os_error(exc: BaseException) -> bool:
@@ -85,6 +89,7 @@ def is_retryable_client_error(exc: BaseException) -> bool:
         return not is_fatal_os_error(exc)
     return False
 
+
 # Indeterminate fuse-entry outcome from _ensure_fuse_entry: the re-add was
 # accepted but the entry is not yet visible to lookups (client registration
 # lag). Callers must park/retry, never fail the row over it.
@@ -107,13 +112,29 @@ class RcloneTransientError(RuntimeError):
 # failure as transient (park) vs persistent (fail). Conservative: unknown
 # text fails like before.
 _RCLONE_TRANSIENT_MARKERS = (
-    "timeout", "timed out", "connection reset", "connection refused",
-    "connection aborted", "network unreachable", "network is unreachable",
-    "host unreachable", "no route to host", "broken pipe",
-    "temporary failure", "try again", "service unavailable",
-    "bad gateway", "gateway timeout", "internal error",
-    "tls handshake", "handshake failure", "connection closed",
-    "too many requests", "slow down", "socket", "eof",
+    "timeout",
+    "timed out",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "network unreachable",
+    "network is unreachable",
+    "host unreachable",
+    "no route to host",
+    "broken pipe",
+    "temporary failure",
+    "try again",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "internal error",
+    "tls handshake",
+    "handshake failure",
+    "connection closed",
+    "too many requests",
+    "slow down",
+    "socket",
+    "eof",
 )
 
 
@@ -180,8 +201,7 @@ class TorrentCheckingError(Exception):
     the watchdog can tell a crawling check from a wedged one.
     """
 
-    def __init__(self, message: str, *, client_state: str = "",
-                 progress: float = 0.0):
+    def __init__(self, message: str, *, client_state: str = "", progress: float = 0.0):
         super().__init__(message)
         try:
             self.client_state = str(client_state or "")

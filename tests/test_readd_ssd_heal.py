@@ -6,6 +6,7 @@ even though the full file exists remotely, so the row only hit the 24h
 FAIL. Only an exact expected-size match may block healing; a stat error
 stays unverifiable ("" -> caller parks, never heals on doubt).
 """
+
 from __future__ import annotations
 
 import time
@@ -28,15 +29,17 @@ KEY = "c" * 40
 
 
 def _blob() -> bytes:
-    return _bencode({
-        b"info": {
-            b"name": TOP.encode(),
-            b"files": [
-                {b"length": PRESENT_SIZE, b"path": [b"ep01.mkv"]},
-                {b"length": MISSING_SIZE, b"path": [b"ep04v2.mkv"]},
-            ],
-        },
-    })
+    return _bencode(
+        {
+            b"info": {
+                b"name": TOP.encode(),
+                b"files": [
+                    {b"length": PRESENT_SIZE, b"path": [b"ep01.mkv"]},
+                    {b"length": MISSING_SIZE, b"path": [b"ep04v2.mkv"]},
+                ],
+            },
+        }
+    )
 
 
 def _scaffold(tmp_path):
@@ -76,8 +79,10 @@ def _scaffold(tmp_path):
     coord._schedule_telegram_update = MagicMock()
 
     ts = TorrentState(
-        source_infohash=KEY, source_name="Show.Batch",
-        dest_infohash=blob_hash, save_path=str(ssd),
+        source_infohash=KEY,
+        source_name="Show.Batch",
+        dest_infohash=blob_hash,
+        save_path=str(ssd),
         classification_kind="movie",
         cross_seed_blob=blob,
         state=State.RE_ADDING,
@@ -111,11 +116,20 @@ def _wire_download(coord, ssd, blob_hash):
         ]
 
     coord.dest_client.get_torrent_files = AsyncMock(side_effect=_files)
-    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
-        hash=blob_hash, name="Show.Batch", size_bytes=300, progress=1.0,
-        state="downloading", category="racing", save_path=str(ssd)))
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=Torrent(
+            hash=blob_hash,
+            name="Show.Batch",
+            size_bytes=300,
+            progress=1.0,
+            state="downloading",
+            category="racing",
+            save_path=str(ssd),
+        )
+    )
     coord.dest_client.add_torrent = AsyncMock(
-        return_value=AddResult(hash=blob_hash, accepted=True, detail="Ok."))
+        return_value=AddResult(hash=blob_hash, accepted=True, detail="Ok.")
+    )
 
     async def _move(local, remote, ts, files_from=None, **kw):
         for n in files_from or []:
@@ -141,8 +155,7 @@ async def test_same_name_leftover_does_not_block_heal(tmp_path, ssd_size):
         coord.dest_client.add_torrent.assert_awaited_once()
         coord.dest_client.resume.assert_awaited()
         coord._rclone_move.assert_awaited_once()
-        assert coord.dest_client.set_file_priorities.call_args[0][1] == {
-            PRESENT: 0, MISSING: 1}
+        assert coord.dest_client.set_file_priorities.call_args[0][1] == {PRESENT: 0, MISSING: 1}
         # The stale stub was overwritten by the re-download, then moved.
         assert coord._rclone_move.call_args.kwargs["files_from"] == [MISSING]
         assert not (ssd / TOP / "ep04v2.mkv").exists()

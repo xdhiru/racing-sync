@@ -9,6 +9,7 @@ fuse blip, AV lock) on a client-complete file used to be read as
 bytes must instead be treated like any other unverified file: never moved,
 never individually deleted, and selected ones block the wipe (step 5b).
 """
+
 from __future__ import annotations
 
 import errno
@@ -63,8 +64,7 @@ def _moving_season_row(tmp_path, cls_files):
 
     coord = make_coordinator()
     coord._stop = False
-    coord.transition = MagicMock(
-        side_effect=lambda t, s, error="": setattr(t, "state", s))
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
     coord.cfg = MagicMock()
     coord.cfg.dest.save_path = ssd
     coord.cfg.ssd.path = ssd
@@ -79,8 +79,7 @@ def _moving_season_row(tmp_path, cls_files):
     coord.dest_client.get_torrent_files = AsyncMock(return_value=cls_files)
     coord.dest_client.export_torrent = AsyncMock(return_value=b"blob")
 
-    async def _fake_move(local, remote, ts, *, include=None, files_from=None,
-                         extra=None):
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
         for name in files_from or []:
             p = ssd / name
             if p.is_file():
@@ -116,8 +115,9 @@ async def test_complete_file_stat_error_is_not_unlinked(tmp_path):
     try:
         flaky_stat, fired = _raise_on_classification_stat(target)
         with patch.object(Path, "stat", flaky_stat):
-            with patch("racing_sync.coordinator.wipe_local_tree",
-                       new_callable=AsyncMock) as mock_wipe:
+            with patch(
+                "racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock
+            ) as mock_wipe:
                 await coord._do_moving(row)
 
         assert fired, "expected the classification stat() to raise"
@@ -125,8 +125,11 @@ async def test_complete_file_stat_error_is_not_unlinked(tmp_path):
         assert target.exists()
         assert target.stat().st_size == 1000
         # (b) no destructive client delete was issued.
-        assert not [c for c in coord.dest_client.delete.await_args_list
-                    if c.kwargs.get("delete_files") is True]
+        assert not [
+            c
+            for c in coord.dest_client.delete.await_args_list
+            if c.kwargs.get("delete_files") is True
+        ]
         # (c) the row never advanced past MOVING into the wipe path.
         assert row.state in (State.MOVING, State.DOWNLOADING)
         assert row.state not in (State.RE_ADDING, State.DONE, State.FAILED)
@@ -157,8 +160,11 @@ async def test_incomplete_file_stat_error_is_not_left_to_wipe(tmp_path):
         assert fired, "expected the classification stat() to raise"
         assert target.exists()
         assert target.stat().st_size == 1000
-        assert not [c for c in coord.dest_client.delete.await_args_list
-                    if c.kwargs.get("delete_files") is True]
+        assert not [
+            c
+            for c in coord.dest_client.delete.await_args_list
+            if c.kwargs.get("delete_files") is True
+        ]
         assert row.state in (State.MOVING, State.DOWNLOADING)
         assert row.state not in (State.RE_ADDING, State.DONE, State.FAILED)
         coord.dest_client.resume.assert_awaited()

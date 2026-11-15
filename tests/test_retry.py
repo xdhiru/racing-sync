@@ -1,4 +1,5 @@
 """P5: central read-retry policy."""
+
 from __future__ import annotations
 
 import asyncio
@@ -23,8 +24,9 @@ async def test_exhaustion_reraises_last():
     from unittest.mock import AsyncMock, patch
     from racing_sync.retry import retryable
 
-    fn = AsyncMock(side_effect=[TimeoutError("one"), TimeoutError("two"),
-                                TimeoutError("three"), "never"])
+    fn = AsyncMock(
+        side_effect=[TimeoutError("one"), TimeoutError("two"), TimeoutError("three"), "never"]
+    )
     with patch("asyncio.sleep", new_callable=AsyncMock):
         with pytest.raises(TimeoutError, match="three"):
             await retryable()(fn)()
@@ -36,8 +38,7 @@ async def test_deterministic_errors_fail_fast():
     from unittest.mock import AsyncMock, patch
     from racing_sync.retry import retryable
 
-    for exc in (ValueError("bad"), RuntimeError("nope"),
-                LookupError("gone")):
+    for exc in (ValueError("bad"), RuntimeError("nope"), LookupError("gone")):
         fn = AsyncMock(side_effect=exc)
         with patch("asyncio.sleep", new_callable=AsyncMock) as _sleep:
             with pytest.raises(type(exc)):
@@ -88,14 +89,12 @@ def test_is_retryable_read_error_shapes():
     try:
         import aiohttp
         from unittest.mock import MagicMock
-        r404 = aiohttp.ClientResponseError(
-            request_info=MagicMock(), history=(), status=404)
-        r400 = aiohttp.ClientResponseError(
-            request_info=MagicMock(), history=(), status=400)
+
+        r404 = aiohttp.ClientResponseError(request_info=MagicMock(), history=(), status=404)
+        r400 = aiohttp.ClientResponseError(request_info=MagicMock(), history=(), status=400)
         assert is_retryable_read_error(r404) is True
         assert is_retryable_read_error(r400) is False
-        assert is_retryable_read_error(
-            aiohttp.ClientConnectionError("down")) is True
+        assert is_retryable_read_error(aiohttp.ClientConnectionError("down")) is True
     except ImportError:
         pass
 

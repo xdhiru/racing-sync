@@ -36,8 +36,13 @@ class _FakeClock:
 
 def _torrent(state: str, progress: float = 1.0) -> Torrent:
     return Torrent(
-        hash="h1", name="Show.S01", size_bytes=2000, progress=progress,
-        state=state, category="racing", save_path="/tmp",
+        hash="h1",
+        name="Show.S01",
+        size_bytes=2000,
+        progress=progress,
+        state=state,
+        category="racing",
+        save_path="/tmp",
     )
 
 
@@ -57,13 +62,11 @@ def _make_coord(tmp_path, *, state: str, stall_timeout: float) -> object:
 
 
 def _ts() -> TorrentState:
-    return TorrentState(
-        source_infohash="h1", source_name="Show.S01", save_path="/tmp")
+    return TorrentState(source_infohash="h1", source_name="Show.S01", save_path="/tmp")
 
 
 @pytest.mark.anyio
-async def test_complete_but_downloading_raises_after_flush_deadline(
-        tmp_path, monkeypatch):
+async def test_complete_but_downloading_raises_after_flush_deadline(tmp_path, monkeypatch):
     """100% with a stuck ``downloading`` state fails once flush time exceeds
     the stall window, naming the row and the stuck client state."""
     clock = _FakeClock(step=0.5)
@@ -114,7 +117,8 @@ async def test_progress_advance_resets_flush_deadline(tmp_path, monkeypatch):
     coord = _make_coord(tmp_path, state="downloading", stall_timeout=1)
     seq = [0.999, 1.0, 1.0, 1.0, 1.0]
     coord.dest_client.get_torrent = AsyncMock(
-        side_effect=lambda h: _torrent("downloading", seq.pop(0)))
+        side_effect=lambda h: _torrent("downloading", seq.pop(0))
+    )
     ts = _ts()
 
     with pytest.raises(DownloadStalledError) as exc:

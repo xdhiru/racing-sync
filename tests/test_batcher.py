@@ -22,9 +22,14 @@ async def test_fail_downloading_row_abandoned_first(tmp_path):
     """A forgotten row must not lose its dest entry to corpse cleanup."""
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(
-            source_infohash="f" * 40, source_name="F",
-            dest_infohash="f" * 40, state=State.DOWNLOADING))
+        store.upsert(
+            TorrentState(
+                source_infohash="f" * 40,
+                source_name="F",
+                dest_infohash="f" * 40,
+                state=State.DOWNLOADING,
+            )
+        )
         coord = make_coordinator(store)
         coord.cfg = MagicMock()
         coord.dest_client = AsyncMock()
@@ -32,10 +37,16 @@ async def test_fail_downloading_row_abandoned_first(tmp_path):
         assert store.tombstone("f" * 40) is True
         with pytest.raises(AbandonedError):
             await coord._fail_downloading_row(
-                store.get("f" * 40) or TorrentState(
-                    source_infohash="f" * 40, source_name="F",
-                    dest_infohash="f" * 40, state=State.DOWNLOADING),
-                "f" * 40, "stalled")
+                store.get("f" * 40)
+                or TorrentState(
+                    source_infohash="f" * 40,
+                    source_name="F",
+                    dest_infohash="f" * 40,
+                    state=State.DOWNLOADING,
+                ),
+                "f" * 40,
+                "stalled",
+            )
         coord.dest_client.delete.assert_not_called()
         coord._notify_telegram.assert_not_called()
     finally:
@@ -47,9 +58,9 @@ async def test_missing_files_needs_two_sightings(tmp_path):
     """One missingFiles report parks quiet; two within the window condemn."""
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(
-            source_infohash="m" * 40, source_name="M",
-            state=State.DOWNLOADING))
+        store.upsert(
+            TorrentState(source_infohash="m" * 40, source_name="M", state=State.DOWNLOADING)
+        )
         coord = make_coordinator(store)
         ts = store.get("m" * 40)
         assert await coord._check_dest_tracker_health(ts, "m" * 40, "missingFiles") is None
@@ -66,9 +77,9 @@ async def test_missing_files_sightings_expire(tmp_path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(
-            source_infohash="m" * 40, source_name="M",
-            state=State.DOWNLOADING))
+        store.upsert(
+            TorrentState(source_infohash="m" * 40, source_name="M", state=State.DOWNLOADING)
+        )
         coord = make_coordinator(store)
         coord._missing_files_sightings = {"m" * 40: time.monotonic() - 400.0}
         ts = store.get("m" * 40)
@@ -82,16 +93,13 @@ async def test_fail_downloading_row_refuses_illegal_edge(tmp_path):
     """Force-assign fallback asserts legality: DONE must not become FAILED."""
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(
-            source_infohash="d" * 40, source_name="D",
-            state=State.DONE))
+        store.upsert(TorrentState(source_infohash="d" * 40, source_name="D", state=State.DONE))
         coord = make_coordinator(store)
         coord.cfg = MagicMock()
         coord.dest_client = AsyncMock()
         coord._notify_telegram = AsyncMock()
         with pytest.raises(ValueError):
-            await coord._fail_downloading_row(
-                store.get("d" * 40), "d" * 40, "stalled")
+            await coord._fail_downloading_row(store.get("d" * 40), "d" * 40, "stalled")
         assert store.get("d" * 40).state == State.DONE
         coord._notify_telegram.assert_not_called()
     finally:
@@ -172,13 +180,15 @@ def test_file_names_normalize_subfolders_and_backslashes():
 def test_files_from_names_dedupes_and_skips_empties():
     from racing_sync.batcher import files_from_names
 
-    assert files_from_names([
-        "Top/Sub/a.mkv",
-        "Top\\Sub\\a.mkv",
-        "Top/c.mkv",
-        "",
-        "root.mkv",
-    ]) == [
+    assert files_from_names(
+        [
+            "Top/Sub/a.mkv",
+            "Top\\Sub\\a.mkv",
+            "Top/c.mkv",
+            "",
+            "root.mkv",
+        ]
+    ) == [
         "Top/Sub/a.mkv",
         "Top/c.mkv",
         "root.mkv",
@@ -414,8 +424,7 @@ async def test_wait_for_completion_resolves_when_expected_files_complete(tmp_pat
     f2 = TorrentFile(name="S01E02.mkv", size_bytes=1000, progress=0.0)
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[f1, f2])
 
-    ts = TorrentState(source_infohash="hash1", source_name="Show.S01",
-                      save_path=str(tmp_path))
+    ts = TorrentState(source_infohash="hash1", source_name="Show.S01", save_path=str(tmp_path))
     # Waiting for only S01E01 should return immediately because S01E01 is complete
     await coord._wait_for_completion(ts, expected_files=["S01E01.mkv"])
 
@@ -440,17 +449,22 @@ async def test_wait_for_completion_waits_when_bytes_missing_on_disk(tmp_path):
         calls["n"] += 1
         if calls["n"] >= 2:
             coord._stop = True
-        return Torrent(hash="hash1", name="Show.S01", size_bytes=2000,
-                       progress=1.0, state="downloading", category="racing",
-                       save_path="/tmp")
+        return Torrent(
+            hash="hash1",
+            name="Show.S01",
+            size_bytes=2000,
+            progress=1.0,
+            state="downloading",
+            category="racing",
+            save_path="/tmp",
+        )
 
     coord.dest_client = MagicMock()
     coord.dest_client.get_torrent = AsyncMock(side_effect=_stop_after_second)
     f1 = TorrentFile(name="S01E01.mkv", size_bytes=1000, progress=1.0)
     coord.dest_client.get_torrent_files = AsyncMock(return_value=[f1])
 
-    ts = TorrentState(source_infohash="hash1", source_name="Show.S01",
-                      save_path=str(tmp_path))
+    ts = TorrentState(source_infohash="hash1", source_name="Show.S01", save_path=str(tmp_path))
     # No S01E01.mkv on disk: must NOT return as complete on the first poll
     # (progress-only logic would); it keeps polling until stopped.
     await coord._wait_for_completion(ts, expected_files=["S01E01.mkv"])
@@ -481,15 +495,20 @@ async def test_wait_for_completion_waits_for_flush_at_100_downloading(tmp_path):
         calls["n"] += 1
         if calls["n"] >= 2:
             coord._stop = True
-        return Torrent(hash="hash1", name="Solo", size_bytes=2000,
-                       progress=1.0, state="downloading", category="racing",
-                       save_path="/tmp")
+        return Torrent(
+            hash="hash1",
+            name="Solo",
+            size_bytes=2000,
+            progress=1.0,
+            state="downloading",
+            category="racing",
+            save_path="/tmp",
+        )
 
     coord.dest_client = MagicMock()
     coord.dest_client.get_torrent = AsyncMock(side_effect=_downloading_at_100)
 
-    ts = TorrentState(source_infohash="hash1", source_name="Solo",
-                      save_path=str(tmp_path))
+    ts = TorrentState(source_infohash="hash1", source_name="Solo", save_path=str(tmp_path))
     await coord._wait_for_completion(ts)
     assert calls["n"] == 2
 
@@ -509,15 +528,20 @@ async def test_wait_for_completion_returns_once_seeding_at_100(tmp_path):
     states = ["downloading", "uploading"]
 
     async def _flip(_h):
-        return Torrent(hash="hash1", name="Solo", size_bytes=2000,
-                       progress=1.0, state=states.pop(0), category="racing",
-                       save_path="/tmp")
+        return Torrent(
+            hash="hash1",
+            name="Solo",
+            size_bytes=2000,
+            progress=1.0,
+            state=states.pop(0),
+            category="racing",
+            save_path="/tmp",
+        )
 
     coord.dest_client = MagicMock()
     coord.dest_client.get_torrent = AsyncMock(side_effect=_flip)
 
-    ts = TorrentState(source_infohash="hash1", source_name="Solo",
-                      save_path=str(tmp_path))
+    ts = TorrentState(source_infohash="hash1", source_name="Solo", save_path=str(tmp_path))
     await coord._wait_for_completion(ts)
     assert states == []
 
@@ -539,12 +563,19 @@ async def test_wait_for_completion_returns_when_paused_at_100(tmp_path):
     coord.cfg.dest.save_path = tmp_path
 
     coord.dest_client = MagicMock()
-    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
-        hash="hash1", name="Solo", size_bytes=2000, progress=1.0,
-        state="pausedDL", category="racing", save_path="/tmp"))
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=Torrent(
+            hash="hash1",
+            name="Solo",
+            size_bytes=2000,
+            progress=1.0,
+            state="pausedDL",
+            category="racing",
+            save_path="/tmp",
+        )
+    )
 
-    ts = TorrentState(source_infohash="hash1", source_name="Solo",
-                      save_path=str(tmp_path))
+    ts = TorrentState(source_infohash="hash1", source_name="Solo", save_path=str(tmp_path))
     await coord._wait_for_completion(ts)
     assert coord.dest_client.get_torrent.await_count == 1
 
@@ -552,6 +583,7 @@ async def test_wait_for_completion_returns_when_paused_at_100(tmp_path):
 def test_classify_tracker_message():
     """Tracker verdicts: deleted vs auth vs healthy."""
     from racing_sync.coordinator_errors import classify_tracker_message
+
     assert classify_tracker_message("Unregistered torrent") == "unregistered"
     assert classify_tracker_message("Torrent has been DELETED") == "unregistered"
     assert classify_tracker_message("unknown torrent in tracker") == "unregistered"
@@ -578,14 +610,20 @@ async def test_wait_for_completion_raises_on_unregistered_tracker(tmp_path):
     coord.cfg.dest.save_path = tmp_path
 
     coord.dest_client = MagicMock()
-    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
-        hash="dead1", name="Dead.Show", size_bytes=1000, progress=0.1,
-        state="downloading", category="racing", save_path="/tmp"))
-    coord.dest_client.get_tracker_messages = AsyncMock(
-        return_value=["Unregistered torrent"])
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=Torrent(
+            hash="dead1",
+            name="Dead.Show",
+            size_bytes=1000,
+            progress=0.1,
+            state="downloading",
+            category="racing",
+            save_path="/tmp",
+        )
+    )
+    coord.dest_client.get_tracker_messages = AsyncMock(return_value=["Unregistered torrent"])
 
-    ts = TorrentState(source_infohash="dead1", source_name="Dead.Show",
-                      save_path=str(tmp_path))
+    ts = TorrentState(source_infohash="dead1", source_name="Dead.Show", save_path=str(tmp_path))
     with pytest.raises(UnregisteredTorrentError, match="tracker unregistered"):
         await coord._wait_for_completion(ts)
     coord.dest_client.get_tracker_messages.assert_awaited()
@@ -606,12 +644,19 @@ async def test_wait_for_completion_raises_on_missing_files(tmp_path):
     coord.cfg.dest.save_path = tmp_path
 
     coord.dest_client = MagicMock()
-    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
-        hash="gone1", name="Gone.Show", size_bytes=1000, progress=0.4,
-        state="missingFiles", category="racing", save_path="/tmp"))
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=Torrent(
+            hash="gone1",
+            name="Gone.Show",
+            size_bytes=1000,
+            progress=0.4,
+            state="missingFiles",
+            category="racing",
+            save_path="/tmp",
+        )
+    )
 
-    ts = TorrentState(source_infohash="gone1", source_name="Gone.Show",
-                      save_path=str(tmp_path))
+    ts = TorrentState(source_infohash="gone1", source_name="Gone.Show", save_path=str(tmp_path))
     with pytest.raises(RuntimeError, match="missingFiles"):
         await coord._wait_for_completion(ts)
 
@@ -619,6 +664,7 @@ async def test_wait_for_completion_raises_on_missing_files(tmp_path):
 def _downloading_pair(tmp_path):
     """Coordinator with real store + one DOWNLOADING row (single flow)."""
     from racing_sync.state import State, StateStore, TorrentState
+
     store = StateStore(tmp_path / "state.db")
     coord = make_coordinator()
     coord.store = store
@@ -629,9 +675,13 @@ def _downloading_pair(tmp_path):
     coord.cfg.general.download_max_stall_parks = 3
     coord.cfg.dest.save_path = tmp_path
     ts = TorrentState(
-        source_infohash="dl1", source_name="DL Show",
-        dest_infohash="dl1", total_bytes=1000, state=State.DOWNLOADING,
-        batches_total=1, batch_index=0,
+        source_infohash="dl1",
+        source_name="DL Show",
+        dest_infohash="dl1",
+        total_bytes=1000,
+        state=State.DOWNLOADING,
+        batches_total=1,
+        batch_index=0,
     )
     store.upsert(ts)
     return coord, store, ts
@@ -647,11 +697,18 @@ async def test_do_downloading_fails_unregistered_row(tmp_path):
 
     coord, store, ts = _downloading_pair(tmp_path)
     coord.dest_client = MagicMock()
-    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
-        hash="dl1", name="DL Show", size_bytes=1000, progress=0.2,
-        state="downloading", category="racing", save_path="/tmp"))
-    coord.dest_client.get_tracker_messages = AsyncMock(
-        return_value=["Unregistered torrent"])
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=Torrent(
+            hash="dl1",
+            name="DL Show",
+            size_bytes=1000,
+            progress=0.2,
+            state="downloading",
+            category="racing",
+            save_path="/tmp",
+        )
+    )
+    coord.dest_client.get_tracker_messages = AsyncMock(return_value=["Unregistered torrent"])
     coord._ssd_release = AsyncMock()
     coord._notify_telegram = AsyncMock()
 
@@ -675,9 +732,17 @@ async def test_do_downloading_parks_then_fails_stalled_row(tmp_path):
     coord.cfg.general.download_stall_timeout_seconds = 0.05
     coord.cfg.general.download_max_stall_parks = 1
     coord.dest_client = MagicMock()
-    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
-        hash="dl1", name="DL Show", size_bytes=1000, progress=0.2,
-        state="stalledDL", category="racing", save_path="/tmp"))
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=Torrent(
+            hash="dl1",
+            name="DL Show",
+            size_bytes=1000,
+            progress=0.2,
+            state="stalledDL",
+            category="racing",
+            save_path="/tmp",
+        )
+    )
     coord.dest_client.get_tracker_messages = AsyncMock(return_value=["Working"])
     coord._ssd_release = AsyncMock()
     coord._notify_telegram = AsyncMock()
@@ -706,8 +771,14 @@ async def test_do_downloading_progress_resets_stall_parks(tmp_path):
 
     async def _trickle(_h):
         return Torrent(
-            hash="dl1", name="DL Show", size_bytes=1000, progress=prog["v"],
-            state="downloading", category="racing", save_path="/tmp")
+            hash="dl1",
+            name="DL Show",
+            size_bytes=1000,
+            progress=prog["v"],
+            state="downloading",
+            category="racing",
+            save_path="/tmp",
+        )
 
     coord.dest_client.get_torrent = AsyncMock(side_effect=_trickle)
     coord.dest_client.get_tracker_messages = AsyncMock(return_value=[])
@@ -743,41 +814,58 @@ async def test_tracker_death_cascades_to_same_tracker_siblings(tmp_path):
 
     def _row(h, name, state, tracker, size=1000):
         from racing_sync.state import TorrentState
+
         r = TorrentState(
-            source_infohash=h, source_name=name, total_bytes=size,
-            state=state, batches_total=1,
-            source_tracker=tracker, source_announce_url=tracker,
+            source_infohash=h,
+            source_name=name,
+            total_bytes=size,
+            state=state,
+            batches_total=1,
+            source_tracker=tracker,
+            source_announce_url=tracker,
         )
         if state == State.QUEUED:
             r.dest_infohash = h
         store.upsert(r)
         return r
 
-    _row("w1", "Dead.Show.S01E01", State.WAITING_INDEXER,
-         "https://tracker-a.example/announce/OTHERKEY")
-    _row("q1", "Dead.Show.S01E01", State.QUEUED,
-         "https://tracker-a.example/announce/KEY")
-    _row("b1", "Dead.Show.S01E01", State.WAITING_INDEXER,
-         "https://tracker-b.example/announce/KEY")  # other tracker: spared
-    _row("d1", "Dead.Show.S01E01", State.DONE,
-         "https://tracker-a.example/announce/KEY")  # settled: untouched
+    _row(
+        "w1",
+        "Dead.Show.S01E01",
+        State.WAITING_INDEXER,
+        "https://tracker-a.example/announce/OTHERKEY",
+    )
+    _row("q1", "Dead.Show.S01E01", State.QUEUED, "https://tracker-a.example/announce/KEY")
+    _row(
+        "b1", "Dead.Show.S01E01", State.WAITING_INDEXER, "https://tracker-b.example/announce/KEY"
+    )  # other tracker: spared
+    _row(
+        "d1", "Dead.Show.S01E01", State.DONE, "https://tracker-a.example/announce/KEY"
+    )  # settled: untouched
     # Same tracker but a DIFFERENT release (file2): the tracker itself is
     # fine, only file1's torrent entry was deleted — must never cascade.
-    _row("f2", "Other.Show.S01E01", State.WAITING_INDEXER,
-         "https://tracker-a.example/announce/KEY")
+    _row("f2", "Other.Show.S01E01", State.WAITING_INDEXER, "https://tracker-a.example/announce/KEY")
     # Spared cross-tracker sibling sits on a far-future retry timer: the
     # cascade must wake it early so it proceeds next tick.
     import datetime as dt
+
     _b1 = store.get("b1")
     _b1.indexer_next_retry_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5)
     store.upsert(_b1)
 
     coord.dest_client = MagicMock()
-    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
-        hash="dl1", name="Dead.Show.S01E01", size_bytes=1000, progress=0.2,
-        state="downloading", category="racing", save_path="/tmp"))
-    coord.dest_client.get_tracker_messages = AsyncMock(
-        return_value=["Unregistered torrent"])
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=Torrent(
+            hash="dl1",
+            name="Dead.Show.S01E01",
+            size_bytes=1000,
+            progress=0.2,
+            state="downloading",
+            category="racing",
+            save_path="/tmp",
+        )
+    )
+    coord.dest_client.get_tracker_messages = AsyncMock(return_value=["Unregistered torrent"])
     coord.dest_client.delete = AsyncMock()
     coord._ssd_release = AsyncMock()
     coord._notify_telegram = AsyncMock()
@@ -795,6 +883,7 @@ async def test_tracker_death_cascades_to_same_tracker_siblings(tmp_path):
     assert store.get("f2").state == State.WAITING_INDEXER
     # ... but the spared sibling was woken early (timer pulled to now).
     import datetime as dt
+
     _b1t = store.get("b1").indexer_next_retry_at
     assert _b1t is not None
     assert (_b1t - dt.datetime.now(dt.timezone.utc)).total_seconds() < 60
@@ -830,12 +919,15 @@ async def test_cascade_wakes_best_ranked_sibling_first(tmp_path):
 
     def _waiter(h, tracker):
         from racing_sync.state import TorrentState
+
         r = TorrentState(
-            source_infohash=h, source_name="Rank.Show.S01E01",
-            total_bytes=1000, state=State.WAITING_INDEXER,
-            source_tracker=tracker, source_announce_url=tracker,
-            indexer_next_retry_at=(
-                dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5)),
+            source_infohash=h,
+            source_name="Rank.Show.S01E01",
+            total_bytes=1000,
+            state=State.WAITING_INDEXER,
+            source_tracker=tracker,
+            source_announce_url=tracker,
+            indexer_next_retry_at=(dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5)),
         )
         store.upsert(r)
 
@@ -843,11 +935,18 @@ async def test_cascade_wakes_best_ranked_sibling_first(tmp_path):
     _waiter("priv1", "https://tracker-c.example/announce/KEY")
 
     coord.dest_client = MagicMock()
-    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
-        hash="dl1", name="Rank.Show.S01E01", size_bytes=1000, progress=0.2,
-        state="downloading", category="racing", save_path="/tmp"))
-    coord.dest_client.get_tracker_messages = AsyncMock(
-        return_value=["Unregistered torrent"])
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=Torrent(
+            hash="dl1",
+            name="Rank.Show.S01E01",
+            size_bytes=1000,
+            progress=0.2,
+            state="downloading",
+            category="racing",
+            save_path="/tmp",
+        )
+    )
+    coord.dest_client.get_tracker_messages = AsyncMock(return_value=["Unregistered torrent"])
     coord.dest_client.delete = AsyncMock()
     coord._ssd_release = AsyncMock()
     coord._notify_telegram = AsyncMock()
@@ -878,19 +977,30 @@ async def test_tracker_auth_death_does_not_cascade(tmp_path):
     ts.source_tracker = "https://tracker-a.example/announce/KEY"
     ts.source_announce_url = ts.source_tracker
     store.upsert(ts)
-    store.upsert(TorrentState(
-        source_infohash="w2", source_name="Auth.Show.S01E01",
-        total_bytes=1000, state=State.WAITING_INDEXER,
-        source_tracker="https://tracker-a.example/announce/KEY",
-        source_announce_url="https://tracker-a.example/announce/KEY",
-    ))
+    store.upsert(
+        TorrentState(
+            source_infohash="w2",
+            source_name="Auth.Show.S01E01",
+            total_bytes=1000,
+            state=State.WAITING_INDEXER,
+            source_tracker="https://tracker-a.example/announce/KEY",
+            source_announce_url="https://tracker-a.example/announce/KEY",
+        )
+    )
 
     coord.dest_client = MagicMock()
-    coord.dest_client.get_torrent = AsyncMock(return_value=Torrent(
-        hash="dl1", name="Auth.Show.S01E01", size_bytes=1000, progress=0.2,
-        state="downloading", category="racing", save_path="/tmp"))
-    coord.dest_client.get_tracker_messages = AsyncMock(
-        return_value=["truncated passkey error"])
+    coord.dest_client.get_torrent = AsyncMock(
+        return_value=Torrent(
+            hash="dl1",
+            name="Auth.Show.S01E01",
+            size_bytes=1000,
+            progress=0.2,
+            state="downloading",
+            category="racing",
+            save_path="/tmp",
+        )
+    )
+    coord.dest_client.get_tracker_messages = AsyncMock(return_value=["truncated passkey error"])
     coord.dest_client.delete = AsyncMock()
     coord._ssd_release = AsyncMock()
     coord._notify_telegram = AsyncMock()
@@ -929,12 +1039,12 @@ async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
 
     cls_files = [
         # Moved by its batch (rides deselected, like the flip leaves it).
-        TorrentFile(name=gone_locally, size_bytes=500, progress=1.0,
-                    priority=0),
+        TorrentFile(name=gone_locally, size_bytes=500, progress=1.0, priority=0),
         # Deselected batch file (priority 0, as _prepare_next_batch leaves
         # non-current-batch files): preallocated shell, wiped as today.
-        TorrentFile(name="Big.Show.S01/Big.Show.S01E04.mkv", size_bytes=500, progress=0.4,
-                    priority=0),
+        TorrentFile(
+            name="Big.Show.S01/Big.Show.S01E04.mkv", size_bytes=500, progress=0.4, priority=0
+        ),
         TorrentFile(name="Big.Show.S01/cover.jpg", size_bytes=6, progress=1.0),
     ]
 
@@ -1018,14 +1128,17 @@ async def test_do_moving_hands_lagging_selected_file_to_downloading(tmp_path):
     e2.write_bytes(b"z" * 1000)
 
     cls_files = [
-        TorrentFile(name="Lag.Season/Lag.Season.S01E01.mkv", size_bytes=1000,
-                    progress=1.0, priority=1),
-        TorrentFile(name="Lag.Season/Lag.Season.S01E02.mkv", size_bytes=1000,
-                    progress=1.0, priority=1),
+        TorrentFile(
+            name="Lag.Season/Lag.Season.S01E01.mkv", size_bytes=1000, progress=1.0, priority=1
+        ),
+        TorrentFile(
+            name="Lag.Season/Lag.Season.S01E02.mkv", size_bytes=1000, progress=1.0, priority=1
+        ),
         # Selected, full-size, 99.5%: real bytes mid-flush, NOT a
         # preallocated shell — wiping it would destroy content.
-        TorrentFile(name="Lag.Season/Lag.Season.S01E03.mkv", size_bytes=1000,
-                    progress=0.995, priority=1),
+        TorrentFile(
+            name="Lag.Season/Lag.Season.S01E03.mkv", size_bytes=1000, progress=0.995, priority=1
+        ),
     ]
 
     coord = make_coordinator()
@@ -1229,8 +1342,9 @@ async def test_do_moving_skips_move_when_no_verified_leftovers(tmp_path):
     cls_files = [
         # Deselected leftover (priority 0: only the current batch stays
         # selected in batch flow): preallocated shell, wiped as today.
-        TorrentFile(name="Big.Show.S01/Big.Show.S01E04.mkv", size_bytes=500, progress=0.4,
-                    priority=0),
+        TorrentFile(
+            name="Big.Show.S01/Big.Show.S01E04.mkv", size_bytes=500, progress=0.4, priority=0
+        ),
     ]
 
     coord = make_coordinator()
@@ -1445,15 +1559,19 @@ async def test_wait_for_completion_fails_fast_on_missing_expected_files():
     coord.dest_client = MagicMock()
     coord.dest_client.get_torrent = AsyncMock(
         return_value=Torrent(
-            hash="h1", name="Show", category="racing", save_path="",
-            size_bytes=1000, state="downloading", progress=0.5, trackers=[],
+            hash="h1",
+            name="Show",
+            category="racing",
+            save_path="",
+            size_bytes=1000,
+            state="downloading",
+            progress=0.5,
+            trackers=[],
         )
     )
     # Torrent metadata is loaded with only Ep01, but batch expects Ep02
     coord.dest_client.get_torrent_files = AsyncMock(
-        return_value=[
-            TorrentFile(name="Show.S01E01.mkv", size_bytes=500, progress=1.0, priority=1)
-        ]
+        return_value=[TorrentFile(name="Show.S01E01.mkv", size_bytes=500, progress=1.0, priority=1)]
     )
 
     ts = TorrentState(
@@ -1521,8 +1639,10 @@ async def test_do_moving_moves_remaining_files_when_batches_incomplete(tmp_path)
         state=State.MOVING,
     )
 
-    with patch("racing_sync.coordinator.classify") as mock_classify, \
-         patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock):
+    with (
+        patch("racing_sync.coordinator.classify") as mock_classify,
+        patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock),
+    ):
         mock_cls = MagicMock()
         mock_cls.kind = "season"
         mock_cls.single_file = None
@@ -1589,8 +1709,10 @@ async def test_do_moving_preserves_top_folder_on_remote(tmp_path):
         state=State.MOVING,
     )
 
-    with patch("racing_sync.coordinator.classify") as mock_classify, \
-         patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock):
+    with (
+        patch("racing_sync.coordinator.classify") as mock_classify,
+        patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock),
+    ):
         mock_cls = MagicMock()
         mock_cls.kind = "season"
         mock_cls.single_file = None
@@ -1667,8 +1789,10 @@ async def test_do_moving_fallback_never_bare_moves_folder(tmp_path):
         state=State.MOVING,
     )
 
-    with patch("racing_sync.coordinator.classify") as mock_classify, \
-         patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock):
+    with (
+        patch("racing_sync.coordinator.classify") as mock_classify,
+        patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock),
+    ):
         mock_cls = MagicMock()
         mock_cls.kind = "season"
         mock_cls.single_file = None
@@ -1811,10 +1935,12 @@ async def test_move_and_clean_batch_honors_skip(tmp_path):
         classification_kind="movie",
         state=State.DOWNLOADING,
     )
-    batch = Batch(episodes=[
-        Episode("Pack/a.mkv", 0, 1, 4),
-        Episode("Pack/b.mkv", 0, 2, 4),
-    ])
+    batch = Batch(
+        episodes=[
+            Episode("Pack/a.mkv", 0, 1, 4),
+            Episode("Pack/b.mkv", 0, 2, 4),
+        ]
+    )
     await coord._move_and_clean_batch(ts, batch, skip={"Pack/a.mkv"})
 
     files_from = coord._rclone_move.call_args.kwargs.get("files_from")
@@ -1854,8 +1980,12 @@ async def test_setup_queued_download_skips_remote_batch0(tmp_path):
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
 
     ts = TorrentState(
-        source_infohash="e" * 40, source_name="Pack", total_bytes=12000,
-        cross_seed_blob=b"blob", save_path=str(tmp_path), state=State.QUEUED,
+        source_infohash="e" * 40,
+        source_name="Pack",
+        total_bytes=12000,
+        cross_seed_blob=b"blob",
+        save_path=str(tmp_path),
+        state=State.QUEUED,
     )
 
     await coord._do_queued(ts)
@@ -1893,8 +2023,12 @@ async def test_setup_queued_download_single_on_fuse_goes_moving(tmp_path):
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
 
     ts = TorrentState(
-        source_infohash="f" * 40, source_name="Movie", total_bytes=100,
-        dest_infohash="f" * 40, save_path=str(tmp_path), state=State.QUEUED,
+        source_infohash="f" * 40,
+        source_name="Movie",
+        total_bytes=100,
+        dest_infohash="f" * 40,
+        save_path=str(tmp_path),
+        state=State.QUEUED,
     )
 
     await coord._setup_queued_download(ts, b"blob")
@@ -1930,12 +2064,14 @@ async def test_do_moving_mixed_skips_remote_episode(tmp_path):
     coord.cfg.rclone.fuse.mount_unsorted = fuse_unsorted
     coord.cfg.rclone.batch_move_extra_flags = []
     coord.dest_client = AsyncMock()
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile("Show.S01E01.mkv", 1000, progress=1.0),
-        TorrentFile("Show.S01E02.mkv", 1000, progress=1.0),
-        TorrentFile("Extra1.mp4", 1000, progress=1.0),
-        TorrentFile("Extra2.mp4", 1000, progress=1.0),
-    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile("Show.S01E01.mkv", 1000, progress=1.0),
+            TorrentFile("Show.S01E02.mkv", 1000, progress=1.0),
+            TorrentFile("Extra1.mp4", 1000, progress=1.0),
+            TorrentFile("Extra2.mp4", 1000, progress=1.0),
+        ]
+    )
     coord.dest_client.pause = AsyncMock()
     coord.dest_client.delete = AsyncMock()
     coord.dest_client.export_torrent = AsyncMock(return_value=b"blob")
@@ -1949,8 +2085,11 @@ async def test_do_moving_mixed_skips_remote_episode(tmp_path):
     coord._rclone_move = AsyncMock(side_effect=_fake_move)
 
     ts = TorrentState(
-        source_infohash="m" * 40, source_name="Show.Mixed", save_path=str(tmp_path),
-        classification_kind="mixed", state=State.MOVING,
+        source_infohash="m" * 40,
+        source_name="Show.Mixed",
+        save_path=str(tmp_path),
+        classification_kind="mixed",
+        state=State.MOVING,
     )
 
     await coord._do_moving(ts)
@@ -2068,6 +2207,8 @@ async def test_flip_to_next_batch_parks_when_file_list_missing():
     assert ok is False
     coord.dest_client.set_file_priorities.assert_not_called()
     coord.dest_client.resume.assert_not_called()
+
+
 @pytest.mark.anyio
 async def test_park_moving_records_reason_and_escalates(tmp_path, caplog):
     """MOVING parks must name their gate instead of idling silently.
@@ -2083,8 +2224,7 @@ async def test_park_moving_records_reason_and_escalates(tmp_path, caplog):
     coord = make_coordinator()
     coord._stop = False
     coord.store = StateStore(tmp_path / "state.db")
-    ts = TorrentState(source_infohash="e" * 40, source_name="Stalled.Show",
-                      state=State.MOVING)
+    ts = TorrentState(source_infohash="e" * 40, source_name="Stalled.Show", state=State.MOVING)
     coord.store.upsert(ts)
 
     with caplog.at_level(logging.WARNING):
@@ -2095,8 +2235,7 @@ async def test_park_moving_records_reason_and_escalates(tmp_path, caplog):
 
     coord._park_moving(ts, "could not pause torrent eeee before move")
     assert "(5x)" in (coord.store.get("e" * 40).last_error or "")
-    assert any(r.levelno >= logging.ERROR and "MOVING stalled" in r.message
-               for r in caplog.records)
+    assert any(r.levelno >= logging.ERROR and "MOVING stalled" in r.message for r in caplog.records)
 
     # Leaving MOVING resets the counter (fresh re-entry starts at 1x).
     coord.transition(ts, State.RE_ADDING)
@@ -2129,8 +2268,7 @@ async def test_do_moving_branches_on_pinned_kind_despite_flip(tmp_path):
     names = [f"Pack.S01E{i:02d}.mkv" for i in range(1, 10)] + ["Extra1.mp4", "Extra2.mp4"]
     for n in names:
         (top / n).write_bytes(b"x" * 100)
-    cls_files = [TorrentFile(name=f"Pack/{n}", size_bytes=100, progress=1.0)
-                 for n in names]
+    cls_files = [TorrentFile(name=f"Pack/{n}", size_bytes=100, progress=1.0) for n in names]
 
     coord = make_coordinator()
     coord._stop = False
@@ -2159,10 +2297,16 @@ async def test_do_moving_branches_on_pinned_kind_despite_flip(tmp_path):
 
     coord._rclone_move = AsyncMock(side_effect=_fake_move)
 
-    ts = TorrentState(source_infohash="f" * 40, source_name="Pack",
-                      dest_infohash="f" * 40, save_path=str(ssd),
-                      classification_kind="season", batches_total=0,
-                      batch_index=0, state=State.MOVING)
+    ts = TorrentState(
+        source_infohash="f" * 40,
+        source_name="Pack",
+        dest_infohash="f" * 40,
+        save_path=str(ssd),
+        classification_kind="season",
+        batches_total=0,
+        batch_index=0,
+        state=State.MOVING,
+    )
     coord.store.upsert(ts)
     row = coord.store.get("f" * 40)
     with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock):
@@ -2173,6 +2317,7 @@ async def test_do_moving_branches_on_pinned_kind_despite_flip(tmp_path):
     assert row.batches_total == 0
     coord._rclone_move.assert_awaited_once()
     assert coord._rclone_move.call_args.kwargs.get("extra") is None
+
 
 @pytest.mark.anyio
 async def test_do_moving_timeout_parks_instead_of_failing(tmp_path):
@@ -2203,18 +2348,24 @@ async def test_do_moving_timeout_parks_instead_of_failing(tmp_path):
     coord.cfg.rclone.fuse.mount = ssd / "fuse"
     coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
     coord.dest_client = AsyncMock()
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=1.0),
-    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=1.0),
+        ]
+    )
 
-    coord._rclone_move = AsyncMock(
-        side_effect=RcloneTimeoutError("rclone timeout after 21600s"))
+    coord._rclone_move = AsyncMock(side_effect=RcloneTimeoutError("rclone timeout after 21600s"))
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
 
-    ts = TorrentState(source_infohash="t" * 40, source_name="Show.S01E01",
-                      dest_infohash="t" * 40, save_path=str(ssd),
-                      classification_kind="episode", batches_total=0,
-                      state=State.MOVING)
+    ts = TorrentState(
+        source_infohash="t" * 40,
+        source_name="Show.S01E01",
+        dest_infohash="t" * 40,
+        save_path=str(ssd),
+        classification_kind="episode",
+        batches_total=0,
+        state=State.MOVING,
+    )
     coord.store.upsert(ts)
 
     await coord._process_torrent(coord.store.get("t" * 40))
@@ -2241,18 +2392,26 @@ async def test_batch_loop_timeout_parks_downloading_without_retry_burn(tmp_path)
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
     coord.cfg = MagicMock()
     coord.dest_client = AsyncMock()
-    coord._get_batches_for_torrent = AsyncMock(return_value=[
-        Batch(episodes=[Episode("Show.S01E01.mkv", 1, 1, 100)]),
-        Batch(episodes=[Episode("Show.S01E02.mkv", 1, 2, 100)]),
-    ])
+    coord._get_batches_for_torrent = AsyncMock(
+        return_value=[
+            Batch(episodes=[Episode("Show.S01E01.mkv", 1, 1, 100)]),
+            Batch(episodes=[Episode("Show.S01E02.mkv", 1, 2, 100)]),
+        ]
+    )
     coord._wait_for_completion = AsyncMock()
     coord._fuse_skipped = AsyncMock(return_value=set())
     coord._move_and_clean_batch = AsyncMock(
-        side_effect=RcloneTimeoutError("rclone timeout after 21600s"))
+        side_effect=RcloneTimeoutError("rclone timeout after 21600s")
+    )
 
-    ts = TorrentState(source_infohash="u" * 40, source_name="Show.S01",
-                      classification_kind="season", batches_total=2,
-                      batch_index=0, state=State.DOWNLOADING)
+    ts = TorrentState(
+        source_infohash="u" * 40,
+        source_name="Show.S01",
+        classification_kind="season",
+        batches_total=2,
+        batch_index=0,
+        state=State.DOWNLOADING,
+    )
 
     await coord._do_downloading(ts)
 
@@ -2273,10 +2432,10 @@ async def test_process_torrent_timeout_safety_net_parks(tmp_path):
     coord._stop = False
     coord.store = StateStore(tmp_path / "state.db")
     coord._process_torrent_inner = AsyncMock(
-        side_effect=RcloneTimeoutError("rclone timeout after 21600s"))
+        side_effect=RcloneTimeoutError("rclone timeout after 21600s")
+    )
 
-    ts = TorrentState(source_infohash="v" * 40, source_name="Show",
-                      state=State.DOWNLOADING)
+    ts = TorrentState(source_infohash="v" * 40, source_name="Show", state=State.DOWNLOADING)
     coord.store.upsert(ts)
 
     await coord._process_torrent(coord.store.get("v" * 40))
@@ -2284,6 +2443,7 @@ async def test_process_torrent_timeout_safety_net_parks(tmp_path):
     row = coord.store.get("v" * 40)
     assert row.state == State.DOWNLOADING
     assert "timed out" in (row.last_error or "")
+
 
 @pytest.mark.anyio
 async def test_queued_burst_respects_download_cap(tmp_path):
@@ -2328,19 +2488,25 @@ async def test_queued_burst_respects_download_cap(tmp_path):
         return AddResult(hash=h, accepted=True, detail="ok")
 
     coord.dest_client.add_torrent = AsyncMock(side_effect=_fake_add)
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=0.0),
-    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=0.0),
+        ]
+    )
     coord.dest_client.set_file_priorities = AsyncMock()
     coord.dest_client.resume = AsyncMock()
 
     rows = []
     for i in range(5):
-        ts = TorrentState(source_infohash=f"{i + 1:040d}", source_name=f"Show{i}",
-                          save_path=str(ssd), total_bytes=100,
-                          classification_kind="unknown",
-                          cross_seed_blob=b"blob",
-                          state=State.QUEUED)
+        ts = TorrentState(
+            source_infohash=f"{i + 1:040d}",
+            source_name=f"Show{i}",
+            save_path=str(ssd),
+            total_bytes=100,
+            classification_kind="unknown",
+            cross_seed_blob=b"blob",
+            state=State.QUEUED,
+        )
         coord.store.upsert(ts)
         rows.append(ts)
 
@@ -2407,19 +2573,33 @@ async def test_queued_existing_entry_parks_when_full(tmp_path):
     coord.cfg.rclone.fuse.mount = fuse
     coord.cfg.rclone.fuse.mount_unsorted = fuse
     coord.dest_client = AsyncMock()
-    coord.dest_client.list_torrents = AsyncMock(return_value=[
-        Torrent(hash="e" * 40, name="Show", category="racing", save_path=str(ssd),
-                size_bytes=100, state="pausedDL", progress=0.5),
-    ])
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash="e" * 40,
+                name="Show",
+                category="racing",
+                save_path=str(ssd),
+                size_bytes=100,
+                state="pausedDL",
+                progress=0.5,
+            ),
+        ]
+    )
     coord.dest_client.resume = AsyncMock()
 
     # One LIVE downloading worker already fills the single slot.
-    coord.store.upsert(TorrentState(source_infohash="d" * 40, source_name="Busy",
-                                    state=State.DOWNLOADING))
-    ts = TorrentState(source_infohash="e" * 40, source_name="Show",
-                      dest_infohash="e" * 40, save_path=str(ssd),
-                      cross_seed_blob=b"blob",
-                      state=State.QUEUED)
+    coord.store.upsert(
+        TorrentState(source_infohash="d" * 40, source_name="Busy", state=State.DOWNLOADING)
+    )
+    ts = TorrentState(
+        source_infohash="e" * 40,
+        source_name="Show",
+        dest_infohash="e" * 40,
+        save_path=str(ssd),
+        cross_seed_blob=b"blob",
+        state=State.QUEUED,
+    )
     coord.store.upsert(ts)
 
     coord._running_infohashes.update(("d" * 40, "e" * 40))
@@ -2447,6 +2627,7 @@ async def test_queued_gate_ignores_non_int_configs():
     assert await coord._try_admit_download(MagicMock()) is True
     assert await coord._park_queued_for_download_slot(MagicMock()) is False
 
+
 @pytest.mark.anyio
 async def test_try_admit_excludes_self(tmp_path):
     """A DOWNLOADING row judging its own (adopted) admission must not
@@ -2457,18 +2638,19 @@ async def test_try_admit_excludes_self(tmp_path):
     try:
         coord = make_coordinator(store)
         coord.cfg.max_active_downloads = 1
-        store.upsert(TorrentState(source_infohash="a" * 40,
-                                  source_name="A", state=State.DOWNLOADING))
+        store.upsert(
+            TorrentState(source_infohash="a" * 40, source_name="A", state=State.DOWNLOADING)
+        )
         coord._running_infohashes = {"a" * 40}
-        assert await coord._try_admit_download(
-            store.get("a" * 40)) is True
-        store.upsert(TorrentState(source_infohash="b" * 40,
-                                  source_name="B", state=State.DOWNLOADING))
+        assert await coord._try_admit_download(store.get("a" * 40)) is True
+        store.upsert(
+            TorrentState(source_infohash="b" * 40, source_name="B", state=State.DOWNLOADING)
+        )
         coord._running_infohashes = {"a" * 40, "b" * 40}
-        assert await coord._try_admit_download(
-            store.get("a" * 40)) is False
+        assert await coord._try_admit_download(store.get("a" * 40)) is False
     finally:
         store.close()
+
 
 @pytest.mark.anyio
 async def test_setup_footprint_excludes_remote_skipped_bytes(tmp_path):
@@ -2503,18 +2685,25 @@ async def test_setup_footprint_excludes_remote_skipped_bytes(tmp_path):
     coord._ssd_reserved = {}
     coord._ssd_lock = None
     coord.dest_client = AsyncMock()
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=1.0),
-        TorrentFile(name="Show.S01E02.mkv", size_bytes=100, progress=1.0),
-        TorrentFile(name="Show.S01E03.mkv", size_bytes=100, progress=0.0),
-    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=1.0),
+            TorrentFile(name="Show.S01E02.mkv", size_bytes=100, progress=1.0),
+            TorrentFile(name="Show.S01E03.mkv", size_bytes=100, progress=0.0),
+        ]
+    )
     coord.dest_client.set_file_priorities = AsyncMock()
     coord.dest_client.resume = AsyncMock()
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
 
-    ts = TorrentState(source_infohash="s" * 40, source_name="Show.S01",
-                      dest_infohash="s" * 40, save_path=str(ssd),
-                      total_bytes=300, state=State.QUEUED)
+    ts = TorrentState(
+        source_infohash="s" * 40,
+        source_name="Show.S01",
+        dest_infohash="s" * 40,
+        save_path=str(ssd),
+        total_bytes=300,
+        state=State.QUEUED,
+    )
     # Admission held the full 300; setup must shrink to the ~100 remaining.
     coord._ssd_reserved["s" * 40] = 300
 
@@ -2555,23 +2744,31 @@ async def test_setup_footprint_zero_when_fully_remote(tmp_path):
     coord._ssd_reserved = {}
     coord._ssd_lock = None
     coord.dest_client = AsyncMock()
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=1.0),
-        TorrentFile(name="Show.S01E02.mkv", size_bytes=100, progress=1.0),
-    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=1.0),
+            TorrentFile(name="Show.S01E02.mkv", size_bytes=100, progress=1.0),
+        ]
+    )
     coord.dest_client.set_file_priorities = AsyncMock()
     coord.dest_client.resume = AsyncMock()
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
 
-    ts = TorrentState(source_infohash="z" * 40, source_name="Show.S01",
-                      dest_infohash="z" * 40, save_path=str(ssd),
-                      total_bytes=200, state=State.QUEUED)
+    ts = TorrentState(
+        source_infohash="z" * 40,
+        source_name="Show.S01",
+        dest_infohash="z" * 40,
+        save_path=str(ssd),
+        total_bytes=200,
+        state=State.QUEUED,
+    )
     coord._ssd_reserved["z" * 40] = 200
 
     await coord._setup_queued_download(ts, b"blob")
 
     assert ts.state == State.RE_ADDING
     coord.dest_client.resume.assert_not_called()  # nothing needs downloading
+
 
 @pytest.mark.anyio
 async def test_setup_corpse_delete_drops_entry_only(tmp_path):
@@ -2602,24 +2799,31 @@ async def test_setup_corpse_delete_drops_entry_only(tmp_path):
     coord._ssd_reserved = {}
     coord._ssd_lock = None
     coord.dest_client = AsyncMock()
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=1.0),
-        TorrentFile(name="Show.S01E02.mkv", size_bytes=100, progress=1.0),
-    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Show.S01E01.mkv", size_bytes=100, progress=1.0),
+            TorrentFile(name="Show.S01E02.mkv", size_bytes=100, progress=1.0),
+        ]
+    )
     coord.dest_client.set_file_priorities = AsyncMock()
     coord.dest_client.resume = AsyncMock()
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
 
-    ts = TorrentState(source_infohash="z" * 40, source_name="Show.S01",
-                      dest_infohash="z" * 40, save_path=str(ssd),
-                      total_bytes=200, state=State.QUEUED)
+    ts = TorrentState(
+        source_infohash="z" * 40,
+        source_name="Show.S01",
+        dest_infohash="z" * 40,
+        save_path=str(ssd),
+        total_bytes=200,
+        state=State.QUEUED,
+    )
     coord._ssd_reserved["z" * 40] = 200
 
     await coord._setup_queued_download(ts, b"blob")
 
     assert ts.state == State.RE_ADDING
-    coord.dest_client.delete.assert_awaited_once_with(
-        "z" * 40, delete_files=False)
+    coord.dest_client.delete.assert_awaited_once_with("z" * 40, delete_files=False)
+
 
 @pytest.mark.anyio
 async def test_download_loop_tightens_reservation_per_batch(tmp_path):
@@ -2639,24 +2843,35 @@ async def test_download_loop_tightens_reservation_per_batch(tmp_path):
     coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
     coord.cfg = MagicMock()
     coord.dest_client = AsyncMock()
-    coord._get_batches_for_torrent = AsyncMock(return_value=[
-        Batch(episodes=[Episode("Show.S01E01.mkv", 1, 1, 100)]),
-        Batch(episodes=[Episode("Show.S01E02.mkv", 1, 2, 100)]),
-    ])
+    coord._get_batches_for_torrent = AsyncMock(
+        return_value=[
+            Batch(episodes=[Episode("Show.S01E01.mkv", 1, 1, 100)]),
+            Batch(episodes=[Episode("Show.S01E02.mkv", 1, 2, 100)]),
+        ]
+    )
     coord._wait_for_completion = AsyncMock()
     # cur_skip (batch 0, nothing remote yet), adjust (batch 0 now remote),
     # cur_skip (batch 1).
-    coord._fuse_skipped = AsyncMock(side_effect=[
-        set(), {"Show.S01E01.mkv"}, set(),
-    ])
+    coord._fuse_skipped = AsyncMock(
+        side_effect=[
+            set(),
+            {"Show.S01E01.mkv"},
+            set(),
+        ]
+    )
     coord._move_and_clean_batch = AsyncMock()
     coord._flip_to_next_batch = AsyncMock(side_effect=lambda ts, nxt: nxt)
     coord._ssd_reserved = {"k" * 40: 200}
     coord._ssd_lock = None
 
-    ts = TorrentState(source_infohash="k" * 40, source_name="Show.S01",
-                      classification_kind="season", batches_total=2,
-                      batch_index=0, state=State.DOWNLOADING)
+    ts = TorrentState(
+        source_infohash="k" * 40,
+        source_name="Show.S01",
+        classification_kind="season",
+        batches_total=2,
+        batch_index=0,
+        state=State.DOWNLOADING,
+    )
 
     await coord._do_downloading(ts)
 
@@ -2759,9 +2974,11 @@ def _all_remote_season_coord(tmp_path, fuse_files: dict[str, int], cap_bytes: in
     coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
     coord._frozen_batch_cap = MagicMock(return_value=cap_bytes)
     coord.dest_client = AsyncMock()
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name=n, size_bytes=s, progress=0.0) for n, s in fuse_files.items()
-    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name=n, size_bytes=s, progress=0.0) for n, s in fuse_files.items()
+        ]
+    )
     coord.dest_client.set_file_priorities = AsyncMock()
     coord.dest_client.resume = AsyncMock()
     names = sorted(fuse_files)
@@ -2839,16 +3056,20 @@ async def test_do_downloading_clears_live_on_batch_resolve_miss(tmp_path):
     coord = make_coordinator()
     coord.store = StateStore(tmp_path / "state.db")
     coord.dest_client = AsyncMock()
-    coord.dest_client.get_torrent_files = AsyncMock(
-        side_effect=RuntimeError("qB timeout"))
+    coord.dest_client.get_torrent_files = AsyncMock(side_effect=RuntimeError("qB timeout"))
     try:
-        ts = TorrentState(source_infohash="e" * 40, source_name="Show",
-                          dest_infohash="e" * 40, state=State.DOWNLOADING,
-                          batches_total=2, batch_index=0)
+        ts = TorrentState(
+            source_infohash="e" * 40,
+            source_name="Show",
+            dest_infohash="e" * 40,
+            state=State.DOWNLOADING,
+            batches_total=2,
+            batch_index=0,
+        )
         coord.store.upsert(ts)
         coord._live["e" * 40] = LiveItem(
-            source_infohash="e" * 40, name="Show", state="downloading",
-            progress=0.0, size_mb=1.0)
+            source_infohash="e" * 40, name="Show", state="downloading", progress=0.0, size_mb=1.0
+        )
         await coord._do_downloading(ts)
         assert ts.state == State.DOWNLOADING
         assert "e" * 40 not in coord._live
@@ -2861,9 +3082,14 @@ async def test_fuse_sweep_skips_client_lookup_without_pre_ssd_rows(tmp_path):
     """No NEW/WAITING rows: the sweep must not touch the dest client."""
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(
-            source_infohash="d" * 40, source_name="Done",
-            dest_infohash="d" * 40, state=State.DONE))
+        store.upsert(
+            TorrentState(
+                source_infohash="d" * 40,
+                source_name="Done",
+                dest_infohash="d" * 40,
+                state=State.DONE,
+            )
+        )
         coord = make_coordinator(store)
         coord.dest_client = AsyncMock()
         await coord._sweep_manual_fuse_adoptions()
@@ -2883,13 +3109,16 @@ async def test_do_moving_parks_on_transient_file_list_error(tmp_path):
     coord = make_coordinator()
     coord.store = StateStore(tmp_path / "state.db")
     coord.dest_client = AsyncMock()
-    coord.dest_client.get_torrent_files = AsyncMock(
-        side_effect=WebUIUnresponsiveError("timeout"))
+    coord.dest_client.get_torrent_files = AsyncMock(side_effect=WebUIUnresponsiveError("timeout"))
     coord.dest_client.pause = AsyncMock()
     try:
-        ts = TorrentState(source_infohash="e" * 40, source_name="Show",
-                          dest_infohash="e" * 40, save_path=str(ssd),
-                          state=State.MOVING)
+        ts = TorrentState(
+            source_infohash="e" * 40,
+            source_name="Show",
+            dest_infohash="e" * 40,
+            save_path=str(ssd),
+            state=State.MOVING,
+        )
         coord.store.upsert(ts)  # workers only run on persisted snapshot rows
         await coord._do_moving(ts)
         row = coord.store.get("e" * 40)
@@ -2918,9 +3147,14 @@ async def test_move_and_clean_batch_refuses_traversal_names(tmp_path):
     coord._rclone_move = AsyncMock()
     batch = MagicMock()
     batch.file_names.return_value = ["../../etc/evil.mkv"]
-    ts = TorrentState(source_infohash="e" * 40, source_name="Evil",
-                      save_path=str(ssd), state=State.DOWNLOADING,
-                      batches_total=1, batch_index=0)
+    ts = TorrentState(
+        source_infohash="e" * 40,
+        source_name="Evil",
+        save_path=str(ssd),
+        state=State.DOWNLOADING,
+        batches_total=1,
+        batch_index=0,
+    )
     try:
         with pytest.raises(BatchMoveIncompleteError, match="path-traversal"):
             await coord._move_and_clean_batch(ts, batch)
@@ -2936,8 +3170,15 @@ async def test_source_group_poison_does_not_skip_siblings(tmp_path):
     from racing_sync.state import StateStore
 
     def _t(h, name):
-        return Torrent(hash=h, name=name, category="racing", save_path="/x",
-                       size_bytes=100, state="downloading", progress=0.1)
+        return Torrent(
+            hash=h,
+            name=name,
+            category="racing",
+            save_path="/x",
+            size_bytes=100,
+            state="downloading",
+            progress=0.1,
+        )
 
     store = StateStore(tmp_path / "state.db")
     try:
@@ -2968,9 +3209,15 @@ async def test_source_group_batches_lookups(tmp_path):
     from racing_sync.state import StateStore
 
     def _t(h):
-        return Torrent(hash=h, name="Batch.Show.S01E01.1080p",
-                       category="racing", save_path="/x",
-                       size_bytes=100, state="downloading", progress=0.1)
+        return Torrent(
+            hash=h,
+            name="Batch.Show.S01E01.1080p",
+            category="racing",
+            save_path="/x",
+            size_bytes=100,
+            state="downloading",
+            progress=0.1,
+        )
 
     store = StateStore(tmp_path / "state.db")
     try:
@@ -2991,8 +3238,7 @@ async def test_source_group_batches_lookups(tmp_path):
         store.get_many = _counting_get_many
         store.find_by_name = _counting_find
         try:
-            await coord._poll_source_racing(
-                [_t("c" * 40), _t("d" * 40), _t("e" * 40)])
+            await coord._poll_source_racing([_t("c" * 40), _t("d" * 40), _t("e" * 40)])
         finally:
             store.get_many = real_get_many
             store.find_by_name = real_find
@@ -3016,12 +3262,17 @@ async def test_await_hash_survives_blip_then_finds():
     coord = make_coordinator()
     coord._stop = False
     coord.cfg = MagicMock()
-    hit = Torrent(hash="H" * 40, name="Wanted", category="racing",
-                  save_path="/s", size_bytes=1, state="downloading",
-                  progress=0.5)
+    hit = Torrent(
+        hash="H" * 40,
+        name="Wanted",
+        category="racing",
+        save_path="/s",
+        size_bytes=1,
+        state="downloading",
+        progress=0.5,
+    )
     coord.dest_client = AsyncMock()
-    coord.dest_client.list_torrents = AsyncMock(
-        side_effect=[OSError("blip"), [hit]])
+    coord.dest_client.list_torrents = AsyncMock(side_effect=[OSError("blip"), [hit]])
     assert await coord._await_hash_for_name("Wanted", timeout_s=30) == "h" * 40
     assert coord.dest_client.list_torrents.await_count == 2
 
@@ -3044,9 +3295,15 @@ async def test_await_hash_normalized_fallback():
     coord = make_coordinator()
     coord._stop = False
     coord.cfg = MagicMock()
-    hit = Torrent(hash="H" * 40, name="wanted", category="racing",
-                  save_path="/s", size_bytes=1, state="downloading",
-                  progress=0.5)
+    hit = Torrent(
+        hash="H" * 40,
+        name="wanted",
+        category="racing",
+        save_path="/s",
+        size_bytes=1,
+        state="downloading",
+        progress=0.5,
+    )
     coord.dest_client = AsyncMock()
     coord.dest_client.list_torrents = AsyncMock(return_value=[hit])
     assert await coord._await_hash_for_name("Wanted", timeout_s=5) == "h" * 40
@@ -3092,16 +3349,27 @@ async def test_queued_existing_entry_reapplies_batch_priorities_before_resume(tm
     from racing_sync.state import TorrentState, State
 
     coord, _files = _batch_pack_coordinator(tmp_path)
-    coord.dest_client.list_torrents = AsyncMock(return_value=[
-        Torrent(hash="e" * 40, name="Pack", category="racing",
-                save_path=str(tmp_path), size_bytes=12000,
-                state="pausedDL", progress=0.0),
-    ])
-    coord.transition = MagicMock(
-        side_effect=lambda t, s, error="": setattr(t, "state", s))
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash="e" * 40,
+                name="Pack",
+                category="racing",
+                save_path=str(tmp_path),
+                size_bytes=12000,
+                state="pausedDL",
+                progress=0.0,
+            ),
+        ]
+    )
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
     ts = TorrentState(
-        source_infohash="e" * 40, source_name="Pack", total_bytes=12000,
-        cross_seed_blob=b"blob", save_path=str(tmp_path), state=State.QUEUED,
+        source_infohash="e" * 40,
+        source_name="Pack",
+        total_bytes=12000,
+        cross_seed_blob=b"blob",
+        save_path=str(tmp_path),
+        state=State.QUEUED,
     )
 
     await coord._do_queued(ts)
@@ -3122,18 +3390,28 @@ async def test_queued_existing_entry_parks_when_priorities_unverifiable(tmp_path
     from racing_sync.state import TorrentState, State
 
     coord, _files = _batch_pack_coordinator(tmp_path)
-    coord.dest_client.list_torrents = AsyncMock(return_value=[
-        Torrent(hash="e" * 40, name="Pack", category="racing",
-                save_path=str(tmp_path), size_bytes=12000,
-                state="pausedDL", progress=0.0),
-    ])
-    coord.dest_client.get_torrent_files = AsyncMock(
-        side_effect=RuntimeError("qB busy"))
-    coord.transition = MagicMock(
-        side_effect=lambda t, s, error="": setattr(t, "state", s))
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash="e" * 40,
+                name="Pack",
+                category="racing",
+                save_path=str(tmp_path),
+                size_bytes=12000,
+                state="pausedDL",
+                progress=0.0,
+            ),
+        ]
+    )
+    coord.dest_client.get_torrent_files = AsyncMock(side_effect=RuntimeError("qB busy"))
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
     ts = TorrentState(
-        source_infohash="e" * 40, source_name="Pack", total_bytes=12000,
-        cross_seed_blob=b"blob", save_path=str(tmp_path), state=State.QUEUED,
+        source_infohash="e" * 40,
+        source_name="Pack",
+        total_bytes=12000,
+        cross_seed_blob=b"blob",
+        save_path=str(tmp_path),
+        state=State.QUEUED,
     )
 
     await coord._do_queued(ts)
@@ -3150,17 +3428,20 @@ async def test_downloading_entry_reverifies_batch_priorities(tmp_path):
     from racing_sync.state import TorrentState, State
 
     coord, _files = _batch_pack_coordinator(tmp_path)
-    coord.transition = MagicMock(
-        side_effect=lambda t, s, **kw: setattr(t, "state", s))
+    coord.transition = MagicMock(side_effect=lambda t, s, **kw: setattr(t, "state", s))
     coord._wait_for_completion = AsyncMock()
     coord._move_and_clean_batch = AsyncMock()
-    coord._flip_to_next_batch = AsyncMock(
-        side_effect=lambda t, nxt: nxt)
+    coord._flip_to_next_batch = AsyncMock(side_effect=lambda t, nxt: nxt)
 
     ts = TorrentState(
-        source_infohash="e" * 40, source_name="Pack", total_bytes=12000,
-        dest_infohash="e" * 40, save_path=str(tmp_path),
-        classification_kind="movie", batches_total=2, batch_index=0,
+        source_infohash="e" * 40,
+        source_name="Pack",
+        total_bytes=12000,
+        dest_infohash="e" * 40,
+        save_path=str(tmp_path),
+        classification_kind="movie",
+        batches_total=2,
+        batch_index=0,
         state=State.DOWNLOADING,
     )
 
@@ -3187,8 +3468,7 @@ async def test_frozen_cap_freeze_keeps_transition_valid(tmp_path):
         coord = make_coordinator(store)
         coord.cfg.ssd.max_inflight_bytes = 10_000
         coord.cfg.ssd.path = tmp_path
-        ts = TorrentState(source_infohash="c" * 40, source_name="Pack",
-                          state=State.QUEUED)
+        ts = TorrentState(source_infohash="c" * 40, source_name="Pack", state=State.QUEUED)
         store.upsert(ts)
         row = store.get("c" * 40)
 
@@ -3211,10 +3491,12 @@ async def test_scheduler_skips_downloading_spawn_at_cap(tmp_path):
         coord = make_coordinator(store)
         coord.cfg.max_active_downloads = 1
         coord.cfg.max_concurrent_moves = 1
-        store.upsert(TorrentState(source_infohash="a" * 40,
-                                  source_name="Idle", state=State.DOWNLOADING))
-        store.upsert(TorrentState(source_infohash="b" * 40,
-                                  source_name="Busy", state=State.DOWNLOADING))
+        store.upsert(
+            TorrentState(source_infohash="a" * 40, source_name="Idle", state=State.DOWNLOADING)
+        )
+        store.upsert(
+            TorrentState(source_infohash="b" * 40, source_name="Busy", state=State.DOWNLOADING)
+        )
         coord._running_infohashes = {"b" * 40}
         await coord._schedule_step()
         assert "a" * 40 not in coord._running_infohashes
@@ -3234,8 +3516,9 @@ async def test_worker_skips_version_moved_row(tmp_path):
     store = StateStore(tmp_path / "state.db")
     try:
         coord = make_coordinator(store)
-        store.upsert(TorrentState(source_infohash="a" * 40,
-                                  source_name="A", state=State.DOWNLOADING))
+        store.upsert(
+            TorrentState(source_infohash="a" * 40, source_name="A", state=State.DOWNLOADING)
+        )
         snap = store.get("a" * 40)
         # Advisory park: no revision bump, worker proceeds.
         store.update_columns("a" * 40, {"indexer_attempts": 3})
@@ -3263,17 +3546,19 @@ def test_resolve_batches_reuses_caller_episodes():
 
     coord = make_coordinator()
     coord.cfg = MagicMock()
-    files = [TorrentFile(name="s01e01.mkv", size_bytes=100),
-             TorrentFile(name="s01e02.mkv", size_bytes=100)]
-    eps = [Episode(file_name="s01e01.mkv", season=1, episode=1,
-                   size_bytes=100),
-           Episode(file_name="s01e02.mkv", season=1, episode=2,
-                   size_bytes=100)]
-    with patch("racing_sync.coordinator.classify",
-               side_effect=AssertionError("must not re-classify")):
+    files = [
+        TorrentFile(name="s01e01.mkv", size_bytes=100),
+        TorrentFile(name="s01e02.mkv", size_bytes=100),
+    ]
+    eps = [
+        Episode(file_name="s01e01.mkv", season=1, episode=1, size_bytes=100),
+        Episode(file_name="s01e02.mkv", season=1, episode=2, size_bytes=100),
+    ]
+    with patch(
+        "racing_sync.coordinator.classify", side_effect=AssertionError("must not re-classify")
+    ):
         batches = coord._resolve_batches(files, "season", 1000, episodes=eps)
-    assert [e.file_name for b in batches for e in b.episodes] == [
-        "s01e01.mkv", "s01e02.mkv"]
+    assert [e.file_name for b in batches for e in b.episodes] == ["s01e01.mkv", "s01e02.mkv"]
 
 
 @pytest.mark.anyio
@@ -3289,11 +3574,13 @@ async def test_scheduler_budgets_phases_independently(tmp_path):
         coord = make_coordinator(store)
         coord.cfg.max_active_downloads = 1
         coord.cfg.max_concurrent_moves = 1
-        for h, st in (("a" * 40, State.MOVING), ("b" * 40, State.MOVING),
-                      ("c" * 40, State.NEW),
-                      ("d" * 40, State.DOWNLOADING)):
-            store.upsert(TorrentState(source_infohash=h, source_name=st.value,
-                                      state=st))
+        for h, st in (
+            ("a" * 40, State.MOVING),
+            ("b" * 40, State.MOVING),
+            ("c" * 40, State.NEW),
+            ("d" * 40, State.DOWNLOADING),
+        ):
+            store.upsert(TorrentState(source_infohash=h, source_name=st.value, state=st))
         coord._running_infohashes = {"a" * 40}
         gate = asyncio.Event()
 
@@ -3342,15 +3629,19 @@ async def test_do_moving_multi_top_moves_files_individually(tmp_path):
     coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-unsorted"
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
     coord.dest_client = MagicMock()
-    coord.dest_client.list_torrents = AsyncMock(return_value=[
-        SimpleNamespace(state="downloading", progress=1.0)])
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="TopA/a.mkv", size_bytes=100, progress=1.0),
-        TorrentFile(name="TopB/b.mkv", size_bytes=100, progress=1.0),
-    ])
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[SimpleNamespace(state="downloading", progress=1.0)]
+    )
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="TopA/a.mkv", size_bytes=100, progress=1.0),
+            TorrentFile(name="TopB/b.mkv", size_bytes=100, progress=1.0),
+        ]
+    )
     coord.dest_client.pause = AsyncMock()
     coord.dest_client.get_torrent = AsyncMock(
-        return_value=SimpleNamespace(state="pausedDL", progress=1.0))
+        return_value=SimpleNamespace(state="pausedDL", progress=1.0)
+    )
     coord._rclone_move = AsyncMock()
 
     ts = TorrentState(
@@ -3406,21 +3697,22 @@ async def test_do_moving_oversized_sibling_survives_wipe(tmp_path):
     coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
     coord.dest_client = MagicMock()
-    coord.dest_client.list_torrents = AsyncMock(return_value=[
-        SimpleNamespace(state="downloading", progress=1.0)])
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="Show.S01/Show.S01E01.mkv", size_bytes=100,
-                    progress=1.0, priority=1),
-        TorrentFile(name="Show.S01/Show.S01E02.mkv", size_bytes=100,
-                    progress=1.0, priority=1),
-    ])
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[SimpleNamespace(state="downloading", progress=1.0)]
+    )
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Show.S01/Show.S01E01.mkv", size_bytes=100, progress=1.0, priority=1),
+            TorrentFile(name="Show.S01/Show.S01E02.mkv", size_bytes=100, progress=1.0, priority=1),
+        ]
+    )
     coord.dest_client.pause = AsyncMock()
     coord.dest_client.get_torrent = AsyncMock(
-        return_value=SimpleNamespace(state="pausedDL", progress=1.0))
+        return_value=SimpleNamespace(state="pausedDL", progress=1.0)
+    )
     coord.dest_client.delete = AsyncMock()
 
-    async def _fake_move(local, remote, ts, *, include=None, files_from=None,
-                         extra=None):
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
         for name in files_from or []:
             p = ssd / name
             if p.is_file():
@@ -3475,21 +3767,22 @@ async def test_do_moving_flat_single_cleans_shells(tmp_path):
     coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
     coord.dest_client = MagicMock()
-    coord.dest_client.list_torrents = AsyncMock(return_value=[
-        SimpleNamespace(state="downloading", progress=1.0)])
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="Solo.mkv", size_bytes=100, progress=1.0,
-                    priority=1),
-        TorrentFile(name="shell.bin", size_bytes=500, progress=0.0,
-                    priority=0),
-    ])
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[SimpleNamespace(state="downloading", progress=1.0)]
+    )
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Solo.mkv", size_bytes=100, progress=1.0, priority=1),
+            TorrentFile(name="shell.bin", size_bytes=500, progress=0.0, priority=0),
+        ]
+    )
     coord.dest_client.pause = AsyncMock()
     coord.dest_client.get_torrent = AsyncMock(
-        return_value=SimpleNamespace(state="pausedDL", progress=1.0))
+        return_value=SimpleNamespace(state="pausedDL", progress=1.0)
+    )
     coord.dest_client.delete = AsyncMock()
 
-    async def _fake_move(local, remote, ts, *, include=None, files_from=None,
-                         extra=None):
+    async def _fake_move(local, remote, ts, *, include=None, files_from=None, extra=None):
         for name in files_from or []:
             p = ssd / name
             if p.is_file():
@@ -3553,28 +3846,31 @@ async def test_do_moving_mixed_loop_keeps_cursor_in_memory(tmp_path):
         coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
         coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
         coord.dest_client = MagicMock()
-        coord.dest_client.list_torrents = AsyncMock(return_value=[
-            SimpleNamespace(state="downloading", progress=1.0)])
-        coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-            TorrentFile(name="E01.mkv", size_bytes=100, progress=1.0),
-            TorrentFile(name="E02.mkv", size_bytes=100, progress=1.0),
-            TorrentFile(name="E03.mkv", size_bytes=100, progress=1.0),
-        ])
+        coord.dest_client.list_torrents = AsyncMock(
+            return_value=[SimpleNamespace(state="downloading", progress=1.0)]
+        )
+        coord.dest_client.get_torrent_files = AsyncMock(
+            return_value=[
+                TorrentFile(name="E01.mkv", size_bytes=100, progress=1.0),
+                TorrentFile(name="E02.mkv", size_bytes=100, progress=1.0),
+                TorrentFile(name="E03.mkv", size_bytes=100, progress=1.0),
+            ]
+        )
         coord.dest_client.pause = AsyncMock()
         coord.dest_client.get_torrent = AsyncMock(
-            return_value=SimpleNamespace(state="pausedDL", progress=1.0))
+            return_value=SimpleNamespace(state="pausedDL", progress=1.0)
+        )
         coord.dest_client.delete = AsyncMock()
         coord.dest_client.set_file_priorities = AsyncMock()
         # One batch per episode: cap 100 splits the 3x100 season in 3.
         coord._batch_cap_cache = {"x" * 40: 100}
         # Batch 0 already remote (fuse-skipped); batch 1+ move then stick.
         coord._rclone_move = AsyncMock()
-        eps = [Episode(file_name="E01.mkv", season=1, episode=1,
-                       size_bytes=100),
-               Episode(file_name="E02.mkv", season=1, episode=2,
-                       size_bytes=100),
-               Episode(file_name="E03.mkv", season=1, episode=3,
-                       size_bytes=100)]
+        eps = [
+            Episode(file_name="E01.mkv", season=1, episode=1, size_bytes=100),
+            Episode(file_name="E02.mkv", season=1, episode=2, size_bytes=100),
+            Episode(file_name="E03.mkv", season=1, episode=3, size_bytes=100),
+        ]
 
         ts = TorrentState(
             source_infohash="x" * 40,
@@ -3593,9 +3889,7 @@ async def test_do_moving_mixed_loop_keeps_cursor_in_memory(tmp_path):
             mock_cls.single_file = None
             mock_cls.episodes = eps
             mock_classify.return_value = mock_cls
-            with patch.object(
-                    type(coord), "_fuse_skipped",
-                    AsyncMock(return_value={"E01.mkv"})):
+            with patch.object(type(coord), "_fuse_skipped", AsyncMock(return_value={"E01.mkv"})):
                 await coord._do_moving(store.get("x" * 40))
         # Parked on the stuck batch-1 move; the persisted cursor is
         # untouched (no half-advanced index baked in).

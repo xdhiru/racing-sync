@@ -43,6 +43,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
     def __init__(self, cfg: SourceConfig | DestConfig, label: str):
         # Build the HTTPClientConfig from the union
         from ..config import DestConfig, HTTPClientConfig, SourceConfig
+
         if isinstance(cfg, SourceConfig):
             http_cfg = HTTPClientConfig.from_source(cfg)
         elif isinstance(cfg, DestConfig):
@@ -62,7 +63,9 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             "api/v2/auth/login",
             data={
                 "username": self._cfg.username,
-                "password": self._cfg.password.get_secret_value() if hasattr(self._cfg.password, "get_secret_value") else str(self._cfg.password),
+                "password": self._cfg.password.get_secret_value()
+                if hasattr(self._cfg.password, "get_secret_value")
+                else str(self._cfg.password),
             },
         ) as r:
             if r.status != 200:
@@ -86,13 +89,23 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             )
 
     _LOGIN_PAGE_MARKERS = (
-        "<html", "<!doctype", "<form", "login", "password", "username",
-        "sign in", "unauthorized",
+        "<html",
+        "<!doctype",
+        "<form",
+        "login",
+        "password",
+        "username",
+        "sign in",
+        "unauthorized",
     )
     # Bare words ("login", "password", "username") also appear in torrent
     # names/JSON — they only count with an HTML hint in the probe.
     _LOGIN_PAGE_STRONG_MARKERS = (
-        "<html", "<!doctype", "<form", "sign in", "unauthorized",
+        "<html",
+        "<!doctype",
+        "<form",
+        "sign in",
+        "unauthorized",
     )
     _LOGIN_PAGE_WEAK_MARKERS = ("login", "password", "username")
 
@@ -122,12 +135,15 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                         _body = ""
                     _probe = f"{_body or ''} {getattr(e, 'doc', '') or ''}".lower()
                     if not any(m in _probe for m in self._LOGIN_PAGE_STRONG_MARKERS):
-                        if ("<" not in _probe or not any(
-                                m in _probe for m in self._LOGIN_PAGE_WEAK_MARKERS)):
+                        if "<" not in _probe or not any(
+                            m in _probe for m in self._LOGIN_PAGE_WEAK_MARKERS
+                        ):
                             raise
                     log.warning(
                         "[%s] %s %s returned login page (expired session?); re-authenticating",
-                        self._label, method, path,
+                        self._label,
+                        method,
+                        path,
                     )
                     _need_reauth = True
         except AuthError:
@@ -144,8 +160,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         except Exception:
             pass
         if not await self._login_singleflight(force=True):
-            raise AuthError(
-                f"[{self._label}] re-auth failed for {path}")
+            raise AuthError(f"[{self._label}] re-auth failed for {path}")
         async with await self.request(method, path, **kwargs) as r:
             return await r.json()
 
@@ -208,7 +223,8 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                     chunk_params = dict(params)
                     chunk_params["hashes"] = "|".join(chunk)
                     data = await self._request_json(
-                        "GET", "/api/v2/torrents/info", params=chunk_params)
+                        "GET", "/api/v2/torrents/info", params=chunk_params
+                    )
                     if isinstance(data, dict):
                         # Error envelope, not a list: no rows to yield.
                         log.warning("qB list_torrents unexpected dict payload; skipping chunk")
@@ -223,15 +239,14 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
 
             out: list[Torrent] = []
             for part in await asyncio.gather(
-                    *(_one(hash_list[i:i + 100])
-                      for i in range(0, len(hash_list), 100))):
+                *(_one(hash_list[i : i + 100]) for i in range(0, len(hash_list), 100))
+            ):
                 out.extend(part)
             return out
         elif hashes is not None:
             # Explicit empty filter: return nothing instead of everything.
             return []
-        data = await self._request_json(
-            "GET", "/api/v2/torrents/info", params=params)
+        data = await self._request_json("GET", "/api/v2/torrents/info", params=params)
         torrents: list[Torrent] = []
         if isinstance(data, dict):
             log.warning("qB list_torrents unexpected dict payload; returning empty")
@@ -263,7 +278,8 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
 
     async def get_torrent_files(self, torrent_hash: str) -> list[TorrentFile]:
         data = await self._request_json(
-            "GET", "/api/v2/torrents/files", params={"hash": torrent_hash})
+            "GET", "/api/v2/torrents/files", params={"hash": torrent_hash}
+        )
         if not isinstance(data, list):
             # Dict error envelope (or garbage): no files to yield, and
             # iterating a dict would silently produce [] via row.get misses.
@@ -295,7 +311,8 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
 
     async def get_trackers(self, torrent_hash: str) -> list[str]:
         data = await self._request_json(
-            "GET", "/api/v2/torrents/trackers", params={"hash": torrent_hash})
+            "GET", "/api/v2/torrents/trackers", params={"hash": torrent_hash}
+        )
         urls: list[str] = []
         for row in data if isinstance(data, list) else []:
             try:
@@ -312,7 +329,8 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         """Non-empty per-tracker `msg` strings (unregistered/passkey signals)."""
         try:
             data = await self._request_json(
-                "GET", "/api/v2/torrents/trackers", params={"hash": torrent_hash})
+                "GET", "/api/v2/torrents/trackers", params={"hash": torrent_hash}
+            )
         except AuthError:
             # Auth expiry must surface for re-login, never read as quiet.
             raise
@@ -358,27 +376,32 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             raise ValueError(
                 "add_torrent takes urls or torrent_files, not both "
                 "(mixed multipart keeps only the last urls part on some "
-                "qB versions — split into two calls)")
+                "qB versions — split into two calls)"
+            )
 
         if urls:
             # Never hand daemon-local paths or hostless URLs to the
             # qBittorrent daemon: it fetches `urls` server-side (SSRF +
             # file read). Same gate as the Deluge client.
             from urllib.parse import urlsplit as _us
+
             for u in urls:
                 try:
                     _p = _us(u)
                 except Exception:
-                    raise ValueError(f"qbittorrent add_torrent refusing unparsable URL: {_scrub_add_url(u)}")
+                    raise ValueError(
+                        f"qbittorrent add_torrent refusing unparsable URL: {_scrub_add_url(u)}"
+                    )
                 if _p.scheme not in ("http", "https", "magnet"):
                     raise ValueError(
                         f"qbittorrent add_torrent refusing scheme "
                         f"{_p.scheme!r} (file:// etc. would hand daemon-local "
-                        f"paths to the VPS2 daemon)")
+                        f"paths to the VPS2 daemon)"
+                    )
                 if _p.scheme in ("http", "https") and not _p.hostname:
                     raise ValueError(
-                        "qbittorrent add_torrent refusing URL without host: "
-                        f"{_scrub_add_url(u)}")
+                        f"qbittorrent add_torrent refusing URL without host: {_scrub_add_url(u)}"
+                    )
 
         fields: dict[str, str] = {
             "savepath": save_path,
@@ -406,11 +429,10 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             for idx, blob in enumerate(torrent_files):
                 if not isinstance(blob, (bytes, bytearray)):
                     raise ValueError(
-                        f"torrent payload #{idx} is not bytes "
-                        f"({type(blob).__name__}); refusing")
+                        f"torrent payload #{idx} is not bytes ({type(blob).__name__}); refusing"
+                    )
                 if len(blob) > MAX_TORRENT_BYTES:
-                    raise ValueError(
-                        f"torrent payload exceeds {MAX_TORRENT_BYTES} bytes; refusing")
+                    raise ValueError(f"torrent payload exceeds {MAX_TORRENT_BYTES} bytes; refusing")
                 fname = f"torrent_{idx}.torrent"
                 data.add_field(
                     "torrents",
@@ -423,9 +445,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         # anyway, and the "Fails." duplicate check below (get_torrent) must
         # stay outside so concurrent adds don't queue behind lookups.
         async with self._add_lock:
-            async with await self.request(
-                "POST", "/api/v2/torrents/add", data=data
-            ) as r:
+            async with await self.request("POST", "/api/v2/torrents/add", data=data) as r:
                 text = (await r.text()).strip()
         is_hex40 = len(text) == 40 and all(c in "0123456789abcdefABCDEF" for c in text)
         if is_hex40:
@@ -436,24 +456,22 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             # the add carried the bytes), else leave empty as before.
             _blob_hashes = self._hashes_from_blobs(torrent_files)
             return AddResult(
-                hash=_blob_hashes[0] if _blob_hashes else None,
-                accepted=True, detail=text)
+                hash=_blob_hashes[0] if _blob_hashes else None, accepted=True, detail=text
+            )
         if text == "Ok." or text == "":
             # Same blob-hash resolution: an accepted add of known bytes
             # reports its hash so callers skip a lookup round-trip.
             _blob_hashes = self._hashes_from_blobs(torrent_files)
             return AddResult(
-                hash=_blob_hashes[0] if _blob_hashes else None,
-                accepted=True, detail=text)
+                hash=_blob_hashes[0] if _blob_hashes else None, accepted=True, detail=text
+            )
         if text == "Fails.":
             # qBittorrent returns "Fails." for both invalid torrents and duplicate torrents.
             # Check if the torrent already exists in qBittorrent.
             candidates: list[str] = self._hashes_from_blobs(torrent_files)
             if urls and not candidates:
                 for u in urls:
-                    m = re.search(
-                        r"xt=urn:btih:([A-Za-z0-9]{32,64})", u
-                    )
+                    m = re.search(r"xt=urn:btih:([A-Za-z0-9]{32,64})", u)
                     if not m:
                         continue
                     raw = m.group(1)
@@ -468,6 +486,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                         else:
                             try:
                                 import base64
+
                                 parsed = base64.b32decode(raw.upper()).hex()
                             except Exception:
                                 continue
@@ -481,6 +500,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                         # 52-char base32 (v1+v2 hybrid) or other lengths
                         try:
                             import base64
+
                             padded = raw.upper() + "=" * (-len(raw) % 8)
                             parsed = base64.b32decode(padded).hex()
                         except Exception:
@@ -495,7 +515,9 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                             "qB add_torrent returned 'Fails.' but torrent %s already exists",
                             candidate_hash[:10],
                         )
-                        return AddResult(hash=candidate_hash.lower(), accepted=True, detail="already added")
+                        return AddResult(
+                            hash=candidate_hash.lower(), accepted=True, detail="already added"
+                        )
                     if len(candidate_hash) == 64:
                         # v2/hybrid hash qB may index under the v1 prefix:
                         # fall back to the first 40 hex chars (20 bytes).
@@ -504,9 +526,17 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                                 "qB add_torrent returned 'Fails.' but torrent %s already exists",
                                 candidate_hash[:10],
                             )
-                            return AddResult(hash=candidate_hash.lower()[:40], accepted=True, detail="already added")
+                            return AddResult(
+                                hash=candidate_hash.lower()[:40],
+                                accepted=True,
+                                detail="already added",
+                            )
                 except Exception as e:
-                    log.debug("could not check if torrent %s exists after Fails: %s", candidate_hash[:10], e)
+                    log.debug(
+                        "could not check if torrent %s exists after Fails: %s",
+                        candidate_hash[:10],
+                        e,
+                    )
 
             return AddResult(hash=None, accepted=False, detail=text)
 
@@ -515,9 +545,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         log.warning("qB add_torrent unexpected response: %r", text[:200])
         return AddResult(hash=None, accepted=False, detail=text)
 
-    async def set_file_priorities(
-        self, torrent_hash: str, priorities: dict[str, int]
-    ) -> None:
+    async def set_file_priorities(self, torrent_hash: str, priorities: dict[str, int]) -> None:
         """Set per-file priorities.
 
         `priorities` is a {file_name: priority_int}. Internally qB uses file
@@ -535,9 +563,9 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 continue
             if prio not in (0, 1, 6, 7):
                 log.warning(
-                    "set_file_priorities: invalid qB priority %r for %r; "
-                    "expected one of 0,1,6,7",
-                    prio, name,
+                    "set_file_priorities: invalid qB priority %r for %r; expected one of 0,1,6,7",
+                    prio,
+                    name,
                 )
                 continue
             prio_to_ids.setdefault(prio, []).append(str(idx))
@@ -545,7 +573,8 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         if not prio_to_ids:
             raise ValueError(
                 f"set_file_priorities: no valid files to update for {torrent_hash} "
-                "(caller would otherwise download unfiltered and blow the SSD budget)")
+                "(caller would otherwise download unfiltered and blow the SSD budget)"
+            )
 
         applied: list[tuple[int, list[str]]] = []
         try:
@@ -554,9 +583,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 data.add_field("hash", torrent_hash)
                 data.add_field("id", "|".join(ids))
                 data.add_field("priority", str(prio))
-                async with await self.request(
-                    "POST", "/api/v2/torrents/filePrio", data=data
-                ) as r:
+                async with await self.request("POST", "/api/v2/torrents/filePrio", data=data) as r:
                     await r.read()
                 applied.append((prio, ids))
         except aiohttp.ClientResponseError as e:
@@ -566,8 +593,12 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             log.warning(
                 "qB set_file_priorities for %s failed after %d/%d batches "
                 "(HTTP %s; applied=%s): caller must re-verify",
-                torrent_hash, len(applied), len(prio_to_ids),
-                getattr(e, "status", "?"), applied)
+                torrent_hash,
+                len(applied),
+                len(prio_to_ids),
+                getattr(e, "status", "?"),
+                applied,
+            )
             raise
 
     async def _pause_resume(self, torrent_hash: str, *, pause: bool) -> None:
@@ -575,21 +606,21 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         data.add_field("hashes", torrent_hash)
         if self._legacy_pause_api is False:
             async with await self.request(
-                "POST", f"/api/v2/torrents/{'stop' if pause else 'start'}",
-                data=data) as r:
+                "POST", f"/api/v2/torrents/{'stop' if pause else 'start'}", data=data
+            ) as r:
                 await r.read()
             return
         if self._legacy_pause_api is True:
             async with await self.request(
-                "POST", f"/api/v2/torrents/{'pause' if pause else 'resume'}",
-                data=data) as r:
+                "POST", f"/api/v2/torrents/{'pause' if pause else 'resume'}", data=data
+            ) as r:
                 await r.read()
             return
         try:
             # qBittorrent v5.0+ renamed pause/resume to stop/start
             async with await self.request(
-                "POST", f"/api/v2/torrents/{'stop' if pause else 'start'}",
-                data=data) as r:
+                "POST", f"/api/v2/torrents/{'stop' if pause else 'start'}", data=data
+            ) as r:
                 await r.read()
             self._legacy_pause_api = False
         except aiohttp.ClientResponseError as e:
@@ -599,8 +630,8 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 data2 = aiohttp.FormData()
                 data2.add_field("hashes", torrent_hash)
                 async with await self.request(
-                    "POST", f"/api/v2/torrents/{'pause' if pause else 'resume'}",
-                    data=data2) as r:
+                    "POST", f"/api/v2/torrents/{'pause' if pause else 'resume'}", data=data2
+                ) as r:
                     await r.read()
             else:
                 raise
@@ -616,9 +647,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         data.add_field("hashes", torrent_hash)
         data.add_field("deleteFiles", "true" if delete_files else "false")
         try:
-            async with await self.request(
-                "POST", "/api/v2/torrents/delete", data=data
-            ) as r:
+            async with await self.request("POST", "/api/v2/torrents/delete", data=data) as r:
                 await r.read()
         except aiohttp.ClientResponseError as e:
             if e.status == 404:
@@ -630,9 +659,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         data = aiohttp.FormData()
         data.add_field("hashes", torrent_hash)
         try:
-            async with await self.request(
-                "POST", "/api/v2/torrents/recheck", data=data
-            ) as r:
+            async with await self.request("POST", "/api/v2/torrents/recheck", data=data) as r:
                 await r.read()
         except aiohttp.ClientResponseError as e:
             if e.status == 404:
@@ -646,9 +673,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         data = aiohttp.FormData()
         data.add_field("hashes", torrent_hash)
         data.add_field("location", save_path)
-        async with await self.request(
-            "POST", "/api/v2/torrents/setLocation", data=data
-        ) as r:
+        async with await self.request("POST", "/api/v2/torrents/setLocation", data=data) as r:
             await r.read()
 
     async def export_torrent(self, torrent_hash: str) -> bytes:
@@ -669,8 +694,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 total += len(chunk)
                 if total > MAX_TORRENT_BYTES:
                     raise ValueError(
-                        f"qB .torrent export for {torrent_hash} exceeds "
-                        f"{MAX_TORRENT_BYTES} bytes"
+                        f"qB .torrent export for {torrent_hash} exceeds {MAX_TORRENT_BYTES} bytes"
                     )
                 chunks.append(chunk)
             data = b"".join(chunks)
@@ -678,19 +702,18 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
             # pages before they travel as "bytes" (callers treat b""
             # as a clean miss, but HTML garbage must fail loudly).
             if not data.startswith(b"d"):
-                raise ValueError(
-                    f"qB .torrent export for {torrent_hash} is not bencoded data"
-                )
+                raise ValueError(f"qB .torrent export for {torrent_hash} is not bencoded data")
             return data
 
     async def get_properties(self, torrent_hash: str) -> dict[str, Any]:
         return await self._request_json(
-            "GET", "/api/v2/torrents/properties", params={"hash": torrent_hash})
+            "GET", "/api/v2/torrents/properties", params={"hash": torrent_hash}
+        )
 
     async def piece_state(self, torrent_hash: str) -> list[int]:
         return await self._request_json(
-            "GET", "/api/v2/torrents/pieceStates",
-            params={"hash": torrent_hash})
+            "GET", "/api/v2/torrents/pieceStates", params={"hash": torrent_hash}
+        )
 
 
 def _split_path(name: str) -> list[str]:
@@ -699,10 +722,7 @@ def _split_path(name: str) -> list[str]:
 
 
 def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
-    state = (
-        d.get("state")
-        or ("completed" if (d.get("progress", 0) or 0) >= 1.0 else "downloading")
-    )
+    state = d.get("state") or ("completed" if (d.get("progress", 0) or 0) >= 1.0 else "downloading")
     # qB `save_path` is always a directory — never truncate it on suffix
     # alone (that corrupts dotted dirs like `/data/My.Show.S01`). The only
     # exception is the single-file case where save_path itself points at
@@ -740,6 +760,7 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
                 else:
                     try:
                         import base64
+
                         _padded = _raw.upper() + "=" * (-len(_raw) % 8)
                         infohash = base64.b32decode(_padded).hex()
                     except Exception:
@@ -748,6 +769,7 @@ def _torrent_from_qb(d: dict[str, Any]) -> Torrent:
             infohash = ""
     if not infohash:
         raise ValueError(f"qB torrent row missing infohash: {d!r}")
+
     def _num(value: object, default: int = 0) -> int:
         try:
             return int(float(value or 0))  # type: ignore[arg-type]

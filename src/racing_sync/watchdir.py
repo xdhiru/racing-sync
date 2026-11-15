@@ -57,16 +57,18 @@ def _bdecode(
 ) -> tuple[int, object]:
     if _items is None:
         _items = [0]
+
     def _count(n: int = 1) -> None:
         _items[0] += n
         if _items[0] > MAX_BENCODE_ITEMS:
             raise ValueError(f"bencode item limit exceeded ({MAX_BENCODE_ITEMS})")
+
     if depth > MAX_BENCODE_DEPTH:
         raise ValueError(f"bencode recursion depth exceeded: {depth}")
     if pos >= len(data):
         raise ValueError(f"unexpected EOF at position {pos}")
 
-    ch = data[pos:pos + 1]
+    ch = data[pos : pos + 1]
     pos += 1
     if ch == b"i":
         try:
@@ -74,7 +76,9 @@ def _bdecode(
         except ValueError as e:
             raise ValueError(f"unterminated integer starting at position {pos - 1}") from e
         num_str = data[pos:end]
-        if not num_str or (num_str.startswith(b"-0") or (len(num_str) > 1 and num_str.startswith(b"0"))):
+        if not num_str or (
+            num_str.startswith(b"-0") or (len(num_str) > 1 and num_str.startswith(b"0"))
+        ):
             raise ValueError(f"invalid integer format {num_str!r} at position {pos}")
         try:
             val = int(num_str)
@@ -87,7 +91,7 @@ def _bdecode(
         while True:
             if pos >= len(data):
                 raise ValueError(f"unexpected EOF in list at position {pos}")
-            if data[pos:pos + 1] == b"e":
+            if data[pos : pos + 1] == b"e":
                 return pos + 1, out_list
             pos, item = _bdecode(data, pos, depth=depth + 1, _items=_items)
             _count(1)
@@ -98,7 +102,7 @@ def _bdecode(
         while True:
             if pos >= len(data):
                 raise ValueError(f"unexpected EOF in dict at position {pos}")
-            if data[pos:pos + 1] == b"e":
+            if data[pos : pos + 1] == b"e":
                 return pos + 1, out_dict
             pos, k = _bdecode(data, pos, depth=depth + 1, _items=_items)
             if not isinstance(k, (bytes, str)):
@@ -114,7 +118,7 @@ def _bdecode(
         except ValueError as e:
             raise ValueError(f"unterminated string length at position {pos - 1}") from e
         try:
-            length = int(data[pos - 1:colon])
+            length = int(data[pos - 1 : colon])
         except ValueError as e:
             raise ValueError(f"invalid string length at position {pos - 1}") from e
         if length < 0:
@@ -141,7 +145,9 @@ def _decode_torrent_root(data: bytes) -> tuple[dict[bytes, object], bytes]:
     if not data:
         raise ValueError("empty torrent data")
     if len(data) > MAX_TORRENT_BYTES:
-        raise ValueError(f"torrent file exceeds maximum allowed size ({len(data)} > {MAX_TORRENT_BYTES})")
+        raise ValueError(
+            f"torrent file exceeds maximum allowed size ({len(data)} > {MAX_TORRENT_BYTES})"
+        )
 
     if not data.startswith(b"d"):
         raise ValueError("torrent has no root dict")
@@ -156,7 +162,7 @@ def _decode_torrent_root(data: bytes) -> tuple[dict[bytes, object], bytes]:
     while True:
         if pos >= len(data):
             raise ValueError("unexpected EOF in root dict")
-        if data[pos:pos + 1] == b"e":
+        if data[pos : pos + 1] == b"e":
             break
         pos, k = _bdecode(data, pos, depth=1, _items=_budget)
         if not isinstance(k, (bytes, str)):
@@ -254,6 +260,7 @@ def extract_torrent_files_from_bencoded(data: bytes) -> list[Any]:
 
     files_list: list[TorrentFile] = []
     pieces = info.get(b"files")
+
     def _safe_part(p: str) -> str | None:
         # Path parts come from untrusted .torrent metadata: reject
         # traversal, absolute, and control-char segments.
@@ -295,7 +302,9 @@ def extract_torrent_files_from_bencoded(data: bytes) -> list[Any]:
         length_raw = info.get(b"length", 0)
         length = length_raw if isinstance(length_raw, int) and length_raw >= 0 else 0
         safe_top = _safe_part(str(top_name)) if top_name else None
-        files_list.append(TorrentFile(name=str(safe_top or "file"), size_bytes=length, progress=1.0))
+        files_list.append(
+            TorrentFile(name=str(safe_top or "file"), size_bytes=length, progress=1.0)
+        )
 
     return files_list
 
@@ -325,7 +334,9 @@ def parse_torrent_file(path: Path) -> tuple[str, str, int, str, bytes]:
     try:
         st = path.stat()
         if st.st_size > MAX_TORRENT_BYTES:
-            raise ValueError(f"torrent file exceeds maximum allowed size ({st.st_size} > {MAX_TORRENT_BYTES})")
+            raise ValueError(
+                f"torrent file exceeds maximum allowed size ({st.st_size} > {MAX_TORRENT_BYTES})"
+            )
         if st.st_size == 0:
             raise ValueError("empty torrent file")
     except OSError as e:
@@ -338,7 +349,9 @@ def parse_torrent_file(path: Path) -> tuple[str, str, int, str, bytes]:
     except OSError as e:
         raise ValueError(f"cannot read torrent file {path}: {e}") from e
     if len(data) > MAX_TORRENT_BYTES:
-        raise ValueError(f"torrent file exceeds maximum allowed size ({len(data)} > {MAX_TORRENT_BYTES})")
+        raise ValueError(
+            f"torrent file exceeds maximum allowed size ({len(data)} > {MAX_TORRENT_BYTES})"
+        )
     try:
         if path.is_symlink():
             raise ValueError(f"refusing symlink torrent: {path}")
@@ -397,8 +410,7 @@ class WatchDirScanner:
         try:
             for _p in Path(self._cfg.path).iterdir():
                 try:
-                    if (_p.is_file() and not _p.is_symlink()
-                            and _p.suffix.lower() == ".torrent"):
+                    if _p.is_file() and not _p.is_symlink() and _p.suffix.lower() == ".torrent":
                         entries.add(_p)
                 except Exception:
                     continue
@@ -423,7 +435,8 @@ class WatchDirScanner:
                     if fsize > MAX_TORRENT_BYTES:
                         log.warning(
                             "watch-dir: skipping oversize torrent %s (%d B)",
-                            entry.name, fsize,
+                            entry.name,
+                            fsize,
                         )
                     continue
 
@@ -434,9 +447,7 @@ class WatchDirScanner:
 
                 cached = self._file_cache.get(entry)
                 if cached and cached[0] == mtime and cached[1] == fsize:
-                    infohash, name, size, announce = (
-                        cached[2], cached[3], cached[4], cached[5]
-                    )
+                    infohash, name, size, announce = (cached[2], cached[3], cached[4], cached[5])
                     # Bytes are never cached: re-read for emission (the file
                     # is small — parse already size-checked it). Re-lstat
                     # first (symlink swapped in after the check) and cap
@@ -452,8 +463,7 @@ class WatchDirScanner:
                         log.warning("watch-dir: error accessing %s (%s)", entry.name, e)
                         continue
                     if len(data) > MAX_TORRENT_BYTES:
-                        log.warning("watch-dir: skipping %s (grew past cap)",
-                                    entry.name)
+                        log.warning("watch-dir: skipping %s (grew past cap)", entry.name)
                         continue
                     if len(data) != fsize:
                         self._file_cache.pop(entry, None)
@@ -467,29 +477,49 @@ class WatchDirScanner:
                         self._file_cache.pop(entry, None)
                         try:
                             infohash, name, size, announce = await asyncio.to_thread(
-                                _bencoded_info_hash, data)
+                                _bencoded_info_hash, data
+                            )
                         except Exception as parse_err:
                             if time.time() - mtime < 2.0:
                                 continue
                             self._bad_files[entry] = (mtime, fsize)
                             self._cap_bad_files()
-                            log.warning("watch-dir: re-parse failed for swapped %s (%s)",
-                                        entry.name, parse_err)
+                            log.warning(
+                                "watch-dir: re-parse failed for swapped %s (%s)",
+                                entry.name,
+                                parse_err,
+                            )
                             continue
                         self._file_cache[entry] = (
-                            mtime, fsize, infohash, name, size, announce, _tag)
+                            mtime,
+                            fsize,
+                            infohash,
+                            name,
+                            size,
+                            announce,
+                            _tag,
+                        )
                 else:
                     try:
                         # Full parse (stat+read+bdecode) off the event loop:
                         # a directory of large drops must not stall the tick.
                         infohash, name, size, announce, data = await asyncio.to_thread(
-                            parse_torrent_file, entry)
+                            parse_torrent_file, entry
+                        )
                         self._file_cache[entry] = (
-                            mtime, fsize, infohash, name, size, announce,
-                            hashlib.sha256(data).hexdigest())
+                            mtime,
+                            fsize,
+                            infohash,
+                            name,
+                            size,
+                            announce,
+                            hashlib.sha256(data).hexdigest(),
+                        )
                         if len(self._file_cache) > self._FILE_CACHE_MAX:
                             # Evict oldest-inserted (dicts preserve order).
-                            for k in list(self._file_cache.keys())[: len(self._file_cache) - self._FILE_CACHE_MAX]:
+                            for k in list(self._file_cache.keys())[
+                                : len(self._file_cache) - self._FILE_CACHE_MAX
+                            ]:
                                 self._file_cache.pop(k, None)
                         self._bad_files.pop(entry, None)
                     except Exception as parse_err:
@@ -498,7 +528,9 @@ class WatchDirScanner:
                             continue
                         self._bad_files[entry] = (mtime, fsize)
                         self._cap_bad_files()
-                        log.warning("watch-dir: skipping invalid torrent %s (%s)", entry.name, parse_err)
+                        log.warning(
+                            "watch-dir: skipping invalid torrent %s (%s)", entry.name, parse_err
+                        )
                         continue
             except Exception as e:  # noqa: BLE001
                 log.warning("watch-dir: error accessing %s (%s)", entry.name, e)
@@ -522,11 +554,14 @@ class WatchDirScanner:
             out.append(item)
             from .coordinator_content import announce_domain
             from .logging_setup import sanitize_log_text
+
             safe_name = sanitize_log_text(name.replace("\n", " ").replace("\r", " "))[:200]
             # Domain only: announce URLs embed per-user passkeys.
             log.info(
                 "watch-dir picked up: %s (%s) announce=%s",
-                safe_name, infohash[:10], announce_domain(announce),
+                safe_name,
+                infohash[:10],
+                announce_domain(announce),
             )
 
         # Prune deleted files from caches
@@ -562,25 +597,22 @@ class WatchDirScanner:
             try:
                 path = item.torrent_path
                 if path.is_symlink():
-                    log.warning("watch-dir: refusing to delete symlink %s",
-                                path.name)
+                    log.warning("watch-dir: refusing to delete symlink %s", path.name)
                     return
                 st = path.stat()
                 want_mtime = float(getattr(item, "file_mtime", 0.0) or 0.0)
                 want_size = int(getattr(item, "file_size", -1) or -1)
-                if want_size >= 0 and (
-                        st.st_size != want_size or st.st_mtime != want_mtime):
+                if want_size >= 0 and (st.st_size != want_size or st.st_mtime != want_mtime):
                     log.warning(
-                        "watch-dir: %s changed since scan "
-                        "(mtime/size drift); leaving it", path.name)
+                        "watch-dir: %s changed since scan (mtime/size drift); leaving it", path.name
+                    )
                     try:
                         self._file_cache.pop(path, None)
                     except Exception:
                         pass
                     return
             except OSError as e:
-                log.warning("watch-dir: delete failed %s: %s",
-                            item.torrent_path, e)
+                log.warning("watch-dir: delete failed %s: %s", item.torrent_path, e)
                 return
             item.torrent_path.unlink()
             self._file_cache.pop(item.torrent_path, None)

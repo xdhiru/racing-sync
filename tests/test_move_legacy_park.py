@@ -28,8 +28,7 @@ def _legacy_row(tmp_path):
     ssd = tmp_path / "ssd"
     ssd.mkdir(exist_ok=True)
     (ssd / "Solo.mkv").write_bytes(b"x" * 1000)
-    files = [TorrentFile(name="Solo.mkv", size_bytes=1000,
-                         progress=1.0, priority=1)]
+    files = [TorrentFile(name="Solo.mkv", size_bytes=1000, progress=1.0, priority=1)]
 
     coord = make_coordinator()
     coord._stop = False
@@ -51,10 +50,14 @@ def _legacy_row(tmp_path):
     coord._ssd_release = AsyncMock()
     coord._notify_telegram = AsyncMock()
     ts = TorrentState(
-        source_infohash="l" * 40, source_name="Solo",
-        dest_infohash="l" * 40, save_path=str(ssd),
+        source_infohash="l" * 40,
+        source_name="Solo",
+        dest_infohash="l" * 40,
+        save_path=str(ssd),
         classification_kind="movie",
-        batches_total=1, batch_index=0, state=State.MOVING,
+        batches_total=1,
+        batch_index=0,
+        state=State.MOVING,
     )
     coord.store.upsert(ts)
     return coord, coord.store
@@ -66,30 +69,26 @@ async def test_legacy_no_checkpoint_parks_then_fails(tmp_path):
     coord, store = _legacy_row(tmp_path)
     try:
         for n in range(1, _LEGACY_MOVE_FAIL_PARKS):
-            with patch("racing_sync.coordinator.wipe_local_tree",
-                       new_callable=AsyncMock) as mock_wipe:
+            with patch(
+                "racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock
+            ) as mock_wipe:
                 await coord._do_moving(store.get("l" * 40))
             row = store.get("l" * 40)
             assert row.state == State.MOVING
-            assert "legacy MOVING row has no checkpoint" in (
-                row.last_error or "")
-            assert f"({n}/{_LEGACY_MOVE_FAIL_PARKS})" in (
-                row.last_error or "")
+            assert "legacy MOVING row has no checkpoint" in (row.last_error or "")
+            assert f"({n}/{_LEGACY_MOVE_FAIL_PARKS})" in (row.last_error or "")
             coord.dest_client.delete.assert_not_called()
             mock_wipe.assert_not_awaited()
-        assert coord._legacy_move_parks["l" * 40] == (
-            _LEGACY_MOVE_FAIL_PARKS - 1)
+        assert coord._legacy_move_parks["l" * 40] == (_LEGACY_MOVE_FAIL_PARKS - 1)
 
         # Nth consecutive no-checkpoint tick: terminal fail, entry dropped,
         # complete SSD bytes survive (delete_files=False).
-        with patch("racing_sync.coordinator.wipe_local_tree",
-                   new_callable=AsyncMock) as mock_wipe:
+        with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock) as mock_wipe:
             await coord._do_moving(store.get("l" * 40))
         row = store.get("l" * 40)
         assert row.state == State.FAILED
         assert "no checkpoint and no dest entry" in (row.last_error or "")
-        coord.dest_client.delete.assert_awaited_once_with(
-            "l" * 40, delete_files=False)
+        coord.dest_client.delete.assert_awaited_once_with("l" * 40, delete_files=False)
         coord._ssd_release.assert_awaited_once_with("l" * 40)
         mock_wipe.assert_not_awaited()
         assert "l" * 40 not in coord._legacy_move_parks
@@ -106,13 +105,13 @@ async def test_successful_listing_resets_legacy_counter(tmp_path):
         # Accrue under the fail threshold.
         for _ in range(_LEGACY_MOVE_FAIL_PARKS - 1):
             await coord._do_moving(store.get("l" * 40))
-        assert coord._legacy_move_parks["l" * 40] == (
-            _LEGACY_MOVE_FAIL_PARKS - 1)
+        assert coord._legacy_move_parks["l" * 40] == (_LEGACY_MOVE_FAIL_PARKS - 1)
 
         # The entry reappears: the successful listing clears the counter
         # instead of letting the stale count fail a healthy tick.
-        coord.dest_client.list_torrents = AsyncMock(return_value=[
-            SimpleNamespace(state="checkingDL", progress=0.5)])
+        coord.dest_client.list_torrents = AsyncMock(
+            return_value=[SimpleNamespace(state="checkingDL", progress=0.5)]
+        )
         await coord._do_moving(store.get("l" * 40))
         assert store.get("l" * 40).state == State.MOVING
         assert coord._legacy_move_parks.get("l" * 40) is None
@@ -136,8 +135,7 @@ async def test_legacy_counter_bounded_at_5000(tmp_path):
     coord, store = _legacy_row(tmp_path)
     try:
         coord._legacy_move_parks = {f"{i:040d}": 1 for i in range(5000)}
-        with patch("racing_sync.coordinator.wipe_local_tree",
-                   new_callable=AsyncMock):
+        with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock):
             await coord._do_moving(store.get("l" * 40))
         assert len(coord._legacy_move_parks) <= 5000
         assert "l" * 40 in coord._legacy_move_parks

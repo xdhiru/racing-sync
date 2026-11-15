@@ -30,8 +30,7 @@ FSIZE = 700
 
 def _cleanup_cfg() -> CleanupConfig:
     """Cleanup config with the grace pinned to 2h (min == max)."""
-    return CleanupConfig(enabled=True, dry_run=True,
-                         min_grace_hours=2.0, max_grace_hours=2.0)
+    return CleanupConfig(enabled=True, dry_run=True, min_grace_hours=2.0, max_grace_hours=2.0)
 
 
 def _coord(cfg: CleanupConfig) -> Coordinator:
@@ -44,14 +43,19 @@ def _coord(cfg: CleanupConfig) -> Coordinator:
 
 
 def _row(
-    *, created_at: dt.datetime | None = None,
+    *,
+    created_at: dt.datetime | None = None,
     completed_at: dt.datetime | None = None,
     activity_at: dt.datetime | None = None,
 ) -> TorrentState:
     row = TorrentState(
-        source_infohash=H, source_name=FNAME, dest_infohash=H,
-        total_bytes=FSIZE, state=State.DONE,
-        completed_at=completed_at, vps1_last_activity_at=activity_at,
+        source_infohash=H,
+        source_name=FNAME,
+        dest_infohash=H,
+        total_bytes=FSIZE,
+        state=State.DONE,
+        completed_at=completed_at,
+        vps1_last_activity_at=activity_at,
     )
     if created_at is None:
         row.created_at = None  # type: ignore[assignment]
@@ -62,18 +66,32 @@ def _row(
 
 def _member(added_on: int) -> Torrent:
     """Quiet, known-stats VPS1 member (passes the pre-grace gates)."""
-    return Torrent(hash=H, name=FNAME, category="", save_path="/vps1/data",
-                   size_bytes=FSIZE, state="seeding", progress=1.0,
-                   ratio=2.0, trackers=[], upspeed_bps=0, num_leechers=0,
-                   added_on=added_on)
+    return Torrent(
+        hash=H,
+        name=FNAME,
+        category="",
+        save_path="/vps1/data",
+        size_bytes=FSIZE,
+        state="seeding",
+        progress=1.0,
+        ratio=2.0,
+        trackers=[],
+        upspeed_bps=0,
+        num_leechers=0,
+        added_on=added_on,
+    )
 
 
-async def _verdict(coord: Coordinator, row: TorrentState, group: list[Torrent],
-                   now: dt.datetime, cfg: CleanupConfig):
+async def _verdict(
+    coord: Coordinator,
+    row: TorrentState,
+    group: list[Torrent],
+    now: dt.datetime,
+    cfg: CleanupConfig,
+):
     grace_s = cleanup_grace_seconds(cfg, None, 0.0)
     assert grace_s == 2 * 3600
-    return await coord._cleanup_verdict(row, group, grace_s, now,
-                                        dry_run=True, free_bytes=None)
+    return await coord._cleanup_verdict(row, group, grace_s, now, dry_run=True, free_bytes=None)
 
 
 @pytest.mark.anyio
@@ -87,9 +105,11 @@ async def test_adopted_done_inside_grace_is_kept_despite_old_added_on():
     now = dt.datetime.now(dt.UTC)
     cfg = _cleanup_cfg()
     coord = _coord(cfg)
-    row = _row(created_at=now - dt.timedelta(minutes=30),
-               completed_at=None,
-               activity_at=now - dt.timedelta(minutes=10))
+    row = _row(
+        created_at=now - dt.timedelta(minutes=30),
+        completed_at=None,
+        activity_at=now - dt.timedelta(minutes=10),
+    )
     old_added_on = int((now - dt.timedelta(days=5)).timestamp())
 
     assert await _verdict(coord, row, [_member(old_added_on)], now, cfg) is None
@@ -106,8 +126,7 @@ async def test_adopted_done_without_activity_still_waits_grace():
     now = dt.datetime.now(dt.UTC)
     cfg = _cleanup_cfg()
     coord = _coord(cfg)
-    row = _row(created_at=now - dt.timedelta(minutes=30),
-               completed_at=None, activity_at=None)
+    row = _row(created_at=now - dt.timedelta(minutes=30), completed_at=None, activity_at=None)
     old_added_on = int((now - dt.timedelta(days=5)).timestamp())
 
     assert await _verdict(coord, row, [_member(old_added_on)], now, cfg) is None
@@ -119,9 +138,11 @@ async def test_done_past_grace_still_follows_the_eligible_path():
     now = dt.datetime.now(dt.UTC)
     cfg = _cleanup_cfg()
     coord = _coord(cfg)
-    row = _row(created_at=now - dt.timedelta(hours=6),
-               completed_at=now - dt.timedelta(hours=5),
-               activity_at=now - dt.timedelta(minutes=10))
+    row = _row(
+        created_at=now - dt.timedelta(hours=6),
+        completed_at=now - dt.timedelta(hours=5),
+        activity_at=now - dt.timedelta(minutes=10),
+    )
     old_added_on = int((now - dt.timedelta(days=5)).timestamp())
 
     got = await _verdict(coord, row, [_member(old_added_on)], now, cfg)
@@ -141,9 +162,11 @@ async def test_adopted_done_past_grace_ages_from_created_at():
     now = dt.datetime.now(dt.UTC)
     cfg = _cleanup_cfg()
     coord = _coord(cfg)
-    row = _row(created_at=now - dt.timedelta(hours=5),
-               completed_at=None,
-               activity_at=now - dt.timedelta(minutes=10))
+    row = _row(
+        created_at=now - dt.timedelta(hours=5),
+        completed_at=None,
+        activity_at=now - dt.timedelta(minutes=10),
+    )
     old_added_on = int((now - dt.timedelta(days=5)).timestamp())
 
     got = await _verdict(coord, row, [_member(old_added_on)], now, cfg)
@@ -158,8 +181,7 @@ async def test_missing_completed_and_created_at_keeps_zero_age_fallback():
     now = dt.datetime.now(dt.UTC)
     cfg = _cleanup_cfg()
     coord = _coord(cfg)
-    row = _row(created_at=None, completed_at=None,
-               activity_at=now - dt.timedelta(minutes=10))
+    row = _row(created_at=None, completed_at=None, activity_at=now - dt.timedelta(minutes=10))
     old_added_on = int((now - dt.timedelta(days=5)).timestamp())
 
     assert await _verdict(coord, row, [_member(old_added_on)], now, cfg) is None

@@ -102,8 +102,6 @@ from .safety import (
 )
 
 
-
-
 def _do_reset(cfg: AppConfig) -> list[str]:
     """Fresh start: delete state.db (+WAL/SHM) and clear the log directory.
 
@@ -176,8 +174,7 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
             await dest.close()
         except Exception:
             pass
-        return [f"full reset: dest client unreachable ({e}); "
-                "full reset aborted, nothing wiped"]
+        return [f"full reset: dest client unreachable ({e}); full reset aborted, nothing wiped"]
     if dest is not None:
         try:
             try:
@@ -213,8 +210,7 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
         if blob_refusal is not None:
             done.append(f"{blob_refusal}; blob cache kept")
         elif blob_root.is_dir() and not blob_root.is_symlink():
-            validate_safe_delete_path(
-                blob_root, base_dir=Path(cfg.general.state_db).parent)
+            validate_safe_delete_path(blob_root, base_dir=Path(cfg.general.state_db).parent)
             shutil.rmtree(blob_root)
             done.append(f"deleted blob cache: {blob_root}")
         else:
@@ -225,8 +221,7 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
     # were already deleted with files above; this catches orphans from
     # crashed downloads or non-racing categories left mid-testing.
     try:
-        raw_roots = [getattr(cfg.ssd, "path", None),
-                     getattr(cfg.dest, "save_path", None)]
+        raw_roots = [getattr(cfg.ssd, "path", None), getattr(cfg.dest, "save_path", None)]
         seen: set[str] = set()
         ssd_roots: list[Path] = []
         for raw in raw_roots:
@@ -259,7 +254,9 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
             try:
                 overlap = _overlaps_fuse(resolved, fuse_roots)
                 if overlap:
-                    done.append(f"full reset: refusing to wipe SSD dir (overlaps fuse mount): {root}")
+                    done.append(
+                        f"full reset: refusing to wipe SSD dir (overlaps fuse mount): {root}"
+                    )
                     continue
             except OSError:
                 pass
@@ -303,16 +300,17 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
         if _backup is not None:
             print(f"state.db backed up to: {_backup}")
         elif _backup_reason == "no-db":
-            print("warning: no state.db yet; continuing without backup",
-                  file=sys.stderr)
+            print("warning: no state.db yet; continuing without backup", file=sys.stderr)
         else:
             # Distinguish "no DB file yet" (nothing to lose) from a real
             # snapshot failure (destructive op without a safety net):
             # refuse the latter instead of warn-continuing.
-            print("refusing forget --apply: state.db backup failed "
-                  f"({_backup_reason}); fix the backup "
-                  "path before deleting anything.",
-                  file=sys.stderr)
+            print(
+                "refusing forget --apply: state.db backup failed "
+                f"({_backup_reason}); fix the backup "
+                "path before deleting anything.",
+                file=sys.stderr,
+            )
             return 2
 
     async def _run() -> dict:
@@ -321,8 +319,11 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
         try:
             await dest.start()
             return await forget_torrent(
-                cfg, dest=dest, store=store,
-                target=args.target, apply=args.apply,
+                cfg,
+                dest=dest,
+                store=store,
+                target=args.target,
+                apply=args.apply,
                 delete_files=not args.keep_files,
                 ignore=bool(getattr(args, "ignore", False)),
             )
@@ -402,8 +403,7 @@ def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
         _lock = DaemonLock(_lp) if _lp is not None else None
         if _lock is not None and not _lock.acquire():
             print(
-                "refusing unignore: the daemon holds the state.db lock "
-                "(stop it first).",
+                "refusing unignore: the daemon holds the state.db lock (stop it first).",
                 file=sys.stderr,
             )
             return 2
@@ -423,8 +423,9 @@ def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
         print(f"unignore failed: {e}", file=sys.stderr)
         return 1
     try:
-        if getattr(args, "list", False) or (not getattr(args, "target", None)
-                                            and not getattr(args, "all", False)):
+        if getattr(args, "list", False) or (
+            not getattr(args, "target", None) and not getattr(args, "all", False)
+        ):
             rows = store.list_ignored()
             if not rows:
                 print("ignore list is empty")
@@ -451,7 +452,9 @@ def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
             print(f"unignore: {e}", file=sys.stderr)
             return 1
         if store.unignore_torrent(found["source_infohash"]):
-            print(f"unignored: {(found['source_name'] or '?')[:60]} ({found['source_infohash'][:10]})")
+            print(
+                f"unignored: {(found['source_name'] or '?')[:60]} ({found['source_infohash'][:10]})"
+            )
         else:
             print("unignore: entry already gone")
         if store.clear_tombstone(found["source_infohash"]):
@@ -502,8 +505,7 @@ def _check_config_env(cfg: AppConfig, *, probe_writes: bool = True) -> list[str]
                 # Probe, don't create: check-config must never mkdir (a
                 # typo'd log_dir would be created just by validating).
                 if not target.exists():
-                    problems.append(
-                        f"{label} does not exist (create it): {target}")
+                    problems.append(f"{label} does not exist (create it): {target}")
                     return
                 if not target.is_dir():
                     problems.append(f"{label} is not a directory: {target}")
@@ -539,8 +541,11 @@ def _check_config_env(cfg: AppConfig, *, probe_writes: bool = True) -> list[str]
             pass
     # state.db itself is created on first run — its parent must exist.
     try:
-        _need_dir("general.state_db parent", Path(str(getattr(cfg.general, "state_db", ""))).parent,
-                  must_exist=True)
+        _need_dir(
+            "general.state_db parent",
+            Path(str(getattr(cfg.general, "state_db", ""))).parent,
+            must_exist=True,
+        )
     except Exception:
         pass
     if getattr(cfg, "watch_dir", None) is not None:
@@ -637,19 +642,19 @@ def main(argv: list[str] | None = None) -> int:
         "--reset",
         action="store_true",
         help="Fresh start: delete state.db (+WAL/SHM) and clear the log "
-             "directory before starting. Bookkeeping only — torrents on the "
-             "clients/SSD are re-adopted by recovery and resume; use "
-             "'forget' to abandon a torrent entirely. Also clears the "
-             "ignored_torrents list (cancelled releases become eligible "
-             "again). Requires --yes.",
+        "directory before starting. Bookkeeping only — torrents on the "
+        "clients/SSD are re-adopted by recovery and resume; use "
+        "'forget' to abandon a torrent entirely. Also clears the "
+        "ignored_torrents list (cancelled releases become eligible "
+        "again). Requires --yes.",
     )
     p_run.add_argument(
         "--full",
         action="store_true",
         help="With --reset: also drop dest racing entries (with files), wipe "
-             "SSD data and the cached .torrent blobs — a true clean slate "
-             "for testing. Implies --reset. Fuse/remote copies are untouched. "
-             "Requires --yes.",
+        "SSD data and the cached .torrent blobs — a true clean slate "
+        "for testing. Implies --reset. Fuse/remote copies are untouched. "
+        "Requires --yes.",
     )
     p_run.add_argument(
         "--yes",
@@ -660,7 +665,7 @@ def main(argv: list[str] | None = None) -> int:
     p_forget = sub.add_parser(
         "forget",
         help="Abandon a torrent: drop its DB row, delete dest client "
-             "entries and (by default) its local SSD data.",
+        "entries and (by default) its local SSD data.",
     )
     p_forget.add_argument("--config", type=Path, required=True)
     p_forget.add_argument(
@@ -681,8 +686,8 @@ def main(argv: list[str] | None = None) -> int:
         "--ignore",
         action="store_true",
         help="With --apply: also record the release as cancelled so it is "
-             "never picked up again while listed on VPS1. Use 'unignore' to "
-             "lift it.",
+        "never picked up again while listed on VPS1. Use 'unignore' to "
+        "lift it.",
     )
 
     p_unignore = sub.add_parser(
@@ -691,18 +696,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_unignore.add_argument("--config", type=Path, required=True)
     p_unignore.add_argument(
-        "target", nargs="?",
+        "target",
+        nargs="?",
         help="40-char infohash or unique name substring. Omit with --list/--all.",
     )
     p_unignore.add_argument(
-        "--list", action="store_true",
+        "--list",
+        action="store_true",
         help="List cancelled releases instead of removing one.",
     )
     p_unignore.add_argument(
-        "--all", action="store_true",
+        "--all",
+        action="store_true",
         help="Unignore every entry and lift their forget tombstones, so "
-             "re-dropped files reprocess immediately (single-target unignore "
-             "lifts that entry's tombstone too).",
+        "re-dropped files reprocess immediately (single-target unignore "
+        "lifts that entry's tombstone too).",
     )
 
     p_check = sub.add_parser("check-config", help="Validate config and exit")
@@ -740,6 +748,7 @@ def main(argv: list[str] | None = None) -> int:
     # whole run. A second `run` (or a mutating CLI against a live
     # daemon) fails fast instead of splitting state.db.
     from .safety import DaemonLock, backup_db, daemon_lock_path
+
     _lock_path = daemon_lock_path(cfg)
     _daemon_lock = DaemonLock(_lock_path) if _lock_path is not None else None
     if _daemon_lock is not None and not _daemon_lock.acquire():
@@ -785,10 +794,12 @@ def main(argv: list[str] | None = None) -> int:
                 # A real snapshot failure (e.g. full disk) refuses — deleting
                 # state.db without a backup when the backup itself just
                 # failed is how data is lost.
-                print(f"refusing --reset: state.db backup failed "
-                      f"({_backup_reason}); fix the backup "
-                      "path before deleting anything.",
-                      file=sys.stderr)
+                print(
+                    f"refusing --reset: state.db backup failed "
+                    f"({_backup_reason}); fix the backup "
+                    "path before deleting anything.",
+                    file=sys.stderr,
+                )
                 return 2
             for line in _do_reset(cfg):
                 print(line)

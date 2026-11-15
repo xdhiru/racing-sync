@@ -1,4 +1,5 @@
 """Watch-row identity cache + watchdir loop offload + bad-file cap."""
+
 from __future__ import annotations
 
 import os
@@ -20,8 +21,7 @@ def _cfg(tmp_path: Path):
 
 
 def _row(h: str, source: str = ""):
-    return TorrentState(source_infohash=h, source_name="X",
-                        cross_seed_source=source)
+    return TorrentState(source_infohash=h, source_name="X", cross_seed_source=source)
 
 
 @pytest.mark.anyio
@@ -29,7 +29,7 @@ async def test_is_watch_row_case_insensitive_and_cached(tmp_path: Path):
     """Uppercase hashes match the lowercase blob dir; second hit is cached."""
     _cc._WATCH_ROW_CACHE.clear()
     cfg = _cfg(tmp_path)
-    blob_dir = (tmp_path / "watch_cross_seeds" / ("a" * 40))
+    blob_dir = tmp_path / "watch_cross_seeds" / ("a" * 40)
     blob_dir.mkdir(parents=True)
     (blob_dir / "x.torrent").write_bytes(b"d1:xe")
     try:
@@ -68,8 +68,7 @@ async def test_bad_files_capped(tmp_path: Path):
         p = watch / f"bad{i:03d}.torrent"
         p.write_bytes(b"not a torrent {{{" + str(i).encode())
         os.utime(p, (old, old))
-    cfg = WatchDirConfig(path=watch, glob="*.torrent",
-                         delete_after_pickup=False)
+    cfg = WatchDirConfig(path=watch, glob="*.torrent", delete_after_pickup=False)
     scanner = WatchDirScanner(cfg, prowlarr=None)
     # Silence per-file warnings for speed of assertion, not behavior.
     items = await scanner.scan_once()

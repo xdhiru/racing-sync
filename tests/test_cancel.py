@@ -1,4 +1,5 @@
 """Cancel / ignore-list / full-reset / telegram-cancel coverage."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,6 +15,7 @@ from racing_sync.state import State, StateStore, TorrentState
 # ---------------------------------------------------------------------------
 # ignore list (state.py)
 # ---------------------------------------------------------------------------
+
 
 def test_ignore_crud_and_find(tmp_path: Path):
     store = StateStore(tmp_path / "s.db")
@@ -42,8 +44,9 @@ def test_group_is_ignored_strictness(tmp_path: Path):
     from racing_sync.coordinator import _group_is_ignored
 
     def _t(h):
-        return Torrent(hash=h, name="n", category="", save_path="",
-                       size_bytes=1, state="", progress=0.0)
+        return Torrent(
+            hash=h, name="n", category="", save_path="", size_bytes=1, state="", progress=0.0
+        )
 
     # Bare MagicMock stores must never veto (they answer truthy to all).
     assert _group_is_ignored([_t("a" * 40)], MagicMock()) is False
@@ -62,26 +65,41 @@ def test_group_is_ignored_strictness(tmp_path: Path):
 # forget: blob cache + ignore flag
 # ---------------------------------------------------------------------------
 
+
 class _FakeDest:
     def __init__(self) -> None:
         self.entries: dict[str, dict] = {}
 
     async def list_torrents(self, *, category=None, hashes=None):
         wanted = {h.lower() for h in hashes} if hashes is not None else None
-        return [Torrent(hash=h, name="n", save_path=e["save_path"],
-                        category="racing", size_bytes=10,
-                        state="downloading", progress=0.5)
-                for h, e in self.entries.items()
-                if wanted is None or h in wanted]
+        return [
+            Torrent(
+                hash=h,
+                name="n",
+                save_path=e["save_path"],
+                category="racing",
+                size_bytes=10,
+                state="downloading",
+                progress=0.5,
+            )
+            for h, e in self.entries.items()
+            if wanted is None or h in wanted
+        ]
 
     async def get_torrent(self, h: str):
         h = h.lower()
         if h not in self.entries:
             return None
         e = self.entries[h]
-        return Torrent(hash=h, name="n", save_path=e["save_path"],
-                       category="racing", size_bytes=10,
-                       state="downloading", progress=0.5)
+        return Torrent(
+            hash=h,
+            name="n",
+            save_path=e["save_path"],
+            category="racing",
+            size_bytes=10,
+            state="downloading",
+            progress=0.5,
+        )
 
     async def get_torrent_files(self, h: str):
         return list(self.entries[h.lower()]["files"])
@@ -108,22 +126,33 @@ async def test_forget_removes_blob_cache(tmp_path: Path):
     blob_dir.mkdir(parents=True)
     (blob_dir / ("a" * 40 + ".torrent")).write_bytes(b"d8:announce1:xee")
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show",
-                              save_path=str(ssd), state=State.MOVING))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40, source_name="Show", save_path=str(ssd), state=State.MOVING
+        )
+    )
     dest = _FakeDest()
     dest.entries["a" * 40] = {"save_path": str(ssd), "files": []}
 
     # Dry-run plans the blob dir but touches nothing.
     dry = await forget_torrent(
-        _forget_cfg(tmp_path), dest=dest, store=store, target="a" * 40,
-        apply=False, delete_files=True,
+        _forget_cfg(tmp_path),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=False,
+        delete_files=True,
     )
     assert str(blob_dir) in dry["local_paths"]
     assert blob_dir.exists()
 
     result = await forget_torrent(
-        _forget_cfg(tmp_path), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=True,
+        _forget_cfg(tmp_path),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
     )
     assert result["errors"] == []
     assert not blob_dir.exists()
@@ -138,25 +167,43 @@ async def test_forget_ignore_records_and_blocks_rediscovery(tmp_path: Path):
     ssd = tmp_path / "ssd"
     ssd.mkdir()
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show",
-                              save_path=str(ssd), state=State.MOVING))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40, source_name="Show", save_path=str(ssd), state=State.MOVING
+        )
+    )
     dest = _FakeDest()
 
     result = await forget_torrent(
-        _forget_cfg(tmp_path), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=True, ignore=True,
+        _forget_cfg(tmp_path),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
+        ignore=True,
     )
     assert result["errors"] == []
     assert result["ignored"] is True
     assert store.is_ignored("a" * 40) is True
-    group = [Torrent(hash="a" * 40, name="Show", category="", save_path="",
-                     size_bytes=10, state="racing", progress=1.0)]
+    group = [
+        Torrent(
+            hash="a" * 40,
+            name="Show",
+            category="",
+            save_path="",
+            size_bytes=10,
+            state="racing",
+            progress=1.0,
+        )
+    ]
     assert _group_is_ignored(group, store) is True
 
 
 # ---------------------------------------------------------------------------
 # recovery + re-inject + late-seed skip cancelled releases
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.anyio
 async def test_recovery_skips_ignored_unadopted(tmp_path: Path):
@@ -170,11 +217,19 @@ async def test_recovery_skips_ignored_unadopted(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     store.ignore_torrent("b" * 40, "Ignored.Show")
     dest = AsyncMock()
-    dest.list_torrents = AsyncMock(return_value=[
-        Torrent(hash="b" * 40, name="Ignored.Show", category="racing",
-                save_path=str(tmp_path / "fuse"), size_bytes=10,
-                state="seeding", progress=1.0),
-    ])
+    dest.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash="b" * 40,
+                name="Ignored.Show",
+                category="racing",
+                save_path=str(tmp_path / "fuse"),
+                size_bytes=10,
+                state="seeding",
+                progress=1.0,
+            ),
+        ]
+    )
     try:
         rpt = await reconcile(cfg, dest=dest, store=store)
         assert store.all() == []
@@ -193,10 +248,23 @@ async def test_reinject_and_late_seed_skip_ignored(tmp_path: Path):
         coord.store = store
         coord.dest_client = AsyncMock()
         coord.cfg = MagicMock()
-        group = [Torrent(hash="c" * 40, name="Ignored.Show", category="",
-                         save_path="", size_bytes=10, state="racing", progress=1.0)]
-        ts = TorrentState(source_infohash="d" * 40, source_name="Other",
-                          injected_private_hashes="", state=State.DONE)
+        group = [
+            Torrent(
+                hash="c" * 40,
+                name="Ignored.Show",
+                category="",
+                save_path="",
+                size_bytes=10,
+                state="racing",
+                progress=1.0,
+            )
+        ]
+        ts = TorrentState(
+            source_infohash="d" * 40,
+            source_name="Other",
+            injected_private_hashes="",
+            state=State.DONE,
+        )
         # Late-seed: ignored arrivals never injected.
         coord._fetch_racing_torrent_bytes = AsyncMock(return_value=b"x")
         await coord._check_and_inject_late_cross_seeds(ts, group)
@@ -223,11 +291,21 @@ async def test_discovery_skips_ignored_group(tmp_path: Path):
         coord.store = store
         coord.watch = None
         src = MagicMock()
-        src.list_torrents = AsyncMock(return_value=[
-            Torrent(hash="e" * 40, name="Ignored.Show", category="",
-                    save_path="", size_bytes=10, state="seeding", progress=1.0,
-                    trackers=["https://alpha.cc/announce/x"], added_on=0),
-        ])
+        src.list_torrents = AsyncMock(
+            return_value=[
+                Torrent(
+                    hash="e" * 40,
+                    name="Ignored.Show",
+                    category="",
+                    save_path="",
+                    size_bytes=10,
+                    state="seeding",
+                    progress=1.0,
+                    trackers=["https://alpha.cc/announce/x"],
+                    added_on=0,
+                ),
+            ]
+        )
         coord.source_client = src
         coord._tasks = set()
         coord._running_infohashes = set()
@@ -292,8 +370,14 @@ def test_forget_cli_ignore_flag(tmp_path: Path, monkeypatch):
     from racing_sync.state import StateStore as _Store
 
     store = _Store(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="f" * 40, source_name="Show",
-                              save_path=str(tmp_path / "ssd"), state=State.MOVING))
+    store.upsert(
+        TorrentState(
+            source_infohash="f" * 40,
+            source_name="Show",
+            save_path=str(tmp_path / "ssd"),
+            state=State.MOVING,
+        )
+    )
     store.close()
 
     class _Dest:
@@ -361,8 +445,14 @@ def test_unignore_lifts_tombstone_so_redrop_reprocesses(tmp_path: Path, capsys):
 
     cfg_file = _cli_config(tmp_path)
     store = _Store(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="c" * 40, source_name="Kept.Show",
-                              save_path=str(tmp_path / "ssd"), state=State.MOVING))
+    store.upsert(
+        TorrentState(
+            source_infohash="c" * 40,
+            source_name="Kept.Show",
+            save_path=str(tmp_path / "ssd"),
+            state=State.MOVING,
+        )
+    )
     assert store.tombstone("c" * 40) is True
     store.ignore_torrent("c" * 40, "Kept.Show")
     store.close()
@@ -375,8 +465,14 @@ def test_unignore_lifts_tombstone_so_redrop_reprocesses(tmp_path: Path, capsys):
     try:
         assert store.is_ignored("c" * 40) is False
         # Re-dropped file re-ingests: the write lands instead of dropping.
-        store.upsert(TorrentState(source_infohash="c" * 40, source_name="Kept.Show",
-                                  save_path=str(tmp_path / "ssd"), state=State.NEW))
+        store.upsert(
+            TorrentState(
+                source_infohash="c" * 40,
+                source_name="Kept.Show",
+                save_path=str(tmp_path / "ssd"),
+                state=State.NEW,
+            )
+        )
         assert store.get("c" * 40) is not None
     finally:
         store.close()
@@ -389,8 +485,14 @@ def test_unignore_all_clears_every_entry_and_tombstone(tmp_path: Path, capsys):
     cfg_file = _cli_config(tmp_path)
     store = _Store(tmp_path / "state.db")
     for h, name in (("a" * 40, "Show.One"), ("b" * 40, "Show.Two")):
-        store.upsert(TorrentState(source_infohash=h, source_name=name,
-                                  save_path=str(tmp_path / "ssd"), state=State.MOVING))
+        store.upsert(
+            TorrentState(
+                source_infohash=h,
+                source_name=name,
+                save_path=str(tmp_path / "ssd"),
+                state=State.MOVING,
+            )
+        )
         assert store.tombstone(h) is True
         store.ignore_torrent(h, name)
     store.close()
@@ -403,8 +505,14 @@ def test_unignore_all_clears_every_entry_and_tombstone(tmp_path: Path, capsys):
     try:
         assert store.list_ignored() == []
         for h in ("a" * 40, "b" * 40):
-            store.upsert(TorrentState(source_infohash=h, source_name="X",
-                                      save_path=str(tmp_path / "ssd"), state=State.NEW))
+            store.upsert(
+                TorrentState(
+                    source_infohash=h,
+                    source_name="X",
+                    save_path=str(tmp_path / "ssd"),
+                    state=State.NEW,
+                )
+            )
             assert store.get(h) is not None
     finally:
         store.close()
@@ -443,9 +551,17 @@ def test_full_reset_clears_client_and_blobs(tmp_path: Path, monkeypatch, capsys)
 
         async def list_torrents(self, *, category=None):
             assert category == "racing"
-            return [Torrent(hash="a" * 40, name="Pack", category="racing",
-                            save_path=str(ssd), size_bytes=10,
-                            state="seeding", progress=1.0)]
+            return [
+                Torrent(
+                    hash="a" * 40,
+                    name="Pack",
+                    category="racing",
+                    save_path=str(ssd),
+                    size_bytes=10,
+                    state="seeding",
+                    progress=1.0,
+                )
+            ]
 
         async def delete(self, h, *, delete_files=False):
             deleted.append((h, delete_files))
@@ -466,6 +582,7 @@ def test_full_reset_clears_client_and_blobs(tmp_path: Path, monkeypatch, capsys)
 # ---------------------------------------------------------------------------
 # telegram cancel flow (copy-paste `/cancel_` commands, no buttons/confirm)
 # ---------------------------------------------------------------------------
+
 
 def _bot(**kw):
     from racing_sync.telegram_bot import TelegramBot
@@ -513,24 +630,19 @@ async def test_admin_allowlist_refuses_stranger_command(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     bot = _bot()
     bot._store = store
-    bot._cfg = SimpleNamespace(chat_id="1", page_size=5,
-                               admin_user_ids=[4242])
+    bot._cfg = SimpleNamespace(chat_id="1", page_size=5, admin_user_ids=[4242])
     try:
-        store.upsert(TorrentState(source_infohash="a" * 40,
-                                  source_name="Show", state=State.MOVING))
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show", state=State.MOVING))
         await bot._handle_chat_message(_message(user="9", text="/cancel_1"))
-        sent = [c.args[1] for c in
-                bot._bot.send_message.await_args_list]
+        sent = [c.args[1] for c in bot._bot.send_message.await_args_list]
         assert any("Not authorized" in str(t) for t in sent)
         # Listed admin proceeds normally (remember question, nothing deleted).
         bot._bot.send_message.reset_mock()
         bot._callback_times.clear()
-        await bot._handle_chat_message(
-            _message(user="4242", text="/cancel_1"))
+        await bot._handle_chat_message(_message(user="4242", text="/cancel_1"))
         assert store.get("a" * 40) is not None
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         assert f"forget:{'a' * 40}:1" in _data
     finally:
         store.close()
@@ -544,18 +656,14 @@ async def test_stranger_tap_refused_by_allowlist(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     bot = _bot()
     bot._store = store
-    bot._cfg = SimpleNamespace(chat_id="1", page_size=5,
-                               admin_user_ids=[4242])
+    bot._cfg = SimpleNamespace(chat_id="1", page_size=5, admin_user_ids=[4242])
     try:
-        store.upsert(TorrentState(source_infohash="a" * 40,
-                                  source_name="Show", state=State.MOVING))
-        store.upsert(TorrentState(source_infohash="b" * 40,
-                                  source_name="Show", state=State.QUEUED))
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show", state=State.MOVING))
+        store.upsert(TorrentState(source_infohash="b" * 40, source_name="Show", state=State.QUEUED))
         # Stranger tap refused before any routing.
         q = _query(f"cancel:{'a' * 40}", user="777")
         await bot._handle_callback(q)
-        q.answer.assert_awaited_with("Not authorized for destructive actions",
-                                     show_alert=True)
+        q.answer.assert_awaited_with("Not authorized for destructive actions", show_alert=True)
         assert store.get("a" * 40) is not None
         # Listed admin's tap opens the keep question.
         bot._callback_times.clear()
@@ -571,8 +679,11 @@ async def test_cancel_torrent_forgets_and_ignores(tmp_path: Path):
     ssd = tmp_path / "ssd"
     ssd.mkdir()
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show",
-                              save_path=str(ssd), state=State.MOVING))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40, source_name="Show", save_path=str(ssd), state=State.MOVING
+        )
+    )
     coord = MagicMock()
     cfg = MagicMock()
     cfg.ssd.path = ssd
@@ -601,15 +712,27 @@ async def test_cancel_torrent_auto_cancels_waiting_pairs(tmp_path: Path):
     ssd = tmp_path / "ssd"
     ssd.mkdir()
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Shared.Show",
-                              save_path=str(ssd), state=State.DOWNLOADING,
-                              cross_seed_source="watch-dir",
-                              source_announce_url="https://alpha.cc/announce/xyz",
-                              total_bytes=1000))
-    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Shared.Show",
-                              state=State.NEW, cross_seed_source="watch-dir",
-                              source_announce_url="https://alpha.cc/announce/xyz",
-                              total_bytes=1000))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40,
+            source_name="Shared.Show",
+            save_path=str(ssd),
+            state=State.DOWNLOADING,
+            cross_seed_source="watch-dir",
+            source_announce_url="https://alpha.cc/announce/xyz",
+            total_bytes=1000,
+        )
+    )
+    store.upsert(
+        TorrentState(
+            source_infohash="b" * 40,
+            source_name="Shared.Show",
+            state=State.NEW,
+            cross_seed_source="watch-dir",
+            source_announce_url="https://alpha.cc/announce/xyz",
+            total_bytes=1000,
+        )
+    )
     coord = MagicMock()
     cfg = MagicMock()
     cfg.ssd.path = ssd
@@ -638,10 +761,12 @@ async def test_cancel_torrent_auto_cancels_waiting_pairs(tmp_path: Path):
 def test_render_active_has_cancel_command_per_task():
     from racing_sync.telegram_bot import render_active
 
-    ts = TorrentState(source_infohash="a" * 40, source_name="Show",
-                      state=State.DOWNLOADING, total_bytes=1000)
-    ts2 = TorrentState(source_infohash="b" * 40, source_name="Show2",
-                       state=State.QUEUED, total_bytes=2000)
+    ts = TorrentState(
+        source_infohash="a" * 40, source_name="Show", state=State.DOWNLOADING, total_bytes=1000
+    )
+    ts2 = TorrentState(
+        source_infohash="b" * 40, source_name="Show2", state=State.QUEUED, total_bytes=2000
+    )
     text, _, _ = render_active([(ts, 0.5), (ts2, None)], page=0, page_size=5)
     # One positional action entry per group (escaped underscore, no labels).
     assert "/act\\_1" in text
@@ -658,12 +783,15 @@ def test_resolve_cancel_target(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     bot._store = store
     try:
-        store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show.One",
-                                  state=State.MOVING))
-        store.upsert(TorrentState(source_infohash="a" * 39 + "b", source_name="Show.Two",
-                                  state=State.QUEUED))
-        store.upsert(TorrentState(source_infohash="b" * 40, source_name="Show.Three",
-                                  state=State.QUEUED))
+        store.upsert(
+            TorrentState(source_infohash="a" * 40, source_name="Show.One", state=State.MOVING)
+        )
+        store.upsert(
+            TorrentState(source_infohash="a" * 39 + "b", source_name="Show.Two", state=State.QUEUED)
+        )
+        store.upsert(
+            TorrentState(source_infohash="b" * 40, source_name="Show.Three", state=State.QUEUED)
+        )
         # Full hash resolves.
         assert bot._resolve_cancel_target("a" * 40).source_name == "Show.One"
         assert bot._resolve_cancel_target("b" * 40).source_name == "Show.Three"
@@ -689,15 +817,24 @@ def test_resolve_cancel_target_ignores_done_history(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     bot._store = store
     try:
-        store.upsert(TorrentState(source_infohash="a" * 10 + "0" * 30,
-                                  source_name="Old.Done", state=State.DONE))
-        store.upsert(TorrentState(source_infohash="a" * 10 + "1" * 30,
-                                  source_name="Live.One", state=State.QUEUED))
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 10 + "0" * 30, source_name="Old.Done", state=State.DONE
+            )
+        )
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 10 + "1" * 30, source_name="Live.One", state=State.QUEUED
+            )
+        )
         assert bot._resolve_cancel_target("a" * 10).source_name == "Live.One"
         assert bot._resolve_cancel_target("a" * 10 + "0" * 30).source_name == "Old.Done"
         # Two live rows on one prefix still refuse.
-        store.upsert(TorrentState(source_infohash="a" * 10 + "2" * 30,
-                                  source_name="Live.Two", state=State.QUEUED))
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 10 + "2" * 30, source_name="Live.Two", state=State.QUEUED
+            )
+        )
         with pytest.raises(LookupError, match="matches 2"):
             bot._resolve_cancel_target("a" * 10)
     finally:
@@ -710,8 +847,11 @@ async def test_chat_message_cancel_arms_keep_question(tmp_path: Path):
     ssd = tmp_path / "ssd"
     ssd.mkdir()
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show",
-                              save_path=str(ssd), state=State.MOVING))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40, source_name="Show", save_path=str(ssd), state=State.MOVING
+        )
+    )
     coord = MagicMock()
     cfg = MagicMock()
     cfg.ssd.path = ssd
@@ -734,8 +874,7 @@ async def test_chat_message_cancel_arms_keep_question(tmp_path: Path):
         sent_text = bot._bot.send_message.call_args[0][1]
         assert sent_text.startswith("Forget Show?")
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         assert f"forget:{'a' * 40}:1" in _data
         assert f"forget:{'a' * 40}:0" in _data
     finally:
@@ -756,8 +895,7 @@ async def test_chat_message_cancel_unknown_and_unauthorized(tmp_path: Path):
         await bot._handle_chat_message(_message(text="hello there"))
         bot._bot.send_message.assert_not_called()
         # Wrong chat is ignored silently.
-        await bot._handle_chat_message(_message(chat="999", user="999",
-                                                text="/cancel_aaaaaaaaaa"))
+        await bot._handle_chat_message(_message(chat="999", user="999", text="/cancel_aaaaaaaaaa"))
         bot._bot.send_message.assert_not_called()
     finally:
         store.close()
@@ -768,8 +906,11 @@ async def test_chat_message_cancel_supports_full_hash_and_suffix(tmp_path: Path)
     ssd = tmp_path / "ssd"
     ssd.mkdir()
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="c" * 40, source_name="Show",
-                              save_path=str(ssd), state=State.MOVING))
+    store.upsert(
+        TorrentState(
+            source_infohash="c" * 40, source_name="Show", save_path=str(ssd), state=State.MOVING
+        )
+    )
     coord = MagicMock()
     cfg = MagicMock()
     cfg.ssd.path = ssd
@@ -784,13 +925,11 @@ async def test_chat_message_cancel_supports_full_hash_and_suffix(tmp_path: Path)
     bot._coord = coord
     bot._store = store
     try:
-        await bot._handle_chat_message(
-            _message(text=f"/cancel_{'c' * 40}@mybot"))
+        await bot._handle_chat_message(_message(text=f"/cancel_{'c' * 40}@mybot"))
         # Full hash also lands on the remember question (never instant).
         assert store.get("c" * 40) is not None
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         assert f"forget:{'c' * 40}:1" in _data
         assert f"forget:{'c' * 40}:0" in _data
     finally:
@@ -802,8 +941,11 @@ async def test_cancel_torrent_releases_ssd_budget(tmp_path: Path):
     ssd = tmp_path / "ssd"
     ssd.mkdir()
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show",
-                              save_path=str(ssd), state=State.MOVING))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40, source_name="Show", save_path=str(ssd), state=State.MOVING
+        )
+    )
     coord = MagicMock()
     cfg = MagicMock()
     cfg.ssd.path = ssd
@@ -829,13 +971,17 @@ async def test_cancel_torrent_releases_ssd_budget(tmp_path: Path):
 def test_render_active_shows_fetch_only_for_waiting_indexer():
     from racing_sync.telegram_bot import render_active
 
-    waiting = TorrentState(source_infohash="a" * 40, source_name="Show",
-                           state=State.WAITING_INDEXER, total_bytes=1000,
-                           indexer_attempts=9)
-    downloading = TorrentState(source_infohash="b" * 40, source_name="Show2",
-                               state=State.DOWNLOADING, total_bytes=2000)
-    text, _, _ = render_active([(waiting, None), (downloading, 0.5)],
-                               page=0, page_size=5)
+    waiting = TorrentState(
+        source_infohash="a" * 40,
+        source_name="Show",
+        state=State.WAITING_INDEXER,
+        total_bytes=1000,
+        indexer_attempts=9,
+    )
+    downloading = TorrentState(
+        source_infohash="b" * 40, source_name="Show2", state=State.DOWNLOADING, total_bytes=2000
+    )
+    text, _, _ = render_active([(waiting, None), (downloading, 0.5)], page=0, page_size=5)
     assert "/act\\_1" in text
     assert "/act\\_2" in text
     assert "Fetch original:" not in text
@@ -846,16 +992,21 @@ def test_render_active_shows_fetch_only_for_waiting_indexer():
 def test_render_detail_shows_fetch_hint_for_waiting_indexer():
     from racing_sync.telegram_bot import render_detail
 
-    waiting = TorrentState(source_infohash="a" * 40, source_name="Show",
-                           state=State.WAITING_INDEXER, total_bytes=1000,
-                           indexer_attempts=9)
+    waiting = TorrentState(
+        source_infohash="a" * 40,
+        source_name="Show",
+        state=State.WAITING_INDEXER,
+        total_bytes=1000,
+        indexer_attempts=9,
+    )
     detail = render_detail(waiting)
     # Full hash untouched in the detail card; now hint added.
     assert "`" + "a" * 40 + "`" in detail
     assert "`/now_aaaaaaaaaa`" in detail
 
-    downloading = TorrentState(source_infohash="b" * 40, source_name="Show2",
-                               state=State.DOWNLOADING, total_bytes=2000)
+    downloading = TorrentState(
+        source_infohash="b" * 40, source_name="Show2", state=State.DOWNLOADING, total_bytes=2000
+    )
     assert "/now_" not in render_detail(downloading)
 
 
@@ -864,10 +1015,14 @@ def test_resolve_fetch_target_requires_waiting(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     bot._store = store
     try:
-        store.upsert(TorrentState(source_infohash="a" * 40, source_name="Waiting.One",
-                                  state=State.WAITING_INDEXER))
-        store.upsert(TorrentState(source_infohash="b" * 40, source_name="Busy.One",
-                                  state=State.DOWNLOADING))
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 40, source_name="Waiting.One", state=State.WAITING_INDEXER
+            )
+        )
+        store.upsert(
+            TorrentState(source_infohash="b" * 40, source_name="Busy.One", state=State.DOWNLOADING)
+        )
         assert bot._resolve_fetch_target("a" * 10).source_name == "Waiting.One"
         assert bot._resolve_fetch_target("a" * 40).source_name == "Waiting.One"
         # Full hash of a non-waiting row explains itself.
@@ -886,8 +1041,14 @@ async def test_chat_message_fetch_flags_and_wakes_row(tmp_path: Path):
     import datetime as dt
 
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show",
-                              state=State.WAITING_INDEXER, indexer_attempts=9))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40,
+            source_name="Show",
+            state=State.WAITING_INDEXER,
+            indexer_attempts=9,
+        )
+    )
     bot = _bot()
     bot._coord = MagicMock()
     bot._store = store
@@ -911,12 +1072,15 @@ async def test_chat_message_fetch_opens_fresh_direct_window(tmp_path: Path):
     import datetime as dt
 
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(
-        source_infohash="e" * 40, source_name="Old",
-        state=State.WAITING_INDEXER, indexer_attempts=40,
-        indexer_first_queried_at=dt.datetime.now(dt.timezone.utc)
-        - dt.timedelta(hours=23),
-    ))
+    store.upsert(
+        TorrentState(
+            source_infohash="e" * 40,
+            source_name="Old",
+            state=State.WAITING_INDEXER,
+            indexer_attempts=40,
+            indexer_first_queried_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=23),
+        )
+    )
     bot = _bot()
     bot._coord = MagicMock()
     bot._store = store
@@ -926,8 +1090,7 @@ async def test_chat_message_fetch_opens_fresh_direct_window(tmp_path: Path):
         assert row.force_direct == 1
         assert row.state == State.WAITING_INDEXER
         assert row.indexer_attempts == 0
-        fresh = (dt.datetime.now(dt.timezone.utc)
-                 - row.indexer_first_queried_at).total_seconds()
+        fresh = (dt.datetime.now(dt.timezone.utc) - row.indexer_first_queried_at).total_seconds()
         assert fresh < 60
     finally:
         store.close()
@@ -937,9 +1100,15 @@ async def test_chat_message_fetch_opens_fresh_direct_window(tmp_path: Path):
 async def test_group_now_singleton_executes_immediately(tmp_path: Path):
     """One eligible copy starts at once (no pick step for singletons)."""
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Lone.Show",
-                              state=State.WAITING_INDEXER, indexer_attempts=2,
-                              total_bytes=1000))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40,
+            source_name="Lone.Show",
+            state=State.WAITING_INDEXER,
+            indexer_attempts=2,
+            total_bytes=1000,
+        )
+    )
     bot = _bot()
     bot._coord = MagicMock()
     bot._store = store
@@ -957,12 +1126,24 @@ async def test_group_now_singleton_executes_immediately(tmp_path: Path):
 async def test_group_now_multi_offers_per_copy_start_buttons(tmp_path: Path):
     """Several eligible copies each get their own Start button (by tracker)."""
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Twin.Show",
-                              total_bytes=1000, state=State.WAITING_INDEXER,
-                              source_announce_url="https://alpha.cc/announce"))
-    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Twin.Show",
-                              total_bytes=1000, state=State.WAITING_INDEXER,
-                              source_announce_url="https://bte.example/announce"))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40,
+            source_name="Twin.Show",
+            total_bytes=1000,
+            state=State.WAITING_INDEXER,
+            source_announce_url="https://alpha.cc/announce",
+        )
+    )
+    store.upsert(
+        TorrentState(
+            source_infohash="b" * 40,
+            source_name="Twin.Show",
+            total_bytes=1000,
+            state=State.WAITING_INDEXER,
+            source_announce_url="https://bte.example/announce",
+        )
+    )
     bot = _bot()
     bot._coord = MagicMock()
     bot._store = store
@@ -970,10 +1151,8 @@ async def test_group_now_multi_offers_per_copy_start_buttons(tmp_path: Path):
         await bot._handle_chat_message(_message(text="/now_1"))
         assert store.get("a" * 40).force_direct == 0  # nothing started yet
         _kwargs = bot._bot.send_message.call_args[1]
-        _labels = [b.text for r in
-                   _kwargs["reply_markup"].inline_keyboard for b in r]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _labels = [b.text for r in _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         assert any(t.startswith("▶ Start ") for t in _labels)
         assert f"go:{'a' * 40}" in _data
         assert f"go:{'b' * 40}" in _data
@@ -985,9 +1164,9 @@ def test_keepq_text_shows_size_or_omits():
     from racing_sync.telegram_bot import TelegramBot
 
     bot = TelegramBot.__new__(TelegramBot)
-    _text, _rows = bot._keepq_text_and_rows("Big.Show", " · all 2 copies",
-                                            "all:" + "a" * 40, 2_600_000_000,
-                                            remember=True)
+    _text, _rows = bot._keepq_text_and_rows(
+        "Big.Show", " · all 2 copies", "all:" + "a" * 40, 2_600_000_000, remember=True
+    )
     assert "Big.Show" in _text and "all 2 copies" in _text
     assert "2.4G" in _text
     _pairs = [t for r in _rows for t in r]
@@ -995,14 +1174,12 @@ def test_keepq_text_shows_size_or_omits():
     assert f"keep:all:{'a' * 40}:1:yes" in _flat
     assert f"keep:all:{'a' * 40}:1:no" in _flat
     assert ("Close", "abort") in _pairs
-    _text0, _rows0 = bot._keepq_text_and_rows("Big.Show", "", "a" * 40,
-                                              remember=False)
+    _text0, _rows0 = bot._keepq_text_and_rows("Big.Show", "", "a" * 40, remember=False)
     _flat0 = [d for r in _rows0 for (_, d) in r]
     assert f"keep:{'a' * 40}:0:yes" in _flat0
     assert f"keep:{'a' * 40}:0:no" in _flat0
     assert "allowed back later" in _text0
-    assert [t for (t, _) in _pairs] == [
-        "✔ Keep files", "✖ Delete files", "Close"]
+    assert [t for (t, _) in _pairs] == ["✔ Keep files", "✖ Delete files", "Close"]
     # Rows without size still render (no dangling separator).
     _text2, _ = bot._keepq_text_and_rows("Big.Show", "", "a" * 40)
     assert "Big.Show" in _text2 and "·" not in _text2.split("—")[0]
@@ -1051,29 +1228,45 @@ def test_chat_command_registry_covers_all_verbs():
     for text, want in cases.items():
         hits = [c.name for c in _CHAT_COMMANDS if c.pattern.match(text)]
         assert hits == want, (text, hits)
-    for text in ("/hello", "/cancel_xyz", "/cancel_", "/act_", "/now_",
-                 "/forcestart_", "/forcestartx", "/cancel_statusx",
-                 "/cancel_match_foo", "/cancel_stalledx", "/pause_intakex",
-                 "/statsx", "/findx", "/files_", "", "/activex"):
-        assert [c.name for c in _CHAT_COMMANDS
-                if c.pattern.match(text)] == [], text
+    for text in (
+        "/hello",
+        "/cancel_xyz",
+        "/cancel_",
+        "/act_",
+        "/now_",
+        "/forcestart_",
+        "/forcestartx",
+        "/cancel_statusx",
+        "/cancel_match_foo",
+        "/cancel_stalledx",
+        "/pause_intakex",
+        "/statsx",
+        "/findx",
+        "/files_",
+        "",
+        "/activex",
+    ):
+        assert [c.name for c in _CHAT_COMMANDS if c.pattern.match(text)] == [], text
 
 
 def test_status_scope_parses_and_resolves():
     """cancel/forget/keep status shapes round-trip; unknown keys are stale."""
     from racing_sync.telegram_protocol import (
-        CancelScope, ScopeGone, _parse_action_data,
+        CancelScope,
+        ScopeGone,
+        _parse_action_data,
     )
 
-    assert _parse_action_data("cancel:status:dl") == (
-        "cancel", False, "status:dl", "", None)
-    assert _parse_action_data("forget:status:mv:1") == (
-        "forget", False, "status:mv", "", True)
-    assert _parse_action_data("keep:status:qd:0:yes") == (
-        "keep", False, "status:qd", "yes", False)
-    for bad in ("cancel:status:all", "cancel:status:ov",
-                "cancel:status:bogus", "forget:status:dl:2",
-                "keep:status:dl:1:maybe"):
+    assert _parse_action_data("cancel:status:dl") == ("cancel", False, "status:dl", "", None)
+    assert _parse_action_data("forget:status:mv:1") == ("forget", False, "status:mv", "", True)
+    assert _parse_action_data("keep:status:qd:0:yes") == ("keep", False, "status:qd", "yes", False)
+    for bad in (
+        "cancel:status:all",
+        "cancel:status:ov",
+        "cancel:status:bogus",
+        "forget:status:dl:2",
+        "keep:status:dl:1:maybe",
+    ):
         assert _parse_action_data(bad) == ("", False, "", "", None), bad
     assert CancelScope.from_parsed(False, "status:dl") == ("status", "dl")
     assert CancelScope("status", "dl").to_data() == "status:dl"
@@ -1088,10 +1281,8 @@ async def test_status_scope_resolve_filters_lane():
     bot = MagicMock()
     bot._store = MagicMock()
     bot._store.list_active_inflight.return_value = [
-        TorrentState(source_infohash="a" * 40, source_name="Dl",
-                     state=State.DOWNLOADING),
-        TorrentState(source_infohash="b" * 40, source_name="Mv",
-                     state=State.MOVING),
+        TorrentState(source_infohash="a" * 40, source_name="Dl", state=State.DOWNLOADING),
+        TorrentState(source_infohash="b" * 40, source_name="Mv", state=State.MOVING),
     ]
     r = await CancelScope("status", "dl").resolve(bot)
     assert r.hashes == ["a" * 40]
@@ -1105,19 +1296,15 @@ async def test_status_scope_resolve_filters_lane():
 async def test_cancel_status_menu_lists_lanes():
     bot = _bot()
     bot._store.list_active_inflight.return_value = [
-        TorrentState(source_infohash="a" * 40, source_name="Dl",
-                     state=State.DOWNLOADING),
-        TorrentState(source_infohash="b" * 40, source_name="Dl2",
-                     state=State.DOWNLOADING),
-        TorrentState(source_infohash="c" * 40, source_name="Mv",
-                     state=State.MOVING),
+        TorrentState(source_infohash="a" * 40, source_name="Dl", state=State.DOWNLOADING),
+        TorrentState(source_infohash="b" * 40, source_name="Dl2", state=State.DOWNLOADING),
+        TorrentState(source_infohash="c" * 40, source_name="Mv", state=State.MOVING),
     ]
     bot._reply = AsyncMock()
     await bot._handle_chat_message(_message(text="/cancel_status"))
     assert bot._bot.send_message.await_count == 1
     _kwargs = bot._bot.send_message.call_args[1]
-    _data = [b.callback_data for r in
-             _kwargs["reply_markup"].inline_keyboard for b in r]
+    _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
     assert "cancel:status:dl" in _data
     assert "cancel:status:mv" in _data
     assert "cancel:status:rd" not in _data
@@ -1141,18 +1328,14 @@ async def test_status_keep_flow_executes_with_stagger():
 
     bot = _bot()
     bot._store.get.side_effect = lambda h, **k: {
-        "a" * 40: TorrentState(
-            source_infohash="a" * 40, source_name="Dl",
-            state=State.DOWNLOADING),
+        "a" * 40: TorrentState(source_infohash="a" * 40, source_name="Dl", state=State.DOWNLOADING),
         "b" * 40: TorrentState(
-            source_infohash="b" * 40, source_name="Dl2",
-            state=State.DOWNLOADING),
+            source_infohash="b" * 40, source_name="Dl2", state=State.DOWNLOADING
+        ),
     }.get(h)
     bot._store.list_active_inflight.return_value = [
-        TorrentState(source_infohash="a" * 40, source_name="Dl",
-                     state=State.DOWNLOADING),
-        TorrentState(source_infohash="b" * 40, source_name="Dl2",
-                     state=State.DOWNLOADING),
+        TorrentState(source_infohash="a" * 40, source_name="Dl", state=State.DOWNLOADING),
+        TorrentState(source_infohash="b" * 40, source_name="Dl2", state=State.DOWNLOADING),
     ]
     executed = []
     bot._bot.delete_message = AsyncMock()
@@ -1204,12 +1387,11 @@ async def test_ops_stats_snapshot(tmp_path: Path):
     from racing_sync.state import StateStore
 
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="New",
-                              state=State.NEW))
-    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Down",
-                              state=State.DOWNLOADING))
-    store.upsert(TorrentState(source_infohash="c" * 40, source_name="Done",
-                              state=State.DONE))
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="New", state=State.NEW))
+    store.upsert(
+        TorrentState(source_infohash="b" * 40, source_name="Down", state=State.DOWNLOADING)
+    )
+    store.upsert(TorrentState(source_infohash="c" * 40, source_name="Done", state=State.DONE))
     bot = _bot()
     bot._coord = MagicMock()
     bot._coord._intake_paused = False
@@ -1232,11 +1414,13 @@ async def test_ops_stats_includes_overview(tmp_path: Path):
     from racing_sync.state import StateStore
 
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Down",
-                              state=State.DOWNLOADING))
+    store.upsert(
+        TorrentState(source_infohash="a" * 40, source_name="Down", state=State.DOWNLOADING)
+    )
     bot = _bot()
     bot._coord = SimpleNamespace(
-        _tasks=set(), _intake_paused=False,
+        _tasks=set(),
+        _intake_paused=False,
         live_totals=lambda: (2_000_000, 1),
     )
     bot._store = store
@@ -1253,17 +1437,22 @@ async def test_find_routes_and_reads_out(tmp_path: Path):
     """Find searches read-only and lists hits per indexer."""
     bot = _bot()
     bot._coord = MagicMock()
-    bot._coord.find_release = AsyncMock(return_value={
-        "query": "Evil.Show",
-        "indexers": [
-            {"name": "Alpha", "total": 2,
-             "hits": [{"title": "Evil.Show.S01.1080p-GRP",
-                       "size_bytes": 1_500_000_000},
-                      {"title": "Evil.Show.S01.720p-GRP",
-                       "size_bytes": 800_000_000}]},
-            {"name": "Beta", "total": 0, "hits": []},
-        ],
-    })
+    bot._coord.find_release = AsyncMock(
+        return_value={
+            "query": "Evil.Show",
+            "indexers": [
+                {
+                    "name": "Alpha",
+                    "total": 2,
+                    "hits": [
+                        {"title": "Evil.Show.S01.1080p-GRP", "size_bytes": 1_500_000_000},
+                        {"title": "Evil.Show.S01.720p-GRP", "size_bytes": 800_000_000},
+                    ],
+                },
+                {"name": "Beta", "total": 0, "hits": []},
+            ],
+        }
+    )
     await bot._handle_chat_message(_message(text="/find Evil.Show"))
     sent = bot._bot.send_message.call_args[0][1]
     assert sent.startswith("🔍 'Evil.Show'")
@@ -1279,8 +1468,7 @@ async def test_find_lookup_error_replies(tmp_path: Path):
     """A refused search explains itself instead of failing silently."""
     bot = _bot()
     bot._coord = MagicMock()
-    bot._coord.find_release = AsyncMock(
-        side_effect=LookupError("Prowlarr is not configured."))
+    bot._coord.find_release = AsyncMock(side_effect=LookupError("Prowlarr is not configured."))
     await bot._handle_chat_message(_message(text="/find Evil.Show"))
     assert "not configured" in bot._bot.send_message.call_args[0][1]
 
@@ -1290,19 +1478,26 @@ async def test_files_lists_with_sizes_and_skips(tmp_path: Path):
     """Files shows names, sizes, progress, skips, and batch position."""
     from racing_sync.clients.abstract import TorrentFile
 
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="a" * 40, source_name="Season.Show",
-                     total_bytes=3000, state=State.DOWNLOADING,
-                     batches_total=3, batch_index=1),
-    ])
-    bot._coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="Season.Show/S01E01.mkv", size_bytes=1000,
-                    priority=1, progress=1.0),
-        TorrentFile(name="Season.Show/S01E02.mkv", size_bytes=1000,
-                    priority=1, progress=0.45),
-        TorrentFile(name="Season.Show/Extras.mkv", size_bytes=1000,
-                    priority=0, progress=0.0),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Season.Show",
+                total_bytes=3000,
+                state=State.DOWNLOADING,
+                batches_total=3,
+                batch_index=1,
+            ),
+        ],
+    )
+    bot._coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Season.Show/S01E01.mkv", size_bytes=1000, priority=1, progress=1.0),
+            TorrentFile(name="Season.Show/S01E02.mkv", size_bytes=1000, priority=1, progress=0.45),
+            TorrentFile(name="Season.Show/Extras.mkv", size_bytes=1000, priority=0, progress=0.0),
+        ]
+    )
     try:
         await bot._handle_chat_message(_message(text="/files_1"))
         sent = bot._bot.send_message.call_args[0][1]
@@ -1311,8 +1506,7 @@ async def test_files_lists_with_sizes_and_skips(tmp_path: Path):
         assert "S01E02.mkv (1000 B, 45%)" in sent
         assert "Extras.mkv (1000 B) — skipped" in sent
         bot._callback_times.clear()
-        await bot._handle_chat_message(
-            _message(text="/files_" + "a" * 40))
+        await bot._handle_chat_message(_message(text="/files_" + "a" * 40))
         assert "S01E01.mkv" in bot._bot.send_message.call_args[0][1]
     finally:
         store.close()
@@ -1321,15 +1515,16 @@ async def test_files_lists_with_sizes_and_skips(tmp_path: Path):
 @pytest.mark.anyio
 async def test_files_empty_and_unknown(tmp_path: Path):
     """Empty listings and unknown tokens explain themselves."""
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="a" * 40, source_name="Empty.Show",
-                     state=State.QUEUED),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(source_infohash="a" * 40, source_name="Empty.Show", state=State.QUEUED),
+        ],
+    )
     bot._coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
     try:
         await bot._handle_chat_message(_message(text="/files_1"))
-        assert "No files listed yet" in \
-            bot._bot.send_message.call_args[0][1]
+        assert "No files listed yet" in bot._bot.send_message.call_args[0][1]
         bot._callback_times.clear()
         await bot._handle_chat_message(_message(text="/files_99"))
         sent = bot._bot.send_message.call_args[0][1]
@@ -1343,25 +1538,37 @@ def test_sheet_buttons_fit_telegram_callback_budget():
     from racing_sync.telegram_bot import _parse_action_data
 
     _h = "a" * 40
-    for _data in (f"go:{_h}", f"cancel:{_h}",
-                  f"cancel:all:{_h}", f"forget:{_h}:1",
-                  f"forget:all:{_h}:0", f"keep:{_h}:1:yes",
-                  f"keep:all:{_h}:0:no", f"inject:{_h}",
-                  f"inject:{_h}:yes", f"skip:all:{_h}", f"resume:{_h}",
-                  f"resume:all:{_h}", "abort"):
+    for _data in (
+        f"go:{_h}",
+        f"cancel:{_h}",
+        f"cancel:all:{_h}",
+        f"forget:{_h}:1",
+        f"forget:all:{_h}:0",
+        f"keep:{_h}:1:yes",
+        f"keep:all:{_h}:0:no",
+        f"inject:{_h}",
+        f"inject:{_h}:yes",
+        f"skip:all:{_h}",
+        f"resume:{_h}",
+        f"resume:all:{_h}",
+        "abort",
+    ):
         assert len(_data) <= 64, _data
         assert _parse_action_data(_data)[0] in (
-            "go", "cancel", "forget", "keep", "inject", "skip",
-            "resume", "abort")
+            "go",
+            "cancel",
+            "forget",
+            "keep",
+            "inject",
+            "skip",
+            "resume",
+            "abort",
+        )
     # Remember choice travels in keep buttons (legacy 3-part = remember).
-    assert _parse_action_data(f"keep:{_h}:1:yes") == (
-        "keep", False, _h, "yes", True)
-    assert _parse_action_data(f"keep:{_h}:0:no") == (
-        "keep", False, _h, "no", False)
-    assert _parse_action_data(f"keep:{_h}:yes") == (
-        "keep", False, _h, "yes", True)
-    assert _parse_action_data(f"forget:{_h}:0") == (
-        "forget", False, _h, "", False)
+    assert _parse_action_data(f"keep:{_h}:1:yes") == ("keep", False, _h, "yes", True)
+    assert _parse_action_data(f"keep:{_h}:0:no") == ("keep", False, _h, "no", False)
+    assert _parse_action_data(f"keep:{_h}:yes") == ("keep", False, _h, "yes", True)
+    assert _parse_action_data(f"forget:{_h}:0") == ("forget", False, _h, "", False)
     assert _parse_action_data("pick:7:1") == ("", False, "", "", None)
     assert _parse_action_data("keep:9:yes") == ("", False, "", "", None)
     assert _parse_action_data("abort:7") == ("", False, "", "", None)
@@ -1379,8 +1586,9 @@ def test_keepq_text_sanitizes_backtick_title():
 @pytest.mark.anyio
 async def test_chat_message_fetch_rejects_non_waiting(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Busy",
-                              state=State.DOWNLOADING))
+    store.upsert(
+        TorrentState(source_infohash="b" * 40, source_name="Busy", state=State.DOWNLOADING)
+    )
     bot = _bot()
     bot._coord = MagicMock()
     bot._store = store
@@ -1398,8 +1606,7 @@ async def test_chat_message_fetch_rejects_non_waiting(tmp_path: Path):
 async def test_fetch_torrent_marks_stale_row(tmp_path: Path):
     """Direct executor call on a row that already moved on explains itself."""
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="c" * 40, source_name="Moved",
-                              state=State.QUEUED))
+    store.upsert(TorrentState(source_infohash="c" * 40, source_name="Moved", state=State.QUEUED))
     bot = _bot()
     bot._coord = MagicMock()
     bot._store = store
@@ -1425,9 +1632,14 @@ def _grace_coord_stub(*, watch: bool):
 async def test_fetch_torrent_new_watch_grace_uses_dropped(tmp_path: Path):
     """NEW grace-held watch drop: force_direct set, stays NEW, woken."""
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(
-        source_infohash="f" * 40, source_name="Drop.One",
-        state=State.NEW, cross_seed_source="watch-dir"))
+    store.upsert(
+        TorrentState(
+            source_infohash="f" * 40,
+            source_name="Drop.One",
+            state=State.NEW,
+            cross_seed_source="watch-dir",
+        )
+    )
     bot = _bot()
     bot._store = store
     bot._coord = _grace_coord_stub(watch=True)
@@ -1446,9 +1658,14 @@ async def test_fetch_torrent_new_watch_grace_uses_dropped(tmp_path: Path):
 async def test_fetch_torrent_new_racing_grace_uses_vps1(tmp_path: Path):
     """NEW grace-held racing row: force_direct set, stays NEW, woken."""
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(
-        source_infohash="e" * 40, source_name="Race.One",
-        state=State.NEW, cross_seed_source="prowlarr"))
+    store.upsert(
+        TorrentState(
+            source_infohash="e" * 40,
+            source_name="Race.One",
+            state=State.NEW,
+            cross_seed_source="prowlarr",
+        )
+    )
     bot = _bot()
     bot._store = store
     bot._coord = _grace_coord_stub(watch=False)
@@ -1467,9 +1684,14 @@ async def test_fetch_torrent_new_racing_grace_uses_vps1(tmp_path: Path):
 async def test_fetch_torrent_new_without_grace_refuses(tmp_path: Path):
     """NEW rows with no grace note have nothing to fetch."""
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(
-        source_infohash="d" * 40, source_name="Fresh.One",
-        state=State.NEW, cross_seed_source="watch-dir"))
+    store.upsert(
+        TorrentState(
+            source_infohash="d" * 40,
+            source_name="Fresh.One",
+            state=State.NEW,
+            cross_seed_source="watch-dir",
+        )
+    )
     bot = _bot()
     bot._store = store
     bot._coord = SimpleNamespace(
@@ -1491,15 +1713,18 @@ def test_now_eligibility_covers_waiting_and_new_grace():
     from racing_sync.telegram_bot import _now_eligible_hashes
 
     mk = lambda h, st, dom: TorrentState(  # noqa: E731
-        source_infohash=h, source_name="Show.X", state=st,
-        total_bytes=1000, source_announce_url=f"https://{dom}/announce")
+        source_infohash=h,
+        source_name="Show.X",
+        state=st,
+        total_bytes=1000,
+        source_announce_url=f"https://{dom}/announce",
+    )
     waiting = mk("a" * 40, State.WAITING_INDEXER, "alpha.cc")
     grace = mk("b" * 40, State.NEW, "bte.example")
     busy = mk("c" * 40, State.DOWNLOADING, "gamma.cc")
     notes = {"b" * 40: "Waiting for preferred copy · 90s left"}
     members = [waiting, grace, busy]
-    assert _now_eligible_hashes(members, notes) == [
-        "a" * 40, "b" * 40]
+    assert _now_eligible_hashes(members, notes) == ["a" * 40, "b" * 40]
 
 
 def test_resolve_fetch_target_allows_new_grace(tmp_path: Path):
@@ -1509,11 +1734,17 @@ def test_resolve_fetch_target_allows_new_grace(tmp_path: Path):
     bot._store = store
     bot._coord = _grace_coord_stub(watch=True)
     try:
-        store.upsert(TorrentState(source_infohash="f" * 40, source_name="Drop",
-                                  state=State.NEW,
-                                  cross_seed_source="watch-dir"))
-        store.upsert(TorrentState(source_infohash="b" * 40, source_name="Busy",
-                                  state=State.DOWNLOADING))
+        store.upsert(
+            TorrentState(
+                source_infohash="f" * 40,
+                source_name="Drop",
+                state=State.NEW,
+                cross_seed_source="watch-dir",
+            )
+        )
+        store.upsert(
+            TorrentState(source_infohash="b" * 40, source_name="Busy", state=State.DOWNLOADING)
+        )
         assert bot._resolve_fetch_target("f" * 10).source_name == "Drop"
         with pytest.raises(LookupError, match="not waiting"):
             bot._resolve_fetch_target("b" * 40)
@@ -1525,8 +1756,9 @@ def test_resolve_fetch_target_allows_new_grace(tmp_path: Path):
 async def test_chat_message_skip_and_unskip_full_hash(tmp_path: Path):
     """/skip_<hash> holds the row; /unskip_<hash> resumes + wakes a worker."""
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Show",
-                              state=State.WAITING_INDEXER))
+    store.upsert(
+        TorrentState(source_infohash="a" * 40, source_name="Show", state=State.WAITING_INDEXER)
+    )
     bot = _bot()
     bot._coord = MagicMock()
     bot._store = store
@@ -1550,11 +1782,24 @@ async def test_chat_message_skip_and_unskip_full_hash(tmp_path: Path):
 async def test_chat_message_resume_group_unholds_and_lifts(tmp_path: Path):
     """/resume_1 resumes held copies and lifts their ignore entries."""
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Same.Show",
-                              total_bytes=1000, state=State.NEW, skipped=1))
-    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Same.Show",
-                              total_bytes=1000, state=State.WAITING_INDEXER,
-                              skipped=1))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40,
+            source_name="Same.Show",
+            total_bytes=1000,
+            state=State.NEW,
+            skipped=1,
+        )
+    )
+    store.upsert(
+        TorrentState(
+            source_infohash="b" * 40,
+            source_name="Same.Show",
+            total_bytes=1000,
+            state=State.WAITING_INDEXER,
+            skipped=1,
+        )
+    )
     store.ignore_torrent("b" * 40, "Same.Show")
     bot = _bot()
     bot._coord = MagicMock()
@@ -1592,10 +1837,19 @@ async def test_chat_message_resume_ignored_only_hash(tmp_path: Path):
 async def test_chat_message_skip_group_number(tmp_path: Path):
     """/skip_1 holds every copy in the group at once."""
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Same.Show",
-                              total_bytes=1000, state=State.NEW))
-    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Same.Show",
-                              total_bytes=1000, state=State.WAITING_INDEXER))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40, source_name="Same.Show", total_bytes=1000, state=State.NEW
+        )
+    )
+    store.upsert(
+        TorrentState(
+            source_infohash="b" * 40,
+            source_name="Same.Show",
+            total_bytes=1000,
+            state=State.WAITING_INDEXER,
+        )
+    )
     bot = _bot()
     bot._coord = MagicMock()
     bot._store = store
@@ -1613,10 +1867,19 @@ async def test_chat_message_skip_group_number(tmp_path: Path):
 async def test_chat_message_skip_single_hash_holds_whole_group(tmp_path: Path):
     """A single hash still holds the release: every grouped copy."""
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Same.Show",
-                              total_bytes=1000, state=State.NEW))
-    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Same.Show",
-                              total_bytes=1000, state=State.WAITING_INDEXER))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40, source_name="Same.Show", total_bytes=1000, state=State.NEW
+        )
+    )
+    store.upsert(
+        TorrentState(
+            source_infohash="b" * 40,
+            source_name="Same.Show",
+            total_bytes=1000,
+            state=State.WAITING_INDEXER,
+        )
+    )
     bot = _bot()
     bot._coord = MagicMock()
     bot._store = store
@@ -1633,8 +1896,11 @@ async def test_chat_message_skip_single_hash_holds_whole_group(tmp_path: Path):
 @pytest.mark.anyio
 async def test_fetch_torrent_refuses_held_row(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="d" * 40, source_name="Held",
-                              state=State.WAITING_INDEXER, skipped=1))
+    store.upsert(
+        TorrentState(
+            source_infohash="d" * 40, source_name="Held", state=State.WAITING_INDEXER, skipped=1
+        )
+    )
     bot = _bot()
     bot._coord = MagicMock()
     bot._store = store
@@ -1650,17 +1916,22 @@ def test_render_active_shows_skip_and_unskip():
     """Held rows get /resume_N + ⏭; running rows get /skip_N."""
     from racing_sync.telegram_bot import render_active
 
-    held = TorrentState(source_infohash="a" * 40, source_name="Held",
-                        state=State.WAITING_INDEXER, total_bytes=1000,
-                        skipped=1)
+    held = TorrentState(
+        source_infohash="a" * 40,
+        source_name="Held",
+        state=State.WAITING_INDEXER,
+        total_bytes=1000,
+        skipped=1,
+    )
     text, _, _ = render_active([(held, None)], page=0, page_size=5)
     assert "⏭ Skipped" in text
     assert "/act\\_1" in text
     assert "/skip\\_1" not in text
     assert "/now\\_1" not in text
 
-    free = TorrentState(source_infohash="b" * 40, source_name="Free",
-                        state=State.WAITING_INDEXER, total_bytes=1000)
+    free = TorrentState(
+        source_infohash="b" * 40, source_name="Free", state=State.WAITING_INDEXER, total_bytes=1000
+    )
     text, _, _ = render_active([(free, None)], page=0, page_size=5)
     assert "/act\\_1" in text
     assert "/resume\\_1" not in text
@@ -1671,8 +1942,12 @@ def test_member_labels_include_held_but_eligibility_skips_them():
     from racing_sync.telegram_bot import _member_button_labels, _now_eligible_hashes
 
     mk = lambda h, st: TorrentState(  # noqa: E731
-        source_infohash=h, source_name="Show.X", state=st,
-        total_bytes=1000, source_announce_url="https://alpha.cc/announce")
+        source_infohash=h,
+        source_name="Show.X",
+        state=st,
+        total_bytes=1000,
+        source_announce_url="https://alpha.cc/announce",
+    )
     grace = mk("b" * 40, State.NEW)
     grace.skipped = 1
     notes = {"b" * 40: "Waiting for preferred copy · 90s left"}
@@ -1685,9 +1960,13 @@ def test_render_detail_shows_held_resume():
     """Held detail cards carry the /resume_ line."""
     from racing_sync.telegram_bot import render_detail
 
-    ts = TorrentState(source_infohash="e" * 40, source_name="Held",
-                      state=State.WAITING_INDEXER, total_bytes=1000,
-                      skipped=1)
+    ts = TorrentState(
+        source_infohash="e" * 40,
+        source_name="Held",
+        state=State.WAITING_INDEXER,
+        total_bytes=1000,
+        skipped=1,
+    )
     detail = render_detail(ts)
     assert "Skipped" in detail
     assert f"/resume_{'e' * 10}" in detail
@@ -1704,6 +1983,7 @@ def test_full_reset_refuses_symlink_ssd(tmp_path: Path, monkeypatch):
         link.symlink_to(ssd, target_is_directory=True)
     except OSError:
         import pytest as _pt
+
         _pt.skip("symlinks unavailable")
     cfg = MagicMock()
     cfg.general.state_db = tmp_path / "state.db"
@@ -1762,11 +2042,15 @@ async def test_chat_message_prefer_starts_grace_held_row(tmp_path: Path):
         coord.cfg.prowlarr.download_indexers = [MagicMock()]
         coord.cfg.prowlarr.is_download_indexer = lambda url: False
         coord._spawn_worker = MagicMock()
-        ts = TorrentState(source_infohash="e" * 40, source_name="Prefer.Me",
-                          source_announce_url="https://alpha.cc/announce/xyz",
-                          source_tracker="https://alpha.cc/announce/xyz",
-                          cross_seed_blob=b"d8:announce...",
-                          cross_seed_source="watch-dir", state=State.NEW)
+        ts = TorrentState(
+            source_infohash="e" * 40,
+            source_name="Prefer.Me",
+            source_announce_url="https://alpha.cc/announce/xyz",
+            source_tracker="https://alpha.cc/announce/xyz",
+            cross_seed_blob=b"d8:announce...",
+            cross_seed_source="watch-dir",
+            state=State.NEW,
+        )
         ts._blob = b"d8:announce..."
         store.upsert(ts)
         bot = _bot()
@@ -1802,9 +2086,14 @@ async def test_chat_message_now_starts_waiting_and_grace_rows(tmp_path: Path):
         coord.cfg.prowlarr.download_indexers = [MagicMock()]
         coord.cfg.prowlarr.is_download_indexer = lambda url: False
         coord._spawn_worker = MagicMock()
-        store.upsert(TorrentState(
-            source_infohash="f" * 40, source_name="Waiting.Now",
-            state=State.WAITING_INDEXER, indexer_attempts=3))
+        store.upsert(
+            TorrentState(
+                source_infohash="f" * 40,
+                source_name="Waiting.Now",
+                state=State.WAITING_INDEXER,
+                indexer_attempts=3,
+            )
+        )
         bot = _bot()
         bot._coord = coord
         bot._store = store
@@ -1823,11 +2112,17 @@ def _twins_store(tmp_path: Path):
     ssd.mkdir(exist_ok=True)
     store = StateStore(tmp_path / "state.db")
     for h in ("a" * 40, "b" * 40):
-        store.upsert(TorrentState(source_infohash=h, source_name="Twin.Show",
-                                  save_path=str(ssd), state=State.NEW,
-                                  cross_seed_source="watch-dir",
-                                  source_announce_url="https://alpha.cc/announce/xyz",
-                                  total_bytes=1000))
+        store.upsert(
+            TorrentState(
+                source_infohash=h,
+                source_name="Twin.Show",
+                save_path=str(ssd),
+                state=State.NEW,
+                cross_seed_source="watch-dir",
+                source_announce_url="https://alpha.cc/announce/xyz",
+                total_bytes=1000,
+            )
+        )
     return store, ssd
 
 
@@ -1865,29 +2160,23 @@ async def test_cancel_group_member_then_yes_keeps_files(tmp_path: Path):
         # Twins share name+size: group 1. Buttons carry each copy's hash.
         await bot._handle_chat_message(_message(text="/cancel_1"))
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         assert f"cancel:{'b' * 40}" in _data
         assert any(d.startswith("cancel:all:") for d in _data)
         # Tap the b-copy → remember question (nothing deleted yet).
-        await bot._on_action_button(
-            _tap(f"cancel:{'b' * 40}"), f"cancel:{'b' * 40}")
+        await bot._on_action_button(_tap(f"cancel:{'b' * 40}"), f"cancel:{'b' * 40}")
         assert store.get("b" * 40) is not None
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         assert f"forget:{'b' * 40}:1" in _data
         assert f"forget:{'b' * 40}:0" in _data
         # Just forget (no remember) → keep question for files.
-        await bot._on_action_button(
-            _tap(f"forget:{'b' * 40}:0"), f"forget:{'b' * 40}:0")
+        await bot._on_action_button(_tap(f"forget:{'b' * 40}:0"), f"forget:{'b' * 40}:0")
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         assert f"keep:{'b' * 40}:0:yes" in _data
         # Yes: forget with files kept and NOT ignored; a-copy untouched.
-        await bot._on_action_button(
-            _tap(f"keep:{'b' * 40}:0:yes"), f"keep:{'b' * 40}:0:yes")
+        await bot._on_action_button(_tap(f"keep:{'b' * 40}:0:yes"), f"keep:{'b' * 40}:0:yes")
         assert store.get("b" * 40) is None
         assert store.is_ignored("b" * 40) is False
         assert store.get("a" * 40) is not None
@@ -1907,25 +2196,22 @@ async def test_cancel_all_then_no_deletes_everything(tmp_path: Path):
     try:
         await bot._handle_chat_message(_message(text="/cancel_1"))
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         _all = next(d for d in _data if d.startswith("cancel:all:"))
         _leader = _all.split(":")[2]
         await bot._on_action_button(_tap(_all), _all)
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         _forget = next(d for d in _data if d.startswith("forget:all:"))
         assert _forget.endswith(":1") or _forget.endswith(":0")
         await bot._on_action_button(_tap(_forget), _forget)
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         _ig = _forget.split(":")[3]
         assert f"keep:all:{_leader}:{_ig}:yes" in _data
         await bot._on_action_button(
-            _tap(f"keep:all:{_leader}:{_ig}:no"),
-            f"keep:all:{_leader}:{_ig}:no")
+            _tap(f"keep:all:{_leader}:{_ig}:no"), f"keep:all:{_leader}:{_ig}:no"
+        )
         assert store.get("a" * 40) is None
         assert store.get("b" * 40) is None
         sent = bot._bot.send_message.call_args[0][1]
@@ -1971,10 +2257,22 @@ def test_act_regex_shapes():
 async def test_act_command_replies_sheet_with_hash_buttons(tmp_path: Path):
     """/act_1 shows eligible actions only; every button is hash-scoped."""
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Twin.Show",
-                              total_bytes=1000, state=State.WAITING_INDEXER))
-    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Twin.Show",
-                              total_bytes=1000, state=State.WAITING_INDEXER))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40,
+            source_name="Twin.Show",
+            total_bytes=1000,
+            state=State.WAITING_INDEXER,
+        )
+    )
+    store.upsert(
+        TorrentState(
+            source_infohash="b" * 40,
+            source_name="Twin.Show",
+            total_bytes=1000,
+            state=State.WAITING_INDEXER,
+        )
+    )
     bot = _bot()
     bot._coord = MagicMock()
     bot._store = store
@@ -1983,21 +2281,18 @@ async def test_act_command_replies_sheet_with_hash_buttons(tmp_path: Path):
         sent = bot._bot.send_message.call_args[0][1]
         assert "Twin.Show" in sent
         _kwargs = bot._bot.send_message.call_args[1]
-        _data = [b.callback_data for r in
-                 _kwargs["reply_markup"].inline_keyboard for b in r]
+        _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         assert f"go:{'a' * 40}" in _data
         assert f"cancel:{'b' * 40}" in _data
         assert any(d.startswith("cancel:all:") for d in _data)
         assert "abort" in _data
         assert not any(d.startswith("pick:") for d in _data)
         assert store.get("a" * 40) is not None  # sheet changes nothing
-        _labels = [b.text for r in
-                   _kwargs["reply_markup"].inline_keyboard for b in r]
+        _labels = [b.text for r in _kwargs["reply_markup"].inline_keyboard for b in r]
         # Every button names its verb and target — no memorized commands.
         assert any(t.startswith("▶ Start ") for t in _labels)
         assert any(t.startswith("✖ Cancel ") for t in _labels)
-        assert any("Skip" in t or "Resume" in t or "Inject" in t
-                   for t in _labels)
+        assert any("Skip" in t or "Resume" in t or "Inject" in t for t in _labels)
     finally:
         store.close()
 
@@ -2014,28 +2309,33 @@ async def test_shifted_numbering_cannot_misroute(tmp_path: Path):
         # same-named row appears (fresh drop re-takes group 1).
         store.tombstone("a" * 40)
         store.tombstone("b" * 40)
-        store.upsert(TorrentState(source_infohash="c" * 40,
-                                  source_name="Twin.Show",
-                                  save_path=str(ssd), state=State.NEW,
-                                  total_bytes=1000))
+        store.upsert(
+            TorrentState(
+                source_infohash="c" * 40,
+                source_name="Twin.Show",
+                save_path=str(ssd),
+                state=State.NEW,
+                total_bytes=1000,
+            )
+        )
         # The old tap still addresses only the b-copy hash, gone now —
         # nothing acted on, certainly not the new row.
-        await bot._on_action_button(
-            _tap(f"cancel:{'b' * 40}"), f"cancel:{'b' * 40}")
-        await bot._on_action_button(
-            _tap(f"keep:{'b' * 40}:yes"), f"keep:{'b' * 40}:yes")
+        await bot._on_action_button(_tap(f"cancel:{'b' * 40}"), f"cancel:{'b' * 40}")
+        await bot._on_action_button(_tap(f"keep:{'b' * 40}:yes"), f"keep:{'b' * 40}:yes")
         assert store.get("c" * 40) is not None  # untouched
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Already gone")
     finally:
         store.close()
 
+
 @pytest.mark.anyio
 async def test_chat_message_unignore_lifts_ignore_and_tombstone(tmp_path: Path):
     """/unignore_<full hash> makes a cancelled release addable again."""
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="c" * 40, source_name="Gone",
-                              state=State.WAITING_INDEXER))
+    store.upsert(
+        TorrentState(source_infohash="c" * 40, source_name="Gone", state=State.WAITING_INDEXER)
+    )
     store.ignore_torrent("c" * 40, "Gone")
     store.tombstone("c" * 40)
     assert store.is_ignored("c" * 40) is True
@@ -2051,6 +2351,7 @@ async def test_chat_message_unignore_lifts_ignore_and_tombstone(tmp_path: Path):
     finally:
         store.close()
 
+
 @pytest.mark.anyio
 async def test_chat_message_unignore_rejects_short_hash(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
@@ -2063,6 +2364,7 @@ async def test_chat_message_unignore_rejects_short_hash(tmp_path: Path):
         assert "full 40-char" in sent
     finally:
         store.close()
+
 
 @pytest.mark.anyio
 async def test_chat_message_unignore_space_form(tmp_path: Path):
@@ -2085,10 +2387,10 @@ async def test_chat_message_unignore_space_form(tmp_path: Path):
 # /cancel_match bulk cancel (substring over live group titles)
 # ---------------------------------------------------------------------------
 
+
 def _sheet_data(bot):
     _kwargs = bot._bot.send_message.call_args[1]
-    return [b.callback_data for r in
-            _kwargs["reply_markup"].inline_keyboard for b in r]
+    return [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
 
 
 def _match_bot(tmp_path: Path, rows):
@@ -2120,20 +2422,39 @@ def _match_bot(tmp_path: Path, rows):
 async def test_cancel_match_bulk_forgets_matched_groups_only(tmp_path: Path):
     """/cancel_match evil → Q1 remember → Q2 keep/delete → matched gone."""
     _root = tmp_path / "ssd"
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="a" * 40, source_name="Flower.of.Evil.S01",
-                     total_bytes=1000, save_path=str(_root),
-                     state=State.DOWNLOADING),
-        TorrentState(source_infohash="b" * 40, source_name="Flower.of.Evil.S01",
-                     total_bytes=1000, save_path=str(_root),
-                     state=State.QUEUED),
-        TorrentState(source_infohash="c" * 40, source_name="Flower.of.Evil.S02",
-                     total_bytes=2000, save_path=str(_root),
-                     state=State.MOVING),
-        TorrentState(source_infohash="d" * 40, source_name="Unrelated.Show",
-                     total_bytes=3000, save_path=str(_root),
-                     state=State.MOVING),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Flower.of.Evil.S01",
+                total_bytes=1000,
+                save_path=str(_root),
+                state=State.DOWNLOADING,
+            ),
+            TorrentState(
+                source_infohash="b" * 40,
+                source_name="Flower.of.Evil.S01",
+                total_bytes=1000,
+                save_path=str(_root),
+                state=State.QUEUED,
+            ),
+            TorrentState(
+                source_infohash="c" * 40,
+                source_name="Flower.of.Evil.S02",
+                total_bytes=2000,
+                save_path=str(_root),
+                state=State.MOVING,
+            ),
+            TorrentState(
+                source_infohash="d" * 40,
+                source_name="Unrelated.Show",
+                total_bytes=3000,
+                save_path=str(_root),
+                state=State.MOVING,
+            ),
+        ],
+    )
     try:
         await bot._handle_chat_message(_message(text="/cancel_match evil"))
         _data = _sheet_data(bot)
@@ -2164,16 +2485,16 @@ async def test_cancel_match_bulk_forgets_matched_groups_only(tmp_path: Path):
 @pytest.mark.anyio
 async def test_cancel_match_reresolves_between_questions(tmp_path: Path):
     """A group forgotten after Q1 is not acted on at Q2."""
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="a" * 40, source_name="Evil.One",
-                     state=State.QUEUED),
-        TorrentState(source_infohash="b" * 40, source_name="Evil.Two",
-                     state=State.QUEUED),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(source_infohash="a" * 40, source_name="Evil.One", state=State.QUEUED),
+            TorrentState(source_infohash="b" * 40, source_name="Evil.Two", state=State.QUEUED),
+        ],
+    )
     try:
         await bot._handle_chat_message(_message(text="/cancel_match evil"))
-        _tok = next(d.split(":")[2] for d in _sheet_data(bot)
-                    if d.startswith("forget:match:"))
+        _tok = next(d.split(":")[2] for d in _sheet_data(bot) if d.startswith("forget:match:"))
         await bot._handle_callback(_query(f"forget:match:{_tok}:0"))
         # Sibling flow removes one group before the keep tap.
         assert store.hard_delete("b" * 40) is True
@@ -2191,12 +2512,13 @@ async def test_cancel_match_reresolves_between_questions(tmp_path: Path):
 @pytest.mark.anyio
 async def test_cancel_match_single_copy_uses_normal_sheet(tmp_path: Path):
     """One matching copy skips the bulk sheet for its forget question."""
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="a" * 40, source_name="Only.Evil",
-                     state=State.QUEUED),
-        TorrentState(source_infohash="d" * 40, source_name="Unrelated",
-                     state=State.QUEUED),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(source_infohash="a" * 40, source_name="Only.Evil", state=State.QUEUED),
+            TorrentState(source_infohash="d" * 40, source_name="Unrelated", state=State.QUEUED),
+        ],
+    )
     try:
         await bot._handle_chat_message(_message(text="/cancel_match only"))
         _data = _sheet_data(bot)
@@ -2209,25 +2531,23 @@ async def test_cancel_match_single_copy_uses_normal_sheet(tmp_path: Path):
 @pytest.mark.anyio
 async def test_cancel_match_no_match_short_and_long(tmp_path: Path):
     """Unknown text, missing text, and 1-char text all explain."""
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="a" * 40, source_name="Some.Show",
-                     state=State.QUEUED),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(source_infohash="a" * 40, source_name="Some.Show", state=State.QUEUED),
+        ],
+    )
     try:
         await bot._handle_chat_message(_message(text="/cancel_match zzz-nope"))
-        assert "No active groups match" in \
-            bot._bot.send_message.call_args[0][1]
+        assert "No active groups match" in bot._bot.send_message.call_args[0][1]
         bot._callback_times.clear()
         await bot._handle_chat_message(_message(text="/cancel_match"))
-        assert "/cancel_match <text>" in \
-            bot._bot.send_message.call_args[0][1]
+        assert "/cancel_match <text>" in bot._bot.send_message.call_args[0][1]
         bot._callback_times.clear()
         await bot._handle_chat_message(_message(text="/cancel_match e"))
-        assert "/cancel_match <text>" in \
-            bot._bot.send_message.call_args[0][1]
+        assert "/cancel_match <text>" in bot._bot.send_message.call_args[0][1]
         bot._callback_times.clear()
-        await bot._handle_chat_message(
-            _message(text="/cancel_match " + "x" * 36))
+        await bot._handle_chat_message(_message(text="/cancel_match " + "x" * 36))
         assert "too long" in bot._bot.send_message.call_args[0][1]
     finally:
         store.close()
@@ -2236,10 +2556,12 @@ async def test_cancel_match_no_match_short_and_long(tmp_path: Path):
 @pytest.mark.anyio
 async def test_callback_router_forwards_forget_taps(tmp_path: Path):
     """`forget:` taps must reach the dispatcher (regression: router gap)."""
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="a" * 40, source_name="Routed.Show",
-                     state=State.QUEUED),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(source_infohash="a" * 40, source_name="Routed.Show", state=State.QUEUED),
+        ],
+    )
     try:
         await bot._handle_callback(_query(f"forget:{'a' * 40}:1"))
         _data = _sheet_data(bot)
@@ -2252,10 +2574,12 @@ async def test_callback_router_forwards_forget_taps(tmp_path: Path):
 @pytest.mark.anyio
 async def test_answered_sheets_are_deleted(tmp_path: Path):
     """Each tapped sheet is deleted; replies and follow-ups stay."""
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="a" * 40, source_name="Gone.Show",
-                     state=State.QUEUED),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(source_infohash="a" * 40, source_name="Gone.Show", state=State.QUEUED),
+        ],
+    )
     bot._bot.delete_message = AsyncMock()
     try:
         await bot._handle_callback(_query(f"cancel:{'a' * 40}"))
@@ -2287,8 +2611,7 @@ async def test_cancel_liveness_read_error_is_action_failed(tmp_path: Path):
     from racing_sync.state import StateStore
 
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Live",
-                              state=State.QUEUED))
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="Live", state=State.QUEUED))
     real_get = store.get
 
     def _boom(h, **kw):
@@ -2298,14 +2621,12 @@ async def test_cancel_liveness_read_error_is_action_failed(tmp_path: Path):
     bot = _bot()
     bot._store = store
     try:
-        out = await bot._execute_snapshot_cancel(
-            ["a" * 40], "Live", delete_files=True)
+        out = await bot._execute_snapshot_cancel(["a" * 40], "Live", delete_files=True)
         assert out.startswith("Action failed")
         assert "Already gone" not in out
         assert real_get("a" * 40) is not None
         bot._callback_times.clear()
-        await bot._start_single_command(
-            "cancel", "a" * 40, _message(text="/cancel_" + "a" * 40))
+        await bot._start_single_command("cancel", "a" * 40, _message(text="/cancel_" + "a" * 40))
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Action failed")
         assert real_get("a" * 40) is not None
@@ -2316,20 +2637,25 @@ async def test_cancel_liveness_read_error_is_action_failed(tmp_path: Path):
 @pytest.mark.anyio
 async def test_cancel_sheet_dead_row_answers_gone_immediately(tmp_path: Path):
     """Q1 on a dead row answers at once — no wasted question sheets."""
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="d" * 40, source_name="Unrelated",
-                     state=State.QUEUED),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(source_infohash="d" * 40, source_name="Unrelated", state=State.QUEUED),
+        ],
+    )
     try:
         await bot._handle_callback(_query(f"cancel:{'e' * 40}"))
         _calls = bot._bot.send_message.await_args_list
         assert _calls
         assert _calls[-1].args[1] == "Already gone from tracking"
-        _data = [b.callback_data
-                 for c in _calls
-                 for r in (c.kwargs.get("reply_markup").inline_keyboard
-                           if c.kwargs.get("reply_markup") else [])
-                 for b in r]
+        _data = [
+            b.callback_data
+            for c in _calls
+            for r in (
+                c.kwargs.get("reply_markup").inline_keyboard if c.kwargs.get("reply_markup") else []
+            )
+            for b in r
+        ]
         assert not any(d.startswith("forget:") for d in _data)
     finally:
         store.close()
@@ -2340,10 +2666,12 @@ async def test_duplicate_keep_tap_gets_working_on_it(tmp_path: Path):
     """A re-tap mid-execution must not run a second forget."""
     import asyncio
 
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="a" * 40, source_name="Slow.Show",
-                     state=State.QUEUED),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(source_infohash="a" * 40, source_name="Slow.Show", state=State.QUEUED),
+        ],
+    )
     bot._bot.delete_message = AsyncMock()
     _release = asyncio.Event()
     _calls: list[str] = []
@@ -2356,8 +2684,7 @@ async def test_duplicate_keep_tap_gets_working_on_it(tmp_path: Path):
 
     bot._execute_cancel_one = _slow
     try:
-        first = asyncio.create_task(
-            bot._handle_callback(_query(f"keep:{'a' * 40}:1:yes")))
+        first = asyncio.create_task(bot._handle_callback(_query(f"keep:{'a' * 40}:1:yes")))
         for _ in range(200):
             if getattr(bot, "_action_inflight", None):
                 break
@@ -2391,14 +2718,28 @@ def test_cancel_match_protocol_shapes_fit_buttons():
     assert _match_token("x" * 36) == ""
     assert _match_query("!!!") == ""
     assert _match_query("") == ""
-    for data in (f"forget:match:{tok}:1", f"forget:match:{tok}:0",
-                 f"keep:match:{tok}:1:yes", f"keep:match:{tok}:0:no"):
+    for data in (
+        f"forget:match:{tok}:1",
+        f"forget:match:{tok}:0",
+        f"keep:match:{tok}:1:yes",
+        f"keep:match:{tok}:0:no",
+    ):
         assert len(data) <= 64
         assert _parse_action_data(data)[0] in ("forget", "keep")
     assert _parse_action_data(f"keep:match:{tok}:1:yes") == (
-        "keep", False, f"match:{tok}", "yes", True)
+        "keep",
+        False,
+        f"match:{tok}",
+        "yes",
+        True,
+    )
     assert _parse_action_data(f"forget:match:{tok}:0") == (
-        "forget", False, f"match:{tok}", "", False)
+        "forget",
+        False,
+        f"match:{tok}",
+        "",
+        False,
+    )
 
 
 @pytest.mark.anyio
@@ -2407,25 +2748,51 @@ async def test_cancel_stalled_flow(tmp_path: Path):
     from racing_sync.clients.abstract import Torrent
 
     _root = tmp_path / "ssd"
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="a" * 40, source_name="Dead.Show.S01",
-                     total_bytes=1000, save_path=str(_root),
-                     state=State.DOWNLOADING),
-        TorrentState(source_infohash="b" * 40, source_name="Dead.Show.S01",
-                     total_bytes=1000, save_path=str(_root),
-                     state=State.DOWNLOADING),
-        TorrentState(source_infohash="c" * 40, source_name="Live.Show.S01",
-                     total_bytes=2000, save_path=str(_root),
-                     state=State.DOWNLOADING),
-        TorrentState(source_infohash="d" * 40, source_name="Queued.Show",
-                     total_bytes=3000, save_path=str(_root),
-                     state=State.QUEUED),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Dead.Show.S01",
+                total_bytes=1000,
+                save_path=str(_root),
+                state=State.DOWNLOADING,
+            ),
+            TorrentState(
+                source_infohash="b" * 40,
+                source_name="Dead.Show.S01",
+                total_bytes=1000,
+                save_path=str(_root),
+                state=State.DOWNLOADING,
+            ),
+            TorrentState(
+                source_infohash="c" * 40,
+                source_name="Live.Show.S01",
+                total_bytes=2000,
+                save_path=str(_root),
+                state=State.DOWNLOADING,
+            ),
+            TorrentState(
+                source_infohash="d" * 40,
+                source_name="Queued.Show",
+                total_bytes=3000,
+                save_path=str(_root),
+                state=State.QUEUED,
+            ),
+        ],
+    )
 
     def _entry(h, seeds, progress=0.1):
-        return Torrent(hash=h, name="x", category="", save_path="",
-                       size_bytes=1000, state="downloading",
-                       progress=progress, num_seeds=seeds)
+        return Torrent(
+            hash=h,
+            name="x",
+            category="",
+            save_path="",
+            size_bytes=1000,
+            state="downloading",
+            progress=progress,
+            num_seeds=seeds,
+        )
 
     _entries = {
         "a" * 40: _entry("a" * 40, 0),
@@ -2473,19 +2840,31 @@ async def test_cancel_stalled_none_and_client_error(tmp_path: Path):
     """No stalled group explains; a dead client fails honestly."""
     from racing_sync.clients.abstract import Torrent
 
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="c" * 40, source_name="Live.Show",
-                     state=State.DOWNLOADING),
-    ])
-    bot._coord.dest_client.list_torrents = AsyncMock(return_value=[
-        Torrent(hash="c" * 40, name="x", category="", save_path="",
-                size_bytes=1000, state="downloading", progress=0.1,
-                num_seeds=4),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(
+                source_infohash="c" * 40, source_name="Live.Show", state=State.DOWNLOADING
+            ),
+        ],
+    )
+    bot._coord.dest_client.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash="c" * 40,
+                name="x",
+                category="",
+                save_path="",
+                size_bytes=1000,
+                state="downloading",
+                progress=0.1,
+                num_seeds=4,
+            ),
+        ]
+    )
     try:
         await bot._handle_chat_message(_message(text="/cancel_stalled"))
-        assert "No stalled downloads" in \
-            bot._bot.send_message.call_args[0][1]
+        assert "No stalled downloads" in bot._bot.send_message.call_args[0][1]
         assert store.get("c" * 40) is not None
 
         async def _boom(**kw):
@@ -2505,15 +2884,28 @@ async def test_cancel_stalled_single_copy_uses_normal_sheet(tmp_path: Path):
     """One stalled copy skips the bulk sheet for its forget question."""
     from racing_sync.clients.abstract import Torrent
 
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="a" * 40, source_name="Dead.Solo",
-                     state=State.DOWNLOADING),
-    ])
-    bot._coord.dest_client.list_torrents = AsyncMock(return_value=[
-        Torrent(hash="a" * 40, name="x", category="", save_path="",
-                size_bytes=1000, state="downloading", progress=0.0,
-                num_seeds=0),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(
+                source_infohash="a" * 40, source_name="Dead.Solo", state=State.DOWNLOADING
+            ),
+        ],
+    )
+    bot._coord.dest_client.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash="a" * 40,
+                name="x",
+                category="",
+                save_path="",
+                size_bytes=1000,
+                state="downloading",
+                progress=0.0,
+                num_seeds=0,
+            ),
+        ]
+    )
     try:
         await bot._handle_chat_message(_message(text="/cancel_stalled"))
         _data = _sheet_data(bot)
@@ -2527,15 +2919,11 @@ def test_cancel_stalled_protocol_shapes():
     """Stalled scope parses, fits buttons, and routes both questions."""
     from racing_sync.telegram_bot import _parse_action_data
 
-    for data in ("forget:stalled:1", "forget:stalled:0",
-                 "keep:stalled:1:yes", "keep:stalled:0:no"):
+    for data in ("forget:stalled:1", "forget:stalled:0", "keep:stalled:1:yes", "keep:stalled:0:no"):
         assert len(data) <= 64
-    assert _parse_action_data("forget:stalled:1") == (
-        "forget", False, "stalled", "", True)
-    assert _parse_action_data("keep:stalled:0:no") == (
-        "keep", False, "stalled", "no", False)
-    assert _parse_action_data("keep:stalled:1:yes") == (
-        "keep", False, "stalled", "yes", True)
+    assert _parse_action_data("forget:stalled:1") == ("forget", False, "stalled", "", True)
+    assert _parse_action_data("keep:stalled:0:no") == ("keep", False, "stalled", "no", False)
+    assert _parse_action_data("keep:stalled:1:yes") == ("keep", False, "stalled", "yes", True)
 
 
 def test_cancel_scope_round_trip():
@@ -2543,10 +2931,13 @@ def test_cancel_scope_round_trip():
     from racing_sync.telegram_bot import CancelScope, _parse_action_data
 
     h = "a" * 40
-    for scope in (CancelScope("single", h), CancelScope("group", h),
-                  CancelScope("match", "dG9r"), CancelScope("stalled", "")):
-        cmd, all_, ph, choice, ig = _parse_action_data(
-            f"forget:{scope.to_data()}:1")
+    for scope in (
+        CancelScope("single", h),
+        CancelScope("group", h),
+        CancelScope("match", "dG9r"),
+        CancelScope("stalled", ""),
+    ):
+        cmd, all_, ph, choice, ig = _parse_action_data(f"forget:{scope.to_data()}:1")
         assert (cmd, choice, ig) == ("forget", "", True)
         back = CancelScope.from_parsed(all_, ph)
         assert (back.kind, back.key) == (scope.kind, scope.key)
@@ -2556,23 +2947,25 @@ def test_cancel_scope_round_trip():
 async def test_cancel_scope_resolve_and_remember_parity(tmp_path: Path):
     """Resolve finds the live set per kind; Q1 sheets share one shape."""
     from racing_sync.telegram_bot import (
-        CancelScope, ScopeGone, _match_token,
+        CancelScope,
+        ScopeGone,
+        _match_token,
     )
 
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="a" * 40, source_name="Same.Show",
-                     state=State.QUEUED),
-        TorrentState(source_infohash="b" * 40, source_name="Same.Show",
-                     state=State.QUEUED),
-    ])
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(source_infohash="a" * 40, source_name="Same.Show", state=State.QUEUED),
+            TorrentState(source_infohash="b" * 40, source_name="Same.Show", state=State.QUEUED),
+        ],
+    )
     try:
         r = await CancelScope("single", "a" * 40).resolve(bot)
         assert r.hashes == ["a" * 40] and r.scope == "a" * 40
         r = await CancelScope("group", "a" * 40).resolve(bot)
         assert sorted(r.hashes) == ["a" * 40, "b" * 40]
         assert r.scope == "all:" + "a" * 40
-        r = await CancelScope(
-            "match", _match_token("same")).resolve(bot)
+        r = await CancelScope("match", _match_token("same")).resolve(bot)
         assert sorted(r.hashes) == ["a" * 40, "b" * 40]
         with pytest.raises(ScopeGone) as exc:
             await CancelScope("single", "e" * 40).resolve(bot)
@@ -2580,16 +2973,17 @@ async def test_cancel_scope_resolve_and_remember_parity(tmp_path: Path):
         with pytest.raises(ScopeGone) as exc:
             await CancelScope("group", "e" * 40).resolve(bot)
         assert str(exc.value) == "Group changed — tap /act again."
-        for scope in (CancelScope("single", "a" * 40),
-                      CancelScope("group", "a" * 40),
-                      CancelScope("match", "dG9r"),
-                      CancelScope("stalled", "")):
+        for scope in (
+            CancelScope("single", "a" * 40),
+            CancelScope("group", "a" * 40),
+            CancelScope("match", "dG9r"),
+            CancelScope("stalled", ""),
+        ):
             text, rows = scope.remember_sheet("Forget X?")
             flat = [d for r in rows for (_, d) in r]
             assert f"forget:{scope.to_data()}:1" in flat
             assert f"forget:{scope.to_data()}:0" in flat
-            assert ("Close", "abort") in [
-                t for r in rows for t in r]
+            assert ("Close", "abort") in [t for r in rows for t in r]
             assert text.startswith("Forget X?")
             assert "Ignore blocks it from coming back" in text
     finally:
@@ -2601,14 +2995,30 @@ def _work_bot(tmp_path: Path, **kw):
     from racing_sync.clients.abstract import Torrent
 
     _root = tmp_path / "ssd"
-    bot, store, _ssd = _match_bot(tmp_path, [
-        TorrentState(source_infohash="a" * 40, source_name="Work.Show",
-                     total_bytes=1000, save_path=str(_root),
-                     state=State.DOWNLOADING),
-    ])
-    _entries = {"a" * 40: Torrent(
-        hash="a" * 40, name="x", category="", save_path="",
-        size_bytes=1000, state="downloading", progress=0.4, num_seeds=2)}
+    bot, store, _ssd = _match_bot(
+        tmp_path,
+        [
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Work.Show",
+                total_bytes=1000,
+                save_path=str(_root),
+                state=State.DOWNLOADING,
+            ),
+        ],
+    )
+    _entries = {
+        "a" * 40: Torrent(
+            hash="a" * 40,
+            name="x",
+            category="",
+            save_path="",
+            size_bytes=1000,
+            state="downloading",
+            progress=0.4,
+            num_seeds=2,
+        )
+    }
 
     async def _list(hashes=None, **k):
         if hashes is None:
@@ -2668,7 +3078,8 @@ async def test_working_mark_failure_still_executes(tmp_path: Path):
 
     bot, store = _work_bot(tmp_path)
     bot._bot.edit_message_text = AsyncMock(
-        side_effect=TelegramError("Flood control exceeded. Retry in 5"))
+        side_effect=TelegramError("Flood control exceeded. Retry in 5")
+    )
     try:
         q = _query(f"keep:{'a' * 40}:1:no")
         q.message.text = "Cancel Work.Show — keep downloaded files?"

@@ -21,7 +21,7 @@ def test_render_active_pagination_and_numbering():
     for i in range(12):
         ts = TorrentState(
             source_infohash=f"hash{i:02d}abcdef1234567890abcdef1234567890",
-            source_name=f"[DummySub] Release Title - {i+1:02d} (1080p) [ABCD{i:04d}].mkv",
+            source_name=f"[DummySub] Release Title - {i + 1:02d} (1080p) [ABCD{i:04d}].mkv",
             state=State.DOWNLOADING if i % 2 == 0 else State.QUEUED,
             source_announce_url="http://nyaa.tracker.wf:7777/announce",
             total_bytes=(i + 1) * 1024 * 1024 * 1024,
@@ -81,7 +81,7 @@ def test_render_active_pagination_and_numbering():
 
 def test_keyboard_builder():
     bot = TelegramBot(TelegramConfig(bot_token="fake:token", chat_id="12345"), None, None)
-    
+
     # 1 page -> refresh + filter rows
     kb1 = bot._build_keyboard(current_page=0, total_pages=1)
     assert kb1 is not None
@@ -89,10 +89,8 @@ def test_keyboard_builder():
     assert kb1.inline_keyboard[0][0].text == "🔄 Refresh"
     # Filter row: All bracketed when active, ov button present.
     _frow = kb1.inline_keyboard[1]
-    assert [b.text for b in _frow] == (
-        ["·All·", "DL", "MV", "RD", "QD", "📊"])
-    assert all((b.callback_data or "").startswith("status:")
-               for b in _frow)
+    assert [b.text for b in _frow] == (["·All·", "DL", "MV", "RD", "QD", "📊"])
+    assert all((b.callback_data or "").startswith("status:") for b in _frow)
 
     # 3 pages -> Prev, Page, Next, Refresh, filters
     kb3 = bot._build_keyboard(current_page=1, total_pages=3)
@@ -105,10 +103,8 @@ def test_keyboard_builder():
     assert kb3.inline_keyboard[1][0].text == "🔄 Refresh"
 
     # Active filter marking follows the argument.
-    kb_dl = bot._build_keyboard(current_page=0, total_pages=1,
-                                status_filter="dl")
-    assert [b.text for b in kb_dl.inline_keyboard[1]] == (
-        ["All", "·DL·", "MV", "RD", "QD", "📊"])
+    kb_dl = bot._build_keyboard(current_page=0, total_pages=1, status_filter="dl")
+    assert [b.text for b in kb_dl.inline_keyboard[1]] == (["All", "·DL·", "MV", "RD", "QD", "📊"])
 
 
 def test_render_detail_formatting():
@@ -228,6 +224,7 @@ async def test_send_one_detail_handles_timedelta_retry_after():
         def __init__(self, retry_after):
             self._mock_retry = retry_after
             super().__init__(1)
+
         @property
         def retry_after(self):
             return self._mock_retry
@@ -236,6 +233,7 @@ async def test_send_one_detail_handles_timedelta_retry_after():
     bot._bot.send_message = AsyncMock(side_effect=err)
 
     from racing_sync.telegram_bot import _FloodBackoff
+
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with pytest.raises(_FloodBackoff) as _exc:
             await bot._send_one_detail("abc123", 0.5)
@@ -251,8 +249,7 @@ def test_flood_wait_seconds_helper():
     from telegram.error import RetryAfter, TelegramError
     from racing_sync.telegram_bot import _flood_wait_seconds
 
-    assert _flood_wait_seconds(TelegramError(
-        "Flood control exceeded. Retry in 39 seconds")) == 47
+    assert _flood_wait_seconds(TelegramError("Flood control exceeded. Retry in 39 seconds")) == 47
     assert _flood_wait_seconds(TelegramError("Too Many Requests")) == 7
     assert _flood_wait_seconds(TelegramError("Bad Request: message is empty")) is None
     assert _flood_wait_seconds(ValueError("nope")) is None
@@ -261,6 +258,7 @@ def test_flood_wait_seconds_helper():
         def __init__(self, v):
             self._v = v
             super().__init__(1)
+
         @property
         def retry_after(self):
             return self._v
@@ -290,8 +288,9 @@ async def test_send_one_detail_recovers_plain_flood_edit():
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
 
     h = "8af4598b" + "0" * 32
-    ts = TorrentState(source_infohash=h, source_name="Show.S04E03",
-                      state=State.DONE, total_bytes=1000)
+    ts = TorrentState(
+        source_infohash=h, source_name="Show.S04E03", state=State.DONE, total_bytes=1000
+    )
     bot._store.get.return_value = ts
     bot._store.get_telegram_message_id.return_value = 111
     bot._detail_cache[h] = 111
@@ -331,10 +330,12 @@ async def test_send_one_detail_send_path_flood_raises_to_loop():
 
     h = "b" * 40
     bot._store.get.return_value = TorrentState(
-        source_infohash=h, source_name="New.Show", state=State.QUEUED)
+        source_infohash=h, source_name="New.Show", state=State.QUEUED
+    )
     bot._store.get_telegram_message_id.return_value = None
     bot._bot.send_message = AsyncMock(
-        side_effect=TelegramError("Too Many Requests: retry after 12"))
+        side_effect=TelegramError("Too Many Requests: retry after 12")
+    )
 
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with pytest.raises(_FloodBackoff) as _exc:
@@ -359,11 +360,13 @@ async def test_send_one_detail_non_flood_error_still_drops():
 
     h = "c" * 40
     bot._store.get.return_value = TorrentState(
-        source_infohash=h, source_name="Bad.Show", state=State.DOWNLOADING)
+        source_infohash=h, source_name="Bad.Show", state=State.DOWNLOADING
+    )
     bot._store.get_telegram_message_id.return_value = 111
     bot._detail_cache[h] = 111
     bot._bot.edit_message_text = AsyncMock(
-        side_effect=TelegramError("Bad Request: message is too long"))
+        side_effect=TelegramError("Bad Request: message is too long")
+    )
 
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         await bot._send_one_detail(h, None)
@@ -381,8 +384,7 @@ async def test_stale_net_requeues_drifted_cards_only():
         bot = object.__new__(TelegramBot)
         bot._bot = MagicMock()
         bot._bot.edit_message_text = AsyncMock()
-        bot._bot.send_message = AsyncMock(
-            return_value=MagicMock(message_id=99))
+        bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=99))
         bot._store = MagicMock()
         bot._coord = MagicMock()
         bot._coord.live_progress_map.return_value = {}
@@ -396,8 +398,9 @@ async def test_stale_net_requeues_drifted_cards_only():
         bot._detail_sent_state = dict(sent_map)
         h = "d" * 40
         bot._store.list_active_inflight.return_value = [
-            TorrentState(source_infohash=h, source_name="Drifted",
-                         state=State.DONE, total_bytes=1000),
+            TorrentState(
+                source_infohash=h, source_name="Drifted", state=State.DONE, total_bytes=1000
+            ),
         ]
         await bot._refresh_active_message_inner()
         got = []
@@ -413,17 +416,20 @@ async def test_stale_net_requeues_drifted_cards_only():
 
 def test_render_active_shows_wait_note_for_deferred_rows():
     waiter = TorrentState(
-        source_infohash="e" * 40, source_name="Twin.Show.S01E01",
-        state=State.NEW, total_bytes=1000,
+        source_infohash="e" * 40,
+        source_name="Twin.Show.S01E01",
+        state=State.NEW,
+        total_bytes=1000,
         source_announce_url="https://alpha.cc/announce/xyz",
     )
     fresh = TorrentState(
-        source_infohash="f" * 40, source_name="Fresh.Show.S01E01",
-        state=State.NEW, total_bytes=1000,
+        source_infohash="f" * 40,
+        source_name="Fresh.Show.S01E01",
+        state=State.NEW,
+        total_bytes=1000,
     )
     notes = {"e" * 40: "Waiting turn · dl-indexer.example.net copy first"}
-    text, _, _ = render_active([(waiter, None), (fresh, None)],
-                               page=0, page_size=5, notes=notes)
+    text, _, _ = render_active([(waiter, None), (fresh, None)], page=0, page_size=5, notes=notes)
     # Compact wait form with the short winning-tracker label on the
     # tracker's ▸ line (no separate Source: line).
     assert "1. `Twin.Show.S01E01`" in text
@@ -432,11 +438,12 @@ def test_render_active_shows_wait_note_for_deferred_rows():
     assert "🆕 New" in text
     # Notes never leak onto other states.
     other = TorrentState(
-        source_infohash="e" * 40, source_name="Twin.Show.S01E01",
-        state=State.DOWNLOADING, total_bytes=1000,
+        source_infohash="e" * 40,
+        source_name="Twin.Show.S01E01",
+        state=State.DOWNLOADING,
+        total_bytes=1000,
     )
-    text2, _, _ = render_active([(other, 0.5)], page=0, page_size=5,
-                                notes=notes)
+    text2, _, _ = render_active([(other, 0.5)], page=0, page_size=5, notes=notes)
     assert "Waiting turn" not in text2
     assert "⬇️ Downloading · 50.0% · ████░░░░" in text2
 
@@ -444,22 +451,28 @@ def test_render_active_shows_wait_note_for_deferred_rows():
 def test_render_active_groups_same_file_trackers():
     """Same file from two trackers: one heading, two lines, gid commands."""
     lead = TorrentState(
-        source_infohash="a" * 40, source_name="Twin.Show.S01E01",
-        state=State.WAITING_INDEXER, total_bytes=1000, indexer_attempts=3,
+        source_infohash="a" * 40,
+        source_name="Twin.Show.S01E01",
+        state=State.WAITING_INDEXER,
+        total_bytes=1000,
+        indexer_attempts=3,
         source_announce_url="https://alpha.cc/announce/xyz",
     )
     sib = TorrentState(
-        source_infohash="b" * 40, source_name="Twin.Show.S01E01",
-        state=State.DOWNLOADING, total_bytes=1000,
+        source_infohash="b" * 40,
+        source_name="Twin.Show.S01E01",
+        state=State.DOWNLOADING,
+        total_bytes=1000,
         source_announce_url="https://bte.example/announce",
     )
     other = TorrentState(
-        source_infohash="c" * 40, source_name="Other.Show.S01E01",
-        state=State.QUEUED, total_bytes=2000,
+        source_infohash="c" * 40,
+        source_name="Other.Show.S01E01",
+        state=State.QUEUED,
+        total_bytes=2000,
         source_announce_url="https://alpha.cc/announce/xyz",
     )
-    text, cur, total = render_active(
-        [(lead, None), (sib, 0.5), (other, None)], page=0, page_size=5)
+    text, cur, total = render_active([(lead, None), (sib, 0.5), (other, None)], page=0, page_size=5)
     assert cur == 0 and total == 1
     # Copies vs titles in the header; pages count groups.
     assert "*Active Tasks (3 copies · 2 titles)* · *Page 1/1*" in text
@@ -478,11 +491,10 @@ def test_render_active_groups_same_file_trackers():
     assert "/keep" not in text and "/prefer" not in text and "/fetch" not in text
     # Sibling choice rides on hash button labels.
     from racing_sync.telegram_bot import _member_button_labels, _now_eligible_hashes
-    assert _member_button_labels([lead, sib]) == [
-        ("a" * 40, "alpha"), ("b" * 40, "bte")]
+
+    assert _member_button_labels([lead, sib]) == [("a" * 40, "alpha"), ("b" * 40, "bte")]
     assert _now_eligible_hashes([lead, sib], {}) == ["a" * 40]
-    snap_cancel = [(h, lbl) for (h, lbl) in
-                   _member_button_labels([lead, sib])]
+    snap_cancel = [(h, lbl) for (h, lbl) in _member_button_labels([lead, sib])]
     assert [h for (h, _) in snap_cancel] == ["a" * 40, "b" * 40]
     assert snap_cancel[1] == ("b" * 40, "bte")
 
@@ -492,26 +504,28 @@ def test_render_active_sibling_prefer_uses_own_hash():
     from racing_sync.telegram_bot import _member_button_labels, _now_eligible_hashes
 
     lead = TorrentState(
-        source_infohash="a" * 40, source_name="Twin.Show.S01E01",
-        state=State.QUEUED, total_bytes=1000,
+        source_infohash="a" * 40,
+        source_name="Twin.Show.S01E01",
+        state=State.QUEUED,
+        total_bytes=1000,
         source_announce_url="https://alpha.cc/announce/xyz",
     )
     sib = TorrentState(
-        source_infohash="b" * 40, source_name="Twin.Show.S01E01",
-        state=State.NEW, total_bytes=1000,
+        source_infohash="b" * 40,
+        source_name="Twin.Show.S01E01",
+        state=State.NEW,
+        total_bytes=1000,
         source_announce_url="https://bte.example/announce",
     )
     notes = {"b" * 40: "Waiting for preferred copy (grace 12m left)"}
-    text, _, _ = render_active([(lead, None), (sib, None)],
-                               page=0, page_size=5, notes=notes)
+    text, _, _ = render_active([(lead, None), (sib, None)], page=0, page_size=5, notes=notes)
     # One group, one heading; action entry per group (no hashes).
     assert text.count("Twin.Show.S01E01") == 1
     assert "/act\\_1" in text
     assert "/cancel\\_aaaaaaaaaa" not in text
     assert "/now\\_bbbbbbbbbb" not in text
     # The grace-held sibling labels with its own hash and is eligible.
-    assert _member_button_labels([lead, sib]) == [
-        ("a" * 40, "alpha"), ("b" * 40, "bte")]
+    assert _member_button_labels([lead, sib]) == [("a" * 40, "alpha"), ("b" * 40, "bte")]
     assert _now_eligible_hashes(
         [lead, sib],
         {"b" * 40: "Waiting for preferred copy (grace 12m left)"},
@@ -523,31 +537,34 @@ def test_member_button_labels_skip_malformed_and_disambiguate():
     from racing_sync.telegram_bot import _member_button_labels
 
     mk = lambda h, st, dom, name="Show.X": TorrentState(  # noqa: E731
-        source_infohash=h, source_name=name,
-        state=st, total_bytes=1000,
-        source_announce_url=f"https://{dom}/announce")
+        source_infohash=h,
+        source_name=name,
+        state=st,
+        total_bytes=1000,
+        source_announce_url=f"https://{dom}/announce",
+    )
     a = mk("a" * 40, State.WAITING_INDEXER, "alpha.cc", "Show.One.S01E01")
     bad = mk("zzz-not-hex", State.WAITING_INDEXER, "evil.example", "Show.One.S01E01")
-    assert _member_button_labels([a, bad]) == [
-        ("a" * 40, "alpha")]
+    assert _member_button_labels([a, bad]) == [("a" * 40, "alpha")]
 
     b = mk("b" * 40, State.WAITING_INDEXER, "alpha.cc", "Show.Two.S01E01")
     assert _member_button_labels([b]) == [("b" * 40, "alpha")]
     # Same label twice inside one group: second gains the short hash.
     c = mk("c" * 40, State.WAITING_INDEXER, "alpha.cc", "Dupe.Show.S01E01")
     d = mk("d" * 40, State.WAITING_INDEXER, "alpha.cc", "Dupe.Show.S01E01")
-    assert _member_button_labels([c, d]) == [
-        ("c" * 40, "alpha"), ("d" * 40, f"alpha {'d' * 6}")]
+    assert _member_button_labels([c, d]) == [("c" * 40, "alpha"), ("d" * 40, f"alpha {'d' * 6}")]
 
 
 def test_render_detail_shows_wait_note():
     from racing_sync.telegram_bot import render_detail
 
-    ts = TorrentState(source_infohash="e" * 40, source_name="Twin.Show",
-                      state=State.NEW, total_bytes=1000)
+    ts = TorrentState(
+        source_infohash="e" * 40, source_name="Twin.Show", state=State.NEW, total_bytes=1000
+    )
     assert "Waiting turn" not in render_detail(ts)
     assert "⏳ Waiting turn · dl-indexer.example.net copy first" in render_detail(
-        ts, None, "Waiting turn · dl-indexer.example.net copy first")
+        ts, None, "Waiting turn · dl-indexer.example.net copy first"
+    )
 
 
 @pytest.mark.anyio
@@ -559,13 +576,13 @@ async def test_refresh_attaches_watch_wait_notes():
     bot = object.__new__(TelegramBot)
     bot._bot = MagicMock()
     bot._bot.edit_message_text = AsyncMock()
-    bot._bot.send_message = AsyncMock(
-        return_value=MagicMock(message_id=99))
+    bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=99))
     bot._store = MagicMock()
     bot._coord = MagicMock()
     bot._coord.live_progress_map.return_value = {}
     bot._coord._watch_wait_note = MagicMock(
-        return_value="Waiting turn · dl-indexer.example.net copy first")
+        return_value="Waiting turn · dl-indexer.example.net copy first"
+    )
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
     bot._current_page = 0
     bot._active_msg_id = None
@@ -576,9 +593,13 @@ async def test_refresh_attaches_watch_wait_notes():
     bot._detail_sent_state = {}
     h = "e" * 40
     bot._store.list_active_inflight.return_value = [
-        TorrentState(source_infohash=h, source_name="Twin.Show",
-                     state=State.NEW, total_bytes=1000,
-                     source_announce_url="https://alpha.cc/announce/xyz"),
+        TorrentState(
+            source_infohash=h,
+            source_name="Twin.Show",
+            state=State.NEW,
+            total_bytes=1000,
+            source_announce_url="https://alpha.cc/announce/xyz",
+        ),
     ]
     await bot._refresh_active_message_inner()
     sent_text = bot._bot.send_message.call_args[0][1]
@@ -590,14 +611,15 @@ def test_inflight_note_for_shapes():
     from unittest.mock import MagicMock
     from racing_sync.telegram_bot import _inflight_note_for
 
-    ts = TorrentState(source_infohash="a" * 40, source_name="Show",
-                      state=State.WAITING_INDEXER)
+    ts = TorrentState(source_infohash="a" * 40, source_name="Show", state=State.WAITING_INDEXER)
     leader = TorrentState(
-        source_infohash="b" * 40, source_name="Show",
-        state=State.DOWNLOADING, total_bytes=1000,
-        source_announce_url="https://bte.example/announce")
-    assert _inflight_note_for(ts, leader) == (
-        "Waiting for bte copy · downloading")
+        source_infohash="b" * 40,
+        source_name="Show",
+        state=State.DOWNLOADING,
+        total_bytes=1000,
+        source_announce_url="https://bte.example/announce",
+    )
+    assert _inflight_note_for(ts, leader) == ("Waiting for bte copy · downloading")
     assert _inflight_note_for(ts, None) == ""
     # Test doubles answer truthy to everything: never a note.
     assert _inflight_note_for(ts, MagicMock()) == ""
@@ -606,13 +628,17 @@ def test_inflight_note_for_shapes():
 
 def test_render_active_waiting_indexer_shows_deferral_note():
     h = "a" * 40
-    ts = TorrentState(source_infohash=h, source_name="Twin.Show",
-                      state=State.WAITING_INDEXER, total_bytes=1000,
-                      indexer_attempts=13,
-                      source_announce_url="https://alpha.cc/announce/xyz")
+    ts = TorrentState(
+        source_infohash=h,
+        source_name="Twin.Show",
+        state=State.WAITING_INDEXER,
+        total_bytes=1000,
+        indexer_attempts=13,
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
     text, _, _ = render_active(
-        [(ts, None)], page=0, page_size=5,
-        notes={h: "Waiting for bte copy · downloading"})
+        [(ts, None)], page=0, page_size=5, notes={h: "Waiting for bte copy · downloading"}
+    )
     assert "⏳ Waiting for bte copy · downloading" in text
     assert "miss #13" not in text
     # No note: the miss count stays.
@@ -629,16 +655,20 @@ async def test_refresh_attaches_inflight_deferral_note():
     bot = object.__new__(TelegramBot)
     bot._bot = MagicMock()
     bot._bot.edit_message_text = AsyncMock()
-    bot._bot.send_message = AsyncMock(
-        return_value=MagicMock(message_id=99))
+    bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=99))
     bot._store = MagicMock()
     bot._coord = MagicMock()
     bot._coord.live_progress_map.return_value = {}
     bot._coord._watch_wait_note = MagicMock(return_value="")
-    bot._coord._inflight_same_content = MagicMock(return_value=TorrentState(
-        source_infohash="b" * 40, source_name="Twin.Show",
-        state=State.DOWNLOADING, total_bytes=1000,
-        source_announce_url="https://bte.example/announce"))
+    bot._coord._inflight_same_content = MagicMock(
+        return_value=TorrentState(
+            source_infohash="b" * 40,
+            source_name="Twin.Show",
+            state=State.DOWNLOADING,
+            total_bytes=1000,
+            source_announce_url="https://bte.example/announce",
+        )
+    )
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
     bot._current_page = 0
     bot._active_msg_id = None
@@ -649,10 +679,14 @@ async def test_refresh_attaches_inflight_deferral_note():
     bot._detail_sent_state = {}
     h = "a" * 40
     bot._store.list_active_inflight.return_value = [
-        TorrentState(source_infohash=h, source_name="Twin.Show",
-                     state=State.WAITING_INDEXER, total_bytes=1000,
-                     indexer_attempts=13,
-                     source_announce_url="https://alpha.cc/announce/xyz"),
+        TorrentState(
+            source_infohash=h,
+            source_name="Twin.Show",
+            state=State.WAITING_INDEXER,
+            total_bytes=1000,
+            indexer_attempts=13,
+            source_announce_url="https://alpha.cc/announce/xyz",
+        ),
     ]
     await bot._refresh_active_message_inner()
     sent_text = bot._bot.send_message.call_args[0][1]
@@ -662,6 +696,7 @@ async def test_refresh_attaches_inflight_deferral_note():
 
 def test_render_active_deterministic_cache_key():
     import time
+
     ts = TorrentState(
         source_infohash="hash1",
         source_name="My.Show.S01E01",
@@ -687,6 +722,7 @@ def test_telegram_outbound_rate_interval():
 
 def test_render_detail_and_active_4096_char_cap():
     from racing_sync.telegram_bot import render_detail
+
     ts = TorrentState(
         source_infohash="longhash123",
         source_name="A" * 5000,
@@ -705,9 +741,11 @@ def test_render_detail_and_active_4096_char_cap():
 async def test_active_repost_deletes_and_resends_as_newest():
     import time
     from unittest.mock import AsyncMock, MagicMock
+
     bot = object.__new__(TelegramBot)
-    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345",
-                              active_repost_interval_seconds=10)
+    bot._cfg = TelegramConfig(
+        enabled=True, bot_token="fake", chat_id="12345", active_repost_interval_seconds=10
+    )
     bot._bot = MagicMock()
     bot._bot.delete_message = AsyncMock()
     bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=222))
@@ -740,9 +778,11 @@ async def test_active_repost_skipped_when_already_last():
     """Interval elapsed but nothing newer arrived: no churn, stay put."""
     import time
     from unittest.mock import AsyncMock, MagicMock
+
     bot = object.__new__(TelegramBot)
-    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345",
-                              active_repost_interval_seconds=10)
+    bot._cfg = TelegramConfig(
+        enabled=True, bot_token="fake", chat_id="12345", active_repost_interval_seconds=10
+    )
     bot._bot = MagicMock()
     bot._bot.delete_message = AsyncMock()
     bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=333))
@@ -772,10 +812,12 @@ async def test_active_repost_skipped_when_already_last():
 async def test_active_repost_skipped_when_disabled_or_not_due():
     import time
     from unittest.mock import AsyncMock, MagicMock
+
     for interval, last_repost_ago in ((0, 3600.0), (60, 5.0)):
         bot = object.__new__(TelegramBot)
-        bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345",
-                                  active_repost_interval_seconds=interval)
+        bot._cfg = TelegramConfig(
+            enabled=True, bot_token="fake", chat_id="12345", active_repost_interval_seconds=interval
+        )
         bot._bot = MagicMock()
         bot._bot.delete_message = AsyncMock()
         bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=333))
@@ -803,6 +845,7 @@ async def test_active_repost_skipped_when_disabled_or_not_due():
 @pytest.mark.anyio
 async def test_callback_authentication_and_throttling():
     from unittest.mock import AsyncMock, MagicMock
+
     bot = object.__new__(TelegramBot)
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
     bot._store = MagicMock()
@@ -836,6 +879,7 @@ async def test_callback_authentication_and_throttling():
 
 def _action_query(data, chat="12345", user="12345"):
     from unittest.mock import AsyncMock, MagicMock
+
     q = MagicMock()
     q.message.chat.id = int(chat)
     q.from_user.id = int(user)
@@ -846,6 +890,7 @@ def _action_query(data, chat="12345", user="12345"):
 
 def _action_bot(**kw):
     from unittest.mock import AsyncMock
+
     bot = object.__new__(TelegramBot)
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
     bot._callback_times = {}
@@ -860,6 +905,7 @@ def _action_bot(**kw):
 async def test_callback_go_starts_copy_and_refreshes():
     """Tapping a hash go button starts that copy via fetch path."""
     from unittest.mock import AsyncMock
+
     bot = _action_bot()
     bot._fetch_torrent = AsyncMock(return_value="Fetching original for X")
     bot._reply = AsyncMock()
@@ -874,18 +920,18 @@ async def test_callback_go_starts_copy_and_refreshes():
 async def test_callback_cancel_opens_keep_question():
     """Tapping a hash cancel button asks remember-first (deletes nothing)."""
     from unittest.mock import AsyncMock, MagicMock
+
     bot = _action_bot()
     bot._store = MagicMock()
     bot._store.get.return_value = TorrentState(
-        source_infohash="b" * 40, source_name="Twin.Show",
-        state=State.WAITING_INDEXER)
+        source_infohash="b" * 40, source_name="Twin.Show", state=State.WAITING_INDEXER
+    )
     bot._bot = MagicMock()
     bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
     bot._refresh_active_message = AsyncMock()
     await bot._handle_callback(_action_query(f"cancel:{'b' * 40}"))
     _kwargs = bot._bot.send_message.call_args[1]
-    _data = [b.callback_data for r in
-             _kwargs["reply_markup"].inline_keyboard for b in r]
+    _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
     assert f"forget:{'b' * 40}:1" in _data
     assert f"forget:{'b' * 40}:0" in _data
 
@@ -894,26 +940,37 @@ async def test_callback_cancel_opens_keep_question():
 async def test_callback_cancel_all_resolves_live_group():
     """cancel:all:<leader> asks remember-first over the live group."""
     from unittest.mock import AsyncMock, MagicMock
+
     bot = _action_bot()
     bot._store = MagicMock()
     bot._store.get.return_value = TorrentState(
-        source_infohash="a" * 40, source_name="Twin.Show",
-        state=State.WAITING_INDEXER, total_bytes=1000,
-        source_announce_url="https://alpha.cc/announce/xyz")
+        source_infohash="a" * 40,
+        source_name="Twin.Show",
+        state=State.WAITING_INDEXER,
+        total_bytes=1000,
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
     bot._store.list_active_inflight.return_value = [
-        TorrentState(source_infohash="a" * 40, source_name="Twin.Show",
-                     state=State.WAITING_INDEXER, total_bytes=1000,
-                     source_announce_url="https://alpha.cc/announce/xyz"),
-        TorrentState(source_infohash="b" * 40, source_name="Twin.Show",
-                     state=State.WAITING_INDEXER, total_bytes=1000,
-                     source_announce_url="https://alpha.cc/announce/xyz"),
+        TorrentState(
+            source_infohash="a" * 40,
+            source_name="Twin.Show",
+            state=State.WAITING_INDEXER,
+            total_bytes=1000,
+            source_announce_url="https://alpha.cc/announce/xyz",
+        ),
+        TorrentState(
+            source_infohash="b" * 40,
+            source_name="Twin.Show",
+            state=State.WAITING_INDEXER,
+            total_bytes=1000,
+            source_announce_url="https://alpha.cc/announce/xyz",
+        ),
     ]
     bot._bot = MagicMock()
     bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=6))
     await bot._handle_callback(_action_query(f"cancel:all:{'a' * 40}"))
     _kwargs = bot._bot.send_message.call_args[1]
-    _data = [b.callback_data for r in
-             _kwargs["reply_markup"].inline_keyboard for b in r]
+    _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
     assert f"forget:all:{'a' * 40}:1" in _data
     assert "all 2 copies" in bot._bot.send_message.call_args[0][1]
 
@@ -927,12 +984,11 @@ async def test_callback_keep_yes_no_execute():
         bot = _action_bot()
         bot._store = MagicMock()
         bot._store.get.return_value = TorrentState(
-            source_infohash="a" * 40, source_name="Show",
-            state=State.WAITING_INDEXER)
+            source_infohash="a" * 40, source_name="Show", state=State.WAITING_INDEXER
+        )
         executed = {}
 
-        async def _fake_snapshot_cancel(hashes, title, *, delete_files,
-                                        remember=True):
+        async def _fake_snapshot_cancel(hashes, title, *, delete_files, remember=True):
             executed["args"] = (list(hashes), title, delete_files, remember)
             return "done"
 
@@ -953,6 +1009,7 @@ async def test_callback_keep_yes_no_execute():
 async def test_callback_abort_deletes_message():
     """Abort removes the sheet message; nothing acts."""
     from unittest.mock import AsyncMock, MagicMock
+
     bot = _action_bot()
     bot._bot = MagicMock()
     bot._bot.delete_message = AsyncMock()
@@ -972,6 +1029,7 @@ async def test_callback_abort_deletes_message():
 async def test_callback_stale_data_replies_stale():
     """Legacy index callbacks degrade to a stale hint, acting on nothing."""
     from unittest.mock import AsyncMock
+
     bot = _action_bot()
     bot._fetch_torrent = AsyncMock()
     bot._reply = AsyncMock()
@@ -986,26 +1044,36 @@ async def test_callback_stale_data_replies_stale():
 def test_keyboard_includes_action_rows():
     bot = object.__new__(TelegramBot)
     kb = bot._build_keyboard(
-        0, 1,
-        [[("alpha", f"go:{'a' * 40}"), ("bte", f"go:{'b' * 40}"),
-          ("All (2)", f"cancel:all:{'a' * 40}")],
-         [("Keep files", f"keep:{'a' * 40}:yes"),
-          ("Delete files", f"keep:{'a' * 40}:no")],
-          [("Close", "abort")]])
+        0,
+        1,
+        [
+            [
+                ("alpha", f"go:{'a' * 40}"),
+                ("bte", f"go:{'b' * 40}"),
+                ("All (2)", f"cancel:all:{'a' * 40}"),
+            ],
+            [("Keep files", f"keep:{'a' * 40}:yes"), ("Delete files", f"keep:{'a' * 40}:no")],
+            [("Close", "abort")],
+        ],
+    )
     rows = kb.inline_keyboard
     assert rows[0][0].text == "🔄 Refresh"
     assert [b.text for b in rows[1]] == ["alpha", "bte", "All (2)"]
     assert rows[1][0].callback_data == f"go:{'a' * 40}"
     assert rows[2][0].text == "Keep files"
     assert rows[3][0].text == "Close"
-    assert all(len(b.callback_data) <= 64 for r in rows for b in r
-               if (b.callback_data or "").startswith(
-                   ("go:", "cancel:", "keep:", "abort", "pick:")))
+    assert all(
+        len(b.callback_data) <= 64
+        for r in rows
+        for b in r
+        if (b.callback_data or "").startswith(("go:", "cancel:", "keep:", "abort", "pick:"))
+    )
 
 
 @pytest.mark.anyio
 async def test_detail_queue_overflow_evicts_oldest():
     import asyncio
+
     bot = object.__new__(TelegramBot)
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
     bot._bot = object()
@@ -1033,6 +1101,7 @@ async def test_detail_queue_overflow_evicts_oldest():
 async def test_active_msg_id_restored_from_store():
     from unittest.mock import AsyncMock, MagicMock, patch
     import unittest.mock
+
     bot = object.__new__(TelegramBot)
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
     bot._store = MagicMock()
@@ -1052,20 +1121,21 @@ async def test_active_msg_id_restored_from_store():
     assert bot._prev_active_msg_id == 778899
     bot._store.get_meta.assert_any_call("telegram_active_msg_id")
     # Stale online ping (>10m) → ping re-sent and timestamp recorded.
-    bot._store.set_meta.assert_called_with(
-        "telegram_online_ping_at", unittest.mock.ANY)
+    bot._store.set_meta.assert_called_with("telegram_online_ping_at", unittest.mock.ANY)
 
 
 @pytest.mark.anyio
 async def test_online_ping_debounced_when_recent():
     from unittest.mock import AsyncMock, MagicMock, patch
     import time as _time
+
     bot = object.__new__(TelegramBot)
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
     bot._store = MagicMock()
     bot._store.all.return_value = []
     bot._store.get_meta.side_effect = lambda k: (
-        str(_time.time()) if k == "telegram_online_ping_at" else None)
+        str(_time.time()) if k == "telegram_online_ping_at" else None
+    )
     bot._detail_cache = {}
     bot._active_msg_id = None
     bot._prev_active_msg_id = None
@@ -1133,12 +1203,10 @@ async def test_detail_card_offers_prefer_for_grace_note():
 
     bot = object.__new__(TelegramBot)
     bot._bot = MagicMock()
-    bot._bot.send_message = AsyncMock(
-        return_value=MagicMock(message_id=99))
+    bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=99))
     bot._store = MagicMock()
     bot._coord = MagicMock()
-    bot._coord._watch_wait_note = MagicMock(
-        return_value="Waiting for preferred copy · 42s left")
+    bot._coord._watch_wait_note = MagicMock(return_value="Waiting for preferred copy · 42s left")
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123")
     bot._detail_cache = {}
     bot._note_outbound = MagicMock()
@@ -1146,8 +1214,12 @@ async def test_detail_card_offers_prefer_for_grace_note():
     bot._store.get_telegram_message_id = MagicMock(return_value=None)
     h = "e" * 40
     bot._store.get.return_value = TorrentState(
-        source_infohash=h, source_name="Grace.Hold", state=State.NEW,
-        total_bytes=1000, source_announce_url="https://alpha.cc/announce/xyz")
+        source_infohash=h,
+        source_name="Grace.Hold",
+        state=State.NEW,
+        total_bytes=1000,
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
     await bot._send_one_detail(h, None)
     sent_text = bot._bot.send_message.call_args[0][1]
     assert "Start this copy now:" in sent_text
@@ -1161,27 +1233,31 @@ def test_render_active_offers_prefer_for_grace_note():
     from racing_sync.telegram_bot import _now_eligible_hashes
 
     h = "e" * 40
-    ts = TorrentState(source_infohash=h, source_name="Grace.Hold",
-                      state=State.NEW, total_bytes=1000,
-                      source_announce_url="https://alpha.cc/announce/xyz")
+    ts = TorrentState(
+        source_infohash=h,
+        source_name="Grace.Hold",
+        state=State.NEW,
+        total_bytes=1000,
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
     notes = {h: "Waiting for preferred copy ?? 42s left"}
-    text, _, _ = render_active(
-        [(ts, None)], page=0, page_size=5, notes=notes)
+    text, _, _ = render_active([(ts, None)], page=0, page_size=5, notes=notes)
     assert "/act\\_1" in text
     assert "/cancel\\_1" not in text
     assert f"{h[:10]}" not in text  # no torrent hash in the message
     assert "Start this copy now:" not in text
     assert _now_eligible_hashes([ts], notes) == [h]
     # Other notes (owner-deferred) and other states get no eligibility.
-    assert _now_eligible_hashes(
-        [ts], {h: "Waiting turn ?? example.net copy first"}) == []
-    ts_q = TorrentState(source_infohash=h, source_name="Grace.Hold",
-                        state=State.QUEUED, total_bytes=1000)
+    assert _now_eligible_hashes([ts], {h: "Waiting turn ?? example.net copy first"}) == []
+    ts_q = TorrentState(
+        source_infohash=h, source_name="Grace.Hold", state=State.QUEUED, total_bytes=1000
+    )
     assert _now_eligible_hashes([ts_q], notes) == []
 
 
 def test_short_tracker_label_generic_rule():
     from racing_sync.telegram_bot import _short_tracker_label
+
     assert _short_tracker_label("tracker.example.com") == "example"
     assert _short_tracker_label("nyaa.tracker.wf") == "nyaa"
     assert _short_tracker_label("example.cc") == "example"
@@ -1191,24 +1267,28 @@ def test_short_tracker_label_generic_rule():
 
 def test_size_compact():
     from racing_sync.telegram_bot import _size_compact
-    assert _size_compact(int(3.1 * 1024 ** 3)) == "3.1G"
+
+    assert _size_compact(int(3.1 * 1024**3)) == "3.1G"
     assert _size_compact(1000) == "1000 B"
 
 
 def test_compact_wait_note():
     from racing_sync.telegram_bot import _compact_wait_note
+
     assert _compact_wait_note("Waiting for preferred copy · 1908s left") == "Wait pref-copy 32m"
-    assert _compact_wait_note("Waiting turn · tracker.example.com copy first") == "Wait example first"
+    assert (
+        _compact_wait_note("Waiting turn · tracker.example.com copy first") == "Wait example first"
+    )
     assert _compact_wait_note("Waiting turn · public copy first") == "Wait public first"
     assert _compact_wait_note("something else") is None
 
 
 def test_render_active_appends_footer():
-    ts = TorrentState(source_infohash="a" * 40, source_name="Show",
-                      state=State.QUEUED, total_bytes=1000)
+    ts = TorrentState(
+        source_infohash="a" * 40, source_name="Show", state=State.QUEUED, total_bytes=1000
+    )
     footer = "______________________\n·  VPS1 Free: 10G\n·  SSD Free: 5G"
-    text, _, _ = render_active([(ts, None)], page=0, page_size=5,
-                               footer=footer)
+    text, _, _ = render_active([(ts, None)], page=0, page_size=5, footer=footer)
     assert text.endswith(footer)
     # No footer by default — message ends with the command line.
     text2, _, _ = render_active([(ts, None)], page=0, page_size=5)
@@ -1231,24 +1311,26 @@ async def test_active_footer_formats_storage(tmp_path):
     from types import SimpleNamespace
 
     async def _vps1_free():
-        return 120 * 1024 ** 3
+        return 120 * 1024**3
 
     coord = SimpleNamespace(
         cfg=SimpleNamespace(
             ssd=SimpleNamespace(path=tmp_path),
             cleanup=SimpleNamespace(
-                low_watermark_free_bytes=200 * 1024 ** 3,
-                critical_watermark_free_bytes=8 * 1024 ** 3,
+                low_watermark_free_bytes=200 * 1024**3,
+                critical_watermark_free_bytes=8 * 1024**3,
             ),
         ),
-        _ssd_reserved_total=lambda: 30 * 1024 ** 3,
+        _ssd_reserved_total=lambda: 30 * 1024**3,
         _source_free_bytes=_vps1_free,
     )
     bot = object.__new__(TelegramBot)
     bot._coord = coord
     bot._vps1_free_cache = None
     footer = await bot._active_footer()
-    assert footer.splitlines()[0] == "\\_" * 35  # escaped: raw ___ parses as italic and goes invisible
+    assert (
+        footer.splitlines()[0] == "\\_" * 35
+    )  # escaped: raw ___ parses as italic and goes invisible
     assert footer.splitlines()[1] == "·  VPS1 Free: 120.0G"
     assert footer.splitlines()[2].startswith("·  SSD Free: ")
     assert footer.splitlines()[2].endswith("·  rsv 30.0G")
@@ -1306,19 +1388,19 @@ def test_render_active_downloading_shows_speed_and_eta():
     from racing_sync.telegram_bot import _eta_human, _speed_human
 
     ts = TorrentState(
-        source_infohash="a" * 40, source_name="Fast.Show",
-        state=State.DOWNLOADING, total_bytes=1_000_000_000,
+        source_infohash="a" * 40,
+        source_name="Fast.Show",
+        state=State.DOWNLOADING,
+        total_bytes=1_000_000_000,
         source_announce_url="https://alpha.cc/announce/xyz",
     )
-    text, _, _ = render_active([(ts, 0.5)], page=0, page_size=5,
-                               speeds={"a" * 40: 10_000_000})
+    text, _, _ = render_active([(ts, 0.5)], page=0, page_size=5, speeds={"a" * 40: 10_000_000})
     assert "50.0%" in text and "████░░░░" in text
     assert "9.5M/s" in text and "ETA 50s" in text
     # Unknown speed: old shape (bar, no rate, no ETA guess).
     text2, _, _ = render_active([(ts, 0.5)], page=0, page_size=5)
     assert "50.0%" in text2 and "M/s" not in text2 and "ETA" not in text2
-    text3, _, _ = render_active([(ts, 0.5)], page=0, page_size=5,
-                                speeds={"a" * 40: 0})
+    text3, _, _ = render_active([(ts, 0.5)], page=0, page_size=5, speeds={"a" * 40: 0})
     assert "M/s" not in text3 and "ETA" not in text3
     assert _speed_human(0) == "" and _speed_human("bogus") == ""
     assert _speed_human(512) == "512 B/s"
@@ -1333,11 +1415,15 @@ def test_live_speed_map_aliases_and_clamps():
     coord = make_coordinator()
     coord._live = {
         "DESTHASH": LiveItem(
-            source_infohash="sourcehash", name="S", state="downloading",
-            progress=0.5, size_mb=1.0, dlspeed_bps=1234),
+            source_infohash="sourcehash",
+            name="S",
+            state="downloading",
+            progress=0.5,
+            size_mb=1.0,
+            dlspeed_bps=1234,
+        ),
     }
-    assert coord.live_speed_map() == {
-        "desthash": 1234, "sourcehash": 1234}
+    assert coord.live_speed_map() == {"desthash": 1234, "sourcehash": 1234}
     coord._live["DESTHASH"].dlspeed_bps = -5
     assert coord.live_speed_map()["desthash"] == 0
 
@@ -1349,10 +1435,8 @@ def test_live_totals_sums_speeds():
     coord = make_coordinator()
     assert coord.live_totals() == (0, 0)
     coord._live = {
-        "a": LiveItem("a", "A", "downloading", 0.5, 1.0,
-                      dlspeed_bps=1_000_000),
-        "b": LiveItem("b", "B", "downloading", 0.2, 1.0,
-                      dlspeed_bps=500_000),
+        "a": LiveItem("a", "A", "downloading", 0.5, 1.0, dlspeed_bps=1_000_000),
+        "b": LiveItem("b", "B", "downloading", 0.2, 1.0, dlspeed_bps=500_000),
     }
     assert coord.live_totals() == (1_500_000, 2)
 
@@ -1379,8 +1463,11 @@ def test_render_active_wait_indexer_shows_retry_countdown():
 
     soon = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=12)
     ts = TorrentState(
-        source_infohash="a" * 40, source_name="Wait.Show",
-        state=State.WAITING_INDEXER, total_bytes=1000, indexer_attempts=3,
+        source_infohash="a" * 40,
+        source_name="Wait.Show",
+        state=State.WAITING_INDEXER,
+        total_bytes=1000,
+        indexer_attempts=3,
         indexer_next_retry_at=soon,
         source_announce_url="https://alpha.cc/announce/xyz",
     )
@@ -1388,12 +1475,13 @@ def test_render_active_wait_indexer_shows_retry_countdown():
     assert "Wait indexer miss #3 · retry in 12m" in text
     # Spent/missing timer: old text, no countdown guess.
     ts2 = TorrentState(
-        source_infohash="b" * 40, source_name="Wait.Show",
-        state=State.WAITING_INDEXER, total_bytes=1000, indexer_attempts=3,
+        source_infohash="b" * 40,
+        source_name="Wait.Show",
+        state=State.WAITING_INDEXER,
+        total_bytes=1000,
+        indexer_attempts=3,
         source_announce_url="https://alpha.cc/announce/xyz",
     )
     text2, _, _ = render_active([(ts2, None)], page=0, page_size=5)
     assert "Wait indexer miss #3" in text2
     assert "retry in" not in text2
-
-

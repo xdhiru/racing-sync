@@ -1,4 +1,5 @@
 """Regression (audit B7): delete() must never erase an existing tombstone."""
+
 from __future__ import annotations
 
 import sqlite3
@@ -24,8 +25,7 @@ def test_delete_keeps_an_existing_tombstone(tmp_path):
     db = tmp_path / "state.db"
     store = StateStore(db)
     try:
-        store.upsert(TorrentState(
-            source_infohash=H, source_name="Gone", state=State.DONE))
+        store.upsert(TorrentState(source_infohash=H, source_name="Gone", state=State.DONE))
         assert store.tombstone(H) is True
         stamp = _raw_deleted_at(db)
         assert stamp

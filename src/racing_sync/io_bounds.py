@@ -40,8 +40,8 @@ def rpc_timeout_seconds(cfg: object | None) -> float:
     """Per-RPC timeout budget from config (clamped, fail-safe default)."""
     try:
         import math as _math
-        raw = getattr(getattr(cfg, "general", None),
-                      "client_rpc_timeout_seconds", None)
+
+        raw = getattr(getattr(cfg, "general", None), "client_rpc_timeout_seconds", None)
         if raw is None:
             return DEFAULT_RPC_TIMEOUT_SECONDS
         if isinstance(raw, bool):
@@ -49,19 +49,17 @@ def rpc_timeout_seconds(cfg: object | None) -> float:
         seconds = float(raw)
         if not _math.isfinite(seconds):
             return DEFAULT_RPC_TIMEOUT_SECONDS
-        return max(MIN_RPC_TIMEOUT_SECONDS,
-                   min(MAX_RPC_TIMEOUT_SECONDS, seconds))
+        return max(MIN_RPC_TIMEOUT_SECONDS, min(MAX_RPC_TIMEOUT_SECONDS, seconds))
     except (TypeError, ValueError, OverflowError):
         return DEFAULT_RPC_TIMEOUT_SECONDS
 
 
-async def bounded(awaitable: Awaitable[T], *, timeout: float | None,
-                  label: str = "rpc") -> T:
+async def bounded(awaitable: Awaitable[T], *, timeout: float | None, label: str = "rpc") -> T:
     """Await with a deadline; TimeoutError propagates (retryable)."""
     import math as _math
+
     try:
-        seconds = float(timeout if timeout is not None
-                        else DEFAULT_RPC_TIMEOUT_SECONDS)
+        seconds = float(timeout if timeout is not None else DEFAULT_RPC_TIMEOUT_SECONDS)
         if isinstance(timeout, bool) or not _math.isfinite(seconds):
             seconds = DEFAULT_RPC_TIMEOUT_SECONDS
     except (TypeError, ValueError, OverflowError):
@@ -86,8 +84,7 @@ async def rpc(awaitable: Awaitable[T], cfg: object | None, label: str) -> T:
     Short call-site form of `bounded(..., timeout=rpc_timeout_seconds(cfg))`.
     Timeouts propagate as TimeoutError (retryable: park-and-retry).
     """
-    return await bounded(awaitable, timeout=rpc_timeout_seconds(cfg),
-                         label=label)
+    return await bounded(awaitable, timeout=rpc_timeout_seconds(cfg), label=label)
 
 
 def chunked(items: Iterable[T], size: int = DEFAULT_HASH_CHUNK) -> list[list[T]]:
@@ -100,7 +97,7 @@ def chunked(items: Iterable[T], size: int = DEFAULT_HASH_CHUNK) -> list[list[T]]
     except (TypeError, ValueError, OverflowError):
         n = DEFAULT_HASH_CHUNK
     items = list(items or [])
-    return [items[i:i + n] for i in range(0, len(items), n)]
+    return [items[i : i + n] for i in range(0, len(items), n)]
 
 
 __all__ = [

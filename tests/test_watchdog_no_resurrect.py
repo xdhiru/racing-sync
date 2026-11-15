@@ -5,6 +5,7 @@ in-memory row when the guarded transition raised, re-inserting a hard-deleted
 row as a zombie FAILED row (which then pages Telegram). The fallback must
 never run for an abandoned row, and must re-read the row for `ValueError`.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock

@@ -55,9 +55,15 @@ _INFLIGHT_SNAPSHOT_S = 30.0
 
 
 class AdmitMixin:
-    async def _pick_and_admit(self, ts: TorrentState, st, others: list,
-                              *, park_reason: str | None = None,
-                              attempt_prowlarr: bool = True) -> None:
+    async def _pick_and_admit(
+        self,
+        ts: TorrentState,
+        st,
+        others: list,
+        *,
+        park_reason: str | None = None,
+        attempt_prowlarr: bool = True,
+    ) -> None:
         """Pick the SSD source, then park (miss) or admit (WAITING_DISK/QUEUED).
 
         `park_reason=None` derives source-export-miss vs indexer-miss from
@@ -71,8 +77,7 @@ class AdmitMixin:
         # is the most expensive call in the intake path.
         try:
             _gh = getattr(self, "_grace_hold_until", None)
-            _until = (_gh.get((ts.source_infohash or "").lower())
-                      if isinstance(_gh, dict) else None)
+            _until = _gh.get((ts.source_infohash or "").lower()) if isinstance(_gh, dict) else None
             if _until is not None and time.monotonic() < float(_until):
                 return
         except Exception:
@@ -97,8 +102,7 @@ class AdmitMixin:
             # No SSD source right now → park and retry.
             if park_reason is None:
                 try:
-                    _skip_title = (
-                        self.cfg.prowlarr.should_skip_title(st.name) is True)
+                    _skip_title = self.cfg.prowlarr.should_skip_title(st.name) is True
                 except Exception:
                     _skip_title = False
                 # Skipped titles park on the public (max-age-free) schedule:
@@ -106,12 +110,14 @@ class AdmitMixin:
                 # clock must not FAILED them for it.
                 park_reason = (
                     "source export miss"
-                    if (any(_looks_public(t.trackers) for t in [st, *others])
-                        or _skip_title)
+                    if (any(_looks_public(t.trackers) for t in [st, *others]) or _skip_title)
                     else "indexer miss"
                 )
-            if (park_reason == "indexer miss" and not getattr(ts, "force_direct", 0)
-                    and self._prowlarr_timed_out(ts)):
+            if (
+                park_reason == "indexer miss"
+                and not getattr(ts, "force_direct", 0)
+                and self._prowlarr_timed_out(ts)
+            ):
                 # Automatic fallback (opt-in): the download-target indexers
                 # never produced this release within prowlarr_max_age_seconds.
                 # Use the racing client's own bytes instead of FAILED — VPS2
@@ -168,30 +174,38 @@ class AdmitMixin:
                 _grace_exempted = bool(_ex.pop((ts.source_infohash or "").lower(), None))
         except Exception:
             pass
-        if (ts.state == State.NEW and not getattr(ts, "force_direct", 0)
-                and not _grace_exempted and not bool(getattr(decision, "preferred", True))
-                and self._in_preferred_grace(ts)):
+        if (
+            ts.state == State.NEW
+            and not getattr(ts, "force_direct", 0)
+            and not _grace_exempted
+            and not bool(getattr(decision, "preferred", True))
+            and self._in_preferred_grace(ts)
+        ):
             _hold = False
             try:
-                if getattr(getattr(self.cfg, "prowlarr", None),
-                           "download_indexers", None):
+                if getattr(getattr(self.cfg, "prowlarr", None), "download_indexers", None):
                     _hold = True
             except Exception:
                 _hold = False
             if _hold:
                 _left = self._preferred_grace_left(ts)
                 log.info(
-                    "holding %s for preferred copy (non-preferred direct, "
-                    "%ds grace left)",
-                    ts.source_name[:60], _left,
+                    "holding %s for preferred copy (non-preferred direct, %ds grace left)",
+                    ts.source_name[:60],
+                    _left,
                 )
                 # Throttle re-picks to the search cadence (watch-flow
                 # parity): re-check when grace ends or the next search is
                 # due, whichever comes first — not every tick.
                 try:
-                    _ri = float(getattr(
-                        getattr(self.cfg, "cross_seed", None),
-                        "prowlarr_retry_interval_seconds", 1800) or 1800)
+                    _ri = float(
+                        getattr(
+                            getattr(self.cfg, "cross_seed", None),
+                            "prowlarr_retry_interval_seconds",
+                            1800,
+                        )
+                        or 1800
+                    )
                 except (TypeError, ValueError):
                     _ri = 1800.0
                 try:
@@ -199,9 +213,9 @@ class AdmitMixin:
                     if not isinstance(_holds, dict):
                         _holds = {}
                         self._grace_hold_until = _holds  # type: ignore[attr-defined]
-                    _holds[(ts.source_infohash or "").lower()] = (
-                        time.monotonic()
-                        + min(max(0.0, float(_left or 0)), max(60.0, _ri)))
+                    _holds[(ts.source_infohash or "").lower()] = time.monotonic() + min(
+                        max(0.0, float(_left or 0)), max(60.0, _ri)
+                    )
                     if len(_holds) > 5000:
                         for _k in list(_holds.keys())[: len(_holds) - 5000]:
                             _holds.pop(_k, None)
@@ -226,13 +240,19 @@ class AdmitMixin:
         # any doubt reserves normally. Shared tail with the watch-dir flow
         # (see _admit_resolved): keep the two in sync via that helper.
         await self._admit_resolved(
-            ts, blob=decision.torrent_bytes,
-            size_bytes=decision.size_bytes, display_name=st.name[:60],
+            ts,
+            blob=decision.torrent_bytes,
+            size_bytes=decision.size_bytes,
+            display_name=st.name[:60],
         )
 
     async def _admit_resolved(
-        self, ts: TorrentState, *, blob: bytes | None,
-        size_bytes: int, display_name: str,
+        self,
+        ts: TorrentState,
+        *,
+        blob: bytes | None,
+        size_bytes: int,
+        display_name: str,
     ) -> None:
         """Shared intake admit tail (racing + watch-dir).
 
@@ -249,13 +269,11 @@ class AdmitMixin:
         leaked budget can never strand waiters.
         """
         try:
-            _fully_remote = await self._blob_fully_remote(
-                blob, cache_key=ts.source_infohash)
+            _fully_remote = await self._blob_fully_remote(blob, cache_key=ts.source_infohash)
         except Exception:
             _fully_remote = None
         if _fully_remote is True:
-            log.info("content for %s already fully on remote; skipping SSD budget",
-                     display_name)
+            log.info("content for %s already fully on remote; skipping SSD budget", display_name)
             try:
                 self.transition(ts, State.QUEUED)
             except Exception:
@@ -264,12 +282,12 @@ class AdmitMixin:
             return
         try:
             _pre = await self._dest_complete_entry(
-                [ts.source_infohash, getattr(ts, "cross_seed_infohash", None)])
+                [ts.source_infohash, getattr(ts, "cross_seed_infohash", None)]
+            )
         except Exception:
             _pre = None
         if _pre is not None:
-            log.info("content for %s already complete on dest; skipping SSD budget",
-                     display_name)
+            log.info("content for %s already complete on dest; skipping SSD budget", display_name)
             try:
                 self.transition(ts, State.QUEUED)
             except Exception:
@@ -291,15 +309,17 @@ class AdmitMixin:
         if isinstance(_foot, int) and not isinstance(_foot, bool) and _foot > 0:
             if _foot < needed:
                 log.info(
-                    "admitting %s against ~%d MB batch footprint "
-                    "(total ~%d MB)", display_name,
-                    _foot // (1024 * 1024), needed // (1024 * 1024),
+                    "admitting %s against ~%d MB batch footprint (total ~%d MB)",
+                    display_name,
+                    _foot // (1024 * 1024),
+                    needed // (1024 * 1024),
                 )
             needed = min(needed, _foot)
         if not await self._ssd_try_reserve(ts.source_infohash, needed):
             log.info(
                 "ssd budget in use (reserved ~%d MB); parking %s",
-                self._ssd_reserved_total() // (1024 * 1024), display_name,
+                self._ssd_reserved_total() // (1024 * 1024),
+                display_name,
             )
             self.transition(ts, State.WAITING_DISK)
         else:
@@ -327,7 +347,12 @@ class AdmitMixin:
         try:
             if ts.state == State.DONE:
                 return True
-            if ts.state not in (State.NEW, State.WAITING_INDEXER, State.WAITING_DISK, State.RE_ADDING):
+            if ts.state not in (
+                State.NEW,
+                State.WAITING_INDEXER,
+                State.WAITING_DISK,
+                State.RE_ADDING,
+            ):
                 return False
             try:
                 if getattr(self, "store", None) is not None and hasattr(self.store, "is_ignored"):
@@ -350,17 +375,18 @@ class AdmitMixin:
             try:
                 fuse_files = await rpc(
                     self.dest_client.get_torrent_files(ext.hash),
-                    getattr(self, "cfg", None), "dest fuse get_torrent_files",
+                    getattr(self, "cfg", None),
+                    "dest fuse get_torrent_files",
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "manual fuse check: could not list files for %s: %s",
-                    ts.source_infohash[:10], e,
+                    ts.source_infohash[:10],
+                    e,
                 )
                 return False
             fuse_expected = [
-                (f.name, f.size_bytes) for f in (fuse_files or [])
-                if getattr(f, "name", "")
+                (f.name, f.size_bytes) for f in (fuse_files or []) if getattr(f, "name", "")
             ]
             # Empty file list: nothing to verify against — do not adopt blind.
             # Recovery keeps the same fail-closed stance; a warming mount also
@@ -377,8 +403,11 @@ class AdmitMixin:
                 log.warning(
                     "manual fuse check: %s reports complete on fuse %s but %d/%d files missing "
                     "(e.g. %s); keeping normal flow instead of DONE",
-                    ts.source_infohash[:10], getattr(ext, "save_path", "?"),
-                    len(fuse_missing), len(fuse_expected), fuse_missing[0],
+                    ts.source_infohash[:10],
+                    getattr(ext, "save_path", "?"),
+                    len(fuse_missing),
+                    len(fuse_expected),
+                    fuse_missing[0],
                 )
                 return False
             log.info(
@@ -408,7 +437,8 @@ class AdmitMixin:
                 # DONE — the late-seed job repairs the racing injection.
                 log.warning(
                     "manual fuse check: re-inject for %s failed (keeping DONE): %s",
-                    ts.source_infohash[:10], e,
+                    ts.source_infohash[:10],
+                    e,
                 )
             try:
                 self.transition(ts, State.DONE)
@@ -429,14 +459,16 @@ class AdmitMixin:
                     return True
                 log.warning(
                     "manual fuse check: could not transition %s to DONE from %s",
-                    ts.source_infohash[:10], ts.state.value,
+                    ts.source_infohash[:10],
+                    ts.state.value,
                 )
                 return False
             return True
         except Exception as e:  # noqa: BLE001
             log.warning(
                 "manual fuse check failed for %s: %s",
-                getattr(ts, "source_infohash", "?")[:10], e,
+                getattr(ts, "source_infohash", "?")[:10],
+                e,
             )
             return False
 
@@ -452,7 +484,12 @@ class AdmitMixin:
             dest_client = getattr(self, "dest_client", None)
             if dest_client is None:
                 return False
-            if ts.state not in (State.NEW, State.WAITING_INDEXER, State.WAITING_DISK, State.RE_ADDING):
+            if ts.state not in (
+                State.NEW,
+                State.WAITING_INDEXER,
+                State.WAITING_DISK,
+                State.RE_ADDING,
+            ):
                 return False
             h = (ts.source_infohash or "").lower()
             if not h:
@@ -466,7 +503,8 @@ class AdmitMixin:
             try:
                 existing = await rpc(
                     dest_client.list_torrents(hashes=[h]),
-                    getattr(self, "cfg", None), "dest manual fuse lookup",
+                    getattr(self, "cfg", None),
+                    "dest manual fuse lookup",
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("manual fuse check: dest lookup failed for %s: %s", h[:10], e)
@@ -496,7 +534,9 @@ class AdmitMixin:
             try:
                 pre_ssd = await offload(
                     store.list_by_state,
-                    State.NEW, State.WAITING_INDEXER, State.WAITING_DISK,
+                    State.NEW,
+                    State.WAITING_INDEXER,
+                    State.WAITING_DISK,
                 )
             except Exception:
                 return
@@ -519,7 +559,10 @@ class AdmitMixin:
                 except Exception:
                     pass
                 try:
-                    if hasattr(store, "is_ignored") and store.is_ignored(ts.source_infohash) is True:
+                    if (
+                        hasattr(store, "is_ignored")
+                        and store.is_ignored(ts.source_infohash) is True
+                    ):
                         continue
                 except Exception:
                     pass
@@ -532,12 +575,17 @@ class AdmitMixin:
             try:
                 # Chunked + RPC-bounded: >~100 hashes risks URL limits
                 # downstream, and one hung lookup must not stall the tick.
-                _sweep_parts = await asyncio.gather(*(
-                    rpc(dest_client.list_torrents(hashes=_c),
-                        getattr(self, "cfg", None), "dest fuse sweep list")
-                    for _c in chunked(hashes)))
-                existing = [t for _part in _sweep_parts
-                            for t in (_part or [])]
+                _sweep_parts = await asyncio.gather(
+                    *(
+                        rpc(
+                            dest_client.list_torrents(hashes=_c),
+                            getattr(self, "cfg", None),
+                            "dest fuse sweep list",
+                        )
+                        for _c in chunked(hashes)
+                    )
+                )
+                existing = [t for _part in _sweep_parts for t in (_part or [])]
             except Exception as e:  # noqa: BLE001
                 log.warning("manual fuse sweep: dest lookup failed: %s", e)
                 return
@@ -568,13 +616,17 @@ class AdmitMixin:
                         # snapshot above — never overwrite a fresh state.
                         try:
                             fresh = await asyncio.to_thread(
-                                store.get, _ts.source_infohash,
-                                include_blob=False)
+                                store.get, _ts.source_infohash, include_blob=False
+                            )
                         except Exception:
                             fresh = None
                         if fresh is None or fresh.state != _ts.state:
                             return
-                        if fresh.state not in (State.NEW, State.WAITING_INDEXER, State.WAITING_DISK):
+                        if fresh.state not in (
+                            State.NEW,
+                            State.WAITING_INDEXER,
+                            State.WAITING_DISK,
+                        ):
                             return
                         if getattr(fresh, "skipped", 0):
                             return
@@ -621,16 +673,20 @@ class AdmitMixin:
             if time.monotonic() - _at <= 0:
                 return False
             try:
-                _interval = float(getattr(
-                    getattr(getattr(self, "cfg", None), "general", None),
-                    "source_poll_interval", 30) or 30)
+                _interval = float(
+                    getattr(
+                        getattr(getattr(self, "cfg", None), "general", None),
+                        "source_poll_interval",
+                        30,
+                    )
+                    or 30
+                )
             except (TypeError, ValueError):
                 _interval = 30.0
             if time.monotonic() - _at > max(30.0, _interval):
                 return False
             _running = getattr(self, "_running_infohashes", None)
-            if isinstance(_running, set) and (
-                    (ts.source_infohash or "").lower() in _running):
+            if isinstance(_running, set) and ((ts.source_infohash or "").lower() in _running):
                 return False
             return True
         except Exception:
@@ -688,14 +744,16 @@ class AdmitMixin:
         if _new_leader is not None:
             try:
                 self._record_deferred_on(
-                    (ts.source_infohash or "").lower(),
-                    _new_leader.source_infohash or "")
+                    (ts.source_infohash or "").lower(), _new_leader.source_infohash or ""
+                )
             except Exception:
                 pass
-            log.info("deferring %s to in-flight same-content %s (%s)",
-                     (ts.source_name or "")[:60],
-                     (_new_leader.source_infohash or "")[:10],
-                     _new_leader.state.value)
+            log.info(
+                "deferring %s to in-flight same-content %s (%s)",
+                (ts.source_name or "")[:60],
+                (_new_leader.source_infohash or "")[:10],
+                _new_leader.state.value,
+            )
             self._park_for_indexer_retry(ts, reason="same-content deferred")
             return
 
@@ -717,8 +775,7 @@ class AdmitMixin:
             first = ts.indexer_first_queried_at
             if first is None:
                 return False
-            max_age = dt.timedelta(
-                seconds=self.cfg.cross_seed.prowlarr_max_age_seconds)
+            max_age = dt.timedelta(seconds=self.cfg.cross_seed.prowlarr_max_age_seconds)
             return (dt.datetime.now(dt.timezone.utc) - first) >= max_age
         except Exception:
             return False
@@ -746,15 +803,19 @@ class AdmitMixin:
             ts.indexer_first_queried_at = now
         ts.indexer_attempts += 1
         try:
-            _retry_gap = float(getattr(
-                getattr(self.cfg, "cross_seed", None),
-                "prowlarr_retry_interval_seconds", 1800) or 1800)
+            _retry_gap = float(
+                getattr(
+                    getattr(self.cfg, "cross_seed", None), "prowlarr_retry_interval_seconds", 1800
+                )
+                or 1800
+            )
         except (TypeError, ValueError):
             _retry_gap = 1800.0
         try:
-            _max_age_s = float(getattr(
-                getattr(self.cfg, "cross_seed", None),
-                "prowlarr_max_age_seconds", 86400) or 86400)
+            _max_age_s = float(
+                getattr(getattr(self.cfg, "cross_seed", None), "prowlarr_max_age_seconds", 86400)
+                or 86400
+            )
         except (TypeError, ValueError):
             _max_age_s = 86400.0
         next_retry = now + dt.timedelta(seconds=max(60.0, _retry_gap))
@@ -768,9 +829,12 @@ class AdmitMixin:
 
         log.info(
             "%s #%d for %s; next retry at %s (elapsed=%ds, max=%ds)",
-            reason, ts.indexer_attempts, ts.source_name,
+            reason,
+            ts.indexer_attempts,
+            ts.source_name,
             next_retry.isoformat(timespec="seconds"),
-            int(elapsed.total_seconds()), int(max_age.total_seconds()),
+            int(elapsed.total_seconds()),
+            int(max_age.total_seconds()),
         )
 
         if elapsed >= max_age:
@@ -790,14 +854,16 @@ class AdmitMixin:
             else:
                 log.error(
                     "download-target indexers giving up on %s after %d attempts (%ds > %ds max)",
-                    ts.source_name, ts.indexer_attempts,
-                    int(elapsed.total_seconds()), int(max_age.total_seconds()),
+                    ts.source_name,
+                    ts.indexer_attempts,
+                    int(elapsed.total_seconds()),
+                    int(max_age.total_seconds()),
                 )
                 # From WAITING_INDEXER → FAILED is legal (see ALLOWED).
                 self.transition(
-                    ts, State.FAILED,
-                    error=(f"Prowlarr cross-seed not found within "
-                           f"{int(max_age.total_seconds())}s"),
+                    ts,
+                    State.FAILED,
+                    error=(f"Prowlarr cross-seed not found within {int(max_age.total_seconds())}s"),
                 )
                 return
 
@@ -829,8 +895,7 @@ class AdmitMixin:
         cannot spin here forever. Attempts are counted for observability.
         """
         try:
-            interval = max(60.0, float(
-                self.cfg.cross_seed.public_export_retry_interval_seconds))
+            interval = max(60.0, float(self.cfg.cross_seed.public_export_retry_interval_seconds))
         except (TypeError, ValueError, AttributeError):
             interval = 1800.0
         now = dt.datetime.now(dt.timezone.utc)
@@ -850,13 +915,15 @@ class AdmitMixin:
         if _n <= 3 or _n % 50 == 0:
             log.info(
                 "source export miss #%d for %s; next retry at %s",
-                _n, ts.source_name,
+                _n,
+                ts.source_name,
                 ts.public_export_next_retry_at.isoformat(timespec="seconds"),
             )
         else:
             log.debug(
                 "source export miss #%d for %s; next retry at %s",
-                _n, ts.source_name,
+                _n,
+                ts.source_name,
                 ts.public_export_next_retry_at.isoformat(timespec="seconds"),
             )
         if ts.state != State.WAITING_INDEXER:
@@ -896,9 +963,12 @@ class AdmitMixin:
         try:
             for r in rows or []:
                 try:
-                    if ((r.source_infohash or "").lower() == me
-                            or r.state not in (State.QUEUED, State.DOWNLOADING,
-                                               State.MOVING, State.RE_ADDING)):
+                    if (r.source_infohash or "").lower() == me or r.state not in (
+                        State.QUEUED,
+                        State.DOWNLOADING,
+                        State.MOVING,
+                        State.RE_ADDING,
+                    ):
                         continue
                     # Single content-key rule (see content_keys.same_content):
                     # same normalized name + same size when both known.
@@ -906,8 +976,10 @@ class AdmitMixin:
                     # election) to avoid duplicate SSD downloads — except
                     # both-unknown, which would mutually defer forever.
                     if _same_content_key(
-                        r.source_name or "", r.total_bytes or 0,
-                        ts.source_name or "", ts.total_bytes or 0,
+                        r.source_name or "",
+                        r.total_bytes or 0,
+                        ts.source_name or "",
+                        ts.total_bytes or 0,
                         require_size=True,
                     ):
                         return r
@@ -921,8 +993,11 @@ class AdmitMixin:
         """all_active() snapshot shared for _INFLIGHT_SNAPSHOT_S seconds."""
         try:
             _memo = getattr(self, "_inflight_snapshot", None)
-            if (isinstance(_memo, tuple) and len(_memo) == 2
-                    and time.monotonic() - float(_memo[0]) < _INFLIGHT_SNAPSHOT_S):
+            if (
+                isinstance(_memo, tuple)
+                and len(_memo) == 2
+                and time.monotonic() - float(_memo[0]) < _INFLIGHT_SNAPSHOT_S
+            ):
                 return _memo[1]
         except Exception:
             _memo = None
@@ -990,9 +1065,12 @@ class AdmitMixin:
                 return False
             for r in self._inflight_snapshot_rows() or []:
                 try:
-                    if ((r.source_infohash or "").lower() == _o
-                            and r.state in (State.QUEUED, State.DOWNLOADING,
-                                            State.MOVING, State.RE_ADDING)):
+                    if (r.source_infohash or "").lower() == _o and r.state in (
+                        State.QUEUED,
+                        State.DOWNLOADING,
+                        State.MOVING,
+                        State.RE_ADDING,
+                    ):
                         return True
                 except Exception:
                     continue
@@ -1009,27 +1087,26 @@ class AdmitMixin:
         when the row is gone (no upsert-resurrect).
         """
         try:
-            _interval = max(60.0, float(
-                self.cfg.cross_seed.prowlarr_retry_interval_seconds))
+            _interval = max(60.0, float(self.cfg.cross_seed.prowlarr_retry_interval_seconds))
         except (TypeError, ValueError):
             _interval = 1800.0
         try:
-            _public_interval = max(60.0, float(
-                self.cfg.cross_seed.public_export_retry_interval_seconds))
+            _public_interval = max(
+                60.0, float(self.cfg.cross_seed.public_export_retry_interval_seconds)
+            )
         except (TypeError, ValueError, AttributeError):
             _public_interval = 1800.0
         try:
             if self._abandoned(ts):
                 return
-            if (ts.public_export_next_retry_at
-                    and not ts.indexer_next_retry_at):
-                ts.public_export_next_retry_at = (
-                    dt.datetime.now(dt.timezone.utc)
-                    + dt.timedelta(seconds=_public_interval))
+            if ts.public_export_next_retry_at and not ts.indexer_next_retry_at:
+                ts.public_export_next_retry_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+                    seconds=_public_interval
+                )
             else:
-                ts.indexer_next_retry_at = (
-                    dt.datetime.now(dt.timezone.utc)
-                    + dt.timedelta(seconds=_interval))
+                ts.indexer_next_retry_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+                    seconds=_interval
+                )
             self.store.upsert(ts)
         except Exception:
             pass
@@ -1073,6 +1150,7 @@ class AdmitMixin:
                 return False
             try:
                 from .watchdir import _bencoded_info_hash
+
                 real_hash, _, _, _ = _bencoded_info_hash(bytes(blob))
             except Exception:
                 return False
@@ -1088,8 +1166,7 @@ class AdmitMixin:
             ts.cross_seed_infohash = want
             ts.cross_seed_source = "ssd-adopted"
             log.info(
-                "adopting SSD-resident %s (already complete on VPS2 client); "
-                "skipping SSD budget",
+                "adopting SSD-resident %s (already complete on VPS2 client); skipping SSD budget",
                 (ts.source_name or "")[:60],
             )
             try:
@@ -1124,7 +1201,8 @@ class AdmitMixin:
         # any doubt runs the normal pick below.
         try:
             _entries = await self._dest_entries_for(
-                [ts.source_infohash, getattr(ts, "cross_seed_infohash", None)])
+                [ts.source_infohash, getattr(ts, "cross_seed_infohash", None)]
+            )
         except Exception:
             _entries = []
         _ssd_complete = None
@@ -1143,8 +1221,7 @@ class AdmitMixin:
                 return
         elif _ssd_any is not None:
             try:
-                _interval = max(60.0, float(
-                    self.cfg.cross_seed.prowlarr_retry_interval_seconds))
+                _interval = max(60.0, float(self.cfg.cross_seed.prowlarr_retry_interval_seconds))
             except (TypeError, ValueError):
                 _interval = 1800.0
             log.info(
@@ -1155,25 +1232,26 @@ class AdmitMixin:
             try:
                 if self._abandoned(ts):
                     raise AbandonedError(
-                        f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}")
+                        f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}"
+                    )
                 # Push the schedule this row is actually parked on (mirror
                 # the same-content deferral below): a public-export row
                 # must not gain an indexer timer — it would wake on the
                 # wrong schedule.
-                if (ts.public_export_next_retry_at
-                        and not ts.indexer_next_retry_at):
+                if ts.public_export_next_retry_at and not ts.indexer_next_retry_at:
                     try:
-                        _public_interval = max(60.0, float(
-                            self.cfg.cross_seed.public_export_retry_interval_seconds))
+                        _public_interval = max(
+                            60.0, float(self.cfg.cross_seed.public_export_retry_interval_seconds)
+                        )
                     except (TypeError, ValueError, AttributeError):
                         _public_interval = 1800.0
-                    ts.public_export_next_retry_at = (
-                        dt.datetime.now(dt.timezone.utc)
-                        + dt.timedelta(seconds=_public_interval))
+                    ts.public_export_next_retry_at = dt.datetime.now(
+                        dt.timezone.utc
+                    ) + dt.timedelta(seconds=_public_interval)
                 else:
-                    ts.indexer_next_retry_at = (
-                        dt.datetime.now(dt.timezone.utc)
-                        + dt.timedelta(seconds=_interval))
+                    ts.indexer_next_retry_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+                        seconds=_interval
+                    )
                 self.store.upsert(ts)
             except Exception:
                 pass
@@ -1206,8 +1284,11 @@ class AdmitMixin:
             except Exception:
                 _alive = False
             if _alive:
-                log.info("still deferring %s to live same-content %s",
-                         (ts.source_name or "")[:60], _rec[:10])
+                log.info(
+                    "still deferring %s to live same-content %s",
+                    (ts.source_name or "")[:60],
+                    _rec[:10],
+                )
                 self._repark_deferred(ts)
                 return
             try:
@@ -1246,13 +1327,14 @@ class AdmitMixin:
         if _leader is not None:
             log.info(
                 "deferring Prowlarr retry for %s — same content %s already %s",
-                ts.source_name[:60], (_leader.source_infohash or "")[:10],
+                ts.source_name[:60],
+                (_leader.source_infohash or "")[:10],
                 _leader.state.value,
             )
             try:
                 self._record_deferred_on(
-                    (ts.source_infohash or "").lower(),
-                    _leader.source_infohash or "")
+                    (ts.source_infohash or "").lower(), _leader.source_infohash or ""
+                )
             except Exception:
                 pass
             self._repark_deferred(ts)
@@ -1260,7 +1342,9 @@ class AdmitMixin:
 
         all_source = await self._list_source_torrents()
         await self._pick_and_admit(
-            ts, st, self._same_content_torrents(all_source, st),
+            ts,
+            st,
+            self._same_content_torrents(all_source, st),
             park_reason=None,
         )
 
@@ -1281,9 +1365,11 @@ class AdmitMixin:
         safe (over-reserve → park, never over-admit).
         """
         try:
-            _ekey = ((ts.source_infohash or "").lower(),
-                     int(getattr(ts, "batch_index", 0) or 0),
-                     int(getattr(ts, "batches_total", 0) or 0))
+            _ekey = (
+                (ts.source_infohash or "").lower(),
+                int(getattr(ts, "batch_index", 0) or 0),
+                int(getattr(ts, "batches_total", 0) or 0),
+            )
         except (TypeError, ValueError, AttributeError):
             _ekey = None
         _ecache = None
@@ -1294,8 +1380,11 @@ class AdmitMixin:
                     _ecache = {}
                     self._estimate_cache = _ecache  # type: ignore[attr-defined]
                 _hit = _ecache.get(_ekey)
-                if (isinstance(_hit, tuple) and len(_hit) == 2
-                        and time.monotonic() - float(_hit[0]) < 60.0):
+                if (
+                    isinstance(_hit, tuple)
+                    and len(_hit) == 2
+                    and time.monotonic() - float(_hit[0]) < 60.0
+                ):
                     return _hit[1]
             except Exception:
                 _ecache = None
@@ -1325,7 +1414,8 @@ class AdmitMixin:
             try:
                 files = await rpc(
                     self.dest_client.get_torrent_files(h),
-                    getattr(self, "cfg", None), "dest remaining estimate",
+                    getattr(self, "cfg", None),
+                    "dest remaining estimate",
                 )
             except Exception:
                 return None
@@ -1338,13 +1428,11 @@ class AdmitMixin:
             # Pinned kind wins over a fresh re-derive: a mid-flight sidecar
             # must not flip season->mixed under the routed batches.
             _pinned = ts.classification_kind or ""
-            kind = ((_pinned if _pinned not in ("", "unknown") else "")
-                    or cls.kind or "unknown")
+            kind = (_pinned if _pinned not in ("", "unknown") else "") or cls.kind or "unknown"
             cap = self._frozen_batch_cap(ts)
             if cap <= 0:
                 return None
-            batches = self._resolve_batches(files, kind, cap,
-                                            episodes=cls.episodes)
+            batches = self._resolve_batches(files, kind, cap, episodes=cls.episodes)
             if not batches:
                 return None
             try:
@@ -1375,10 +1463,14 @@ class AdmitMixin:
             if not _proceed:
                 _owner_desc = (
                     f"{(_owner.source_infohash or '')[:10]} ({_owner.state.value})"
-                    if _owner is not None else "unknown owner"
+                    if _owner is not None
+                    else "unknown owner"
                 )
-                log.debug("watch-dir: %s stays waiting_disk — same content owned by %s",
-                          ts.source_name[:60], _owner_desc)
+                log.debug(
+                    "watch-dir: %s stays waiting_disk — same content owned by %s",
+                    ts.source_name[:60],
+                    _owner_desc,
+                )
                 # Refresh the quiet-wait window like the SSD-full path so a
                 # deferred row re-checks election at most once per interval.
                 try:
@@ -1399,12 +1491,14 @@ class AdmitMixin:
         # will never download. Fail-open: any doubt reserves normally.
         try:
             _pre = await self._dest_complete_entry(
-                [ts.source_infohash, getattr(ts, "cross_seed_infohash", None)])
+                [ts.source_infohash, getattr(ts, "cross_seed_infohash", None)]
+            )
         except Exception:
             _pre = None
         if _pre is not None:
-            log.info("watch-dir: %s already complete on dest; skipping SSD budget",
-                     ts.source_name[:60])
+            log.info(
+                "watch-dir: %s already complete on dest; skipping SSD budget", ts.source_name[:60]
+            )
             try:
                 _wd = getattr(self, "_waiting_disk_next_check", None)
                 if isinstance(_wd, dict):
@@ -1418,9 +1512,11 @@ class AdmitMixin:
         # window. Live-worker count, off-loop. Non-int configs skip.
         try:
             _pre_max_raw = getattr(self.cfg, "max_active_downloads", 0)
-            _pre_max = (int(_pre_max_raw or 0)
-                        if isinstance(_pre_max_raw, (int, float))
-                        and not isinstance(_pre_max_raw, bool) else 0)
+            _pre_max = (
+                int(_pre_max_raw or 0)
+                if isinstance(_pre_max_raw, (int, float)) and not isinstance(_pre_max_raw, bool)
+                else 0
+            )
         except (TypeError, ValueError):
             _pre_max = 0
         if _pre_max > 0 and await self._live_download_count() >= _pre_max:
@@ -1436,7 +1532,9 @@ class AdmitMixin:
                 pass
             log.debug(
                 "downloads full (%d/%d); %s stays waiting_disk (no reserve churn)",
-                _pre_max, _pre_max, ts.source_name[:60],
+                _pre_max,
+                _pre_max,
+                ts.source_name[:60],
             )
             return
         needed = self._ssd_estimate_for_new(ts.total_bytes)
@@ -1450,8 +1548,12 @@ class AdmitMixin:
             except Exception:
                 rem = None
             if rem is not None and rem < needed:
-                log.info("retrying %s against remaining ~%d MB (full ~%d MB did not fit)",
-                         ts.source_name[:60], rem // (1024 * 1024), needed // (1024 * 1024))
+                log.info(
+                    "retrying %s against remaining ~%d MB (full ~%d MB did not fit)",
+                    ts.source_name[:60],
+                    rem // (1024 * 1024),
+                    needed // (1024 * 1024),
+                )
                 admitted = await self._ssd_try_reserve(ts.source_infohash, rem)
                 if admitted:
                     needed = rem
@@ -1465,23 +1567,22 @@ class AdmitMixin:
                 _blob = getattr(ts, "_blob", None) or None
                 if not _blob:
                     try:
-                        _blob = await asyncio.to_thread(
-                            self.store.get_blob, ts.source_infohash)
+                        _blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
                     except Exception:
                         _blob = None
                 try:
-                    _foot = self._blob_admit_footprint(
-                        ts, _blob, ts.total_bytes or 0)
+                    _foot = self._blob_admit_footprint(ts, _blob, ts.total_bytes or 0)
                 except Exception:
                     _foot = None
             except Exception:
                 _foot = None
-            if isinstance(_foot, int) and not isinstance(_foot, bool) \
-                    and 0 < _foot < needed:
-                log.info("retrying %s against ~%d MB batch footprint "
-                         "(full ~%d MB did not fit)",
-                         ts.source_name[:60], _foot // (1024 * 1024),
-                         needed // (1024 * 1024))
+            if isinstance(_foot, int) and not isinstance(_foot, bool) and 0 < _foot < needed:
+                log.info(
+                    "retrying %s against ~%d MB batch footprint (full ~%d MB did not fit)",
+                    ts.source_name[:60],
+                    _foot // (1024 * 1024),
+                    needed // (1024 * 1024),
+                )
                 admitted = await self._ssd_try_reserve(ts.source_infohash, _foot)
                 if admitted:
                     needed = _foot
@@ -1524,7 +1625,9 @@ class AdmitMixin:
                         pass
                     log.debug(
                         "downloads full (%d/%d); %s stays waiting_disk",
-                        _active_dl, _max_dl, ts.source_name[:60],
+                        _active_dl,
+                        _max_dl,
+                        ts.source_name[:60],
                     )
                     return
             try:
@@ -1536,8 +1639,9 @@ class AdmitMixin:
                     await self._ssd_release(ts.source_infohash)
                 except Exception:
                     pass
-                log.info("waiting_disk admit aborted for %s (%s)",
-                         (ts.source_infohash or "")[:10], e)
+                log.info(
+                    "waiting_disk admit aborted for %s (%s)", (ts.source_infohash or "")[:10], e
+                )
             return
         # Still full: stay parked quietly until the next interval instead of
         # hot-looping every tick while batch moves drain.
@@ -1553,7 +1657,8 @@ class AdmitMixin:
             pass
         log.debug(
             "ssd still full; %s stays waiting_disk (need ~%d MB, re-check in %ds)",
-            ts.source_name[:60], needed // (1024 * 1024),
+            ts.source_name[:60],
+            needed // (1024 * 1024),
             int(self.WAITING_DISK_RECHECK_SECONDS),
         )
 
@@ -1573,9 +1678,12 @@ class AdmitMixin:
                 return 0
             _ex = (exclude or "").lower()
             rows = await offload(self.store.list_by_state, State.DOWNLOADING)
-            return sum(1 for t in rows or ()
-                       if (t.source_infohash or "").lower() in running
-                       and (t.source_infohash or "").lower() != _ex)
+            return sum(
+                1
+                for t in rows or ()
+                if (t.source_infohash or "").lower() in running
+                and (t.source_infohash or "").lower() != _ex
+            )
         except Exception:
             return 0
 
@@ -1623,8 +1731,12 @@ class AdmitMixin:
             n_down = await self._live_download_count(exclude=key)
             others = len(adm - {key}) if key else len(adm)
             if n_down + others >= max_dl:
-                log.info("downloads full (%d/%d); %s stays queued",
-                         n_down + others, max_dl, ts.source_name[:60])
+                log.info(
+                    "downloads full (%d/%d); %s stays queued",
+                    n_down + others,
+                    max_dl,
+                    ts.source_name[:60],
+                )
                 if self._abandoned(ts):
                     # Row forgotten after the snapshot: stay silent instead
                     # of upsert-resurrecting it as QUEUED.
@@ -1649,9 +1761,9 @@ class AdmitMixin:
     def _lane_cap(self, lane: str) -> int | None:
         """Lane slot cap, or None when unconfigured (fail-open admit)."""
         try:
-            raw = getattr(self.cfg,
-                          "max_active_downloads" if lane == "dl"
-                          else "max_concurrent_moves", 0)
+            raw = getattr(
+                self.cfg, "max_active_downloads" if lane == "dl" else "max_concurrent_moves", 0
+            )
             if isinstance(raw, bool) or not isinstance(raw, (int, float)):
                 return None
             val = int(raw or 0)
@@ -1667,6 +1779,7 @@ class AdmitMixin:
             return 0
         try:
             from .task import handles_for as _hf
+
             _reg = getattr(self, "_task_handles", None)
             if not isinstance(_reg, dict):
                 return 0
@@ -1677,9 +1790,11 @@ class AdmitMixin:
                     continue
                 for _x in list(_set):
                     try:
-                        if (getattr(_x, "kind", "") in _kinds
-                                and not getattr(_x, "queued", False)
-                                and not getattr(_x, "cancelled", False)):
+                        if (
+                            getattr(_x, "kind", "") in _kinds
+                            and not getattr(_x, "queued", False)
+                            and not getattr(_x, "cancelled", False)
+                        ):
                             n += 1
                             break
                     except Exception:
@@ -1692,8 +1807,7 @@ class AdmitMixin:
         """True when /forcestart armed this hash (in-memory bypass)."""
         try:
             _f = getattr(self, "_forced", None)
-            return (isinstance(_f, set)
-                    and (key or "").lower() in _f)
+            return isinstance(_f, set) and (key or "").lower() in _f
         except Exception:
             return False
 
@@ -1711,13 +1825,13 @@ class AdmitMixin:
             if key not in _q:
                 try:
                     import time as _time
+
                     _q[key] = _time.monotonic()
                 except Exception:
                     _q[key] = 0.0
                 if len(_q) > 500:
                     try:
-                        _oldest = sorted(_q.items(),
-                                         key=lambda kv: kv[1])[: len(_q) - 500]
+                        _oldest = sorted(_q.items(), key=lambda kv: kv[1])[: len(_q) - 500]
                         for _k, _ in _oldest:
                             _q.pop(_k, None)
                     except Exception:
@@ -1726,6 +1840,7 @@ class AdmitMixin:
             pass
         try:
             from .task import handles_for
+
             for _hd in handles_for(self, key):
                 try:
                     return _hd.event
@@ -1745,8 +1860,7 @@ class AdmitMixin:
         edge behavior). Never raises.
         """
         try:
-            key = ((getattr(ts, "source_infohash", "") or "")
-                   .strip().lower())
+            key = (getattr(ts, "source_infohash", "") or "").strip().lower()
         except Exception:
             return False, None
         if not key:
@@ -1772,6 +1886,7 @@ class AdmitMixin:
             # — today's edge behavior, no phantom queue entries.
             try:
                 from .task import handles_for
+
                 _hs = handles_for(self, key)
             except Exception:
                 _hs = []
@@ -1839,19 +1954,16 @@ class AdmitMixin:
                         if total >= _free and cap is not None:
                             break
                         try:
-                            _rk = (getattr(_r, "source_infohash", "") or "") \
-                                .lower()
+                            _rk = (getattr(_r, "source_infohash", "") or "").lower()
                         except Exception:
                             continue
                         if not _rk or _rk not in _q:
                             continue
                         try:
-                            _st = getattr(getattr(_r, "state", None),
-                                          "value", "")
+                            _st = getattr(getattr(_r, "state", None), "value", "")
                         except Exception:
                             _st = ""
-                        _want = (("queued", "downloading") if lane == "dl"
-                                 else ("moving",))
+                        _want = ("queued", "downloading") if lane == "dl" else ("moving",)
                         if _st not in _want and not self._is_forced(_rk):
                             try:
                                 _q.pop(_rk, None)
@@ -1862,6 +1974,7 @@ class AdmitMixin:
                             continue
                         try:
                             from .task import handles_for
+
                             _hs = handles_for(self, _rk)
                         except Exception:
                             _hs = []
@@ -1884,7 +1997,10 @@ class AdmitMixin:
         return total
 
     async def _park_queued_for_download_slot(
-        self, ts, *, holds_slot: bool = False,
+        self,
+        ts,
+        *,
+        holds_slot: bool = False,
     ) -> bool:
         """Event-park when the download lane is full; True = exit worker.
 
@@ -1895,8 +2011,7 @@ class AdmitMixin:
         authoritatively; row-gone/shutdown exits True (caller returns).
         """
         try:
-            key = ((getattr(ts, "source_infohash", "") or "")
-                   .strip().lower())
+            key = (getattr(ts, "source_infohash", "") or "").strip().lower()
         except Exception:
             return False
         # Waiter identity: only worker-backed rows (spawned → handle with
@@ -1910,6 +2025,7 @@ class AdmitMixin:
             if key and self._is_forced(key):
                 try:
                     from .task import handles_for
+
                     for _hd in handles_for(self, key):
                         try:
                             _hd.queued = False
@@ -1922,6 +2038,7 @@ class AdmitMixin:
             if not queued:
                 try:
                     from .task import handles_for
+
                     for _hd in handles_for(self, key):
                         try:
                             _hd.queued = False
@@ -1953,6 +2070,7 @@ class AdmitMixin:
             _ever_queued = True
             try:
                 from .task import handles_for
+
                 for _hd in handles_for(self, key):
                     try:
                         _hd.queued = True
@@ -1962,9 +2080,12 @@ class AdmitMixin:
                 pass
             if ev is None:
                 return True
-            log.info("downloads full; %s waits for a slot (no churn)",
-                     (getattr(ts, "source_name", "") or key)[:60])
+            log.info(
+                "downloads full; %s waits for a slot (no churn)",
+                (getattr(ts, "source_name", "") or key)[:60],
+            )
             try:
+
                 async def _wait_ev() -> None:
                     try:
                         await asyncio.wait_for(ev.wait(), 60.0)
@@ -1975,8 +2096,7 @@ class AdmitMixin:
                     except Exception:
                         pass
 
-                await self._run_outside_download_slot(
-                    _wait_ev(), holds_slot)
+                await self._run_outside_download_slot(_wait_ev(), holds_slot)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -2040,8 +2160,7 @@ class AdmitMixin:
             except Exception:
                 continue
 
-    async def _do_queued(self, ts: TorrentState, *,
-                         _holds_download_slot: bool = False) -> None:
+    async def _do_queued(self, ts: TorrentState, *, _holds_download_slot: bool = False) -> None:
         blob: bytes = ts._blob or ts.cross_seed_blob
         if not blob:
             blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
@@ -2054,16 +2173,20 @@ class AdmitMixin:
             return
 
         # Re-check that the torrent isn't already present on VPS2.
-        check_hashes = [h for h in (ts.source_infohash, ts.cross_seed_infohash, ts.dest_infohash) if h]
+        check_hashes = [
+            h for h in (ts.source_infohash, ts.cross_seed_infohash, ts.dest_infohash) if h
+        ]
         existing = await rpc(
             self.dest_client.list_torrents(hashes=check_hashes),
-            getattr(self, "cfg", None), "dest queued list_torrents",
+            getattr(self, "cfg", None),
+            "dest queued list_torrents",
         )
         if existing:
             fuse_mounts = [
                 str(self.cfg.rclone.fuse.mount).rstrip("/\\").replace("\\", "/"),
                 str(self.cfg.rclone.fuse.mount_unsorted).rstrip("/\\").replace("\\", "/"),
             ]
+
             # Prefer fuse-complete > SSD-complete > first-listed: adopting
             # an SSD partial while a fuse-complete copy exists strands the
             # seed. Completeness here is client-side; the fuse branch
@@ -2071,16 +2194,16 @@ class AdmitMixin:
             def _rank(t):
                 try:
                     _sp = (getattr(t, "save_path", "") or "").rstrip("/\\").replace("\\", "/")
-                    _on_fuse = any(_sp == fm or _sp.startswith(fm + "/")
-                                   for fm in fuse_mounts if fm)
+                    _on_fuse = any(
+                        _sp == fm or _sp.startswith(fm + "/") for fm in fuse_mounts if fm
+                    )
                 except Exception:
                     _on_fuse = False
                 try:
                     _complete = bool(t.is_complete())
                 except Exception:
                     _complete = False
-                return (0 if (_on_fuse and _complete)
-                        else (1 if _complete else 2))
+                return 0 if (_on_fuse and _complete) else (1 if _complete else 2)
 
             try:
                 ext = min(existing, key=_rank)
@@ -2091,8 +2214,7 @@ class AdmitMixin:
             # an SSD-pointing entry must never have its bytes statted
             # as fuse — data never seeded would verify as present.
             try:
-                on_fuse = bool(self._save_path_is_on_fuse(
-                    getattr(ext, "save_path", "")))
+                on_fuse = bool(self._save_path_is_on_fuse(getattr(ext, "save_path", "")))
             except Exception:
                 on_fuse = False
             try:
@@ -2112,7 +2234,8 @@ class AdmitMixin:
                 log.warning(
                     "torrent %s already exists incomplete on fuse at %s; "
                     "not adopting as an SSD download — routing to RE_ADDING",
-                    (ts.source_infohash or "")[:10], save_path,
+                    (ts.source_infohash or "")[:10],
+                    save_path,
                 )
                 self.transition(ts, State.RE_ADDING)
                 return
@@ -2125,19 +2248,20 @@ class AdmitMixin:
                 try:
                     fuse_files = await rpc(
                         self.dest_client.get_torrent_files(ext.hash),
-                        getattr(self, "cfg", None), "dest fuse get_torrent_files",
+                        getattr(self, "cfg", None),
+                        "dest fuse get_torrent_files",
                     )
                     fuse_list_failed = False
                 except Exception as e:  # noqa: BLE001
                     log.warning(
                         "could not list fuse torrent files for %s: %s",
-                        ts.source_infohash[:10], e,
+                        ts.source_infohash[:10],
+                        e,
                     )
                     fuse_files = []
                     fuse_list_failed = True
                 fuse_expected = [
-                    (f.name, f.size_bytes) for f in fuse_files
-                    if getattr(f, "name", "")
+                    (f.name, f.size_bytes) for f in fuse_files if getattr(f, "name", "")
                 ]
                 if fuse_list_failed or not fuse_expected:
                     # Fail closed: an unlistable or empty file list must never
@@ -2146,7 +2270,9 @@ class AdmitMixin:
                     log.warning(
                         "fuse verification inconclusive for %s (list_failed=%s, files=%d); "
                         "staying queued",
-                        ts.source_infohash[:10], fuse_list_failed, len(fuse_expected),
+                        ts.source_infohash[:10],
+                        fuse_list_failed,
+                        len(fuse_expected),
                     )
                     try:
                         self.store.upsert(ts)
@@ -2165,21 +2291,28 @@ class AdmitMixin:
                         log.warning(
                             "torrent %s reports complete on fuse %s but %d/%d files missing; "
                             "content found on SSD at %s — resuming SSD flow instead of DONE",
-                            ts.source_infohash[:10], save_path,
-                            len(fuse_missing), len(fuse_expected), ssd_root,
+                            ts.source_infohash[:10],
+                            save_path,
+                            len(fuse_missing),
+                            len(fuse_expected),
+                            ssd_root,
                         )
                         ts.dest_infohash = ext.hash.lower()
                         ts.save_path = str(ssd_root)
                         if await self._park_queued_for_download_slot(
-                                ts, holds_slot=_holds_download_slot):
+                            ts, holds_slot=_holds_download_slot
+                        ):
                             return
                         self.transition(ts, State.DOWNLOADING)
                         return
                     log.warning(
                         "torrent %s reports complete on fuse %s but %d/%d files missing "
                         "(e.g. %s); routing to RE_ADDING for gated retry instead of DONE",
-                        ts.source_infohash[:10], save_path,
-                        len(fuse_missing), len(fuse_expected), fuse_missing[0],
+                        ts.source_infohash[:10],
+                        save_path,
+                        len(fuse_missing),
+                        len(fuse_expected),
+                        fuse_missing[0],
                     )
                     self.transition(ts, State.RE_ADDING)
                     return
@@ -2220,8 +2353,8 @@ class AdmitMixin:
                         # overwrite) decides the injection set.
                         try:
                             await self._run_outside_download_slot(
-                                self._re_inject_watch_dir_torrents(ts),
-                                _holds_download_slot)
+                                self._re_inject_watch_dir_torrents(ts), _holds_download_slot
+                            )
                         except Exception as e:  # noqa: BLE001
                             if not is_retryable_client_error(e):
                                 # Fatal disk/permission errors (ENOSPC,
@@ -2229,7 +2362,8 @@ class AdmitMixin:
                                 raise
                             log.warning(
                                 "watch re-inject hit transient dest error for %s (%s); staying queued",
-                                ts.source_name[:60], e,
+                                ts.source_name[:60],
+                                e,
                             )
                             try:
                                 self.store.upsert(ts)
@@ -2238,8 +2372,8 @@ class AdmitMixin:
                             return
                     else:
                         await self._run_outside_download_slot(
-                            self._re_inject_racing_torrents(ts),
-                            _holds_download_slot)
+                            self._re_inject_racing_torrents(ts), _holds_download_slot
+                        )
                 self.transition(ts, State.DONE)
                 return
 
@@ -2261,10 +2395,12 @@ class AdmitMixin:
                 log.error(
                     "torrent %s already on VPS2 but at foreign path %s "
                     "(not under an SSD/dest root); refusing to adopt/resume it",
-                    (ts.source_infohash or "")[:10], save_path,
+                    (ts.source_infohash or "")[:10],
+                    save_path,
                 )
                 self.transition(
-                    ts, State.FAILED,
+                    ts,
+                    State.FAILED,
                     error=(
                         f"existing dest entry at foreign path {save_path!r} "
                         "(not SSD/dest or fuse); refusing to adopt it as a "
@@ -2274,12 +2410,13 @@ class AdmitMixin:
                 return
             log.info(
                 "torrent already on VPS2: %s (complete=%s, on_fuse=%s)",
-                ts.source_infohash[:10], complete, on_fuse,
+                ts.source_infohash[:10],
+                complete,
+                on_fuse,
             )
             ts.dest_infohash = ext.hash.lower()
             ts.save_path = ext.save_path
-            if await self._park_queued_for_download_slot(
-                    ts, holds_slot=_holds_download_slot):
+            if await self._park_queued_for_download_slot(ts, holds_slot=_holds_download_slot):
                 return
             # Batch-priority re-verify before resume: this entry may predate
             # its priorities (setup-transient park, restart between add and
@@ -2290,8 +2427,11 @@ class AdmitMixin:
             try:
                 await self._prepare_next_batch(ts, strict=True)
             except Exception as e:  # noqa: BLE001
-                log.warning("batch priorities not verified for %s (%s); staying queued",
-                            ts.source_infohash[:10], e)
+                log.warning(
+                    "batch priorities not verified for %s (%s); staying queued",
+                    ts.source_infohash[:10],
+                    e,
+                )
                 try:
                     self.store.upsert(ts)
                 except Exception:
@@ -2302,8 +2442,9 @@ class AdmitMixin:
             except Exception as e:  # noqa: BLE001
                 # Transient qB hiccup (registration lag, timeout): stay
                 # QUEUED so the next tick retries via this same check.
-                log.warning("resume %s hit transient dest error: %s; staying queued",
-                            ext.hash[:10], e)
+                log.warning(
+                    "resume %s hit transient dest error: %s; staying queued", ext.hash[:10], e
+                )
                 try:
                     self.store.upsert(ts)
                 except Exception:
@@ -2321,8 +2462,7 @@ class AdmitMixin:
         # the SSD add entirely and go fuse-gated RE_ADDING, which
         # re-verifies before injecting. Fail-open: any doubt adds normally.
         try:
-            _fully_remote = await self._blob_fully_remote(
-                blob, cache_key=ts.source_infohash)
+            _fully_remote = await self._blob_fully_remote(blob, cache_key=ts.source_infohash)
         except Exception:
             _fully_remote = None
         if _fully_remote is True:
@@ -2335,8 +2475,7 @@ class AdmitMixin:
         # Brand-new entry: gate before adding so a fresh-start burst of NEW
         # workers can't sail past the tick's snapshot-QUEUED-only cap into
         # concurrent DOWNLOADING (live incident: 5 at once against max 3).
-        if await self._park_queued_for_download_slot(
-                ts, holds_slot=_holds_download_slot):
+        if await self._park_queued_for_download_slot(ts, holds_slot=_holds_download_slot):
             return
         result = await self.dest_client.add_torrent(
             torrent_files=[blob],
@@ -2347,7 +2486,9 @@ class AdmitMixin:
         )
         if not result.accepted:
             self.transition(
-                ts, State.FAILED, error=f"add rejected: {result.detail}",
+                ts,
+                State.FAILED,
+                error=f"add rejected: {result.detail}",
             )
             return
 
@@ -2356,6 +2497,7 @@ class AdmitMixin:
         if not new_hash and blob:
             try:
                 from .watchdir import _bencoded_info_hash
+
                 parsed_hash, _, _, _ = _bencoded_info_hash(blob)
                 new_hash = parsed_hash.lower()
             except Exception:
@@ -2375,16 +2517,14 @@ class AdmitMixin:
         # Deliberate terminal transitions (WAITING_DISK park, oversize-movie
         # FAILED) return normally inside the block and are unaffected.
         try:
-            await self._setup_queued_download(
-                ts, blob, _holds_download_slot=_holds_download_slot)
+            await self._setup_queued_download(ts, blob, _holds_download_slot=_holds_download_slot)
         except ValueError as e:
             # Deterministic poison (bad batching/classify, no valid files
             # for priorities): retrying the same bytes parks QUEUED forever.
             # Fail loudly so the operator sees it instead.
             # (BatchMoveIncompleteError stays on the retry path below —
             # its contract is "same batch retries".)
-            log.error("queued setup poisoned for %s: %s; failing",
-                      ts.source_infohash[:10], e)
+            log.error("queued setup poisoned for %s: %s; failing", ts.source_infohash[:10], e)
             try:
                 self.transition(ts, State.FAILED, error=str(e)[:500])
             except (AbandonedError, ValueError):
@@ -2396,8 +2536,11 @@ class AdmitMixin:
                     pass
             return
         except Exception as e:  # noqa: BLE001
-            log.warning("queued setup hit transient dest error for %s: %s; staying queued",
-                        ts.source_infohash[:10], e)
+            log.warning(
+                "queued setup hit transient dest error for %s: %s; staying queued",
+                ts.source_infohash[:10],
+                e,
+            )
             try:
                 self.store.upsert(ts)
             except Exception:
@@ -2415,8 +2558,7 @@ class AdmitMixin:
         grace is opt-in runtime policy, never test-double behavior.
         """
         try:
-            raw = getattr(getattr(self.cfg, "general", None),
-                          "preferred_copy_grace_seconds", 0)
+            raw = getattr(getattr(self.cfg, "general", None), "preferred_copy_grace_seconds", 0)
             if isinstance(raw, bool) or not isinstance(raw, (int, float)):
                 return 0
             return max(0, int(raw or 0))
@@ -2497,8 +2639,10 @@ class AdmitMixin:
                 return False
             try:
                 prow = getattr(self.cfg, "prowlarr", None)
-                if not (bool(getattr(prow, "enabled", False))
-                        and bool(getattr(prow, "download_indexers", None))):
+                if not (
+                    bool(getattr(prow, "enabled", False))
+                    and bool(getattr(prow, "download_indexers", None))
+                ):
                     return False
             except Exception:
                 return False
@@ -2557,9 +2701,11 @@ class AdmitMixin:
             # Held LOCKED rows keep blocking: their SSD budget / client
             # presence is real and a duplicate download to the same
             # save_path must still be prevented.
-            rows = [r for r in (rows or [])
-                    if not (getattr(r, "skipped", 0)
-                            and r.state in WATCH_ELECTION_WAITER_STATES)]
+            rows = [
+                r
+                for r in (rows or [])
+                if not (getattr(r, "skipped", 0) and r.state in WATCH_ELECTION_WAITER_STATES)
+            ]
         except Exception:
             pass
         try:
@@ -2624,62 +2770,71 @@ class AdmitMixin:
                     continue
             if ts is None:
                 raise LookupError(
-                    f"no tracked torrent is {norm} "
-                    "(it may already be done/cancelled)")
+                    f"no tracked torrent is {norm} (it may already be done/cancelled)"
+                )
         else:
             cands = []
             for r in rows or []:
                 try:
-                    if ((r.state == State.NEW)
-                            and (r.source_infohash or "").lower().startswith(norm)):
+                    if (r.state == State.NEW) and (r.source_infohash or "").lower().startswith(
+                        norm
+                    ):
                         cands.append(r)
                 except Exception:
                     continue
             if len(cands) > 1:
                 preview = ", ".join(
                     f"{(t.source_name or '?')[:30]} ({(t.source_infohash or '')[:10]})"
-                    for t in cands[:5])
+                    for t in cands[:5]
+                )
                 raise LookupError(
                     f"/prefer_{norm} matches {len(cands)} waiting torrents: "
-                    f"{preview}; send /prefer_<full 40-char hash>")
+                    f"{preview}; send /prefer_<full 40-char hash>"
+                )
             if not cands:
                 raise LookupError(
-                    f"no waiting NEW torrent starts with {norm!r} "
-                    "(it may already be running/done)")
+                    f"no waiting NEW torrent starts with {norm!r} (it may already be running/done)"
+                )
             ts = cands[0]
         name = (ts.source_name or (ts.source_infohash or "")[:10])[:50]
         if getattr(ts, "skipped", 0):
             return None, (f"{name} is skipped — /unskip it first")
         if ts.state != State.NEW:
-            return None, (f"{name} is {ts.state.value} — nothing to prefer "
-                          "(only NEW rows waiting in grace can be started)")
+            return None, (
+                f"{name} is {ts.state.value} — nothing to prefer "
+                "(only NEW rows waiting in grace can be started)"
+            )
         if self._is_watch_row(ts):
             return self._prefer_watch_row(ts, name, rows)
         return self._prefer_racing_row(ts, name)
 
-    def _prefer_watch_row(self, ts: TorrentState, name: str,
-                          rows: list[TorrentState]) -> tuple[TorrentState | None, str]:
+    def _prefer_watch_row(
+        self, ts: TorrentState, name: str, rows: list[TorrentState]
+    ) -> tuple[TorrentState | None, str]:
         """Prefer branch for a NEW watch-dir drop (rank/owner/grace checks)."""
         try:
             rank = self._watch_rank(ts)
         except Exception:
             rank = 2
         if rank < 2:
-            return None, (f"{name} is already first (rank {rank}) — "
-                          "proceeding on its own")
+            return None, (f"{name} is already first (rank {rank}) — proceeding on its own")
         try:
             proceed, owner = self._watch_election(ts)
         except Exception:
             proceed, owner = True, None
         if not proceed or owner is not None:
             try:
-                odesc = (f"{(owner.source_name or '?')[:40]} "
-                         f"({(owner.source_infohash or '')[:10]}, {owner.state.value})"
-                         if owner is not None else "another copy")
+                odesc = (
+                    f"{(owner.source_name or '?')[:40]} "
+                    f"({(owner.source_infohash or '')[:10]}, {owner.state.value})"
+                    if owner is not None
+                    else "another copy"
+                )
             except Exception:
                 odesc = "another copy"
-            return None, (f"{name} waits on {odesc} — it goes first; "
-                          "forget it to force this one instead")
+            return None, (
+                f"{name} waits on {odesc} — it goes first; forget it to force this one instead"
+            )
         if not self._in_preferred_grace(ts):
             return None, (f"{name} is past its grace wait — proceeding on its own")
         h = (ts.source_infohash or "").lower()
@@ -2697,8 +2852,10 @@ class AdmitMixin:
                         if not self._is_watch_row(p):
                             continue
                         if not _same_content_key(
-                            p.source_name or "", p.total_bytes or 0,
-                            ts.source_name or "", ts.total_bytes or 0,
+                            p.source_name or "",
+                            p.total_bytes or 0,
+                            ts.source_name or "",
+                            ts.total_bytes or 0,
                         ):
                             continue
                         sibs += 1
@@ -2706,24 +2863,32 @@ class AdmitMixin:
                         continue
         except Exception:
             pass
-        log.info("prefer: operator started %s (%s); %d waiting sibling(s)",
-                 ts.source_name[:60], h[:10], sibs)
-        return ts, (f"Preferred {name} — starting SSD download now; "
-                    f"{sibs} waiting sibling(s) will seed from fuse/remote after.")
+        log.info(
+            "prefer: operator started %s (%s); %d waiting sibling(s)",
+            ts.source_name[:60],
+            h[:10],
+            sibs,
+        )
+        return ts, (
+            f"Preferred {name} — starting SSD download now; "
+            f"{sibs} waiting sibling(s) will seed from fuse/remote after."
+        )
 
     def _prefer_racing_row(self, ts: TorrentState, name: str) -> tuple[TorrentState | None, str]:
         """Prefer branch for a NEW VPS1 racing row (source-preference checks)."""
         try:
-            entries = getattr(getattr(self.cfg, "prowlarr", None),
-                              "download_indexers", None)
+            entries = getattr(getattr(self.cfg, "prowlarr", None), "download_indexers", None)
         except Exception:
             entries = None
         if not entries:
-            return None, (f"{name} is proceeding on its own "
-                          "(no download indexers configured — nothing to wait for)")
+            return None, (
+                f"{name} is proceeding on its own "
+                "(no download indexers configured — nothing to wait for)"
+            )
         try:
             urls = [u for u in (ts.source_announce_url or "").split(",") if u] or (
-                [ts.source_tracker] if ts.source_tracker else [])
+                [ts.source_tracker] if ts.source_tracker else []
+            )
         except Exception:
             urls = []
         try:
@@ -2733,16 +2898,14 @@ class AdmitMixin:
             pass
         try:
             if any(self.cfg.prowlarr.is_download_indexer(u) for u in urls):
-                return None, (f"{name} is already from a download indexer — "
-                              "proceeding on its own")
+                return None, (f"{name} is already from a download indexer — proceeding on its own")
         except Exception:
             pass
         if not self._in_preferred_grace(ts):
             return None, (f"{name} is past its grace wait — proceeding on its own")
         h = (ts.source_infohash or "").lower()
         self._exempt_grace_hash(h)
-        log.info("prefer: operator started racing row %s (%s)",
-                 ts.source_name[:60], h[:10])
+        log.info("prefer: operator started racing row %s (%s)", ts.source_name[:60], h[:10])
         return ts, (f"Preferred {name} — grace skipped, starting now.")
 
     def _watch_wait_note(self, ts: TorrentState) -> str:
@@ -2754,7 +2917,7 @@ class AdmitMixin:
         """
         try:
             proceed, owner = self._watch_election(ts)
-            if (proceed or owner is None):
+            if proceed or owner is None:
                 # Cross-path leader invisible to the watch election: defer
                 # to an in-flight same-content row of any origin like an
                 # election owner (grace-holding here would duplicate its
@@ -2770,15 +2933,21 @@ class AdmitMixin:
                 # No owner — but a sacrificial row inside its preferred-copy
                 # grace is still deliberately held: say so on the card.
                 try:
-                    if (proceed and owner is None and self._watch_rank(ts) >= 2
-                            and self._in_preferred_grace(ts)):
-                        return (f"Waiting for preferred copy · "
-                                f"{self._preferred_grace_left(ts)}s left")
+                    if (
+                        proceed
+                        and owner is None
+                        and self._watch_rank(ts) >= 2
+                        and self._in_preferred_grace(ts)
+                    ):
+                        return (
+                            f"Waiting for preferred copy · {self._preferred_grace_left(ts)}s left"
+                        )
                 except Exception:
                     pass
                 return ""
             domain = announce_domain(owner.source_announce_url) or announce_domain(
-                owner.source_tracker)
+                owner.source_tracker
+            )
             if domain:
                 return f"Waiting turn · {domain} copy first"
             try:
@@ -2817,16 +2986,21 @@ class AdmitMixin:
         try:
             _proceed, _owner = self._watch_election(ts)
         except Exception as e:  # noqa: BLE001
-            log.warning("watch-dir election failed for %s (%s); proceeding solo",
-                        ts.source_name[:60], e)
+            log.warning(
+                "watch-dir election failed for %s (%s); proceeding solo", ts.source_name[:60], e
+            )
             _proceed, _owner = True, None
         if not _proceed:
             _owner_desc = (
                 f"{(_owner.source_infohash or '')[:10]} ({_owner.state.value})"
-                if _owner is not None else "unknown owner"
+                if _owner is not None
+                else "unknown owner"
             )
-            log.info("watch-dir: deferring %s — same content owned by %s",
-                     ts.source_name[:60], _owner_desc)
+            log.info(
+                "watch-dir: deferring %s — same content owned by %s",
+                ts.source_name[:60],
+                _owner_desc,
+            )
             return
 
         # Preferred-copy grace candidacy (decided after the Prowlarr search
@@ -2862,11 +3036,13 @@ class AdmitMixin:
         try:
             _prow = getattr(self.cfg, "prowlarr", None)
             _prefer_possible = bool(getattr(_prow, "enabled", False)) and bool(
-                getattr(_prow, "download_indexers", None))
+                getattr(_prow, "download_indexers", None)
+            )
         except Exception:
             _prefer_possible = False
-        _hold_candidate = (not _exempted and _rank_now >= 2 and _prefer_possible
-                           and self._in_preferred_grace(ts))
+        _hold_candidate = (
+            not _exempted and _rank_now >= 2 and _prefer_possible and self._in_preferred_grace(ts)
+        )
         # Set when the search below secures download-indexer bytes: a
         # preferred source found automatically releases the hold.
         _found_preferred = False
@@ -2886,16 +3062,19 @@ class AdmitMixin:
             if _flyer is not None:
                 log.info(
                     "watch-dir: deferring %s — same content %s already %s",
-                    ts.source_name[:60], (_flyer.source_infohash or "")[:10],
-                    _flyer.state.value)
+                    ts.source_name[:60],
+                    (_flyer.source_infohash or "")[:10],
+                    _flyer.state.value,
+                )
                 return
 
         ts.save_path = str(self.cfg.dest.save_path)
-        tracker_list = [u for u in ts.source_announce_url.split(",") if u] or ([ts.source_tracker] if ts.source_tracker else [])
+        tracker_list = [u for u in ts.source_announce_url.split(",") if u] or (
+            [ts.source_tracker] if ts.source_tracker else []
+        )
         is_public = _looks_public(tracker_list)
-        is_download_tracker = (
-            self.cfg.prowlarr.enabled
-            and any(self.cfg.prowlarr.is_download_indexer(u) for u in tracker_list)
+        is_download_tracker = self.cfg.prowlarr.enabled and any(
+            self.cfg.prowlarr.is_download_indexer(u) for u in tracker_list
         )
         needs_sacrificial_copy = not is_download_tracker and not is_public
 
@@ -2907,8 +3086,7 @@ class AdmitMixin:
         # Prepare persistence directory for cross-seed torrents. The
         # infohash is hex-validated by the helper: untrusted values can
         # never escape the blob root via join/mkdir.
-        watch_cross_dir = _watch_cross_seed_dir(
-            self.cfg.general.state_db, ts.source_infohash)
+        watch_cross_dir = _watch_cross_seed_dir(self.cfg.general.state_db, ts.source_infohash)
         if watch_cross_dir is not None:
             await asyncio.to_thread(watch_cross_dir.mkdir, parents=True, exist_ok=True)
             # Always persist the dropped .torrent so it can be seeded on FUSE.
@@ -2922,8 +3100,11 @@ class AdmitMixin:
             if not _persisted:
                 await asyncio.to_thread((watch_cross_dir / _safe_name).write_bytes, blob)
         else:
-            log.warning("refusing blob persistence for %s: bad infohash %r",
-                        ts.source_name[:60], ts.source_infohash)
+            log.warning(
+                "refusing blob persistence for %s: bad infohash %r",
+                ts.source_name[:60],
+                ts.source_infohash,
+            )
 
         query_prowlarr = True
         prefer_prowlarr = True
@@ -2943,9 +3124,15 @@ class AdmitMixin:
         download_idx_names: list[str] = []
         hits_by_indexer: dict[str, list[TorrentHit]] = {}
         if _forced:
-            log.info("prowlarr: skipping search for watch-dir release %r (/fetch override: using starting .torrent)", ts.source_name)
+            log.info(
+                "prowlarr: skipping search for watch-dir release %r (/fetch override: using starting .torrent)",
+                ts.source_name,
+            )
         elif not query_prowlarr:
-            log.info("prowlarr: skipping search for watch-dir release %r (watch_dir.query_prowlarr is False)", ts.source_name)
+            log.info(
+                "prowlarr: skipping search for watch-dir release %r (watch_dir.query_prowlarr is False)",
+                ts.source_name,
+            )
         elif should_skip_prowlarr:
             log.info(
                 "prowlarr: skipping search for watch-dir release %r (matches skip_query_substrings)",
@@ -2966,8 +3153,11 @@ class AdmitMixin:
             if _hold_candidate:
                 _search_due = False
                 try:
-                    _ri = getattr(getattr(self.cfg, "cross_seed", None),
-                                  "prowlarr_retry_interval_seconds", 1800)
+                    _ri = getattr(
+                        getattr(self.cfg, "cross_seed", None),
+                        "prowlarr_retry_interval_seconds",
+                        1800,
+                    )
                     if isinstance(_ri, bool) or not isinstance(_ri, (int, float)):
                         raise TypeError
                     _interval = max(60.0, float(_ri))
@@ -3016,12 +3206,14 @@ class AdmitMixin:
                 for dl_name in download_idx_names:
                     dl_hits = hits_by_indexer.get(dl_name, [])
                     matching_dl = [
-                        h for h in dl_hits
+                        h
+                        for h in dl_hits
                         if _matches_release(h.title, h.size_bytes, ts.source_name, ts.total_bytes)
                     ]
                     matching_dl.sort(
                         key=lambda h: (
-                            normalize_content_name(h.title) != normalize_content_name(ts.source_name),
+                            normalize_content_name(h.title)
+                            != normalize_content_name(ts.source_name),
                             abs(h.size_bytes - ts.total_bytes),
                         )
                     )
@@ -3031,6 +3223,7 @@ class AdmitMixin:
                     try:
                         dl_blob = await self.prowlarr.download_torrent(best_dl)
                         from .watchdir import _bencoded_info_hash
+
                         dl_h, _, _, _ = _bencoded_info_hash(dl_blob)
                         chosen_blob = dl_blob
                         chosen_label = "public-prowlarr"
@@ -3050,12 +3243,16 @@ class AdmitMixin:
                                 # below — the bytes were fetched fine.
                                 log.warning(
                                     "watch-dir: not persisting sacrificial copy %s (no blob dir)",
-                                    dl_h[:10])
+                                    dl_h[:10],
+                                )
                             else:
-                                await asyncio.to_thread((watch_cross_dir / f"{dl_h}.torrent").write_bytes, dl_blob)
+                                await asyncio.to_thread(
+                                    (watch_cross_dir / f"{dl_h}.torrent").write_bytes, dl_blob
+                                )
                         log.info(
                             "watch-dir: using sacrificial download torrent from %s (%s)",
-                            best_dl.indexer, best_dl.title,
+                            best_dl.indexer,
+                            best_dl.title,
                         )
                         # Download-indexer bytes secured: a preferred source
                         # was found automatically (the primary choice) — the
@@ -3076,6 +3273,7 @@ class AdmitMixin:
                         try:
                             cross_blob = await self.prowlarr.download_torrent(hit)
                             from .watchdir import _bencoded_info_hash
+
                             cross_h, _, _, _ = _bencoded_info_hash(cross_blob)
                             # Same info, different announce (identical files)
                             # shares one filename — first persisted wins
@@ -3084,17 +3282,23 @@ class AdmitMixin:
                             if watch_cross_dir is None:
                                 log.warning(
                                     "watch-dir: not persisting cross-seed %s (no blob dir)",
-                                    cross_h[:10])
+                                    cross_h[:10],
+                                )
                             elif (watch_cross_dir / f"{cross_h}.torrent").exists():
                                 log.debug(
                                     "watch-dir: cross-seed %s from %s shares infohash; keeping persisted copy",
-                                    cross_h[:10], hit.indexer,
+                                    cross_h[:10],
+                                    hit.indexer,
                                 )
                             else:
-                                await asyncio.to_thread((watch_cross_dir / f"{cross_h}.torrent").write_bytes, cross_blob)
+                                await asyncio.to_thread(
+                                    (watch_cross_dir / f"{cross_h}.torrent").write_bytes, cross_blob
+                                )
                             log.info(
                                 "watch-dir: discovered cross-seed from %s: %s (%s)",
-                                hit.indexer, hit.title, cross_h[:10],
+                                hit.indexer,
+                                hit.title,
+                                cross_h[:10],
                             )
                         except Exception as e:  # noqa: BLE001
                             log.warning("could not download cross-seed from %s: %s", hit.indexer, e)
@@ -3103,6 +3307,7 @@ class AdmitMixin:
         parsed_files: list = []
         try:
             from .watchdir import extract_torrent_files_from_bencoded
+
             parsed_files = extract_torrent_files_from_bencoded(chosen_blob)
             if parsed_files:
                 # Patched in tests as racing_sync.coordinator.classify.
@@ -3117,9 +3322,14 @@ class AdmitMixin:
         # needed) unless one file alone exceeds the SSD cap.
         too_big = oversize_single_file(parsed_files, self.cfg)
         if too_big is not None:
-            log.warning("watch-dir: single file %s exceeds skip threshold; failing %s",
-                        too_big, ts.source_name)
-            self.transition(ts, State.FAILED, error=f"single file larger than skip threshold: {too_big}")
+            log.warning(
+                "watch-dir: single file %s exceeds skip threshold; failing %s",
+                too_big,
+                ts.source_name,
+            )
+            self.transition(
+                ts, State.FAILED, error=f"single file larger than skip threshold: {too_big}"
+            )
             return
 
         ts.cross_seed_infohash = chosen_infohash.lower()
@@ -3135,19 +3345,27 @@ class AdmitMixin:
         # query_prowlarr=False (no search will ever release the hold) —
         # proceed immediately. Nothing is reserved yet, so returning keeps
         # the row NEW with no leakage.
-        if (_hold_candidate and query_prowlarr and not _found_preferred
-                and not _forced and self._in_preferred_grace(ts)):
+        if (
+            _hold_candidate
+            and query_prowlarr
+            and not _found_preferred
+            and not _forced
+            and self._in_preferred_grace(ts)
+        ):
             log.info(
                 "watch-dir: holding %s for preferred copy (rank 2, %ds grace left)",
-                ts.source_name[:60], self._preferred_grace_left(ts),
+                ts.source_name[:60],
+                self._preferred_grace_left(ts),
             )
             return
 
         # Shared admit tail with the racing flow (all-remote skip,
         # on-SSD shortcut, ledger reserve → QUEUED/WAITING_DISK).
         await self._admit_resolved(
-            ts, blob=chosen_blob,
-            size_bytes=chosen_size, display_name=ts.source_name[:60],
+            ts,
+            blob=chosen_blob,
+            size_bytes=chosen_size,
+            display_name=ts.source_name[:60],
         )
 
     async def _remaining_batch_footprint(self, batches, kind: str) -> int | None:
@@ -3169,7 +3387,8 @@ class AdmitMixin:
                 return None
             all_eps = [
                 (e.file_name, e.size_bytes)
-                for b in blist for e in (getattr(b, "episodes", None) or [])
+                for b in blist
+                for e in (getattr(b, "episodes", None) or [])
                 if getattr(e, "file_name", "")
             ]
             if not all_eps:
@@ -3196,8 +3415,7 @@ class AdmitMixin:
         Never raises — [] means "no usable information".
         """
         try:
-            want = {(h or "").strip().lower() for h in (hashes or [])
-                    if (h or "").strip()}
+            want = {(h or "").strip().lower() for h in (hashes or []) if (h or "").strip()}
             if not want:
                 return []
             dest = getattr(self, "dest_client", None)
@@ -3205,7 +3423,8 @@ class AdmitMixin:
                 return []
             found = await rpc(
                 dest.list_torrents(hashes=sorted(want)),
-                getattr(self, "cfg", None), "dest entries lookup",
+                getattr(self, "cfg", None),
+                "dest entries lookup",
             )
             out = []
             for t in found or []:
@@ -3254,6 +3473,7 @@ class AdmitMixin:
             if not blob or not isinstance(blob, (bytes, bytearray)):
                 return None
             from .watchdir import extract_torrent_files_from_bencoded
+
             _k = (key or "").lower()
             if not _k:
                 # Unkeyed callers (tests, one-shots): parse, don't cache.
@@ -3267,8 +3487,11 @@ class AdmitMixin:
                 _cache = {}
                 self._blob_parse_cache = _cache  # type: ignore[attr-defined]
             _hit = _cache.get(_k)
-            if (isinstance(_hit, tuple) and len(_hit) == 2
-                    and _now - float(_hit[0]) < _BLOB_PARSE_TTL_S):
+            if (
+                isinstance(_hit, tuple)
+                and len(_hit) == 2
+                and _now - float(_hit[0]) < _BLOB_PARSE_TTL_S
+            ):
                 return _hit[1]
             try:
                 parsed = extract_torrent_files_from_bencoded(bytes(blob))
@@ -3285,8 +3508,7 @@ class AdmitMixin:
         except Exception:
             return None
 
-    async def _blob_fully_remote(self, blob: bytes | None, *,
-                                 cache_key: str = "") -> bool | None:
+    async def _blob_fully_remote(self, blob: bytes | None, *, cache_key: str = "") -> bool | None:
         """True iff every file in the .torrent bytes already sits verified on fuse.
 
         Admit-time shortcut so already-remote content never queues behind
@@ -3304,8 +3526,7 @@ class AdmitMixin:
             parsed = self._cached_blob_files(blob, cache_key)
             if parsed is None:
                 return None
-            names = [(f.name, f.size_bytes) for f in (parsed or [])
-                     if getattr(f, "name", "")]
+            names = [(f.name, f.size_bytes) for f in (parsed or []) if getattr(f, "name", "")]
             if not names:
                 return None
             try:
@@ -3346,8 +3567,9 @@ class AdmitMixin:
             log.warning("fuse skip check failed, downloading everything: %s", e)
             return set()
 
-    async def _setup_queued_download(self, ts: TorrentState, blob: bytes, *,
-                                     _holds_download_slot: bool = True) -> None:
+    async def _setup_queued_download(
+        self, ts: TorrentState, blob: bytes, *, _holds_download_slot: bool = True
+    ) -> None:
         """Classify, prioritize, and resume a just-added SSD torrent."""
         # Classify (with a short retry: the files endpoint can 404 for a few
         # seconds right after add while qB registers the torrent). Central
@@ -3358,11 +3580,11 @@ class AdmitMixin:
         async def _fetch_setup_files() -> list[TorrentFile]:
             return await rpc(
                 self.dest_client.get_torrent_files(ts.dest_infohash or ts.source_infohash),
-                getattr(self, "cfg", None), "dest setup files",
+                getattr(self, "cfg", None),
+                "dest setup files",
             )
 
-        files: list[TorrentFile] = await retryable(
-            label="dest setup files")(_fetch_setup_files)()
+        files: list[TorrentFile] = await retryable(label="dest setup files")(_fetch_setup_files)()
         from . import coordinator as _coordinator
 
         cls = _coordinator.classify(files, self.cfg)
@@ -3374,8 +3596,7 @@ class AdmitMixin:
             # tolerates already-remote singles) for the fuse-gated finish.
             only = files[0]
             if await self._fuse_skipped([(only.name, only.size_bytes)], cls.kind):
-                log.info("single file %s already on remote; skipping SSD download",
-                         only.name)
+                log.info("single file %s already on remote; skipping SSD download", only.name)
                 # No SSD footprint — free the admission estimate for waiters.
                 try:
                     await self._ssd_adjust(ts.source_infohash, 0)
@@ -3389,14 +3610,17 @@ class AdmitMixin:
         # disqualifies content anymore.
         too_big = oversize_single_file(files, self.cfg)
         if too_big is not None:
-            log.warning("single file %s exceeds skip threshold; failing %s",
-                        too_big, ts.source_name)
+            log.warning(
+                "single file %s exceeds skip threshold; failing %s", too_big, ts.source_name
+            )
             # Remove the paused torrent from VPS2 so it does not leak as an orphan
             h = ts.dest_infohash or ts.source_infohash
             if h:
                 await self._drop_failed_entry(h, ts, files, "oversize")
             self.transition(
-                ts, State.FAILED, error=f"single file larger than skip threshold: {too_big}",
+                ts,
+                State.FAILED,
+                error=f"single file larger than skip threshold: {too_big}",
             )
             return
 
@@ -3425,14 +3649,19 @@ class AdmitMixin:
             except Exception:
                 _too_big_for_cap = None
             if _too_big_for_cap is not None:
-                log.warning("single file %s exceeds batch cap (%d B); failing %s",
-                            _too_big_for_cap, _fit_cap, ts.source_name)
+                log.warning(
+                    "single file %s exceeds batch cap (%d B); failing %s",
+                    _too_big_for_cap,
+                    _fit_cap,
+                    ts.source_name,
+                )
                 # Remove the paused torrent from VPS2 so it does not leak as an orphan
                 h = ts.dest_infohash or ts.source_infohash
                 if h:
                     await self._drop_failed_entry(h, ts, files, "over-cap")
                 self.transition(
-                    ts, State.FAILED,
+                    ts,
+                    State.FAILED,
                     error=f"single file larger than batch cap ({_fit_cap} B): {_too_big_for_cap}",
                 )
                 return
@@ -3450,7 +3679,9 @@ class AdmitMixin:
                 # Patched in tests as racing_sync.coordinator.ssd_has_room.
                 from . import coordinator as _coordinator
 
-                if not _coordinator.ssd_has_room(self.cfg, min(total_ep, ts.total_bytes or total_ep)):
+                if not _coordinator.ssd_has_room(
+                    self.cfg, min(total_ep, ts.total_bytes or total_ep)
+                ):
                     log.info("ssd cap in use; parking %s", ts.source_name)
                     # Keep the paused entry for the retry (existing-entry
                     # adopt path) — see the grow-fail park below.
@@ -3482,14 +3713,16 @@ class AdmitMixin:
                 # already moved stay deselected (re-downloaded never).
                 first = batches[0]
                 skip0 = await self._fuse_skipped(
-                    [(e.file_name, e.size_bytes) for e in first.episodes], cls.kind,
+                    [(e.file_name, e.size_bytes) for e in first.episodes],
+                    cls.kind,
                 )
                 prio_map = {f.name: 0 for f in files}
                 first_need = {e.file_name for e in first.episodes} - skip0
                 for name in first_need:
                     prio_map[name] = 1
                 await self.dest_client.set_file_priorities(
-                    ts.dest_infohash or ts.source_infohash, prio_map,
+                    ts.dest_infohash or ts.source_infohash,
+                    prio_map,
                 )
                 await self._warn_if_preallocated(ts, files, first_need)
         elif cls.kind in ("movie", "unknown") and len(files) > 1:
@@ -3503,7 +3736,9 @@ class AdmitMixin:
                 total_files = sum(f.size_bytes for f in files)
                 from . import coordinator as _coordinator
 
-                if not _coordinator.ssd_has_room(self.cfg, min(total_files, ts.total_bytes or total_files)):
+                if not _coordinator.ssd_has_room(
+                    self.cfg, min(total_files, ts.total_bytes or total_files)
+                ):
                     log.info("ssd cap in use; parking %s", ts.source_name)
                     # Keep the paused entry for the retry (existing-entry
                     # adopt path) — see the grow-fail park below. A
@@ -3533,12 +3768,14 @@ class AdmitMixin:
                 first = batches[0]
                 wanted = {ep.file_name for ep in first.episodes}
                 skip0 = await self._fuse_skipped(
-                    [(e.file_name, e.size_bytes) for e in first.episodes], cls.kind,
+                    [(e.file_name, e.size_bytes) for e in first.episodes],
+                    cls.kind,
                 )
                 first_need = wanted - skip0
                 prio_map = {f.name: (1 if f.name in first_need else 0) for f in files}
                 await self.dest_client.set_file_priorities(
-                    ts.dest_infohash or ts.source_infohash, prio_map,
+                    ts.dest_infohash or ts.source_infohash,
+                    prio_map,
                 )
                 await self._warn_if_preallocated(ts, files, first_need)
         elif cls.kind == "episode" and len(files) > 1:
@@ -3565,12 +3802,14 @@ class AdmitMixin:
                     first = batches[0]
                     wanted = {ep.file_name for ep in first.episodes}
                     skip0 = await self._fuse_skipped(
-                        [(e.file_name, e.size_bytes) for e in first.episodes], cls.kind,
+                        [(e.file_name, e.size_bytes) for e in first.episodes],
+                        cls.kind,
                     )
                     first_need = wanted - skip0
                     prio_map = {f.name: (1 if f.name in first_need else 0) for f in files}
                     await self.dest_client.set_file_priorities(
-                        ts.dest_infohash or ts.source_infohash, prio_map,
+                        ts.dest_infohash or ts.source_infohash,
+                        prio_map,
                     )
                     await self._warn_if_preallocated(ts, files, first_need)
 
@@ -3585,7 +3824,8 @@ class AdmitMixin:
         if ts.batches_total > 0 and _real_footprint == 0:
             log.info(
                 "all %d batche(s) for %s already on remote; skipping SSD download",
-                ts.batches_total, ts.source_name,
+                ts.batches_total,
+                ts.source_name,
             )
             # Safety net for the admit-race (bytes landed on fuse between
             # the _do_queued shortcut check and this classification): the
@@ -3598,8 +3838,11 @@ class AdmitMixin:
                 if _h:
                     await self.dest_client.delete(_h, delete_files=False)
             except Exception as e:  # noqa: BLE001
-                log.debug("could not delete fully-remote SSD corpse %s: %s",
-                          (ts.dest_infohash or ts.source_infohash or "")[:10], e)
+                log.debug(
+                    "could not delete fully-remote SSD corpse %s: %s",
+                    (ts.dest_infohash or ts.source_infohash or "")[:10],
+                    e,
+                )
             self.transition(ts, State.RE_ADDING)
             return
 
@@ -3623,7 +3866,8 @@ class AdmitMixin:
             log.info(
                 "ssd budget in use after classify (need ~%d MB, reserved ~%d MB); parking %s",
                 int(_real_footprint or 0) // (1024 * 1024),
-                self._ssd_reserved_total() // (1024 * 1024), ts.source_name,
+                self._ssd_reserved_total() // (1024 * 1024),
+                ts.source_name,
             )
             # Keep the paused entry (delete_files=False): the retry adopts
             # it via the existing-entry path instead of re-adding, and a
@@ -3642,8 +3886,7 @@ class AdmitMixin:
         # resumes on reaching the first batch with work). Gate first: setup
         # (add + prioritize) already ran, so park with the paused entry
         # intact — the next tick resumes through the existing-entry path.
-        if await self._park_queued_for_download_slot(
-                ts, holds_slot=_holds_download_slot):
+        if await self._park_queued_for_download_slot(ts, holds_slot=_holds_download_slot):
             return
         if first_need is None or first_need:
             await self.dest_client.resume(ts.dest_infohash or ts.source_infohash)
@@ -3669,7 +3912,9 @@ class AdmitMixin:
             try:
                 rows = await rpc(
                     self.dest_client.list_torrents(category="racing"),
-                    getattr(self, "cfg", None), "dest await-hash list")
+                    getattr(self, "cfg", None),
+                    "dest await-hash list",
+                )
             except (asyncio.CancelledError, AbandonedError):
                 raise
             except Exception as e:  # noqa: BLE001
@@ -3694,8 +3939,9 @@ class AdmitMixin:
 
     # ---- state: DOWNLOADING ----
 
-    def _resolve_batches(self, files: list[TorrentFile], kind: str, cap_bytes: int,
-                           episodes=None) -> list[Batch]:
+    def _resolve_batches(
+        self, files: list[TorrentFile], kind: str, cap_bytes: int, episodes=None
+    ) -> list[Batch]:
         """Episode batches for seasons, file-group batches otherwise.
 
         Single shared rule used at QUEUED time and re-resolved during the
@@ -3735,7 +3981,8 @@ class AdmitMixin:
         try:
             files = await rpc(
                 self.dest_client.get_torrent_files(h),
-                getattr(self, "cfg", None), "dest batches files",
+                getattr(self, "cfg", None),
+                "dest batches files",
             )
         except Exception as e:
             log.warning("could not get torrent files for batches: %s", e)
@@ -3776,20 +4023,22 @@ class AdmitMixin:
         remote = (
             self.cfg.rclone.remote.default
             if hasattr(self, "cfg") and self.cfg and ts.classification_kind in ("movie", "season")
-            else (self.cfg.rclone.remote.unsorted if hasattr(self, "cfg") and self.cfg else "remote:")
+            else (
+                self.cfg.rclone.remote.unsorted if hasattr(self, "cfg") and self.cfg else "remote:"
+            )
         )
         log.info(
             "moving completed batch %d/%d for %s",
-            ts.batch_index + 1, ts.batches_total, ts.source_name,
+            ts.batch_index + 1,
+            ts.batches_total,
+            ts.source_name,
         )
         extra_flags = (
             self.cfg.rclone.batch_move_extra_flags
             if hasattr(self, "cfg") and hasattr(self.cfg.rclone, "batch_move_extra_flags")
             else None
         )
-        skip_norm = {
-            (n or "").replace("\\", "/").strip("/") for n in (skip or set())
-        }
+        skip_norm = {(n or "").replace("\\", "/").strip("/") for n in (skip or set())}
         names = [n for n in batch.file_names() if n not in skip_norm]
         unsafe = [n for n in names if _safe_ssd_join(src_dir, n or "") is None]
         if unsafe:
@@ -3804,7 +4053,9 @@ class AdmitMixin:
         if not names:
             log.info(
                 "batch %d/%d for %s already on remote; skipping move",
-                ts.batch_index + 1, ts.batches_total, ts.source_name,
+                ts.batch_index + 1,
+                ts.batches_total,
+                ts.source_name,
             )
             return
         await self._rclone_move(
@@ -3855,12 +4106,13 @@ class AdmitMixin:
         err: Exception | None = None
         for attempt in range(3):
             try:
-                await rpc(self.dest_client.pause(h),
-                          getattr(self, "cfg", None), "dest pause")
+                await rpc(self.dest_client.pause(h), getattr(self, "cfg", None), "dest pause")
                 try:
                     cur = await rpc(
                         self.dest_client.get_torrent(h),
-                        getattr(self, "cfg", None), "dest get_torrent")
+                        getattr(self, "cfg", None),
+                        "dest get_torrent",
+                    )
                     state = getattr(cur, "state", "") if cur is not None else ""
                     if cur is None or self._client_reports_paused(state):
                         return True, None
@@ -3887,8 +4139,7 @@ class AdmitMixin:
                     # Verification read failed: the pause may not have
                     # landed — fail closed (retry the pause, then park)
                     # instead of moving under a writing client.
-                    err = RuntimeError(
-                        f"could not verify pause for {h[:10]}: {e}")
+                    err = RuntimeError(f"could not verify pause for {h[:10]}: {e}")
             except Exception as e:  # noqa: BLE001
                 err = e
             if attempt < 2:
@@ -3932,7 +4183,10 @@ class AdmitMixin:
             return False
 
     async def _warn_if_preallocated(
-        self, ts: TorrentState, files: list, wanted: set[str] | None,
+        self,
+        ts: TorrentState,
+        files: list,
+        wanted: set[str] | None,
     ) -> None:
         """Loud one-time hint when deselected files already occupy full size.
 
@@ -3964,8 +4218,9 @@ class AdmitMixin:
                 base = Path(ts.save_path) if ts.save_path else Path(self.cfg.dest.save_path)
             except Exception:
                 return
-            others = [f for f in (files or [])
-                      if (getattr(f, "name", "") or "") not in (wanted or set())]
+            others = [
+                f for f in (files or []) if (getattr(f, "name", "") or "") not in (wanted or set())
+            ]
 
             def _check() -> tuple[int, int]:
                 n = 0
@@ -4015,7 +4270,9 @@ class AdmitMixin:
                 "deselect-after-add cannot reclaim them — disable pre-allocation "
                 "(sparse allocation) on the VPS2 client or seasons bigger than "
                 "the SSD will keep filling the disk",
-                n, total // (1024 * 1024), ts.source_name[:60],
+                n,
+                total // (1024 * 1024),
+                ts.source_name[:60],
             )
         except Exception:
             pass

@@ -1,4 +1,5 @@
 """P1 wiring: MOVING cards show live rclone lines; progress resets parks."""
+
 from __future__ import annotations
 
 import time
@@ -10,15 +11,24 @@ from racing_sync.state import State, TorrentState
 
 
 def _moving_row(h="a" * 40):
-    return TorrentState(source_infohash=h, source_name="Big.Show.S01",
-                        state=State.MOVING, total_bytes=10_000_000_000,
-                        source_announce_url="https://alpha.cc/announce/xyz")
+    return TorrentState(
+        source_infohash=h,
+        source_name="Big.Show.S01",
+        state=State.MOVING,
+        total_bytes=10_000_000_000,
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
 
 
 def _fresh(**kw):
-    args = dict(transferred_bytes=4_200_000_000, total_bytes=10_000_000_000,
-                percent=42.0, speed_bps=80_000_000, eta_seconds=72,
-                updated_at=time.monotonic())
+    args = dict(
+        transferred_bytes=4_200_000_000,
+        total_bytes=10_000_000_000,
+        percent=42.0,
+        speed_bps=80_000_000,
+        eta_seconds=72,
+        updated_at=time.monotonic(),
+    )
     args.update(kw)
     return RcloneProgress(**args)
 
@@ -27,8 +37,9 @@ def test_moving_card_shows_live_line():
     from racing_sync.telegram_views import render_active
 
     h = "a" * 40
-    text, _, _ = render_active([(_moving_row(h), None)], page=0, page_size=5,
-                               move_progress={h: _fresh()})
+    text, _, _ = render_active(
+        [(_moving_row(h), None)], page=0, page_size=5, move_progress={h: _fresh()}
+    )
     assert "📦 Moving · 42%" in text
     assert "▓" in text or "█" in text
     assert "76.3M/s" in text
@@ -41,8 +52,11 @@ def test_moving_card_plain_without_fresh_progress():
     h = "a" * 40
     # Stale entry: plain badge, no fossilized percentage.
     text, _, _ = render_active(
-        [(_moving_row(h), None)], page=0, page_size=5,
-        move_progress={h: _fresh(updated_at=time.monotonic() - 600.0)})
+        [(_moving_row(h), None)],
+        page=0,
+        page_size=5,
+        move_progress={h: _fresh(updated_at=time.monotonic() - 600.0)},
+    )
     assert "📦 Moving" in text
     assert "42%" not in text
     # No entry at all: same plain badge.
@@ -64,8 +78,7 @@ def test_park_counter_resets_on_transferred_growth():
     coord._moving_tree = {h: "tree-key"}
     coord._moving_progress_bytes = {h: 100}
     try:
-        rclone_ops._RCLONE_PROGRESS["tree-key"] = _fresh(
-            transferred_bytes=200)
+        rclone_ops._RCLONE_PROGRESS["tree-key"] = _fresh(transferred_bytes=200)
         coord._park_moving(_moving_row(h), "busy", quiet=True)
         assert coord._moving_parks[h] == 1
         # Same bytes next tick: no advance, counter climbs again.
@@ -97,8 +110,7 @@ def test_transition_clears_progress_join_maps():
 
     coord = make_coordinator(MagicMock())
     h = "b" * 40
-    ts = TorrentState(source_infohash=h, source_name="S",
-                      state=State.MOVING)
+    ts = TorrentState(source_infohash=h, source_name="S", state=State.MOVING)
     coord._moving_parks = {h: 3}
     coord._moving_tree = {h: "t"}
     coord._moving_progress_bytes = {h: 9}

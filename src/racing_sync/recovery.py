@@ -32,9 +32,9 @@ class RecoveryReport:
         self.kept: list[str] = []
         self.resumed: list[str] = []
         self.re_added: list[str] = []
-        self.orphans: list[str] = []   # in DB but not on VPS2
+        self.orphans: list[str] = []  # in DB but not on VPS2
         self.unknowns: list[str] = []  # on VPS2 but not in DB
-        self.adopted: list[str] = []   # fresh DB rows rebuilt from VPS2 state
+        self.adopted: list[str] = []  # fresh DB rows rebuilt from VPS2 state
 
     def summary(self) -> str:
         return (
@@ -92,11 +92,7 @@ def _hash_is_ignored(store, infohash: str) -> bool:
 
 def _known_row_hashes(ts: TorrentState) -> set[str]:
     """Every hash that can identify this row's dest entry (lowercased)."""
-    known = {
-        k.lower()
-        for k in (ts.source_infohash, ts.dest_infohash, ts.cross_seed_infohash)
-        if k
-    }
+    known = {k.lower() for k in (ts.source_infohash, ts.dest_infohash, ts.cross_seed_infohash) if k}
     if ts.injected_private_hashes:
         for iph in ts.injected_private_hashes.split(","):
             if iph.strip():
@@ -139,14 +135,16 @@ async def _fill_entries_by_hash(
         try:
             found = await bounded(
                 dest.list_torrents(hashes=chunk),
-                timeout=30.0, label="reconcile hash lookup",
+                timeout=30.0,
+                label="reconcile hash lookup",
             )
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
             log.warning(
-                "reconcile: category-agnostic hash lookup failed "
-                "(%d hashes): %s", len(chunk), e,
+                "reconcile: category-agnostic hash lookup failed (%d hashes): %s",
+                len(chunk),
+                e,
             )
             continue
         allowed = set(chunk)
@@ -166,8 +164,7 @@ def _ssd_roots_known(cfg: AppConfig) -> bool:
     try:
         return any(
             isinstance(raw, (str, Path)) and str(raw).strip()
-            for raw in (getattr(cfg.dest, "save_path", None),
-                        getattr(cfg.ssd, "path", None))
+            for raw in (getattr(cfg.dest, "save_path", None), getattr(cfg.ssd, "path", None))
         )
     except Exception:
         return False
@@ -263,13 +260,10 @@ def _classify_kind_for_files(files: list, cfg: AppConfig) -> str:
         return "unknown"
 
 
-async def _classify_adopted(
-    cfg: AppConfig, dest: TorrentClient, h: str
-) -> str:
+async def _classify_adopted(cfg: AppConfig, dest: TorrentClient, h: str) -> str:
     """Fetch dest files and classify; "unknown" on any failure."""
     try:
-        files = await rpc(dest.get_torrent_files(h), cfg,
-                          "reconcile classify get_torrent_files")
+        files = await rpc(dest.get_torrent_files(h), cfg, "reconcile classify get_torrent_files")
     except Exception:
         return "unknown"
     try:
@@ -290,8 +284,7 @@ async def _adopt_blob(dest: TorrentClient, h: str) -> bytes:
         export = getattr(dest, "export_torrent", None)
         if not callable(export):
             return b""
-        blob = await bounded(export(h), timeout=30.0,
-                             label="reconcile export_torrent")
+        blob = await bounded(export(h), timeout=30.0, label="reconcile export_torrent")
         if isinstance(blob, (bytes, bytearray)) and blob:
             return bytes(blob)
         return b""
@@ -306,6 +299,7 @@ async def _missing_under(mount: Path, expected: list[tuple[str, int]]) -> list[s
     trust behavior — absence of evidence must never manufacture terminal
     failures (a warming/dead mount also shows nothing).
     """
+
     def _check() -> list[str]:
         missing: list[str] = []
         for name, want in expected:
@@ -351,20 +345,16 @@ async def _verify_fuse_adopted(
     h = str(getattr(t, "hash", "") or "")
     name = str(getattr(t, "name", "") or h)
     try:
-        files = await rpc(dest.get_torrent_files(h), cfg,
-                          "reconcile verify get_torrent_files")
+        files = await rpc(dest.get_torrent_files(h), cfg, "reconcile verify get_torrent_files")
     except Exception as e:  # noqa: BLE001
-        log.warning("reconcile: cannot list files for %s; keeping DONE trust: %s",
-                    h[:10], e)
+        log.warning("reconcile: cannot list files for %s; keeping DONE trust: %s", h[:10], e)
         return True, save_path, "unknown", False
     try:
         expected = [
-            (str(f.name), int(f.size_bytes or 0))
-            for f in (files or []) if getattr(f, "name", "")
+            (str(f.name), int(f.size_bytes or 0)) for f in (files or []) if getattr(f, "name", "")
         ]
     except Exception as e:  # noqa: BLE001
-        log.warning("reconcile: cannot decode file list for %s; keeping DONE trust: %s",
-                    h[:10], e)
+        log.warning("reconcile: cannot decode file list for %s; keeping DONE trust: %s", h[:10], e)
         return True, save_path, "unknown", False
     kind = _classify_kind_for_files(files, cfg)
     if not expected:
@@ -382,12 +372,20 @@ async def _verify_fuse_adopted(
     if ssd_root is not None:
         log.warning(
             "reconcile: %s claims fuse %s but %d/%d files missing; content found on SSD at %s — adopting as MOVING",
-            name[:60], save_path, len(missing), len(expected), ssd_root,
+            name[:60],
+            save_path,
+            len(missing),
+            len(expected),
+            ssd_root,
         )
         return False, str(ssd_root), kind, True
     log.warning(
         "reconcile: %s claims fuse %s but %d/%d files missing (e.g. %s); keeping DONE (mount may be warming); late injections stay gated",
-        name[:60], save_path, len(missing), len(expected), missing[0],
+        name[:60],
+        save_path,
+        len(missing),
+        len(expected),
+        missing[0],
     )
     return True, save_path, kind, False
 
@@ -430,13 +428,20 @@ async def reconcile_verify(
     never kills the pass), fail-closed throughout. CancelledError
     propagates so shutdown stays prompt. Returns outcome counts.
     """
-    counts = {"verified": 0, "demoted": 0, "classified": 0,
-              "blob_healed": 0, "orphans_fixed": 0, "skipped": 0,
-              "failed": 0}
+    counts = {
+        "verified": 0,
+        "demoted": 0,
+        "classified": 0,
+        "blob_healed": 0,
+        "orphans_fixed": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
     try:
         actual = await bounded(
             dest.list_torrents(category="racing"),
-            timeout=30.0, label="verify list_torrents",
+            timeout=30.0,
+            label="verify list_torrents",
         )
     except asyncio.CancelledError:
         raise
@@ -469,18 +474,19 @@ async def reconcile_verify(
     async def _one(ts) -> None:
         try:
             async with sem:
-                await _verify_row(cfg, dest, store, ts, actual_by_hash,
-                                  counts)
+                await _verify_row(cfg, dest, store, ts, actual_by_hash, counts)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
             counts["failed"] += 1
-            log.warning("reconcile_verify: row %s failed: %s",
-                        (getattr(ts, "source_infohash", "") or "")[:10], e)
+            log.warning(
+                "reconcile_verify: row %s failed: %s",
+                (getattr(ts, "source_infohash", "") or "")[:10],
+                e,
+            )
 
     await asyncio.gather(*[_one(ts) for ts in all_rows or []])
-    log.info("reconcile_verify: %s", ", ".join(
-        f"{k}={v}" for k, v in counts.items()))
+    log.info("reconcile_verify: %s", ", ".join(f"{k}={v}" for k, v in counts.items()))
     return counts
 
 
@@ -503,19 +509,20 @@ async def _verify_row(cfg, dest, store, ts, actual_by_hash, counts) -> None:
         hit = next((k for k in known if k in actual_by_hash), None)
         # Orphaned in-flight row: run the orphan fix.
         if not present and ts.state in (
-                State.QUEUED, State.DOWNLOADING, State.MOVING,
-                State.RE_ADDING):
+            State.QUEUED,
+            State.DOWNLOADING,
+            State.MOVING,
+            State.RE_ADDING,
+        ):
             try:
                 sftp_bytes = await offload(store.get_blob, h) or None
             except Exception:
                 sftp_bytes = None
             try:
-                await fix_orphan(ts, cfg, dest=dest, store=store,
-                                 sftp_bytes=sftp_bytes)
+                await fix_orphan(ts, cfg, dest=dest, store=store, sftp_bytes=sftp_bytes)
                 counts["orphans_fixed"] += 1
             except Exception as e:  # noqa: BLE001
-                log.error("reconcile_verify: fix_orphan failed for %s: %s",
-                          h[:10], e)
+                log.error("reconcile_verify: fix_orphan failed for %s: %s", h[:10], e)
                 counts["failed"] += 1
             return
         if not present:
@@ -530,8 +537,7 @@ async def _verify_row(cfg, dest, store, ts, actual_by_hash, counts) -> None:
                     sp = str(getattr(t, "save_path", "") or "")
                 except Exception:
                     pass
-                ok, use_path, kind, verified = await _verify_fuse_adopted(
-                    cfg, dest, t, sp)
+                ok, use_path, kind, verified = await _verify_fuse_adopted(cfg, dest, t, sp)
                 if verified and ok:
                     if kind and kind != "unknown":
                         ts.classification_kind = kind
@@ -562,13 +568,16 @@ async def _verify_row(cfg, dest, store, ts, actual_by_hash, counts) -> None:
                 else:
                     counts["skipped"] += 1
             except Exception as e:  # noqa: BLE001
-                log.warning("reconcile_verify: fuse verify failed for %s: %s",
-                            h[:10], e)
+                log.warning("reconcile_verify: fuse verify failed for %s: %s", h[:10], e)
                 counts["failed"] += 1
             return
         # Adopted rows with unknown kind: classify + heal the blob.
         if (ts.classification_kind or "unknown") == "unknown" and ts.state in (
-                State.DONE, State.MOVING, State.DOWNLOADING, State.RE_ADDING):
+            State.DONE,
+            State.MOVING,
+            State.DOWNLOADING,
+            State.RE_ADDING,
+        ):
             try:
                 kind = await _classify_adopted(cfg, dest, hit or h)
                 if kind and kind != "unknown":
@@ -581,8 +590,7 @@ async def _verify_row(cfg, dest, store, ts, actual_by_hash, counts) -> None:
                 else:
                     counts["skipped"] += 1
             except Exception as e:  # noqa: BLE001
-                log.warning("reconcile_verify: classify failed for %s: %s",
-                            h[:10], e)
+                log.warning("reconcile_verify: classify failed for %s: %s", h[:10], e)
                 counts["failed"] += 1
             try:
                 if not ts.cross_seed_blob:
@@ -600,8 +608,11 @@ async def _verify_row(cfg, dest, store, ts, actual_by_hash, counts) -> None:
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001
-        log.warning("reconcile_verify: row %s failed: %s",
-                    (getattr(ts, "source_infohash", "") or "")[:10], e)
+        log.warning(
+            "reconcile_verify: row %s failed: %s",
+            (getattr(ts, "source_infohash", "") or "")[:10],
+            e,
+        )
         counts["failed"] += 1
 
 
@@ -634,7 +645,8 @@ async def _reconcile_snapshot(
         try:
             actual = await bounded(
                 dest.list_torrents(category="racing"),
-                timeout=30.0, label="reconcile list_torrents",
+                timeout=30.0,
+                label="reconcile list_torrents",
             )
             last_err = None
             break
@@ -648,7 +660,9 @@ async def _reconcile_snapshot(
         # "lost" and mass-demote to RE_ADDING below. Aborting startup on a
         # wedged VPS2 is correct — steady-state loops tolerate the same
         # outage once running, but reconcile must never act on blindness.
-        raise RuntimeError(f"reconcile: cannot list dest torrents after 3 attempts: {last_err}") from last_err
+        raise RuntimeError(
+            f"reconcile: cannot list dest torrents after 3 attempts: {last_err}"
+        ) from last_err
     actual_by_hash: dict[str, object] = {}
     for t in actual:
         h = (getattr(t, "hash", "") or "").strip().lower()
@@ -682,7 +696,8 @@ async def _reconcile_snapshot(
                     if hit is not None:
                         try:
                             _files = await rpc(
-                                dest.get_torrent_files(hit), cfg,
+                                dest.get_torrent_files(hit),
+                                cfg,
                                 "reconcile heal get_torrent_files",
                             )
                             _kind = _classify_kind_for_files(_files or [], cfg)
@@ -696,7 +711,8 @@ async def _reconcile_snapshot(
                                 pass
                             log.info(
                                 "reconcile: classified previously-unknown DONE %s as %s",
-                                ts.source_name[:60], _kind,
+                                ts.source_name[:60],
+                                _kind,
                             )
                 # Ghost check: a skip_check entry reports complete with zero
                 # bytes. Verify cheaply at startup; a warming mount keeps
@@ -709,12 +725,14 @@ async def _reconcile_snapshot(
                             _t = actual_by_hash[_hit]
                             _sp = str(getattr(_t, "save_path", "") or "")
                             _fl = await rpc(
-                                dest.get_torrent_files(_hit), cfg,
+                                dest.get_torrent_files(_hit),
+                                cfg,
                                 "reconcile ghost get_torrent_files",
                             )
                             _exp = [
                                 (str(f.name), int(f.size_bytes or 0))
-                                for f in (_fl or []) if getattr(f, "name", "")
+                                for f in (_fl or [])
+                                if getattr(f, "name", "")
                             ]
                             if _exp and _sp:
                                 _miss = await _missing_under(Path(_sp), _exp)
@@ -724,8 +742,11 @@ async def _reconcile_snapshot(
                                         log.warning(
                                             "reconcile: DONE %s missing %d/%d files at %s; "
                                             "bytes on SSD at %s — demoting to MOVING",
-                                            ts.source_name[:60], len(_miss), len(_exp),
-                                            _sp, _root,
+                                            ts.source_name[:60],
+                                            len(_miss),
+                                            len(_exp),
+                                            _sp,
+                                            _root,
                                         )
                                         ts.save_path = str(_root)
                                         store.transition(ts, State.MOVING)
@@ -734,7 +755,10 @@ async def _reconcile_snapshot(
                                     log.warning(
                                         "reconcile: DONE %s missing %d/%d files at %s; "
                                         "keeping DONE (mount may be warming)",
-                                        ts.source_name[:60], len(_miss), len(_exp), _sp,
+                                        ts.source_name[:60],
+                                        len(_miss),
+                                        len(_exp),
+                                        _sp,
                                     )
                     except Exception as e:  # noqa: BLE001
                         log.warning("reconcile: ghost check failed for %s: %s", h[:10], e)
@@ -771,8 +795,7 @@ async def _reconcile_snapshot(
                     # One bad orphan must never kill startup — park it FAILED.
                     log.error("reconcile: fix_orphan failed for %s: %s", h[:10], e)
                     try:
-                        _force_state(store, ts, State.FAILED,
-                                     error=f"recovery failed: {e}")
+                        _force_state(store, ts, State.FAILED, error=f"recovery failed: {e}")
                     except Exception:
                         pass
 
@@ -799,11 +822,16 @@ async def _reconcile_snapshot(
     for h, t in actual_by_hash.items():
         if h.lower() not in db_hashes:
             if _hash_is_ignored(store, h):
-                log.info("reconcile: skipping cancelled release %s (%s)",
-                         getattr(t, "name", h)[:60], h[:10])
+                log.info(
+                    "reconcile: skipping cancelled release %s (%s)",
+                    getattr(t, "name", h)[:60],
+                    h[:10],
+                )
                 continue
             save_path = (getattr(t, "save_path", "") or "").rstrip("/\\").replace("\\", "/")
-            on_fuse = any(save_path == fm or save_path.startswith(fm + "/") for fm in fuse_mounts if fm)
+            on_fuse = any(
+                save_path == fm or save_path.startswith(fm + "/") for fm in fuse_mounts if fm
+            )
             # Placement gate: only adopt entries under known SSD/fuse roots.
             # With unresolvable roots (e.g. MagicMock cfg in unit tests)
             # membership is unknowable — preserve legacy adopt behavior.
@@ -815,7 +843,9 @@ async def _reconcile_snapshot(
                 log.warning(
                     "reconcile: ignoring unplaced entry %s (%s) at %s; "
                     "not SSD nor fuse — left as unknown",
-                    getattr(t, "name", h)[:60], h[:10], save_path,
+                    getattr(t, "name", h)[:60],
+                    h[:10],
+                    save_path,
                 )
                 rpt.unknowns.append(h)
                 continue
@@ -833,31 +863,39 @@ async def _reconcile_snapshot(
 
                     norm = normalize_content_name(name)
                     same_release = [
-                        m for m in matches
-                        if normalize_content_name(m.source_name or "") == norm
+                        m for m in matches if normalize_content_name(m.source_name or "") == norm
                     ]
                     existing = same_release[0] if same_release else None
                     if existing is None:
                         log.warning(
                             "reconcile: %s (%s) name-matches %d row(s) but none "
                             "is the same release; adopting fresh instead of merging",
-                            name[:60], h[:10], len(matches),
+                            name[:60],
+                            h[:10],
+                            len(matches),
                         )
                     elif _hash_is_ignored(store, h):
-                        log.info("reconcile: skipping link of cancelled %s (%s)",
-                                 name[:60], h[:10])
+                        log.info("reconcile: skipping link of cancelled %s (%s)", name[:60], h[:10])
                         continue
                     else:
-                        curr = [x.strip() for x in existing.injected_private_hashes.split(",") if x.strip()]
+                        curr = [
+                            x.strip()
+                            for x in existing.injected_private_hashes.split(",")
+                            if x.strip()
+                        ]
                         curr_lower = {x.lower() for x in curr}
-                        if h.lower() not in curr_lower and h.lower() != existing.source_infohash.lower():
+                        if (
+                            h.lower() not in curr_lower
+                            and h.lower() != existing.source_infohash.lower()
+                        ):
                             curr.append(h)
                             existing.injected_private_hashes = ",".join(curr)
                             store.upsert(existing, expected_version=existing.version)
                             rpt.kept.append(h)
                             log.info(
                                 "reconcile: linked existing cross-seed %s to adopted release %s",
-                                h[:10], name,
+                                h[:10],
+                                name,
                             )
                             continue
                 adopt_state = State.DONE if on_fuse else State.MOVING
@@ -875,7 +913,9 @@ async def _reconcile_snapshot(
                     # unverified, unknown kind/blob); reconcile_verify()
                     # verifies in the background.
                     if verify:
-                        ok, use_save_path, kind, fuse_verified = await _verify_fuse_adopted(cfg, dest, t, save_path)
+                        ok, use_save_path, kind, fuse_verified = await _verify_fuse_adopted(
+                            cfg, dest, t, save_path
+                        )
                         adopt_state = State.DONE if ok else State.MOVING
                 elif on_fuse and not is_done:
                     # Fuse-pointing but incomplete: the client itself says
@@ -897,8 +937,13 @@ async def _reconcile_snapshot(
                 log.info(
                     "reconcile: adopting existing completed/fuse torrent on VPS2 as %s: %s (%s) "
                     "save_path=%s on_fuse=%s complete=%s kind=%s",
-                    adopt_state.value, name, h[:10],
-                    use_save_path, on_fuse, is_done, kind,
+                    adopt_state.value,
+                    name,
+                    h[:10],
+                    use_save_path,
+                    on_fuse,
+                    is_done,
+                    kind,
                 )
                 ts = TorrentState(
                     source_infohash=h,
@@ -932,7 +977,11 @@ async def _reconcile_snapshot(
                 log.info(
                     "reconcile: adopting partial SSD torrent on VPS2 as downloading: %s (%s) "
                     "save_path=%s complete=%s kind=%s",
-                    name, h[:10], save_path, is_done, kind,
+                    name,
+                    h[:10],
+                    save_path,
+                    is_done,
+                    kind,
                 )
                 ts = TorrentState(
                     source_infohash=h,
@@ -961,7 +1010,8 @@ async def _reconcile_snapshot(
             "recovery adopted %d torrent(s) from VPS2 client state with no DB row "
             "(e.g. %s); --reset clears bookkeeping only — in-flight work resumes; "
             "use 'forget' to abandon a torrent entirely",
-            len(rpt.adopted), preview,
+            len(rpt.adopted),
+            preview,
         )
     return rpt
 
@@ -1035,6 +1085,7 @@ async def fix_orphan(
         if not new_hash:
             try:
                 from .watchdir import _bencoded_info_hash
+
                 new_hash, _, _, _ = _bencoded_info_hash(sftp_bytes)
                 new_hash = (new_hash or "").lower()
             except Exception:
@@ -1060,8 +1111,8 @@ async def fix_orphan(
             # coordinator can replay it safely; do not infer a new state
             # from the SSD listing (which is expected to be empty).
             log.info(
-                "orphan %s: move checkpoint %r present; leaving MOVING for replay",
-                h, ts.move_stage)
+                "orphan %s: move checkpoint %r present; leaving MOVING for replay", h, ts.move_stage
+            )
             return State.MOVING.value
         src_path = Path(ts.save_path) if ts.save_path else Path(cfg.dest.save_path)
         # Torrent display name often differs from the on-disk top folder, so
@@ -1070,9 +1121,8 @@ async def fix_orphan(
         if sftp_bytes:
             try:
                 from .watchdir import extract_torrent_files_from_bencoded
-                expected_names = [
-                    f.name for f in extract_torrent_files_from_bencoded(sftp_bytes)
-                ]
+
+                expected_names = [f.name for f in extract_torrent_files_from_bencoded(sftp_bytes)]
             except Exception:
                 expected_names = None
 
@@ -1107,7 +1157,6 @@ async def fix_orphan(
         _force_state(store, ts, State.RE_ADDING)
         return State.RE_ADDING.value
 
-    log.warning("orphan %s: cannot infer recovery path from state %s",
-                h, ts.state.value)
+    log.warning("orphan %s: cannot infer recovery path from state %s", h, ts.state.value)
     _force_state(store, ts, State.FAILED, error=f"orphan in state {ts.state.value}")
     return State.FAILED.value

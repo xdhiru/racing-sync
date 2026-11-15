@@ -53,8 +53,7 @@ log = logging.getLogger("racing_sync.coordinator")
 # (every later row queues as "checking resume data"). Single-flow
 # completion therefore waits these states out; anything else (seeding
 # family, paused, checking, unknown/exotic) keeps the old behavior.
-_DOWNLOADING_ACTIVE_STATES = frozenset(
-    {"downloading", "stalleddl", "forceddl"})
+_DOWNLOADING_ACTIVE_STATES = frozenset({"downloading", "stalleddl", "forceddl"})
 
 
 def _is_actively_downloading(state: object) -> bool:
@@ -95,8 +94,10 @@ class DownloadMixin:
             if batches is None:
                 # Transient RPC failure — not "single flow". Retry next tick
                 # rather than persisting batches_total=0 as truth.
-                log.warning("could not resolve batches for adopted %s; retry next tick",
-                            ts.source_infohash[:10])
+                log.warning(
+                    "could not resolve batches for adopted %s; retry next tick",
+                    ts.source_infohash[:10],
+                )
                 self.store.upsert(ts)
                 return
             ts.batches_total = len(batches)
@@ -105,12 +106,19 @@ class DownloadMixin:
             # an empty resolution clears the cursor to single-flow zero.
             if not batches:
                 if ts.batch_index != 0:
-                    log.warning("clearing stale batch_index %d (no batches) for %s",
-                                ts.batch_index, ts.source_name)
+                    log.warning(
+                        "clearing stale batch_index %d (no batches) for %s",
+                        ts.batch_index,
+                        ts.source_name,
+                    )
                     ts.batch_index = 0
             elif ts.batch_index >= len(batches):
-                log.warning("clamping stale batch_index %d to %d for %s",
-                            ts.batch_index, len(batches) - 1, ts.source_name)
+                log.warning(
+                    "clamping stale batch_index %d to %d for %s",
+                    ts.batch_index,
+                    len(batches) - 1,
+                    ts.source_name,
+                )
                 ts.batch_index = len(batches) - 1
             self.store.upsert(ts)
             # Freshly adopted rows (e.g. recovery after --reset wiped the batch
@@ -121,8 +129,11 @@ class DownloadMixin:
             try:
                 await self._prepare_next_batch(ts, strict=True)
             except Exception as e:  # noqa: BLE001
-                log.warning("could not prioritize first batch for %s: %s; retry next tick",
-                            ts.source_infohash[:10], e)
+                log.warning(
+                    "could not prioritize first batch for %s: %s; retry next tick",
+                    ts.source_infohash[:10],
+                    e,
+                )
                 self.store.upsert(ts)
                 return
             try:
@@ -147,7 +158,7 @@ class DownloadMixin:
         consecutive_batch_failures = 0
         max_batch_failures_per_tick = 5
         # First wait iteration reuses the pre-loop batch resolution (see
-                # above); later iterations re-resolve after each flip.
+        # above); later iterations re-resolve after each flip.
         _first_wait = True
 
         if is_batched and hasattr(self, "dest_client"):
@@ -171,8 +182,11 @@ class DownloadMixin:
                 # below (which parks on transient failure and degrades to
                 # single-flow only when genuinely unresolvable — the
                 # designed full-move fallback, not a blind cap breach).
-                log.warning("batch priorities not verified for %s (%s); proceeding",
-                            ts.source_infohash[:10], e)
+                log.warning(
+                    "batch priorities not verified for %s (%s); proceeding",
+                    ts.source_infohash[:10],
+                    e,
+                )
                 _pre_batches = None
 
         while not self._stop:
@@ -198,7 +212,8 @@ class DownloadMixin:
             if isinstance(_fresh_dl, TorrentState) and _fresh_dl.state != State.DOWNLOADING:
                 log.info(
                     "worker: %s left DOWNLOADING while downloading (%s); stopping",
-                    ts.source_infohash[:10], _fresh_dl.state.value,
+                    ts.source_infohash[:10],
+                    _fresh_dl.state.value,
                 )
                 return
             # Live tracking, keyed by dest hash for client polling; the
@@ -241,8 +256,9 @@ class DownloadMixin:
                         # Transient RPC failure (not "no batches"): park this
                         # tick rather than degrading to a full-torrent wait
                         # that would defeat the SSD cap.
-                        log.warning("batch resolution unavailable for %s; retry next tick",
-                                    ts.source_name)
+                        log.warning(
+                            "batch resolution unavailable for %s; retry next tick", ts.source_name
+                        )
                         self.store.upsert(ts)
                         self._live.pop(h.lower(), None)
                         return
@@ -250,8 +266,12 @@ class DownloadMixin:
                         # File list / cap drifted mid-run (tracker sidecar
                         # added, cap re-frozen): heal the total instead of
                         # comparing a stale index against a stale total.
-                        log.warning("batch count drifted %d -> %d for %s; healing",
-                                    ts.batches_total, len(batches), ts.source_name)
+                        log.warning(
+                            "batch count drifted %d -> %d for %s; healing",
+                            ts.batches_total,
+                            len(batches),
+                            ts.source_name,
+                        )
                         ts.batches_total = len(batches)
                         if ts.batch_index >= len(batches):
                             ts.batch_index = max(0, len(batches) - 1)
@@ -265,7 +285,8 @@ class DownloadMixin:
                             ts.classification_kind or "unknown",
                         )
                         expected_files = [
-                            ep.file_name for ep in cur_batch.episodes
+                            ep.file_name
+                            for ep in cur_batch.episodes
                             if ep.file_name not in cur_skip
                         ]
                 except Exception as e:
@@ -301,9 +322,10 @@ class DownloadMixin:
                 # fail it after download_max_stall_parks instead of parking
                 # forever. Any progress resets the count.
                 try:
-                    _max_parks = int(getattr(
-                        getattr(self.cfg, "general", None),
-                        "download_max_stall_parks", 3) or 3)
+                    _max_parks = int(
+                        getattr(getattr(self.cfg, "general", None), "download_max_stall_parks", 3)
+                        or 3
+                    )
                 except (TypeError, ValueError):
                     _max_parks = 3
                 try:
@@ -321,8 +343,7 @@ class DownloadMixin:
                 try:
                     _rec = _parks.get(_key)
                     if isinstance(_rec, (list, tuple)) and len(_rec) == 2:
-                        _old_prog = (float(_rec[0]) if _rec[0] is not None
-                                     else None)
+                        _old_prog = float(_rec[0]) if _rec[0] is not None else None
                         _old_n = int(_rec[1])
                     else:
                         _old_prog, _old_n = None, 0
@@ -344,12 +365,16 @@ class DownloadMixin:
                     pass
                 if _n >= max(1, _max_parks):
                     await self._fail_downloading_row(
-                        ts, h,
-                        f"stalled with no progress for {_n} consecutive "
-                        f"windows ({e})")
+                        ts, h, f"stalled with no progress for {_n} consecutive windows ({e})"
+                    )
                     return
-                log.warning("download stalled for %s (%s); parking (%d/%d)",
-                            ts.source_name, e, _n, max(1, _max_parks))
+                log.warning(
+                    "download stalled for %s (%s); parking (%d/%d)",
+                    ts.source_name,
+                    e,
+                    _n,
+                    max(1, _max_parks),
+                )
                 self.store.upsert(ts)
                 return
             except TimeoutError as e:
@@ -394,7 +419,8 @@ class DownloadMixin:
                             # DOWNLOADING.
                             log.warning(
                                 "could not pause torrent %s before batch move (%s); parking",
-                                h[:10], pause_err,
+                                h[:10],
+                                pause_err,
                             )
                             self.store.upsert(ts)
                             self._live.pop(h.lower(), None)
@@ -407,8 +433,7 @@ class DownloadMixin:
                         # (Must NOT funnel into the incomplete-move retry
                         # below: each attempt would block for the full
                         # timeout again.)
-                        log.error("rclone batch move timed out for %s: %s",
-                                  ts.source_name[:60], e)
+                        log.error("rclone batch move timed out for %s: %s", ts.source_name[:60], e)
                         try:
                             ts.last_error = f"batch move timed out: {e}"[:500]
                         except Exception:
@@ -423,13 +448,18 @@ class DownloadMixin:
                         consecutive_batch_failures += 1
                         log.warning(
                             "batch move %d/%d for %s incomplete (%s); retrying shortly (%d/%d)",
-                            ts.batch_index + 1, ts.batches_total, ts.source_name, e,
-                            consecutive_batch_failures, max_batch_failures_per_tick,
+                            ts.batch_index + 1,
+                            ts.batches_total,
+                            ts.source_name,
+                            e,
+                            consecutive_batch_failures,
+                            max_batch_failures_per_tick,
                         )
                         if consecutive_batch_failures >= max_batch_failures_per_tick:
                             log.warning(
                                 "parking %s in DOWNLOADING after %d incomplete batch moves",
-                                ts.source_name, consecutive_batch_failures,
+                                ts.source_name,
+                                consecutive_batch_failures,
                             )
                             self.store.upsert(ts)
                             self._live.pop(h.lower(), None)
@@ -455,7 +485,8 @@ class DownloadMixin:
                                 raise
                             log.warning(
                                 "batch flip hit transient dest error for %s (%s); retry next tick",
-                                ts.source_name, e,
+                                ts.source_name,
+                                e,
                             )
                             self.store.upsert(ts)
                             self._live.pop(h.lower(), None)
@@ -488,13 +519,17 @@ class DownloadMixin:
                     if ts.batch_index < ts.batches_total:
                         try:
                             _rem = await self._remaining_batch_footprint(
-                                batches, ts.classification_kind or "unknown")
+                                batches, ts.classification_kind or "unknown"
+                            )
                             if _rem is not None:
-                                await self._ssd_adjust(
-                                    ts.source_infohash, int(_rem))
+                                await self._ssd_adjust(ts.source_infohash, int(_rem))
                         except Exception:
                             pass
-                elif _TESTING and hasattr(self, "_move_and_clean_batch") and hasattr(self._move_and_clean_batch, "mock_calls"):
+                elif (
+                    _TESTING
+                    and hasattr(self, "_move_and_clean_batch")
+                    and hasattr(self._move_and_clean_batch, "mock_calls")
+                ):
                     # Mock in unit test (e.g. AsyncMock)
                     await self._move_and_clean_batch(ts, None)  # type: ignore[arg-type]
                     ts.batch_index += 1
@@ -509,9 +544,9 @@ class DownloadMixin:
                     # MOVING for a full move instead of failing after
                     # successful downloads. (RPC-transient None parks above.)
                     log.warning(
-                        "current batch %d could not be resolved for %s; "
-                        "falling back to full move",
-                        ts.batch_index, ts.source_name,
+                        "current batch %d could not be resolved for %s; falling back to full move",
+                        ts.batch_index,
+                        ts.source_name,
                     )
                     break
 
@@ -564,17 +599,17 @@ class DownloadMixin:
         from .retry import retryable
 
         async def _fetch_poll():
-            return await rpc(self.dest_client.get_torrent(h),
-                             getattr(self, "cfg", None),
-                             "dest poll get_torrent")
+            return await rpc(
+                self.dest_client.get_torrent(h), getattr(self, "cfg", None), "dest poll get_torrent"
+            )
 
         async def _fetch_wait_files():
-            return await rpc(self.dest_client.get_torrent_files(h),
-                             getattr(self, "cfg", None), "dest wait files")
+            return await rpc(
+                self.dest_client.get_torrent_files(h), getattr(self, "cfg", None), "dest wait files"
+            )
 
         _poll_read = retryable(label="dest poll get_torrent")(_fetch_poll)
-        _wait_files_read = retryable(
-            label="dest wait files")(_fetch_wait_files)
+        _wait_files_read = retryable(label="dest wait files")(_fetch_wait_files)
 
         while not self._stop:
             # Central snapshot first: the listener poll already fetched
@@ -606,8 +641,7 @@ class DownloadMixin:
                         "worker: row gone for %s; stopping download",
                         ts.source_infohash[:10],
                     )
-                    raise AbandonedError(
-                        f"row forgotten while downloading: {h[:10]}")
+                    raise AbandonedError(f"row forgotten while downloading: {h[:10]}")
                 raise RuntimeError(f"torrent vanished mid-download: {h}")
 
             # Dead-torrent watchdog: a release the tracker deleted reports
@@ -622,15 +656,15 @@ class DownloadMixin:
             if _t_state == "missingFiles" or poll_n % 10 == 1:
                 try:
                     await self._check_dest_tracker_health(ts, h, _t_state)
-                except (UnregisteredTorrentError, RuntimeError,
-                        asyncio.CancelledError):
+                except (UnregisteredTorrentError, RuntimeError, asyncio.CancelledError):
                     # Terminal verdicts (and cancellation) propagate; anything
                     # else is watchdog-internal noise that must never kill a
                     # healthy download.
                     raise
                 except Exception as e:  # noqa: BLE001
-                    log.debug("tracker health check failed for %s: %s",
-                              (ts.source_infohash or "")[:10], e)
+                    log.debug(
+                        "tracker health check failed for %s: %s", (ts.source_infohash or "")[:10], e
+                    )
 
             if expected_files is not None:
                 files = await _wait_files_read()
@@ -664,12 +698,9 @@ class DownloadMixin:
                     except Exception:
                         pass
                     if _drift_n < 3:
-                        _what = (
-                            "file list empty" if not files
-                            else "expected batch files missing")
+                        _what = "file list empty" if not files else "expected batch files missing"
                         raise TimeoutError(
-                            f"{_what} for {ts.source_name} "
-                            f"({_drift_n}/3); re-planning next tick"
+                            f"{_what} for {ts.source_name} ({_drift_n}/3); re-planning next tick"
                         )
                     raise RuntimeError(
                         f"expected batch files missing from torrent {ts.source_name}: {missing_files}"
@@ -684,10 +715,8 @@ class DownloadMixin:
                 prog = done_sz / total_sz if total_sz > 0 else 0.0
                 # Zero-size files carry no bytes: presence on SSD (verified
                 # below) is completion for them, not client progress.
-                all_done = (
-                    len(batch_files) == len(expected_files)
-                    and all((f.progress or 0.0) >= 0.999 or not (f.size_bytes or 0)
-                            for f in batch_files)
+                all_done = len(batch_files) == len(expected_files) and all(
+                    (f.progress or 0.0) >= 0.999 or not (f.size_bytes or 0) for f in batch_files
                 )
                 if all_done and not await self._batch_bytes_on_disk(ts, batch_files):
                     # Client reports complete but bytes are not on SSD
@@ -695,7 +724,8 @@ class DownloadMixin:
                     # polling so the client re-fetches instead of moving air.
                     log.warning(
                         "batch %d for %s reports complete but bytes missing on SSD; waiting",
-                        ts.batch_index + 1, ts.source_name,
+                        ts.batch_index + 1,
+                        ts.source_name,
                     )
                     all_done = False
             else:
@@ -705,8 +735,7 @@ class DownloadMixin:
             if h.lower() in self._live:
                 self._live[h.lower()].progress = prog
                 try:
-                    self._live[h.lower()].dlspeed_bps = int(
-                        getattr(t, "dlspeed_bps", 0) or 0)
+                    self._live[h.lower()].dlspeed_bps = int(getattr(t, "dlspeed_bps", 0) or 0)
                 except (TypeError, ValueError):
                     self._live[h.lower()].dlspeed_bps = 0
 
@@ -762,7 +791,8 @@ class DownloadMixin:
                         log.info(
                             "download %s at 100%% but client still %s; "
                             "waiting for the completion flush before moving",
-                            ts.source_name, _done_state or "downloading",
+                            ts.source_name,
+                            _done_state or "downloading",
                         )
                         # Hard deadline on the flush itself: a 100% entry
                         # whose final flush never lands would otherwise pin
@@ -807,8 +837,8 @@ class DownloadMixin:
         _ev = None
         try:
             from .task import handles_for
-            for _x in handles_for(
-                    self, getattr(ts, "source_infohash", "") or ""):
+
+            for _x in handles_for(self, getattr(ts, "source_infohash", "") or ""):
                 try:
                     _e = getattr(_x, "event", None)
                     if _e is not None:
@@ -867,8 +897,11 @@ class DownloadMixin:
         """
         h = ts.dest_infohash or ts.source_infohash
         try:
-            files = await rpc(self.dest_client.get_torrent_files(h),
-                              getattr(self, "cfg", None), "dest next-batch files")
+            files = await rpc(
+                self.dest_client.get_torrent_files(h),
+                getattr(self, "cfg", None),
+                "dest next-batch files",
+            )
         except Exception as e:
             log.warning("could not get torrent files for next batch: %s", e)
             if strict:
@@ -884,8 +917,7 @@ class DownloadMixin:
         # Pinned kind wins over a fresh re-derive: a mid-flight sidecar
         # must not flip season->mixed under the routed batches.
         _pinned = ts.classification_kind or ""
-        kind = ((_pinned if _pinned not in ("", "unknown") else "")
-                or cls.kind or "unknown")
+        kind = (_pinned if _pinned not in ("", "unknown") else "") or cls.kind or "unknown"
         cap = self._frozen_batch_cap(ts)
         if cap <= 0:
             try:
@@ -895,11 +927,9 @@ class DownloadMixin:
             if not files and strict:
                 # Unknowable under strict (empty list + no cap): the
                 # fallback below would silently single-flow.
-                raise RuntimeError(
-                    f"batch cap unknowable for {ts.source_name}")
+                raise RuntimeError(f"batch cap unknowable for {ts.source_name}")
         try:
-            batches = self._resolve_batches(files, kind, cap,
-                                            episodes=cls.episodes)
+            batches = self._resolve_batches(files, kind, cap, episodes=cls.episodes)
         except Exception as e:
             log.warning("could not make batches for next batch: %s", e)
             if strict:
@@ -918,7 +948,8 @@ class DownloadMixin:
                     _rev = await asyncio.to_thread(
                         self.store.update_columns,
                         ts.source_infohash,
-                        {"batch_index": ts.batch_index})
+                        {"batch_index": ts.batch_index},
+                    )
                     if _rev:
                         ts.version = _rev
                 except Exception:
@@ -927,7 +958,8 @@ class DownloadMixin:
                 return batches
         cur = batches[ts.batch_index]
         skip = await self._fuse_skipped(
-            [(e.file_name, e.size_bytes) for e in cur.episodes], kind,
+            [(e.file_name, e.size_bytes) for e in cur.episodes],
+            kind,
         )
         prio_map = {f.name: 0 for f in files}
         for ep in cur.episodes:
@@ -968,8 +1000,11 @@ class DownloadMixin:
         files: list[TorrentFile] = []
         for _ in range(4):
             try:
-                files = await rpc(self.dest_client.get_torrent_files(h),
-                                  getattr(self, "cfg", None), "dest flip files")
+                files = await rpc(
+                    self.dest_client.get_torrent_files(h),
+                    getattr(self, "cfg", None),
+                    "dest flip files",
+                )
                 if files:
                     break
             except Exception:
@@ -1010,7 +1045,8 @@ class DownloadMixin:
             # already-moved batch as a no-op via _fuse_skipped.
             log.warning(
                 "batch flip: grouping shrank to %d batches for %s; finishing",
-                len(batches), ts.source_name,
+                len(batches),
+                ts.source_name,
             )
             ts.batches_total = len(batches)
             ts.batch_index = len(batches)
@@ -1026,8 +1062,7 @@ class DownloadMixin:
                 _need = None
             if _need is None:
                 try:
-                    _need = sum(int(getattr(e, "size_bytes", 0) or 0)
-                                for e in (nxt.episodes or []))
+                    _need = sum(int(getattr(e, "size_bytes", 0) or 0) for e in (nxt.episodes or []))
                 except (TypeError, ValueError):
                     _need = 0
             if _need > 0:
@@ -1037,26 +1072,33 @@ class DownloadMixin:
                     if not _coordinator.ssd_has_room(self.cfg, _need):
                         log.warning(
                             "batch flip: next batch ~%d MB exceeds free space for %s; retry next tick",
-                            _need // (1024 * 1024), ts.source_name)
+                            _need // (1024 * 1024),
+                            ts.source_name,
+                        )
                         return False
                 except Exception:
                     pass
         try:
             skip = await self._fuse_skipped(
-                [(e.file_name, e.size_bytes) for e in nxt.episodes], kind,
+                [(e.file_name, e.size_bytes) for e in nxt.episodes],
+                kind,
             )
         except Exception as e:
             # Fail closed: an unknown remote set must park, never
             # re-download bytes the remote may already hold (SSD waste
             # + double reseed). Retries next tick.
-            log.warning("batch flip: fuse skip check failed for %s (%s); retry next tick",
-                        ts.source_name, e)
+            log.warning(
+                "batch flip: fuse skip check failed for %s (%s); retry next tick", ts.source_name, e
+            )
             return False
         wanted = {e.file_name for e in nxt.episodes} - skip
         prio_map = {f.name: (1 if f.name in wanted else 0) for f in files}
         try:
-            await rpc(self.dest_client.set_file_priorities(h, prio_map),
-                      getattr(self, "cfg", None), "dest flip priorities")
+            await rpc(
+                self.dest_client.set_file_priorities(h, prio_map),
+                getattr(self, "cfg", None),
+                "dest flip priorities",
+            )
         except Exception as e:  # noqa: BLE001
             if is_fatal_os_error(e):
                 raise
@@ -1068,8 +1110,9 @@ class DownloadMixin:
             # exactly the next batch — replaying this batch is a no-op via
             # _fuse_skipped, and the index advances solely on flip success.
             try:
-                await rpc(self.dest_client.resume(h),
-                          getattr(self, "cfg", None), "dest flip resume")
+                await rpc(
+                    self.dest_client.resume(h), getattr(self, "cfg", None), "dest flip resume"
+                )
             except Exception as e:  # noqa: BLE001
                 if is_fatal_os_error(e):
                     raise
@@ -1077,7 +1120,10 @@ class DownloadMixin:
                 return False
         log.info(
             "batch flip: ready for batch %d/%d for %s (%d file(s) wanted)",
-            next_index + 1, ts.batches_total, ts.source_name, len(wanted),
+            next_index + 1,
+            ts.batches_total,
+            ts.source_name,
+            len(wanted),
         )
         return next_index
 
@@ -1090,17 +1136,14 @@ class DownloadMixin:
     ) -> Path | None:
         if not files:
             return None
-        base = (
-            Path(base_path).resolve()
-            if base_path
-            else Path(self.cfg.dest.save_path).resolve()
-        )
+        base = Path(base_path).resolve() if base_path else Path(self.cfg.dest.save_path).resolve()
         # The top-most folder shared by all files. Derived from ALL files
         # (most common first component), not files[0] — qB file order is
         # not guaranteed and files[0] may be a root-level extra while the
         # pack lives under Top/ (returning None then falls back to a bare
         # folder move that strips the top dir on the remote).
         from collections import Counter
+
         tops: Counter[str] = Counter()
         for f in files:
             parts = (f.name or "").replace("\\", "/").split("/")

@@ -26,8 +26,7 @@ T = TypeVar("T")
 #: Statuses worth one more attempt when they arrive as
 #: aiohttp.ClientResponseError (registration lag 404s right after add,
 #: plus the transient gateway set). Anything else fails fast.
-_RETRYABLE_HTTP_STATUSES = frozenset(
-    {404, 408, 425, 429, 500, 502, 503, 504})
+_RETRYABLE_HTTP_STATUSES = frozenset({404, 408, 425, 429, 500, 502, 503, 504})
 
 
 def is_retryable_read_error(exc: BaseException) -> bool:
@@ -37,10 +36,10 @@ def is_retryable_read_error(exc: BaseException) -> bool:
             return True
         try:
             import aiohttp
+
             if isinstance(exc, aiohttp.ClientResponseError):
                 try:
-                    return int(getattr(exc, "status", 0) or 0) in (
-                        _RETRYABLE_HTTP_STATUSES)
+                    return int(getattr(exc, "status", 0) or 0) in (_RETRYABLE_HTTP_STATUSES)
                 except (TypeError, ValueError):
                     return False
             if isinstance(exc, aiohttp.ClientConnectionError):
@@ -93,9 +92,14 @@ def retryable(
                         break
                     _wait = _delays[min(_i, len(_delays) - 1)]
                     try:
-                        log.debug("%s transient (%s); retrying in %.0fs "
-                                  "(attempt %d/%d)", label, e, _wait,
-                                  _i + 2, _n)
+                        log.debug(
+                            "%s transient (%s); retrying in %.0fs (attempt %d/%d)",
+                            label,
+                            e,
+                            _wait,
+                            _i + 2,
+                            _n,
+                        )
                     except Exception:
                         pass
                     try:

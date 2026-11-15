@@ -315,15 +315,14 @@ def test_api_token_compare_is_stripped_and_ascii_safe():
     app = build_app(coord)
     client = TestClient(app, raise_server_exceptions=False)
     # Trailing whitespace authenticates like the validated config.
-    assert client.get("/api/state",
-                      headers={"X-Api-Token": "secret "}).status_code == 200
+    assert client.get("/api/state", headers={"X-Api-Token": "secret "}).status_code == 200
     # Non-ASCII bytes 401 instead of 500ing inside compare_digest
     # (raw latin-1 bytes survive HTTP; str.encode("ascii") would blow up).
-    assert client.get(
-        "/api/state",
-        headers={b"X-Api-Token": "sécret".encode("latin-1")}).status_code == 401
-    assert client.get("/api/state",
-                      headers={"X-Api-Token": "wrong"}).status_code == 401
+    assert (
+        client.get("/api/state", headers={b"X-Api-Token": "sécret".encode("latin-1")}).status_code
+        == 401
+    )
+    assert client.get("/api/state", headers={"X-Api-Token": "wrong"}).status_code == 401
 
 
 def test_auth_brute_force_throttled_and_logged():
@@ -339,8 +338,7 @@ def test_auth_brute_force_throttled_and_logged():
     api_mod._AUTH_FAILURES.clear()
 
     codes = [
-        client.get("/api/state", headers={"X-Api-Token": "wrong"}).status_code
-        for _ in range(12)
+        client.get("/api/state", headers={"X-Api-Token": "wrong"}).status_code for _ in range(12)
     ]
     assert codes[:10] == [401] * 10
     assert codes[10] == 429
@@ -377,8 +375,7 @@ def test_readyz_reports_checks_when_authed(tmp_path):
 
     coord, _ = _api_coord()
     cfg = MagicMock()
-    cfg.api = APIConfig(enabled=True, api_token="secret",
-                        trust_nginx_header=False)
+    cfg.api = APIConfig(enabled=True, api_token="secret", trust_nginx_header=False)
     cfg.rclone = SimpleNamespace(fuse=SimpleNamespace(mount=tmp_path))
     cfg.ssd = SimpleNamespace(path=tmp_path)
     coord.cfg = cfg
@@ -409,7 +406,10 @@ def test_metrics_exposes_state_counts():
     ]
     # Authoritative counts (DONE/FAILED live outside all_active).
     coord.store.count_by_state.return_value = {
-        "moving": 2, "queued": 1, "done": 5, "failed": 1,
+        "moving": 2,
+        "queued": 1,
+        "done": 5,
+        "failed": 1,
         "waiting_disk": 3,
     }
     coord._tasks = set()
@@ -444,8 +444,12 @@ def test_api_tls_validator_requires_pair_and_files(tmp_path):
         APIConfig(enabled=True, api_token="secret", tls_keyfile=str(cert))
     # Missing files rejected when enabled.
     with pytest.raises(pydantic.ValidationError):
-        APIConfig(enabled=True, api_token="secret",
-                  tls_certfile=str(cert), tls_keyfile=str(tmp_path / "nope.pem"))
+        APIConfig(
+            enabled=True,
+            api_token="secret",
+            tls_certfile=str(cert),
+            tls_keyfile=str(tmp_path / "nope.pem"),
+        )
     # Disabled: not validated (placeholder-friendly).
     APIConfig(enabled=False, tls_keyfile=str(tmp_path / "nope.pem"))
 
@@ -480,6 +484,7 @@ def test_serve_passes_tls_opts_to_uvicorn():
     sys.modules["uvicorn"] = fake_uvicorn
     try:
         import asyncio
+
         asyncio.run(api_mod.serve(coord))
     finally:
         if _real_uvicorn is not None:
@@ -514,11 +519,13 @@ async def test_shutdown_prefers_graceful_exit():
 
     task = asyncio.ensure_future(_serve())
     coord._api_task = task
+
     # Simulate the server draining right after should_exit.
     async def _drain():
         await asyncio.sleep(0.05)
         server.should_exit = True
         done.set()
+
     asyncio.ensure_future(_drain())
     await coord.shutdown()
     assert task.done() and not task.cancelled()
@@ -535,5 +542,3 @@ async def test_shutdown_prefers_graceful_exit():
     with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
         await coord.shutdown()
     assert task2.cancelled() or task2.done()
-
-

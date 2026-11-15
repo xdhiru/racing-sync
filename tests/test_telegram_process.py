@@ -1,4 +1,5 @@
 """Tests for Telegram /add .torrent ingestion (chat -> VPS2 pipeline)."""
+
 from __future__ import annotations
 
 import io
@@ -13,17 +14,18 @@ from racing_sync.telegram_bot import TelegramBot
 from racing_sync.watchdir import _bencode, _bencoded_info_hash
 
 
-def _torrent_bytes(name="Show.S01E01.mkv",
-                   announce="https://tracker.example/announce/SECRETKEY"):
-    blob = _bencode({
-        b"announce": announce.encode(),
-        b"info": {
-            b"name": name.encode(),
-            b"length": 100,
-            b"piece length": 16384,
-            b"pieces": b"0" * 20,
-        },
-    })
+def _torrent_bytes(name="Show.S01E01.mkv", announce="https://tracker.example/announce/SECRETKEY"):
+    blob = _bencode(
+        {
+            b"announce": announce.encode(),
+            b"info": {
+                b"name": name.encode(),
+                b"length": 100,
+                b"piece length": 16384,
+                b"pieces": b"0" * 20,
+            },
+        }
+    )
     assert isinstance(blob, (bytes, bytearray))
     return bytes(blob)
 
@@ -36,8 +38,7 @@ def _bot(store, **kw):
     bot._bot = SimpleNamespace(
         get_file=AsyncMock(),
         delete_message=AsyncMock(),
-        send_message=AsyncMock(
-            return_value=SimpleNamespace(message_id=7)),
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=7)),
     )
     for k, v in kw.items():
         setattr(bot, k, v)
@@ -52,8 +53,11 @@ def _doc(file_name="show.torrent", size=200, file_id="fid1", mid=50):
         text=None,
         caption=None,
         document=SimpleNamespace(
-            file_name=file_name, file_size=size, file_id=file_id,
-            mime_type="application/x-bittorrent"),
+            file_name=file_name,
+            file_size=size,
+            file_id=file_id,
+            mime_type="application/x-bittorrent",
+        ),
         reply_to_message=None,
     )
 
@@ -71,8 +75,7 @@ def _cmd(text="/add", mid=51, user="9", reply_to=None):
 
 
 def _sent_texts(bot):
-    return [str(c.args[1]) for c in
-            bot._bot.send_message.await_args_list]
+    return [str(c.args[1]) for c in bot._bot.send_message.await_args_list]
 
 
 @pytest.mark.anyio
@@ -83,8 +86,11 @@ async def test_process_reply_ingests_and_deletes(tmp_path):
         blob = _torrent_bytes()
         infohash, name, size, announce = _bencoded_info_hash(blob)
         bot = _bot(store)
-        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
-            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+        bot._bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_to_memory=AsyncMock(return_value=io.BytesIO(blob))
+            )
+        )
 
         file_msg = _doc(mid=50)
         await bot._handle_chat_message(_cmd(reply_to=file_msg))
@@ -97,8 +103,7 @@ async def test_process_reply_ingests_and_deletes(tmp_path):
         assert row.total_bytes == size
         assert bytes(store.get_blob(infohash)) == blob
         # File message deleted (passkey hygiene).
-        bot._bot.delete_message.assert_awaited_once_with(
-            chat_id="1", message_id=50)
+        bot._bot.delete_message.assert_awaited_once_with(chat_id="1", message_id=50)
         # Confirm names the domain, never the passkeyed URL.
         texts = _sent_texts(bot)
         assert any("Queued" in t for t in texts)
@@ -117,16 +122,18 @@ async def test_process_caption_variant(tmp_path):
         blob = _torrent_bytes(name="Other.mkv")
         infohash, _, _, _ = _bencoded_info_hash(blob)
         bot = _bot(store)
-        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
-            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+        bot._bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_to_memory=AsyncMock(return_value=io.BytesIO(blob))
+            )
+        )
 
         msg = _doc(mid=60)
         msg.caption = "/add"
         await bot._handle_chat_message(msg)
 
         assert store.get(infohash) is not None
-        bot._bot.delete_message.assert_awaited_once_with(
-            chat_id="1", message_id=60)
+        bot._bot.delete_message.assert_awaited_once_with(chat_id="1", message_id=60)
     finally:
         store.close()
 
@@ -142,14 +149,23 @@ async def test_process_add_revives_failed(tmp_path):
     try:
         blob = _torrent_bytes(name="Comeback.mkv")
         infohash, _, _, _ = _bencoded_info_hash(blob)
-        store.upsert(TorrentState(
-            source_infohash=infohash, source_name="Comeback.mkv",
-            state=State.FAILED, last_error="boom", failed_retries=2))
+        store.upsert(
+            TorrentState(
+                source_infohash=infohash,
+                source_name="Comeback.mkv",
+                state=State.FAILED,
+                last_error="boom",
+                failed_retries=2,
+            )
+        )
         coord = make_coordinator(store)
         bot = _bot(store, coord=coord)
         bot._coord = coord  # harness kwarg lands on bot.coord; prod uses _coord
-        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
-            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+        bot._bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_to_memory=AsyncMock(return_value=io.BytesIO(blob))
+            )
+        )
 
         file_msg = _doc(mid=50)
         await bot._handle_chat_message(_cmd(reply_to=file_msg))
@@ -160,8 +176,7 @@ async def test_process_add_revives_failed(tmp_path):
         assert bytes(store.get_blob(infohash)) == blob
         texts = _sent_texts(bot)
         assert any("Re-queued" in t for t in texts)
-        bot._bot.delete_message.assert_awaited_once_with(
-            chat_id="1", message_id=50)
+        bot._bot.delete_message.assert_awaited_once_with(chat_id="1", message_id=50)
     finally:
         store.close()
 
@@ -177,15 +192,18 @@ async def test_process_add_refuses_ignored_failed(tmp_path):
     try:
         blob = _torrent_bytes(name="Cancelled.mkv")
         infohash, _, _, _ = _bencoded_info_hash(blob)
-        store.upsert(TorrentState(
-            source_infohash=infohash, source_name="Cancelled.mkv",
-            state=State.FAILED))
+        store.upsert(
+            TorrentState(source_infohash=infohash, source_name="Cancelled.mkv", state=State.FAILED)
+        )
         store.ignore_torrent(infohash, "Cancelled.mkv")
         coord = make_coordinator(store)
         bot = _bot(store, coord=coord)
         bot._coord = coord  # harness kwarg lands on bot.coord; prod uses _coord
-        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
-            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+        bot._bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_to_memory=AsyncMock(return_value=io.BytesIO(blob))
+            )
+        )
 
         file_msg = _doc(mid=50)
         await bot._handle_chat_message(_cmd(reply_to=file_msg))
@@ -248,8 +266,11 @@ async def test_process_rejects_invalid_bytes(tmp_path):
     store = StateStore(tmp_path / "state.db")
     try:
         bot = _bot(store)
-        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
-            download_to_memory=AsyncMock(return_value=io.BytesIO(b"junk"))))
+        bot._bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_to_memory=AsyncMock(return_value=io.BytesIO(b"junk"))
+            )
+        )
         await bot._handle_chat_message(_cmd(reply_to=_doc()))
         assert store.all() == []
         bot._bot.delete_message.assert_not_called()
@@ -273,13 +294,16 @@ async def test_process_duplicate_waiting_attaches_bytes(tmp_path):
     try:
         blob = _torrent_bytes()
         infohash, _, _, _ = _bencoded_info_hash(blob)
-        store.upsert(TorrentState(
-            source_infohash=infohash, source_name="Show",
-            state=State.WAITING_INDEXER))
+        store.upsert(
+            TorrentState(source_infohash=infohash, source_name="Show", state=State.WAITING_INDEXER)
+        )
         assert store.get_blob(infohash) == b""
         bot = _bot(store)
-        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
-            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+        bot._bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_to_memory=AsyncMock(return_value=io.BytesIO(blob))
+            )
+        )
 
         await bot._handle_chat_message(_cmd(reply_to=_doc(mid=50)))
 
@@ -289,8 +313,7 @@ async def test_process_duplicate_waiting_attaches_bytes(tmp_path):
         texts = _sent_texts(bot)
         assert any("Attached supplied .torrent" in t for t in texts)
         assert any(f"/now_{infohash[:10]}" in t for t in texts)
-        bot._bot.delete_message.assert_awaited_once_with(
-            chat_id="1", message_id=50)
+        bot._bot.delete_message.assert_awaited_once_with(chat_id="1", message_id=50)
     finally:
         store.close()
 
@@ -304,12 +327,17 @@ async def test_process_duplicate_held_row_resumes_on_add(tmp_path):
     try:
         blob = _torrent_bytes()
         infohash, _, _, _ = _bencoded_info_hash(blob)
-        store.upsert(TorrentState(
-            source_infohash=infohash, source_name="Show",
-            state=State.WAITING_INDEXER, skipped=1))
+        store.upsert(
+            TorrentState(
+                source_infohash=infohash, source_name="Show", state=State.WAITING_INDEXER, skipped=1
+            )
+        )
         bot = _bot(store)
-        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
-            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+        bot._bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_to_memory=AsyncMock(return_value=io.BytesIO(blob))
+            )
+        )
 
         await bot._handle_chat_message(_cmd(reply_to=_doc(mid=50)))
 
@@ -330,12 +358,15 @@ async def test_process_duplicate_downloading_keeps_old_reply(tmp_path):
     try:
         blob = _torrent_bytes()
         infohash, _, _, _ = _bencoded_info_hash(blob)
-        store.upsert(TorrentState(
-            source_infohash=infohash, source_name="Show",
-            state=State.DOWNLOADING))
+        store.upsert(
+            TorrentState(source_infohash=infohash, source_name="Show", state=State.DOWNLOADING)
+        )
         bot = _bot(store)
-        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
-            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+        bot._bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_to_memory=AsyncMock(return_value=io.BytesIO(blob))
+            )
+        )
 
         await bot._handle_chat_message(_cmd(reply_to=_doc(mid=50)))
 
@@ -354,19 +385,21 @@ async def test_process_duplicate_reports_and_still_deletes(tmp_path):
     try:
         blob = _torrent_bytes()
         infohash, _, _, _ = _bencoded_info_hash(blob)
-        store.upsert(TorrentState(
-            source_infohash=infohash, source_name="Show",
-            state=State.DOWNLOADING))
+        store.upsert(
+            TorrentState(source_infohash=infohash, source_name="Show", state=State.DOWNLOADING)
+        )
         bot = _bot(store)
-        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
-            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+        bot._bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_to_memory=AsyncMock(return_value=io.BytesIO(blob))
+            )
+        )
 
         await bot._handle_chat_message(_cmd(reply_to=_doc(mid=50)))
 
         assert store.get(infohash).state == State.DOWNLOADING
         assert any("Already tracked" in t for t in _sent_texts(bot))
-        bot._bot.delete_message.assert_awaited_once_with(
-            chat_id="1", message_id=50)
+        bot._bot.delete_message.assert_awaited_once_with(chat_id="1", message_id=50)
     finally:
         store.close()
 
@@ -380,15 +413,17 @@ async def test_process_respects_ignore_list(tmp_path):
         infohash, _, _, _ = _bencoded_info_hash(blob)
         store.ignore_torrent(infohash, "Show")
         bot = _bot(store)
-        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
-            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+        bot._bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_to_memory=AsyncMock(return_value=io.BytesIO(blob))
+            )
+        )
 
         await bot._handle_chat_message(_cmd(reply_to=_doc(mid=50)))
 
         assert store.get(infohash) is None
         assert any("Ignored" in t for t in _sent_texts(bot))
-        bot._bot.delete_message.assert_awaited_once_with(
-            chat_id="1", message_id=50)
+        bot._bot.delete_message.assert_awaited_once_with(chat_id="1", message_id=50)
     finally:
         store.close()
 
@@ -400,10 +435,12 @@ async def test_process_unauthorized_user_refused(tmp_path):
     try:
         blob = _torrent_bytes()
         bot = _bot(store)
-        bot._cfg = SimpleNamespace(chat_id="1", page_size=5,
-                                   admin_user_ids=[4242])
-        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
-            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+        bot._cfg = SimpleNamespace(chat_id="1", page_size=5, admin_user_ids=[4242])
+        bot._bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_to_memory=AsyncMock(return_value=io.BytesIO(blob))
+            )
+        )
 
         await bot._handle_chat_message(_cmd(user="9", reply_to=_doc()))
 
@@ -440,10 +477,12 @@ async def test_process_delete_failure_nudges_manual_removal(tmp_path):
         blob = _torrent_bytes()
         infohash, _, _, _ = _bencoded_info_hash(blob)
         bot = _bot(store)
-        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
-            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
-        bot._bot.delete_message = AsyncMock(
-            side_effect=TelegramError("not enough rights"))
+        bot._bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_to_memory=AsyncMock(return_value=io.BytesIO(blob))
+            )
+        )
+        bot._bot.delete_message = AsyncMock(side_effect=TelegramError("not enough rights"))
 
         await bot._handle_chat_message(_cmd(reply_to=_doc(mid=50)))
 
@@ -463,10 +502,12 @@ async def test_process_delete_disabled_keeps_file(tmp_path):
         blob = _torrent_bytes()
         infohash, _, _, _ = _bencoded_info_hash(blob)
         bot = _bot(store)
-        bot._cfg = SimpleNamespace(chat_id="1", page_size=5,
-                                   delete_processed_torrent=False)
-        bot._bot.get_file = AsyncMock(return_value=SimpleNamespace(
-            download_to_memory=AsyncMock(return_value=io.BytesIO(blob))))
+        bot._cfg = SimpleNamespace(chat_id="1", page_size=5, delete_processed_torrent=False)
+        bot._bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_to_memory=AsyncMock(return_value=io.BytesIO(blob))
+            )
+        )
 
         await bot._handle_chat_message(_cmd(reply_to=_doc(mid=50)))
 
@@ -485,43 +526,52 @@ async def test_bot_command_menu_lists_add(tmp_path):
     from racing_sync.telegram_bot import _bot_command_menu
 
     cmds = _bot_command_menu()
-    assert [(c.command, c.description) for c in cmds] == [(
-        "add",
-        "Add a .torrent file — reply to it with /add, or send it "
-        "with /add as caption",
-    ), (
-        "cancel_match",
-        "Cancel every active group whose title contains <text> — "
-        "/cancel_match <text>",
-    ), (
-        "cancel_stalled",
-        "Cancel every downloading group with no seeders — "
-        "/cancel_stalled",
-    ), (
-        "cancel_status",
-        "Cancel a whole lane (DL/MV/RD/QD) — /cancel_status",
-    ), (
-        "pause_intake",
-        "Pause intake — no new downloads start until /resume_intake",
-    ), (
-        "resume_intake",
-        "Resume intake of new downloads",
-    ), (
-        "tick",
-        "Run one pipeline tick now (poll + schedule + janitor)",
-    ), (
-        "active",
-        "Send a fresh Active Tasks card now",
-    ), (
-        "stats",
-        "Pipeline snapshot — rows by state, workers, storage",
-    ), (
-        "find",
-        "Search download-target indexers (read-only) — /find <text>",
-    ), (
-        "files",
-        "List a torrent's files (read-only) — /files_<n|hash>",
-    )]
+    assert [(c.command, c.description) for c in cmds] == [
+        (
+            "add",
+            "Add a .torrent file — reply to it with /add, or send it with /add as caption",
+        ),
+        (
+            "cancel_match",
+            "Cancel every active group whose title contains <text> — /cancel_match <text>",
+        ),
+        (
+            "cancel_stalled",
+            "Cancel every downloading group with no seeders — /cancel_stalled",
+        ),
+        (
+            "cancel_status",
+            "Cancel a whole lane (DL/MV/RD/QD) — /cancel_status",
+        ),
+        (
+            "pause_intake",
+            "Pause intake — no new downloads start until /resume_intake",
+        ),
+        (
+            "resume_intake",
+            "Resume intake of new downloads",
+        ),
+        (
+            "tick",
+            "Run one pipeline tick now (poll + schedule + janitor)",
+        ),
+        (
+            "active",
+            "Send a fresh Active Tasks card now",
+        ),
+        (
+            "stats",
+            "Pipeline snapshot — rows by state, workers, storage",
+        ),
+        (
+            "find",
+            "Search download-target indexers (read-only) — /find <text>",
+        ),
+        (
+            "files",
+            "List a torrent's files (read-only) — /files_<n|hash>",
+        ),
+    ]
 
 
 @pytest.mark.anyio
@@ -535,8 +585,8 @@ async def test_start_publishes_command_menu(tmp_path):
     try:
         bot = object.__new__(TelegramBot)
         bot._cfg = SimpleNamespace(
-            chat_id="1", page_size=5, enabled=True,
-            bot_token="123:ABC", status_update_interval=15)
+            chat_id="1", page_size=5, enabled=True, bot_token="123:ABC", status_update_interval=15
+        )
         bot._store = store
         bot._callback_times = {}
         bot._current_page = 0
@@ -549,20 +599,27 @@ async def test_start_publishes_command_menu(tmp_path):
         bot._coord = MagicMock()
         bot._coord.live_progress_map = MagicMock(return_value={})
         fake = SimpleNamespace(
-            send_message=AsyncMock(
-                return_value=SimpleNamespace(message_id=3)),
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=3)),
             set_my_commands=AsyncMock(),
             get_updates=AsyncMock(return_value=[]),
         )
-        with patch("racing_sync.telegram_bot._make_bot",
-                   return_value=fake):
+        with patch("racing_sync.telegram_bot._make_bot", return_value=fake):
             await bot.start()
         try:
             cmds = fake.set_my_commands.await_args.args[0]
             assert [c.command for c in cmds] == [
-                "add", "cancel_match", "cancel_stalled", "cancel_status",
+                "add",
+                "cancel_match",
+                "cancel_stalled",
+                "cancel_status",
                 "pause_intake",
-                "resume_intake", "tick", "active", "stats", "find", "files"]
+                "resume_intake",
+                "tick",
+                "active",
+                "stats",
+                "find",
+                "files",
+            ]
         finally:
             try:
                 await bot.stop()
@@ -583,8 +640,8 @@ async def test_start_survives_menu_publish_failure(tmp_path):
     try:
         bot = object.__new__(TelegramBot)
         bot._cfg = SimpleNamespace(
-            chat_id="1", page_size=5, enabled=True,
-            bot_token="123:ABC", status_update_interval=15)
+            chat_id="1", page_size=5, enabled=True, bot_token="123:ABC", status_update_interval=15
+        )
         bot._store = store
         bot._callback_times = {}
         bot._current_page = 0
@@ -597,12 +654,10 @@ async def test_start_survives_menu_publish_failure(tmp_path):
         bot._coord = MagicMock()
         bot._coord.live_progress_map = MagicMock(return_value={})
         fake = SimpleNamespace(
-            send_message=AsyncMock(
-                return_value=SimpleNamespace(message_id=3)),
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=3)),
             get_updates=AsyncMock(return_value=[]),
         )
-        with patch("racing_sync.telegram_bot._make_bot",
-                   return_value=fake):
+        with patch("racing_sync.telegram_bot._make_bot", return_value=fake):
             await bot.start()  # must not raise
         assert bot._bot is fake
         try:
@@ -634,8 +689,7 @@ async def test_process_old_ptb_file_shape(tmp_path):
         await bot._handle_chat_message(_cmd(reply_to=_doc(mid=50)))
 
         assert store.get(infohash) is not None
-        bot._bot.delete_message.assert_awaited_once_with(
-            chat_id="1", message_id=50)
+        bot._bot.delete_message.assert_awaited_once_with(chat_id="1", message_id=50)
         assert any("Queued" in t for t in _sent_texts(bot))
     finally:
         store.close()

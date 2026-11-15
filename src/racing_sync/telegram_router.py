@@ -74,6 +74,7 @@ class RouterMixin:
         The tapped sheet is deleted by the caller once this returns, so
         answered questions never linger behind their follow-up.
         """
+
         async def _say(text: str) -> None:
             # Standalone (no reply_to): the tapped sheet is deleted by the
             # caller once this returns, so threading to it would dangle.
@@ -91,8 +92,7 @@ class RouterMixin:
 
         async def _group_of(leader: str) -> list[str]:
             try:
-                return await asyncio.to_thread(
-                    self._live_group_hashes, leader)
+                return await asyncio.to_thread(self._live_group_hashes, leader)
             except Exception:
                 return []
 
@@ -130,10 +130,10 @@ class RouterMixin:
                 if _scope.kind == "group":
                     _subject = (
                         f"Forget {_safe_display_name((_r.title_raw or '')[:60])}"
-                        f" · all {len(_r.hashes)} copies?")
+                        f" · all {len(_r.hashes)} copies?"
+                    )
                 else:
-                    _subject = (
-                        f"Forget {_safe_display_name((_r.title_raw or '')[:60])}?")
+                    _subject = f"Forget {_safe_display_name((_r.title_raw or '')[:60])}?"
                 _text, _rows = _scope.remember_sheet(_subject)
                 try:
                     # Standalone sheet: query.message (the tapped sheet)
@@ -160,8 +160,8 @@ class RouterMixin:
                     await _say(_action_error_text(e))
                     return
                 _text, _rows = self._keepq_text_and_rows(
-                    _r.title_raw, _r.qlabel,
-                    _r.scope, None, remember=_ig)
+                    _r.title_raw, _r.qlabel, _r.scope, None, remember=_ig
+                )
                 try:
                     # Standalone (see remember-sheet above).
                     await self._send_sheet(_text, _rows)
@@ -182,8 +182,8 @@ class RouterMixin:
                     await _say(_action_error_text(e))
                     return
                 result = await self._execute_snapshot_cancel(
-                    _r.hashes, _r.etitle_raw,
-                    delete_files=(_choice == "no"), remember=_ig)
+                    _r.hashes, _r.etitle_raw, delete_files=(_choice == "no"), remember=_ig
+                )
                 await _say(result)
                 await _refresh()
                 return
@@ -315,13 +315,17 @@ class RouterMixin:
                         log.error(
                             "telegram polling conflict x%s (another bot "
                             "session with this token?); stopping callback "
-                            "loop", _n)
+                            "loop",
+                            _n,
+                        )
                         try:
                             self._stopped = True
                         except Exception:
                             pass
                         return
-                    log.warning("telegram callback polling conflict (another bot session running?): %s", e)
+                    log.warning(
+                        "telegram callback polling conflict (another bot session running?): %s", e
+                    )
                     await asyncio.sleep(15)
                 else:
                     log.debug("telegram callback polling error: %s", e)
@@ -353,8 +357,7 @@ class RouterMixin:
         if now - last < window:
             return True
         try:
-            for k in [k for k, t in times.items()
-                      if now - float(t or 0.0) >= window]:
+            for k in [k for k, t in times.items() if now - float(t or 0.0) >= window]:
                 times.pop(k, None)
             if len(times) < 1000:
                 times[key] = now
@@ -379,8 +382,7 @@ class RouterMixin:
             if not isinstance(inflight, dict):
                 inflight = {}
                 self._action_inflight = inflight
-            for k in [k for k, t in inflight.items()
-                      if now - float(t or 0.0) > ttl]:
+            for k in [k for k, t in inflight.items() if now - float(t or 0.0) > ttl]:
                 inflight.pop(k, None)
             if key in inflight:
                 return False
@@ -417,8 +419,7 @@ class RouterMixin:
         if not _tg_actor_allowed(self._cfg, user_id):
             log.warning("callback from non-admin user=%s (allowlist set)", user_id)
             try:
-                await query.answer("Not authorized for destructive actions",
-                                   show_alert=True)
+                await query.answer("Not authorized for destructive actions", show_alert=True)
             except Exception:
                 pass
             return
@@ -427,8 +428,7 @@ class RouterMixin:
         # taps bucketed harder below — a per-chat key lets one spammer
         # block pagination for all chats sharing it).
         try:
-            _debounce_key = (f"{chat_id}:{user_id}"
-                             if chat_id is not None else str(user_id))
+            _debounce_key = f"{chat_id}:{user_id}" if chat_id is not None else str(user_id)
         except Exception:
             _debounce_key = ""
         if self._debounced(_debounce_key):
@@ -444,12 +444,17 @@ class RouterMixin:
             pass
 
         data = str(getattr(query, "data", "") or "")
-        if (data.startswith("pick:") or data.startswith("keep:")
-                or data.startswith("forget:")
-                or data.startswith("abort")
-                or data.startswith("inject:")
-                or data.startswith("go:") or data.startswith("cancel:")
-                or data.startswith("skip:") or data.startswith("resume:")):
+        if (
+            data.startswith("pick:")
+            or data.startswith("keep:")
+            or data.startswith("forget:")
+            or data.startswith("abort")
+            or data.startswith("inject:")
+            or data.startswith("go:")
+            or data.startswith("cancel:")
+            or data.startswith("skip:")
+            or data.startswith("resume:")
+        ):
             if _slow_tap(data):
                 # Feedback first: the execution below can outlive the tap
                 # by a minute while the sheet stays live — a silent sheet
@@ -478,6 +483,7 @@ class RouterMixin:
                     return
                 try:
                     from .telegram_protocol import _STATUS_FILTERS
+
                     _valid = _skey in _STATUS_FILTERS
                 except Exception:
                     _valid = _skey in ("all", "dl", "mv", "rd", "qd")
@@ -514,8 +520,7 @@ class RouterMixin:
         # desyncs prev/next (taps wrap early or look dead) whenever
         # duplicates share a page.
         try:
-            total_groups = len(_group_active_items(
-                [(r, None) for r in rows or []]))
+            total_groups = len(_group_active_items([(r, None) for r in rows or []]))
         except Exception:
             try:
                 total_groups = len(rows or [])
@@ -553,8 +558,7 @@ class RouterMixin:
             # 1-3 char prefixes always match-or-error over a full table
             # scan; group numbers never reach here (digits route first).
             raise LookupError(
-                f"/{cmd}_{norm} is too short — send at least 4 hex chars "
-                f"or the full 40-char hash"
+                f"/{cmd}_{norm} is too short — send at least 4 hex chars or the full 40-char hash"
             )
         try:
             if len(norm) == 40:
@@ -566,22 +570,17 @@ class RouterMixin:
         try:
             all_active = getattr(self._store, "all_active", None)
             rows = all_active() if callable(all_active) else self._store.all()
-            candidates = [
-                ts for ts in rows
-                if (ts.source_infohash or "").lower().startswith(norm)
-            ]
+            candidates = [ts for ts in rows if (ts.source_infohash or "").lower().startswith(norm)]
         except Exception as e:  # noqa: BLE001
             raise LookupError(f"cannot look up {short!r}: {e}") from e
         if len(candidates) == 1:
             return candidates[0]
         if len(candidates) > 1:
             raise LookupError(
-                f"/{cmd}_{norm} matches {len(candidates)} torrents; "
-                f"send /{cmd}_<full 40-char hash>"
+                f"/{cmd}_{norm} matches {len(candidates)} torrents; send /{cmd}_<full 40-char hash>"
             )
         raise LookupError(
-            f"no tracked torrent starts with {norm!r} "
-            "(it may already be done/cancelled)"
+            f"no tracked torrent starts with {norm!r} (it may already be done/cancelled)"
         )
 
     def _fetch_new_eligible(self, row) -> bool:
@@ -631,19 +630,19 @@ class RouterMixin:
     async def _handle_chat_message(self, message: Any) -> None:
         """Execute `/cancel_` / `/cancel_match` / `/now_` / `/resume_` / `/injectfuse` commands.
 
-    Legacy `/fetch_` + `/prefer_` parse as `/now_`; `/unskip_` +
-    `/unignore_` parse as `/resume_` (same shapes, unified executors).
+        Legacy `/fetch_` + `/prefer_` parse as `/now_`; `/unskip_` +
+        `/unignore_` parse as `/resume_` (same shapes, unified executors).
 
-    Group commands (stable content ids from the active list) open
-    member-choice buttons; full hashes and legacy hash prefixes act
-    directly. Cancel always ends at a keep/delete question — nothing
-    is wiped without an explicit choice. Injectfuse always ends at a
-    Yes/No question — nothing changes state without verification.
-    `/add` ingests a replied-to (or captioned) .torrent file as a
-    Telegram-origin drop. Anything else is ignored. Only the
-    configured chat/user may send commands. Dispatch is table-driven
-    (:data:`_CHAT_COMMANDS`): first pattern match wins.
-    """
+        Group commands (stable content ids from the active list) open
+        member-choice buttons; full hashes and legacy hash prefixes act
+        directly. Cancel always ends at a keep/delete question — nothing
+        is wiped without an explicit choice. Injectfuse always ends at a
+        Yes/No question — nothing changes state without verification.
+        `/add` ingests a replied-to (or captioned) .torrent file as a
+        Telegram-origin drop. Anything else is ignored. Only the
+        configured chat/user may send commands. Dispatch is table-driven
+        (:data:`_CHAT_COMMANDS`): first pattern match wins.
+        """
         try:
             chat = getattr(message, "chat", None)
             chat_id = getattr(chat, "id", None)
@@ -657,16 +656,11 @@ class RouterMixin:
             # no admin allowlist is configured, but they must leave an
             # audit trail; a configured allowlist refuses them below).
             _via_channel = user_id is None
-            text = (
-                getattr(message, "text", None)
-                or getattr(message, "caption", None)
-                or ""
-            )
+            text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
             text = str(text or "").strip()
             if not _tg_actor_allowed(self._cfg, user_id):
                 try:
-                    await self._reply("Not authorized for destructive actions.",
-                                      reply_to=message)
+                    await self._reply("Not authorized for destructive actions.", reply_to=message)
                 except Exception:
                     pass
                 return
@@ -685,9 +679,12 @@ class RouterMixin:
                 return
             if _via_channel:
                 try:
-                    log.warning("channel-post command /%s without sender "
-                                "(chat=%s): %r", _matched.name, chat_id,
-                                text[:80])
+                    log.warning(
+                        "channel-post command /%s without sender (chat=%s): %r",
+                        _matched.name,
+                        chat_id,
+                        text[:80],
+                    )
                 except Exception:
                     pass
             # Debounce mutating verbs only (double-sent command must not
@@ -697,8 +694,7 @@ class RouterMixin:
             # cannot block other operators.
             if _matched.name not in self._READ_ONLY_COMMANDS:
                 try:
-                    _ckey = (f"cmd:{chat_id}:{user_id}"
-                             if chat_id is not None else f"cmd:{user_id}")
+                    _ckey = f"cmd:{chat_id}:{user_id}" if chat_id is not None else f"cmd:{user_id}"
                 except Exception:
                     _ckey = ""
                 if _ckey and self._debounced(_ckey, window=2.0):
@@ -727,8 +723,7 @@ class RouterMixin:
         try:
             from .watchdir import MAX_TORRENT_BYTES, _bencoded_info_hash
         except Exception:
-            await self._reply("Action failed: torrent parser unavailable.",
-                              reply_to=message)
+            await self._reply("Action failed: torrent parser unavailable.", reply_to=message)
             return
         # Resolve the document: same-message caption case first, else the
         # replied-to message.
@@ -745,8 +740,9 @@ class RouterMixin:
                     doc_msg = _replied
         if doc is None:
             await self._reply(
-                "Reply to a .torrent file with /add (or send the file "
-                "with /add as its caption).", reply_to=message)
+                "Reply to a .torrent file with /add (or send the file with /add as its caption).",
+                reply_to=message,
+            )
             return
         try:
             fname = str(getattr(doc, "file_name", "") or "")
@@ -756,8 +752,8 @@ class RouterMixin:
             fname, fsize, file_id = "", None, None
         if not fname.lower().endswith(".torrent"):
             await self._reply(
-                f"Not a .torrent file ({fname or 'unnamed'}); nothing ingested.",
-                reply_to=message)
+                f"Not a .torrent file ({fname or 'unnamed'}); nothing ingested.", reply_to=message
+            )
             return
         try:
             fsize_int = int(fsize) if fsize is not None else -1
@@ -765,25 +761,26 @@ class RouterMixin:
             fsize_int = -1
         if fsize_int < 0 or fsize_int > MAX_TORRENT_BYTES:
             await self._reply(
-                f"Refusing {fname or 'file'} ({fsize_int} B; cap "
-                f"{MAX_TORRENT_BYTES} B).", reply_to=message)
+                f"Refusing {fname or 'file'} ({fsize_int} B; cap {MAX_TORRENT_BYTES} B).",
+                reply_to=message,
+            )
             return
         if not file_id:
             await self._reply(
-                "Could not read the file from Telegram; try re-sending it.",
-                reply_to=message)
+                "Could not read the file from Telegram; try re-sending it.", reply_to=message
+            )
             return
         bot = getattr(self, "_bot", None)
         if bot is None:
-            await self._reply("Action failed: bot not attached.",
-                              reply_to=message)
+            await self._reply("Action failed: bot not attached.", reply_to=message)
             return
         try:
             tg_file = await bot.get_file(file_id)
         except Exception as e:  # noqa: BLE001
             await self._reply(
-                f"Could not download the file from Telegram ({e}); "
-                "try re-sending it.", reply_to=message)
+                f"Could not download the file from Telegram ({e}); try re-sending it.",
+                reply_to=message,
+            )
             return
         try:
             # Pass the buffer explicitly: some PTB versions require the
@@ -791,6 +788,7 @@ class RouterMixin:
             # it optional — explicit works on both. Accept bytes, a buffer,
             # or None (filled buffer) back.
             import io as _io
+
             _buf = _io.BytesIO()
             _dl = tg_file.download_to_memory(_buf)
             if asyncio.iscoroutine(_dl):
@@ -803,24 +801,21 @@ class RouterMixin:
                 data = bytes(_buf.getvalue())
         except Exception as e:  # noqa: BLE001
             await self._reply(
-                f"Could not download the file from Telegram ({e}); "
-                "try re-sending it.", reply_to=message)
+                f"Could not download the file from Telegram ({e}); try re-sending it.",
+                reply_to=message,
+            )
             return
         if not data or len(data) > MAX_TORRENT_BYTES + 1:
-            await self._reply(
-                "Refusing: file is empty or over the size cap.",
-                reply_to=message)
+            await self._reply("Refusing: file is empty or over the size cap.", reply_to=message)
             return
         try:
             infohash, name, size, announce = _bencoded_info_hash(data)
         except Exception as e:  # noqa: BLE001
-            await self._reply(f"Not a valid .torrent file ({_scrubbed(e)}).",
-                              reply_to=message)
+            await self._reply(f"Not a valid .torrent file ({_scrubbed(e)}).", reply_to=message)
             return
         store = getattr(self, "_store", None)
         if store is None:
-            await self._reply("Action failed: bot not attached.",
-                              reply_to=message)
+            await self._reply("Action failed: bot not attached.", reply_to=message)
             return
         try:
             existing = store.get(infohash, include_blob=False)
@@ -844,7 +839,8 @@ class RouterMixin:
                     await self._reply(
                         f"Ignored (previously cancelled): {name}. "
                         f"Unignore it first, then add again.",
-                        reply_to=message)
+                        reply_to=message,
+                    )
                     await self._delete_chat_file(message, doc_msg)
                     return
                 # Operator re-provided the .torrent for a failed release
@@ -855,27 +851,28 @@ class RouterMixin:
                 if coord is not None and callable(_revive):
                     try:
                         _revived = _revive(
-                            infohash=infohash, name=name, size=size,
-                            announce=announce or "", blob=bytes(data),
-                            source_label="telegram")
+                            infohash=infohash,
+                            name=name,
+                            size=size,
+                            announce=announce or "",
+                            blob=bytes(data),
+                            source_label="telegram",
+                        )
                     except LookupError as e:
                         await self._reply(_scrubbed(e)[:300], reply_to=message)
                         await self._delete_chat_file(message, doc_msg)
                         return
                     except Exception as e:  # noqa: BLE001
-                        await self._reply(_action_error_text(e),
-                                          reply_to=message)
+                        await self._reply(_action_error_text(e), reply_to=message)
                         return
                     await self._reply(
-                        f"Re-queued {name} (was failed) — downloading "
-                        f"on VPS2, watch its card.",
-                        reply_to=message)
+                        f"Re-queued {name} (was failed) — downloading on VPS2, watch its card.",
+                        reply_to=message,
+                    )
                     await self._delete_chat_file(message, doc_msg)
                     return
             try:
-                _pre = existing.state in (State.NEW,
-                                          State.WAITING_INDEXER,
-                                          State.WAITING_DISK)
+                _pre = existing.state in (State.NEW, State.WAITING_INDEXER, State.WAITING_DISK)
             except Exception:
                 _pre = False
             if _pre:
@@ -888,8 +885,7 @@ class RouterMixin:
                 # from them instead of waiting on the indexer. Narrow
                 # blob write only: the row's state is left untouched.
                 try:
-                    _kept = bool(await asyncio.to_thread(
-                        store.set_blob, infohash, bytes(data)))
+                    _kept = bool(await asyncio.to_thread(store.set_blob, infohash, bytes(data)))
                 except Exception:
                     _kept = False
                 if _kept:
@@ -897,28 +893,28 @@ class RouterMixin:
                     # re-drop): the operator is acting on it again.
                     try:
                         _upd = getattr(store, "update_columns", None)
-                        _resumed = bool(await asyncio.to_thread(
-                            _upd, infohash, {"skipped": 0})) if callable(_upd) else False
+                        _resumed = (
+                            bool(await asyncio.to_thread(_upd, infohash, {"skipped": 0}))
+                            if callable(_upd)
+                            else False
+                        )
                     except Exception:
                         _resumed = False
-                    _tail = (" — it can now download from your bytes: "
-                             f"`{_now_command(infohash)}`.")
+                    _tail = f" — it can now download from your bytes: `{_now_command(infohash)}`."
                     if _resumed and getattr(existing, "skipped", 0):
-                        _tail = (" — hold cleared, it resumes next tick"
-                                 " (bytes attached too).")
+                        _tail = " — hold cleared, it resumes next tick (bytes attached too)."
                     await self._reply(
-                        f"Attached supplied .torrent to {name} ({_st}){_tail}",
-                        reply_to=message)
+                        f"Attached supplied .torrent to {name} ({_st}){_tail}", reply_to=message
+                    )
                     await self._delete_chat_file(message, doc_msg)
                     return
-            await self._reply(f"Already tracked: {name} ({_st}).",
-                              reply_to=message)
+            await self._reply(f"Already tracked: {name} ({_st}).", reply_to=message)
             await self._delete_chat_file(message, doc_msg)
             return
         if _ignored:
             await self._reply(
-                f"Ignored (previously cancelled): {name}. Nothing ingested.",
-                reply_to=message)
+                f"Ignored (previously cancelled): {name}. Nothing ingested.", reply_to=message
+            )
             await self._delete_chat_file(message, doc_msg)
             return
         try:
@@ -933,9 +929,9 @@ class RouterMixin:
                 state=State.NEW,
             )
         except Exception as e:  # noqa: BLE001
-            await self._reply(f"Action failed: could not track {name} "
-                              f"({_scrubbed(e)}).",
-                              reply_to=message)
+            await self._reply(
+                f"Action failed: could not track {name} ({_scrubbed(e)}).", reply_to=message
+            )
             return
         try:
             ts._blob = bytes(data)
@@ -944,19 +940,26 @@ class RouterMixin:
         try:
             store.upsert(ts)
         except Exception as e:  # noqa: BLE001
-            await self._reply(f"Action failed: could not track {name} "
-                              f"({_scrubbed(e)}).",
-                              reply_to=message)
+            await self._reply(
+                f"Action failed: could not track {name} ({_scrubbed(e)}).", reply_to=message
+            )
             return
         try:
-            log.info("telegram ingest: %s (%s, %d bytes) announce=%s",
-                     name[:60], infohash[:10], size, _domain or "?")
+            log.info(
+                "telegram ingest: %s (%s, %d bytes) announce=%s",
+                name[:60],
+                infohash[:10],
+                size,
+                _domain or "?",
+            )
         except Exception:
             pass
         await self._reply(
             f"Queued {name} ({_size_compact(size)}) via "
             f"{_domain or 'unknown tracker'} — downloading on VPS2, "
-            "watch its card.", reply_to=message)
+            "watch its card.",
+            reply_to=message,
+        )
         await self._delete_chat_file(message, doc_msg)
 
     async def _delete_chat_file(self, cmd_msg: Any, doc_msg: Any) -> None:
@@ -969,8 +972,7 @@ class RouterMixin:
         entirely when `telegram.delete_processed_torrent` is false.
         """
         try:
-            if not bool(getattr(getattr(self, "_cfg", None),
-                                "delete_processed_torrent", True)):
+            if not bool(getattr(getattr(self, "_cfg", None), "delete_processed_torrent", True)):
                 return
         except Exception:
             pass
@@ -995,7 +997,8 @@ class RouterMixin:
                     "Note: could not delete the .torrent from chat (the bot "
                     "needs message-deletion rights) — please remove it by "
                     "hand; it contains your tracker passkey.",
-                    reply_to=cmd_msg)
+                    reply_to=cmd_msg,
+                )
             except Exception:
                 pass
 

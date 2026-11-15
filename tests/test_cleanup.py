@@ -18,12 +18,11 @@ from conftest import make_coordinator
 from racing_sync.coordinator import Coordinator, cleanup_grace_seconds
 from racing_sync.state import State, StateStore, TorrentState
 
-GiB = 1024 ** 3
+GiB = 1024**3
 
 
 def _cleanup_cfg(**over) -> CleanupConfig:
-    base = dict(enabled=True, dry_run=False,
-                janitor_startup_delay_seconds=0.0)
+    base = dict(enabled=True, dry_run=False, janitor_startup_delay_seconds=0.0)
     base.update(over)
     return CleanupConfig(**base)
 
@@ -54,14 +53,21 @@ FSIZE = 700
 def _single_file_blob(name: str = FNAME, size: int = FSIZE) -> bytes:
     """Minimal single-file .torrent bytes the fuse-health check can decode."""
     nb = name.encode()
-    info = (b"d6:lengthi" + str(size).encode() + b"e4:name" +
-            str(len(nb)).encode() + b":" + nb +
-            b"12:piece lengthi16384e6:pieces20:" + b"\x00" * 20 + b"e")
-    return (b"d8:announce4:test4:info" + info + b"e")
+    info = (
+        b"d6:lengthi"
+        + str(size).encode()
+        + b"e4:name"
+        + str(len(nb)).encode()
+        + b":"
+        + nb
+        + b"12:piece lengthi16384e6:pieces20:"
+        + b"\x00" * 20
+        + b"e"
+    )
+    return b"d8:announce4:test4:info" + info + b"e"
 
 
-def _healthy_fuse(tmp_path: Path, store: StateStore, hashes: list[str],
-                  cfg) -> None:
+def _healthy_fuse(tmp_path: Path, store: StateStore, hashes: list[str], cfg) -> None:
     """Give rows verifiable fuse bytes: blob + real file under both mounts.
 
     Under the fail-closed janitor, entries alone no longer suffice — rows
@@ -80,25 +86,47 @@ def _healthy_fuse(tmp_path: Path, store: StateStore, hashes: list[str],
         assert store.set_blob(h, blob) is True
 
 
-def _member(h: str, upspeed: int = 0, leechers: int = 0, ratio: float = 2.0,
-            added_on: int = 0) -> Torrent:
+def _member(
+    h: str, upspeed: int = 0, leechers: int = 0, ratio: float = 2.0, added_on: int = 0
+) -> Torrent:
     return Torrent(
-        hash=h, name=FNAME, category="", save_path="/vps1/data",
-        size_bytes=FSIZE, state="seeding", progress=1.0, ratio=ratio,
-        trackers=[], upspeed_bps=upspeed, num_leechers=leechers,
+        hash=h,
+        name=FNAME,
+        category="",
+        save_path="/vps1/data",
+        size_bytes=FSIZE,
+        state="seeding",
+        progress=1.0,
+        ratio=ratio,
+        trackers=[],
+        upspeed_bps=upspeed,
+        num_leechers=leechers,
         added_on=added_on,
     )
 
 
-def _row(store: StateStore, h: str, state: State, completed_h_ago: float | None,
-         activity_h_ago: float | None, injected: str, save_path: str = "",
-         created_h_ago: float | None = None) -> TorrentState:
+def _row(
+    store: StateStore,
+    h: str,
+    state: State,
+    completed_h_ago: float | None,
+    activity_h_ago: float | None,
+    injected: str,
+    save_path: str = "",
+    created_h_ago: float | None = None,
+) -> TorrentState:
     now = dt.datetime.now(dt.timezone.utc)
     ts = TorrentState(
-        source_infohash=h, source_name=FNAME, dest_infohash=h,
-        total_bytes=FSIZE, save_path=save_path,
-        injected_private_hashes=injected, state=state,
-        completed_at=(now - dt.timedelta(hours=completed_h_ago)) if completed_h_ago is not None else None,
+        source_infohash=h,
+        source_name=FNAME,
+        dest_infohash=h,
+        total_bytes=FSIZE,
+        save_path=save_path,
+        injected_private_hashes=injected,
+        state=state,
+        completed_at=(now - dt.timedelta(hours=completed_h_ago))
+        if completed_h_ago is not None
+        else None,
         vps1_last_activity_at=(
             (now - dt.timedelta(hours=activity_h_ago)) if activity_h_ago is not None else None
         ),
@@ -130,8 +158,15 @@ class _FakeDest:
     async def list_torrents(self, *, category=None, hashes=None):
         want = {h.lower() for h in hashes} if hashes is not None else self.hashes
         return [
-            Torrent(hash=h, name="x", category="racing", save_path="/mnt/fuse",
-                    size_bytes=1, state="seeding", progress=1.0)
+            Torrent(
+                hash=h,
+                name="x",
+                category="racing",
+                save_path="/mnt/fuse",
+                size_bytes=1,
+                state="seeding",
+                progress=1.0,
+            )
             for h in (want & self.hashes)
         ]
 
@@ -140,6 +175,7 @@ class _FakeDest:
 
 
 # ---- grace math ----
+
 
 def test_grace_calm_and_roomy_is_max():
     cfg = _cleanup_cfg()
@@ -163,6 +199,7 @@ def test_grace_interpolates_and_unknown_free_uses_velocity():
 
 def test_cleanup_config_rejects_bad_bounds():
     import pydantic
+
     with pytest.raises(pydantic.ValidationError):
         CleanupConfig(min_grace_hours=10, max_grace_hours=2)
     with pytest.raises(pydantic.ValidationError):
@@ -172,6 +209,7 @@ def test_cleanup_config_rejects_bad_bounds():
 
 
 # ---- janitor gating ----
+
 
 @pytest.mark.anyio
 async def test_janitor_disabled_is_noop(tmp_path: Path):
@@ -193,6 +231,7 @@ async def test_janitor_respects_interval(tmp_path: Path):
     dest = _FakeDest([])
     coord = _make_coord(tmp_path, store, src, dest, _base_cfg(tmp_path))
     import time
+
     coord._cleanup_last_run = time.monotonic()
     src.list_torrents = AsyncMock(wraps=src.list_torrents)
     await coord._maybe_cleanup_source()
@@ -201,12 +240,12 @@ async def test_janitor_respects_interval(tmp_path: Path):
 
 # ---- DONE normal path ----
 
+
 @pytest.mark.anyio
 async def test_done_idle_and_old_gets_deleted(tmp_path: Path):
     pub, p1, p2 = "a" * 40, "b" * 40, "c" * 40
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0,
-         injected=f"{p1},{p2}")
+    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0, injected=f"{p1},{p2}")
     src = _FakeSource([_member(pub), _member(p1), _member(p2)])
     dest = _FakeDest([pub, p1, p2])
     cfg = _base_cfg(tmp_path)
@@ -226,8 +265,7 @@ async def test_done_idle_and_old_gets_deleted(tmp_path: Path):
 async def test_done_recent_and_quiet_is_kept(tmp_path: Path):
     pub = "a" * 40
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.DONE, completed_h_ago=1.0, activity_h_ago=None,
-         injected="")
+    _row(store, pub, State.DONE, completed_h_ago=1.0, activity_h_ago=None, injected="")
     src = _FakeSource([_member(pub)])
     dest = _FakeDest([pub])
     coord = _make_coord(tmp_path, store, src, dest, _base_cfg(tmp_path))
@@ -243,8 +281,7 @@ async def test_done_recent_and_quiet_is_kept(tmp_path: Path):
 async def test_done_active_swarm_bumps_activity_and_keeps(tmp_path: Path):
     pub = "a" * 40
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=50.0,
-         injected="")
+    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=50.0, injected="")
     src = _FakeSource([_member(pub, upspeed=500_000, leechers=3)])
     dest = _FakeDest([pub])
     coord = _make_coord(tmp_path, store, src, dest, _base_cfg(tmp_path))
@@ -259,8 +296,7 @@ async def test_done_active_swarm_bumps_activity_and_keeps(tmp_path: Path):
 async def test_done_missing_fuse_entry_is_kept(tmp_path: Path):
     pub, gone = "a" * 40, "b" * 40
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0,
-         injected=gone)
+    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0, injected=gone)
     src = _FakeSource([_member(pub)])
     dest = _FakeDest([pub])  # `gone` vanished from dest
     coord = _make_coord(tmp_path, store, src, dest, _base_cfg(tmp_path))
@@ -275,8 +311,7 @@ async def test_done_blobless_is_kept_fail_closed(tmp_path: Path):
     """Entries alone never clear VPS1: no bytes ⇒ no delete (C2)."""
     pub = "a" * 40
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0,
-         injected="")
+    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0, injected="")
     src = _FakeSource([_member(pub)])
     dest = _FakeDest([pub])
     coord = _make_coord(tmp_path, store, src, dest, _base_cfg(tmp_path))
@@ -291,8 +326,7 @@ async def test_done_blob_heals_via_export_then_deletes(tmp_path: Path):
     """A blobless row whose dest entry exports bytes verifies next run."""
     pub = "a" * 40
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0,
-         injected="")
+    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0, injected="")
     src = _FakeSource([_member(pub)])
     dest = _FakeDest([pub])
     cfg = _base_cfg(tmp_path)
@@ -315,8 +349,7 @@ async def test_done_blob_heals_via_export_then_deletes(tmp_path: Path):
 async def test_done_protected_pattern_is_kept(tmp_path: Path):
     pub = "a" * 40
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0,
-         injected="")
+    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0, injected="")
     src = _FakeSource([_member(pub)])
     dest = _FakeDest([pub])
     cfg = _base_cfg(tmp_path)
@@ -332,8 +365,7 @@ async def test_done_protected_pattern_is_kept(tmp_path: Path):
 async def test_dry_run_deletes_nothing(tmp_path: Path):
     pub = "a" * 40
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0,
-         injected="")
+    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0, injected="")
     src = _FakeSource([_member(pub)])
     dest = _FakeDest([pub])
     cfg = _base_cfg(tmp_path)
@@ -348,6 +380,7 @@ async def test_dry_run_deletes_nothing(tmp_path: Path):
 
 # ---- MOVING early pressure path ----
 
+
 @pytest.mark.anyio
 async def test_done_old_quiet_no_stamp_uses_added_on_fallback(tmp_path: Path):
     """Pre-existing idle backlog clears on the first run, no grace wait.
@@ -358,11 +391,19 @@ async def test_done_old_quiet_no_stamp_uses_added_on_fallback(tmp_path: Path):
     period even without a completed_at stamp.
     """
     import time
+
     pub = "a" * 40
     added = int(time.time()) - 5 * 24 * 3600
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.DONE, completed_h_ago=None, activity_h_ago=None,
-         injected="", created_h_ago=5 * 24)
+    _row(
+        store,
+        pub,
+        State.DONE,
+        completed_h_ago=None,
+        activity_h_ago=None,
+        injected="",
+        created_h_ago=5 * 24,
+    )
     src = _FakeSource([_member(pub, added_on=added)])
     dest = _FakeDest([pub])
     cfg = _base_cfg(tmp_path)
@@ -378,11 +419,11 @@ async def test_done_old_quiet_no_stamp_uses_added_on_fallback(tmp_path: Path):
 async def test_done_fresh_torrent_no_stamp_waits_grace(tmp_path: Path):
     """A torrent added minutes ago with no stamp can't prove idleness yet."""
     import time
+
     pub = "a" * 40
     added = int(time.time()) - 120
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.DONE, completed_h_ago=None, activity_h_ago=None,
-         injected="")
+    _row(store, pub, State.DONE, completed_h_ago=None, activity_h_ago=None, injected="")
     src = _FakeSource([_member(pub, added_on=added)])
     dest = _FakeDest([pub])
     coord = _make_coord(tmp_path, store, src, dest, _base_cfg(tmp_path))
@@ -402,8 +443,15 @@ async def test_moving_early_deletes_only_under_pressure(tmp_path: Path):
     async def run_case(free_bytes: int | None) -> list:
         pub = "a" * 40
         store = StateStore(tmp_path / f"{free_bytes}.db")
-        _row(store, pub, State.MOVING, completed_h_ago=None, activity_h_ago=10.0,
-             injected="", save_path=str(ssd))
+        _row(
+            store,
+            pub,
+            State.MOVING,
+            completed_h_ago=None,
+            activity_h_ago=10.0,
+            injected="",
+            save_path=str(ssd),
+        )
         src = _FakeSource([_member(pub)])
         dest = _FakeDest([pub], files=list(files))
         coord = _make_coord(ssd, store, src, dest, _base_cfg(ssd))
@@ -411,7 +459,7 @@ async def test_moving_early_deletes_only_under_pressure(tmp_path: Path):
         await coord._maybe_cleanup_source()
         return src.deleted
 
-    assert await run_case(5 * GiB) != []   # pressured: early delete
+    assert await run_case(5 * GiB) != []  # pressured: early delete
     assert await run_case(60 * GiB) == []  # roomy: wait for DONE+grace
 
 
@@ -426,22 +474,32 @@ async def test_delete_source_group_partitions_by_size(tmp_path: Path):
     coord = _make_coord(ssd, store, _FakeSource([]), _FakeDest([]), cfg)
 
     def _mem(h, size):
-        return Torrent(hash=h, name=FNAME, category="", save_path="/vps1/data",
-                       size_bytes=size, state="seeding", progress=1.0)
+        return Torrent(
+            hash=h,
+            name=FNAME,
+            category="",
+            save_path="/vps1/data",
+            size_bytes=size,
+            state="seeding",
+            progress=1.0,
+        )
+
     ts = TorrentState(source_infohash="a" * 40, source_name=FNAME)
 
     # Same size: one shared copy, files deleted exactly once.
     src = _FakeSource([_mem("a" * 40, 700), _mem("b" * 40, 700)])
     coord.source_client = src
     await coord._delete_source_group(
-        ts, [_mem("a" * 40, 700), _mem("b" * 40, 700)], cfg.cleanup, False)
+        ts, [_mem("a" * 40, 700), _mem("b" * 40, 700)], cfg.cleanup, False
+    )
     assert src.deleted == [("a" * 40, True), ("b" * 40, False)]
 
     # Different sizes: different files, each partition deletes its own.
     src2 = _FakeSource([_mem("a" * 40, 700), _mem("c" * 40, 500)])
     coord.source_client = src2
     await coord._delete_source_group(
-        ts, [_mem("a" * 40, 700), _mem("c" * 40, 500)], cfg.cleanup, False)
+        ts, [_mem("a" * 40, 700), _mem("c" * 40, 500)], cfg.cleanup, False
+    )
     assert src2.deleted == [("a" * 40, True), ("c" * 40, True)]
 
 
@@ -453,8 +511,15 @@ async def test_moving_early_skipped_when_ssd_bytes_gone(tmp_path: Path):
     files = [TorrentFile(name=FNAME, size_bytes=FSIZE, progress=1.0)]
     pub = "a" * 40
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.MOVING, completed_h_ago=None, activity_h_ago=10.0,
-         injected="", save_path=str(ssd))
+    _row(
+        store,
+        pub,
+        State.MOVING,
+        completed_h_ago=None,
+        activity_h_ago=10.0,
+        injected="",
+        save_path=str(ssd),
+    )
     src = _FakeSource([_member(pub)])
     dest = _FakeDest([pub], files=list(files))
     coord = _make_coord(ssd, store, src, dest, _base_cfg(ssd))
@@ -475,14 +540,21 @@ async def test_ssd_bytes_present_with_verified_bytes(tmp_path: Path):
     pub = "b" * 40
     store = StateStore(tmp_path / "s.db")
     try:
-        _row(store, pub, State.MOVING, completed_h_ago=None,
-             activity_h_ago=10.0, injected="", save_path=str(ssd))
+        _row(
+            store,
+            pub,
+            State.MOVING,
+            completed_h_ago=None,
+            activity_h_ago=10.0,
+            injected="",
+            save_path=str(ssd),
+        )
         cfg = _base_cfg(ssd)
         cfg.ssd.path = ssd
-        coord = _make_coord(ssd, store, _FakeSource([_member(pub)]),
-                            _FakeDest([pub], files=list(files)), cfg)
-        assert await coord._cleanup_ssd_bytes_present(
-            store.get(pub)) is True
+        coord = _make_coord(
+            ssd, store, _FakeSource([_member(pub)]), _FakeDest([pub], files=list(files)), cfg
+        )
+        assert await coord._cleanup_ssd_bytes_present(store.get(pub)) is True
     finally:
         store.close()
 
@@ -502,12 +574,20 @@ async def test_ssd_bytes_check_runs_off_loop(tmp_path: Path):
     pub = "b" * 40
     store = StateStore(tmp_path / "s.db")
     try:
-        _row(store, pub, State.MOVING, completed_h_ago=None,
-             activity_h_ago=10.0, injected="", save_path=str(ssd))
+        _row(
+            store,
+            pub,
+            State.MOVING,
+            completed_h_ago=None,
+            activity_h_ago=10.0,
+            injected="",
+            save_path=str(ssd),
+        )
         cfg = _base_cfg(ssd)
         cfg.ssd.path = ssd
-        coord = _make_coord(ssd, store, _FakeSource([_member(pub)]),
-                            _FakeDest([pub], files=list(files)), cfg)
+        coord = _make_coord(
+            ssd, store, _FakeSource([_member(pub)]), _FakeDest([pub], files=list(files)), cfg
+        )
         seen = {}
         real_join = _cleanup_mod._safe_ssd_join
 
@@ -516,8 +596,7 @@ async def test_ssd_bytes_check_runs_off_loop(tmp_path: Path):
             return real_join(base, name)
 
         with patch.object(_cleanup_mod, "_safe_ssd_join", side_effect=_spy):
-            assert await coord._cleanup_ssd_bytes_present(
-                store.get(pub)) is True
+            assert await coord._cleanup_ssd_bytes_present(store.get(pub)) is True
         assert seen["thread"] is not threading.main_thread()
     finally:
         store.close()
@@ -535,14 +614,21 @@ async def test_ssd_bytes_outside_roots_fails_closed(tmp_path: Path):
     pub = "c" * 40
     store = StateStore(tmp_path / "s.db")
     try:
-        _row(store, pub, State.MOVING, completed_h_ago=None,
-             activity_h_ago=10.0, injected="", save_path=str(fuse))
+        _row(
+            store,
+            pub,
+            State.MOVING,
+            completed_h_ago=None,
+            activity_h_ago=10.0,
+            injected="",
+            save_path=str(fuse),
+        )
         cfg = _base_cfg(ssd)
         cfg.ssd.path = ssd
-        coord = _make_coord(ssd, store, _FakeSource([_member(pub)]),
-                            _FakeDest([pub], files=list(files)), cfg)
-        assert await coord._cleanup_ssd_bytes_present(
-            store.get(pub)) is False
+        coord = _make_coord(
+            ssd, store, _FakeSource([_member(pub)]), _FakeDest([pub], files=list(files)), cfg
+        )
+        assert await coord._cleanup_ssd_bytes_present(store.get(pub)) is False
     finally:
         store.close()
 
@@ -559,20 +645,39 @@ async def test_verdicts_evaluate_concurrently(tmp_path: Path):
     try:
         for i, name in enumerate(names):
             h = str(i + 1) * 40
-            store.upsert(TorrentState(
-                source_infohash=h, source_name=name, dest_infohash=h,
-                total_bytes=FSIZE, state=State.DONE,
-                completed_at=now - dt.timedelta(hours=100),
-                vps1_last_activity_at=now - dt.timedelta(hours=10)))
-            members.append(Torrent(
-                hash=h, name=name, category="", save_path="/vps1/data",
-                size_bytes=FSIZE, state="seeding", progress=1.0, ratio=2.0,
-                trackers=[], upspeed_bps=0, num_leechers=0, added_on=0))
+            store.upsert(
+                TorrentState(
+                    source_infohash=h,
+                    source_name=name,
+                    dest_infohash=h,
+                    total_bytes=FSIZE,
+                    state=State.DONE,
+                    completed_at=now - dt.timedelta(hours=100),
+                    vps1_last_activity_at=now - dt.timedelta(hours=10),
+                )
+            )
+            members.append(
+                Torrent(
+                    hash=h,
+                    name=name,
+                    category="",
+                    save_path="/vps1/data",
+                    size_bytes=FSIZE,
+                    state="seeding",
+                    progress=1.0,
+                    ratio=2.0,
+                    trackers=[],
+                    upspeed_bps=0,
+                    num_leechers=0,
+                    added_on=0,
+                )
+            )
         cfg = _base_cfg(tmp_path)
         cfg.cleanup = _cleanup_cfg(delete_stagger_seconds=0)
         _healthy_fuse(tmp_path, store, ["1" * 40, "2" * 40], cfg)
-        coord = _make_coord(tmp_path, store, _FakeSource(list(members)),
-                            _FakeDest(["1" * 40, "2" * 40]), cfg)
+        coord = _make_coord(
+            tmp_path, store, _FakeSource(list(members)), _FakeDest(["1" * 40, "2" * 40]), cfg
+        )
         in_flight = 0
         peak = 0
         real_verdict = coord._cleanup_verdict
@@ -601,8 +706,8 @@ def test_group_for_requires_known_equal_sizes():
 
     coord = make_coordinator()
     row = TorrentState(
-        source_infohash="r" * 40, source_name=FNAME, total_bytes=FSIZE,
-        state=State.DONE)
+        source_infohash="r" * 40, source_name=FNAME, total_bytes=FSIZE, state=State.DONE
+    )
     same = _member("m" * 40)
     by_hash = {"m" * 40: same}
     assert coord._cleanup_group_for(row, by_hash) == [same]
@@ -619,8 +724,8 @@ def test_group_for_requires_known_equal_sizes():
 
     # Unknown row size (fresh adoption): fail closed, no group.
     fresh = TorrentState(
-        source_infohash="f" * 40, source_name=FNAME, total_bytes=0,
-        state=State.DONE)
+        source_infohash="f" * 40, source_name=FNAME, total_bytes=0, state=State.DONE
+    )
     assert coord._cleanup_group_for(fresh, by_hash) == []
 
 
@@ -632,8 +737,7 @@ async def test_unknown_stats_veto_delete(tmp_path: Path):
     pub = "a" * 40
     added = int(time.time()) - 5 * 24 * 3600
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.DONE, completed_h_ago=None, activity_h_ago=None,
-         injected="")
+    _row(store, pub, State.DONE, completed_h_ago=None, activity_h_ago=None, injected="")
     member = _member(pub, upspeed=0, leechers=0, ratio=0.0, added_on=added)
     member.total_uploaded_bytes = 0
     member.seeding_time_seconds = 0
@@ -657,8 +761,7 @@ async def test_dry_run_heals_in_memory_only(tmp_path: Path, caplog):
     """Dry-run previews the heal path with zero persisted mutations."""
     pub = "a" * 40
     store = StateStore(tmp_path / "s.db")
-    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0,
-         injected="")
+    _row(store, pub, State.DONE, completed_h_ago=100.0, activity_h_ago=10.0, injected="")
     src = _FakeSource([_member(pub)])
     dest = _FakeDest([pub])
     cfg = _base_cfg(tmp_path)

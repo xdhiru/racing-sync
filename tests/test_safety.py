@@ -1,4 +1,5 @@
 """Central destructive-path guards: one rule, every caller."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -21,10 +22,14 @@ from racing_sync.safety import (
 
 def _cfg(**over):
     cfg = SimpleNamespace(
-        general=SimpleNamespace(state_db=str(over.pop("state_db", "/data/app/state.db")),
-                                log_dir="/data/app/logs"),
-        rclone=SimpleNamespace(fuse=SimpleNamespace(
-            mount=over.pop("mount", None), mount_unsorted=over.pop("mount_unsorted", None))),
+        general=SimpleNamespace(
+            state_db=str(over.pop("state_db", "/data/app/state.db")), log_dir="/data/app/logs"
+        ),
+        rclone=SimpleNamespace(
+            fuse=SimpleNamespace(
+                mount=over.pop("mount", None), mount_unsorted=over.pop("mount_unsorted", None)
+            )
+        ),
         ssd=SimpleNamespace(path="/data/ssd"),
         dest=SimpleNamespace(save_path="/data/ssd"),
     )
@@ -61,12 +66,10 @@ def test_state_db_parent_refusal_covers_root_and_checkout(tmp_path: Path):
     checkout = tmp_path / "proj"
     checkout.mkdir()
     (checkout / ".git").mkdir()
-    assert state_db_parent_refusal(
-        _cfg(state_db=str(checkout / "state.db"))) is not None
+    assert state_db_parent_refusal(_cfg(state_db=str(checkout / "state.db"))) is not None
     good = tmp_path / "data" / "app"
     good.mkdir(parents=True)
-    assert state_db_parent_refusal(
-        _cfg(state_db=str(good / "state.db"))) is None
+    assert state_db_parent_refusal(_cfg(state_db=str(good / "state.db"))) is None
 
 
 def test_overlaps_fuse_both_directions(tmp_path: Path):
@@ -151,6 +154,7 @@ def test_backup_db_snapshot_and_prune(tmp_path: Path):
     assert first is not None and Path(first).is_file()
     # A snapshot taken through WAL reads back the data.
     from racing_sync.state import StateStore as S2
+
     probe = S2(Path(first))
     try:
         assert probe.get_meta("k") == "v"

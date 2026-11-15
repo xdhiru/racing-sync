@@ -52,9 +52,11 @@ def _coerce_pool_size(raw: object) -> int:
         return _POOL_SIZE_DEFAULT
     return max(_POOL_SIZE_MIN, min(_POOL_SIZE_MAX, n))
 
+
 _HEX40_RE = None  # lazy compiled in list_state_dir to avoid import cost
 
 import re as _re
+
 _HEX40_RE = _re.compile(r"[0-9a-fA-F]{40}")
 
 
@@ -102,7 +104,10 @@ def _ipv4_socket(host: str, port: int, *, timeout: float = 15) -> socket.socket:
     records that aren't actually routable.
     """
     infos = socket.getaddrinfo(
-        host, port, family=socket.AF_INET, type=socket.SOCK_STREAM,
+        host,
+        port,
+        family=socket.AF_INET,
+        type=socket.SOCK_STREAM,
     )
     if not infos:
         raise SFTPError(f"no IPv4 address for {host}")
@@ -232,9 +237,7 @@ class _SFTPConnection:
                 # IPv6 address and paramiko defaults to getaddrinfo's first
                 # result, which can be a hung AAAA connection. We pre-resolve
                 # with AF_INET, open a socket ourselves, and pass it to connect().
-                sock = _ipv4_socket(
-                    self._cfg.ssh_host, self._cfg.ssh_port, timeout=15
-                )
+                sock = _ipv4_socket(self._cfg.ssh_host, self._cfg.ssh_port, timeout=15)
                 kwargs["sock"] = sock
                 self._client.connect(**kwargs)
                 self._sftp = self._client.open_sftp()
@@ -278,8 +281,7 @@ class _SFTPConnection:
             except Exception as e:  # noqa: BLE001
                 errors.append(f"{loader.__name__}: {e}")
         raise paramiko.SSHException(
-            "could not parse private key as RSA/ECDSA/Ed25519: "
-            + " | ".join(errors)
+            "could not parse private key as RSA/ECDSA/Ed25519: " + " | ".join(errors)
         )
 
     def close(self) -> None:
@@ -337,7 +339,11 @@ class _SFTPConnection:
 
     def fetch_torrent(self, infohash: str) -> bytes | None:
         """Return the .torrent bytes for `infohash` or None if missing."""
-        if not infohash or len(infohash) != 40 or not all(c in "0123456789abcdefABCDEF" for c in infohash):
+        if (
+            not infohash
+            or len(infohash) != 40
+            or not all(c in "0123456789abcdefABCDEF" for c in infohash)
+        ):
             return None
         # State dirs live on case-sensitive filesystems with lowercase names.
         infohash = infohash.lower()
@@ -355,10 +361,12 @@ class _SFTPConnection:
     def _fetch_torrent_locked(self, infohash: str) -> bytes | None:
         with self._lock:
             # Reconnect if connection dropped
-            if (self._client is None
-                    or self._sftp is None
-                    or self._client.get_transport() is None
-                    or not self._client.get_transport().is_active()):
+            if (
+                self._client is None
+                or self._sftp is None
+                or self._client.get_transport() is None
+                or not self._client.get_transport().is_active()
+            ):
                 log.info("sftp connection dropped or not active; reconnecting...")
                 try:
                     self.connect()
@@ -381,9 +389,7 @@ class _SFTPConnection:
                     with self._sftp.open(path_str, "rb") as f:  # type: ignore[union-attr]
                         data = f.read(MAX_TORRENT_BYTES + 1)
                     if len(data) > MAX_TORRENT_BYTES:
-                        log.warning(
-                            "sftp: %s exceeds %d bytes limit", path_str, MAX_TORRENT_BYTES
-                        )
+                        log.warning("sftp: %s exceeds %d bytes limit", path_str, MAX_TORRENT_BYTES)
                         continue
                     if data.startswith(b"d"):
                         return data
@@ -429,10 +435,12 @@ class _SFTPConnection:
             return None  # unreachable: helper raises; kept for clarity
         try:
             with self._lock:
-                if (self._client is None
-                        or self._sftp is None
-                        or self._client.get_transport() is None
-                        or not self._client.get_transport().is_active()):
+                if (
+                    self._client is None
+                    or self._sftp is None
+                    or self._client.get_transport() is None
+                    or not self._client.get_transport().is_active()
+                ):
                     try:
                         self.connect()
                     except Exception as e:
@@ -481,7 +489,8 @@ class _SFTPConnection:
         try:
             try:
                 stdin, stdout, stderr = client.exec_command(
-                    f"stat -f -c '%a %S' {shlex.quote(path)}")
+                    f"stat -f -c '%a %S' {shlex.quote(path)}"
+                )
                 try:
                     stdout.channel.settimeout(10.0)
                 except Exception:
@@ -506,8 +515,7 @@ class _SFTPConnection:
         stdin, stdout, stderr = None, None, None
         try:
             try:
-                stdin, stdout, stderr = client.exec_command(
-                    f"df -kP {shlex.quote(path)}")
+                stdin, stdout, stderr = client.exec_command(f"df -kP {shlex.quote(path)}")
             except Exception as e:  # noqa: BLE001
                 log.warning("ssh df %s failed: %r", path, e)
                 return None
@@ -562,10 +570,12 @@ class _SFTPConnection:
     def _list_state_dir_locked(self) -> list[str]:
         with self._lock:
             # Mirror fetch_torrent: reconnect if the connection dropped.
-            if (self._client is None
-                    or self._sftp is None
-                    or self._client.get_transport() is None
-                    or not self._client.get_transport().is_active()):
+            if (
+                self._client is None
+                or self._sftp is None
+                or self._client.get_transport() is None
+                or not self._client.get_transport().is_active()
+            ):
                 log.info("sftp connection dropped or not active; reconnecting...")
                 try:
                     self.connect()
@@ -598,8 +608,7 @@ class _SFTPConnection:
             try:
                 for entry in iterator:
                     if len(out) >= _LIST_CAP:
-                        log.warning("sftp state dir exceeds %d entries; truncating list",
-                                    _LIST_CAP)
+                        log.warning("sftp state dir exceeds %d entries; truncating list", _LIST_CAP)
                         break
                     try:
                         name = entry.filename
@@ -727,9 +736,7 @@ class SFTPExporter:
                 except Exception:
                     continue
             if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"sftp busy: {what} gave up waiting for a free connection"
-                )
+                raise TimeoutError(f"sftp busy: {what} gave up waiting for a free connection")
             for i in range(len(members)):
                 m = members[(start + i) % len(members)]
                 try:
@@ -786,7 +793,8 @@ class SFTPExporter:
                 raise SFTPError("sftp pool closed during dial")
 
         pool = _fut.ThreadPoolExecutor(
-            max_workers=max(1, len(members)), thread_name_prefix="sftp-dial",
+            max_workers=max(1, len(members)),
+            thread_name_prefix="sftp-dial",
         )
         futs: dict = {}
         try:
@@ -797,8 +805,7 @@ class SFTPExporter:
                     if exc is not None:
                         raise exc
             except _fut.TimeoutError as e:
-                raise SFTPError(
-                    f"sftp dial timed out after {self._DIAL_TIMEOUT_S:.0f}s") from e
+                raise SFTPError(f"sftp dial timed out after {self._DIAL_TIMEOUT_S:.0f}s") from e
         except Exception:
             for m in members:
                 try:
@@ -842,7 +849,11 @@ class SFTPExporter:
 
     def fetch_torrent(self, infohash: str) -> bytes | None:
         """Return the .torrent bytes for `infohash` or None if missing."""
-        if not infohash or len(infohash) != 40 or not all(c in "0123456789abcdefABCDEF" for c in infohash):
+        if (
+            not infohash
+            or len(infohash) != 40
+            or not all(c in "0123456789abcdefABCDEF" for c in infohash)
+        ):
             return None
         infohash = infohash.lower()
         m = self._lease(f"fetch {infohash[:10]}")
@@ -876,8 +887,8 @@ class SFTPExporter:
 
         _workers = max(1, min(len(hashes), self._pool_size))
         with _fut.ThreadPoolExecutor(
-                max_workers=_workers,
-                thread_name_prefix="sftp-fetch") as _pool:
+            max_workers=_workers, thread_name_prefix="sftp-fetch"
+        ) as _pool:
             for h, data in _pool.map(_one, hashes):
                 if data:
                     out[h] = data

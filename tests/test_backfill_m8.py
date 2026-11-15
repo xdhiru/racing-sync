@@ -1,4 +1,5 @@
 """M8 backfill: narrow gaps across phases (state/gc, forget pairs, margin)."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -13,14 +14,11 @@ def test_gc_tombstones_ttl(tmp_path: Path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="a" * 40, source_name="Old",
-                                  state=State.FAILED))
-        store.upsert(TorrentState(source_infohash="b" * 40, source_name="New",
-                                  state=State.FAILED))
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="Old", state=State.FAILED))
+        store.upsert(TorrentState(source_infohash="b" * 40, source_name="New", state=State.FAILED))
         store.delete("a" * 40)
         store.delete("b" * 40)
-        old = (dt.datetime.now(dt.timezone.utc)
-               - dt.timedelta(hours=49)).isoformat()
+        old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=49)).isoformat()
         store._conn.execute(
             "UPDATE torrent_state SET deleted_at = ? WHERE source_infohash = ?",
             (old, "a" * 40),
@@ -40,14 +38,17 @@ def test_null_deleted_at_normalized_on_open(tmp_path: Path):
     import datetime as dt
     import sqlite3
     from racing_sync.state import (
-        SCHEMA_TABLES, State, StateStore, TorrentState,
+        SCHEMA_TABLES,
+        State,
+        StateStore,
+        TorrentState,
     )
 
     db = tmp_path / "legacy.db"
     now = dt.datetime.now(dt.timezone.utc).isoformat()
     legacy_schema = SCHEMA_TABLES.replace(
-        "deleted_at               TEXT NOT NULL DEFAULT ''",
-        "deleted_at               TEXT")
+        "deleted_at               TEXT NOT NULL DEFAULT ''", "deleted_at               TEXT"
+    )
     assert legacy_schema != SCHEMA_TABLES
     conn = sqlite3.connect(str(db), isolation_level=None)
     try:
@@ -65,8 +66,8 @@ def test_null_deleted_at_normalized_on_open(tmp_path: Path):
         got = store.get("a" * 40)
         assert got is not None and got.state == State.NEW
         raw = store._conn.execute(
-            "SELECT deleted_at FROM torrent_state WHERE source_infohash = ?",
-            ("a" * 40,)).fetchone()[0]
+            "SELECT deleted_at FROM torrent_state WHERE source_infohash = ?", ("a" * 40,)
+        ).fetchone()[0]
         assert raw == ""
     finally:
         store.close()
@@ -77,8 +78,7 @@ def test_find_by_name_empty_string(tmp_path: Path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A",
-                                  state=State.NEW))
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A", state=State.NEW))
         assert store.find_by_name("") == []
     finally:
         store.close()
@@ -99,20 +99,24 @@ async def test_forget_hard_deletes_pairs_without_zombies(tmp_path: Path):
     dest.seed("a" * 40, str(ssd), [TorrentFile(name="Shared/a.mkv", size_bytes=10)])
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=True, ignore=False, hard=True,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
+        ignore=False,
+        hard=True,
     )
 
     assert store.get("a" * 40) is None
     assert store.get("b" * 40) is None
     assert store.get("c" * 40) is None
-    assert {p["source_infohash"] for p in result["paired_cancelled"]} == {
-        "b" * 40, "c" * 40}
+    assert {p["source_infohash"] for p in result["paired_cancelled"]} == {"b" * 40, "c" * 40}
     # No tombstones, no ignore entries: a later re-drop re-ingests clean.
     assert store.is_ignored("a" * 40) is False
     assert store.is_ignored("b" * 40) is False
-    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Re",
-                              state=State.NEW))
+    store.upsert(TorrentState(source_infohash="b" * 40, source_name="Re", state=State.NEW))
     assert store.get("b" * 40) is not None
 
 

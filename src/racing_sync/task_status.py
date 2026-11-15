@@ -71,8 +71,7 @@ def _num(value: object, default: float = 0.0) -> float:
 def status_for(coord: object, ts: object) -> TaskStatus:
     """Pick the reader for a row's state and snapshot it. Never raises."""
     try:
-        state_val = str(getattr(getattr(ts, "state", None), "value", "")
-                        or "").lower()
+        state_val = str(getattr(getattr(ts, "state", None), "value", "") or "").lower()
     except Exception:
         state_val = ""
     try:
@@ -107,8 +106,7 @@ def status_for(coord: object, ts: object) -> TaskStatus:
                 if _rp is not None:
                     _pc = _num(getattr(_rp, "percent", 0.0), -1.0)
                     prog = _pc / 100.0 if 0.0 <= _pc <= 100.0 else None
-                    spd = max(0, int(_num(
-                        getattr(_rp, "speed_bps", 0))))
+                    spd = max(0, int(_num(getattr(_rp, "speed_bps", 0))))
                     _e = int(_num(getattr(_rp, "eta_seconds", 0)))
                     eta = _e if _e > 0 else None
             except Exception:
@@ -116,14 +114,15 @@ def status_for(coord: object, ts: object) -> TaskStatus:
             return MoveStatus(progress=prog, speed_bps=spd, eta_seconds=eta)
         if state_val == "re_adding":
             return ReaddStatus()
-        if state_val in ("queued", "waiting_disk", "waiting_indexer",
-                         "new"):
-            _labels = {"queued": "Queued", "waiting_disk": "Wait SSD",
-                       "waiting_indexer": "Wait indexer", "new": "New"}
-            return QueueStatus(
-                label=_labels.get(state_val, "Queued"), state=state_val)
-        return QueueStatus(label=state_val or "unknown",
-                           state=state_val or "unknown")
+        if state_val in ("queued", "waiting_disk", "waiting_indexer", "new"):
+            _labels = {
+                "queued": "Queued",
+                "waiting_disk": "Wait SSD",
+                "waiting_indexer": "Wait indexer",
+                "new": "New",
+            }
+            return QueueStatus(label=_labels.get(state_val, "Queued"), state=state_val)
+        return QueueStatus(label=state_val or "unknown", state=state_val or "unknown")
     except Exception:
         return QueueStatus()
 
@@ -143,5 +142,12 @@ def status_counts(coord: object, rows: list) -> dict[str, int]:
     return out
 
 
-__all__ = ["TaskStatus", "DownloadStatus", "MoveStatus", "ReaddStatus",
-           "QueueStatus", "status_for", "status_counts"]
+__all__ = [
+    "TaskStatus",
+    "DownloadStatus",
+    "MoveStatus",
+    "ReaddStatus",
+    "QueueStatus",
+    "status_for",
+    "status_counts",
+]

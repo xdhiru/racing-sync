@@ -1,4 +1,5 @@
 """Debounce scoping, slow-down hints, fail-closed guards, per-hash claims."""
+
 from __future__ import annotations
 
 import re
@@ -13,6 +14,7 @@ from racing_sync.telegram_protocol import _ChatCommand
 
 def _cmd_bot(**kw):
     from unittest.mock import MagicMock
+
     bot = object.__new__(TelegramBot)
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
     bot._callback_times = {}
@@ -25,6 +27,7 @@ def _cmd_bot(**kw):
 
 def _msg(text):
     from unittest.mock import MagicMock
+
     m = MagicMock()
     m.chat.id = 12345
     m.from_user.id = 12345
@@ -68,9 +71,7 @@ async def test_mutating_command_debounced():
     async def _fake_handle(bot, match, message):
         calls.append("handled")
 
-    fake_table = (
-        _ChatCommand("cancel", re.compile(r"^/cancel_"), _fake_handle),
-    )
+    fake_table = (_ChatCommand("cancel", re.compile(r"^/cancel_"), _fake_handle),)
     bot = _cmd_bot()
     orig = _router._CHAT_COMMANDS
     _router._CHAT_COMMANDS = fake_table
@@ -85,6 +86,7 @@ async def test_mutating_command_debounced():
 @pytest.mark.anyio
 async def test_debounced_callback_answers_slow_down():
     from unittest.mock import AsyncMock, MagicMock
+
     bot = _cmd_bot()
     bot._store = MagicMock()
     bot._store.list_active_inflight.return_value = []
@@ -143,8 +145,8 @@ async def test_overlapping_cancel_scope_conflicts_per_hash():
     now = time.monotonic()
     bot._action_inflight = {f"keep:{'a' * 40}:1:del": now}
     res = await bot._execute_snapshot_cancel(
-        ["a" * 40, "b" * 40], "Twin.Show",
-        delete_files=True, remember=True)
+        ["a" * 40, "b" * 40], "Twin.Show", delete_files=True, remember=True
+    )
     assert res.startswith("Already working")
     # The sibling's speculative hold was rolled back, not leaked.
     assert f"keep:{'b' * 40}:1:del" not in bot._action_inflight

@@ -82,6 +82,7 @@ class TaskHandle:
         try:
             if self.tree_key:
                 from .rclone_ops import abort_move_tree
+
                 try:
                     if abort_move_tree(self.tree_key):
                         did = True

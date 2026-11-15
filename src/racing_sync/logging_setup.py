@@ -98,8 +98,11 @@ class ENOSPCSafeTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandl
             if e.errno == _errno.ENOSPC or _streak >= 3:
                 self._disabled_due_to_enospc = True
                 try:
-                    _why = ("no space left on device" if e.errno == _errno.ENOSPC
-                            else f"persistent write error {e!r}")
+                    _why = (
+                        "no space left on device"
+                        if e.errno == _errno.ENOSPC
+                        else f"persistent write error {e!r}"
+                    )
                     sys.stderr.write(
                         f"[log] disabling file handler {self.baseFilename}: "
                         f"{_why} (logging to console/ring only)\n"
@@ -208,10 +211,28 @@ class JsonlFormatter(logging.Formatter):
             payload["exc"] = sanitize_log_text(self.formatException(record.exc_info))
         for k, v in record.__dict__.items():
             if k in (
-                "args", "asctime", "created", "exc_info", "exc_text", "filename",
-                "funcName", "levelname", "levelno", "lineno", "message", "module",
-                "msecs", "msg", "name", "pathname", "process", "processName",
-                "relativeCreated", "stack_info", "thread", "threadName",
+                "args",
+                "asctime",
+                "created",
+                "exc_info",
+                "exc_text",
+                "filename",
+                "funcName",
+                "levelname",
+                "levelno",
+                "lineno",
+                "message",
+                "module",
+                "msecs",
+                "msg",
+                "name",
+                "pathname",
+                "process",
+                "processName",
+                "relativeCreated",
+                "stack_info",
+                "thread",
+                "threadName",
                 "taskName",
             ):
                 continue
@@ -342,7 +363,9 @@ class HTTPSinkHandler(logging.handlers.QueueHandler):
             }
             try:
                 data = json.dumps(payload).encode("utf-8")
-                req = urllib.request.Request(self._cfg.url, data=data, headers=headers, method="POST")
+                req = urllib.request.Request(
+                    self._cfg.url, data=data, headers=headers, method="POST"
+                )
                 with urllib.request.urlopen(req, timeout=5.0) as resp:
                     resp.read()
             except Exception as e:  # noqa: BLE001
@@ -429,15 +452,21 @@ def setup_logging(cfg: AppConfig) -> None:
         try:
             _sink_url = str(cfg.logging_sink.url or "")
             _parsed = urlsplit(_sink_url)
-            _plain = (_parsed.scheme == "http" and _parsed.hostname
-                      not in ("localhost", "127.0.0.1", "::1"))
+            _plain = _parsed.scheme == "http" and _parsed.hostname not in (
+                "localhost",
+                "127.0.0.1",
+                "::1",
+            )
         except Exception:
             _plain = False
         try:
             _has_token = bool(
-                (cfg.logging_sink.auth_token.get_secret_value()
-                 if hasattr(cfg.logging_sink.auth_token, "get_secret_value")
-                 else str(cfg.logging_sink.auth_token or "")).strip())
+                (
+                    cfg.logging_sink.auth_token.get_secret_value()
+                    if hasattr(cfg.logging_sink.auth_token, "get_secret_value")
+                    else str(cfg.logging_sink.auth_token or "")
+                ).strip()
+            )
         except Exception:
             _has_token = False
         if _plain:
@@ -450,26 +479,38 @@ def setup_logging(cfg: AppConfig) -> None:
                     "logging sink bearer token will be sent over PLAINTEXT "
                     "http:// to %s (allow_plaintext opt-in) — log bodies "
                     "and credentials travel unencrypted",
-                    _parsed.hostname)
+                    _parsed.hostname,
+                )
             elif _has_token:
                 logging.getLogger("racing_sync").warning(
                     "logging sink is plaintext http:// to %s: bearer token "
                     "withheld per request (no allow_plaintext opt-in), but "
                     "log bodies still ship unencrypted — prefer https://",
-                    _parsed.hostname)
+                    _parsed.hostname,
+                )
             else:
                 logging.getLogger("racing_sync").warning(
                     "logging sink is plaintext http:// to %s: log bodies "
                     "ship unencrypted — prefer https://",
-                    _parsed.hostname)
+                    _parsed.hostname,
+                )
         sink = HTTPSinkHandler(cfg.logging_sink)
         sink.setLevel(getattr(logging, level_name))
         root.addHandler(sink)
 
     # Silence overly chatty libraries (httpx/httpcore back the Telegram
     # bot's HTTP calls and log every request at INFO without this).
-    for noisy in ("aiohttp.access", "asyncio", "urllib3", "paramiko", "uvicorn",
-                  "httpx", "httpcore", "telegram", "telegram.ext"):
+    for noisy in (
+        "aiohttp.access",
+        "asyncio",
+        "urllib3",
+        "paramiko",
+        "uvicorn",
+        "httpx",
+        "httpcore",
+        "telegram",
+        "telegram.ext",
+    ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     # Fail-fast hint for the ENOSPC feedback loop: logs + SSD/state on one
@@ -488,7 +529,9 @@ def setup_logging(cfg: AppConfig) -> None:
                         "log dir %s shares a filesystem with %s (%s) — "
                         "move logs to a separate mount so a full SSD does not "
                         "take down logging/state.db",
-                        log_dir, _label, _p,
+                        log_dir,
+                        _label,
+                        _p,
                     )
                     break
             except OSError:
@@ -498,7 +541,8 @@ def setup_logging(cfg: AppConfig) -> None:
 
     logging.getLogger("racing_sync").info(
         "logging initialised: dir=%s retention=%dd",
-        log_dir, cfg.general.log_retention_days,
+        log_dir,
+        cfg.general.log_retention_days,
     )
 
 
@@ -526,7 +570,8 @@ async def post_log_event_async(
                     logging.getLogger(__name__).warning(
                         "log sink POST %s -> HTTP %s",
                         sanitize_log_text(str(url)),
-                        getattr(r, "status", "?"))
+                        getattr(r, "status", "?"),
+                    )
                 except Exception:
                     pass
             return _ok

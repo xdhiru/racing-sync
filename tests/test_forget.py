@@ -19,9 +19,12 @@ async def test_candidate_local_paths_dedups_top_dir(tmp_path: Path):
     ssd.mkdir()
     dest = FakeDest()
     dest.seed(
-        "a" * 40, str(ssd),
-        [TorrentFile(name="Show/ep1.mkv", size_bytes=10),
-         TorrentFile(name="Show/ep2.mkv", size_bytes=10)],
+        "a" * 40,
+        str(ssd),
+        [
+            TorrentFile(name="Show/ep1.mkv", size_bytes=10),
+            TorrentFile(name="Show/ep2.mkv", size_bytes=10),
+        ],
     )
     cfg = MagicMock()
     cfg.ssd.path = ssd
@@ -43,20 +46,16 @@ async def test_candidate_local_paths_unions_all_entries(tmp_path: Path):
     (ssd / "Pack.One").mkdir(parents=True)
     (ssd / "Pack.Two").mkdir(parents=True)
     dest = FakeDest()
-    dest.seed("a" * 40, str(ssd),
-              [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
-    dest.seed("b" * 40, str(ssd),
-              [TorrentFile(name="Pack.Two/b.mkv", size_bytes=10)])
+    dest.seed("a" * 40, str(ssd), [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
+    dest.seed("b" * 40, str(ssd), [TorrentFile(name="Pack.Two/b.mkv", size_bytes=10)])
     cfg = MagicMock()
     cfg.ssd.path = ssd
     cfg.dest.save_path = ssd
     row = MagicMock()
     row.save_path = str(ssd)
 
-    paths, skipped = await _candidate_local_paths(
-        cfg, dest, row, ["a" * 40, "b" * 40])
-    assert [str(p) for p in paths] == [
-        str(ssd / "Pack.One"), str(ssd / "Pack.Two")]
+    paths, skipped = await _candidate_local_paths(cfg, dest, row, ["a" * 40, "b" * 40])
+    assert [str(p) for p in paths] == [str(ssd / "Pack.One"), str(ssd / "Pack.Two")]
     assert skipped == []
 
 
@@ -70,10 +69,8 @@ async def test_candidate_local_paths_per_entry_save_path(tmp_path: Path):
     (ssd / "Pack.One").mkdir(parents=True)
     (alt / "Pack.Alt").mkdir(parents=True)
     dest = FakeDest()
-    dest.seed("a" * 40, str(ssd),
-              [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
-    dest.seed("b" * 40, str(alt),
-              [TorrentFile(name="Pack.Alt/b.mkv", size_bytes=10)])
+    dest.seed("a" * 40, str(ssd), [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
+    dest.seed("b" * 40, str(alt), [TorrentFile(name="Pack.Alt/b.mkv", size_bytes=10)])
     cfg = MagicMock()
     cfg.ssd.path = ssd
     cfg.dest.save_path = ssd
@@ -81,8 +78,7 @@ async def test_candidate_local_paths_per_entry_save_path(tmp_path: Path):
     row.save_path = str(ssd)
 
     # alt is outside the SSD bases → its top is skipped, never wiped.
-    paths, skipped = await _candidate_local_paths(
-        cfg, dest, row, ["a" * 40, "b" * 40])
+    paths, skipped = await _candidate_local_paths(cfg, dest, row, ["a" * 40, "b" * 40])
     assert [str(p) for p in paths] == [str(ssd / "Pack.One")]
     assert len(skipped) == 1 and "Pack.Alt" in skipped[0]
 
@@ -95,18 +91,15 @@ async def test_candidate_local_paths_dedups_shared_top(tmp_path: Path):
     ssd = tmp_path / "ssd"
     (ssd / "Show").mkdir(parents=True)
     dest = FakeDest()
-    dest.seed("a" * 40, str(ssd),
-              [TorrentFile(name="Show/ep1.mkv", size_bytes=10)])
-    dest.seed("b" * 40, str(ssd),
-              [TorrentFile(name="Show/ep2.mkv", size_bytes=10)])
+    dest.seed("a" * 40, str(ssd), [TorrentFile(name="Show/ep1.mkv", size_bytes=10)])
+    dest.seed("b" * 40, str(ssd), [TorrentFile(name="Show/ep2.mkv", size_bytes=10)])
     cfg = MagicMock()
     cfg.ssd.path = ssd
     cfg.dest.save_path = ssd
     row = MagicMock()
     row.save_path = str(ssd)
 
-    paths, skipped = await _candidate_local_paths(
-        cfg, dest, row, ["a" * 40, "b" * 40])
+    paths, skipped = await _candidate_local_paths(cfg, dest, row, ["a" * 40, "b" * 40])
     assert [str(p) for p in paths] == [str(ssd / "Show")]
     assert skipped == []
 
@@ -127,9 +120,17 @@ class FakeDest:
         for h, e in self.entries.items():
             if wanted is not None and h not in wanted:
                 continue
-            out.append(Torrent(hash=h, name="n", save_path=e["save_path"],
-                               category="racing", size_bytes=10,
-                               state="downloading", progress=0.5))
+            out.append(
+                Torrent(
+                    hash=h,
+                    name="n",
+                    save_path=e["save_path"],
+                    category="racing",
+                    size_bytes=10,
+                    state="downloading",
+                    progress=0.5,
+                )
+            )
         return out
 
     async def get_torrent(self, h: str):
@@ -137,9 +138,15 @@ class FakeDest:
         if h not in self.entries:
             return None
         e = self.entries[h]
-        return Torrent(hash=h, name="n", save_path=e["save_path"],
-                       category="racing", size_bytes=10,
-                       state="downloading", progress=0.5)
+        return Torrent(
+            hash=h,
+            name="n",
+            save_path=e["save_path"],
+            category="racing",
+            size_bytes=10,
+            state="downloading",
+            progress=0.5,
+        )
 
     async def get_torrent_files(self, h: str):
         return list(self.entries[h.lower()]["files"])
@@ -197,8 +204,12 @@ async def test_forget_dry_run_changes_nothing(tmp_path: Path):
     dest.seed("a" * 40, str(ssd), [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="A" * 40,
-        apply=False, delete_files=True,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="A" * 40,
+        apply=False,
+        delete_files=True,
     )
 
     assert result["applied"] is False
@@ -222,8 +233,12 @@ async def test_forget_apply_removes_everything(tmp_path: Path):
     dest.seed("a" * 40, str(ssd), [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="pack.one",
-        apply=True, delete_files=True,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="pack.one",
+        apply=True,
+        delete_files=True,
     )
 
     assert result["applied"] is True
@@ -245,8 +260,12 @@ async def test_forget_keep_files_leaves_data(tmp_path: Path):
     dest.seed("a" * 40, str(ssd), [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=False,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=False,
     )
 
     assert dest.delete_calls == [("a" * 40, False)]
@@ -269,8 +288,12 @@ async def test_forget_skips_paths_outside_ssd(tmp_path: Path):
     dest.seed("a" * 40, str(outside), [TorrentFile(name="Stray/x.mkv", size_bytes=1)])
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=True,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
     )
 
     # The client removes its own data; our direct wipe stays out of scope.
@@ -294,8 +317,12 @@ async def test_forget_keep_files_skips_out_of_scope_wipe(tmp_path: Path):
     dest.seed("a" * 40, str(outside), [TorrentFile(name="Stray/x.mkv", size_bytes=1)])
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=False,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=False,
     )
 
     assert dest.delete_calls == [("a" * 40, False)]
@@ -313,8 +340,12 @@ async def test_forget_missing_client_entry_still_drops_row(tmp_path: Path):
     dest = FakeDest()
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=True,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
     )
 
     assert result["dest_entries"] == []
@@ -324,14 +355,18 @@ async def test_forget_missing_client_entry_still_drops_row(tmp_path: Path):
 def _watch_pair_store(tmp_path: Path):
     """Owner DOWNLOADING + two NEW waiters (same content) + bystanders."""
     from racing_sync.state import StateStore
+
     store = StateStore(tmp_path / "state.db")
 
-    def _w(h, name="Shared.Show.S01E01", size=1000, state=State.NEW,
-           source="watch-dir"):
-        ts = TorrentState(source_infohash=h, source_name=name,
-                          total_bytes=size, cross_seed_source=source,
-                          source_announce_url="https://alpha.cc/announce/xyz",
-                          state=state)
+    def _w(h, name="Shared.Show.S01E01", size=1000, state=State.NEW, source="watch-dir"):
+        ts = TorrentState(
+            source_infohash=h,
+            source_name=name,
+            total_bytes=size,
+            cross_seed_source=source,
+            source_announce_url="https://alpha.cc/announce/xyz",
+            state=state,
+        )
         store.upsert(ts)
         return ts
 
@@ -352,8 +387,13 @@ async def test_forget_cascades_to_waiting_pairs(tmp_path: Path):
     dest.seed("a" * 40, str(ssd), [TorrentFile(name="Shared/a.mkv", size_bytes=10)])
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=True, ignore=True,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
+        ignore=True,
     )
 
     assert store.get("a" * 40) is None
@@ -379,8 +419,13 @@ async def test_forget_dry_run_plans_pairs_without_deleting(tmp_path: Path):
     dest = FakeDest()
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=False, delete_files=True, ignore=True,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=False,
+        delete_files=True,
+        ignore=True,
     )
 
     assert result["applied"] is False
@@ -399,8 +444,13 @@ async def test_forget_waiter_cancels_alone(tmp_path: Path):
     dest = FakeDest()
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="b" * 40,
-        apply=True, delete_files=True, ignore=True,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="b" * 40,
+        apply=True,
+        delete_files=True,
+        ignore=True,
     )
 
     assert store.get("b" * 40) is None
@@ -415,21 +465,36 @@ async def test_forget_done_owner_cascades_nothing(tmp_path: Path):
     ssd = tmp_path / "ssd"
     ssd.mkdir()
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(
-        source_infohash="a" * 40, source_name="Shared.Show.S01E01",
-        total_bytes=1000, cross_seed_source="watch-dir",
-        source_announce_url="https://alpha.cc/announce/xyz",
-        state=State.DONE))
-    store.upsert(TorrentState(
-        source_infohash="b" * 40, source_name="Shared.Show.S01E01",
-        total_bytes=1000, cross_seed_source="watch-dir",
-        source_announce_url="https://alpha.cc/announce/xyz",
-        state=State.NEW))
+    store.upsert(
+        TorrentState(
+            source_infohash="a" * 40,
+            source_name="Shared.Show.S01E01",
+            total_bytes=1000,
+            cross_seed_source="watch-dir",
+            source_announce_url="https://alpha.cc/announce/xyz",
+            state=State.DONE,
+        )
+    )
+    store.upsert(
+        TorrentState(
+            source_infohash="b" * 40,
+            source_name="Shared.Show.S01E01",
+            total_bytes=1000,
+            cross_seed_source="watch-dir",
+            source_announce_url="https://alpha.cc/announce/xyz",
+            state=State.NEW,
+        )
+    )
     dest = FakeDest()
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=True, ignore=True,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
+        ignore=True,
     )
 
     assert store.get("b" * 40) is not None
@@ -455,8 +520,12 @@ async def test_forget_verify_after_delete_reports_survivors(tmp_path: Path):
     dest.seed("a" * 40, str(ssd), [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=True,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
     )
 
     assert any("still present after delete" in e for e in result["errors"])
@@ -489,8 +558,12 @@ async def test_forget_unverifiable_deletes_keep_row(tmp_path: Path):
     dest.seed("a" * 40, str(ssd), [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=True,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
     )
 
     assert any("could not list dest entries" in e for e in result["errors"])
@@ -525,8 +598,12 @@ async def test_forget_verify_failure_keeps_row(tmp_path: Path):
     # delete_files=False: the entry goes, bytes stay — only the local-path
     # wipe (which the keep-row return must skip) could remove them.
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=False,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=False,
     )
 
     assert any("could not verify" in e for e in result["errors"])
@@ -566,8 +643,8 @@ def test_hard_delete_removes_row_outright(tmp_path: Path):
         store.upsert(_row())
         assert store.hard_delete("a" * 40) is True
         raw = store._conn.execute(
-            "SELECT COUNT(*) AS n FROM torrent_state WHERE source_infohash = ?",
-            ("a" * 40,)).fetchone()
+            "SELECT COUNT(*) AS n FROM torrent_state WHERE source_infohash = ?", ("a" * 40,)
+        ).fetchone()
         assert raw["n"] == 0
         assert store.hard_delete("a" * 40) is False
         assert store.hard_delete("") is False
@@ -585,15 +662,21 @@ async def test_forget_hard_removes_row_and_allows_reingest(tmp_path: Path):
     dest = FakeDest()
     try:
         result = await forget_torrent(
-            _cfg(ssd), dest=dest, store=store, target="a" * 40,
-            apply=True, delete_files=False, ignore=False, hard=True,
+            _cfg(ssd),
+            dest=dest,
+            store=store,
+            target="a" * 40,
+            apply=True,
+            delete_files=False,
+            ignore=False,
+            hard=True,
         )
         assert result["applied"] is True
         assert result["ignored"] is False
         assert result["errors"] == []
         raw = store._conn.execute(
-            "SELECT COUNT(*) AS n FROM torrent_state WHERE source_infohash = ?",
-            ("a" * 40,)).fetchone()
+            "SELECT COUNT(*) AS n FROM torrent_state WHERE source_infohash = ?", ("a" * 40,)
+        ).fetchone()
         assert raw["n"] == 0
         assert store.is_ignored("a" * 40) is False
         # Never-seen: the same hash re-ingests immediately (no tombstone
@@ -614,8 +697,14 @@ async def test_forget_hard_with_ignore_keeps_ignore_list(tmp_path: Path):
     dest = FakeDest()
     try:
         result = await forget_torrent(
-            _cfg(ssd), dest=dest, store=store, target="a" * 40,
-            apply=True, delete_files=False, ignore=True, hard=True,
+            _cfg(ssd),
+            dest=dest,
+            store=store,
+            target="a" * 40,
+            apply=True,
+            delete_files=False,
+            ignore=True,
+            hard=True,
         )
         assert result["ignored"] is True
         assert store.get("a" * 40) is None
@@ -706,8 +795,7 @@ async def test_spawn_worker_tracks_task_until_done(tmp_path: Path):
         coord = make_coordinator(store)
         coord.cfg = MagicMock()
         coord._process_torrent = AsyncMock()
-        ts = TorrentState(source_infohash="a" * 40, source_name="Show",
-                          state=State.NEW)
+        ts = TorrentState(source_infohash="a" * 40, source_name="Show", state=State.NEW)
         coord._spawn_worker(ts)
         for _ in range(100):
             await asyncio.sleep(0)
@@ -778,14 +866,18 @@ async def test_forget_tombstones_row_and_blocks_reingest(tmp_path: Path):
     dest = FakeDest()
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=True,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
     )
     assert result["applied"] is True
     # Physically present (tombstoned), logically gone.
     raw = store._conn.execute(
-        "SELECT deleted_at FROM torrent_state WHERE source_infohash = ?",
-        ("a" * 40,)).fetchone()
+        "SELECT deleted_at FROM torrent_state WHERE source_infohash = ?", ("a" * 40,)
+    ).fetchone()
     assert raw and raw["deleted_at"]
     assert store.get("a" * 40) is None
     # Re-discovery while tombstoned is a silent no-op.
@@ -802,8 +894,7 @@ async def test_forget_hard_stops_primary_and_pair_workers(tmp_path: Path):
     ssd.mkdir()
     store, _owner, _waiters, _bystanders = _watch_pair_store(tmp_path)
     dest = FakeDest()
-    dest.seed("a" * 40, str(ssd),
-              [TorrentFile(name="Shared/a.mkv", size_bytes=10)])
+    dest.seed("a" * 40, str(ssd), [TorrentFile(name="Shared/a.mkv", size_bytes=10)])
 
     stopped: list[str] = []
 
@@ -811,8 +902,14 @@ async def test_forget_hard_stops_primary_and_pair_workers(tmp_path: Path):
         stopped.append(h.lower())
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=True, ignore=False, hard=True,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
+        ignore=False,
+        hard=True,
         stop_workers=_stop,
     )
 
@@ -838,8 +935,13 @@ async def test_forget_stop_failure_is_reported_not_swallowed(tmp_path: Path):
         raise RuntimeError("nope")
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=True, stop_workers=_flaky,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
+        stop_workers=_flaky,
     )
 
     assert any("stop workers" in e for e in result["errors"])
@@ -860,8 +962,14 @@ async def test_forget_dry_run_stops_no_workers(tmp_path: Path):
         stopped.append(h.lower())
 
     await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=False, delete_files=True, ignore=True, stop_workers=_stop,
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=False,
+        delete_files=True,
+        ignore=True,
+        stop_workers=_stop,
     )
 
     assert stopped == []
@@ -882,8 +990,13 @@ async def test_forget_ignores_non_async_stop_hook(tmp_path: Path):
     dest = FakeDest()
 
     result = await forget_torrent(
-        _cfg(ssd), dest=dest, store=store, target="a" * 40,
-        apply=True, delete_files=True, stop_workers=MagicMock(),
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
+        stop_workers=MagicMock(),
     )
 
     assert result["errors"] == []

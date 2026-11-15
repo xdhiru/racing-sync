@@ -1,9 +1,11 @@
 """Tests for SFTP single-path stat fallback."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 
 import pytest
+
 
 def test_disk_free_prefers_stat_over_df():
     """Single-path stat: no mount-table walk, parses avail blocks."""
@@ -58,14 +60,18 @@ def test_disk_free_falls_back_to_df():
             calls.append(cmd)
             if cmd.startswith("stat -f"):
                 raise OSError("stat: command not found")
-            return (None, _Stdout(
-                b"Filesystem 1024-blocks Used Available Capacity Mounted\n"
-                b"/dev/sda1 1000 100 900 10% /data\n"), None)
+            return (
+                None,
+                _Stdout(
+                    b"Filesystem 1024-blocks Used Available Capacity Mounted\n"
+                    b"/dev/sda1 1000 100 900 10% /data\n"
+                ),
+                None,
+            )
 
     conn._client = _Client()
     assert conn._disk_free_via_df("/data") == 900 * 1024
     assert any(c.startswith("df -kP") for c in calls)
-
 
 
 def test_fuse_stat_cached_serves_and_expires(tmp_path):
@@ -102,6 +108,7 @@ def test_missing_fuse_files_uses_shared_cache(tmp_path):
         return real_stat(path)
 
     import os as _os
+
     _orig = _os.stat
     _os.stat = _counting
     try:

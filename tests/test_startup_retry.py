@@ -1,4 +1,5 @@
 """Boot-step backoff: transient blips heal, auth fails fast."""
+
 from __future__ import annotations
 
 import asyncio

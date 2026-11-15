@@ -1,4 +1,5 @@
 """Shutdown must never start an rclone move after stop is requested."""
+
 from __future__ import annotations
 
 import asyncio
@@ -32,16 +33,14 @@ def _coord():
 
 
 def _ts() -> TorrentState:
-    return TorrentState(source_infohash="r" * 40, source_name="R",
-                        state=State.MOVING)
+    return TorrentState(source_infohash="r" * 40, source_name="R", state=State.MOVING)
 
 
 @pytest.mark.anyio
 async def test_rclone_move_raises_when_stop_already_set(tmp_path):
     coord = _coord()
     coord._stop = True
-    with patch("racing_sync.coordinator_move.move_local_to_remote",
-               AsyncMock()) as child:
+    with patch("racing_sync.coordinator_move.move_local_to_remote", AsyncMock()) as child:
         with pytest.raises(asyncio.CancelledError):
             await coord._rclone_move(tmp_path, "remote:x", _ts())
     child.assert_not_awaited()
@@ -60,8 +59,7 @@ async def test_rclone_move_raises_when_stop_set_while_queued(tmp_path):
         return True, wake
 
     coord.check_running_tasks = MagicMock(side_effect=_queued_then_stop)
-    with patch("racing_sync.coordinator_move.move_local_to_remote",
-               AsyncMock()) as child:
+    with patch("racing_sync.coordinator_move.move_local_to_remote", AsyncMock()) as child:
         with pytest.raises(asyncio.CancelledError):
             await coord._rclone_move(tmp_path, "remote:x", _ts())
     coord.check_running_tasks.assert_called_once()

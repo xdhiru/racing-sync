@@ -24,14 +24,16 @@ class SheetsMixin:
         """Display title for a group (lead row's name, truncated)."""
         try:
             if members:
-                return _safe_display_name(
-                    str(getattr(members[0], "source_name", "") or "")[:60])
+                return _safe_display_name(str(getattr(members[0], "source_name", "") or "")[:60])
         except Exception:
             pass
         return "?"
 
     def _sheet_text_and_rows(
-        self, members, title: str, size_bytes: object,
+        self,
+        members,
+        title: str,
+        size_bytes: object,
         notes: dict | None = None,
     ) -> tuple[str, list[list[tuple[str, str]]]]:
         """Action sheet text + self-explanatory button rows for a group.
@@ -65,8 +67,7 @@ class SheetsMixin:
         _inject_ok = False
         try:
             for _ts in members or []:
-                if getattr(_ts, "state", None) in (
-                        State.WAITING_INDEXER, State.WAITING_DISK):
+                if getattr(_ts, "state", None) in (State.WAITING_INDEXER, State.WAITING_DISK):
                     _inject_ok = True
                     break
         except Exception:
@@ -74,34 +75,37 @@ class SheetsMixin:
         _maker = ButtonMaker()
         # One row per copy: start and cancel side by side stay readable
         # while keeping the copy context shared.
-        for (_h, _lbl) in _labels:
+        for _h, _lbl in _labels:
             if _h in _now_ok:
                 _maker.add(f"▶ Start {_lbl} now", f"go:{_h}")
             _maker.add(f"✖ Cancel {_lbl}…", f"cancel:{_h}")
             _maker.newline()
         _leader = _labels[0][0] if _labels else ""
         if len(_labels) > 1 and _leader:
-            _maker.add(f"✖ Cancel all {_n} copies…",
-                       f"cancel:all:{_leader}").newline()
+            _maker.add(f"✖ Cancel all {_n} copies…", f"cancel:all:{_leader}").newline()
         if _inject_ok and _leader:
-            _maker.add("💉 Inject all to fuse…",
-                       f"inject:all:{_leader}").newline()
+            _maker.add("💉 Inject all to fuse…", f"inject:all:{_leader}").newline()
         if _free_any and _leader:
-            _maker.add("⏭ Skip release (pause downloads)",
-                       f"skip:all:{_leader}").newline()
+            _maker.add("⏭ Skip release (pause downloads)", f"skip:all:{_leader}").newline()
         if _held_any and _leader:
-            _maker.add("⏪ Resume release (restart it)",
-                       f"resume:all:{_leader}").newline()
+            _maker.add("⏪ Resume release (restart it)", f"resume:all:{_leader}").newline()
         _maker.add("Close", "abort")
-        _text = (f"{_tspec}" + (f" · {_size}" if _size else "")
-                 + (f" · {_n} cop{'y' if _n == 1 else 'ies'} tracked" if _n else "")
-                 + "\nStart downloads now. Cancel/Inject ask first. "
-                 "Skip pauses, Resume restarts.")
+        _text = (
+            f"{_tspec}"
+            + (f" · {_size}" if _size else "")
+            + (f" · {_n} cop{'y' if _n == 1 else 'ies'} tracked" if _n else "")
+            + "\nStart downloads now. Cancel/Inject ask first. "
+            "Skip pauses, Resume restarts."
+        )
         return _text, _maker.rows()
 
     def _keepq_text_and_rows(
-        self, title: str, scope_label: str, scope: str,
-        size_bytes: object = None, remember: bool = True,
+        self,
+        title: str,
+        scope_label: str,
+        scope: str,
+        size_bytes: object = None,
+        remember: bool = True,
     ) -> tuple[str, list[list[tuple[str, str]]]]:
         """Keep/delete question text + hash buttons for a cancel scope.
 
@@ -113,17 +117,22 @@ class SheetsMixin:
             _size = _size_compact(size_bytes)
         except Exception:
             _size = ""
-        _tspec = _safe_display_name((title or "")[:60]) + (
-            f" · {_size}" if _size else "")
+        _tspec = _safe_display_name((title or "")[:60]) + (f" · {_size}" if _size else "")
         _ig = "1" if remember else "0"
-        _blocked = "blocked from returning" if remember else \
-            "allowed back later"
-        _text = (f"Cancel {_tspec}{scope_label} — keep downloaded files? "
-                 f"({_blocked})"
-                 f"\nKeep untracks (data stays in place); "
-                 f"Delete wipes the torrent and its data.")
-        _rows = (ButtonMaker()
-                 .add("✔ Keep files", f"keep:{scope}:{_ig}:yes").newline()
-                 .add("✖ Delete files", f"keep:{scope}:{_ig}:no").newline()
-                 .add("Close", "abort").rows())
+        _blocked = "blocked from returning" if remember else "allowed back later"
+        _text = (
+            f"Cancel {_tspec}{scope_label} — keep downloaded files? "
+            f"({_blocked})"
+            f"\nKeep untracks (data stays in place); "
+            f"Delete wipes the torrent and its data."
+        )
+        _rows = (
+            ButtonMaker()
+            .add("✔ Keep files", f"keep:{scope}:{_ig}:yes")
+            .newline()
+            .add("✖ Delete files", f"keep:{scope}:{_ig}:no")
+            .newline()
+            .add("Close", "abort")
+            .rows()
+        )
         return _text, _rows

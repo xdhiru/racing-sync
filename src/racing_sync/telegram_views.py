@@ -151,8 +151,7 @@ def _short_tracker_label(domain: str) -> str:
         if not parts:
             return ""
         # Drop generic infrastructure labels (never actual tracker names).
-        _generic = {"tracker", "trackers", "www", "www2", "api", "announce",
-                    "bt", "ipv6"}
+        _generic = {"tracker", "trackers", "www", "www2", "api", "announce", "bt", "ipv6"}
         kept = [p for p in parts if p not in _generic]
         if not kept:
             kept = parts
@@ -176,8 +175,7 @@ def _size_compact(n: int) -> str:
         s = _bytes_human(n)
     except Exception:
         return ""
-    for long, short in ((" PB", "P"), (" TB", "T"), (" GB", "G"),
-                        (" MB", "M"), (" KB", "K")):
+    for long, short in ((" PB", "P"), (" TB", "T"), (" GB", "G"), (" MB", "M"), (" KB", "K")):
         if s.endswith(long):
             return s[: -len(long)] + short
     return s
@@ -284,8 +282,7 @@ def _safe_display_name(name: str) -> str:
     backticks with a quote and flatten newlines — matches the renderer
     convention so headings and questions display identically.
     """
-    return ((name or "").replace("`", "'").replace("\n", " ")
-            .replace("\r", " ").rstrip("\\"))
+    return (name or "").replace("`", "'").replace("\n", " ").replace("\r", " ").rstrip("\\")
 
 
 def _row_text_bits(ts: TorrentState) -> tuple[str, str, str]:
@@ -320,8 +317,7 @@ def _retry_minutes(ts: TorrentState) -> int | None:
     return max(1, round(_retry_s / 60))
 
 
-def render_detail(ts: TorrentState, progress: float | None = None,
-                  note: str = "") -> str:
+def render_detail(ts: TorrentState, progress: float | None = None, note: str = "") -> str:
     """Per-torrent detail message (edited in place as state advances).
 
     `note` is an optional one-line extra (e.g. why a NEW row is waiting)
@@ -347,9 +343,7 @@ def render_detail(ts: TorrentState, progress: float | None = None,
     if ts.state == State.WAITING_INDEXER and ts.indexer_next_retry_at:
         _when = _as_aware_utc(ts.indexer_next_retry_at)
         when = _when.astimezone().strftime("%H:%M:%S") if _when else "?"
-        lines.append(
-            f"Indexer miss #{ts.indexer_attempts}; next retry at {when}"
-        )
+        lines.append(f"Indexer miss #{ts.indexer_attempts}; next retry at {when}")
     if ts.state == State.WAITING_INDEXER:
         lines.append(f"Start SSD download now: `{_now_command(full_hash)}`")
     elif ts.state == State.WAITING_DISK:
@@ -369,6 +363,7 @@ def render_detail(ts: TorrentState, progress: float | None = None,
         lines.append("rclone moving to remote…")
         if (ts.last_error or "").strip():
             from .logging_setup import sanitize_log_text as _san
+
             _reason = (ts.last_error or "").replace("\n", " ").replace("\r", " ")
             _reason = _san(_reason).strip()
             if len(_reason) > 160:
@@ -385,6 +380,7 @@ def render_detail(ts: TorrentState, progress: float | None = None,
         lines.append("✓ Seeded from fuse mount")
     elif ts.state == State.FAILED:
         from .logging_setup import sanitize_log_text as _san
+
         raw_err = (ts.last_error or "")[:200].replace("\n", " ").replace("\r", " ")
         err = _esc(_san(raw_err)) if raw_err else "no detail"
         lines.append(f"✗ Failed: {err}")
@@ -428,6 +424,7 @@ def _active_group_key(name: str, size_bytes: object) -> tuple[str, int]:
     """
     try:
         from .coordinator_content import normalize_content_name
+
         norm = normalize_content_name(name or "")
     except Exception:
         norm = (name or "").strip().lower()
@@ -446,9 +443,13 @@ def _active_note(ts: TorrentState, notes: dict[str, str] | None) -> str:
         return ""
 
 
-def _active_state_text(ts: TorrentState, progress: float | None, note: str,
-                       speed_bps: object = 0,
-                       move_progress: object = None) -> str:
+def _active_state_text(
+    ts: TorrentState,
+    progress: float | None,
+    note: str,
+    speed_bps: object = 0,
+    move_progress: object = None,
+) -> str:
     """One-line stage text for an active-tasks tracker row.
 
     DOWNLOADING rows additionally show bar + percent + rate + ETA when
@@ -504,8 +505,7 @@ def _active_state_text(ts: TorrentState, progress: float | None, note: str,
             _mp_pct = float(getattr(move_progress, "percent", 0.0) or 0.0)
             _mp_spd = int(getattr(move_progress, "speed_bps", 0) or 0)
             _mp_eta = int(getattr(move_progress, "eta_seconds", 0) or 0)
-            _mp_age = time.monotonic() - float(
-                getattr(move_progress, "updated_at", 0.0) or 0.0)
+            _mp_age = time.monotonic() - float(getattr(move_progress, "updated_at", 0.0) or 0.0)
             _mp_fresh = 0.0 <= _mp_age < 120.0
         except Exception:
             _mp_pct, _mp_spd, _mp_eta, _mp_fresh = 0.0, 0, 0, False
@@ -517,8 +517,7 @@ def _active_state_text(ts: TorrentState, progress: float | None, note: str,
             _mp_eta_h = _eta_human(_mp_eta)
             if _mp_eta_h:
                 _mp_parts.append(f"ETA {_mp_eta_h}")
-            state_text += " · " + " · ".join(
-                [p for p in _mp_parts if p])
+            state_text += " · " + " · ".join([p for p in _mp_parts if p])
         if (ts.last_error or "").strip():
             state_text += " · retrying"
     elif ts.state == State.RE_ADDING:
@@ -534,12 +533,14 @@ def _active_state_text(ts: TorrentState, progress: float | None, note: str,
         # timer/election-based, not FIFO), but the timer is exact.
         try:
             _retry_s = _retry_in_future_seconds(ts.indexer_next_retry_at)
-            _retry = (f" · retry in {max(1, round(_retry_s / 60))}m"
-                      if _retry_s else "")
+            _retry = f" · retry in {max(1, round(_retry_s / 60))}m" if _retry_s else ""
         except Exception:
             _retry = ""
-        state_text = (f"⏳ {_esc(note)}{_retry}" if note
-                      else f"⏳ Wait indexer miss #{ts.indexer_attempts}{_retry}")
+        state_text = (
+            f"⏳ {_esc(note)}{_retry}"
+            if note
+            else f"⏳ Wait indexer miss #{ts.indexer_attempts}{_retry}"
+        )
     elif ts.state == State.WAITING_DISK:
         state_text = "⏳ Wait SSD space"
     elif ts.state == State.DONE:
@@ -571,8 +572,7 @@ def _group_active_items(
             _name0, _, _ = _row_text_bits(_ts)
         except Exception:
             _name0 = getattr(_ts, "source_name", "") or ""
-        _key = _active_group_key(
-            _name0, getattr(_ts, "total_bytes", 0))
+        _key = _active_group_key(_name0, getattr(_ts, "total_bytes", 0))
         if _key not in by_key:
             by_key[_key] = []
             order.append(_key)
@@ -593,8 +593,7 @@ def _live_group_by_gid(
         gid = (gid or "").strip().lower()
         if not gid:
             return None
-        for (_key, _members) in _group_active_items(
-                [(_r, None) for _r in rows or []]):
+        for _key, _members in _group_active_items([(_r, None) for _r in rows or []]):
             if _key and _group_gid(_key) == gid:
                 return _key, [_ts for (_ts, _) in _members]
         return None
@@ -617,8 +616,7 @@ def _member_hash(ts: TorrentState) -> str:
 def _member_domain(ts: TorrentState) -> str:
     """Full tracker host for labels, "" when unknown."""
     try:
-        return (_tracker_domain(ts.source_announce_url)
-                or _tracker_domain(ts.source_tracker) or "")
+        return _tracker_domain(ts.source_announce_url) or _tracker_domain(ts.source_tracker) or ""
     except Exception:
         return ""
 
@@ -684,8 +682,7 @@ def _group_gid(key: tuple[str, int]) -> str:
 def _pick_member_label(ts: TorrentState, short_fallback: str = "") -> str:
     """Short tracker label for a member-choice button."""
     try:
-        return (_short_tracker_label(_member_domain(ts))
-                or short_fallback or "?")
+        return _short_tracker_label(_member_domain(ts)) or short_fallback or "?"
     except Exception:
         return short_fallback or "?"
 
@@ -706,10 +703,8 @@ def _now_eligible_hashes(members, notes: dict | None = None) -> list[str]:
                 out.append(_h)
                 continue
             try:
-                _note = (notes or {}).get(_h, "") if isinstance(
-                    notes, dict) else ""
-                if getattr(_ts, "state", None) == State.NEW \
-                        and _is_grace_note_for_prefer(_note):
+                _note = (notes or {}).get(_h, "") if isinstance(notes, dict) else ""
+                if getattr(_ts, "state", None) == State.NEW and _is_grace_note_for_prefer(_note):
                     out.append(_h)
             except Exception:
                 continue
@@ -827,22 +822,20 @@ def render_active(
         # 2. Display-only tracker lines, no indent: the ▸ glyph plus the
         # blank line between groups already carries the hierarchy, and
         # leading spaces only push long statuses into a wrap.
-        for (ts, progress) in members:
-            domain_full = (_tracker_domain(ts.source_announce_url)
-                           or _tracker_domain(ts.source_tracker))
+        for ts, progress in members:
+            domain_full = _tracker_domain(ts.source_announce_url) or _tracker_domain(
+                ts.source_tracker
+            )
             _note = _active_note(ts, notes)
             try:
-                _spd = (speeds or {}).get(
-                    (ts.source_infohash or "").lower(), 0)
+                _spd = (speeds or {}).get((ts.source_infohash or "").lower(), 0)
             except Exception:
                 _spd = 0
             try:
-                _mp = (move_progress or {}).get(
-                    (ts.source_infohash or "").lower())
+                _mp = (move_progress or {}).get((ts.source_infohash or "").lower())
             except Exception:
                 _mp = None
-            state_text = _active_state_text(ts, progress, _note, _spd,
-                                            move_progress=_mp)
+            state_text = _active_state_text(ts, progress, _note, _spd, move_progress=_mp)
             if domain_full:
                 lines.append(f"▸ {_esc(domain_full)} {state_text}")
             else:

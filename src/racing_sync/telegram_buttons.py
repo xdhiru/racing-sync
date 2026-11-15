@@ -40,8 +40,8 @@ def check_button(label: object, data: object) -> tuple[str, str]:
     size = len(data.encode("utf-8"))
     if size > MAX_CALLBACK_BYTES:
         raise ValueError(
-            f"button data exceeds {MAX_CALLBACK_BYTES} bytes "
-            f"({size} bytes): {data[:60]!r}…")
+            f"button data exceeds {MAX_CALLBACK_BYTES} bytes ({size} bytes): {data[:60]!r}…"
+        )
     return text, data
 
 
@@ -66,8 +66,7 @@ class ButtonMaker:
             self._rows.append([])
         return self
 
-    def extend(
-            self, rows: list[list[tuple[str, str]]] | tuple) -> ButtonMaker:
+    def extend(self, rows: list[list[tuple[str, str]]] | tuple) -> ButtonMaker:
         """Append legacy ``(label, data)`` rows, validated each."""
         for row in rows or ():
             for label, data in row or ():
@@ -76,8 +75,7 @@ class ButtonMaker:
         return self
 
     @classmethod
-    def from_rows(
-            cls, rows: list[list[tuple[str, str]]] | tuple) -> ButtonMaker:
+    def from_rows(cls, rows: list[list[tuple[str, str]]] | tuple) -> ButtonMaker:
         """Build from legacy rows (validates eagerly)."""
         return cls().extend(rows)
 
@@ -89,11 +87,16 @@ class ButtonMaker:
         """Render to :class:`InlineKeyboardMarkup` (labels truncated)."""
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(label[:MAX_LABEL_CHARS], callback_data=data)
-             for (label, data) in row]
-            for row in self._rows if row
-        ])
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(label[:MAX_LABEL_CHARS], callback_data=data)
+                    for (label, data) in row
+                ]
+                for row in self._rows
+                if row
+            ]
+        )
 
     def __len__(self) -> int:
         return sum(len(row) for row in self._rows)
@@ -121,8 +124,7 @@ def validate_rows(rows: list | tuple | Any) -> list[list[tuple[str, str]]]:
                     log.warning("dropping invalid button: %s", e)
                     continue
                 except Exception as e:  # noqa: BLE001
-                    log.warning("dropping malformed button pair %r: %s",
-                                pair, e)
+                    log.warning("dropping malformed button pair %r: %s", pair, e)
                     continue
                 line.append((label[:MAX_LABEL_CHARS], data))
             if line:

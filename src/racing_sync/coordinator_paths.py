@@ -108,6 +108,7 @@ def fuse_stat_cached(path: Path | str) -> tuple[bool, int]:
     try:
         st = os.stat(key)
         import stat as _stat_mod
+
         if _stat_mod.S_ISREG(st.st_mode):
             # Regular file: existence + size. Anything else (dirs, the
             # mount itself): existence only (size -1 never satisfies a
@@ -124,8 +125,7 @@ def fuse_stat_cached(path: Path | str) -> tuple[bool, int]:
             _fuse_stat_cache[key] = (now, found[0], found[1])
             if len(_fuse_stat_cache) > _FUSE_STAT_CAP:
                 cutoff = now - FUSE_STAT_TTL_S
-                for k in [k for k, v in _fuse_stat_cache.items()
-                          if v[0] < cutoff]:
+                for k in [k for k, v in _fuse_stat_cache.items() if v[0] < cutoff]:
                     _fuse_stat_cache.pop(k, None)
                 while len(_fuse_stat_cache) > _FUSE_STAT_CAP:
                     _fuse_stat_cache.pop(next(iter(_fuse_stat_cache)), None)
@@ -182,6 +182,12 @@ def left_on_disk_many(src_dir: Path, names) -> list[str]:
         return list(names or [])
 
 
-__all__ = ["_safe_ssd_join", "_watch_cross_seed_dir", "fuse_stat_cached",
-           "fuse_stat_invalidate", "FUSE_STAT_TTL_S", "_left_on_disk",
-           "left_on_disk_many"]
+__all__ = [
+    "_safe_ssd_join",
+    "_watch_cross_seed_dir",
+    "fuse_stat_cached",
+    "fuse_stat_invalidate",
+    "FUSE_STAT_TTL_S",
+    "_left_on_disk",
+    "left_on_disk_many",
+]

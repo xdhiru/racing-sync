@@ -58,16 +58,18 @@ async def test_vanished_source_grants_fresh_window(tmp_path):
         coord = make_coordinator()
         coord.cfg = _cfg()
         coord.store = store
-        _old = (dt.datetime.now(dt.timezone.utc)
-                - dt.timedelta(seconds=86400 + 60))
+        _old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=86400 + 60)
         for h, reason, final in (
             ("a" * 40, "source vanished from VPS1", State.WAITING_INDEXER),
             ("b" * 40, "indexer miss", State.FAILED),
         ):
             ts = TorrentState(
-                source_infohash=h, source_name="Twin",
+                source_infohash=h,
+                source_name="Twin",
                 state=State.WAITING_INDEXER,
-                indexer_first_queried_at=_old, indexer_attempts=40)
+                indexer_first_queried_at=_old,
+                indexer_attempts=40,
+            )
             store.upsert(ts)
             coord._park_for_indexer_retry(store.get(h), reason=reason)
             row = store.get(h)
@@ -90,10 +92,8 @@ async def test_public_retry_rotates_verbosity(tmp_path, caplog):
     try:
         coord = make_coordinator()
         coord.store = store
-        store.upsert(TorrentState(source_infohash="p" * 40,
-                                  source_name="Pub", state=State.NEW))
-        with caplog.at_level(logging.INFO,
-                             logger="racing_sync.coordinator"):
+        store.upsert(TorrentState(source_infohash="p" * 40, source_name="Pub", state=State.NEW))
+        with caplog.at_level(logging.INFO, logger="racing_sync.coordinator"):
             for _ in range(4):
                 coord._park_for_public_retry(store.get("p" * 40))
         row = store.get("p" * 40)
@@ -147,7 +147,15 @@ async def test_list_source_torrents_caches_within_ttl():
     coord._source_torrents_cache = []
     coord._source_torrents_cached_at = 0.0
 
-    t1 = Torrent(hash="h1", name="Show.A", category="racing", save_path="", size_bytes=100, state="", progress=1.0)
+    t1 = Torrent(
+        hash="h1",
+        name="Show.A",
+        category="racing",
+        save_path="",
+        size_bytes=100,
+        state="",
+        progress=1.0,
+    )
     coord.source_client = AsyncMock()
     coord.source_client.list_torrents.return_value = [t1]
 
@@ -200,9 +208,16 @@ async def test_fetch_source_prefers_snapshot_on_deluge():
     from racing_sync.clients.abstract import Torrent
     from racing_sync.clients.deluge import DelugeClient
 
-    snap = Torrent(hash="d" * 40, name="Snap.Show", category="racing",
-                   save_path="/vps1", size_bytes=999, state="seeding",
-                   progress=1.0, trackers=["http://t/announce"])
+    snap = Torrent(
+        hash="d" * 40,
+        name="Snap.Show",
+        category="racing",
+        save_path="/vps1",
+        size_bytes=999,
+        state="seeding",
+        progress=1.0,
+        trackers=["http://t/announce"],
+    )
 
     # Deluge source: snapshot hit → zero RPC, miss counter cleared.
     coord = make_coordinator()
@@ -236,9 +251,16 @@ async def test_fetch_source_prefers_snapshot_on_deluge():
 
     # Non-Deluge source with a trackerless snapshot row: live RPC as
     # before (full tracker set needed for public detection).
-    bare = Torrent(hash="d" * 40, name="Snap.Show", category="racing",
-                   save_path="/vps1", size_bytes=999, state="seeding",
-                   progress=1.0, trackers=[])
+    bare = Torrent(
+        hash="d" * 40,
+        name="Snap.Show",
+        category="racing",
+        save_path="/vps1",
+        size_bytes=999,
+        state="seeding",
+        progress=1.0,
+        trackers=[],
+    )
     coord3 = make_coordinator()
     coord3.source_client = AsyncMock()
     coord3.source_client.get_torrent = AsyncMock(return_value=snap)
@@ -305,11 +327,17 @@ def _ssd_dest(entries):
             out = []
             for h, (progress, _blob) in entries.items():
                 if wanted is None or h in wanted:
-                    out.append(Torrent(
-                        hash=h, name="Hand.Added.mkv", category="",
-                        save_path="/ssd/Hand.Added.mkv", size_bytes=1000,
-                        state="seeding" if progress >= 1.0 else "downloading",
-                        progress=progress))
+                    out.append(
+                        Torrent(
+                            hash=h,
+                            name="Hand.Added.mkv",
+                            category="",
+                            save_path="/ssd/Hand.Added.mkv",
+                            size_bytes=1000,
+                            state="seeding" if progress >= 1.0 else "downloading",
+                            progress=progress,
+                        )
+                    )
             return out
 
         async def export_torrent(self, h):
@@ -333,8 +361,12 @@ async def test_do_waiting_indexer_adopts_complete_ssd_entry():
     coord.dest_client = _ssd_dest({h: (1.0, b"")})
     coord.transition = MagicMock(side_effect=lambda t, s, **k: setattr(t, "state", s))
 
-    ts = TorrentState(source_infohash=h, source_name="Hand.Added.mkv",
-                      total_bytes=1000, state=State.WAITING_INDEXER)
+    ts = TorrentState(
+        source_infohash=h,
+        source_name="Hand.Added.mkv",
+        total_bytes=1000,
+        state=State.WAITING_INDEXER,
+    )
     ts._blob = raw
     await coord._do_waiting_indexer(ts)
 
@@ -365,8 +397,12 @@ async def test_do_waiting_indexer_heals_blob_from_ssd_entry():
         coord.dest_client = dest
         coord.transition = MagicMock(side_effect=lambda t, s, **k: setattr(t, "state", s))
 
-        ts = TorrentState(source_infohash=h, source_name="Hand.Added.mkv",
-                          total_bytes=1000, state=State.WAITING_INDEXER)
+        ts = TorrentState(
+            source_infohash=h,
+            source_name="Hand.Added.mkv",
+            total_bytes=1000,
+            state=State.WAITING_INDEXER,
+        )
         store.upsert(ts)
         await coord._do_waiting_indexer(ts)
 
@@ -391,8 +427,12 @@ async def test_do_waiting_indexer_waits_on_downloading_ssd_entry():
     coord.dest_client = _ssd_dest({h: (0.5, raw)})
     coord.transition = MagicMock()
 
-    ts = TorrentState(source_infohash=h, source_name="Hand.Added.mkv",
-                      total_bytes=1000, state=State.WAITING_INDEXER)
+    ts = TorrentState(
+        source_infohash=h,
+        source_name="Hand.Added.mkv",
+        total_bytes=1000,
+        state=State.WAITING_INDEXER,
+    )
     await coord._do_waiting_indexer(ts)
 
     coord._pick_and_admit.assert_not_called()
@@ -417,8 +457,9 @@ async def test_vanished_parks_for_prowlarr_when_possible():
     coord.transition = MagicMock()
     coord._schedule_telegram_update = MagicMock()
 
-    ts = TorrentState(source_infohash="v" * 40, source_name="Gone.Show",
-                      total_bytes=500, state=State.NEW)
+    ts = TorrentState(
+        source_infohash="v" * 40, source_name="Gone.Show", total_bytes=500, state=State.NEW
+    )
     coord._source_miss_counts = {"v" * 40: 2}
     got = await coord._fetch_source_or_fail(ts)
     assert got is _SOURCE_GONE
@@ -437,8 +478,7 @@ async def test_vanished_fails_when_no_prowlarr_possible():
     coord.prowlarr = None
     coord.transition = MagicMock()
 
-    ts = TorrentState(source_infohash="w" * 40, source_name="Gone.Show",
-                      state=State.NEW)
+    ts = TorrentState(source_infohash="w" * 40, source_name="Gone.Show", state=State.NEW)
     coord._source_miss_counts = {"w" * 40: 2}
     assert await coord._fetch_source_or_fail(ts) is None
     coord.transition.assert_called_once_with(
@@ -463,10 +503,13 @@ async def test_do_new_pseudo_picks_on_vanish():
     coord._pick_and_admit = AsyncMock()
     coord._list_source_torrents = AsyncMock(return_value=[])
 
-    ts = TorrentState(source_infohash="x" * 40, source_name="Gone.Show",
-                      total_bytes=500,
-                      source_announce_url="https://t.example/announce",
-                      state=State.NEW)
+    ts = TorrentState(
+        source_infohash="x" * 40,
+        source_name="Gone.Show",
+        total_bytes=500,
+        source_announce_url="https://t.example/announce",
+        state=State.NEW,
+    )
     coord._source_miss_counts = {"x" * 40: 2}
     await coord._do_new(ts)
     assert coord._pick_and_admit.await_count == 1
@@ -514,9 +557,17 @@ async def test_do_re_add_accepts_when_dest_client_returns_fails_but_already_exis
     ts.cross_seed_infohash = "abc123456789"
     ts.cross_seed_blob = b"dummy"
 
-    coord.dest_client.add_torrent.return_value = AddResult(hash=None, accepted=False, detail="Fails.")
+    coord.dest_client.add_torrent.return_value = AddResult(
+        hash=None, accepted=False, detail="Fails."
+    )
     coord.dest_client.get_torrent.return_value = Torrent(
-        hash="abc123456789", name="Test", category="racing", save_path="/mnt/fuse", size_bytes=100, state="", progress=1.0
+        hash="abc123456789",
+        name="Test",
+        category="racing",
+        save_path="/mnt/fuse",
+        size_bytes=100,
+        state="",
+        progress=1.0,
     )
 
     await coord._do_re_add(ts)
@@ -661,6 +712,7 @@ async def test_loops_run_their_own_step_and_stop():
         await getattr(coord, loop_name)()
         assert calls == [1], loop_name
 
+
 @pytest.mark.anyio
 async def test_wait_disk_then_queue_transitions_to_queued_under_download_sem():
     import asyncio
@@ -678,6 +730,7 @@ async def test_wait_disk_then_queue_transitions_to_queued_under_download_sem():
 
     def fake_transition(target_ts, new_state):
         target_ts.state = new_state
+
     coord.transition.side_effect = fake_transition
 
     with patch("racing_sync.coordinator.ssd_has_room", return_value=True):
@@ -704,14 +757,23 @@ async def test_public_sftp_timeout_retried_once_then_succeeds(caplog):
     sftp.fetch_torrent = MagicMock(side_effect=[TimeoutError(), blob])
 
     torrent = Torrent(
-        hash="p" * 40, name="Public.Show.S01E01.mkv", category="",
-        save_path="", size_bytes=500, state="seeding", progress=1.0,
+        hash="p" * 40,
+        name="Public.Show.S01E01.mkv",
+        category="",
+        save_path="",
+        size_bytes=500,
+        state="seeding",
+        progress=1.0,
         trackers=["http://tracker.opentrackr.org/announce"],
     )
     with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
         dec = await pick_ssd_source_for_racing(
-            cfg=cfg, source_torrent=torrent, other_source_torrents=[],
-            prowlarr=None, sftp=sftp, source_client=AsyncMock(),
+            cfg=cfg,
+            source_torrent=torrent,
+            other_source_torrents=[],
+            prowlarr=None,
+            sftp=sftp,
+            source_client=AsyncMock(),
             attempt_prowlarr=True,
         )
     assert dec is not None
@@ -738,8 +800,13 @@ async def test_public_export_failure_parks_as_source_export_miss(caplog):
     cfg.dest.save_path = "/ssd"
 
     torrent = Torrent(
-        hash="p" * 40, name="Public.Show.S01E01.mkv", category="",
-        save_path="", size_bytes=500, state="seeding", progress=1.0,
+        hash="p" * 40,
+        name="Public.Show.S01E01.mkv",
+        category="",
+        save_path="",
+        size_bytes=500,
+        state="seeding",
+        progress=1.0,
         trackers=["http://tracker.opentrackr.org/announce"],
     )
     sftp = MagicMock()
@@ -790,8 +857,13 @@ async def test_waiting_indexer_retry_republishes_public_schedule(tmp_path: Path,
     cfg.dest.save_path = "/ssd"
 
     torrent = Torrent(
-        hash="p" * 40, name="Public.Show.S01E01.mkv", category="",
-        save_path="", size_bytes=500, state="seeding", progress=1.0,
+        hash="p" * 40,
+        name="Public.Show.S01E01.mkv",
+        category="",
+        save_path="",
+        size_bytes=500,
+        state="seeding",
+        progress=1.0,
         trackers=["http://tracker.opentrackr.org/announce"],
     )
     sftp = MagicMock()
@@ -811,16 +883,18 @@ async def test_waiting_indexer_retry_republishes_public_schedule(tmp_path: Path,
         coord._list_source_torrents = AsyncMock(return_value=[torrent])
         coord.dest_client = AsyncMock()
         coord.dest_client.list_torrents = AsyncMock(return_value=[])
-        coord.transition = MagicMock(
-            side_effect=lambda t, s, **k: setattr(t, "state", s))
+        coord.transition = MagicMock(side_effect=lambda t, s, **k: setattr(t, "state", s))
 
         now = dt.datetime.now(dt.timezone.utc)
         ts = TorrentState(
-            source_infohash="p" * 40, source_name="Public.Show.S01E01.mkv",
-            total_bytes=500, state=State.WAITING_INDEXER,
+            source_infohash="p" * 40,
+            source_name="Public.Show.S01E01.mkv",
+            total_bytes=500,
+            state=State.WAITING_INDEXER,
             indexer_first_queried_at=now - dt.timedelta(seconds=60),
             indexer_attempts=5,
-            indexer_next_retry_at=now - dt.timedelta(seconds=1))
+            indexer_next_retry_at=now - dt.timedelta(seconds=1),
+        )
         store.upsert(ts)
 
         with caplog.at_level(logging.INFO, logger="racing_sync.coordinator"):
@@ -847,17 +921,19 @@ async def test_public_export_miss_never_hits_max_age_failed(tmp_path: Path):
     from racing_sync.state import StateStore
 
     coord = make_coordinator()
-    coord.transition = MagicMock(
-        side_effect=lambda t, s, **k: setattr(t, "state", s))
+    coord.transition = MagicMock(side_effect=lambda t, s, **k: setattr(t, "state", s))
     store = StateStore(tmp_path / "s.db")
     coord.store = store
     try:
-        ts = TorrentState(source_infohash="p" * 40, source_name="Public.Show",
-                          state=State.NEW,
-                          public_export_first_attempted_at=(
-                              dt.datetime.now(dt.timezone.utc)
-                              - dt.timedelta(days=30)),
-                          public_export_attempts=100)
+        ts = TorrentState(
+            source_infohash="p" * 40,
+            source_name="Public.Show",
+            state=State.NEW,
+            public_export_first_attempted_at=(
+                dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
+            ),
+            public_export_attempts=100,
+        )
         coord._park_for_indexer_retry(ts, reason="source export miss")
 
         assert ts.state == State.WAITING_INDEXER
@@ -887,14 +963,20 @@ def test_list_public_retry_ready_only_elapsed(tmp_path: Path):
     try:
         now = dt.datetime.now(dt.timezone.utc)
         old = TorrentState(
-            source_infohash="o" * 40, state=State.WAITING_INDEXER,
-            public_export_next_retry_at=now - dt.timedelta(seconds=1))
+            source_infohash="o" * 40,
+            state=State.WAITING_INDEXER,
+            public_export_next_retry_at=now - dt.timedelta(seconds=1),
+        )
         future = TorrentState(
-            source_infohash="f" * 40, state=State.WAITING_INDEXER,
-            public_export_next_retry_at=now + dt.timedelta(hours=1))
+            source_infohash="f" * 40,
+            state=State.WAITING_INDEXER,
+            public_export_next_retry_at=now + dt.timedelta(hours=1),
+        )
         indexed = TorrentState(
-            source_infohash="i" * 40, state=State.WAITING_INDEXER,
-            indexer_next_retry_at=now - dt.timedelta(seconds=1))
+            source_infohash="i" * 40,
+            state=State.WAITING_INDEXER,
+            indexer_next_retry_at=now - dt.timedelta(seconds=1),
+        )
         for ts in (old, future, indexed):
             store.upsert(ts)
         ready = store.list_public_retry_ready()
@@ -904,6 +986,7 @@ def test_list_public_retry_ready_only_elapsed(tmp_path: Path):
 
 
 # ---- racing-torrent fallback (force_direct) ----
+
 
 def _pick_coord(**cross_seed_over):
     from unittest.mock import AsyncMock, MagicMock
@@ -934,8 +1017,13 @@ def _priv_st():
     from racing_sync.clients.abstract import Torrent
 
     return Torrent(
-        hash="d" * 40, name="Private.Show.S01E01.mkv", category="",
-        save_path="", size_bytes=1000, state="seeding", progress=1.0,
+        hash="d" * 40,
+        name="Private.Show.S01E01.mkv",
+        category="",
+        save_path="",
+        size_bytes=1000,
+        state="seeding",
+        progress=1.0,
         trackers=["https://alpha.cc/announce/xyz"],
     )
 
@@ -944,15 +1032,19 @@ def _decision():
     from racing_sync.coordinator_content import SourceDecision
 
     return SourceDecision(
-        torrent_bytes=b"blob", source_label="private-export-fallback",
-        name="Private.Show.S01E01.mkv", size_bytes=1000,
-        infohash="d" * 40, announce_url="https://alpha.cc/announce/xyz",
+        torrent_bytes=b"blob",
+        source_label="private-export-fallback",
+        name="Private.Show.S01E01.mkv",
+        size_bytes=1000,
+        infohash="d" * 40,
+        announce_url="https://alpha.cc/announce/xyz",
     )
 
 
 def _past_max_age(cfg):
     return dt.datetime.now(dt.timezone.utc) - dt.timedelta(
-        seconds=cfg.cross_seed.prowlarr_max_age_seconds + 10)
+        seconds=cfg.cross_seed.prowlarr_max_age_seconds + 10
+    )
 
 
 @pytest.mark.anyio
@@ -961,8 +1053,9 @@ async def test_pick_and_admit_force_direct_bypasses_prowlarr():
 
     coord = _pick_coord()
     ts = TorrentState(source_infohash="d" * 40, state=State.WAITING_INDEXER, force_direct=1)
-    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
-               new_callable=AsyncMock) as pick:
+    with patch(
+        "racing_sync.coordinator.pick_ssd_source_for_racing", new_callable=AsyncMock
+    ) as pick:
         pick.return_value = _decision()
         await coord._pick_and_admit(ts, _priv_st(), [])
     pick.assert_awaited_once()
@@ -980,16 +1073,15 @@ async def test_skipped_title_parks_public_schedule():
 
     coord = _pick_coord()
     coord.cfg.prowlarr.should_skip_title = MagicMock(return_value=True)
-    ts = TorrentState(source_infohash="d" * 40, source_name="Skipped.Show",
-                      state=State.NEW)
-    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
-               new_callable=AsyncMock) as pick:
+    ts = TorrentState(source_infohash="d" * 40, source_name="Skipped.Show", state=State.NEW)
+    with patch(
+        "racing_sync.coordinator.pick_ssd_source_for_racing", new_callable=AsyncMock
+    ) as pick:
         pick.return_value = None
         await coord._pick_and_admit(ts, _priv_st(), [])
     pick.assert_awaited_once()
     coord._park_for_indexer_retry.assert_called_once()
-    assert (coord._park_for_indexer_retry.call_args.kwargs["reason"]
-            == "source export miss")
+    assert coord._park_for_indexer_retry.call_args.kwargs["reason"] == "source export miss"
 
 
 @pytest.mark.anyio
@@ -1000,8 +1092,9 @@ async def test_pick_and_admit_first_miss_parks_despite_fallback_flag():
     coord = _pick_coord(fallback_to_racing_torrent_on_prowlarr_timeout=True)
     ts = TorrentState(source_infohash="d" * 40, state=State.WAITING_INDEXER)
     assert ts.indexer_first_queried_at is None
-    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
-               new_callable=AsyncMock) as pick:
+    with patch(
+        "racing_sync.coordinator.pick_ssd_source_for_racing", new_callable=AsyncMock
+    ) as pick:
         pick.return_value = None
         await coord._pick_and_admit(ts, _priv_st(), [])
     pick.assert_awaited_once()
@@ -1016,12 +1109,14 @@ async def test_pick_and_admit_timeout_falls_back_to_racing():
 
     coord = _pick_coord(fallback_to_racing_torrent_on_prowlarr_timeout=True)
     ts = TorrentState(
-        source_infohash="d" * 40, state=State.WAITING_INDEXER,
+        source_infohash="d" * 40,
+        state=State.WAITING_INDEXER,
         indexer_first_queried_at=_past_max_age(coord.cfg),
         indexer_attempts=40,
     )
-    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
-               new_callable=AsyncMock) as pick:
+    with patch(
+        "racing_sync.coordinator.pick_ssd_source_for_racing", new_callable=AsyncMock
+    ) as pick:
         pick.side_effect = [None, _decision()]
         await coord._pick_and_admit(ts, _priv_st(), [])
     assert pick.await_count == 2
@@ -1043,15 +1138,17 @@ async def test_pick_and_admit_timeout_resets_public_clock():
     coord = _pick_coord(fallback_to_racing_torrent_on_prowlarr_timeout=True)
     _now = dt.datetime.now(dt.timezone.utc)
     ts = TorrentState(
-        source_infohash="d" * 40, state=State.WAITING_INDEXER,
+        source_infohash="d" * 40,
+        state=State.WAITING_INDEXER,
         indexer_first_queried_at=_past_max_age(coord.cfg),
         indexer_attempts=40,
         public_export_first_attempted_at=_now,
         public_export_attempts=5,
         public_export_next_retry_at=_now,
     )
-    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
-               new_callable=AsyncMock) as pick:
+    with patch(
+        "racing_sync.coordinator.pick_ssd_source_for_racing", new_callable=AsyncMock
+    ) as pick:
         pick.side_effect = [None, _decision()]
         await coord._pick_and_admit(ts, _priv_st(), [])
     assert ts.force_direct == 1
@@ -1066,12 +1163,14 @@ async def test_pick_and_admit_timeout_without_flag_parks():
 
     coord = _pick_coord()
     ts = TorrentState(
-        source_infohash="d" * 40, state=State.WAITING_INDEXER,
+        source_infohash="d" * 40,
+        state=State.WAITING_INDEXER,
         indexer_first_queried_at=_past_max_age(coord.cfg),
         indexer_attempts=40,
     )
-    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
-               new_callable=AsyncMock) as pick:
+    with patch(
+        "racing_sync.coordinator.pick_ssd_source_for_racing", new_callable=AsyncMock
+    ) as pick:
         pick.return_value = None
         await coord._pick_and_admit(ts, _priv_st(), [])
     pick.assert_awaited_once()
@@ -1087,16 +1186,23 @@ async def test_pick_and_admit_timeout_skips_public_groups():
 
     coord = _pick_coord(fallback_to_racing_torrent_on_prowlarr_timeout=True)
     pub = Torrent(
-        hash="e" * 40, name="Public.Show.mkv", category="",
-        save_path="", size_bytes=500, state="seeding", progress=1.0,
+        hash="e" * 40,
+        name="Public.Show.mkv",
+        category="",
+        save_path="",
+        size_bytes=500,
+        state="seeding",
+        progress=1.0,
         trackers=["http://tracker.opentrackr.org/announce"],
     )
     ts = TorrentState(
-        source_infohash="e" * 40, state=State.WAITING_INDEXER,
+        source_infohash="e" * 40,
+        state=State.WAITING_INDEXER,
         indexer_first_queried_at=_past_max_age(coord.cfg),
     )
-    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
-               new_callable=AsyncMock) as pick:
+    with patch(
+        "racing_sync.coordinator.pick_ssd_source_for_racing", new_callable=AsyncMock
+    ) as pick:
         pick.return_value = None
         await coord._pick_and_admit(ts, pub, [])
     pick.assert_awaited_once()
@@ -1104,20 +1210,21 @@ async def test_pick_and_admit_timeout_skips_public_groups():
     assert ts.force_direct == 0
 
 
-def _operator_blob(name="Op.Supplied.1080p", size=1000,
-                   announce="https://alpha.cc/announce/xyz"):
+def _operator_blob(name="Op.Supplied.1080p", size=1000, announce="https://alpha.cc/announce/xyz"):
     """Same-infohash .torrent bytes as /add would attach to a tracked row."""
     from racing_sync.watchdir import _bencode, _bencoded_info_hash
 
-    raw = _bencode({
-        b"announce": announce.encode(),
-        b"info": {
-            b"name": name.encode(),
-            b"length": size,
-            b"piece length": 16384,
-            b"pieces": b"0" * 20,
-        },
-    })
+    raw = _bencode(
+        {
+            b"announce": announce.encode(),
+            b"info": {
+                b"name": name.encode(),
+                b"length": size,
+                b"piece length": 16384,
+                b"pieces": b"0" * 20,
+            },
+        }
+    )
     raw = bytes(raw)
     h, _, _, _ = _bencoded_info_hash(raw)
     return raw, h
@@ -1142,10 +1249,13 @@ async def test_pick_and_admit_uses_operator_supplied_bytes(tmp_path):
         coord = _pick_coord()
         raw, h = _operator_blob()
         ts = TorrentState(
-            source_infohash=h, source_name="Op.Supplied.1080p", total_bytes=1000,
+            source_infohash=h,
+            source_name="Op.Supplied.1080p",
+            total_bytes=1000,
             source_announce_url="https://alpha.cc/announce/xyz",
             source_tracker="https://alpha.cc/announce/xyz",
-            state=State.WAITING_INDEXER, force_direct=1,
+            state=State.WAITING_INDEXER,
+            force_direct=1,
             cross_seed_blob=raw,
         )
         store.upsert(ts)
@@ -1154,8 +1264,9 @@ async def test_pick_and_admit_uses_operator_supplied_bytes(tmp_path):
         ts._blob = None
         ts.cross_seed_blob = None
         coord.store = store
-        with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
-                   new_callable=AsyncMock) as pick:
+        with patch(
+            "racing_sync.coordinator.pick_ssd_source_for_racing", new_callable=AsyncMock
+        ) as pick:
             pick.return_value = None
             await coord._pick_and_admit(ts, _priv_st(), [])
         coord._park_for_indexer_retry.assert_not_called()
@@ -1175,13 +1286,17 @@ async def test_pick_and_admit_ignores_mismatched_blob():
     coord = _pick_coord()
     raw, _h = _operator_blob()
     ts = TorrentState(
-        source_infohash="f" * 40, source_name="Other.Show",
-        total_bytes=1000, state=State.WAITING_INDEXER, force_direct=1,
+        source_infohash="f" * 40,
+        source_name="Other.Show",
+        total_bytes=1000,
+        state=State.WAITING_INDEXER,
+        force_direct=1,
         cross_seed_blob=raw,
     )
     ts._blob = raw
-    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
-               new_callable=AsyncMock) as pick:
+    with patch(
+        "racing_sync.coordinator.pick_ssd_source_for_racing", new_callable=AsyncMock
+    ) as pick:
         pick.return_value = None
         await coord._pick_and_admit(ts, _priv_st(), [])
     coord._park_for_indexer_retry.assert_called_once()
@@ -1202,13 +1317,22 @@ async def test_private_fallback_retries_sftp_timeout_once():
     sftp = MagicMock()
     sftp.fetch_torrent = MagicMock(side_effect=[TimeoutError(), b"direct-blob"])
     t_priv = Torrent(
-        hash="f" * 40, name="Priv.Retry", category="",
-        save_path="", size_bytes=500, state="seeding", progress=1.0,
+        hash="f" * 40,
+        name="Priv.Retry",
+        category="",
+        save_path="",
+        size_bytes=500,
+        state="seeding",
+        progress=1.0,
         trackers=["https://alpha.cc/announce"],
     )
     dec = await pick_ssd_source_for_racing(
-        cfg=cfg, source_torrent=t_priv, other_source_torrents=[],
-        prowlarr=None, sftp=sftp, source_client=AsyncMock(),
+        cfg=cfg,
+        source_torrent=t_priv,
+        other_source_torrents=[],
+        prowlarr=None,
+        sftp=sftp,
+        source_client=AsyncMock(),
         attempt_prowlarr=False,
     )
     assert dec is not None
@@ -1231,13 +1355,22 @@ async def test_private_fallback_double_timeout_falls_to_export():
     source_client = AsyncMock()
     source_client.export_torrent = AsyncMock(return_value=b"export-blob")
     t_priv = Torrent(
-        hash="f" * 40, name="Priv.Retry", category="",
-        save_path="", size_bytes=500, state="seeding", progress=1.0,
+        hash="f" * 40,
+        name="Priv.Retry",
+        category="",
+        save_path="",
+        size_bytes=500,
+        state="seeding",
+        progress=1.0,
         trackers=["https://alpha.cc/announce"],
     )
     dec = await pick_ssd_source_for_racing(
-        cfg=cfg, source_torrent=t_priv, other_source_torrents=[],
-        prowlarr=None, sftp=sftp, source_client=source_client,
+        cfg=cfg,
+        source_torrent=t_priv,
+        other_source_torrents=[],
+        prowlarr=None,
+        sftp=sftp,
+        source_client=source_client,
         attempt_prowlarr=False,
     )
     assert dec is not None
@@ -1255,12 +1388,14 @@ async def test_fallback_trip_opens_fresh_direct_window():
     # Real park (not mocked) so the max-age give-up logic actually runs.
     del coord._park_for_indexer_retry
     ts = TorrentState(
-        source_infohash="d" * 40, state=State.WAITING_INDEXER,
+        source_infohash="d" * 40,
+        state=State.WAITING_INDEXER,
         indexer_first_queried_at=_past_max_age(coord.cfg),
         indexer_attempts=40,
     )
-    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
-               new_callable=AsyncMock) as pick:
+    with patch(
+        "racing_sync.coordinator.pick_ssd_source_for_racing", new_callable=AsyncMock
+    ) as pick:
         pick.return_value = None  # prowlarr miss AND direct fetch miss
         await coord._pick_and_admit(ts, _priv_st(), [])
     # Fallback tripped (flag set, clock restarted) and the row parked for
@@ -1269,8 +1404,7 @@ async def test_fallback_trip_opens_fresh_direct_window():
     assert ts.state == State.WAITING_INDEXER
     assert ts.indexer_next_retry_at is not None
     assert ts.indexer_next_retry_at > dt.datetime.now(dt.timezone.utc)
-    fresh_elapsed = (dt.datetime.now(dt.timezone.utc)
-                     - ts.indexer_first_queried_at).total_seconds()
+    fresh_elapsed = (dt.datetime.now(dt.timezone.utc) - ts.indexer_first_queried_at).total_seconds()
     assert fresh_elapsed < 60
 
 
@@ -1311,8 +1445,13 @@ async def test_reset_empty_db_rediscovers_waiting_row_from_zero(tmp_path: Path):
     coord._sweep_manual_fuse_adoptions = AsyncMock()
     coord._last_source_log_ts = time.monotonic()
     t = Torrent(
-        hash="f" * 40, name="Reset.Show.S01E01", category="",
-        save_path="", size_bytes=1000, state="seeding", progress=1.0,
+        hash="f" * 40,
+        name="Reset.Show.S01E01",
+        category="",
+        save_path="",
+        size_bytes=1000,
+        state="seeding",
+        progress=1.0,
         trackers=["https://alpha.cc/announce/xyz"],
     )
     coord._list_source_torrents = AsyncMock(return_value=[t])
@@ -1333,15 +1472,17 @@ async def test_reset_empty_db_rediscovers_waiting_row_from_zero(tmp_path: Path):
 def _sample_blob(name: str, size: int, announce: str, piece_length: int = 16384) -> bytes:
     from racing_sync.watchdir import _bencode
 
-    return _bencode({
-        b"announce": announce.encode(),
-        b"info": {
-            b"name": name.encode(),
-            b"length": size,
-            b"piece length": piece_length,
-            b"pieces": b"12345678901234567890",
-        },
-    })
+    return _bencode(
+        {
+            b"announce": announce.encode(),
+            b"info": {
+                b"name": name.encode(),
+                b"length": size,
+                b"piece length": piece_length,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
 
 
 @pytest.mark.anyio
@@ -1365,13 +1506,17 @@ async def test_pick_and_admit_all_remote_skips_budget(tmp_path: Path):
     coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-u"
     coord._ssd_try_reserve = AsyncMock()
     decision = SourceDecision(
-        torrent_bytes=blob, source_label="private-export-fallback",
-        name="Admit.Movie.1080p.mkv", size_bytes=2000,
-        infohash="d" * 40, announce_url="https://alpha.cc/announce/xyz",
+        torrent_bytes=blob,
+        source_label="private-export-fallback",
+        name="Admit.Movie.1080p.mkv",
+        size_bytes=2000,
+        infohash="d" * 40,
+        announce_url="https://alpha.cc/announce/xyz",
     )
     ts = TorrentState(source_infohash="d" * 40, state=State.NEW)
-    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
-               new_callable=AsyncMock) as pick:
+    with patch(
+        "racing_sync.coordinator.pick_ssd_source_for_racing", new_callable=AsyncMock
+    ) as pick:
         pick.return_value = decision
         await coord._pick_and_admit(ts, _priv_st(), [])
     assert ts.state == State.QUEUED
@@ -1406,6 +1551,7 @@ def test_blob_fully_remote_three_valued(tmp_path: Path):
     # production reads through rclone's even coarser dir-cache, but tests
     # assert instantaneous visibility).
     from racing_sync.coordinator_paths import fuse_stat_invalidate
+
     (fuse_dir / "Remote.Movie.1080p.mkv").write_bytes(b"m" * 2000)
     fuse_stat_invalidate(fuse_dir / "Remote.Movie.1080p.mkv")
     assert asyncio.run(_check(raw)) is True
@@ -1415,19 +1561,24 @@ def test_fallback_config_validation():
     from racing_sync.config import CrossSeedConfig
 
     assert CrossSeedConfig().fallback_to_racing_torrent_on_prowlarr_timeout is False
-    CrossSeedConfig(fallback_to_racing_torrent_on_prowlarr_timeout=True,
-                    allow_ssh_export=True)
+    CrossSeedConfig(fallback_to_racing_torrent_on_prowlarr_timeout=True, allow_ssh_export=True)
     with pytest.raises(ValueError, match="allow_ssh_export"):
-        CrossSeedConfig(fallback_to_racing_torrent_on_prowlarr_timeout=True,
-                        allow_ssh_export=False)
+        CrossSeedConfig(fallback_to_racing_torrent_on_prowlarr_timeout=True, allow_ssh_export=False)
 
 
 def _grace_st(infohash: str, tracker: str):
     from racing_sync.clients.abstract import Torrent
 
-    return Torrent(hash=infohash, name="Grace.Show.S01E01", category="",
-                   save_path="", size_bytes=100, state="seeding",
-                   progress=1.0, trackers=[tracker])
+    return Torrent(
+        hash=infohash,
+        name="Grace.Show.S01E01",
+        category="",
+        save_path="",
+        size_bytes=100,
+        state="seeding",
+        progress=1.0,
+        trackers=[tracker],
+    )
 
 
 def _grace_racing_coord():
@@ -1450,10 +1601,13 @@ def test_prefer_racing_row_starts_held_row(tmp_path):
     try:
         coord = _grace_racing_coord()
         coord.store = store
-        ts = TorrentState(source_infohash="f" * 40, source_name="Grace.Show",
-                          source_announce_url="https://unknown.example/announce",
-                          source_tracker="https://unknown.example/announce",
-                          state=State.NEW)
+        ts = TorrentState(
+            source_infohash="f" * 40,
+            source_name="Grace.Show",
+            source_announce_url="https://unknown.example/announce",
+            source_tracker="https://unknown.example/announce",
+            state=State.NEW,
+        )
         store.upsert(ts)
         row, msg = coord.prefer_grace_row("f" * 40)
         assert row is not None and row.source_infohash == "f" * 40
@@ -1472,23 +1626,29 @@ def test_prefer_racing_row_refusals(tmp_path):
         coord = _grace_racing_coord()
         coord.store = store
         pref = TorrentState(
-            source_infohash="a" * 40, source_name="Pref.Show",
+            source_infohash="a" * 40,
+            source_name="Pref.Show",
             source_announce_url="https://dl-indexer.example.net/announce",
-            state=State.NEW)
+            state=State.NEW,
+        )
         store.upsert(pref)
         row, msg = coord.prefer_grace_row("a" * 40)
         assert row is None and "already from a download indexer" in msg
         pub = TorrentState(
-            source_infohash="b" * 40, source_name="Pub.Show",
+            source_infohash="b" * 40,
+            source_name="Pub.Show",
             source_announce_url="udp://tracker.opentrackr.org:1337/announce",
-            state=State.NEW)
+            state=State.NEW,
+        )
         store.upsert(pub)
         row2, msg2 = coord.prefer_grace_row("b" * 40)
         assert row2 is None and "is public" in msg2
         old = TorrentState(
-            source_infohash="c" * 40, source_name="Old.Show",
+            source_infohash="c" * 40,
+            source_name="Old.Show",
             source_announce_url="https://unknown.example/announce",
-            state=State.NEW)
+            state=State.NEW,
+        )
         import datetime as dt
 
         old.created_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)
@@ -1508,8 +1668,7 @@ async def test_pick_and_admit_holds_nonpreferred_direct():
     coord.cfg.prowlarr.download_indexers = [MagicMock()]
     coord.cfg.prowlarr.is_download_indexer = MagicMock(return_value=False)
     coord.prowlarr = None
-    ts = TorrentState(source_infohash="e" * 40, source_name="Grace.Show",
-                      state=State.NEW)
+    ts = TorrentState(source_infohash="e" * 40, source_name="Grace.Show", state=State.NEW)
     await coord._pick_and_admit(ts, _grace_st("e" * 40, "https://unknown.example/announce"), [])
     assert ts.state == State.NEW
     coord.transition.assert_not_called()
@@ -1530,18 +1689,20 @@ async def test_pick_and_admit_throttles_held_repick():
     coord.cfg.prowlarr.is_download_indexer = MagicMock(return_value=False)
     coord.prowlarr = None
     decision = SourceDecision(
-        torrent_bytes=b"x", source_label="private-export-fallback",
-        name="Grace.Show", size_bytes=100, infohash="e" * 40,
-        preferred=False)
-    ts = TorrentState(source_infohash="e" * 40, source_name="Grace.Show",
-                      state=State.NEW)
-    with patch("racing_sync.coordinator.pick_ssd_source_for_racing",
-               AsyncMock(return_value=decision)) as mock_pick:
-        await coord._pick_and_admit(
-            ts, _grace_st("e" * 40, "https://unknown.example/announce"), [])
+        torrent_bytes=b"x",
+        source_label="private-export-fallback",
+        name="Grace.Show",
+        size_bytes=100,
+        infohash="e" * 40,
+        preferred=False,
+    )
+    ts = TorrentState(source_infohash="e" * 40, source_name="Grace.Show", state=State.NEW)
+    with patch(
+        "racing_sync.coordinator.pick_ssd_source_for_racing", AsyncMock(return_value=decision)
+    ) as mock_pick:
+        await coord._pick_and_admit(ts, _grace_st("e" * 40, "https://unknown.example/announce"), [])
         assert ts.state == State.NEW
-        await coord._pick_and_admit(
-            ts, _grace_st("e" * 40, "https://unknown.example/announce"), [])
+        await coord._pick_and_admit(ts, _grace_st("e" * 40, "https://unknown.example/announce"), [])
         assert ts.state == State.NEW
         assert mock_pick.await_count == 1
 
@@ -1556,18 +1717,17 @@ async def test_pick_and_admit_exemption_and_preferred_proceed():
     coord.prowlarr = None
     # Exempted non-preferred direct -> admits (exemption consumed).
     coord._grace_exempt = {"e" * 40: 1.0}
-    ts = TorrentState(source_infohash="e" * 40, source_name="Grace.Show",
-                      state=State.NEW)
+    ts = TorrentState(source_infohash="e" * 40, source_name="Grace.Show", state=State.NEW)
     await coord._pick_and_admit(ts, _grace_st("e" * 40, "https://unknown.example/announce"), [])
     assert ts.state == State.QUEUED
     assert coord._grace_exempt == {}
     # Preferred direct (visible download-indexer copy) -> admits outright.
     coord.cfg.prowlarr.is_download_indexer = lambda url: "dl-indexer" in (url or "")
-    ts2 = TorrentState(source_infohash="g" * 40, source_name="Grace.Show",
-                       state=State.NEW)
+    ts2 = TorrentState(source_infohash="g" * 40, source_name="Grace.Show", state=State.NEW)
     other = _grace_st("h" * 40, "https://dl-indexer.example.net/announce")
     await coord._pick_and_admit(
-        ts2, _grace_st("g" * 40, "https://unknown.example/announce"), [other])
+        ts2, _grace_st("g" * 40, "https://unknown.example/announce"), [other]
+    )
     assert ts2.state == State.QUEUED
     assert ts2.cross_seed_infohash == "h" * 40
 
@@ -1580,34 +1740,54 @@ async def test_picker_direct_fallback_prefers_download_indexer_copy():
     from racing_sync.coordinator_picker import pick_ssd_source_for_racing
 
     pcfg = ProwlarrConfig(
-        enabled=False, base_url="http://127.0.0.1:9696", api_key="secret",
-        download_indexers=[DownloadIndexerConfig(
-            name="Preferred (API)", announce_substrings=["preferred"])],
+        enabled=False,
+        base_url="http://127.0.0.1:9696",
+        api_key="secret",
+        download_indexers=[
+            DownloadIndexerConfig(name="Preferred (API)", announce_substrings=["preferred"])
+        ],
     )
     cfg = MagicMock()
     cfg.prowlarr = pcfg
     cfg.cross_seed.allow_ssh_export = True
 
     def _t(h, tracker):
-        return Torrent(hash=h, name="Show", category="", save_path="",
-                       size_bytes=100, state="seeding", progress=1.0,
-                       trackers=[tracker])
+        return Torrent(
+            hash=h,
+            name="Show",
+            category="",
+            save_path="",
+            size_bytes=100,
+            state="seeding",
+            progress=1.0,
+            trackers=[tracker],
+        )
 
     st = _t("a" * 40, "https://unknown.example/announce")
     other = _t("b" * 40, "https://preferred.example.net/announce/xyz")
     sftp = MagicMock()
     sftp.fetch_torrent = MagicMock(return_value=b"d8:announce...")
     dec = await pick_ssd_source_for_racing(
-        cfg=cfg, source_torrent=st, other_source_torrents=[other],
-        prowlarr=None, sftp=sftp, source_client=MagicMock())
+        cfg=cfg,
+        source_torrent=st,
+        other_source_torrents=[other],
+        prowlarr=None,
+        sftp=sftp,
+        source_client=MagicMock(),
+    )
     assert dec.infohash == "b" * 40
     sftp.fetch_torrent.assert_called_once_with("b" * 40)
 
     sftp2 = MagicMock()
     sftp2.fetch_torrent = MagicMock(return_value=b"d8:announce...")
     dec2 = await pick_ssd_source_for_racing(
-        cfg=cfg, source_torrent=st, other_source_torrents=[],
-        prowlarr=None, sftp=sftp2, source_client=MagicMock())
+        cfg=cfg,
+        source_torrent=st,
+        other_source_torrents=[],
+        prowlarr=None,
+        sftp=sftp2,
+        source_client=MagicMock(),
+    )
     assert dec2.infohash == "a" * 40
 
 
@@ -1619,37 +1799,47 @@ def _waiting_pair(tmp_path, *, leader_state, same_content=True):
     store = StateStore(tmp_path / "state.db")
     now = dt.datetime.now(dt.timezone.utc)
     waiter = TorrentState(
-        source_infohash="w" * 40, source_name="Twin.Show",
-        total_bytes=1000, state=State.WAITING_INDEXER,
+        source_infohash="w" * 40,
+        source_name="Twin.Show",
+        total_bytes=1000,
+        state=State.WAITING_INDEXER,
         indexer_attempts=3,
         indexer_first_queried_at=now - dt.timedelta(seconds=100),
-        indexer_next_retry_at=now - dt.timedelta(seconds=1))
+        indexer_next_retry_at=now - dt.timedelta(seconds=1),
+    )
     leader = TorrentState(
         source_infohash="l" * 40,
         source_name="Twin.Show" if same_content else "Other.Show",
-        total_bytes=1000, state=leader_state)
+        total_bytes=1000,
+        state=leader_state,
+    )
     store.upsert(waiter)
     store.upsert(leader)
     coord = make_coordinator()
     coord.cfg = _cfg()
     coord.store = store
-    st = Torrent(hash="w" * 40, name="Twin.Show", category="",
-                 save_path="", size_bytes=1000, state="seeding",
-                 progress=1.0, trackers=[])
+    st = Torrent(
+        hash="w" * 40,
+        name="Twin.Show",
+        category="",
+        save_path="",
+        size_bytes=1000,
+        state="seeding",
+        progress=1.0,
+        trackers=[],
+    )
     coord.source_client = AsyncMock()
     coord.source_client.get_torrent = AsyncMock(return_value=st)
     coord._adopt_manual_fuse_if_present = AsyncMock(return_value=False)
     coord._pick_and_admit = AsyncMock()
-    coord.transition = MagicMock(
-        side_effect=lambda t, s, **k: setattr(t, "state", s))
+    coord.transition = MagicMock(side_effect=lambda t, s, **k: setattr(t, "state", s))
     return coord, store, waiter
 
 
 @pytest.mark.anyio
 async def test_waiting_indexer_defers_to_inflight_same_content(tmp_path):
     """Sibling DOWNLOADING: skip the Prowlarr search, park quietly."""
-    coord, store, waiter = _waiting_pair(
-        tmp_path, leader_state=State.DOWNLOADING)
+    coord, store, waiter = _waiting_pair(tmp_path, leader_state=State.DOWNLOADING)
     before = waiter.indexer_next_retry_at
     try:
         await coord._do_waiting_indexer(waiter)
@@ -1675,20 +1865,37 @@ async def test_inflight_both_unknown_size_proceeds(tmp_path):
         coord.cfg = _cfg()
         coord.store = store
         now = dt.datetime.now(dt.timezone.utc)
-        store.upsert(TorrentState(
-            source_infohash="l" * 40, source_name="Twin.Show",
-            total_bytes=0, state=State.DOWNLOADING))
+        store.upsert(
+            TorrentState(
+                source_infohash="l" * 40,
+                source_name="Twin.Show",
+                total_bytes=0,
+                state=State.DOWNLOADING,
+            )
+        )
         waiter = TorrentState(
-            source_infohash="w" * 40, source_name="Twin.Show",
-            total_bytes=0, state=State.WAITING_INDEXER,
+            source_infohash="w" * 40,
+            source_name="Twin.Show",
+            total_bytes=0,
+            state=State.WAITING_INDEXER,
             indexer_attempts=3,
             indexer_first_queried_at=now - dt.timedelta(seconds=100),
-            indexer_next_retry_at=now - dt.timedelta(seconds=1))
+            indexer_next_retry_at=now - dt.timedelta(seconds=1),
+        )
         store.upsert(waiter)
         coord.source_client = AsyncMock()
-        coord.source_client.get_torrent = AsyncMock(return_value=Torrent(
-            hash="w" * 40, name="Twin.Show", category="", save_path="",
-            size_bytes=0, state="seeding", progress=1.0, trackers=[]))
+        coord.source_client.get_torrent = AsyncMock(
+            return_value=Torrent(
+                hash="w" * 40,
+                name="Twin.Show",
+                category="",
+                save_path="",
+                size_bytes=0,
+                state="seeding",
+                progress=1.0,
+                trackers=[],
+            )
+        )
         coord._list_source_torrents = AsyncMock(return_value=[])
         coord._pick_and_admit = AsyncMock()
         await coord._do_waiting_indexer(store.get("w" * 40))
@@ -1715,18 +1922,29 @@ async def test_ssd_downloading_quiet_park_keeps_public_schedule(tmp_path):
         coord.store = store
         _now = dt.datetime.now(dt.timezone.utc)
         ts = TorrentState(
-            source_infohash="w" * 40, source_name="Twin.Show",
-            total_bytes=1000, state=State.WAITING_INDEXER,
+            source_infohash="w" * 40,
+            source_name="Twin.Show",
+            total_bytes=1000,
+            state=State.WAITING_INDEXER,
             public_export_first_attempted_at=_now - dt.timedelta(seconds=100),
             public_export_attempts=2,
-            public_export_next_retry_at=_now - dt.timedelta(seconds=1))
+            public_export_next_retry_at=_now - dt.timedelta(seconds=1),
+        )
         store.upsert(ts)
         coord.dest_client = AsyncMock()
-        coord.dest_client.list_torrents = AsyncMock(return_value=[
-            Torrent(hash="w" * 40, name="Twin.Show", category="racing",
-                    save_path=str(ssd), size_bytes=1000, state="downloading",
-                    progress=0.5),
-        ])
+        coord.dest_client.list_torrents = AsyncMock(
+            return_value=[
+                Torrent(
+                    hash="w" * 40,
+                    name="Twin.Show",
+                    category="racing",
+                    save_path=str(ssd),
+                    size_bytes=1000,
+                    state="downloading",
+                    progress=0.5,
+                ),
+            ]
+        )
         before = ts.public_export_next_retry_at
         await coord._do_waiting_indexer(store.get("w" * 40))
         row = store.get("w" * 40)
@@ -1756,14 +1974,17 @@ def test_inflight_snapshot_shared_across_calls(tmp_path):
             return real_all_active()
 
         store.all_active = _counting  # type: ignore[method-assign]
-        ts = TorrentState(source_infohash="w" * 40, source_name="Twin.Show",
-                          total_bytes=1000, state=State.WAITING_INDEXER)
+        ts = TorrentState(
+            source_infohash="w" * 40,
+            source_name="Twin.Show",
+            total_bytes=1000,
+            state=State.WAITING_INDEXER,
+        )
         try:
             assert coord._inflight_same_content(ts) is None
             assert coord._inflight_same_content(ts) is None
             assert len(calls) == 1
-            coord._inflight_snapshot = (time.monotonic() - 60.0,
-                                        coord._inflight_snapshot[1])
+            coord._inflight_snapshot = (time.monotonic() - 60.0, coord._inflight_snapshot[1])
             assert coord._inflight_same_content(ts) is None
             assert len(calls) == 2
         finally:
@@ -1776,9 +1997,9 @@ def test_inflight_snapshot_shared_across_calls(tmp_path):
 async def test_waiting_indexer_proceeds_when_leader_settled(tmp_path):
     """DONE/FAILED siblings hold no SSD work: pick runs as before."""
     from racing_sync.state import State as _S
+
     for settled in (_S.DONE, _S.FAILED):
-        coord, store, waiter = _waiting_pair(
-            tmp_path, leader_state=settled)
+        coord, store, waiter = _waiting_pair(tmp_path, leader_state=settled)
         try:
             await coord._do_waiting_indexer(waiter)
             coord._pick_and_admit.assert_awaited_once()
@@ -1790,7 +2011,8 @@ async def test_waiting_indexer_proceeds_when_leader_settled(tmp_path):
 async def test_waiting_indexer_ignores_other_content(tmp_path):
     """In-flight rows for other releases never gate the retry."""
     coord, store, waiter = _waiting_pair(
-        tmp_path, leader_state=State.DOWNLOADING, same_content=False)
+        tmp_path, leader_state=State.DOWNLOADING, same_content=False
+    )
     try:
         await coord._do_waiting_indexer(waiter)
         coord._pick_and_admit.assert_awaited_once()
@@ -1807,6 +2029,7 @@ async def test_concurrent_source_lists_share_one_scan():
     worker burst re-scans deluged and starves autobrr injections.
     """
     import asyncio
+
     coord = make_coordinator()
     coord.cfg.source.min_age_seconds = 0
     _row = MagicMock()
@@ -1822,15 +2045,14 @@ async def test_concurrent_source_lists_share_one_scan():
     coord.source_client.list_torrents = AsyncMock(side_effect=_slow_list)
     coord._source_torrents_cache = []
     coord._source_torrents_cached_at = 0.0
-    results = await asyncio.gather(
-        *[coord._list_source_torrents() for _ in range(5)])
+    results = await asyncio.gather(*[coord._list_source_torrents() for _ in range(5)])
     assert coord.source_client.list_torrents.await_count == 1
     assert all(len(r) == 1 for r in results)
     # Fresh cache: no RPC at all.
-    results2 = await asyncio.gather(
-        *[coord._list_source_torrents() for _ in range(5)])
+    results2 = await asyncio.gather(*[coord._list_source_torrents() for _ in range(5)])
     assert coord.source_client.list_torrents.await_count == 1
     assert all(len(r) == 1 for r in results2)
+
 
 @pytest.mark.anyio
 async def test_wakeup_indexer_row_ignores_skipped():
@@ -1848,14 +2070,16 @@ async def test_wakeup_indexer_row_ignores_skipped():
     try:
         coord = make_coordinator(store)
         coord.transition = MagicMock()
-        ts = TorrentState(source_infohash="s" * 40, source_name="Held",
-                          state=State.WAITING_INDEXER, skipped=1)
+        ts = TorrentState(
+            source_infohash="s" * 40, source_name="Held", state=State.WAITING_INDEXER, skipped=1
+        )
         store.upsert(ts)
         coord._wakeup_indexer_row(ts)
         coord.transition.assert_not_called()
         assert "s" * 40 not in coord._running_infohashes
     finally:
         store.close()
+
 
 @pytest.mark.anyio
 async def test_process_torrent_inner_honors_hold():
@@ -1867,6 +2091,7 @@ async def test_process_torrent_inner_honors_hold():
     ts = TorrentState(source_infohash="s" * 40, state=State.NEW, skipped=1)
     await coord._process_torrent_inner(ts)
     coord._do_new.assert_not_called()
+
 
 @pytest.mark.anyio
 async def test_schedule_step_never_spawns_held_rows(tmp_path):
@@ -1883,8 +2108,9 @@ async def test_schedule_step_never_spawns_held_rows(tmp_path):
             cfg__max_active_downloads=3,
             cfg__max_concurrent_moves=3,
         )
-        held = TorrentState(source_infohash="a" * 40, source_name="Held",
-                            state=State.NEW, skipped=1)
+        held = TorrentState(
+            source_infohash="a" * 40, source_name="Held", state=State.NEW, skipped=1
+        )
         store.upsert(held)
         await coord._schedule_step()
         assert "a" * 40 not in coord._running_infohashes
@@ -1897,6 +2123,7 @@ async def test_schedule_step_never_spawns_held_rows(tmp_path):
                 pass
         store.close()
 
+
 def test_prefer_grace_row_refuses_held(tmp_path):
     """Prefer on a held row explains itself instead of exempting it."""
     from racing_sync.state import StateStore
@@ -1904,8 +2131,7 @@ def test_prefer_grace_row_refuses_held(tmp_path):
     store = StateStore(tmp_path / "prefer.db")
     try:
         coord = make_coordinator(store)
-        ts = TorrentState(source_infohash="b" * 40, source_name="Held",
-                          state=State.NEW, skipped=1)
+        ts = TorrentState(source_infohash="b" * 40, source_name="Held", state=State.NEW, skipped=1)
         store.upsert(ts)
         row, msg = coord.prefer_grace_row("b" * 40)
         assert row is None

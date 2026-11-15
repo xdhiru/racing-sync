@@ -4,6 +4,7 @@ Covers the 32GB+16GB-over-40GB regression: admission reserves an estimate
 (min(total, configured_cap)) and blocks when the global sum would exceed the
 budget — even when each torrent alone fits current free space.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,8 +19,11 @@ def _coord_with_cap(tmp_path, cap: int):
     coord = make_coordinator()
     coord._stop = False
     # Unknown test-double rows must not prune real reservations (see _ssd_prune_stale).
-    coord.store.get = MagicMock(side_effect=lambda h: TorrentState(
-        source_infohash=h, source_name="x", state=State.DOWNLOADING))
+    coord.store.get = MagicMock(
+        side_effect=lambda h: TorrentState(
+            source_infohash=h, source_name="x", state=State.DOWNLOADING
+        )
+    )
     coord._ssd_reserved = {}
     coord._ssd_lock = None
     coord._waiting_disk_next_check = {}
@@ -38,20 +42,31 @@ async def test_global_budget_blocks_second_torrent(tmp_path):
     cap = 40_000
     coord = _coord_with_cap(tmp_path, cap)
 
-    ts1 = TorrentState(source_infohash="a" * 40, source_name="Big32",
-                       total_bytes=32_000, state=State.NEW)
-    ts2 = TorrentState(source_infohash="b" * 40, source_name="Mid16",
-                       total_bytes=16_000, state=State.NEW)
+    ts1 = TorrentState(
+        source_infohash="a" * 40, source_name="Big32", total_bytes=32_000, state=State.NEW
+    )
+    ts2 = TorrentState(
+        source_infohash="b" * 40, source_name="Mid16", total_bytes=16_000, state=State.NEW
+    )
 
-    assert await coord._ssd_try_reserve(ts1.source_infohash, coord._ssd_estimate_for_new(32_000)) is True
+    assert (
+        await coord._ssd_try_reserve(ts1.source_infohash, coord._ssd_estimate_for_new(32_000))
+        is True
+    )
     assert coord._ssd_reserved_total() == 32_000
     # 32k+16k=48k > 40k → park even though 16k alone fits free space.
-    assert await coord._ssd_try_reserve(ts2.source_infohash, coord._ssd_estimate_for_new(16_000)) is False
+    assert (
+        await coord._ssd_try_reserve(ts2.source_infohash, coord._ssd_estimate_for_new(16_000))
+        is False
+    )
     assert coord._ssd_reserved_total() == 32_000
 
     # First finishes (MOVING→RE_ADDING releases via transition hook path).
     await coord._ssd_release(ts1.source_infohash)
-    assert await coord._ssd_try_reserve(ts2.source_infohash, coord._ssd_estimate_for_new(16_000)) is True
+    assert (
+        await coord._ssd_try_reserve(ts2.source_infohash, coord._ssd_estimate_for_new(16_000))
+        is True
+    )
     assert coord._ssd_reserved_total() == 16_000
 
 
@@ -107,8 +122,9 @@ async def test_wait_disk_promotes_after_release(tmp_path):
     coord._waiting_disk_next_check = {}
     assert await coord._ssd_try_reserve("a" * 40, 32_000) is True
 
-    ts = TorrentState(source_infohash="b" * 40, source_name="Mid16",
-                      total_bytes=16_000, state=State.WAITING_DISK)
+    ts = TorrentState(
+        source_infohash="b" * 40, source_name="Mid16", total_bytes=16_000, state=State.WAITING_DISK
+    )
     await coord._wait_disk_then_queue(ts)
     assert ts.state == State.WAITING_DISK  # parked, deadline set
     assert ts.source_infohash in coord._waiting_disk_next_check
@@ -128,17 +144,29 @@ async def test_rebuild_after_abrupt_stop(tmp_path):
     store = StateStore(Path(db))
     try:
         rows = [
-            TorrentState(source_infohash="q" * 40, source_name="Q",
-                         total_bytes=10_000, state=State.QUEUED),
-            TorrentState(source_infohash="d" * 40, source_name="D",
-                         total_bytes=12_000, state=State.DOWNLOADING,
-                         batches_total=4, batch_index=1),
-            TorrentState(source_infohash="m" * 40, source_name="M",
-                         total_bytes=8_000, state=State.MOVING),
-            TorrentState(source_infohash="w" * 40, source_name="W",
-                         total_bytes=50_000, state=State.WAITING_DISK),
-            TorrentState(source_infohash="f" * 40, source_name="F",
-                         total_bytes=9_000, state=State.DONE),
+            TorrentState(
+                source_infohash="q" * 40, source_name="Q", total_bytes=10_000, state=State.QUEUED
+            ),
+            TorrentState(
+                source_infohash="d" * 40,
+                source_name="D",
+                total_bytes=12_000,
+                state=State.DOWNLOADING,
+                batches_total=4,
+                batch_index=1,
+            ),
+            TorrentState(
+                source_infohash="m" * 40, source_name="M", total_bytes=8_000, state=State.MOVING
+            ),
+            TorrentState(
+                source_infohash="w" * 40,
+                source_name="W",
+                total_bytes=50_000,
+                state=State.WAITING_DISK,
+            ),
+            TorrentState(
+                source_infohash="f" * 40, source_name="F", total_bytes=9_000, state=State.DONE
+            ),
         ]
         for r in rows:
             store.upsert(r)
@@ -186,6 +214,7 @@ async def test_stale_reservation_pruned_after_forget(tmp_path):
     assert await coord._ssd_try_reserve("n" * 40, 16_000) is True
     assert "gone" + "0" * 36 not in coord._ssd_reserved
 
+
 @pytest.mark.anyio
 async def test_waiting_retry_uses_remaining_batches_not_total(tmp_path):
     """A partially-moved season retries WAITING_DISK on its remainder.
@@ -201,17 +230,25 @@ async def test_waiting_retry_uses_remaining_batches_not_total(tmp_path):
     cap = 40_000
     coord = _coord_with_cap(tmp_path, cap)
     coord.dest_client = AsyncMock()
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="Show.S01E01.mkv", size_bytes=27_000, progress=1.0),
-        TorrentFile(name="Show.S01E02.mkv", size_bytes=5_000, progress=0.0),
-    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="Show.S01E01.mkv", size_bytes=27_000, progress=1.0),
+            TorrentFile(name="Show.S01E02.mkv", size_bytes=5_000, progress=0.0),
+        ]
+    )
     coord._batch_cap_cache = {("w" * 40): 30_000}
 
     assert await coord._ssd_try_reserve("x" * 40, 32_000) is True
-    ts = TorrentState(source_infohash="w" * 40, source_name="Season32",
-                      dest_infohash="w" * 40, total_bytes=32_000,
-                      classification_kind="season", batches_total=2,
-                      batch_index=1, state=State.WAITING_DISK)
+    ts = TorrentState(
+        source_infohash="w" * 40,
+        source_name="Season32",
+        dest_infohash="w" * 40,
+        total_bytes=32_000,
+        classification_kind="season",
+        batches_total=2,
+        batch_index=1,
+        state=State.WAITING_DISK,
+    )
     await coord._wait_disk_then_queue(ts)
 
     assert ts.state == State.QUEUED
@@ -279,8 +316,9 @@ async def test_prune_stale_reaps_forgotten_wait_and_park_keys(tmp_path):
     """Forget bypasses transition pops: the prune reaps orphaned hints."""
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="q" * 40, source_name="X",
-                                  state=State.WAITING_DISK))
+        store.upsert(
+            TorrentState(source_infohash="q" * 40, source_name="X", state=State.WAITING_DISK)
+        )
         coord = make_coordinator(store)
         coord.cfg = MagicMock()
         coord._waiting_disk_next_check = {"q" * 40: 1.0, "z" * 40: 2.0}
@@ -324,19 +362,25 @@ def _pack_blob(top, parts):
     for rel, size in parts:
         segs = [p.encode() for p in rel.split("/")]
         files.append({b"length": size, b"path": segs})
-    return bytes(_bencode({
-        b"info": {b"name": top.encode(), b"files": files,
-                  b"piece length": 16384, b"pieces": b"0" * 20},
-    }))
+    return bytes(
+        _bencode(
+            {
+                b"info": {
+                    b"name": top.encode(),
+                    b"files": files,
+                    b"piece length": 16384,
+                    b"pieces": b"0" * 20,
+                },
+            }
+        )
+    )
 
 
 def test_blob_admit_footprint_is_max_batch(tmp_path):
     """A 24KB pack in 8KB files admits on one 8KB batch, not 10KB cap."""
     coord = _coord_with_cap(tmp_path, 10_000)
-    ts = TorrentState(source_infohash="f" * 40, source_name="Pack",
-                      state=State.NEW)
-    blob = _pack_blob("Pack", [("a.bin", 8000), ("b.bin", 8000),
-                               ("c.bin", 8000)])
+    ts = TorrentState(source_infohash="f" * 40, source_name="Pack", state=State.NEW)
+    blob = _pack_blob("Pack", [("a.bin", 8000), ("b.bin", 8000), ("c.bin", 8000)])
     assert coord._blob_admit_footprint(ts, blob, 24_000) == 8000
 
 
@@ -345,10 +389,8 @@ def test_blob_parse_memoized_per_infohash(tmp_path):
     import racing_sync.watchdir as _wd
 
     coord = _coord_with_cap(tmp_path, 10_000)
-    ts = TorrentState(source_infohash="f" * 40, source_name="Pack",
-                      state=State.NEW)
-    blob = _pack_blob("Pack", [("a.bin", 8000), ("b.bin", 8000),
-                               ("c.bin", 8000)])
+    ts = TorrentState(source_infohash="f" * 40, source_name="Pack", state=State.NEW)
+    blob = _pack_blob("Pack", [("a.bin", 8000), ("b.bin", 8000), ("c.bin", 8000)])
     real_extract = _wd.extract_torrent_files_from_bencoded
     calls: list[bytes] = []
 
@@ -356,8 +398,7 @@ def test_blob_parse_memoized_per_infohash(tmp_path):
         calls.append(bytes(raw))
         return real_extract(raw)
 
-    with patch("racing_sync.watchdir.extract_torrent_files_from_bencoded",
-               side_effect=_counting):
+    with patch("racing_sync.watchdir.extract_torrent_files_from_bencoded", side_effect=_counting):
         assert coord._blob_admit_footprint(ts, blob, 24_000) == 8000
         assert coord._blob_admit_footprint(ts, blob, 24_000) == 8000
     assert len(calls) == 1
@@ -365,17 +406,15 @@ def test_blob_parse_memoized_per_infohash(tmp_path):
 
 def test_blob_admit_footprint_single_file_is_total(tmp_path):
     coord = _coord_with_cap(tmp_path, 10_000)
-    coord.cfg.ssd.skip_movie_larger_than_bytes = 10 ** 12
-    ts = TorrentState(source_infohash="g" * 40, source_name="Movie",
-                      state=State.NEW)
+    coord.cfg.ssd.skip_movie_larger_than_bytes = 10**12
+    ts = TorrentState(source_infohash="g" * 40, source_name="Movie", state=State.NEW)
     blob = _pack_blob("Movie", [("film.mkv", 5000)])
     assert coord._blob_admit_footprint(ts, blob, 5000) == 5000
 
 
 def test_blob_admit_footprint_refuses_over_cap_and_garbage(tmp_path):
     coord = _coord_with_cap(tmp_path, 10_000)
-    ts = TorrentState(source_infohash="h" * 40, source_name="Big",
-                      state=State.NEW)
+    ts = TorrentState(source_infohash="h" * 40, source_name="Big", state=State.NEW)
     # A single file that can never fit one batch: defer (setup fails it).
     blob = _pack_blob("Big", [("huge.bin", 15_000)])
     assert coord._blob_admit_footprint(ts, blob, 15_000) is None
@@ -388,14 +427,12 @@ async def test_admit_prefers_batch_footprint_over_total_estimate(tmp_path):
     """_admit_resolved reserves one batch (~8KB), not min(total, cap)."""
     coord = _coord_with_cap(tmp_path, 10_000)
     coord.dest_client = None
-    blob = _pack_blob("Pack", [("a.bin", 8000), ("b.bin", 8000),
-                               ("c.bin", 8000)])
-    ts = TorrentState(source_infohash="f" * 40, source_name="Pack",
-                      total_bytes=24_000, state=State.NEW)
-    with patch.object(coord, "_ssd_try_reserve",
-                      AsyncMock(return_value=True)) as reserve:
-        await coord._admit_resolved(
-            ts, blob=blob, size_bytes=24_000, display_name="Pack")
+    blob = _pack_blob("Pack", [("a.bin", 8000), ("b.bin", 8000), ("c.bin", 8000)])
+    ts = TorrentState(
+        source_infohash="f" * 40, source_name="Pack", total_bytes=24_000, state=State.NEW
+    )
+    with patch.object(coord, "_ssd_try_reserve", AsyncMock(return_value=True)) as reserve:
+        await coord._admit_resolved(ts, blob=blob, size_bytes=24_000, display_name="Pack")
     reserve.assert_awaited_once_with("f" * 40, 8000)
     assert ts.state == State.QUEUED
 
@@ -405,19 +442,23 @@ async def test_wait_disk_retries_against_blob_batches(tmp_path):
     """A parked 24KB pack with only batch room promotes to QUEUED."""
     store = StateStore(tmp_path / "state.db")
     try:
-        blob = _pack_blob("Pack", [("a.bin", 8000), ("b.bin", 8000),
-                                   ("c.bin", 8000)])
-        ts = TorrentState(source_infohash="f" * 40, source_name="Pack",
-                          total_bytes=24_000, state=State.WAITING_DISK,
-                          cross_seed_blob=blob)
+        blob = _pack_blob("Pack", [("a.bin", 8000), ("b.bin", 8000), ("c.bin", 8000)])
+        ts = TorrentState(
+            source_infohash="f" * 40,
+            source_name="Pack",
+            total_bytes=24_000,
+            state=State.WAITING_DISK,
+            cross_seed_blob=blob,
+        )
         store.upsert(ts)
         coord = _coord_with_cap(tmp_path, 10_000)
         coord.store = store
         coord.dest_client = AsyncMock()
         coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
         row = store.get("f" * 40, include_blob=False)
-        with patch.object(coord, "_ssd_try_reserve",
-                          AsyncMock(side_effect=[False, True])) as reserve:
+        with patch.object(
+            coord, "_ssd_try_reserve", AsyncMock(side_effect=[False, True])
+        ) as reserve:
             await coord._wait_disk_then_queue(row)
         assert reserve.await_count == 2
         assert reserve.call_args_list[0][0][1] == 10_000  # full estimate
@@ -449,15 +490,19 @@ async def test_wait_disk_skips_reserve_when_downloads_full(tmp_path):
         coord = _coord_with_cap(tmp_path, 10_000)
         coord.store = store
         coord.cfg.max_active_downloads = 1
-        store.upsert(TorrentState(source_infohash="b" * 40,
-                                  source_name="Busy",
-                                  state=State.DOWNLOADING))
-        store.upsert(TorrentState(source_infohash="w" * 40,
-                                  source_name="Wait", total_bytes=100,
-                                  state=State.WAITING_DISK))
+        store.upsert(
+            TorrentState(source_infohash="b" * 40, source_name="Busy", state=State.DOWNLOADING)
+        )
+        store.upsert(
+            TorrentState(
+                source_infohash="w" * 40,
+                source_name="Wait",
+                total_bytes=100,
+                state=State.WAITING_DISK,
+            )
+        )
         coord._running_infohashes = {"b" * 40}
-        with patch.object(coord, "_ssd_try_reserve",
-                          AsyncMock(return_value=True)) as reserve:
+        with patch.object(coord, "_ssd_try_reserve", AsyncMock(return_value=True)) as reserve:
             await coord._wait_disk_then_queue(store.get("w" * 40))
         reserve.assert_not_called()
         assert store.get("w" * 40).state == State.WAITING_DISK
@@ -477,8 +522,9 @@ async def test_prune_skips_fresh_reservation(tmp_path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="w" * 40, source_name="W",
-                                  state=State.WAITING_DISK))
+        store.upsert(
+            TorrentState(source_infohash="w" * 40, source_name="W", state=State.WAITING_DISK)
+        )
         coord = make_coordinator(store)
         coord.cfg = MagicMock()
         coord._ssd_reserved = {"w" * 40: 5_000}
@@ -528,9 +574,13 @@ async def test_estimate_cached_per_cursor():
     """Repeat estimates for one cursor compute once; a cursor move
     recomputes."""
     coord = make_coordinator()
-    ts = TorrentState(source_infohash="e" * 40, source_name="E",
-                      state=State.WAITING_DISK,
-                      batches_total=3, batch_index=1)
+    ts = TorrentState(
+        source_infohash="e" * 40,
+        source_name="E",
+        state=State.WAITING_DISK,
+        batches_total=3,
+        batch_index=1,
+    )
     calls: list[bool] = []
 
     async def _fake(_ts):

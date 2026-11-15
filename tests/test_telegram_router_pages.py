@@ -1,4 +1,5 @@
 """Router pagination pages over rendered groups; refresh taps keep the dedup cache."""
+
 from __future__ import annotations
 
 import pytest
@@ -10,16 +11,19 @@ from racing_sync.telegram_bot import TelegramBot
 
 def _row(h: str, name: str, size: int = 1000) -> TorrentState:
     return TorrentState(
-        source_infohash=h, source_name=name, state=State.QUEUED,
+        source_infohash=h,
+        source_name=name,
+        state=State.QUEUED,
         total_bytes=size,
-        source_announce_url="https://alpha.cc/announce/xyz")
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
 
 
 def _page_bot(rows, **kw):
     from unittest.mock import AsyncMock, MagicMock
+
     bot = object.__new__(TelegramBot)
-    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345",
-                              page_size=5)
+    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345", page_size=5)
     bot._callback_times = {}
     bot._current_page = 0
     bot._last_active_cache = None
@@ -33,6 +37,7 @@ def _page_bot(rows, **kw):
 
 def _query(data):
     from unittest.mock import AsyncMock, MagicMock
+
     q = MagicMock()
     q.message.chat.id = 12345
     q.from_user.id = 12345
@@ -48,12 +53,14 @@ async def test_page_next_wraps_over_groups_not_rows():
     Row-based paging would wrap to page 2 (a dead tap the renderer
     then clamps); group-based paging matches what is rendered.
     """
-    rows = [_row("a" * 40, "Twin.Show.S01E01"),
-            _row("b" * 40, "Twin.Show.S01E01"),
-            _row("c" * 40, "Twin.Show.S01E01"),
-            _row("d" * 40, "Twin.Show.S01E01"),
-            _row("e" * 40, "Twin.Show.S01E01"),
-            _row("f" * 40, "Other.Show.S01E01")]
+    rows = [
+        _row("a" * 40, "Twin.Show.S01E01"),
+        _row("b" * 40, "Twin.Show.S01E01"),
+        _row("c" * 40, "Twin.Show.S01E01"),
+        _row("d" * 40, "Twin.Show.S01E01"),
+        _row("e" * 40, "Twin.Show.S01E01"),
+        _row("f" * 40, "Other.Show.S01E01"),
+    ]
     bot = _page_bot(rows)
     await bot._handle_callback(_query("page:next"))
     assert bot._current_page == 0
@@ -62,8 +69,7 @@ async def test_page_next_wraps_over_groups_not_rows():
 
 @pytest.mark.anyio
 async def test_page_next_advances_when_groups_span_pages():
-    rows = [_row(f"{i:040x}"[-40:], f"Show.{i:02d}.S01E01", size=1000 + i)
-            for i in range(6)]
+    rows = [_row(f"{i:040x}"[-40:], f"Show.{i:02d}.S01E01", size=1000 + i) for i in range(6)]
     bot = _page_bot(rows)
     await bot._handle_callback(_query("page:next"))
     assert bot._current_page == 1
@@ -141,8 +147,7 @@ async def test_filtered_refresh_narrows_render():
     bot = object.__new__(TelegramBot)
     bot._bot = MagicMock()
     bot._bot.edit_message_text = AsyncMock()
-    bot._bot.send_message = AsyncMock(
-        return_value=MagicMock(message_id=99))
+    bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=99))
     bot._store = MagicMock()
     bot._coord = MagicMock()
     bot._coord.live_progress_map.return_value = {}
@@ -158,8 +163,12 @@ async def test_filtered_refresh_narrows_render():
     bot._detail_sent_state = {}
     bot._status_filter = "dl"
     mk = lambda h, st, name: TorrentState(  # noqa: E731
-        source_infohash=h, source_name=name, state=st, total_bytes=1000,
-        source_announce_url="https://alpha.cc/announce/xyz")
+        source_infohash=h,
+        source_name=name,
+        state=st,
+        total_bytes=1000,
+        source_announce_url="https://alpha.cc/announce/xyz",
+    )
     bot._store.list_active_inflight.return_value = [
         mk("a" * 40, State.DOWNLOADING, "Dl.Show.S01E01"),
         mk("b" * 40, State.QUEUED, "Q.Show.S01E01"),
@@ -181,10 +190,8 @@ async def test_overview_button_sends_aggregate():
     bot._coord.live_totals.return_value = (10_000_000, 2)
     bot._store = MagicMock()
     bot._store.list_active_inflight.return_value = [
-        TorrentState(source_infohash="a" * 40, source_name="D",
-                     state=State.DOWNLOADING),
-        TorrentState(source_infohash="b" * 40, source_name="M",
-                     state=State.MOVING),
+        TorrentState(source_infohash="a" * 40, source_name="D", state=State.DOWNLOADING),
+        TorrentState(source_infohash="b" * 40, source_name="M", state=State.MOVING),
     ]
     bot._reply = AsyncMock()
     q = _query("status:ov")

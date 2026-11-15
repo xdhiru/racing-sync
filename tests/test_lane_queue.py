@@ -1,4 +1,5 @@
 """P4: lane queues — check/start/wake without DB churn."""
+
 from __future__ import annotations
 
 import asyncio
@@ -20,8 +21,8 @@ def _coord(cap_dl=1, cap_mv=1):
 
 def _row(h, state, **kw):
     from racing_sync.state import State, TorrentState
-    args = dict(source_infohash=h, source_name=f"Show-{h[:6]}",
-                state=state, total_bytes=1000)
+
+    args = dict(source_infohash=h, source_name=f"Show-{h[:6]}", state=state, total_bytes=1000)
     args.update(kw)
     return TorrentState(**args)
 
@@ -29,6 +30,7 @@ def _row(h, state, **kw):
 def _handle(h, kind):
     from racing_sync.task import TaskHandle, register_handle
     import asyncio as _a
+
     hd = TaskHandle(infohash=h, gid=h[:12], kind=kind)
     return hd
 
@@ -44,28 +46,24 @@ def test_check_running_tasks_gates_and_forces():
     register_handle(coord, ha)
     hb = _handle("b" * 40, "queued")
     register_handle(coord, hb)
-    queued, ev = coord.check_running_tasks(
-        _row("b" * 40, State.QUEUED), "dl")
+    queued, ev = coord.check_running_tasks(_row("b" * 40, State.QUEUED), "dl")
     assert queued is True
     assert ev is not None
     # Forced rows never queue.
     coord._forced = {"b" * 40}
-    queued2, _ = coord.check_running_tasks(
-        _row("b" * 40, State.QUEUED), "dl")
+    queued2, _ = coord.check_running_tasks(_row("b" * 40, State.QUEUED), "dl")
     assert queued2 is False
     # Move lane mirrors with its own cap.
     hm = _handle("c" * 40, "moving")
     register_handle(coord, hm)
     hd = _handle("d" * 40, "moving")
     register_handle(coord, hd)
-    queued3, ev3 = coord.check_running_tasks(
-        _row("d" * 40, State.MOVING), "move")
+    queued3, ev3 = coord.check_running_tasks(_row("d" * 40, State.MOVING), "move")
     assert queued3 is True and ev3 is not None
     # No handles at all: admittable (today's edge behavior).
     coord2 = make_coordinator(MagicMock())
     coord2.cfg.max_active_downloads = 1
-    assert coord2.check_running_tasks(
-        _row("e" * 40, State.QUEUED), "dl") == (False, None)
+    assert coord2.check_running_tasks(_row("e" * 40, State.QUEUED), "dl") == (False, None)
 
 
 @pytest.mark.anyio
@@ -85,8 +83,7 @@ async def test_park_waits_without_db_churn_and_wakes_by_priority():
     new = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
     ts_b = _row("b" * 40, State.QUEUED, updated_at=old)
     ts_c = _row("c" * 40, State.QUEUED, updated_at=new)
-    store.get = MagicMock(side_effect=lambda h, **k: {
-        "b" * 40: ts_b, "c" * 40: ts_c}.get(h))
+    store.get = MagicMock(side_effect=lambda h, **k: {"b" * 40: ts_b, "c" * 40: ts_c}.get(h))
     hb = _handle("b" * 40, "queued")
     hc = _handle("c" * 40, "queued")
     register_handle(coord, hb)
@@ -102,6 +99,7 @@ async def test_park_waits_without_db_churn_and_wakes_by_priority():
     assert await coord.start_from_queued() == 0
     # A leaves: oldest queued (B) wakes first.
     from racing_sync.task import unregister_handle
+
     unregister_handle(coord, ha)
     woken = await coord.start_from_queued()
     assert woken == 1
@@ -121,9 +119,9 @@ async def test_park_waits_without_db_churn_and_wakes_by_priority():
 async def test_try_admit_honors_force():
     coord = _coord()
     from racing_sync.state import State
+
     coord._forced = {"b" * 40}
-    assert await coord._try_admit_download(
-        _row("b" * 40, State.QUEUED)) is True
+    assert await coord._try_admit_download(_row("b" * 40, State.QUEUED)) is True
 
 
 @pytest.mark.anyio

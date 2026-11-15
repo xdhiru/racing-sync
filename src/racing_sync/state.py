@@ -62,15 +62,38 @@ class State(str, enum.Enum):
 # the same infohash on VPS2 pointing at the fuse mount (any category) with
 # verified bytes, so no SSD download / rclone move is needed.
 ALLOWED: dict[State, set[State]] = {
-    State.NEW: {State.WAITING_INDEXER, State.WAITING_DISK,
-                State.QUEUED, State.DOWNLOADING, State.MOVING, State.RE_ADDING,
-                State.DONE, State.FAILED},
-    State.WAITING_INDEXER: {State.WAITING_DISK,
-                State.QUEUED, State.DONE, State.FAILED, State.RE_ADDING},
-    State.WAITING_DISK: {State.QUEUED, State.DOWNLOADING, State.DONE, State.FAILED,
-                State.RE_ADDING},
-    State.QUEUED: {State.DOWNLOADING, State.MOVING, State.WAITING_DISK,
-                   State.RE_ADDING, State.DONE, State.FAILED},
+    State.NEW: {
+        State.WAITING_INDEXER,
+        State.WAITING_DISK,
+        State.QUEUED,
+        State.DOWNLOADING,
+        State.MOVING,
+        State.RE_ADDING,
+        State.DONE,
+        State.FAILED,
+    },
+    State.WAITING_INDEXER: {
+        State.WAITING_DISK,
+        State.QUEUED,
+        State.DONE,
+        State.FAILED,
+        State.RE_ADDING,
+    },
+    State.WAITING_DISK: {
+        State.QUEUED,
+        State.DOWNLOADING,
+        State.DONE,
+        State.FAILED,
+        State.RE_ADDING,
+    },
+    State.QUEUED: {
+        State.DOWNLOADING,
+        State.MOVING,
+        State.WAITING_DISK,
+        State.RE_ADDING,
+        State.DONE,
+        State.FAILED,
+    },
     # DOWNLOADING -> RE_ADDING is the /injectfuse manual preempt: the operator
     # moved the bytes to the remote by hand, fuse verification passed, so the
     # SSD download is abandoned (dest entry removed, reservation released)
@@ -116,8 +139,8 @@ _MAX_READD_CYCLES = 5
 @dataclass(slots=True)
 class TorrentState:
     # Identity
-    source_infohash: str        # VPS1 racing client infohash
-    dest_infohash: str = ""     # VPS2 qBittorrent infohash (may equal source for public)
+    source_infohash: str  # VPS1 racing client infohash
+    dest_infohash: str = ""  # VPS2 qBittorrent infohash (may equal source for public)
     # Source torrent meta
     source_name: str = ""
     source_tracker: str = ""
@@ -129,7 +152,7 @@ class TorrentState:
     save_path: str = ""
     # Cross-seed bookkeeping
     cross_seed_infohash: str = ""  # prowlarr / SFTP-fetched torrent used on SSD
-    cross_seed_source: str = ""    # "prowlarr" | "sftp" | "self"
+    cross_seed_source: str = ""  # "prowlarr" | "sftp" | "self"
     # Raw .torrent bytes used on SSD (prowlarr / SFTP-fetched). Persisted
     # so that recovery after a restart can re-add the cross-seed torrent
     # when only the racing torrents survived.
@@ -223,41 +246,39 @@ class TorrentState:
             "cross_seed_source": self.cross_seed_source,
             "cross_seed_blob": self.cross_seed_blob,
             "injected_private_hashes": self.injected_private_hashes,
-            "indexer_first_queried_at":
-                self.indexer_first_queried_at.isoformat()
-                if self.indexer_first_queried_at else "",
-            "indexer_next_retry_at":
-                self.indexer_next_retry_at.isoformat()
-                if self.indexer_next_retry_at else "",
+            "indexer_first_queried_at": self.indexer_first_queried_at.isoformat()
+            if self.indexer_first_queried_at
+            else "",
+            "indexer_next_retry_at": self.indexer_next_retry_at.isoformat()
+            if self.indexer_next_retry_at
+            else "",
             "indexer_attempts": self.indexer_attempts,
             "public_export_first_attempted_at": (
                 self.public_export_first_attempted_at.isoformat()
-                if self.public_export_first_attempted_at else ""
+                if self.public_export_first_attempted_at
+                else ""
             ),
             "public_export_next_retry_at": (
                 self.public_export_next_retry_at.isoformat()
-                if self.public_export_next_retry_at else ""
+                if self.public_export_next_retry_at
+                else ""
             ),
             "public_export_attempts": self.public_export_attempts,
             "fuse_verified": int(self.fuse_verified or 0),
             "force_direct": int(self.force_direct or 0),
             "skipped": int(self.skipped or 0),
             "readd_first_attempted_at": (
-                self.readd_first_attempted_at.isoformat()
-                if self.readd_first_attempted_at else ""
+                self.readd_first_attempted_at.isoformat() if self.readd_first_attempted_at else ""
             ),
             "readd_next_retry_at": (
-                self.readd_next_retry_at.isoformat()
-                if self.readd_next_retry_at else ""
+                self.readd_next_retry_at.isoformat() if self.readd_next_retry_at else ""
             ),
             "readd_attempts": self.readd_attempts,
             "failed_retries": self.failed_retries,
-            "completed_at":
-                self.completed_at.isoformat()
-                if self.completed_at else "",
-            "vps1_last_activity_at":
-                self.vps1_last_activity_at.isoformat()
-                if self.vps1_last_activity_at else "",
+            "completed_at": self.completed_at.isoformat() if self.completed_at else "",
+            "vps1_last_activity_at": self.vps1_last_activity_at.isoformat()
+            if self.vps1_last_activity_at
+            else "",
             "state": self.state.value,
             "move_stage": self.move_stage,
             "move_plan": self.move_plan,
@@ -270,9 +291,7 @@ class TorrentState:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "telegram_message_id": self.telegram_message_id,
-            "deleted_at":
-                self.deleted_at.isoformat()
-                if self.deleted_at else "",
+            "deleted_at": self.deleted_at.isoformat() if self.deleted_at else "",
         }
 
 
@@ -422,7 +441,8 @@ class StateStore:
             log.warning(
                 "state DB journal_mode is %r, not WAL; forcing "
                 "synchronous=FULL for durability (performance may degrade)",
-                journal_mode)
+                journal_mode,
+            )
             self._conn.execute("PRAGMA synchronous=FULL")
         else:
             self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -485,23 +505,26 @@ class StateStore:
                 (dt.datetime.now(dt.timezone.utc).isoformat(),),
             )
             if (_cur.rowcount or 0) > 0:
-                log.info("state DB: migrated %d retired 'querying' row(s) to "
-                         "'waiting_indexer'", _cur.rowcount)
+                log.info(
+                    "state DB: migrated %d retired 'querying' row(s) to 'waiting_indexer'",
+                    _cur.rowcount,
+                )
         except Exception:
             pass
         # Single deleted_at sentinel: legacy NULL rows are writable but
         # invisible (every read requires ''), so normalize once at open.
         # A real tombstone is always a timestamp string, never NULL.
         try:
-            _normed = self._conn.execute(
-                "UPDATE torrent_state SET deleted_at = '' "
-                "WHERE deleted_at IS NULL"
-            ).rowcount or 0
+            _normed = (
+                self._conn.execute(
+                    "UPDATE torrent_state SET deleted_at = '' WHERE deleted_at IS NULL"
+                ).rowcount
+                or 0
+            )
         except Exception:
             _normed = 0
         if _normed:
-            log.warning("state DB: normalized %d legacy NULL deleted_at "
-                        "row(s) to ''", _normed)
+            log.warning("state DB: normalized %d legacy NULL deleted_at row(s) to ''", _normed)
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -612,8 +635,7 @@ class StateStore:
         cols = "*" if include_blob else _TORRENT_STATE_COLUMNS_NO_BLOB
         with self._lock:
             row = self._conn.execute(
-                f"SELECT {cols} FROM torrent_state WHERE source_infohash = ? "
-                "AND deleted_at = ''",
+                f"SELECT {cols} FROM torrent_state WHERE source_infohash = ? AND deleted_at = ''",
                 (norm,),
             ).fetchone()
             return _row_to_state(row) if row else None
@@ -646,7 +668,7 @@ class StateStore:
         cols = "*" if include_blob else _TORRENT_STATE_COLUMNS_NO_BLOB
         with self._lock:
             for i in range(0, len(wanted), 500):
-                chunk = wanted[i:i + 500]
+                chunk = wanted[i : i + 500]
                 try:
                     qmarks = ",".join(["?"] * len(chunk))
                     rows = self._conn.execute(
@@ -659,8 +681,7 @@ class StateStore:
                     # Explicit signal, not a silent partial map: the only
                     # caller (SSD-prune sweep) treats missing as absent, so
                     # the contract stays fail-open — but it must be loud.
-                    log.warning("get_many chunk failed (%d hashes): %s",
-                                len(chunk), e)
+                    log.warning("get_many chunk failed (%d hashes): %s", len(chunk), e)
                     continue
                 for r in rows or []:
                     try:
@@ -700,7 +721,9 @@ class StateStore:
         return bool(row and row["deleted_at"])
 
     def upsert(
-        self, ts: TorrentState, *,
+        self,
+        ts: TorrentState,
+        *,
         expected_version: int | None = None,
         expected_state: State | None = None,
     ) -> UpsertResult:
@@ -730,8 +753,7 @@ class StateStore:
                 return UpsertResult.TOMBSTONED
             if guarded:
                 cur = self._conn.execute(
-                    "SELECT state, version FROM torrent_state "
-                    "WHERE source_infohash = ?",
+                    "SELECT state, version FROM torrent_state WHERE source_infohash = ?",
                     (ts.source_infohash,),
                 ).fetchone()
                 if cur is None:
@@ -807,7 +829,10 @@ class StateStore:
         return self.list_waiting_ready(now=now, which="indexer")
 
     def list_waiting_ready(
-        self, now: dt.datetime | None = None, *, which: str = "both",
+        self,
+        now: dt.datetime | None = None,
+        *,
+        which: str = "both",
     ) -> list[TorrentState]:
         """WAITING_INDEXER rows whose indexer and/or public timer elapsed.
 
@@ -819,12 +844,11 @@ class StateStore:
         now = now or dt.datetime.now(dt.timezone.utc)
         clauses: list[str] = []
         if which in ("indexer", "both"):
-            clauses.append(
-                "(indexer_next_retry_at != '' AND indexer_next_retry_at <= ?)")
+            clauses.append("(indexer_next_retry_at != '' AND indexer_next_retry_at <= ?)")
         if which in ("public", "both"):
             clauses.append(
-                "(public_export_next_retry_at != '' "
-                "AND public_export_next_retry_at <= ?)")
+                "(public_export_next_retry_at != '' AND public_export_next_retry_at <= ?)"
+            )
         if not clauses:
             return []
         where = " OR ".join(clauses)
@@ -853,8 +877,11 @@ class StateStore:
         self._ensure_open()
         try:
             _mc = getattr(self, "_display_cache", None)
-            if (isinstance(_mc, tuple) and len(_mc) == 2
-                    and time.monotonic() - float(_mc[0]) < _DISPLAY_CACHE_S):
+            if (
+                isinstance(_mc, tuple)
+                and len(_mc) == 2
+                and time.monotonic() - float(_mc[0]) < _DISPLAY_CACHE_S
+            ):
                 return list(_mc[1])
         except Exception:
             pass
@@ -891,11 +918,12 @@ class StateStore:
             self._conn.execute(
                 "UPDATE torrent_state SET telegram_message_id = ?, "
                 "updated_at = ? WHERE source_infohash = ? AND deleted_at = ''",
-                (message_id, dt.datetime.now(dt.timezone.utc).isoformat(),
-                 norm),
+                (message_id, dt.datetime.now(dt.timezone.utc).isoformat(), norm),
             )
 
-    def all_active(self, include_blob: bool = False, limit: int | None = None) -> list[TorrentState]:
+    def all_active(
+        self, include_blob: bool = False, limit: int | None = None
+    ) -> list[TorrentState]:
         self._ensure_open()
         cols = _TORRENT_STATE_COLUMNS_NO_BLOB if not include_blob else "*"
         with self._lock:
@@ -917,7 +945,9 @@ class StateStore:
             ).fetchall()
             return [_row_to_state(r) for r in rows]
 
-    def all(self, include_blob: bool = False, limit: int | None = None, offset: int = 0) -> list[TorrentState]:
+    def all(
+        self, include_blob: bool = False, limit: int | None = None, offset: int = 0
+    ) -> list[TorrentState]:
         self._ensure_open()
         cols = "*" if include_blob else _TORRENT_STATE_COLUMNS_NO_BLOB
         with self._lock:
@@ -957,9 +987,13 @@ class StateStore:
         out: list[tuple[str, int, str]] = []
         for r in rows:
             try:
-                out.append((str(r["source_infohash"]),
-                            int(r["telegram_message_id"] or 0),
-                            str(r["state"] or "")))
+                out.append(
+                    (
+                        str(r["source_infohash"]),
+                        int(r["telegram_message_id"] or 0),
+                        str(r["state"] or ""),
+                    )
+                )
             except Exception:
                 continue
         return out
@@ -992,7 +1026,7 @@ class StateStore:
             return []
         for ext in (".mkv", ".mp4", ".avi", ".ts", ".m4v", ".torrent"):
             if clean_name.lower().endswith(ext):
-                clean_name = clean_name[:-len(ext)].strip()
+                clean_name = clean_name[: -len(ext)].strip()
                 break
         if not clean_name:
             # ".mkv" alone strips to nothing — same '%' hazard.
@@ -1039,9 +1073,7 @@ class StateStore:
             # resurrection window. Only an absent row may fall through.
             if self._is_tombstoned(norm):
                 return
-            self._conn.execute(
-                "DELETE FROM torrent_state WHERE source_infohash = ?", (norm,)
-            )
+            self._conn.execute("DELETE FROM torrent_state WHERE source_infohash = ?", (norm,))
             self._invalidate_display()
 
     def hard_delete(self, source_infohash: str) -> bool:
@@ -1058,9 +1090,7 @@ class StateStore:
         if not norm:
             return False
         with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM torrent_state WHERE source_infohash = ?", (norm,)
-            )
+            cur = self._conn.execute("DELETE FROM torrent_state WHERE source_infohash = ?", (norm,))
             if (cur.rowcount or 0) > 0:
                 self._invalidate_display()
             return (cur.rowcount or 0) > 0
@@ -1126,8 +1156,10 @@ class StateStore:
         """Hard-delete tombstones older than the TTL. Returns rows removed."""
         self._ensure_open()
         try:
-            cutoff = (dt.datetime.now(dt.timezone.utc)
-                      - dt.timedelta(seconds=max(0, int(ttl_seconds or 0)))).isoformat()
+            cutoff = (
+                dt.datetime.now(dt.timezone.utc)
+                - dt.timedelta(seconds=max(0, int(ttl_seconds or 0)))
+            ).isoformat()
         except (TypeError, ValueError):
             return 0
         with self._lock:
@@ -1157,8 +1189,7 @@ class StateStore:
             self._conn.execute(
                 "INSERT OR REPLACE INTO ignored_torrents "
                 "(source_infohash, source_name, created_at) VALUES (?,?,?)",
-                (norm, source_name or "",
-                 dt.datetime.now(dt.timezone.utc).isoformat()),
+                (norm, source_name or "", dt.datetime.now(dt.timezone.utc).isoformat()),
             )
 
     def unignore_torrent(self, source_infohash: str) -> bool:
@@ -1197,9 +1228,11 @@ class StateStore:
                 "FROM ignored_torrents ORDER BY created_at DESC"
             ).fetchall()
             return [
-                {"source_infohash": r["source_infohash"],
-                 "source_name": r["source_name"],
-                 "created_at": r["created_at"]}
+                {
+                    "source_infohash": r["source_infohash"],
+                    "source_name": r["source_name"],
+                    "created_at": r["created_at"],
+                }
                 for r in rows
             ]
 
@@ -1221,8 +1254,7 @@ class StateStore:
             return matches[0]
         if len(matches) > 1:
             preview = ", ".join(
-                f"{r['source_name']} ({(r['source_infohash'] or '')[:10]})"
-                for r in matches[:5]
+                f"{r['source_name']} ({(r['source_infohash'] or '')[:10]})" for r in matches[:5]
             )
             raise LookupError(
                 f"ignore target {target!r} matches {len(matches)} entries: {preview}; "
@@ -1232,8 +1264,9 @@ class StateStore:
 
     # ---- convenience ----
 
-    def transition(self, ts: TorrentState, dst: State,
-                   *, error: str = "", batch_index: int | None = None) -> None:
+    def transition(
+        self, ts: TorrentState, dst: State, *, error: str = "", batch_index: int | None = None
+    ) -> None:
         """Move a row to `dst`, refusing concurrent-move clobbers.
 
         The whole check-act sequence runs in one IMMEDIATE transaction:
@@ -1265,11 +1298,21 @@ class StateStore:
         # (SQLITE_FULL, locked, lost race) must leave the in-memory
         # object identical to the DB row.
         _snapshot = (
-            ts.state, ts.last_error, ts.move_stage, ts.move_plan,
-            ts.indexer_first_queried_at, ts.indexer_next_retry_at,
-            ts.indexer_attempts, ts.readd_first_attempted_at,
-            ts.readd_next_retry_at, ts.readd_attempts, ts.failed_retries,
-            ts.completed_at, ts.batch_index, ts.readd_cycles, ts.version,
+            ts.state,
+            ts.last_error,
+            ts.move_stage,
+            ts.move_plan,
+            ts.indexer_first_queried_at,
+            ts.indexer_next_retry_at,
+            ts.indexer_attempts,
+            ts.readd_first_attempted_at,
+            ts.readd_next_retry_at,
+            ts.readd_attempts,
+            ts.failed_retries,
+            ts.completed_at,
+            ts.batch_index,
+            ts.readd_cycles,
+            ts.version,
             ts.updated_at,
         )
         try:
@@ -1371,17 +1414,28 @@ class StateStore:
                     self._transition_write(ts, src, expected_version)
                     ts.version = expected_version + 1
         except Exception:
-            (ts.state, ts.last_error, ts.move_stage, ts.move_plan,
-             ts.indexer_first_queried_at, ts.indexer_next_retry_at,
-             ts.indexer_attempts, ts.readd_first_attempted_at,
-             ts.readd_next_retry_at, ts.readd_attempts, ts.failed_retries,
-             ts.completed_at, ts.batch_index, ts.readd_cycles,
-             ts.version, ts.updated_at) = _snapshot
+            (
+                ts.state,
+                ts.last_error,
+                ts.move_stage,
+                ts.move_plan,
+                ts.indexer_first_queried_at,
+                ts.indexer_next_retry_at,
+                ts.indexer_attempts,
+                ts.readd_first_attempted_at,
+                ts.readd_next_retry_at,
+                ts.readd_attempts,
+                ts.failed_retries,
+                ts.completed_at,
+                ts.batch_index,
+                ts.readd_cycles,
+                ts.version,
+                ts.updated_at,
+            ) = _snapshot
             raise
         log.info("state %s -> %s for %s", ts.source_infohash[:8], dst.value, ts.source_name)
 
-    def _transition_write(self, ts: TorrentState, src: State,
-                          expected_version: int) -> None:
+    def _transition_write(self, ts: TorrentState, src: State, expected_version: int) -> None:
         """Persist a transitioned row under the state+version guard.
 
         Same column semantics as upsert's conflict branch (blob kept when
@@ -1397,10 +1451,7 @@ class StateStore:
             if k in ("source_infohash", "created_at", "deleted_at", "version"):
                 continue
             if k == "cross_seed_blob":
-                sets.append(
-                    f"{k} = CASE WHEN length(?) > 0 THEN ? "
-                    f"ELSE torrent_state.{k} END"
-                )
+                sets.append(f"{k} = CASE WHEN length(?) > 0 THEN ? ELSE torrent_state.{k} END")
                 params.extend([v, v])
             else:
                 sets.append(f"{k} = ?")
@@ -1410,9 +1461,7 @@ class StateStore:
             f"UPDATE torrent_state SET {', '.join(sets)} "
             "WHERE source_infohash = ? AND state = ? AND version = ? "
             "AND deleted_at = ''",
-            (*params,
-             (ts.source_infohash or "").strip().lower(),
-             src.value, expected_version),
+            (*params, (ts.source_infohash or "").strip().lower(), src.value, expected_version),
         )
         if (cur.rowcount or 0) <= 0:
             raise AbandonedError(
@@ -1430,8 +1479,7 @@ class StateStore:
         except Exception:
             pass
 
-    def append_log(self, level: str, message: str,
-                   source_infohash: str | None = None) -> None:
+    def append_log(self, level: str, message: str, source_infohash: str | None = None) -> None:
         self._ensure_open()
         # Single transaction: a crash between INSERT and prune must never
         # leave the table over cap (or a prune without its insert).
@@ -1518,8 +1566,7 @@ class StateStore:
             cur = self._conn.execute(
                 "UPDATE torrent_state SET fuse_verified = ?, updated_at = ? "
                 "WHERE source_infohash = ? AND deleted_at = ''",
-                (1 if verified else 0,
-                 dt.datetime.now(dt.timezone.utc).isoformat(), norm),
+                (1 if verified else 0, dt.datetime.now(dt.timezone.utc).isoformat(), norm),
             )
             return (cur.rowcount or 0) > 0
 
@@ -1539,28 +1586,52 @@ class StateStore:
             cur = self._conn.execute(
                 "UPDATE torrent_state SET cross_seed_blob = ?, updated_at = ? "
                 "WHERE source_infohash = ? AND deleted_at = ''",
-                (bytes(blob), dt.datetime.now(dt.timezone.utc).isoformat(),
-                 norm),
+                (bytes(blob), dt.datetime.now(dt.timezone.utc).isoformat(), norm),
             )
             return (cur.rowcount or 0) > 0
 
     # Columns a narrow update may touch (everything but identity,
     # creation, and the tombstone stamp itself).
-    _UPDATABLE_COLUMNS = frozenset({
-        "dest_infohash", "source_name", "source_tracker",
-        "source_announce_url", "classification_kind", "total_bytes",
-        "save_path", "cross_seed_infohash", "cross_seed_source",
-        "cross_seed_blob", "injected_private_hashes",
-        "indexer_first_queried_at", "indexer_next_retry_at",
-        "indexer_attempts", "public_export_first_attempted_at",
-        "public_export_next_retry_at", "public_export_attempts",
-        "fuse_verified", "force_direct", "skipped", "readd_first_attempted_at",
-        "readd_next_retry_at", "readd_attempts", "failed_retries",
-        "completed_at", "vps1_last_activity_at", "state", "move_stage",
-        "move_plan", "batch_index", "batches_total", "batch_cap_bytes",
-        "readd_cycles", "last_error",
-        "telegram_message_id", "updated_at",
-    })
+    _UPDATABLE_COLUMNS = frozenset(
+        {
+            "dest_infohash",
+            "source_name",
+            "source_tracker",
+            "source_announce_url",
+            "classification_kind",
+            "total_bytes",
+            "save_path",
+            "cross_seed_infohash",
+            "cross_seed_source",
+            "cross_seed_blob",
+            "injected_private_hashes",
+            "indexer_first_queried_at",
+            "indexer_next_retry_at",
+            "indexer_attempts",
+            "public_export_first_attempted_at",
+            "public_export_next_retry_at",
+            "public_export_attempts",
+            "fuse_verified",
+            "force_direct",
+            "skipped",
+            "readd_first_attempted_at",
+            "readd_next_retry_at",
+            "readd_attempts",
+            "failed_retries",
+            "completed_at",
+            "vps1_last_activity_at",
+            "state",
+            "move_stage",
+            "move_plan",
+            "batch_index",
+            "batches_total",
+            "batch_cap_bytes",
+            "readd_cycles",
+            "last_error",
+            "telegram_message_id",
+            "updated_at",
+        }
+    )
 
     # Narrow writes touching only advisory/display columns below skip the
     # version bump: a background timer/display park must not invalidate
@@ -1569,18 +1640,31 @@ class StateStore:
     # are refreshed every tick, while a transition clobbering them loses
     # nothing durable. Everything else (routing, cursors, operator
     # intent, state) keeps the bump so concurrent moves still fail loud.
-    _UNVERSIONED_COLUMNS = frozenset({
-        "vps1_last_activity_at", "fuse_verified", "telegram_message_id",
-        "indexer_first_queried_at", "indexer_next_retry_at",
-        "indexer_attempts", "public_export_first_attempted_at",
-        "public_export_next_retry_at", "public_export_attempts",
-        "readd_first_attempted_at", "readd_next_retry_at",
-        "readd_attempts", "readd_cycles", "completed_at",
-    })
+    _UNVERSIONED_COLUMNS = frozenset(
+        {
+            "vps1_last_activity_at",
+            "fuse_verified",
+            "telegram_message_id",
+            "indexer_first_queried_at",
+            "indexer_next_retry_at",
+            "indexer_attempts",
+            "public_export_first_attempted_at",
+            "public_export_next_retry_at",
+            "public_export_attempts",
+            "readd_first_attempted_at",
+            "readd_next_retry_at",
+            "readd_attempts",
+            "readd_cycles",
+            "completed_at",
+        }
+    )
 
     def update_columns(
-        self, source_infohash: str, mapping: dict | None = None,
-        *, expected_state: State | None = None,
+        self,
+        source_infohash: str,
+        mapping: dict | None = None,
+        *,
+        expected_state: State | None = None,
         expected_version: int | None = None,
     ) -> int:
         """Narrow UPDATE of a few columns; returns the new revision (0 = no row).
@@ -1640,7 +1724,7 @@ class StateStore:
                 f"UPDATE torrent_state SET {', '.join(sets)}, "
                 f"updated_at = ?{_ver} "
                 f"WHERE {' AND '.join(clauses)}",
-                (*params[:len(sets)], now, *params[len(sets):]),
+                (*params[: len(sets)], now, *params[len(sets) :]),
             )
             if (cur.rowcount or 0) <= 0:
                 return 0
@@ -1658,9 +1742,8 @@ class StateStore:
                 return int(row["version"] or 0) if row else 0
             except (TypeError, ValueError):
                 return 0
-    
-    def set_vps1_activity(self, source_infohash: str,
-                          when: dt.datetime | None = None) -> bool:
+
+    def set_vps1_activity(self, source_infohash: str, when: dt.datetime | None = None) -> bool:
         """Stamp swarm-activity observation; True when a row was updated.
 
         Narrow UPDATE so the janitor's activity bump never clobbers
@@ -1685,9 +1768,7 @@ class StateStore:
             )
             return (cur.rowcount or 0) > 0
 
-    def list_public_retry_ready(
-        self, now: dt.datetime | None = None
-    ) -> list[TorrentState]:
+    def list_public_retry_ready(self, now: dt.datetime | None = None) -> list[TorrentState]:
         """Rows in WAITING_INDEXER whose public-export timer has elapsed.
 
         The public-export schedule is independent of the download-target
@@ -1695,7 +1776,6 @@ class StateStore:
         instead of sharing the indexer's max-age clock.
         """
         return self.list_waiting_ready(now=now, which="public")
-
 
 
 def _safe_state(value: object) -> State:
@@ -1774,36 +1854,37 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         source_name=row["source_name"] if "source_name" in keys else "",
         source_tracker=row["source_tracker"] if "source_tracker" in keys else "",
         source_announce_url=row["source_announce_url"] if "source_announce_url" in keys else "",
-        classification_kind=row["classification_kind"] if "classification_kind" in keys else "unknown",
+        classification_kind=row["classification_kind"]
+        if "classification_kind" in keys
+        else "unknown",
         total_bytes=_safe_int(row["total_bytes"]) if "total_bytes" in keys else 0,
         save_path=row["save_path"] if "save_path" in keys else "",
         cross_seed_infohash=row["cross_seed_infohash"] if "cross_seed_infohash" in keys else "",
         cross_seed_source=row["cross_seed_source"] if "cross_seed_source" in keys else "",
         cross_seed_blob=blob_bytes,
-        injected_private_hashes=row["injected_private_hashes"] if "injected_private_hashes" in keys else "",
+        injected_private_hashes=row["injected_private_hashes"]
+        if "injected_private_hashes" in keys
+        else "",
         indexer_first_queried_at=_safe_dt(idx_first),
         indexer_next_retry_at=_safe_dt(idx_next),
         indexer_attempts=_safe_int(idx_attempts),
         public_export_first_attempted_at=(
             _safe_dt(row["public_export_first_attempted_at"])
-            if ("public_export_first_attempted_at" in keys
-                and row["public_export_first_attempted_at"])
+            if (
+                "public_export_first_attempted_at" in keys
+                and row["public_export_first_attempted_at"]
+            )
             else None
         ),
         public_export_next_retry_at=(
             _safe_dt(row["public_export_next_retry_at"])
-            if ("public_export_next_retry_at" in keys
-                and row["public_export_next_retry_at"])
+            if ("public_export_next_retry_at" in keys and row["public_export_next_retry_at"])
             else None
         ),
         public_export_attempts=(
-            _safe_int(row["public_export_attempts"])
-            if "public_export_attempts" in keys else 0
+            _safe_int(row["public_export_attempts"]) if "public_export_attempts" in keys else 0
         ),
-        fuse_verified=(
-            _safe_int(row["fuse_verified"])
-            if "fuse_verified" in keys else 0
-        ),
+        fuse_verified=(_safe_int(row["fuse_verified"]) if "fuse_verified" in keys else 0),
         force_direct=_safe_int(row["force_direct"]) if "force_direct" in keys else 0,
         skipped=_safe_int(row["skipped"]) if "skipped" in keys else 0,
         readd_first_attempted_at=_safe_dt(ra_first),
@@ -1821,32 +1902,24 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
             else None
         ),
         state=_safe_state(row["state"]) if "state" in keys else State.NEW,
-        move_stage=(
-            str(row["move_stage"] or "")
-            if "move_stage" in keys else ""
-        ),
-        move_plan=(
-            str(row["move_plan"] or "")
-            if "move_plan" in keys else ""
-        ),
+        move_stage=(str(row["move_stage"] or "") if "move_stage" in keys else ""),
+        move_plan=(str(row["move_plan"] or "") if "move_plan" in keys else ""),
         batch_index=_safe_int(row["batch_index"]) if "batch_index" in keys else 0,
         batches_total=_safe_int(row["batches_total"]) if "batches_total" in keys else 0,
         batch_cap_bytes=_safe_int(row["batch_cap_bytes"]) if "batch_cap_bytes" in keys else 0,
         readd_cycles=_safe_int(row["readd_cycles"]) if "readd_cycles" in keys else 0,
         version=_safe_int(row["version"]) if "version" in keys else 0,
         last_error=row["last_error"] if "last_error" in keys else "",
-        created_at=(
-            _safe_dt(row["created_at"])
-            or dt.datetime.now(dt.timezone.utc)
-        ) if "created_at" in keys else dt.datetime.now(dt.timezone.utc),
-        updated_at=(
-            _safe_dt(row["updated_at"])
-            or dt.datetime.now(dt.timezone.utc)
-        ) if "updated_at" in keys else dt.datetime.now(dt.timezone.utc),
-        telegram_message_id=_safe_int(row["telegram_message_id"]) if "telegram_message_id" in keys else 0,
+        created_at=(_safe_dt(row["created_at"]) or dt.datetime.now(dt.timezone.utc))
+        if "created_at" in keys
+        else dt.datetime.now(dt.timezone.utc),
+        updated_at=(_safe_dt(row["updated_at"]) or dt.datetime.now(dt.timezone.utc))
+        if "updated_at" in keys
+        else dt.datetime.now(dt.timezone.utc),
+        telegram_message_id=_safe_int(row["telegram_message_id"])
+        if "telegram_message_id" in keys
+        else 0,
         deleted_at=(
-            _safe_dt(row["deleted_at"])
-            if ("deleted_at" in keys and row["deleted_at"])
-            else None
+            _safe_dt(row["deleted_at"]) if ("deleted_at" in keys and row["deleted_at"]) else None
         ),
     )

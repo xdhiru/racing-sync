@@ -52,7 +52,9 @@ def test_sftp_exporter_requires_auth():
 def test_sftp_config_rejects_empty_or_whitespace_password():
     from pydantic import ValidationError
 
-    with pytest.raises(ValidationError, match="Deluge SFTP requires ssh_password or ssh_key_path when enabled"):
+    with pytest.raises(
+        ValidationError, match="Deluge SFTP requires ssh_password or ssh_key_path when enabled"
+    ):
         DelugeSFTPConfig(
             enabled=True,
             ssh_host="localhost",
@@ -61,7 +63,9 @@ def test_sftp_config_rejects_empty_or_whitespace_password():
             state_dir=Path("/tmp"),
         )
 
-    with pytest.raises(ValidationError, match="Deluge SFTP requires ssh_password or ssh_key_path when enabled"):
+    with pytest.raises(
+        ValidationError, match="Deluge SFTP requires ssh_password or ssh_key_path when enabled"
+    ):
         DelugeSFTPConfig(
             enabled=True,
             ssh_host="localhost",
@@ -69,7 +73,6 @@ def test_sftp_config_rejects_empty_or_whitespace_password():
             ssh_password="   ",
             state_dir=Path("/tmp"),
         )
-
 
 
 def test_pool_size_config_defaults_and_validates():
@@ -115,8 +118,7 @@ def test_sftp_exporter_connect_closes_prior_connection():
     exporter._sftp = old_sftp
     exporter._client = old_client
 
-    with patch("racing_sync.sftp_source._ipv4_socket"), \
-         patch("paramiko.SSHClient") as mock_ssh_cls:
+    with patch("racing_sync.sftp_source._ipv4_socket"), patch("paramiko.SSHClient") as mock_ssh_cls:
         new_client = MagicMock()
         mock_ssh_cls.return_value = new_client
         new_client.open_sftp.return_value = MagicMock()
@@ -134,8 +136,7 @@ def test_pool_connect_opens_one_ssh_per_member():
     from racing_sync.sftp_source import SFTPExporter
 
     exporter = SFTPExporter(_sftp_cfg(), pool_size=3)
-    with patch("racing_sync.sftp_source._ipv4_socket"), \
-         patch("paramiko.SSHClient") as mock_ssh_cls:
+    with patch("racing_sync.sftp_source._ipv4_socket"), patch("paramiko.SSHClient") as mock_ssh_cls:
         client = MagicMock()
         mock_ssh_cls.return_value = client
         client.open_sftp.return_value = MagicMock()
@@ -191,8 +192,7 @@ def test_sftp_host_key_policy_defaults_to_reject():
 
     exporter = _SFTPConnection(_sftp_cfg())
 
-    with patch("racing_sync.sftp_source._ipv4_socket"), \
-         patch("paramiko.SSHClient") as mock_ssh_cls:
+    with patch("racing_sync.sftp_source._ipv4_socket"), patch("paramiko.SSHClient") as mock_ssh_cls:
         client = MagicMock()
         mock_ssh_cls.return_value = client
         client.open_sftp.return_value = MagicMock()
@@ -210,8 +210,7 @@ def test_sftp_host_key_policy_custom_known_hosts():
     known_hosts = Path("/tmp/custom_known_hosts")
     exporter = _SFTPConnection(_sftp_cfg(known_hosts_path=known_hosts))
 
-    with patch("racing_sync.sftp_source._ipv4_socket"), \
-         patch("paramiko.SSHClient") as mock_ssh_cls:
+    with patch("racing_sync.sftp_source._ipv4_socket"), patch("paramiko.SSHClient") as mock_ssh_cls:
         client = MagicMock()
         mock_ssh_cls.return_value = client
         client.open_sftp.return_value = MagicMock()
@@ -227,8 +226,7 @@ def test_sftp_host_key_policy_auto_add_opt_in():
 
     exporter = _SFTPConnection(_sftp_cfg(auto_add_host_key=True))
 
-    with patch("racing_sync.sftp_source._ipv4_socket"), \
-         patch("paramiko.SSHClient") as mock_ssh_cls:
+    with patch("racing_sync.sftp_source._ipv4_socket"), patch("paramiko.SSHClient") as mock_ssh_cls:
         client = MagicMock()
         mock_ssh_cls.return_value = client
         client.open_sftp.return_value = MagicMock()
@@ -266,8 +264,10 @@ def test_connect_failure_cleans_up_socket_and_client():
     exporter = _SFTPConnection(_sftp_cfg())
     mock_sock = MagicMock()
 
-    with patch("racing_sync.sftp_source._ipv4_socket", return_value=mock_sock), \
-         patch("paramiko.SSHClient") as mock_ssh_cls:
+    with (
+        patch("racing_sync.sftp_source._ipv4_socket", return_value=mock_sock),
+        patch("paramiko.SSHClient") as mock_ssh_cls,
+    ):
         client = MagicMock()
         mock_ssh_cls.return_value = client
         client.connect.side_effect = RuntimeError("auth error")
@@ -285,9 +285,7 @@ def test_fetch_torrent_uses_posix_path_and_caps_read():
     from unittest.mock import MagicMock
     from racing_sync.sftp_source import MAX_TORRENT_BYTES
 
-    exporter = _SFTPConnection(
-        _sftp_cfg(state_dir=Path(r"\var\data\deluge\state"))
-    )
+    exporter = _SFTPConnection(_sftp_cfg(state_dir=Path(r"\var\data\deluge\state")))
     mock_client = MagicMock()
     mock_client.get_transport().is_active.return_value = True
     mock_sftp = MagicMock()
@@ -511,7 +509,8 @@ def test_pool_connect_failure_closes_all_members():
     exporter._members = members
 
     with patch.object(
-        _SFTPConnection, "connect",
+        _SFTPConnection,
+        "connect",
         side_effect=[None, RuntimeError("boom"), None],
     ):
         with pytest.raises(RuntimeError, match="boom"):
@@ -578,8 +577,7 @@ def test_listdir_streams_without_full_fetch():
         SimpleNamespace(filename="notes.txt"),
     ]
     m._sftp.listdir_iter = MagicMock(return_value=iter(entries))
-    m._sftp.listdir_attr = MagicMock(
-        side_effect=AssertionError("must stream, not bulk-fetch"))
+    m._sftp.listdir_attr = MagicMock(side_effect=AssertionError("must stream, not bulk-fetch"))
 
     assert m._list_state_dir_locked() == ["a" * 40]
 
@@ -591,9 +589,11 @@ def test_listdir_falls_back_without_iter():
 
     m = _live_member(_sftp_cfg())
     m._sftp.listdir_iter = None
-    m._sftp.listdir_attr = MagicMock(return_value=[
-        SimpleNamespace(filename="b" * 40 + ".torrent"),
-    ])
+    m._sftp.listdir_attr = MagicMock(
+        return_value=[
+            SimpleNamespace(filename="b" * 40 + ".torrent"),
+        ]
+    )
     assert m._list_state_dir_locked() == ["b" * 40]
 
 
@@ -612,6 +612,7 @@ def test_pool_connect_timeout(monkeypatch):
     monkeypatch.setattr(SFTPExporter, "_DIAL_TIMEOUT_S", 0.2)
 
     import time
+
     t0 = time.monotonic()
     with pytest.raises(SFTPError, match="timed out"):
         exporter.connect()
@@ -627,8 +628,7 @@ def test_connect_sets_sftp_channel_timeout():
     from racing_sync.sftp_source import _SFTPConnection, _SFTP_IO_TIMEOUT_S
 
     exporter = _SFTPConnection(_sftp_cfg())
-    with patch("racing_sync.sftp_source._ipv4_socket"), \
-         patch("paramiko.SSHClient") as mock_ssh_cls:
+    with patch("racing_sync.sftp_source._ipv4_socket"), patch("paramiko.SSHClient") as mock_ssh_cls:
         new_client = MagicMock()
         mock_ssh_cls.return_value = new_client
         sftp = MagicMock()
@@ -636,8 +636,7 @@ def test_connect_sets_sftp_channel_timeout():
 
         exporter.connect()
 
-        sftp.get_channel.return_value.settimeout.assert_called_once_with(
-            _SFTP_IO_TIMEOUT_S)
+        sftp.get_channel.return_value.settimeout.assert_called_once_with(_SFTP_IO_TIMEOUT_S)
 
 
 def test_connect_survives_channel_timeout_failure():
@@ -647,8 +646,7 @@ def test_connect_survives_channel_timeout_failure():
     from racing_sync.sftp_source import _SFTPConnection
 
     exporter = _SFTPConnection(_sftp_cfg())
-    with patch("racing_sync.sftp_source._ipv4_socket"), \
-         patch("paramiko.SSHClient") as mock_ssh_cls:
+    with patch("racing_sync.sftp_source._ipv4_socket"), patch("paramiko.SSHClient") as mock_ssh_cls:
         new_client = MagicMock()
         mock_ssh_cls.return_value = new_client
         sftp = MagicMock()
@@ -721,6 +719,7 @@ def test_pool_fetch_many_fans_out():
         peak = max(peak, in_flight)
         try:
             import time as _time
+
             _time.sleep(0.05)
             return real_fetch(self, h)
         finally:
@@ -756,4 +755,3 @@ def test_df_parses_wrapped_last_line():
     exporter._sftp = mock_sftp
 
     assert exporter.disk_free_bytes("/home") == 4000000 * 1024
-

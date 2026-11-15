@@ -40,16 +40,18 @@ def _mk_blob(announce: str) -> bytes:
     # padding, `source` tag), giving distinct hashes for identical filenames.
     # Embed the tracker in `info.source` so public+privates are distinct
     # hashes sharing one filename — the reported incident shape.
-    return _bencode({
-        b"announce": announce.encode(),
-        b"info": {
-            b"name": FNAME.encode(),
-            b"length": FSIZE,
-            b"piece length": 262144,
-            b"pieces": b"12345678901234567890",
-            b"source": announce.encode(),
-        },
-    })
+    return _bencode(
+        {
+            b"announce": announce.encode(),
+            b"info": {
+                b"name": FNAME.encode(),
+                b"length": FSIZE,
+                b"piece length": 262144,
+                b"pieces": b"12345678901234567890",
+                b"source": announce.encode(),
+            },
+        }
+    )
 
 
 class _FakeSource:
@@ -60,11 +62,19 @@ class _FakeSource:
         self.blobs = {}
         for blob, ann in zip(blobs, announces, strict=True):
             ih, name, size, _ = _bencoded_info_hash(blob)
-            self.torrents.append(Torrent(
-                hash=ih.lower(), name=name, category="", save_path="",
-                size_bytes=size, state="seeding", progress=1.0,
-                trackers=[ann], added_on=0,
-            ))
+            self.torrents.append(
+                Torrent(
+                    hash=ih.lower(),
+                    name=name,
+                    category="",
+                    save_path="",
+                    size_bytes=size,
+                    state="seeding",
+                    progress=1.0,
+                    trackers=[ann],
+                    added_on=0,
+                )
+            )
             self.blobs[ih.lower()] = blob
 
     async def list_torrents(self, *, category=None, hashes=None):
@@ -95,9 +105,14 @@ class _FakeDest:
         ih, name, size, _ = _bencoded_info_hash(blob)
         files = extract_torrent_files_from_bencoded(blob)
         self.entries[ih.lower()] = {
-            "name": name, "save_path": save_path, "category": category,
-            "files": files, "size": size, "progress": progress,
-            "paused": True, "blob": blob,
+            "name": name,
+            "save_path": save_path,
+            "category": category,
+            "files": files,
+            "size": size,
+            "progress": progress,
+            "paused": True,
+            "blob": blob,
         }
         return ih.lower()
 
@@ -108,10 +123,14 @@ class _FakeDest:
         else:
             state = "seeding" if e["progress"] >= 1.0 else "downloading"
         t = Torrent(
-            hash=h.lower(), name=e["name"], category=e["category"],
-            save_path=e["save_path"], size_bytes=e["size"],
+            hash=h.lower(),
+            name=e["name"],
+            category=e["category"],
+            save_path=e["save_path"],
+            size_bytes=e["size"],
             state=state,
-            progress=e["progress"], trackers=[],
+            progress=e["progress"],
+            trackers=[],
         )
         t.files = list(e["files"])
         return t
@@ -137,9 +156,18 @@ class _FakeDest:
     async def get_trackers(self, h: str):
         return []
 
-    async def add_torrent(self, *, urls=None, torrent_files=None, save_path,
-                          category="", paused=True, skip_check=False,
-                          content_layout=None, tags=None):
+    async def add_torrent(
+        self,
+        *,
+        urls=None,
+        torrent_files=None,
+        save_path,
+        category="",
+        paused=True,
+        skip_check=False,
+        content_layout=None,
+        tags=None,
+    ):
         blob = torrent_files[0]
         ih, name, size, _ = _bencoded_info_hash(blob)
         ih = ih.lower()
@@ -148,10 +176,14 @@ class _FakeDest:
             return AddResult(hash=ih, accepted=False, detail="Fails.")
         files = extract_torrent_files_from_bencoded(blob)
         self.entries[ih] = {
-            "name": name, "save_path": save_path, "category": category,
-            "files": files, "size": size,
+            "name": name,
+            "save_path": save_path,
+            "category": category,
+            "files": files,
+            "size": size,
             "progress": 1.0 if skip_check else 0.0,
-            "paused": paused, "blob": blob,
+            "paused": paused,
+            "blob": blob,
         }
         return AddResult(hash=None, accepted=True, detail="Ok.")
 
@@ -228,6 +260,7 @@ def _rclone_fake(ssd: Path, fuse: Path, calls: list):
             # (TTL expires naturally); instant fakes must invalidate.
             try:
                 from racing_sync.coordinator_paths import fuse_stat_invalidate
+
                 fuse_stat_invalidate(dst)
             except Exception:
                 pass
@@ -353,8 +386,9 @@ async def test_fresh_db_unadopted_ssd_public_moves_before_injecting(tmp_path: Pa
     assert store.all() == []
 
     # Mimic _tick discovery of the public primary.
-    ts = TorrentState(source_infohash=pub_hash, source_name=FNAME,
-                      total_bytes=FSIZE, state=State.NEW)
+    ts = TorrentState(
+        source_infohash=pub_hash, source_name=FNAME, total_bytes=FSIZE, state=State.NEW
+    )
     store.upsert(ts)
     await coord._process_torrent_inner(store.get(pub_hash))
     row = store.get(pub_hash)
@@ -401,8 +435,12 @@ async def test_false_done_with_ssd_save_path_demotes_and_moves_before_injecting(
 
     # Pre-fix DONE row pointing at SSD (move never ran).
     ts = TorrentState(
-        source_infohash=pub_hash, source_name=FNAME, dest_infohash=pub_hash,
-        save_path=str(ssd), total_bytes=FSIZE, state=State.DONE,
+        source_infohash=pub_hash,
+        source_name=FNAME,
+        dest_infohash=pub_hash,
+        save_path=str(ssd),
+        total_bytes=FSIZE,
+        state=State.DONE,
     )
     store.upsert(ts)
 
@@ -427,7 +465,9 @@ async def test_false_done_with_ssd_save_path_demotes_and_moves_before_injecting(
     assert not (ssd / FNAME).exists()
     fuse_adds = [e for e in dest.events if e[0] == "add" and e[2] == str(fuse)]
     assert {e[1] for e in fuse_adds} == {pub_hash, *priv_hashes}
-    assert max(dest.events.index(e) for e in rclone_evts) < min(dest.events.index(e) for e in fuse_adds)
+    assert max(dest.events.index(e) for e in rclone_evts) < min(
+        dest.events.index(e) for e in fuse_adds
+    )
     assert row.state == State.DONE
 
 
@@ -457,8 +497,12 @@ async def test_false_done_claiming_fuse_but_ssd_bytes_demotes(tmp_path: Path):
 
     # DB claims fuse, but the file only exists on SSD.
     ts = TorrentState(
-        source_infohash=pub_hash, source_name=FNAME, dest_infohash=pub_hash,
-        save_path=str(fuse), total_bytes=FSIZE, state=State.DONE,
+        source_infohash=pub_hash,
+        source_name=FNAME,
+        dest_infohash=pub_hash,
+        save_path=str(fuse),
+        total_bytes=FSIZE,
+        state=State.DONE,
     )
     store.upsert(ts)
 
@@ -490,8 +534,12 @@ async def test_false_done_with_no_new_arrivals_still_demotes(tmp_path: Path):
     coord = _make_coord(ssd, fuse, store, src, dest)
 
     ts = TorrentState(
-        source_infohash=pub_hash, source_name=FNAME, dest_infohash=pub_hash,
-        save_path=str(ssd), total_bytes=FSIZE, state=State.DONE,
+        source_infohash=pub_hash,
+        source_name=FNAME,
+        dest_infohash=pub_hash,
+        save_path=str(ssd),
+        total_bytes=FSIZE,
+        state=State.DONE,
     )
     store.upsert(ts)
 
@@ -528,9 +576,14 @@ async def test_done_stale_save_path_repairs_forward_when_fuse_healthy(tmp_path: 
     coord = _make_coord(ssd, fuse, store, src, dest)
 
     ts = TorrentState(
-        source_infohash=pub_hash, source_name=FNAME, dest_infohash=pub_hash,
-        save_path=str(ssd), total_bytes=FSIZE, state=State.DONE,
-        cross_seed_blob=pub_blob, injected_private_hashes=pub_hash,
+        source_infohash=pub_hash,
+        source_name=FNAME,
+        dest_infohash=pub_hash,
+        save_path=str(ssd),
+        total_bytes=FSIZE,
+        state=State.DONE,
+        cross_seed_blob=pub_blob,
+        injected_private_hashes=pub_hash,
     )
     store.upsert(ts)
 
@@ -562,9 +615,14 @@ async def test_re_add_success_points_save_path_at_fuse(tmp_path: Path):
     coord = _make_coord(ssd, fuse, store, src, dest)
 
     ts = TorrentState(
-        source_infohash=pub_hash, source_name=FNAME, dest_infohash=pub_hash,
-        cross_seed_infohash=pub_hash, cross_seed_blob=pub_blob,
-        save_path=str(ssd), total_bytes=FSIZE, state=State.RE_ADDING,
+        source_infohash=pub_hash,
+        source_name=FNAME,
+        dest_infohash=pub_hash,
+        cross_seed_infohash=pub_hash,
+        cross_seed_blob=pub_blob,
+        save_path=str(ssd),
+        total_bytes=FSIZE,
+        state=State.RE_ADDING,
     )
     store.upsert(ts)
 
@@ -589,17 +647,22 @@ async def test_demote_false_done_keeps_concurrent_columns(tmp_path: Path):
         coord = make_coordinator(store)
         coord.cfg = MagicMock()
         coord.dest_client = AsyncMock()
-        coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-            TorrentFile(name="Solo.mkv", size_bytes=100, progress=1.0)])
-        store.upsert(TorrentState(
-            source_infohash="a" * 40, source_name="Solo",
-            dest_infohash="a" * 40, save_path=str(ssd),
-            state=State.DONE))
+        coord.dest_client.get_torrent_files = AsyncMock(
+            return_value=[TorrentFile(name="Solo.mkv", size_bytes=100, progress=1.0)]
+        )
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Solo",
+                dest_infohash="a" * 40,
+                save_path=str(ssd),
+                state=State.DONE,
+            )
+        )
         snap = store.get("a" * 40)
         # Concurrent timer park lands after our snapshot.
         store.update_columns("a" * 40, {"indexer_attempts": 7})
-        with patch("racing_sync.recovery.find_content_on_ssd",
-                   return_value=ssd):
+        with patch("racing_sync.recovery.find_content_on_ssd", return_value=ssd):
             await coord._demote_false_done_to_moving(snap)
         row = store.get("a" * 40)
         assert row.state == State.MOVING
@@ -621,8 +684,7 @@ async def test_late_seed_defers_unseen_rows_after_boot():
     coord.dest_client = AsyncMock()
     coord.source_client = AsyncMock()
     for h in ("a" * 40, "b" * 40):
-        ts = TorrentState(source_infohash=h, source_name="Show",
-                          state=State.DONE)
+        ts = TorrentState(source_infohash=h, source_name="Show", state=State.DONE)
         await coord._check_and_inject_late_cross_seeds(ts, [])
     assert coord.dest_client.mock_calls == []
     assert coord.source_client.mock_calls == []

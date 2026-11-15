@@ -1,4 +1,5 @@
 """P8: admit-time stop-duplicate with recorded deferrals."""
+
 from __future__ import annotations
 
 import pytest
@@ -23,8 +24,8 @@ def _coord_with_store(tmp_path, **kw):
 
 def _mkrow(h, name, state, size=1000):
     from racing_sync.state import TorrentState
-    return TorrentState(source_infohash=h, source_name=name,
-                        state=state, total_bytes=size)
+
+    return TorrentState(source_infohash=h, source_name=name, state=state, total_bytes=size)
 
 
 @pytest.mark.anyio
@@ -38,9 +39,16 @@ async def test_do_new_defers_to_inflight_sibling(tmp_path):
     coord.store.upsert(_mkrow("o" * 40, "Twin.Show.S01E01", State.QUEUED))
     waiter = _mkrow("w" * 40, "Twin.Show.S01E01", State.NEW)
     coord.store.upsert(waiter)
-    snap = Torrent(hash="w" * 40, name="Twin.Show.S01E01", category="racing",
-                   save_path="/vps1", size_bytes=1000, state="seeding",
-                   progress=1.0, trackers=[])
+    snap = Torrent(
+        hash="w" * 40,
+        name="Twin.Show.S01E01",
+        category="racing",
+        save_path="/vps1",
+        size_bytes=1000,
+        state="seeding",
+        progress=1.0,
+        trackers=[],
+    )
     coord._source_torrents_cache = [snap]
     coord.source_client.get_torrent = AsyncMock(return_value=snap)
     coord._pick_and_admit = AsyncMock()
@@ -62,9 +70,16 @@ async def test_do_new_picks_without_sibling(tmp_path):
     coord = _coord_with_store(tmp_path)
     waiter = _mkrow("w" * 40, "Solo.Show.S01E01", State.NEW)
     coord.store.upsert(waiter)
-    snap = Torrent(hash="w" * 40, name="Solo.Show.S01E01", category="racing",
-                   save_path="/vps1", size_bytes=1000, state="seeding",
-                   progress=1.0, trackers=[])
+    snap = Torrent(
+        hash="w" * 40,
+        name="Solo.Show.S01E01",
+        category="racing",
+        save_path="/vps1",
+        size_bytes=1000,
+        state="seeding",
+        progress=1.0,
+        trackers=[],
+    )
     coord._source_torrents_cache = [snap]
     coord.source_client.get_torrent = AsyncMock(return_value=snap)
     coord._pick_and_admit = AsyncMock()
@@ -109,9 +124,16 @@ async def test_waiting_indexer_owner_gone_clears_and_picks(tmp_path):
     waiter = _mkrow("w" * 40, "Twin.Show.S01E01", State.WAITING_INDEXER)
     coord.store.upsert(waiter)
     coord._deferred_on = {"w" * 40: "o" * 40}
-    snap = Torrent(hash="w" * 40, name="Twin.Show.S01E01", category="racing",
-                   save_path="/vps1", size_bytes=1000, state="seeding",
-                   progress=1.0, trackers=[])
+    snap = Torrent(
+        hash="w" * 40,
+        name="Twin.Show.S01E01",
+        category="racing",
+        save_path="/vps1",
+        size_bytes=1000,
+        state="seeding",
+        progress=1.0,
+        trackers=[],
+    )
     coord._source_torrents_cache = [snap]
     coord.source_client.get_torrent = AsyncMock(return_value=snap)
     coord._pick_and_admit = AsyncMock()

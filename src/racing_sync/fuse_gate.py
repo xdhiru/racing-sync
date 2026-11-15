@@ -134,9 +134,7 @@ async def verify_blob_on_mount(
     return FuseVerdict.PRESENT, [], expected or []
 
 
-async def skipped_present(
-    mount: Path | str, items: list[tuple[str, int]]
-) -> set[str]:
+async def skipped_present(mount: Path | str, items: list[tuple[str, int]]) -> set[str]:
     """Subset of names already size-verified on mount (fail-open empty).
 
     Strict equality (actual == want), matching legacy _fuse_skipped:

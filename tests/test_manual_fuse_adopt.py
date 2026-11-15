@@ -63,8 +63,13 @@ async def test_new_adopts_manual_fuse_without_category(tmp_path: Path):
     coord.source_client = AsyncMock()
     coord.source_client.get_torrent = AsyncMock(
         return_value=Torrent(
-            hash=h, name="Pack.2026", category="", save_path="",
-            size_bytes=100, state="seeding", progress=1.0,
+            hash=h,
+            name="Pack.2026",
+            category="",
+            save_path="",
+            size_bytes=100,
+            state="seeding",
+            progress=1.0,
             trackers=["https://tracker.animebytes.tv/announce"],
         )
     )
@@ -114,8 +119,13 @@ async def test_waiting_indexer_adopts_manual_fuse(tmp_path: Path):
     coord.source_client = AsyncMock()
     coord.source_client.get_torrent = AsyncMock(
         return_value=Torrent(
-            hash=h, name="Pack.2026", category="", save_path="",
-            size_bytes=100, state="seeding", progress=1.0,
+            hash=h,
+            name="Pack.2026",
+            category="",
+            save_path="",
+            size_bytes=100,
+            state="seeding",
+            progress=1.0,
             trackers=["https://beta.me/announce"],
         )
     )
@@ -184,8 +194,13 @@ async def test_manual_fuse_incomplete_or_off_fuse_does_not_adopt(tmp_path: Path)
     coord.dest_client.list_torrents = AsyncMock(
         return_value=[
             Torrent(
-                hash=h1, name="Pack.2026", category="", save_path=str(fuse),
-                size_bytes=100, state="downloading", progress=0.5,
+                hash=h1,
+                name="Pack.2026",
+                category="",
+                save_path=str(fuse),
+                size_bytes=100,
+                state="downloading",
+                progress=0.5,
             )
         ]
     )
@@ -200,9 +215,13 @@ async def test_manual_fuse_incomplete_or_off_fuse_does_not_adopt(tmp_path: Path)
     coord.dest_client.list_torrents = AsyncMock(
         return_value=[
             Torrent(
-                hash=h2, name="Pack.2026", category="racing",
-                save_path="/local/ssd", size_bytes=100,
-                state="seeding", progress=1.0,
+                hash=h2,
+                name="Pack.2026",
+                category="racing",
+                save_path="/local/ssd",
+                size_bytes=100,
+                state="seeding",
+                progress=1.0,
             )
         ]
     )
@@ -294,8 +313,7 @@ async def test_adopt_skipped_when_sweep_covered(tmp_path: Path):
     lookup; rows with live workers still check."""
     store = StateStore(tmp_path / "state.db")
     h = "f" * 40
-    store.upsert(TorrentState(source_infohash=h, source_name="Pack",
-                              state=State.NEW))
+    store.upsert(TorrentState(source_infohash=h, source_name="Pack", state=State.NEW))
     coord = make_coordinator()
     coord.store = store
     coord._running_infohashes = set()
@@ -328,12 +346,18 @@ async def test_queued_prefers_fuse_complete_over_ssd(tmp_path: Path):
     ssd = tmp_path / "ssd"
     ssd.mkdir()
     h = "g" * 40
-    blob = bytes(_bencode({
-        b"info": {b"name": b"Pack.2026.mkv", b"length": 100},
-    }))
-    store.upsert(TorrentState(
-        source_infohash=h, source_name="Pack.2026", state=State.QUEUED,
-        cross_seed_blob=blob))
+    blob = bytes(
+        _bencode(
+            {
+                b"info": {b"name": b"Pack.2026.mkv", b"length": 100},
+            }
+        )
+    )
+    store.upsert(
+        TorrentState(
+            source_infohash=h, source_name="Pack.2026", state=State.QUEUED, cross_seed_blob=blob
+        )
+    )
 
     coord = make_coordinator()
     coord.store = store
@@ -341,15 +365,22 @@ async def test_queued_prefers_fuse_complete_over_ssd(tmp_path: Path):
     (fuse / "Pack.2026.mkv").write_bytes(b"x" * 100)
     coord.dest_client = AsyncMock()
     # SSD entry listed first: must lose to the fuse-complete copy.
-    coord.dest_client.list_torrents = AsyncMock(return_value=[
-        Torrent(hash=h, name="Pack.2026", category="racing",
-                save_path=str(ssd), size_bytes=100,
-                state="seeding", progress=1.0),
-        _seeded_fuse_torrent(fuse, h, "Pack.2026"),
-    ])
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash=h,
+                name="Pack.2026",
+                category="racing",
+                save_path=str(ssd),
+                size_bytes=100,
+                state="seeding",
+                progress=1.0,
+            ),
+            _seeded_fuse_torrent(fuse, h, "Pack.2026"),
+        ]
+    )
     coord.dest_client.get_torrent_files = AsyncMock(
-        return_value=[TorrentFile(name="Pack.2026.mkv", size_bytes=100,
-                                  progress=1.0)]
+        return_value=[TorrentFile(name="Pack.2026.mkv", size_bytes=100, progress=1.0)]
     )
     try:
         await coord._do_queued(store.get(h))
@@ -370,12 +401,18 @@ async def test_queued_reinject_releases_download_slot(tmp_path: Path):
 
     store = StateStore(tmp_path / "state.db")
     h = "r" * 40
-    blob = bytes(_bencode({
-        b"info": {b"name": b"Pack.2026.mkv", b"length": 100},
-    }))
-    store.upsert(TorrentState(
-        source_infohash=h, source_name="Pack.2026", state=State.QUEUED,
-        cross_seed_blob=blob))
+    blob = bytes(
+        _bencode(
+            {
+                b"info": {b"name": b"Pack.2026.mkv", b"length": 100},
+            }
+        )
+    )
+    store.upsert(
+        TorrentState(
+            source_infohash=h, source_name="Pack.2026", state=State.QUEUED, cross_seed_blob=blob
+        )
+    )
 
     coord = make_coordinator()
     coord.store = store
@@ -384,10 +421,10 @@ async def test_queued_reinject_releases_download_slot(tmp_path: Path):
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
     coord.dest_client = AsyncMock()
     coord.dest_client.list_torrents = AsyncMock(
-        return_value=[_seeded_fuse_torrent(fuse, h, "Pack.2026")])
+        return_value=[_seeded_fuse_torrent(fuse, h, "Pack.2026")]
+    )
     coord.dest_client.get_torrent_files = AsyncMock(
-        return_value=[TorrentFile(name="Pack.2026.mkv", size_bytes=100,
-                                  progress=1.0)]
+        return_value=[TorrentFile(name="Pack.2026.mkv", size_bytes=100, progress=1.0)]
     )
     sem = asyncio.Semaphore(1)
     coord._download_sem = sem
@@ -417,8 +454,13 @@ def _category_seed(fuse: Path, h: str, name: str, files: list[tuple[str, int]]):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"x" * size)
     entry = Torrent(
-        hash=h, name=name, category="SUB", save_path=str(cat),
-        size_bytes=sum(size for _, size in files), state="seeding", progress=1.0,
+        hash=h,
+        name=name,
+        category="SUB",
+        save_path=str(cat),
+        size_bytes=sum(size for _, size in files),
+        state="seeding",
+        progress=1.0,
     )
     return cat, entry
 
@@ -432,9 +474,14 @@ async def test_re_add_adopts_seed_under_category_subfolder(tmp_path: Path):
     """
     store = StateStore(tmp_path / "state.db")
     h = "9" * 40
-    store.upsert(TorrentState(
-        source_infohash=h, source_name="voices38-demon.slayer",
-        dest_infohash=h, state=State.RE_ADDING))
+    store.upsert(
+        TorrentState(
+            source_infohash=h,
+            source_name="voices38-demon.slayer",
+            dest_infohash=h,
+            state=State.RE_ADDING,
+        )
+    )
 
     coord = make_coordinator()
     coord.store = store
@@ -442,7 +489,9 @@ async def test_re_add_adopts_seed_under_category_subfolder(tmp_path: Path):
     fuse.mkdir()
     (fuse / "unsorted").mkdir()
     cat, entry = _category_seed(
-        fuse, h, "voices38-demon.slayer",
+        fuse,
+        h,
+        "voices38-demon.slayer",
         [("voices38.nfo", 10), ("game.iso", 90)],
     )
     coord.cfg.rclone.fuse.mount = fuse
@@ -454,12 +503,15 @@ async def test_re_add_adopts_seed_under_category_subfolder(tmp_path: Path):
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
     coord.dest_client = AsyncMock()
     coord.dest_client.list_torrents = AsyncMock(return_value=[entry])
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="voices38.nfo", size_bytes=10, progress=1.0),
-        TorrentFile(name="game.iso", size_bytes=90, progress=1.0),
-    ])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="voices38.nfo", size_bytes=10, progress=1.0),
+            TorrentFile(name="game.iso", size_bytes=90, progress=1.0),
+        ]
+    )
     coord.dest_client.add_torrent = AsyncMock(
-        side_effect=AssertionError("already seeding; must not re-add"))
+        side_effect=AssertionError("already seeding; must not re-add")
+    )
 
     try:
         await coord._do_re_add(store.get(h))
@@ -476,15 +528,19 @@ async def test_reconcile_keeps_done_seed_under_other_category(tmp_path: Path):
     """DONE row hidden from the racing snapshot keeps DONE via hash lookup."""
     store = StateStore(tmp_path / "state.db")
     h = "8" * 40
-    store.upsert(TorrentState(
-        source_infohash=h, source_name="voices38-demon.slayer",
-        dest_infohash=h, state=State.DONE))
+    store.upsert(
+        TorrentState(
+            source_infohash=h,
+            source_name="voices38-demon.slayer",
+            dest_infohash=h,
+            state=State.DONE,
+        )
+    )
 
     fuse = tmp_path / "fuse"
     fuse.mkdir()
     (fuse / "unsorted").mkdir()
-    cat, entry = _category_seed(
-        fuse, h, "voices38-demon.slayer", [("game.iso", 100)])
+    cat, entry = _category_seed(fuse, h, "voices38-demon.slayer", [("game.iso", 100)])
 
     cfg = MagicMock()
     cfg.rclone.fuse.mount = fuse
@@ -501,9 +557,11 @@ async def test_reconcile_keeps_done_seed_under_other_category(tmp_path: Path):
         return [entry]
 
     dest.list_torrents = AsyncMock(side_effect=_list)
-    dest.get_torrent_files = AsyncMock(return_value=[
-        TorrentFile(name="game.iso", size_bytes=100, progress=1.0),
-    ])
+    dest.get_torrent_files = AsyncMock(
+        return_value=[
+            TorrentFile(name="game.iso", size_bytes=100, progress=1.0),
+        ]
+    )
 
     try:
         report = await reconcile(cfg, dest=dest, store=store)
@@ -516,17 +574,22 @@ async def test_reconcile_keeps_done_seed_under_other_category(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_queued_incomplete_fuse_entry_routes_to_readd(
-        tmp_path: Path, caplog):
+async def test_queued_incomplete_fuse_entry_routes_to_readd(tmp_path: Path, caplog):
     """An incomplete fuse entry is never adopted as an SSD download."""
     store = StateStore(tmp_path / "state.db")
     ssd = tmp_path / "ssd"
     ssd.mkdir()
     h = "i" * 40
     keep_path = str(ssd / "Pack.2026")
-    store.upsert(TorrentState(
-        source_infohash=h, source_name="Pack.2026", state=State.QUEUED,
-        save_path=keep_path, cross_seed_blob=b"blob"))
+    store.upsert(
+        TorrentState(
+            source_infohash=h,
+            source_name="Pack.2026",
+            state=State.QUEUED,
+            save_path=keep_path,
+            cross_seed_blob=b"blob",
+        )
+    )
 
     coord = make_coordinator()
     coord.store = store
@@ -534,14 +597,23 @@ async def test_queued_incomplete_fuse_entry_routes_to_readd(
     coord.cfg.dest.save_path = ssd
     coord.cfg.ssd.path = ssd
     coord.dest_client = AsyncMock()
-    coord.dest_client.list_torrents = AsyncMock(return_value=[Torrent(
-        hash=h, name="Pack.2026", category="racing", save_path=str(fuse),
-        size_bytes=100, state="downloading", progress=0.5)])
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash=h,
+                name="Pack.2026",
+                category="racing",
+                save_path=str(fuse),
+                size_bytes=100,
+                state="downloading",
+                progress=0.5,
+            )
+        ]
+    )
     coord._prepare_next_batch = AsyncMock()
     coord._park_queued_for_download_slot = AsyncMock(return_value=False)
     try:
-        with caplog.at_level(logging.WARNING,
-                             logger="racing_sync.coordinator"):
+        with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
             await coord._do_queued(store.get(h))
         row = store.get(h)
         assert row.state == State.RE_ADDING
@@ -563,9 +635,11 @@ async def test_queued_foreign_existing_entry_fails_closed(tmp_path: Path):
     ssd.mkdir()
     h = "j" * 40
     foreign = "/etc/foreign"
-    store.upsert(TorrentState(
-        source_infohash=h, source_name="Pack.2026", state=State.QUEUED,
-        cross_seed_blob=b"blob"))
+    store.upsert(
+        TorrentState(
+            source_infohash=h, source_name="Pack.2026", state=State.QUEUED, cross_seed_blob=b"blob"
+        )
+    )
 
     coord = make_coordinator()
     coord.store = store
@@ -573,9 +647,19 @@ async def test_queued_foreign_existing_entry_fails_closed(tmp_path: Path):
     coord.cfg.dest.save_path = ssd
     coord.cfg.ssd.path = ssd
     coord.dest_client = AsyncMock()
-    coord.dest_client.list_torrents = AsyncMock(return_value=[Torrent(
-        hash=h, name="Pack.2026", category="racing", save_path=foreign,
-        size_bytes=100, state="downloading", progress=0.5)])
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash=h,
+                name="Pack.2026",
+                category="racing",
+                save_path=foreign,
+                size_bytes=100,
+                state="downloading",
+                progress=0.5,
+            )
+        ]
+    )
     coord._prepare_next_batch = AsyncMock()
     coord._park_queued_for_download_slot = AsyncMock(return_value=False)
     try:
@@ -597,18 +681,30 @@ async def test_queued_unknown_roots_keep_legacy_adoption(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     h = "l" * 40
     adopted_path = str(tmp_path / "ssd" / "Pack.2026")
-    store.upsert(TorrentState(
-        source_infohash=h, source_name="Pack.2026", state=State.QUEUED,
-        cross_seed_blob=b"blob"))
+    store.upsert(
+        TorrentState(
+            source_infohash=h, source_name="Pack.2026", state=State.QUEUED, cross_seed_blob=b"blob"
+        )
+    )
 
     coord = make_coordinator()
     coord.store = store
     _fuse_cfg(tmp_path, coord)
     # cfg.dest / cfg.ssd remain MagicMock: roots unknown -> fail-open.
     coord.dest_client = AsyncMock()
-    coord.dest_client.list_torrents = AsyncMock(return_value=[Torrent(
-        hash=h, name="Pack.2026", category="racing", save_path=adopted_path,
-        size_bytes=100, state="downloading", progress=0.5)])
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash=h,
+                name="Pack.2026",
+                category="racing",
+                save_path=adopted_path,
+                size_bytes=100,
+                state="downloading",
+                progress=0.5,
+            )
+        ]
+    )
     coord._prepare_next_batch = AsyncMock()
     coord._park_queued_for_download_slot = AsyncMock(return_value=False)
     coord.dest_client.resume = AsyncMock()
@@ -630,15 +726,19 @@ async def test_readd_heal_foreign_helper_not_resumed(tmp_path: Path):
 
     top = "Batch"
     missing = f"{top}/ep04v2.mkv"
-    blob = bytes(_bencode({
-        b"info": {
-            b"name": top.encode(),
-            b"files": [
-                {b"length": 100, b"path": [b"ep01.mkv"]},
-                {b"length": 200, b"path": [b"ep04v2.mkv"]},
-            ],
-        },
-    }))
+    blob = bytes(
+        _bencode(
+            {
+                b"info": {
+                    b"name": top.encode(),
+                    b"files": [
+                        {b"length": 100, b"path": [b"ep01.mkv"]},
+                        {b"length": 200, b"path": [b"ep04v2.mkv"]},
+                    ],
+                },
+            }
+        )
+    )
     blob_hash, _, _, _ = _bencoded_info_hash(blob)
 
     ssd = tmp_path / "ssd"
@@ -649,10 +749,16 @@ async def test_readd_heal_foreign_helper_not_resumed(tmp_path: Path):
     h = "k" * 40
 
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(
-        source_infohash=h, source_name="Show.Batch",
-        dest_infohash=blob_hash, save_path=str(ssd),
-        cross_seed_blob=blob, state=State.RE_ADDING))
+    store.upsert(
+        TorrentState(
+            source_infohash=h,
+            source_name="Show.Batch",
+            dest_infohash=blob_hash,
+            save_path=str(ssd),
+            cross_seed_blob=blob,
+            state=State.RE_ADDING,
+        )
+    )
     coord = make_coordinator()
     coord.store = store
     coord._stop = False
@@ -667,13 +773,21 @@ async def test_readd_heal_foreign_helper_not_resumed(tmp_path: Path):
     coord._ssd_try_reserve = AsyncMock(return_value=True)
     coord._ssd_release = AsyncMock()
     coord.dest_client = AsyncMock()
-    coord.dest_client.list_torrents = AsyncMock(return_value=[Torrent(
-        hash=blob_hash, name="Show.Batch", category="racing",
-        save_path=str(fuse), size_bytes=300, state="downloading",
-        progress=0.5)])
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash=blob_hash,
+                name="Show.Batch",
+                category="racing",
+                save_path=str(fuse),
+                size_bytes=300,
+                state="downloading",
+                progress=0.5,
+            )
+        ]
+    )
     try:
-        healed = await coord._maybe_heal_readd_missing(
-            store.get(h), [missing], fuse, blob)
+        healed = await coord._maybe_heal_readd_missing(store.get(h), [missing], fuse, blob)
         assert healed is False
         coord.dest_client.set_file_priorities.assert_not_awaited()
         coord.dest_client.resume.assert_not_awaited()

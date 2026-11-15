@@ -1,4 +1,5 @@
 """Refresh upkeep: coalescing, footer TTLs, drift streak gate, orphans, pin persist."""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,11 +13,11 @@ from racing_sync.telegram_bot import TelegramBot
 
 def _bot(**kw):
     from unittest.mock import AsyncMock, MagicMock
+
     bot = object.__new__(TelegramBot)
     bot._bot = MagicMock()
     bot._bot.edit_message_text = AsyncMock()
-    bot._bot.send_message = AsyncMock(
-        return_value=MagicMock(message_id=99))
+    bot._bot.send_message = AsyncMock(return_value=MagicMock(message_id=99))
     bot._store = MagicMock()
     bot._coord = MagicMock()
     bot._coord.live_progress_map.return_value = {}
@@ -86,8 +87,7 @@ async def test_ssd_free_stat_cached_per_ttl(tmp_path):
     bot = object.__new__(TelegramBot)
     bot._coord = coord
     bot._ssd_free_cache = None
-    with patch("racing_sync.rclone_ops.ssd_free_bytes",
-               return_value=50 * 1024 ** 3) as _free:
+    with patch("racing_sync.rclone_ops.ssd_free_bytes", return_value=50 * 1024**3) as _free:
         f1 = await bot._active_footer()
         f2 = await bot._active_footer()
     assert f1 == f2 and "SSD Free" in f1
@@ -103,8 +103,9 @@ async def test_drift_net_skips_fail_streak_hashes():
         bot = _bot(_detail_sent_state={h: "queued"})
         bot._detail_fail_streak = {h: 9}
         bot._store.list_active_inflight.return_value = [
-            TorrentState(source_infohash=h, source_name="Drifted",
-                         state=State.DONE, total_bytes=1000),
+            TorrentState(
+                source_infohash=h, source_name="Drifted", state=State.DONE, total_bytes=1000
+            ),
         ]
         for k, v in kw.items():
             setattr(bot, k, v)
@@ -129,8 +130,8 @@ async def test_hopeless_prev_id_remembered_for_sweep():
     bot = _bot()
     bot._prev_active_msg_id = 111
     bot._bot.delete_message = AsyncMock(
-        side_effect=TelegramError(
-            "Bad Request: not enough rights to delete"))
+        side_effect=TelegramError("Bad Request: not enough rights to delete")
+    )
     bot._store.list_active_inflight.return_value = []
     await bot._refresh_active_message_inner()
     assert 111 in bot._orphan_ids()
@@ -145,11 +146,12 @@ async def test_pin_failure_persists_without_mutating_cfg():
     from telegram.error import TelegramError
 
     bot = _bot()
-    bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123",
-                              pin_status_message=True)
+    bot._cfg = TelegramConfig(
+        enabled=True, bot_token="fake", chat_id="123", pin_status_message=True
+    )
     bot._bot.pin_chat_message = AsyncMock(
-        side_effect=TelegramError(
-            "Bad Request: not enough rights to pin"))
+        side_effect=TelegramError("Bad Request: not enough rights to pin")
+    )
     bot._active_msg_id = 5
     bot._pinned_message_id = None
     bot._store.get_meta.return_value = None

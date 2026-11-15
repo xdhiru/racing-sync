@@ -90,8 +90,7 @@ _RCLONE_COUNTERS = {"moves": 0, "move_ok": 0, "move_fail": 0}
 def rclone_counters() -> dict[str, int]:
     """Snapshot of lifetime move counters. Never raises."""
     try:
-        return {k: int(_RCLONE_COUNTERS.get(k, 0))
-                for k in ("moves", "move_ok", "move_fail")}
+        return {k: int(_RCLONE_COUNTERS.get(k, 0)) for k in ("moves", "move_ok", "move_fail")}
     except Exception:
         return {"moves": 0, "move_ok": 0, "move_fail": 0}
 
@@ -116,6 +115,7 @@ def _note_rclone_move(ok: bool) -> None:
 # The pump below ingests those lines into _RCLONE_PROGRESS[tree] while the
 # move runs; completion/timeout/cancel evicts the entry.
 
+
 @dataclass
 class RcloneProgress:
     transferred_bytes: int = 0
@@ -133,13 +133,17 @@ _TRANSFERRED_RE = re.compile(
     r"Transferred:\s+([\d.]+\s*\w+)\s+/\s+([\d.]+\s*\w+),\s+"
     r"([\d.]+%)\s*,\s+([\d.]+\s*\w+/s),\s+ETA\s+([\dwdhms-]+)"
 )
-_SIZE_RE = re.compile(r"^\s*([\d.]+)\s*([KMGTPE]?)(i?[Bb])?(ytes?)?\s*(/s)?\s*$",
-                      re.IGNORECASE)
-_ETA_RE = re.compile(
-    r"^\s*(?:(\d+)\s*h\s*)?(?:(\d+)\s*m\s*)?(?:(\d+)\s*s\s*)?\s*$",
-    re.IGNORECASE)
-_SIZE_FACTORS = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3,
-                 "T": 1024 ** 4, "P": 1024 ** 5, "E": 1024 ** 6}
+_SIZE_RE = re.compile(r"^\s*([\d.]+)\s*([KMGTPE]?)(i?[Bb])?(ytes?)?\s*(/s)?\s*$", re.IGNORECASE)
+_ETA_RE = re.compile(r"^\s*(?:(\d+)\s*h\s*)?(?:(\d+)\s*m\s*)?(?:(\d+)\s*s\s*)?\s*$", re.IGNORECASE)
+_SIZE_FACTORS = {
+    "": 1,
+    "K": 1024,
+    "M": 1024**2,
+    "G": 1024**3,
+    "T": 1024**4,
+    "P": 1024**5,
+    "E": 1024**6,
+}
 
 
 def _parse_rclone_size(text: object) -> int | None:
@@ -148,8 +152,7 @@ def _parse_rclone_size(text: object) -> int | None:
         m = _SIZE_RE.match(str(text or ""))
         if not m:
             return None
-        return int(float(m.group(1)) * _SIZE_FACTORS.get(
-            (m.group(2) or "").upper(), 1))
+        return int(float(m.group(1)) * _SIZE_FACTORS.get((m.group(2) or "").upper(), 1))
     except (TypeError, ValueError):
         return None
 
@@ -164,7 +167,7 @@ def _parse_rclone_eta(text: object) -> int | None:
         if not m or not any(m.groups()):
             return None
         h, mi, se = m.groups()
-        return (int(h or 0) * 3600 + int(mi or 0) * 60 + int(se or 0))
+        return int(h or 0) * 3600 + int(mi or 0) * 60 + int(se or 0)
     except (TypeError, ValueError):
         return None
 
@@ -265,8 +268,7 @@ def abort_move_tree(tree_key: str | None) -> bool:
                         except Exception:
                             pass
                         try:
-                            await _asyncio.wait_for(proc.wait(),
-                                                    timeout=10.0)
+                            await _asyncio.wait_for(proc.wait(), timeout=10.0)
                         except _asyncio.TimeoutError:
                             pass
 
@@ -308,7 +310,9 @@ def _with_stats_flags(cmd: list[str]) -> list[str]:
 
 
 async def _communicate_with_progress(
-    proc: object, key: str, timeout: float,
+    proc: object,
+    key: str,
+    timeout: float,
 ) -> tuple[bytes, bytes]:
     """Pump stderr stats lines while the move runs; then collect output.
 
@@ -316,6 +320,7 @@ async def _communicate_with_progress(
     the caller's kill path. stderr is accumulated (capped) so
     RcloneResult.stderr stays meaningful on failure.
     """
+
     async def _pump() -> tuple[bytes, bytes]:
         err_parts: list[bytes] = []
         err_len = 0
@@ -332,8 +337,7 @@ async def _communicate_with_progress(
                     except Exception:
                         break
                 try:
-                    line = await asyncio.wait_for(
-                        proc.stderr.readline(), 60.0)
+                    line = await asyncio.wait_for(proc.stderr.readline(), 60.0)
                 except asyncio.TimeoutError:
                     if _rc is not None:
                         break
@@ -363,7 +367,7 @@ async def _communicate_with_progress(
             rest = b""
         try:
             if rest and err_len < _MAX_PROGRESS_STDERR:
-                err_parts.append(bytes(rest)[:_MAX_PROGRESS_STDERR - err_len])
+                err_parts.append(bytes(rest)[: _MAX_PROGRESS_STDERR - err_len])
         except Exception:
             pass
         try:
@@ -376,8 +380,7 @@ async def _communicate_with_progress(
         except Exception:
             pass
         try:
-            return (bytes(out or b""),
-                    b"".join(err_parts)[:_MAX_PROGRESS_STDERR])
+            return (bytes(out or b""), b"".join(err_parts)[:_MAX_PROGRESS_STDERR])
         except Exception:
             return b"", b""
 
@@ -433,7 +436,8 @@ def _active_check(tree: object) -> str | None:
             raise RcloneBusyError(
                 f"previous rclone move for {tree} (pid={_pid}) still "
                 f"running; not starting a duplicate (source intact, "
-                f"retry later)")
+                f"retry later)"
+            )
     try:
         if len(_ACTIVE_MOVES) >= _ACTIVE_MOVES_CAP:
             # Evict reaped entries only: a live entry guards a running
@@ -497,7 +501,8 @@ def _validate_rclone_binary(cfg: AppConfig) -> Path | None:
                 raise RcloneError(f"rclone.binary not executable: {b}")
             log.warning(
                 "rclone.binary not found at %s (tolerated: unit tests mock "
-                "spawn; check-config flags this in prod)", b,
+                "spawn; check-config flags this in prod)",
+                b,
             )
     except OSError:
         pass
@@ -533,12 +538,25 @@ def _reject_hijack_flags(flags: list[str] | None, where: str) -> None:
             else:
                 flag = str(item).strip().lower().split("=", 1)[0]
                 norm = flag.lstrip("-").replace("_", "-")
-                blocked = norm in ("config", "password-command", "ask-password",
-                                   "config-file", "c",
-                                   "log-file", "log-file-max-size", "syslog", "syslog-facility",
-                                   "s3-access-key-id", "s3-secret-access-key",
-                                   "files-from", "files-from-raw", "files-from-encoding",
-                                   "filter-from", "exclude-file", "include-file")
+                blocked = norm in (
+                    "config",
+                    "password-command",
+                    "ask-password",
+                    "config-file",
+                    "c",
+                    "log-file",
+                    "log-file-max-size",
+                    "syslog",
+                    "syslog-facility",
+                    "s3-access-key-id",
+                    "s3-secret-access-key",
+                    "files-from",
+                    "files-from-raw",
+                    "files-from-encoding",
+                    "filter-from",
+                    "exclude-file",
+                    "include-file",
+                )
         except Exception:
             continue
         if blocked:
@@ -547,10 +565,15 @@ def _reject_hijack_flags(flags: list[str] | None, where: str) -> None:
             )
 
 
-def build_move_cmd(cfg: AppConfig, source: Path, dest_remote: str,
-                   *, include: list[str] | None = None,
-                   files_from: str | None = None,
-                   extra: list[str] | None = None) -> list[str]:
+def build_move_cmd(
+    cfg: AppConfig,
+    source: Path,
+    dest_remote: str,
+    *,
+    include: list[str] | None = None,
+    files_from: str | None = None,
+    extra: list[str] | None = None,
+) -> list[str]:
     if not dest_remote or not dest_remote.strip():
         raise RcloneError(f"refusing rclone move with empty dest_remote (source={source})")
     if dest_remote.startswith("-"):
@@ -605,8 +628,17 @@ def redact_rclone_cmd(cmd: list[str]) -> str:
             continue
         lower = arg.lower()
         if any(lower == flag or lower.startswith(flag + "=") for flag in _SENSITIVE_FLAGS) or any(
-            f in lower for f in ("secret", "pass", "token", "apikey", "api_key",
-                                 "api-key", "auth-key", "authkey")
+            f in lower
+            for f in (
+                "secret",
+                "pass",
+                "token",
+                "apikey",
+                "api_key",
+                "api-key",
+                "auth-key",
+                "authkey",
+            )
         ):
             if "=" in arg:
                 key, _ = arg.split("=", 1)
@@ -634,6 +666,7 @@ def _move_timeout_seconds(cfg: AppConfig) -> float:
     except (TypeError, ValueError):
         return 6 * 3600
     import math as _math
+
     if not _math.isfinite(val):
         return 6 * 3600
     return max(60.0, val)
@@ -679,6 +712,7 @@ async def run_rclone(
         _active_drop(_move_key, keep=False)
         raise RcloneError(f"could not spawn rclone {cmd[0]!r}: {e}") from e
     _active_set(_move_key, proc)
+
     async def _kill_child() -> None:
         """Best-effort terminate+reap a still-running child (bounded)."""
         try:
@@ -708,14 +742,11 @@ async def run_rclone(
     try:
         if _progress_key is not None:
             try:
-                stdout_b, stderr_b = await _communicate_with_progress(
-                    proc, _progress_key, timeout)
+                stdout_b, stderr_b = await _communicate_with_progress(proc, _progress_key, timeout)
             finally:
                 _progress_drop(_progress_key)
         else:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.CancelledError:
         # Shutdown while a move is in flight: terminate the child (bounded)
         # so it can't keep uploading/deleting source files after we exit,
@@ -813,10 +844,14 @@ async def run_rclone(
     stdout = stdout_b.decode("utf-8", errors="replace")
     stderr = stderr_b.decode("utf-8", errors="replace")
     code = proc.returncode if proc.returncode is not None else -1
-    res = RcloneResult(returncode=code,
-                       stdout=stdout, stderr=stderr, duration=dt)
+    res = RcloneResult(returncode=code, stdout=stdout, stderr=stderr, duration=dt)
     if not res.ok:
-        log.error("rclone failed (%d) in %.1fs:\n%s", res.returncode, dt, sanitize_log_text(stderr[-2000:]))
+        log.error(
+            "rclone failed (%d) in %.1fs:\n%s",
+            res.returncode,
+            dt,
+            sanitize_log_text(stderr[-2000:]),
+        )
     else:
         log.info("rclone ok in %.1fs", dt)
     _active_drop(_move_key, keep=False)
@@ -867,12 +902,16 @@ async def move_local_to_remote(
         # data was lost (fail loudly — a silent "success" would mark DONE
         # with bytes nowhere).
         if await _remote_has_bytes(cfg, dest_remote, files_from):
-            log.info("rclone move %s -> %s: source already empty, remote holds "
-                     "the bytes; skipping move", local, dest_remote)
+            log.info(
+                "rclone move %s -> %s: source already empty, remote holds the bytes; skipping move",
+                local,
+                dest_remote,
+            )
             return RcloneResult(returncode=0, stdout="", stderr="", duration=0.0)
         raise RcloneError(
             f"rclone move {local} -> {dest_remote}: source empty and remote "
-            "holds no bytes — refusing silent no-op (data loss?)")
+            "holds no bytes — refusing silent no-op (data loss?)"
+        )
     list_path: str | None = None
     try:
         if files_from is not None:
@@ -882,20 +921,27 @@ async def move_local_to_remote(
             # per line, relative to `local`. delete=False + explicit unlink:
             # Windows cannot reopen delete=True temp files from the child.
             with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", suffix=".lst",
-                prefix="racing-sync-files-", delete=False,
+                mode="w",
+                encoding="utf-8",
+                suffix=".lst",
+                prefix="racing-sync-files-",
+                delete=False,
             ) as fh:
                 fh.write("\n".join(files_from) + "\n")
                 list_path = fh.name
         # Fail loudly when nothing moves: an rc=0 "success" that transferred
         # zero files hides stalled/filtered moves (the source-empty case is
         # handled above, so any no-transfer here is a real failure).
-        cmd = build_move_cmd(cfg, local, dest_remote, include=include,
-                             files_from=list_path,
-                             extra=[*(extra or []), "--error-on-no-transfer"])
+        cmd = build_move_cmd(
+            cfg,
+            local,
+            dest_remote,
+            include=include,
+            files_from=list_path,
+            extra=[*(extra or []), "--error-on-no-transfer"],
+        )
         try:
-            res = await run_rclone(cfg, cmd, timeout=timeout, tree=local,
-                                   progress=progress)
+            res = await run_rclone(cfg, cmd, timeout=timeout, tree=local, progress=progress)
         except Exception:
             _note_rclone_move(False)
             raise
@@ -911,6 +957,7 @@ async def move_local_to_remote(
 
 async def _move_source_has_files(local: Path, files_from: list[str] | None) -> bool:
     """True when the move has anything to transfer (off-loop for big trees)."""
+
     def _check() -> bool:
         try:
             if files_from is not None:
@@ -957,7 +1004,9 @@ def _norm_listed_path(name: str) -> str:
 
 
 async def _remote_has_bytes(
-    cfg: AppConfig, dest_remote: str, files_from: list[str] | None,
+    cfg: AppConfig,
+    dest_remote: str,
+    files_from: list[str] | None,
 ) -> bool:
     """True when the remote already holds the move's bytes (recursive lsf verify).
 
@@ -969,8 +1018,8 @@ async def _remote_has_bytes(
     """
     try:
         res = await run_rclone(
-            cfg, ["lsf", "-R", "--files-only", dest_remote],
-            timeout=120.0, tree=None)
+            cfg, ["lsf", "-R", "--files-only", dest_remote], timeout=120.0, tree=None
+        )
     except Exception as e:  # noqa: BLE001
         log.warning("rclone lsf verify of %s failed: %s", dest_remote, e)
         return False
@@ -993,9 +1042,7 @@ async def _remote_has_bytes(
 from .safety import validate_safe_delete_path  # noqa: F401 (re-exported)
 
 
-async def wipe_local_tree(
-    path: Path, *, base_dir: Path | Iterable[Path] | None = None
-) -> None:
+async def wipe_local_tree(path: Path, *, base_dir: Path | Iterable[Path] | None = None) -> None:
     """Remove a directory tree safely, ensuring it is within base_dir and not a filesystem root."""
     if base_dir is None:
         raise ValueError(f"refusing to delete without base_dir guard: {path}")
@@ -1055,9 +1102,6 @@ async def wipe_local_files(
     return failed
 
 
-
-
-
 def disk_free_bytes_at(path: Path) -> int:
     try:
         return shutil.disk_usage(str(path)).free
@@ -1068,6 +1112,7 @@ def disk_free_bytes_at(path: Path) -> int:
 
 def _total_margin_bytes(cfg: AppConfig) -> int:
     """Combined SSD safety margin: general + ssd-specific (both default 0)."""
+
     def _as_int(raw: object) -> int:
         # Non-numeric doubles (MagicMock cfg in unit tests) count as 0 —
         # int(MagicMock) would otherwise invent a 1-byte margin.

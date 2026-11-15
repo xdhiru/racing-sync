@@ -1,4 +1,5 @@
 """Uniform I/O bounds: timeouts, offload, chunking."""
+
 from __future__ import annotations
 
 import asyncio
@@ -18,17 +19,13 @@ def test_rpc_timeout_clamped_with_fallbacks():
 
     assert rpc_timeout_seconds(None) == 30.0
     assert rpc_timeout_seconds(object()) == 30.0
-    good = SimpleNamespace(general=SimpleNamespace(
-        client_rpc_timeout_seconds=45))
+    good = SimpleNamespace(general=SimpleNamespace(client_rpc_timeout_seconds=45))
     assert rpc_timeout_seconds(good) == 45.0
-    low = SimpleNamespace(general=SimpleNamespace(
-        client_rpc_timeout_seconds=1))
+    low = SimpleNamespace(general=SimpleNamespace(client_rpc_timeout_seconds=1))
     assert rpc_timeout_seconds(low) == 5.0
-    high = SimpleNamespace(general=SimpleNamespace(
-        client_rpc_timeout_seconds=9999))
+    high = SimpleNamespace(general=SimpleNamespace(client_rpc_timeout_seconds=9999))
     assert rpc_timeout_seconds(high) == 300.0
-    bad = SimpleNamespace(general=SimpleNamespace(
-        client_rpc_timeout_seconds="soon"))
+    bad = SimpleNamespace(general=SimpleNamespace(client_rpc_timeout_seconds="soon"))
     assert rpc_timeout_seconds(bad) == 30.0
 
 
@@ -71,7 +68,11 @@ async def test_offload_runs_blocking_fn():
 
 
 def test_chunked_bounds_and_defaults():
-    assert chunked(range(250), 100) == [list(range(100)), list(range(100, 200)), list(range(200, 250))]
+    assert chunked(range(250), 100) == [
+        list(range(100)),
+        list(range(100, 200)),
+        list(range(200, 250)),
+    ]
     assert chunked([], 100) == []
     assert chunked([1, 2, 3], 0) == [[1, 2, 3]]
     assert chunked(None) == []

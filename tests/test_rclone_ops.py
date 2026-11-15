@@ -132,7 +132,9 @@ def test_build_move_cmd_files_from_raw(tmp_path: Path):
     cfg.rclone.extra_move_flags = []
 
     cmd = build_move_cmd(
-        cfg, tmp_path / "src", "remote:dest",
+        cfg,
+        tmp_path / "src",
+        "remote:dest",
         files_from="/tmp/list.lst",
     )
     dash_idx = cmd.index("--")
@@ -152,8 +154,11 @@ def test_build_move_cmd_rejects_include_plus_files_from(tmp_path: Path):
 
     with _pytest.raises(Exception):
         build_move_cmd(
-            cfg, tmp_path / "src", "remote:dest",
-            include=["--include=*.mkv"], files_from="/tmp/list.lst",
+            cfg,
+            tmp_path / "src",
+            "remote:dest",
+            include=["--include=*.mkv"],
+            files_from="/tmp/list.lst",
         )
 
 
@@ -184,11 +189,14 @@ async def test_move_local_to_remote_files_from_writes_and_cleans_list(tmp_path: 
             seen["content"] = fh.read()
         seen["list_path"] = cmd[idx + 1]
         from racing_sync.rclone_ops import RcloneResult
+
         return RcloneResult(returncode=0, stdout="", stderr="", duration=0.1)
 
     with patch.object(rclone_ops, "run_rclone", AsyncMock(side_effect=_fake_run)):
         await move_local_to_remote(
-            cfg, src, "remote:dest",
+            cfg,
+            src,
+            "remote:dest",
             files_from=["Top/a.mkv", "Top/Sub/b.mkv"],
         )
 
@@ -310,20 +318,33 @@ async def test_run_rclone_kills_child_on_communicate_error(monkeypatch):
 def test_reject_hijack_flags_normalizes_variants():
     from racing_sync.rclone_ops import _reject_hijack_flags, RcloneError
 
-    for bad in ("--config", "-config", "---config", "--password_command",
-                "-password-command=x", "--ask-password"):
+    for bad in (
+        "--config",
+        "-config",
+        "---config",
+        "--password_command",
+        "-password-command=x",
+        "--ask-password",
+    ):
         with pytest.raises(RcloneError):
             _reject_hijack_flags([bad], "test")
     # Credential families and the remote-control surface are refused too.
-    for bad in ("--password", "--rc", "--rc-addr", "--rc-user",
-                "--drive-token", "--s3-session-token", "--b2-key=x",
-                "--dropbox-client-secret", "--gcs-client-id",
-                "--custom-token"):
+    for bad in (
+        "--password",
+        "--rc",
+        "--rc-addr",
+        "--rc-user",
+        "--drive-token",
+        "--s3-session-token",
+        "--b2-key=x",
+        "--dropbox-client-secret",
+        "--gcs-client-id",
+        "--custom-token",
+    ):
         with pytest.raises(RcloneError):
             _reject_hijack_flags([bad], "test")
     # Legit tuning flags pass through untouched.
-    _reject_hijack_flags(["--transfers=4", "-v", "--bwlimit=0",
-                          "--s3-chunk-size=64M"], "test")
+    _reject_hijack_flags(["--transfers=4", "-v", "--bwlimit=0", "--s3-chunk-size=64M"], "test")
 
 
 def test_move_timeout_seconds_falls_back_for_test_doubles():
@@ -365,7 +386,9 @@ async def test_unreaped_orphan_blocks_duplicate_tree(monkeypatch, tmp_path):
     from unittest.mock import AsyncMock
     from racing_sync import rclone_ops
     from racing_sync.rclone_ops import (
-        RcloneBusyError, RcloneTimeoutError, run_rclone,
+        RcloneBusyError,
+        RcloneTimeoutError,
+        run_rclone,
     )
 
     tree = tmp_path / "Top"
@@ -375,13 +398,11 @@ async def test_unreaped_orphan_blocks_duplicate_tree(monkeypatch, tmp_path):
     monkeypatch.setattr(_asyncio, "create_subprocess_exec", spawn)
     try:
         with pytest.raises(RcloneTimeoutError):
-            await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"],
-                             timeout=0.01, tree=tree)
+            await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"], timeout=0.01, tree=tree)
         # Orphan unreaped (returncode None): guard held.
         assert rclone_ops._ACTIVE_MOVES, "orphan must keep its tree guard"
         with pytest.raises(RcloneBusyError) as exc_info:
-            await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"],
-                             timeout=0.01, tree=tree)
+            await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"], timeout=0.01, tree=tree)
         assert isinstance(exc_info.value, RcloneTimeoutError)  # parks like timeout
         assert "4242" in str(exc_info.value)
         assert spawn.await_count == 1, "no duplicate spawn while orphan lives"
@@ -407,12 +428,10 @@ async def test_reaped_orphan_releases_tree(monkeypatch, tmp_path):
     monkeypatch.setattr(_asyncio, "create_subprocess_exec", spawn)
     try:
         with pytest.raises(Exception):
-            await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"],
-                             timeout=0.01, tree=tree)
+            await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"], timeout=0.01, tree=tree)
         assert spawn.await_count == 1
         proc.returncode = 0  # loop reaps the orphan meanwhile
-        res = await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"],
-                               timeout=60, tree=tree)
+        res = await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"], timeout=60, tree=tree)
         assert res.ok
         assert spawn.await_count == 2
         assert not rclone_ops._ACTIVE_MOVES
@@ -432,11 +451,9 @@ async def test_success_drops_tree_guard(monkeypatch, tmp_path):
     proc = AsyncMock()
     proc.communicate = AsyncMock(return_value=(b"", b""))
     proc.returncode = 0
-    monkeypatch.setattr(_asyncio, "create_subprocess_exec",
-                        AsyncMock(return_value=proc))
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", AsyncMock(return_value=proc))
     try:
-        res = await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"],
-                               timeout=60, tree=tree)
+        res = await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"], timeout=60, tree=tree)
         assert res.ok
         assert not rclone_ops._ACTIVE_MOVES
     finally:
@@ -460,10 +477,8 @@ def test_cap_eviction_keeps_live_entries():
     try:
         for i in range(rclone_ops._ACTIVE_MOVES_CAP + 5):
             key = f"/tree/{i}"
-            rclone_ops._ACTIVE_MOVES[key] = (
-                reaped_holder if i % 2 else live_holder)
-        kept_live = [k for k, v in rclone_ops._ACTIVE_MOVES.items()
-                     if v is live_holder]
+            rclone_ops._ACTIVE_MOVES[key] = reaped_holder if i % 2 else live_holder
+        kept_live = [k for k, v in rclone_ops._ACTIVE_MOVES.items() if v is live_holder]
         assert kept_live, "live guards must survive cap pressure"
     finally:
         rclone_ops._ACTIVE_MOVES.clear()
@@ -500,12 +515,11 @@ async def test_empty_source_with_remote_bytes_skips_move(tmp_path: Path):
     async def _fake_run(cfg_, cmd, **kwargs):
         assert cmd[0] == "lsf"
         from racing_sync.rclone_ops import RcloneResult
-        return RcloneResult(returncode=0, stdout="Top/a.mkv\n", stderr="",
-                            duration=0.1)
+
+        return RcloneResult(returncode=0, stdout="Top/a.mkv\n", stderr="", duration=0.1)
 
     with patch.object(rclone_ops, "run_rclone", AsyncMock(side_effect=_fake_run)) as _m:
-        res = await move_local_to_remote(
-            cfg, src, "remote:dest", files_from=["Top/a.mkv"])
+        res = await move_local_to_remote(cfg, src, "remote:dest", files_from=["Top/a.mkv"])
     assert res.ok
     assert _m.await_count == 1  # lsf only; no move spawned
 
@@ -528,12 +542,12 @@ async def test_empty_source_without_remote_bytes_fails_loud(tmp_path: Path):
 
     async def _fake_run(cfg_, cmd, **kwargs):
         from racing_sync.rclone_ops import RcloneResult
+
         return RcloneResult(returncode=0, stdout="", stderr="", duration=0.1)
 
     with patch.object(rclone_ops, "run_rclone", AsyncMock(side_effect=_fake_run)):
         with _pytest.raises(RcloneError, match="refusing silent no-op"):
-            await move_local_to_remote(
-                cfg, src, "remote:dest", files_from=["Top/a.mkv"])
+            await move_local_to_remote(cfg, src, "remote:dest", files_from=["Top/a.mkv"])
 
 
 @pytest.mark.anyio
@@ -557,6 +571,7 @@ async def test_move_cmd_carries_error_on_no_transfer(tmp_path: Path):
     async def _fake_run(cfg_, cmd, **kwargs):
         seen["cmd"] = list(cmd)
         from racing_sync.rclone_ops import RcloneResult
+
         return RcloneResult(returncode=0, stdout="", stderr="", duration=0.1)
 
     with patch.object(rclone_ops, "run_rclone", AsyncMock(side_effect=_fake_run)):
@@ -586,8 +601,8 @@ async def test_wipe_reports_partial_failures(tmp_path: Path):
 def test_parse_rclone_size_and_eta():
     from racing_sync.rclone_ops import _parse_rclone_size, _parse_rclone_eta
 
-    assert _parse_rclone_size("80.5M") == int(80.5 * 1024 ** 2)
-    assert _parse_rclone_size("1.2G") == int(1.2 * 1024 ** 3)
+    assert _parse_rclone_size("80.5M") == int(80.5 * 1024**2)
+    assert _parse_rclone_size("1.2G") == int(1.2 * 1024**3)
     assert _parse_rclone_size("0 B") == 0
     assert _parse_rclone_size("nope") is None
     assert _parse_rclone_eta("3m12s") == 192
@@ -602,14 +617,12 @@ def test_ingest_progress_line_updates_map():
     from racing_sync.rclone_ops import _ingest_progress_line
 
     try:
-        _ingest_progress_line(
-            "k",
-            b"Transferred: 80.500M / 200.000M, 40%, 10.000M/s, ETA 12s\n")
+        _ingest_progress_line("k", b"Transferred: 80.500M / 200.000M, 40%, 10.000M/s, ETA 12s\n")
         prog = rclone_ops._RCLONE_PROGRESS["k"]
         assert prog.percent == 40.0
-        assert prog.transferred_bytes == int(80.5 * 1024 ** 2)
-        assert prog.total_bytes == int(200.0 * 1024 ** 2)
-        assert prog.speed_bps == int(10.0 * 1024 ** 2)
+        assert prog.transferred_bytes == int(80.5 * 1024**2)
+        assert prog.total_bytes == int(200.0 * 1024**2)
+        assert prog.speed_bps == int(10.0 * 1024**2)
         assert prog.eta_seconds == 12
         # Noise lines never create entries.
         _ingest_progress_line("j", b"2026/01/01 NOTICE: Config file\n")
@@ -623,9 +636,16 @@ def test_stats_flags_inserted_before_positionals(tmp_path: Path):
 
     cmd = ["rclone", "move", "--stats=9s", "--", "src", "remote:dest"]
     assert _with_stats_flags(cmd) == [
-        "rclone", "move", "--stats=9s",
-        "--stats=5s", "--stats-one-line", "--stats-log-level", "NOTICE",
-        "--", "src", "remote:dest",
+        "rclone",
+        "move",
+        "--stats=9s",
+        "--stats=5s",
+        "--stats-one-line",
+        "--stats-log-level",
+        "NOTICE",
+        "--",
+        "src",
+        "remote:dest",
     ]
 
 
@@ -636,7 +656,9 @@ async def test_progress_run_pumps_stats_and_evicts(monkeypatch, tmp_path):
     from unittest.mock import AsyncMock, MagicMock
     from racing_sync import rclone_ops
     from racing_sync.rclone_ops import (
-        _tree_key, rclone_counters, run_rclone,
+        _tree_key,
+        rclone_counters,
+        run_rclone,
     )
 
     tree = tmp_path / "Top"
@@ -644,20 +666,21 @@ async def test_progress_run_pumps_stats_and_evicts(monkeypatch, tmp_path):
     proc = MagicMock()
     proc.returncode = 0
     proc.stderr.at_eof.return_value = False
-    proc.stderr.readline = AsyncMock(side_effect=[
-        b"Transferred: 10.000M / 20.000M, 50%, 5.000M/s, ETA 10s\n",
-        b"",
-    ])
+    proc.stderr.readline = AsyncMock(
+        side_effect=[
+            b"Transferred: 10.000M / 20.000M, 50%, 5.000M/s, ETA 10s\n",
+            b"",
+        ]
+    )
     proc.stderr.read = AsyncMock(return_value=b"tail\n")
     proc.stdout.read = AsyncMock(return_value=b"")
     proc.wait = AsyncMock(return_value=0)
-    monkeypatch.setattr(_asyncio, "create_subprocess_exec",
-                        AsyncMock(return_value=proc))
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", AsyncMock(return_value=proc))
     before = rclone_counters()["moves"]
     try:
         res = await run_rclone(
-            _rclone_cfg(), ["rclone", "move", "--", "x", "y"],
-            timeout=60, tree=tree, progress=True)
+            _rclone_cfg(), ["rclone", "move", "--", "x", "y"], timeout=60, tree=tree, progress=True
+        )
     finally:
         rclone_ops._ACTIVE_MOVES.clear()
         rclone_ops._RCLONE_PROGRESS.clear()
@@ -701,9 +724,7 @@ async def test_single_file_move_reaches_spawn(tmp_path: Path):
     async def _fake_run(cfg_, cmd, **kwargs):
         return RcloneResult(returncode=0, stdout="", stderr="", duration=0.1)
 
-    with patch.object(rclone_ops, "run_rclone",
-                      AsyncMock(side_effect=_fake_run)) as _m:
-        res = await move_local_to_remote(_rclone_cfg(), single,
-                                         "remote:dest")
+    with patch.object(rclone_ops, "run_rclone", AsyncMock(side_effect=_fake_run)) as _m:
+        res = await move_local_to_remote(_rclone_cfg(), single, "remote:dest")
     assert res.ok
     assert _m.await_count == 1  # the move spawned; no refusal, no lsf

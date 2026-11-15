@@ -11,9 +11,7 @@ from racing_sync.clients.abstract import TorrentFile
 
 
 def _cfg() -> AppConfig:
-    return AppConfig.from_toml(
-        Path(__file__).parent.parent / "config.example.toml"
-    )
+    return AppConfig.from_toml(Path(__file__).parent.parent / "config.example.toml")
 
 
 def test_single_file_is_movie():
@@ -25,8 +23,7 @@ def test_single_file_is_movie():
 
 def test_season_with_episodes():
     files = [
-        TorrentFile(f"Show.Name.S01E{i:02d}.1080p.WEB.mkv", 2_000_000_000)
-        for i in range(1, 11)
+        TorrentFile(f"Show.Name.S01E{i:02d}.1080p.WEB.mkv", 2_000_000_000) for i in range(1, 11)
     ]
     cls = classify(files, _cfg())
     assert cls.kind == "season"
@@ -49,16 +46,16 @@ def test_mixed_classification_rare_case():
 
 
 def test_season_with_one_extras_is_still_season():
-    files = (
-        [TorrentFile(f"S01E{i:02d}.mkv", 2_000_000_000) for i in range(1, 10)]
-        + [TorrentFile("sample.mkv", 100_000_000)]
-    )
+    files = [TorrentFile(f"S01E{i:02d}.mkv", 2_000_000_000) for i in range(1, 10)] + [
+        TorrentFile("sample.mkv", 100_000_000)
+    ]
     cls = classify(files, _cfg())
     assert cls.kind == "season"
 
 
 def test_parse_episode_case_insensitive():
     from racing_sync.classifier import parse_episode
+
     assert parse_episode("Show.s10e22.mkv") == (10, 22)
     assert parse_episode("Show.S01E01.mkv") == (1, 1)
     assert parse_episode("no.episode.tag.mkv") is None
@@ -77,10 +74,12 @@ def test_single_file_episode_is_classified_as_episode():
 def test_three_digit_episode_is_classified_as_episode():
     """Long-running dailies (S36E171, S62E010): 3-digit episode numbers are
     still individual episodes and route to unsorted/, not the movie path."""
-    files = [TorrentFile(
-        "Example.Cookoff.S36E171.2026.06.10.1080p.AMZN.WEB-DL.DDP2.0.H.264-DUMMYGRP.mkv",
-        2_600_000_000,
-    )]
+    files = [
+        TorrentFile(
+            "Example.Cookoff.S36E171.2026.06.10.1080p.AMZN.WEB-DL.DDP2.0.H.264-DUMMYGRP.mkv",
+            2_600_000_000,
+        )
+    ]
     cls = classify(files, _cfg())
     assert cls.kind == "episode"
     assert len(cls.episodes) == 1
@@ -194,8 +193,7 @@ async def test_do_queued_deletes_torrent_when_oversize_movie_skipped(tmp_path: P
 
     assert ts.state == State.FAILED
     # Entry dropped without files; our shell unlinked file-scoped.
-    coord.dest_client.delete.assert_awaited_once_with(
-        "moviehash", delete_files=False)
+    coord.dest_client.delete.assert_awaited_once_with("moviehash", delete_files=False)
     assert not (tmp_path / "BigMovie.2024.1080p.mkv").exists()
     assert (tmp_path / "Sibling.2024.1080p.mkv").exists()
 
@@ -293,12 +291,15 @@ def test_default_episode_regex_fansub_dashform_and_wide_digits():
 
     rx = ClassifierConfig()._episode_re
     assert parse_episode(
-        "[DummySub] Harbor Innkeepers of the Silent Tide - 10 (1080p) [F47ACD54].mkv",
-        rx) == (1, 10)
-    assert parse_episode("[DummySub] Hollow Sky Chronicles S3 - 10 (1080p) [6DBC1189].mkv", rx) == (1, 10)
+        "[DummySub] Harbor Innkeepers of the Silent Tide - 10 (1080p) [F47ACD54].mkv", rx
+    ) == (1, 10)
+    assert parse_episode("[DummySub] Hollow Sky Chronicles S3 - 10 (1080p) [6DBC1189].mkv", rx) == (
+        1,
+        10,
+    )
     assert parse_episode(
-        "[DummySub] Wandering Cartographer Guild S4 - 21 (1080p) [9057F2E5].mkv",
-        rx) == (1, 21)
+        "[DummySub] Wandering Cartographer Guild S4 - 21 (1080p) [9057F2E5].mkv", rx
+    ) == (1, 21)
     assert parse_episode("Show.S012E012.mkv", rx) == (12, 12)
     assert parse_episode("Show.S123E123.mkv", rx) == (123, 123)
     for pack in (
@@ -314,8 +315,9 @@ def test_default_episode_regex_fansub_dashform_and_wide_digits():
 def test_classify_fansub_dashform_single_as_episode():
     """A fansub dash-form single-file drop classifies episode (routes unsorted)."""
     cfg = _cfg()
-    files = [TorrentFile(
-        "[DummySub] Hollow Sky Chronicles S3 - 10 (1080p) [6DBC1189].mkv", 500_000_000)]
+    files = [
+        TorrentFile("[DummySub] Hollow Sky Chronicles S3 - 10 (1080p) [6DBC1189].mkv", 500_000_000)
+    ]
     cls = classify(files, cfg)
     assert cls.kind == "episode"
     assert len(cls.episodes) == 1
@@ -385,6 +387,7 @@ def test_season_folder_for_ignores_file_order(tmp_path):
 def test_parse_episode_without_digits_returns_none():
     from racing_sync.classifier import parse_episode
     import re
+
     # Custom regex matching words without digits
     regex = re.compile(r"SPECIAL")
     assert parse_episode("Show.SPECIAL.mkv", regex) is None
@@ -494,4 +497,3 @@ def test_oversize_single_file_ignores_non_numeric_cap():
 
     cfg.ssd.skip_movie_larger_than_bytes = 0
     assert oversize_single_file(files, cfg) is None
-

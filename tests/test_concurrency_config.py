@@ -34,6 +34,7 @@ def test_concurrency_defaults():
     mount_unsorted = "/mnt/fuse/unsorted"
     """
     import tomllib
+
     cfg = AppConfig.model_validate(tomllib.loads(data))
     assert cfg.rclone.binary == Path("/usr/local/bin/rclone")
     assert cfg.dest.max_active_downloads == 3
@@ -78,6 +79,7 @@ def test_concurrency_custom_overrides():
     reinject_delay_seconds = 15
     """
     import tomllib
+
     cfg = AppConfig.model_validate(tomllib.loads(data))
     assert cfg.dest.max_active_downloads == 5
     assert cfg.rclone.max_concurrent_moves == 2
@@ -224,6 +226,7 @@ async def test_coordinator_wait_disk_stops_on_stop():
 async def test_coordinator_do_queued_extracts_infohash_from_blob():
     from racing_sync.watchdir import _bencode
     from racing_sync.config import ClassifierConfig
+
     coord = make_coordinator()
     coord.cfg.dest.save_path = "/downloads"
     coord.cfg.classifier = ClassifierConfig()
@@ -235,8 +238,12 @@ async def test_coordinator_do_queued_extracts_infohash_from_blob():
     coord.dest_client = MagicMock()
     coord.dest_client.list_torrents = AsyncMock(return_value=[])
     # add_torrent returns accepted with no hash in result
-    coord.dest_client.add_torrent = AsyncMock(return_value=AddResult(hash=None, accepted=True, detail="ok"))
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[TorrentFile(name="ep1.mkv", size_bytes=1000, priority=1, progress=0.0)])
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash=None, accepted=True, detail="ok")
+    )
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[TorrentFile(name="ep1.mkv", size_bytes=1000, priority=1, progress=0.0)]
+    )
     coord.dest_client.set_file_priorities = AsyncMock()
     coord.dest_client.resume = AsyncMock()
     coord._await_hash_for_name = AsyncMock()
@@ -247,6 +254,7 @@ async def test_coordinator_do_queued_extracts_infohash_from_blob():
     sample_blob = _bencode(torrent_dict)
 
     import hashlib
+
     expected_hash = hashlib.sha1(_bencode(info_dict)).hexdigest().lower()
 
     ts = TorrentState(
@@ -275,15 +283,17 @@ async def test_late_cross_seeds_handles_none_detail_and_expires_failures(tmp_pat
     fname = "Movie.Title.mkv"
     fsize = 1000
     (fuse_dir / fname).write_bytes(b"q" * fsize)
-    blob = _bencode({
-        b"announce": b"http://tracker.example/announce",
-        b"info": {
-            b"name": fname.encode(),
-            b"length": fsize,
-            b"piece length": 16384,
-            b"pieces": b"12345678901234567890",
-        },
-    })
+    blob = _bencode(
+        {
+            b"announce": b"http://tracker.example/announce",
+            b"info": {
+                b"name": fname.encode(),
+                b"length": fsize,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
 
     coord = make_coordinator()
     coord.cfg.rclone.fuse.mount = str(fuse_dir)
@@ -294,7 +304,9 @@ async def test_late_cross_seeds_handles_none_detail_and_expires_failures(tmp_pat
     coord._failed_late_cross_seeds = {}
 
     # add_torrent returns accepted=False and detail=None
-    coord.dest_client.add_torrent = AsyncMock(return_value=AddResult(hash=None, accepted=False, detail=None))
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash=None, accepted=False, detail=None)
+    )
     coord.dest_client.get_torrent = AsyncMock(return_value=None)
 
     ts = TorrentState(
@@ -302,7 +314,17 @@ async def test_late_cross_seeds_handles_none_detail_and_expires_failures(tmp_pat
         source_name="Movie.Title",
         injected_private_hashes="",
     )
-    group = [Torrent(hash="late1", name="Movie.Title", category="", save_path="", size_bytes=1000, state="seeding", progress=1.0)]
+    group = [
+        Torrent(
+            hash="late1",
+            name="Movie.Title",
+            category="",
+            save_path="",
+            size_bytes=1000,
+            state="seeding",
+            progress=1.0,
+        )
+    ]
 
     # Run injection - must not raise AttributeError: 'NoneType' object has no attribute 'lower'
     await coord._check_and_inject_late_cross_seeds(ts, group)
@@ -310,10 +332,14 @@ async def test_late_cross_seeds_handles_none_detail_and_expires_failures(tmp_pat
     assert "late1" in coord._failed_late_cross_seeds
 
     # Simulate 31 minutes passing
-    coord._failed_late_cross_seeds["late1"] = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=31)
+    coord._failed_late_cross_seeds["late1"] = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+        minutes=31
+    )
 
     # Now add_torrent succeeds with detail=None
-    coord.dest_client.add_torrent = AsyncMock(return_value=AddResult(hash="late1", accepted=True, detail=None))
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash="late1", accepted=True, detail=None)
+    )
     coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path="x"))
     coord._save_path_points_at_target = MagicMock(return_value=True)
     await coord._check_and_inject_late_cross_seeds(ts, group)
@@ -361,7 +387,13 @@ async def test_wait_for_completion_stall_timeout():
 
     # Torrent stays at 50%
     stalled_torrent = Torrent(
-        hash="h1", name="StalledItem", category="", save_path="", size_bytes=1000, state="downloading", progress=0.5
+        hash="h1",
+        name="StalledItem",
+        category="",
+        save_path="",
+        size_bytes=1000,
+        state="downloading",
+        progress=0.5,
     )
     coord.dest_client = MagicMock()
     coord.dest_client.get_torrent = AsyncMock(return_value=stalled_torrent)
@@ -383,8 +415,9 @@ async def test_wait_for_completion_abandoned_row_raises_abandoned(tmp_path: Path
     coord.store = StateStore(tmp_path / "state.db")
     coord.dest_client = MagicMock()
     coord.dest_client.get_torrent = AsyncMock(return_value=None)
-    ts = TorrentState(source_infohash="gone" + "0" * 36, source_name="Gone",
-                      state=State.DOWNLOADING)
+    ts = TorrentState(
+        source_infohash="gone" + "0" * 36, source_name="Gone", state=State.DOWNLOADING
+    )
     try:
         with pytest.raises(AbandonedError):
             await coord._wait_for_completion(ts)
@@ -405,8 +438,7 @@ async def test_wait_for_completion_vanish_live_row_still_fails(tmp_path: Path):
     coord.store = StateStore(tmp_path / "state.db")
     coord.dest_client = MagicMock()
     coord.dest_client.get_torrent = AsyncMock(return_value=None)
-    ts = TorrentState(source_infohash="h1", source_name="Live",
-                      state=State.DOWNLOADING)
+    ts = TorrentState(source_infohash="h1", source_name="Live", state=State.DOWNLOADING)
     coord.store.upsert(ts)
     try:
         with pytest.raises(RuntimeError, match="vanished mid-download"):
@@ -428,8 +460,9 @@ async def test_process_torrent_skips_failed_for_forgotten_row(tmp_path: Path):
         raise RuntimeError("boom!")
 
     coord._process_torrent_inner = raise_boom
-    ts = TorrentState(source_infohash="gone" + "0" * 36, source_name="Gone",
-                      state=State.DOWNLOADING)
+    ts = TorrentState(
+        source_infohash="gone" + "0" * 36, source_name="Gone", state=State.DOWNLOADING
+    )
     try:
         await coord._process_torrent(ts)  # must not raise, must not resurrect
         assert coord.store.get(ts.source_infohash) is None
@@ -451,8 +484,7 @@ async def test_process_torrent_still_fails_live_row(tmp_path: Path):
         raise RuntimeError("boom!")
 
     coord._process_torrent_inner = raise_boom
-    ts = TorrentState(source_infohash="h1", source_name="Live",
-                      state=State.DOWNLOADING)
+    ts = TorrentState(source_infohash="h1", source_name="Live", state=State.DOWNLOADING)
     coord.store.upsert(ts)
     try:
         await coord._process_torrent(ts)
@@ -529,8 +561,7 @@ def test_sched_priority_pipeline_before_discovery():
     def _row(state):
         return TorrentState(source_infohash="h1", source_name="x", state=state)
 
-    for st in (State.RE_ADDING, State.QUEUED, State.MOVING,
-               State.DOWNLOADING):
+    for st in (State.RE_ADDING, State.QUEUED, State.MOVING, State.DOWNLOADING):
         assert _sched_priority(_row(st))[0] == 0
     assert _sched_priority(_row(State.NEW))[0] == 1
     assert _sched_priority(_row(State.WAITING_DISK))[0] == 2
@@ -541,12 +572,10 @@ def test_sched_priority_sorts_readding_before_new():
     from racing_sync.coordinator import _sched_priority
 
     new_rows = [
-        TorrentState(source_infohash=f"new{i:02d}", source_name="x",
-                     state=State.NEW)
+        TorrentState(source_infohash=f"new{i:02d}", source_name="x", state=State.NEW)
         for i in range(20)
     ]
-    waiting = TorrentState(source_infohash="r1", source_name="y",
-                           state=State.RE_ADDING)
+    waiting = TorrentState(source_infohash="r1", source_name="y", state=State.RE_ADDING)
     ordered = sorted([*new_rows, waiting], key=_sched_priority)
     assert ordered[0].source_infohash == "r1"
     assert all(t.state == State.NEW for t in ordered[1:])
@@ -566,12 +595,24 @@ def test_rclone_flag_validator_rejects_dash_variants():
         return RcloneConfig(**{**base, "extra_move_flags": flags})
 
     _cfg_with(["--transfers=4", "--bwlimit=0"])
-    for bad in ("--config", "-config", "---config", "--CONFIG=x",
-                "--password_command", "--ask-password=yes"):
+    for bad in (
+        "--config",
+        "-config",
+        "---config",
+        "--CONFIG=x",
+        "--password_command",
+        "--ask-password=yes",
+    ):
         with pytest.raises(ValidationError):
             _cfg_with([bad])
-    for bad in ("--password", "--rc-addr", "--drive-token",
-                "--s3-session-token", "--b2-key", "--custom-token"):
+    for bad in (
+        "--password",
+        "--rc-addr",
+        "--drive-token",
+        "--s3-session-token",
+        "--b2-key",
+        "--custom-token",
+    ):
         with pytest.raises(ValidationError):
             _cfg_with([bad])
 
@@ -583,16 +624,14 @@ def test_warn_unknown_keys_descends_into_indexer_lists(caplog):
         "general": {},
         "source": {"type": "qbittorrent", "host": "http://x/"},
         "dest": {"host": "http://y/", "save_path": "/s"},
-        "ssd": {"path": "/s", "max_inflight_bytes": 1,
-                "skip_movie_larger_than_bytes": 1},
+        "ssd": {"path": "/s", "max_inflight_bytes": 1, "skip_movie_larger_than_bytes": 1},
         "rclone": {
             "remote": {"default": "r:a/", "unsorted": "r:a/u/"},
             "fuse": {"mount": "/m", "mount_unsorted": "/m/u"},
         },
         "prowlarr": {
             "download_indexers": [
-                {"name": "Idx", "announce_substrings": [],
-                 "indxer_typo": True},
+                {"name": "Idx", "announce_substrings": [], "indxer_typo": True},
             ],
         },
     }
@@ -620,6 +659,7 @@ async def test_pick_ssd_source_public_and_private_paths():
     source_client.export_torrent.return_value = b"d8:announce...e"
     prowlarr = AsyncMock()
     from racing_sync.prowlarr import Indexer
+
     prowlarr.get_download_indexers = MagicMock(
         return_value=[Indexer(1, "Test Indexer (API)", "torrent", True, [])]
     )
@@ -670,19 +710,27 @@ async def test_pick_ssd_source_public_and_private_paths():
     cfg_priv.prowlarr.tracker_map = {"alpha.cc": "Alpha (API)"}
     cfg_priv.cross_seed.allow_prowlarr_cross_seed = True
 
-    hit = MagicMock(title="Priv.Movie", size_bytes=1000, download_url="http://dl-indexer.example/1", guid="0123456789012345678901234567890123456789")
+    hit = MagicMock(
+        title="Priv.Movie",
+        size_bytes=1000,
+        download_url="http://dl-indexer.example/1",
+        guid="0123456789012345678901234567890123456789",
+    )
     hit.indexer = "Test Indexer (API)"
     prowlarr.best_match.return_value = hit
     from racing_sync.watchdir import _bencode
-    prowlarr.download_torrent.return_value = _bencode({
-        b"announce": b"http://dl-indexer.example/announce",
-        b"info": {
-            b"name": b"Priv.Movie",
-            b"length": 1000,
-            b"piece length": 16384,
-            b"pieces": b"12345678901234567890",
-        },
-    })
+
+    prowlarr.download_torrent.return_value = _bencode(
+        {
+            b"announce": b"http://dl-indexer.example/announce",
+            b"info": {
+                b"name": b"Priv.Movie",
+                b"length": 1000,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
 
     dec_priv = await pick_ssd_source_for_racing(
         cfg=cfg_priv,
@@ -708,8 +756,10 @@ async def test_wait_disk_then_queue_false_branch():
 
     ts = TorrentState(source_infohash="h1", state=State.WAITING_DISK, total_bytes=1000)
 
-    with patch("racing_sync.coordinator.ssd_has_room", return_value=False), \
-         patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+    with (
+        patch("racing_sync.coordinator.ssd_has_room", return_value=False),
+        patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+    ):
         # Should check room once, not sleep, and return immediately to release worker slot
         await coord._wait_disk_then_queue(ts)
         mock_sleep.assert_not_called()
@@ -810,13 +860,17 @@ async def test_do_queued_happy_path():
     coord.cfg.classifier._episode_re = None
     coord.cfg.ssd.skip_movie_larger_than_bytes = 10_000_000_000
 
-    ts = TorrentState(source_infohash="h1", source_name="Movie.2024", state=State.QUEUED, save_path="/downloads")
+    ts = TorrentState(
+        source_infohash="h1", source_name="Movie.2024", state=State.QUEUED, save_path="/downloads"
+    )
     ts._blob = b"d8:announce..."
 
     coord.dest_client = MagicMock()
     coord.dest_client.list_torrents = AsyncMock(return_value=[])
     coord.dest_client.add_torrent = AsyncMock(return_value=AddResult(hash="dest_h1", accepted=True))
-    coord.dest_client.get_torrent_files = AsyncMock(return_value=[TorrentFile("Movie.2024.mkv", 5_000_000_000)])
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[TorrentFile("Movie.2024.mkv", 5_000_000_000)]
+    )
     coord.dest_client.resume = AsyncMock()
 
     coord.transition = MagicMock()
@@ -853,24 +907,31 @@ async def test_do_queued_remote_first_skips_slot_park(tmp_path):
         coord.cfg.ssd.skip_movie_larger_than_bytes = 10_000_000_000
         coord.cfg.max_active_downloads = 1
         # One live download fills the single slot.
-        store.upsert(TorrentState(source_infohash="b" * 40,
-                                  source_name="Busy",
-                                  state=State.DOWNLOADING))
+        store.upsert(
+            TorrentState(source_infohash="b" * 40, source_name="Busy", state=State.DOWNLOADING)
+        )
         coord._running_infohashes = {"b" * 40}
 
-        blob = bytes(_bencode({
-            b"info": {b"name": b"Remote.mkv", b"length": 100},
-        }))
-        ts = TorrentState(source_infohash="q" * 40, source_name="Remote",
-                          state=State.QUEUED, save_path=str(tmp_path),
-                          cross_seed_blob=blob)
+        blob = bytes(
+            _bencode(
+                {
+                    b"info": {b"name": b"Remote.mkv", b"length": 100},
+                }
+            )
+        )
+        ts = TorrentState(
+            source_infohash="q" * 40,
+            source_name="Remote",
+            state=State.QUEUED,
+            save_path=str(tmp_path),
+            cross_seed_blob=blob,
+        )
         store.upsert(ts)
 
         coord.dest_client = MagicMock()
         coord.dest_client.list_torrents = AsyncMock(return_value=[])
         coord.dest_client.add_torrent = AsyncMock()
-        coord.transition = MagicMock(
-            side_effect=lambda t, s, **k: setattr(t, "state", s))
+        coord.transition = MagicMock(side_effect=lambda t, s, **k: setattr(t, "state", s))
 
         await coord._do_queued(store.get("q" * 40))
 
@@ -887,8 +948,9 @@ def test_telegram_rate_product_warns(caplog):
     from racing_sync.config import TelegramConfig
 
     with caplog.at_level("WARNING", logger="racing_sync.config"):
-        TelegramConfig(enabled=True, bot_token="1:abc", chat_id="9",
-                       outbound_rate=30, status_update_interval=5)
+        TelegramConfig(
+            enabled=True, bot_token="1:abc", chat_id="9", outbound_rate=30, status_update_interval=5
+        )
     assert "outbound_rate" in caplog.text
     assert "429" in caplog.text
 
@@ -898,8 +960,9 @@ def test_telegram_repost_clamp_warns(caplog):
     from racing_sync.config import TelegramConfig
 
     with caplog.at_level("WARNING", logger="racing_sync.config"):
-        TelegramConfig(enabled=True, bot_token="1:abc", chat_id="9",
-                       active_repost_interval_seconds=3)
+        TelegramConfig(
+            enabled=True, bot_token="1:abc", chat_id="9", active_repost_interval_seconds=3
+        )
     assert "clamped to 5" in caplog.text
 
 
@@ -942,8 +1005,7 @@ def test_rpc_timeout_exceeding_poll_warns(caplog):
     from racing_sync.config import AppConfig
 
     with caplog.at_level("WARNING", logger="racing_sync.config"):
-        AppConfig.model_validate(tomllib.loads(
-            _minimal_app_toml(client_rpc_timeout_seconds=60)))
+        AppConfig.model_validate(tomllib.loads(_minimal_app_toml(client_rpc_timeout_seconds=60)))
     assert "client_rpc_timeout_seconds" in caplog.text
 
 
@@ -954,8 +1016,7 @@ def test_general_override_logs_winner(caplog):
     from racing_sync.config import AppConfig
 
     with caplog.at_level("INFO", logger="racing_sync.config"):
-        cfg = AppConfig.model_validate(tomllib.loads(
-            _minimal_app_toml(max_active_downloads=7)))
+        cfg = AppConfig.model_validate(tomllib.loads(_minimal_app_toml(max_active_downloads=7)))
     assert cfg.max_active_downloads == 7
     assert "wins over" in caplog.text
     assert "[general].max_active_downloads=7" in caplog.text
@@ -978,26 +1039,21 @@ def test_config_strategy_rejects():
     assert ProwlarrConfig(skip_query_substrings=["ab"]).skip_query_substrings == ["ab"]
     # Retry must fit inside the max-age window.
     with pytest.raises(ValidationError, match="must be less than"):
-        CrossSeedConfig(prowlarr_retry_interval_seconds=86400,
-                        prowlarr_max_age_seconds=3600)
+        CrossSeedConfig(prowlarr_retry_interval_seconds=86400, prowlarr_max_age_seconds=3600)
     # Refetch without Prowlarr queries is a silent no-op.
     with pytest.raises(ValidationError, match="silent no-op"):
-        CrossSeedConfig(refetch_public_via_prowlarr=True,
-                        allow_prowlarr_cross_seed=False)
+        CrossSeedConfig(refetch_public_via_prowlarr=True, allow_prowlarr_cross_seed=False)
     # Absurd inflight caps are typos, not plans.
     with pytest.raises(ValidationError):
-        SSDConfig(path="/ssd", max_inflight_bytes=2**60,
-                  skip_movie_larger_than_bytes=1)
+        SSDConfig(path="/ssd", max_inflight_bytes=2**60, skip_movie_larger_than_bytes=1)
     # Source origins need a scheme + host; placeholders rejected.
     with pytest.raises(ValidationError, match="http"):
         SourceConfig(type="qbittorrent", host="seedbox.lan:8080")
     with pytest.raises(ValidationError, match="include a host"):
         SourceConfig(type="qbittorrent", host="http://")
     with pytest.raises(ValidationError, match="placeholder"):
-        SourceConfig(type="qbittorrent", host="http://seedbox.lan:8080",
-                     password="CHANGE_ME")
-    assert SourceConfig(
-        type="qbittorrent", host="http://seedbox.lan:8080").host.startswith("http")
+        SourceConfig(type="qbittorrent", host="http://seedbox.lan:8080", password="CHANGE_ME")
+    assert SourceConfig(type="qbittorrent", host="http://seedbox.lan:8080").host.startswith("http")
 
 
 def test_remote_dotdot_rejected_and_overlap_resolves():
@@ -1009,8 +1065,9 @@ def test_remote_dotdot_rejected_and_overlap_resolves():
     with pytest.raises(ValidationError, match=r"\.\."):
         RemoteConfig(default="remote:a/../b/", unsorted="remote:u/")
     # Distinct trees stay fine (nested documented layout allowed).
-    assert RemoteConfig(
-        default="remote:qb/", unsorted="remote:qb/unsorted/").default == "remote:qb/"
+    assert (
+        RemoteConfig(default="remote:qb/", unsorted="remote:qb/unsorted/").default == "remote:qb/"
+    )
 
 
 def test_storage_overlap_resolves_dotdot(tmp_path: Path):
@@ -1022,12 +1079,13 @@ def test_storage_overlap_resolves_dotdot(tmp_path: Path):
 
     fuse = tmp_path / "fuse"
     tricky_ssd = tmp_path / "sub" / ".." / "fuse"
-    text = _minimal_app_toml().replace(
-        'mount = "/mnt/fuse"', f'mount = "{fuse.as_posix()}"').replace(
-        'mount_unsorted = "/mnt/fuse/unsorted"',
-        f'mount_unsorted = "{fuse.as_posix()}-u"').replace(
-        'path = "/downloads"', f'path = "{tricky_ssd.as_posix()}"').replace(
-        'save_path = "/downloads"', f'save_path = "{tricky_ssd.as_posix()}"')
+    text = (
+        _minimal_app_toml()
+        .replace('mount = "/mnt/fuse"', f'mount = "{fuse.as_posix()}"')
+        .replace('mount_unsorted = "/mnt/fuse/unsorted"', f'mount_unsorted = "{fuse.as_posix()}-u"')
+        .replace('path = "/downloads"', f'path = "{tricky_ssd.as_posix()}"')
+        .replace('save_path = "/downloads"', f'save_path = "{tricky_ssd.as_posix()}"')
+    )
     with pytest.raises(ValidationError, match="overlap"):
         AppConfig.model_validate(tomllib.loads(text))
 

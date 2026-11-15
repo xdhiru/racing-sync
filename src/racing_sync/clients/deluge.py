@@ -57,8 +57,8 @@ class DelugeClient(TorrentClient, HTTPClientBase):
 
     def __init__(self, cfg: SourceConfig):
         from ..config import HTTPClientConfig
-        HTTPClientBase.__init__(self, HTTPClientConfig.from_source(cfg),
-                                label="source-deluge")
+
+        HTTPClientBase.__init__(self, HTTPClientConfig.from_source(cfg), label="source-deluge")
         self._req_id = 0
         # NOTE: the Deluge web API's `web.connect` takes only the host id —
         # the *daemon* password lives in the WebUI's stored host entry
@@ -67,10 +67,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         # is intentionally no `deluge_password` knob here.
         # Keep a reference to the SFTP config so we can fall back to
         # reading .torrent files when the daemon RPC is unavailable.
-        self._sftp_cfg = (
-            cfg.deluge_sftp if cfg.deluge_sftp and cfg.deluge_sftp.enabled
-            else None
-        )
+        self._sftp_cfg = cfg.deluge_sftp if cfg.deluge_sftp and cfg.deluge_sftp.enabled else None
         # Shared exporter wired by the coordinator (reuses one SSH
         # connection). Falls back to a fresh per-call connection when unset
         # (e.g. standalone use in tests).
@@ -101,9 +98,14 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         # Note: We must NOT call self._rpc here because self.request()
         # would attempt to re-acquire self._auth_lock (deadlock!).
         from .http_base import AuthError
+
         payload = {
             "method": "auth.login",
-            "params": [self._cfg.password.get_secret_value() if hasattr(self._cfg.password, "get_secret_value") else str(self._cfg.password)],
+            "params": [
+                self._cfg.password.get_secret_value()
+                if hasattr(self._cfg.password, "get_secret_value")
+                else str(self._cfg.password)
+            ],
             "id": 1,
         }
         # The login POST bypasses HTTPClientBase.request (which would
@@ -119,22 +121,23 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     else:
                         login_data = await r.json()
                 break
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError,
-                    aiohttp.ClientPayloadError, aiohttp.ClientOSError) as e:
+            except (
+                aiohttp.ClientConnectionError,
+                asyncio.TimeoutError,
+                aiohttp.ClientPayloadError,
+                aiohttp.ClientOSError,
+            ) as e:
                 if attempt == 2:
-                    raise AuthError(
-                        f"deluge login unreachable at {self._cfg.host}: {e}"
-                    ) from e
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                    raise AuthError(f"deluge login unreachable at {self._cfg.host}: {e}") from e
+                await asyncio.sleep(0.5 * (2**attempt))
             except aiohttp.ContentTypeError as e:
                 # Non-JSON login body (proxy error page, captive portal):
                 # retry like a transport blip, but say what it was.
                 if attempt == 2:
                     raise AuthError(
-                        f"deluge login at {self._cfg.host} returned "
-                        f"non-JSON body: {e}"
+                        f"deluge login at {self._cfg.host} returned non-JSON body: {e}"
                     ) from e
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                await asyncio.sleep(0.5 * (2**attempt))
         if login_status >= 400:
             raise AuthError(
                 f"deluge login HTTP {login_status} at {self._cfg.host}: {login_body[:200]}"
@@ -193,12 +196,13 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                                     cdata = {}
                                 if isinstance(cdata, dict) and cdata.get("error"):
                                     raise AuthError(
-                                        f"deluge web.connect to {host_id} failed: "
-                                        f"{cdata['error']}"
+                                        f"deluge web.connect to {host_id} failed: {cdata['error']}"
                                     )
-                                if (isinstance(cdata, dict)
-                                        and "result" in cdata
-                                        and cdata.get("result") is False):
+                                if (
+                                    isinstance(cdata, dict)
+                                    and "result" in cdata
+                                    and cdata.get("result") is False
+                                ):
                                     raise AuthError(
                                         f"deluge web.connect to {host_id} refused "
                                         f"(returned False). If the daemon needs a "
@@ -213,9 +217,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             # nothing about the daemon link — returning "authed" here
             # used to green-light a disconnected client. Transient blips
             # heal via the boot backoff / per-call retry instead.
-            raise AuthError(
-                f"deluge daemon health check failed at {self._cfg.host}: {e}"
-            ) from e
+            raise AuthError(f"deluge daemon health check failed at {self._cfg.host}: {e}") from e
 
     # ---- JSON-RPC plumbing ----
 
@@ -227,13 +229,12 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             "id": self._req_id,
         }
         for attempt in range(2):
-            async with await self.request(
-                "POST", "json", json_body=payload
-            ) as r:
+            async with await self.request("POST", "json", json_body=payload) as r:
                 try:
                     data = await r.json()
                 except Exception as e:
                     from .http_base import AuthError
+
                     body = ""
                     try:
                         body = await r.text()
@@ -252,8 +253,11 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             if "error" in data and data["error"]:
                 err_text = str(data["error"])
                 low = err_text.lower()
-                if any(s in low for s in ("not authenticated", "not authorized", "login", "session")):
+                if any(
+                    s in low for s in ("not authenticated", "not authorized", "login", "session")
+                ):
                     from .http_base import AuthError
+
                     # Drop the session flag so the next request() re-logs in
                     # instead of replaying the dead session forever: Deluge
                     # expiry arrives as HTTP 200 + JSON (never 401), so the
@@ -269,10 +273,20 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 # Daemon-side transient failures (load shedding, timeouts)
                 # must park-and-retry, not fail the row: surface them as
                 # TimeoutError, which the retryable contract honors.
-                if any(s in low for s in ("timeout", "timed out", "try again",
-                                          "busy", "overloaded", "unavailable")):
+                if any(
+                    s in low
+                    for s in (
+                        "timeout",
+                        "timed out",
+                        "try again",
+                        "busy",
+                        "overloaded",
+                        "unavailable",
+                    )
+                ):
                     raise TimeoutError(
-                        f"deluge rpc {method} transient daemon error: {err_text[:200]}")
+                        f"deluge rpc {method} transient daemon error: {err_text[:200]}"
+                    )
                 raise RuntimeError(f"deluge rpc {method} error: {data['error']}")
             return data.get("result")
         raise RuntimeError("unreachable")  # pragma: no cover
@@ -285,6 +299,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         """
         try:
             from .http_base import AuthError as _AE
+
             try:
                 return bool(await self._login_singleflight(force=True))
             except _AE as e:
@@ -339,19 +354,24 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         info = await self._cached_scan(filt, status_keys)
         rows = info or {}
         if not isinstance(rows, dict):
-            log.warning("deluge get_torrents_status returned unexpected shape %s", type(rows).__name__)
+            log.warning(
+                "deluge get_torrents_status returned unexpected shape %s", type(rows).__name__
+            )
             return []
         out: list[Torrent] = []
+
         def _num(value: object) -> int:
             try:
                 return int(float(value or 0))  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 return 0
+
         def _ratio(value: object) -> float:
             try:
                 return float(value or 0.0)  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 return 0.0
+
         def _progress(value: object) -> float:
             try:
                 p = float(value or 0.0)  # type: ignore[arg-type]
@@ -361,6 +381,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             # the old `> 1.0` heuristic misclassified exactly 1% (1.0)
             # as complete.
             return min(1.0, max(0.0, p / 100.0))
+
         for h, status in rows.items():
             if not isinstance(status, dict):
                 continue
@@ -376,9 +397,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     state=status.get("state", ""),
                     progress=_progress(status.get("progress", 0.0)),
                     ratio=_ratio(status.get("ratio", 0.0)),
-                    trackers=_extract_tracker_urls(
-                        status.get("trackers", []) or []
-                    ),
+                    trackers=_extract_tracker_urls(status.get("trackers", []) or []),
                     files=[],
                     added_on=_num(status.get("time_added", 0)),
                     upspeed_bps=_num(status.get("upload_payload_rate")),
@@ -422,8 +441,12 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             key = ("", ())
         try:
             cached = self._scan_cache.get(key)
-            if (cached and _time.monotonic() - cached[0] < _SCAN_TTL_S
-                    and isinstance(cached[1], dict) and cached[1]):
+            if (
+                cached
+                and _time.monotonic() - cached[0] < _SCAN_TTL_S
+                and isinstance(cached[1], dict)
+                and cached[1]
+            ):
                 return cached[1]
         except Exception:
             pass
@@ -439,8 +462,12 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         async with _lock:
             try:
                 cached = self._scan_cache.get(key)
-                if (cached and _time.monotonic() - cached[0] < _SCAN_TTL_S
-                        and isinstance(cached[1], dict) and cached[1]):
+                if (
+                    cached
+                    and _time.monotonic() - cached[0] < _SCAN_TTL_S
+                    and isinstance(cached[1], dict)
+                    and cached[1]
+                ):
                     return cached[1]
             except Exception:
                 pass
@@ -473,11 +500,12 @@ class DelugeClient(TorrentClient, HTTPClientBase):
 
     async def get_torrent_files(self, torrent_hash: str) -> list[TorrentFile]:
         """Fetch files for `torrent_hash`.
-        
+
         Tries Deluge's native `core.get_torrent_status(..., ['files', 'file_priorities'])`.
         Falls back to decoding the .torrent file from SFTP if unavailable.
         """
         from .http_base import AuthError
+
         try:
             status = await self._rpc(
                 "core.get_torrent_status",
@@ -486,6 +514,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             if status and "files" in status:
                 prios = status.get("file_priorities", []) or []
                 progs = status.get("file_progress", []) or []
+
                 # Deluge reports file_progress on a 0-100 scale (same as the
                 # torrent-level progress). Always normalize by /100.
                 def _fnum(v: object) -> float:
@@ -493,6 +522,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                         return float(v or 0.0)  # type: ignore[arg-type]
                     except (TypeError, ValueError):
                         return 0.0
+
                 out: list[TorrentFile] = []
                 for item in status["files"]:
                     idx = item.get("index", len(out))
@@ -527,7 +557,9 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         except AuthError:
             raise
         except Exception as e:
-            log.debug("deluge get_torrent_status files failed: %s; falling back to .torrent file", e)
+            log.debug(
+                "deluge get_torrent_status files failed: %s; falling back to .torrent file", e
+            )
         # RPC yielded no files: either a magnet without metadata (bytes
         # arrive later — retry is meaningful) or a genuinely fileless
         # torrent (retry is futile). The daemon doesn't say which; name
@@ -535,7 +567,8 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         log.warning(
             "deluge has no RPC file list for %s (magnet without metadata "
             "or fileless torrent); trying .torrent fallback",
-            torrent_hash[:10])
+            torrent_hash[:10],
+        )
         return await self._files_from_torrent_file(torrent_hash)
 
     async def _files_from_torrent_file(self, torrent_hash: str) -> list[TorrentFile]:
@@ -551,6 +584,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         set_sftp_exporter() (standalone/test use).
         """
         from ..sftp_source import SFTPExporter
+
         if not self._sftp_cfg and self._shared_sftp is None:
             return []
         shared = self._shared_sftp
@@ -562,12 +596,12 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     timeout=15.0,
                 )
             except TimeoutError:
-                log.warning("deluge: shared SFTP .torrent fetch for %s timed out",
-                            torrent_hash[:10])
+                log.warning(
+                    "deluge: shared SFTP .torrent fetch for %s timed out", torrent_hash[:10]
+                )
                 return None
             except Exception as e:
-                log.warning("deluge: shared SFTP fetch failed for %s: %s",
-                            torrent_hash, e)
+                log.warning("deluge: shared SFTP fetch failed for %s: %s", torrent_hash, e)
                 return None
 
         def _fetch_fresh() -> bytes | None:
@@ -594,11 +628,11 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         if not blob:
             return []
         from ..watchdir import _bdecode
+
         try:
             _, root = _bdecode(blob, 0)
         except Exception as e:  # noqa: BLE001
-            log.warning("deluge: failed to bencode .torrent for %s: %s",
-                        torrent_hash[:10], e)
+            log.warning("deluge: failed to bencode .torrent for %s: %s", torrent_hash[:10], e)
             return []
         info = root.get(b"info") if isinstance(root, dict) else None
         if not info:
@@ -617,9 +651,17 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     _parts = [p.decode("utf-8", "replace") for p in (f.get(b"path", []) or [])]
                 except Exception:
                     continue
-                _parts = [p for p in _parts
-                          if p and p not in (".", "..") and "/" not in p and "\\" not in p
-                          and "\n" not in p and "\r" not in p and "\0" not in p]
+                _parts = [
+                    p
+                    for p in _parts
+                    if p
+                    and p not in (".", "..")
+                    and "/" not in p
+                    and "\\" not in p
+                    and "\n" not in p
+                    and "\r" not in p
+                    and "\0" not in p
+                ]
                 if not _parts:
                     continue
                 rel = "/".join(_parts)
@@ -633,12 +675,14 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     length = int(length_raw or 0)
                 except (TypeError, ValueError, OverflowError):
                     length = 0
-                out.append(TorrentFile(
-                    name=full,
-                    size_bytes=length,
-                    priority=1,
-                    progress=0.0,
-                ))
+                out.append(
+                    TorrentFile(
+                        name=full,
+                        size_bytes=length,
+                        priority=1,
+                        progress=0.0,
+                    )
+                )
             return out
         # Single-file mode
         name = (top_name or "").replace("\n", " ").replace("\r", " ")
@@ -646,15 +690,18 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             length = int(info.get(b"length", 0) or 0)
         except (TypeError, ValueError, OverflowError):
             length = 0
-        return [TorrentFile(
-            name=name,
-            size_bytes=length,
-            priority=1,
-            progress=0.0,
-        )]
+        return [
+            TorrentFile(
+                name=name,
+                size_bytes=length,
+                priority=1,
+                progress=0.0,
+            )
+        ]
 
     async def get_trackers(self, torrent_hash: str) -> list[str]:
         from .http_base import AuthError
+
         try:
             status = await self._rpc("core.get_torrent_status", [torrent_hash, ["trackers"]])
         except AuthError:
@@ -702,7 +749,8 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             # paths will diverge here. Log so layout bugs are visible.
             log.warning(
                 "deluge add_torrent ignoring content_layout=%r tags=%r (no Deluge equivalent)",
-                content_layout, tags,
+                content_layout,
+                tags,
             )
 
         if torrent_files and urls:
@@ -713,19 +761,18 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             # We pass the bytes directly via base64.
             import base64
             import uuid
+
             for blob in torrent_files:
                 if not isinstance(blob, (bytes, bytearray)) or not blob:
                     results.append(None)
                     continue
                 # Bound the wire payload like the watchdir .torrent cap.
                 from ..watchdir import MAX_TORRENT_BYTES
+
                 if len(blob) > MAX_TORRENT_BYTES:
-                    raise ValueError(
-                        f"torrent payload exceeds {MAX_TORRENT_BYTES} bytes; refusing"
-                    )
+                    raise ValueError(f"torrent payload exceeds {MAX_TORRENT_BYTES} bytes; refusing")
                 # Base64 of a 20 MiB blob is pure CPU: off the loop.
-                encoded = await asyncio.to_thread(
-                    base64.b64encode, bytes(blob))
+                encoded = await asyncio.to_thread(base64.b64encode, bytes(blob))
                 encoded = encoded.decode()
                 res = await self._rpc(
                     "core.add_torrent_file", [f"{uuid.uuid4().hex}.torrent", encoded, opts]
@@ -733,6 +780,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 results.append(res)
         elif urls:
             from urllib.parse import urlsplit as _us
+
             for u in urls:
                 try:
                     _p = _us(u)
@@ -742,25 +790,29 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                     raise ValueError(
                         f"deluge add_torrent_url refusing scheme "
                         f"{_p.scheme!r} (file:// etc. would hand daemon-local "
-                        f"paths to the VPS1 daemon)")
+                        f"paths to the VPS1 daemon)"
+                    )
                 if _p.scheme in ("http", "https") and not _p.hostname:
-                    raise ValueError(
-                        f"deluge add_torrent_url refusing URL without host: {u!r}")
+                    raise ValueError(f"deluge add_torrent_url refusing URL without host: {u!r}")
                 res = await self._rpc("core.add_torrent_url", [u, opts])
                 results.append(res)
         else:
             raise ValueError("add_torrent requires urls or torrent_files")
 
         first_raw = next((str(r) for r in results if r), None)
-        if first_raw and len(first_raw) == 40 and all(
-                c in "0123456789abcdefABCDEF" for c in first_raw):
+        if (
+            first_raw
+            and len(first_raw) == 40
+            and all(c in "0123456789abcdefABCDEF" for c in first_raw)
+        ):
             first_hash = first_raw.lower()
         else:
             # The daemon accepted the add (results truthy) but answered
             # garbage ("True", an error string): never mint that as a hash.
             if first_raw:
-                log.warning("deluge add_torrent returned non-hash %r; leaving hash empty",
-                            first_raw[:40])
+                log.warning(
+                    "deluge add_torrent returned non-hash %r; leaving hash empty", first_raw[:40]
+                )
             first_hash = None
         return AddResult(
             hash=first_hash,
@@ -768,10 +820,9 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             detail=json.dumps([str(r) for r in results]),
         )
 
-    async def set_file_priorities(
-        self, torrent_hash: str, priorities: dict[str, int]
-    ) -> None:
+    async def set_file_priorities(self, torrent_hash: str, priorities: dict[str, int]) -> None:
         from .http_base import AuthError
+
         self._invalidate_scan_cache()
         try:
             status = await self._rpc(
@@ -784,8 +835,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 if len(curr_prios) < len(files):
                     curr_prios += [1] * (len(files) - len(curr_prios))
                 name_to_idx = {
-                    item.get("path", ""): item.get("index", i)
-                    for i, item in enumerate(files)
+                    item.get("path", ""): item.get("index", i) for i, item in enumerate(files)
                 }
                 applied = 0
                 for name, prio in priorities.items():
@@ -801,13 +851,18 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                             except (TypeError, ValueError):
                                 log.warning(
                                     "deluge set_file_priorities: unparsable priority %r "
-                                    "for %r; skipping it", prio, name)
+                                    "for %r; skipping it",
+                                    prio,
+                                    name,
+                                )
                                 continue
                             if p not in (0, 1, 6, 7):
                                 log.warning(
                                     "deluge set_file_priorities: unknown priority %r "
                                     "for %r (want 0/1, qB 6/7 map to 1); skipping it",
-                                    prio, name)
+                                    prio,
+                                    name,
+                                )
                                 continue
                             # Deluge scale is 0 (skip) / 1 (download);
                             # map qB 6/7 down to 1.
@@ -815,14 +870,14 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                             applied += 1
                     else:
                         log.warning(
-                            "deluge set_file_priorities: file %r not in torrent; skipping it",
-                            name)
+                            "deluge set_file_priorities: file %r not in torrent; skipping it", name
+                        )
                 if priorities and not applied:
                     # Fail closed: mapping nothing would download unfiltered
                     # and blow the SSD budget (qB parity).
                     raise ValueError(
-                        f"deluge set_file_priorities: no valid files to update "
-                        f"for {torrent_hash}")
+                        f"deluge set_file_priorities: no valid files to update for {torrent_hash}"
+                    )
                 await self._rpc("core.set_torrent_file_priorities", [torrent_hash, curr_prios])
         except AuthError:
             raise
@@ -838,6 +893,7 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         error instead of a no-op.
         """
         from .http_base import AuthError
+
         try:
             await coro
         except AuthError:
@@ -846,34 +902,35 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         except Exception as e:
             _msg = f"{e}".lower()
             if "no such torrent" in _msg or "unknown torrent" in _msg or "invalid torrent" in _msg:
-                log.info("deluge %s %s already gone; treating as success",
-                         op, torrent_hash[:10])
+                log.info("deluge %s %s already gone; treating as success", op, torrent_hash[:10])
                 return
             raise
 
     async def pause(self, torrent_hash: str) -> None:
         self._invalidate_scan_cache()
         await self._not_found_is_gone(
-            "pause", torrent_hash,
-            self._rpc("core.pause_torrent", [torrent_hash]))
+            "pause", torrent_hash, self._rpc("core.pause_torrent", [torrent_hash])
+        )
 
     async def resume(self, torrent_hash: str) -> None:
         self._invalidate_scan_cache()
         await self._not_found_is_gone(
-            "resume", torrent_hash,
-            self._rpc("core.resume_torrent", [torrent_hash]))
+            "resume", torrent_hash, self._rpc("core.resume_torrent", [torrent_hash])
+        )
 
     async def delete(self, torrent_hash: str, *, delete_files: bool = False) -> None:
         self._invalidate_scan_cache()
         await self._not_found_is_gone(
-            "delete", torrent_hash,
-            self._rpc("core.remove_torrent", [torrent_hash, bool(delete_files)]))
+            "delete",
+            torrent_hash,
+            self._rpc("core.remove_torrent", [torrent_hash, bool(delete_files)]),
+        )
 
     async def recheck(self, torrent_hash: str) -> None:
         self._invalidate_scan_cache()
         await self._not_found_is_gone(
-            "recheck", torrent_hash,
-            self._rpc("core.force_recheck", [torrent_hash]))
+            "recheck", torrent_hash, self._rpc("core.force_recheck", [torrent_hash])
+        )
 
     # ---- deluge-specific ----
 
@@ -887,13 +944,13 @@ class DelugeClient(TorrentClient, HTTPClientBase):
         if not isinstance(encoded, str):
             raise ValueError(f"deluge returned non-string .torrent for {torrent_hash}")
         from ..watchdir import MAX_TORRENT_BYTES
+
         # Base64 inflates ~4/3: reject before decoding unbounded input.
         if len(encoded) > MAX_TORRENT_BYTES * 4 // 3 + 16:
             raise ValueError(f"deluge .torrent for {torrent_hash} exceeds size cap")
         try:
             # Decode off the loop: base64 of a ~27MB string is pure CPU.
-            decoded = await asyncio.to_thread(
-                base64.b64decode, encoded, validate=True)
+            decoded = await asyncio.to_thread(base64.b64decode, encoded, validate=True)
         except Exception as e:
             raise ValueError(f"deluge .torrent for {torrent_hash} is not valid base64: {e}") from e
         # A bencoded torrent is always a dict: refuse error pages and

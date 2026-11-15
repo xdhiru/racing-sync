@@ -26,7 +26,7 @@ class _FakeContent:
 
     async def iter_chunked(self, size: int):
         for start in range(0, len(self._body), size):
-            yield self._body[start:start + size]
+            yield self._body[start : start + size]
 
 
 class _FakeResponse:
@@ -102,14 +102,15 @@ def _api_key(headers) -> str | None:
 @pytest.mark.anyio
 async def test_same_origin_redirect_is_followed_with_key():
     client = _client()
-    session = _FakeSession([
-        _redirect("/download/2"),
-        _FakeResponse(200, body=_BODY),
-    ])
+    session = _FakeSession(
+        [
+            _redirect("/download/2"),
+            _FakeResponse(200, body=_BODY),
+        ]
+    )
     client._session = session
 
-    data = await client.download_torrent(
-        _hit("http://127.0.0.1:9696/api/v1/download/1"))
+    data = await client.download_torrent(_hit("http://127.0.0.1:9696/api/v1/download/1"))
 
     assert data == _BODY
     assert len(session.calls) == 2
@@ -125,14 +126,15 @@ async def test_same_origin_redirect_is_followed_with_key():
 @pytest.mark.anyio
 async def test_cross_origin_redirect_drops_api_key():
     client = _client()
-    session = _FakeSession([
-        _redirect("http://evil.example/file"),
-        _FakeResponse(200, body=_BODY),
-    ])
+    session = _FakeSession(
+        [
+            _redirect("http://evil.example/file"),
+            _FakeResponse(200, body=_BODY),
+        ]
+    )
     client._session = session
 
-    data = await client.download_torrent(
-        _hit("http://127.0.0.1:9696/api/v1/download/1"))
+    data = await client.download_torrent(_hit("http://127.0.0.1:9696/api/v1/download/1"))
 
     assert data == _BODY
     assert len(session.calls) == 2
@@ -146,14 +148,15 @@ async def test_cross_origin_redirect_drops_api_key():
 @pytest.mark.anyio
 async def test_redirect_to_link_local_literal_is_refused():
     client = _client()
-    session = _FakeSession([
-        _redirect("http://169.254.169.254/latest/meta-data?token=SECRET"),
-    ])
+    session = _FakeSession(
+        [
+            _redirect("http://169.254.169.254/latest/meta-data?token=SECRET"),
+        ]
+    )
     client._session = session
 
     with pytest.raises(ProwlarrError) as exc_info:
-        await client.download_torrent(
-            _hit("http://127.0.0.1:9696/api/v1/download/1"))
+        await client.download_torrent(_hit("http://127.0.0.1:9696/api/v1/download/1"))
 
     # Local verdict: refuse before issuing a second request.
     assert len(session.calls) == 1
@@ -170,8 +173,7 @@ async def test_redirect_loop_over_cap_is_refused():
     client._session = session
 
     with pytest.raises(ProwlarrError, match="redirect"):
-        await client.download_torrent(
-            _hit("http://127.0.0.1:9696/api/v1/download/1"))
+        await client.download_torrent(_hit("http://127.0.0.1:9696/api/v1/download/1"))
 
     # 1 initial + 5 allowed hops; the 6th Location is refused.
     assert len(session.calls) == 6

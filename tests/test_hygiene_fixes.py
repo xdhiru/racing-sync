@@ -1,6 +1,7 @@
 """Focused tests for the hygiene-fix batch (flap trip, late-seed memo,
 mount short-circuit, added_on skew, protected-pattern validation).
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -12,8 +13,12 @@ from conftest import make_coordinator
 
 def _ts(state=None, **kw):
     from racing_sync.state import State, TorrentState
-    base = dict(source_infohash="a" * 40, source_name="Show",
-                state=State.RE_ADDING if state is None else state)
+
+    base = dict(
+        source_infohash="a" * 40,
+        source_name="Show",
+        state=State.RE_ADDING if state is None else state,
+    )
     base.update(kw)
     return TorrentState(**base)
 
@@ -61,8 +66,11 @@ async def test_do_re_add_trips_on_flap_limit():
         ts.state = dst
 
     coord.transition = _transition
-    ts = _ts(state=State.RE_ADDING, readd_cycles=5,
-             readd_first_attempted_at=dt.datetime.now(dt.timezone.utc))
+    ts = _ts(
+        state=State.RE_ADDING,
+        readd_cycles=5,
+        readd_first_attempted_at=dt.datetime.now(dt.timezone.utc),
+    )
     await coord._do_re_add(ts)
     assert transitioned.get("dst") == State.FAILED
 
@@ -79,15 +87,17 @@ async def test_late_seed_healthy_check_memoized(tmp_path):
     fname = "Movie.Title.mkv"
     fsize = 1000
     (fuse / fname).write_bytes(b"q" * fsize)
-    blob = _bencode({
-        b"announce": b"http://tracker.example/announce",
-        b"info": {
-            b"name": fname.encode(),
-            b"length": fsize,
-            b"piece length": 16384,
-            b"pieces": b"12345678901234567890",
-        },
-    })
+    blob = _bencode(
+        {
+            b"announce": b"http://tracker.example/announce",
+            b"info": {
+                b"name": fname.encode(),
+                b"length": fsize,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
 
     coord = make_coordinator()
     coord.cfg.cross_seed.inject_racing_torrents_to_fuse = True
@@ -99,23 +109,38 @@ async def test_late_seed_healthy_check_memoized(tmp_path):
     coord._failed_late_cross_seeds = {}
     # First attempt rejected -> deferred; retry succeeds -> injected.
     coord.dest_client.add_torrent = AsyncMock(
-        return_value=AddResult(hash=None, accepted=False, detail=None))
+        return_value=AddResult(hash=None, accepted=False, detail=None)
+    )
     coord.dest_client.get_torrent = AsyncMock(return_value=None)
 
-    ts = _ts(state=State.DONE, source_infohash="src1",
-             source_name="Movie.Title", save_path=str(fuse),
-             injected_private_hashes="")
-    group = [Torrent(hash="late1", name="Movie.Title", category="",
-                     save_path="", size_bytes=1000, state="seeding", progress=1.0)]
+    ts = _ts(
+        state=State.DONE,
+        source_infohash="src1",
+        source_name="Movie.Title",
+        save_path=str(fuse),
+        injected_private_hashes="",
+    )
+    group = [
+        Torrent(
+            hash="late1",
+            name="Movie.Title",
+            category="",
+            save_path="",
+            size_bytes=1000,
+            state="seeding",
+            progress=1.0,
+        )
+    ]
     await coord._check_and_inject_late_cross_seeds(ts, group)
     assert "late1" in coord._failed_late_cross_seeds
 
-    coord._failed_late_cross_seeds["late1"] = (
-        dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=31))
+    coord._failed_late_cross_seeds["late1"] = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+        minutes=31
+    )
     coord.dest_client.add_torrent = AsyncMock(
-        return_value=AddResult(hash="late1", accepted=True, detail=None))
-    coord.dest_client.get_torrent = AsyncMock(
-        return_value=MagicMock(save_path=str(fuse)))
+        return_value=AddResult(hash="late1", accepted=True, detail=None)
+    )
+    coord.dest_client.get_torrent = AsyncMock(return_value=MagicMock(save_path=str(fuse)))
     coord._save_path_points_at_target = MagicMock(return_value=True)
     await coord._check_and_inject_late_cross_seeds(ts, group)
     assert "late1" in ts.injected_private_hashes
@@ -133,7 +158,8 @@ async def test_missing_fuse_files_short_circuits_dead_mount(tmp_path):
 
     coord = make_coordinator()
     missing = await coord._missing_fuse_files(
-        tmp_path / "no-such-mount", [("a.mkv", 1), ("b.mkv", 2)])
+        tmp_path / "no-such-mount", [("a.mkv", 1), ("b.mkv", 2)]
+    )
     assert len(missing) == 1
     assert missing[0].startswith("<mount unavailable")
 
@@ -151,18 +177,23 @@ def test_cleanup_idle_rejects_skewed_added_on():
     ts = TorrentState(source_infohash="h", source_name="S", state=State.DONE)
 
     def _member(added):
-        return Torrent(hash="h", name="S", category="", save_path="",
-                       size_bytes=1, state="seeding", progress=1.0,
-                       added_on=added)
+        return Torrent(
+            hash="h",
+            name="S",
+            category="",
+            save_path="",
+            size_bytes=1,
+            state="seeding",
+            progress=1.0,
+            added_on=added,
+        )
 
     # Future timestamp (VPS1 clock ahead) fails closed.
-    assert coord._cleanup_idle_confirmed(
-        ts, [_member(int(time.time()) + 3600)], now, cfg) is False
+    assert coord._cleanup_idle_confirmed(ts, [_member(int(time.time()) + 3600)], now, cfg) is False
     # Near-epoch bogus timestamp fails closed.
     assert coord._cleanup_idle_confirmed(ts, [_member(1)], now, cfg) is False
     # Genuinely old + quiet passes.
-    assert coord._cleanup_idle_confirmed(
-        ts, [_member(int(time.time()) - 7200)], now, cfg) is True
+    assert coord._cleanup_idle_confirmed(ts, [_member(int(time.time()) - 7200)], now, cfg) is True
 
 
 def test_protected_patterns_reject_blank():
@@ -226,22 +257,26 @@ async def test_fuse_first_add_verified_before_trust(tmp_path):
 
     fuse = tmp_path / "fuse"
     # Invisible: get_torrent stays None through all 4 polls.
-    coord = _coord_with_add(
-        AddResult(hash="ab" * 20, accepted=True, detail="Ok."), None)
+    coord = _coord_with_add(AddResult(hash="ab" * 20, accepted=True, detail="Ok."), None)
     ok, detail = await coord._ensure_fuse_entry(
         blob=b"d8:announce1:a4:infod4:name1:x6:lengthi1ee",
-        infohash="ab" * 20, target_mount=fuse, label="t")
+        infohash="ab" * 20,
+        target_mount=fuse,
+        label="t",
+    )
     assert ok is False
     assert detail == _NOT_VISIBLE_DETAIL
     coord.dest_client.delete.assert_not_called()
 
     # Visible at target: trusted on the first poll (no 8s wait).
     entry = MagicMock(save_path=str(fuse))
-    coord = _coord_with_add(
-        AddResult(hash="ab" * 20, accepted=True, detail="Ok."), entry)
+    coord = _coord_with_add(AddResult(hash="ab" * 20, accepted=True, detail="Ok."), entry)
     ok, _ = await coord._ensure_fuse_entry(
         blob=b"d8:announce1:a4:infod4:name1:x6:lengthi1ee",
-        infohash="ab" * 20, target_mount=fuse, label="t")
+        infohash="ab" * 20,
+        target_mount=fuse,
+        label="t",
+    )
     assert ok is True
     assert coord.dest_client.get_torrent.await_count == 1
 
@@ -255,16 +290,32 @@ async def test_deluge_scan_cached_across_hash_lookups():
     from racing_sync.config import SourceConfig
 
     cfg = SourceConfig(
-        type="deluge", host="http://localhost:8112", password="secret",
-        deluge_sftp={"enabled": True, "ssh_host": "127.0.0.1",
-                     "ssh_password": "pwd", "state_dir": "/var/lib/deluged/state"},
+        type="deluge",
+        host="http://localhost:8112",
+        password="secret",
+        deluge_sftp={
+            "enabled": True,
+            "ssh_host": "127.0.0.1",
+            "ssh_password": "pwd",
+            "state_dir": "/var/lib/deluged/state",
+        },
     )
     client = DelugeClient(cfg)
-    client._rpc = AsyncMock(return_value={
-        "hash_1": {"name": "T1", "progress": 100.0, "state": "Seeding",
-                   "total_size": 1000, "label": "", "save_path": "/d",
-                   "ratio": 0.0, "trackers": [], "time_added": 1},
-    })
+    client._rpc = AsyncMock(
+        return_value={
+            "hash_1": {
+                "name": "T1",
+                "progress": 100.0,
+                "state": "Seeding",
+                "total_size": 1000,
+                "label": "",
+                "save_path": "/d",
+                "ratio": 0.0,
+                "trackers": [],
+                "time_added": 1,
+            },
+        }
+    )
     client.get_torrent_files = AsyncMock(return_value=[])
     assert await client.get_torrent("hash_1") is not None
     assert await client.get_torrent("hash_1") is not None
@@ -309,11 +360,17 @@ async def test_watchdir_no_reemit_without_pickup(tmp_path):
 
     watch = tmp_path / "watch"
     watch.mkdir()
-    blob = _bencode({
-        b"announce": b"http://tracker.example/announce",
-        b"info": {b"name": b"a", b"length": 10, b"piece length": 16384,
-                  b"pieces": b"12345678901234567890"},
-    })
+    blob = _bencode(
+        {
+            b"announce": b"http://tracker.example/announce",
+            b"info": {
+                b"name": b"a",
+                b"length": 10,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+            },
+        }
+    )
     (watch / "a.torrent").write_bytes(blob)
     cfg = WatchDirConfig(path=watch, glob="*.torrent", delete_after_pickup=False)
     scanner = WatchDirScanner(cfg, None)
@@ -372,12 +429,12 @@ def test_unknown_config_keys_warned(tmp_path, caplog):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(
         "[general]\nmax_active_download = 3\n"
-        "[source]\ntype = \"qbittorrent\"\nhost = \"http://127.0.0.1:8080\"\n"
-        "[dest]\nhost = \"http://127.0.0.1:8081\"\nsave_path = \"/d\"\n"
-        "[ssd]\npath = \"/d\"\nmax_inflight_bytes = 10\n"
+        '[source]\ntype = "qbittorrent"\nhost = "http://127.0.0.1:8080"\n'
+        '[dest]\nhost = "http://127.0.0.1:8081"\nsave_path = "/d"\n'
+        '[ssd]\npath = "/d"\nmax_inflight_bytes = 10\n'
         "skip_movie_larger_than_bytes = 10\n"
-        "[rclone.remote]\ndefault = \"rem:/a/\"\nunsorted = \"rem:/u/\"\n"
-        "[rclone.fuse]\nmount = \"/m\"\nmount_unsorted = \"/m/u\"\n"
+        '[rclone.remote]\ndefault = "rem:/a/"\nunsorted = "rem:/u/"\n'
+        '[rclone.fuse]\nmount = "/m"\nmount_unsorted = "/m/u"\n'
     )
     with caplog.at_level(logging.WARNING):
         AppConfig.from_toml(cfg_file)

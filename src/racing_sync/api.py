@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 try:
     from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+
     HAS_FASTAPI = True
 except ImportError:
     HAS_FASTAPI = False
@@ -67,6 +68,7 @@ def _subnet_key(ip: str) -> str | None:
     """`/24` bucket for an IPv4 literal; None otherwise. Never raises."""
     try:
         import ipaddress as _ip
+
         try:
             addr = _ip.ip_address((ip or "").strip())
         except ValueError:
@@ -150,12 +152,10 @@ def _note_auth_failure(ip: str) -> bool:
             except Exception:
                 pass
             try:
-                _over = (len(_AUTH_FAILURES) + len(_AUTH_SUBNET_FAILURES)
-                         - _AUTH_CAP)
+                _over = len(_AUTH_FAILURES) + len(_AUTH_SUBNET_FAILURES) - _AUTH_CAP
                 if _over > 0:
                     _ranked = sorted(
-                        ((k, float(_AUTH_LAST_SEEN.get(k, 0.0)))
-                         for k in list(_AUTH_FAILURES)),
+                        ((k, float(_AUTH_LAST_SEEN.get(k, 0.0))) for k in list(_AUTH_FAILURES)),
                         key=lambda kv: kv[1],
                     )
                     for k, _ in _ranked[:_over]:
@@ -178,6 +178,7 @@ def _host_is_trusted(client_host: str, trusted_proxies: set[str]) -> bool:
     ("10.0.0.0/8", "::1/128") for reverse-proxy subnets.
     """
     import ipaddress as _ip
+
     host = (client_host or "").strip().lower()
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
@@ -276,10 +277,8 @@ def _lane_entry(raw: object) -> dict[str, Any]:
         "last_attempt_at": _strict_float(src.get("last_attempt_at")),
         "last_success_at": _strict_float(src.get("last_success_at")),
         "last_failure_at": _strict_float(src.get("last_failure_at")),
-        "last_duration_s": (
-            max(0.0, duration) if duration is not None else None),
-        "consecutive_failures": _strict_count(
-            src.get("consecutive_failures")),
+        "last_duration_s": (max(0.0, duration) if duration is not None else None),
+        "consecutive_failures": _strict_count(src.get("consecutive_failures")),
         "last_error": _strict_text(src.get("last_error")),
     }
 
@@ -314,8 +313,7 @@ def _lane_interval(cfg: AppConfig, name: str) -> float:
 def _janitor_interval(cfg: AppConfig) -> float:
     """Janitor cadence: configured interval floored like the loop itself."""
     try:
-        value = getattr(getattr(cfg, "cleanup", None),
-                        "janitor_interval_seconds", None)
+        value = getattr(getattr(cfg, "cleanup", None), "janitor_interval_seconds", None)
     except Exception:
         return _JANITOR_DEFAULT_INTERVAL_S
     interval = _strict_float(value)
@@ -365,7 +363,11 @@ def _lane_fresh(
 
 
 def _lane_body(
-    entry: dict[str, Any], *, required: bool, ok: bool, now: float,
+    entry: dict[str, Any],
+    *,
+    required: bool,
+    ok: bool,
+    now: float,
 ) -> dict[str, Any]:
     def _age(value: float | None) -> float | None:
         return round(max(0.0, now - value), 3) if value is not None else None
@@ -407,8 +409,9 @@ def build_app(coord: Coordinator) -> FastAPI:
     cfg = coord.cfg
     # No unauthenticated docs/openapi endpoints: the control plane sits
     # behind token/nginx auth, its schema surface should too.
-    app = FastAPI(title="racing-sync", version="0.1.0",
-                  docs_url=None, openapi_url=None, redoc_url=None)
+    app = FastAPI(
+        title="racing-sync", version="0.1.0", docs_url=None, openapi_url=None, redoc_url=None
+    )
 
     # Request guards: 1 MiB body cap (no endpoint takes a body — query
     # params only) + a generous authed rate limit. /healthz stays
@@ -426,13 +429,11 @@ def build_app(coord: Coordinator) -> FastAPI:
                 try:
                     _cl = request.headers.get("content-length")
                     if _cl is not None and int(str(_cl).strip()) > 1048576:
-                        return _JSONResponse(
-                            {"detail": "body too large"}, status_code=413)
+                        return _JSONResponse({"detail": "body too large"}, status_code=413)
                 except Exception:
                     pass
                 try:
-                    _rip = (request.client.host
-                            if request.client else "unknown")
+                    _rip = request.client.host if request.client else "unknown"
                 except Exception:
                     _rip = "unknown"
                 try:
@@ -447,10 +448,10 @@ def build_app(coord: Coordinator) -> FastAPI:
                     _bucket.append(_now)
                     if len(_bucket) > 300:
                         return _JSONResponse(
-                            {"detail": "rate limited; backing off"},
-                            status_code=429)
+                            {"detail": "rate limited; backing off"}, status_code=429
+                        )
                     if len(_AUTHD_HITS) > 1000:
-                        for k in list(_AUTHD_HITS)[:len(_AUTHD_HITS) - 1000]:
+                        for k in list(_AUTHD_HITS)[: len(_AUTHD_HITS) - 1000]:
                             _AUTHD_HITS.pop(k, None)
                 except Exception:
                     pass
@@ -469,7 +470,9 @@ def build_app(coord: Coordinator) -> FastAPI:
         if not cfg.api.enabled:
             raise HTTPException(403, "api disabled")
         client_host = request.client.host if request.client else ""
-        trusted_proxies = set(getattr(cfg.api, "trusted_proxies", ["127.0.0.1", "::1", "localhost"]))
+        trusted_proxies = set(
+            getattr(cfg.api, "trusted_proxies", ["127.0.0.1", "::1", "localhost"])
+        )
         if cfg.api.trust_nginx_header and x_authenticated_user and x_authenticated_user.strip():
             if not _host_is_trusted(client_host, trusted_proxies):
                 log.warning("api auth rejected for untrusted proxy %r", client_host)
@@ -505,16 +508,21 @@ def build_app(coord: Coordinator) -> FastAPI:
         except Exception:
             _ep, _method = "?", "?"
         try:
-            _ident = ((x_authenticated_user or "").strip()
-                      or ("token" if (x_api_token or "").strip() else "-"))
+            _ident = (x_authenticated_user or "").strip() or (
+                "token" if (x_api_token or "").strip() else "-"
+            )
         except Exception:
             _ident = "-"
         if _note_auth_failure(_fail_ip):
-            log.warning("api auth throttled for %s (%s %s user=%s; too many "
-                        "failures)", _fail_ip, _method, _ep, _ident)
+            log.warning(
+                "api auth throttled for %s (%s %s user=%s; too many failures)",
+                _fail_ip,
+                _method,
+                _ep,
+                _ident,
+            )
             raise HTTPException(429, "too many auth failures; backing off")
-        log.warning("api auth failure from %s (%s %s user=%s)",
-                    _fail_ip, _method, _ep, _ident)
+        log.warning("api auth failure from %s (%s %s user=%s)", _fail_ip, _method, _ep, _ident)
         raise HTTPException(401, "auth required")
 
     @app.get("/healthz")
@@ -545,8 +553,7 @@ def build_app(coord: Coordinator) -> FastAPI:
                 checks[name] = False
         # Fuse mount present (the seeding lane depends on it).
         try:
-            _mount = getattr(getattr(getattr(cfg, "rclone", None),
-                                     "fuse", None), "mount", None)
+            _mount = getattr(getattr(getattr(cfg, "rclone", None), "fuse", None), "mount", None)
             _mpath = os.fspath(_mount) if _mount is not None else ""
             checks["fuse_mount"] = bool(_mpath) and os.path.isdir(_mpath)
         except Exception:
@@ -574,10 +581,8 @@ def build_app(coord: Coordinator) -> FastAPI:
         except Exception:
             legacy_tick = None
         thresholds = {
-            "poller": _lane_threshold(
-                _lane_interval(cfg, "source_poll_interval")),
-            "scheduler": _lane_threshold(
-                _lane_interval(cfg, "dest_poll_interval")),
+            "poller": _lane_threshold(_lane_interval(cfg, "source_poll_interval")),
+            "scheduler": _lane_threshold(_lane_interval(cfg, "dest_poll_interval")),
             "janitor": _lane_threshold(_janitor_interval(cfg)),
             "qb_listener": _lane_threshold(_QB_LISTENER_INTERVAL_S),
         }
@@ -585,15 +590,16 @@ def build_app(coord: Coordinator) -> FastAPI:
         for name in _ALL_LANES:
             required = name in _REQUIRED_LANES
             ok = _lane_fresh(
-                lanes[name], now=now, threshold=thresholds[name],
-                started_at=started_at, legacy_tick=legacy_tick,
+                lanes[name],
+                now=now,
+                threshold=thresholds[name],
+                started_at=started_at,
+                legacy_tick=legacy_tick,
             )
-            lane_body[name] = _lane_body(
-                lanes[name], required=required, ok=ok, now=now)
+            lane_body[name] = _lane_body(lanes[name], required=required, ok=ok, now=now)
         checks["poller_fresh"] = bool(lane_body["poller"]["ok"])
         checks["scheduler_fresh"] = bool(lane_body["scheduler"]["ok"])
-        checks["tick_fresh"] = bool(
-            checks["poller_fresh"] and checks["scheduler_fresh"])
+        checks["tick_fresh"] = bool(checks["poller_fresh"] and checks["scheduler_fresh"])
         ready = all(checks.values())
         from fastapi.responses import JSONResponse
 
@@ -606,13 +612,17 @@ def build_app(coord: Coordinator) -> FastAPI:
     async def metrics() -> Any:
         """Minimal Prometheus metrics (authed): no Telegram spam for ops."""
         from fastapi.responses import PlainTextResponse
+
         # 10s TTL: scrapes every 15s must not each pay a full table scan
         # + SSD stat on an SSD-constrained host.
         try:
             _cache = getattr(metrics, "_cache", None)
-            if (_cache is not None and isinstance(_cache, dict)
-                    and time.monotonic() - float(_cache.get("at", 0.0)) < 10.0
-                    and isinstance(_cache.get("body"), str)):
+            if (
+                _cache is not None
+                and isinstance(_cache, dict)
+                and time.monotonic() - float(_cache.get("at", 0.0)) < 10.0
+                and isinstance(_cache.get("body"), str)
+            ):
                 return PlainTextResponse(_cache["body"])
         except Exception:
             _cache = None
@@ -641,8 +651,7 @@ def build_app(coord: Coordinator) -> FastAPI:
             counts = {}
         if not counts:
             try:
-                rows = await asyncio.to_thread(
-                    coord.store.all_active, False, 5000)
+                rows = await asyncio.to_thread(coord.store.all_active, False, 5000)
             except Exception:
                 rows = []
             for t in rows or []:
@@ -654,8 +663,7 @@ def build_app(coord: Coordinator) -> FastAPI:
         for st in sorted(counts):
             lines.append(f'racing_sync_rows{{state="{st}"}} {counts[st]}')
         try:
-            lines.append(f"racing_sync_waiting_disk_depth "
-                         f"{int(counts.get('waiting_disk', 0))}")
+            lines.append(f"racing_sync_waiting_disk_depth {int(counts.get('waiting_disk', 0))}")
         except Exception:
             pass
         try:
@@ -675,11 +683,14 @@ def build_app(coord: Coordinator) -> FastAPI:
         _now = time.monotonic()
         for _name in _ALL_LANES:
             _ent = _lanes.get(_name) or {}
-            _has_data = (
-                _ent.get("consecutive_failures", 0) > 0
-                or any(_ent.get(key) is not None for key in (
-                    "last_attempt_at", "last_success_at",
-                    "last_failure_at", "last_duration_s"))
+            _has_data = _ent.get("consecutive_failures", 0) > 0 or any(
+                _ent.get(key) is not None
+                for key in (
+                    "last_attempt_at",
+                    "last_success_at",
+                    "last_failure_at",
+                    "last_duration_s",
+                )
             )
             if not _has_data:
                 continue
@@ -689,37 +700,39 @@ def build_app(coord: Coordinator) -> FastAPI:
             if _succ is not None:
                 lines.append(
                     f'racing_sync_lane_success_age_seconds{{lane="{_name}"}} '
-                    f"{max(0.0, _now - _succ):.0f}")
+                    f"{max(0.0, _now - _succ):.0f}"
+                )
             if _att is not None:
                 lines.append(
                     f'racing_sync_lane_attempt_age_seconds{{lane="{_name}"}} '
-                    f"{max(0.0, _now - _att):.0f}")
+                    f"{max(0.0, _now - _att):.0f}"
+                )
             if _ldur is not None:
                 lines.append(
-                    f'racing_sync_lane_latency_seconds{{lane="{_name}"}} '
-                    f"{float(_ldur):.3f}")
+                    f'racing_sync_lane_latency_seconds{{lane="{_name}"}} {float(_ldur):.3f}'
+                )
             lines.append(
                 f'racing_sync_lane_consecutive_failures{{lane="{_name}"}} '
-                f"{int(_ent.get('consecutive_failures', 0) or 0)}")
+                f"{int(_ent.get('consecutive_failures', 0) or 0)}"
+            )
         # Legacy tick aliases: prefer the single-pass fields when present;
         # otherwise derive from the required lanes so production exports
         # them too (age = oldest required-lane reference = worst staleness;
         # latency = slowest required-lane pass).
         try:
-            _tick_dur = _strict_float(
-                getattr(coord, "_last_tick_duration_s", None))
+            _tick_dur = _strict_float(getattr(coord, "_last_tick_duration_s", None))
         except Exception:
             _tick_dur = None
         if _tick_dur is None:
             _durs = [
-                _lanes[_n]["last_duration_s"] for _n in _REQUIRED_LANES
+                _lanes[_n]["last_duration_s"]
+                for _n in _REQUIRED_LANES
                 if _lanes[_n].get("last_duration_s") is not None
             ]
             if _durs:
                 _tick_dur = max(_durs)
         if _tick_dur is not None:
-            lines.append(f"racing_sync_tick_latency_seconds "
-                         f"{float(_tick_dur):.3f}")
+            lines.append(f"racing_sync_tick_latency_seconds {float(_tick_dur):.3f}")
         try:
             _tick_at = _strict_float(getattr(coord, "_last_tick_at", None))
         except Exception:
@@ -731,8 +744,7 @@ def build_app(coord: Coordinator) -> FastAPI:
                 _succ = _ent.get("last_success_at")
                 _att = _ent.get("last_attempt_at")
                 if _succ is not None:
-                    _ref = (_att if (_att is not None and _att > _succ)
-                            else _succ)
+                    _ref = _att if (_att is not None and _att > _succ) else _succ
                 elif _att is not None:
                     _ref = _att
                 else:
@@ -742,29 +754,26 @@ def build_app(coord: Coordinator) -> FastAPI:
             if _refs:
                 _tick_at = min(_refs)
         if _tick_at is not None:
-            lines.append(f"racing_sync_tick_age_seconds "
-                         f"{max(0.0, time.monotonic() - _tick_at):.0f}")
+            lines.append(
+                f"racing_sync_tick_age_seconds {max(0.0, time.monotonic() - _tick_at):.0f}"
+            )
         # Indexer + move counters (best-effort; absent when never used).
         try:
             from .prowlarr import prowlarr_counters as _pc
+
             _p = _pc()
-            lines.append(f"racing_sync_prowlarr_searches_total "
-                         f"{int(_p.get('searches', 0))}")
-            lines.append(f"racing_sync_prowlarr_hits_total "
-                         f"{int(_p.get('hits', 0))}")
-            lines.append(f"racing_sync_prowlarr_errors_total "
-                         f"{int(_p.get('errors', 0))}")
+            lines.append(f"racing_sync_prowlarr_searches_total {int(_p.get('searches', 0))}")
+            lines.append(f"racing_sync_prowlarr_hits_total {int(_p.get('hits', 0))}")
+            lines.append(f"racing_sync_prowlarr_errors_total {int(_p.get('errors', 0))}")
         except Exception:
             pass
         try:
             from .rclone_ops import rclone_counters as _rc
+
             _r = _rc()
-            lines.append(f"racing_sync_rclone_moves_total "
-                         f"{int(_r.get('moves', 0))}")
-            lines.append(f"racing_sync_rclone_move_ok_total "
-                         f"{int(_r.get('move_ok', 0))}")
-            lines.append(f"racing_sync_rclone_move_fail_total "
-                         f"{int(_r.get('move_fail', 0))}")
+            lines.append(f"racing_sync_rclone_moves_total {int(_r.get('moves', 0))}")
+            lines.append(f"racing_sync_rclone_move_ok_total {int(_r.get('move_ok', 0))}")
+            lines.append(f"racing_sync_rclone_move_fail_total {int(_r.get('move_fail', 0))}")
         except Exception:
             pass
         body = "\n".join(lines) + "\n"
@@ -862,27 +871,34 @@ def build_app(coord: Coordinator) -> FastAPI:
         source_infohash: str,
         delete_files: bool = Query(default=True),
         ignore: bool = Query(default=False),
-        confirm: bool = Query(default=False,
-                              description="must be true: forget is destructive"),
+        confirm: bool = Query(default=False, description="must be true: forget is destructive"),
         requester: str = Depends(auth),
     ) -> ForgetResult:
         normalized = (source_infohash or "").strip().lower()
         if not _INFOHASH_RE.fullmatch(normalized):
             raise HTTPException(422, "must be 40-char hex infohash")
         if not confirm:
-            raise HTTPException(
-                400, "forget is destructive; re-issue with ?confirm=true")
+            raise HTTPException(400, "forget is destructive; re-issue with ?confirm=true")
         try:
-            log.warning("api forget %s by %s (delete_files=%s, ignore=%s)",
-                        normalized[:10], requester, delete_files, ignore)
+            log.warning(
+                "api forget %s by %s (delete_files=%s, ignore=%s)",
+                normalized[:10],
+                requester,
+                delete_files,
+                ignore,
+            )
         except Exception:
             pass
         async with _hold_ops_lock(coord):
             try:
                 _api_stop = getattr(coord, "stop_workers_for", None)
                 result = await forget_torrent(
-                    cfg, dest=coord.dest_client, store=coord.store,
-                    target=normalized, apply=True, delete_files=delete_files,
+                    cfg,
+                    dest=coord.dest_client,
+                    store=coord.store,
+                    target=normalized,
+                    apply=True,
+                    delete_files=delete_files,
                     ignore=ignore,
                     stop_workers=_api_stop if callable(_api_stop) else None,
                 )
@@ -913,9 +929,11 @@ def build_app(coord: Coordinator) -> FastAPI:
             try:
                 for pair in result.get("paired_cancelled") or []:
                     try:
-                        _ph = ((pair.get("source_infohash") or "")
-                               .strip().lower()) if isinstance(
-                                   pair, dict) else str(pair or "").strip().lower()
+                        _ph = (
+                            ((pair.get("source_infohash") or "").strip().lower())
+                            if isinstance(pair, dict)
+                            else str(pair or "").strip().lower()
+                        )
                     except Exception:
                         continue
                     if not _ph:
@@ -926,20 +944,17 @@ def build_app(coord: Coordinator) -> FastAPI:
                         pass
                     try:
                         if isinstance(pair, dict):
-                            paired.append({
-                                "source_infohash": _ph,
-                                "source_name": str(pair.get(
-                                    "source_name") or "")[:200],
-                                "errors": [str(e)[:300] for e in
-                                           (pair.get("errors") or [])],
-                            })
+                            paired.append(
+                                {
+                                    "source_infohash": _ph,
+                                    "source_name": str(pair.get("source_name") or "")[:200],
+                                    "errors": [str(e)[:300] for e in (pair.get("errors") or [])],
+                                }
+                            )
                         else:
-                            paired.append({"source_infohash": _ph,
-                                           "source_name": "",
-                                           "errors": []})
+                            paired.append({"source_infohash": _ph, "source_name": "", "errors": []})
                     except Exception:
-                        paired.append({"source_infohash": _ph,
-                                       "source_name": "", "errors": []})
+                        paired.append({"source_infohash": _ph, "source_name": "", "errors": []})
             except Exception:
                 pass
         return ForgetResult(
@@ -960,6 +975,7 @@ def build_app(coord: Coordinator) -> FastAPI:
 def _ts_to_dict(t) -> dict[str, Any]:
     try:
         from .logging_setup import sanitize_log_text
+
         safe_error = sanitize_log_text(str(t.last_error or ""))[:500]
     except Exception:
         safe_error = str(t.last_error or "")[:500]
@@ -979,6 +995,7 @@ def _ts_to_dict(t) -> dict[str, Any]:
         name_val = str(t.source_name or "")[:200]
     except Exception:
         name_val = ""
+
     # Admission/transport flags operators filter on (strict numerics —
     # test doubles answer truthy to everything and must read 0).
     def _flag(name: str) -> int:
@@ -1011,6 +1028,7 @@ def _ts_to_dict(t) -> dict[str, Any]:
 
 async def serve(coord: Coordinator) -> None:
     import uvicorn
+
     cfg = coord.cfg.api
     app = build_app(coord)
     kwargs: dict[str, Any] = {}
@@ -1023,7 +1041,10 @@ async def serve(coord: Coordinator) -> None:
     except Exception:
         pass
     config = uvicorn.Config(
-        app, host=cfg.host, port=cfg.port, log_level="info",
+        app,
+        host=cfg.host,
+        port=cfg.port,
+        log_level="info",
         **kwargs,
     )
     server = uvicorn.Server(config)

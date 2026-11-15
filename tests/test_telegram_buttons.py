@@ -70,13 +70,17 @@ def test_check_button_rejects_bad_buttons():
 def test_maker_layout_and_truncation():
     from racing_sync.telegram_buttons import ButtonMaker
 
-    maker = (ButtonMaker()
-             .add("A", "a:1").add("B", "b:2").newline()
-             .add("C", "c:3").newline()
-             .add("D" * 100, "d:4"))
+    maker = (
+        ButtonMaker()
+        .add("A", "a:1")
+        .add("B", "b:2")
+        .newline()
+        .add("C", "c:3")
+        .newline()
+        .add("D" * 100, "d:4")
+    )
     rows = maker.rows()
-    assert rows == [[("A", "a:1"), ("B", "b:2")],
-                    [("C", "c:3")], [("D" * 100, "d:4")]]
+    assert rows == [[("A", "a:1"), ("B", "b:2")], [("C", "c:3")], [("D" * 100, "d:4")]]
     assert len(maker) == 4
     markup = maker.build()
     assert markup.inline_keyboard[2][0].text == "D" * 60
@@ -86,9 +90,10 @@ def test_maker_layout_and_truncation():
     # Legacy rows validate eagerly.
     with pytest.raises(ValueError):
         ButtonMaker.from_rows([[("Ok", "k:" + "y" * 70)]])
-    assert ButtonMaker.from_rows(
-        [[("Ok", "ok:1")], [("Close", "abort")]]).rows() == [
-            [("Ok", "ok:1")], [("Close", "abort")]]
+    assert ButtonMaker.from_rows([[("Ok", "ok:1")], [("Close", "abort")]]).rows() == [
+        [("Ok", "ok:1")],
+        [("Close", "abort")],
+    ]
 
 
 def test_validate_rows_warns_and_drops(caplog):
@@ -97,9 +102,9 @@ def test_validate_rows_warns_and_drops(caplog):
     from racing_sync.telegram_buttons import validate_rows
 
     with caplog.at_level(logging.WARNING):
-        clean = validate_rows([[("Ok", "ok:1"), ("", "nope"),
-                                ("Big", "k:" + "y" * 70)],
-                               [("Close", "abort")]])
+        clean = validate_rows(
+            [[("Ok", "ok:1"), ("", "nope"), ("Big", "k:" + "y" * 70)], [("Close", "abort")]]
+        )
     assert clean == [[("Ok", "ok:1")], [("Close", "abort")]]
     assert "dropping invalid button" in caplog.text
 
@@ -109,12 +114,22 @@ async def test_sheet_builders_all_fit_budget():
     """Every real sheet builder emits buttons within 64 bytes."""
     from racing_sync.state import State, TorrentState
 
-    bot, store = _bot_with([
-        TorrentState(source_infohash="a" * 40, source_name="Fit.Show",
-                     total_bytes=1000, state=State.QUEUED),
-        TorrentState(source_infohash="b" * 40, source_name="Fit.Show",
-                     total_bytes=1000, state=State.QUEUED),
-    ])
+    bot, store = _bot_with(
+        [
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Fit.Show",
+                total_bytes=1000,
+                state=State.QUEUED,
+            ),
+            TorrentState(
+                source_infohash="b" * 40,
+                source_name="Fit.Show",
+                total_bytes=1000,
+                state=State.QUEUED,
+            ),
+        ]
+    )
     try:
         m = MagicMock()
         m.chat.id = "1"
@@ -124,12 +139,12 @@ async def test_sheet_builders_all_fit_budget():
         m.message_id = 42
         await bot._handle_chat_message(m)
         _text, _rows = bot._sheet_text_and_rows(
-            [store.get("a" * 40), store.get("b" * 40)],
-            "Fit.Show", 1000, {})
+            [store.get("a" * 40), store.get("b" * 40)], "Fit.Show", 1000, {}
+        )
         _t2, _rows2 = bot._keepq_text_and_rows(
-            "Fit.Show", " · all 2 copies", "all:" + "a" * 40, 1000)
-        for data in _sheet_datas(bot) + [
-                d for r in list(_rows) + list(_rows2) for (_, d) in r]:
+            "Fit.Show", " · all 2 copies", "all:" + "a" * 40, 1000
+        )
+        for data in _sheet_datas(bot) + [d for r in list(_rows) + list(_rows2) for (_, d) in r]:
             assert len(data.encode("utf-8")) <= 64, data
     finally:
         store.close()

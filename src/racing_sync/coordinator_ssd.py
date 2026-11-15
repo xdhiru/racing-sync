@@ -165,8 +165,9 @@ class SSDLedgerMixin:
             return cap
         return min(total, cap)
 
-    def _blob_admit_footprint(self, ts: TorrentState, blob: bytes | None,
-                              size_bytes: int = 0) -> int | None:
+    def _blob_admit_footprint(
+        self, ts: TorrentState, blob: bytes | None, size_bytes: int = 0
+    ) -> int | None:
         """Max single-batch bytes from .torrent metadata, None when unknowable.
 
         Lets admission reserve what a torrent will REALLY occupy (one
@@ -196,8 +197,7 @@ class SSDLedgerMixin:
                 return None
             if parsed is None:
                 return None
-            names = [(f.name, f.size_bytes) for f in (parsed or [])
-                     if getattr(f, "name", "")]
+            names = [(f.name, f.size_bytes) for f in (parsed or []) if getattr(f, "name", "")]
             if not names:
                 return None
             try:
@@ -218,8 +218,7 @@ class SSDLedgerMixin:
                 _cls = _classify(parsed, self.cfg)
                 # Pinned kind wins over a fresh re-derive (see _resolve_batches).
                 _pinned = ts.classification_kind or ""
-                kind = ((_pinned if _pinned not in ("", "unknown") else "")
-                        or _cls.kind or "unknown")
+                kind = (_pinned if _pinned not in ("", "unknown") else "") or _cls.kind or "unknown"
                 _eps = _cls.episodes
             except Exception:
                 return None
@@ -229,8 +228,7 @@ class SSDLedgerMixin:
                 return None
             if not batches:
                 try:
-                    total = int(size_bytes or 0) or sum(
-                        int(s or 0) for _, s in names)
+                    total = int(size_bytes or 0) or sum(int(s or 0) for _, s in names)
                 except (TypeError, ValueError):
                     total = 0
                 return total if total > 0 else None
@@ -295,10 +293,12 @@ class SSDLedgerMixin:
             if store is None or not hasattr(store, "get"):
                 return
             d = getattr(self, "_ssd_reserved", None)
-            maps = [("_waiting_disk_next_check", State.WAITING_DISK),
-                    ("_moving_parks", State.MOVING),
-                    ("_grace_exempt", State.NEW),
-                    ("_last_grace_search", State.NEW)]
+            maps = [
+                ("_waiting_disk_next_check", State.WAITING_DISK),
+                ("_moving_parks", State.MOVING),
+                ("_grace_exempt", State.NEW),
+                ("_last_grace_search", State.NEW),
+            ]
             keys: set[str] = set()
             if isinstance(d, dict) and d:
                 keys.update(list(d.keys()))
@@ -341,6 +341,7 @@ class SSDLedgerMixin:
 
             try:
                 from .io_bounds import offload as _offload
+
                 rows = await _offload(_fetch_all)
             except Exception:
                 return
@@ -361,8 +362,10 @@ class SSDLedgerMixin:
                         continue
                     if isinstance(_at, dict):
                         _stamp = _at.get(h)
-                        if (isinstance(_stamp, (int, float))
-                                and _time.monotonic() - _stamp < _RESERVATION_GRACE_S):
+                        if (
+                            isinstance(_stamp, (int, float))
+                            and _time.monotonic() - _stamp < _RESERVATION_GRACE_S
+                        ):
                             # Fresh reservation: the promotion that made it may
                             # still be awaiting the live-download count before
                             # the WAITING_DISK -> QUEUED transition. Leave it.
@@ -372,7 +375,9 @@ class SSDLedgerMixin:
                     except Exception:
                         continue
                     if isinstance(st, State) and st not in (
-                        State.QUEUED, State.DOWNLOADING, State.MOVING,
+                        State.QUEUED,
+                        State.DOWNLOADING,
+                        State.MOVING,
                     ):
                         d.pop(h, None)
                         if isinstance(_at, dict):
@@ -462,9 +467,9 @@ class SSDLedgerMixin:
                 return False
             if len(getattr(self, "_ssd_reserved", {})) > 5000:
                 log.error(
-                    "ssd ledger holds %d entries; freezing admissions "
-                    "until the prune catches up",
-                    len(getattr(self, "_ssd_reserved", {})))
+                    "ssd ledger holds %d entries; freezing admissions until the prune catches up",
+                    len(getattr(self, "_ssd_reserved", {})),
+                )
                 return False
             try:
                 d = getattr(self, "_ssd_reserved", None)
@@ -562,8 +567,7 @@ class SSDLedgerMixin:
                     from .io_bounds import offload as _offload
 
                     await _offload(_shutil.disk_usage, str(_sp))
-                    _room_ok = _c.ssd_has_room(
-                        self.cfg, res_total_pre - _old_pre + new_amount)
+                    _room_ok = _c.ssd_has_room(self.cfg, res_total_pre - _old_pre + new_amount)
             except Exception as e:
                 log.warning("ssd grow physical check unavailable (%s); refusing grow", e)
                 _room_ok = False
@@ -637,7 +641,9 @@ class SSDLedgerMixin:
             for ts in rows or []:
                 try:
                     if getattr(ts, "state", None) not in (
-                        State.QUEUED, State.DOWNLOADING, State.MOVING,
+                        State.QUEUED,
+                        State.DOWNLOADING,
+                        State.MOVING,
                     ):
                         continue
                     h = (getattr(ts, "source_infohash", "") or "").lower()
@@ -661,8 +667,7 @@ class SSDLedgerMixin:
                     else:
                         amt = total
                     if amt > 0:
-                        candidates.append(
-                            (getattr(ts, "created_at", None), h, int(amt)))
+                        candidates.append((getattr(ts, "created_at", None), h, int(amt)))
                 except Exception:
                     continue
             # Oldest created_at first; corrupt/legacy rows without one sort
@@ -685,15 +690,19 @@ class SSDLedgerMixin:
                     "ssd ledger rebuild clamped %d of %d in-flight rows: "
                     "their reservations would exceed the %d MB global cap; "
                     "the youngest rows wait for the budget to free",
-                    clamped, len(candidates), cap // (1024 * 1024))
+                    clamped,
+                    len(candidates),
+                    cap // (1024 * 1024),
+                )
             # Clamp dict size for safety.
             if len(d) > 5000:
                 for k in list(d.keys())[: len(d) - 5000]:
                     d.pop(k, None)
             log.info(
                 "ssd ledger rebuilt: %d rows reserved ~%d MB of %s cap",
-                len(d), sum(d.values()) // (1024 * 1024),
-                f"{cap // (1024*1024)} MB" if cap else "unlimited",
+                len(d),
+                sum(d.values()) // (1024 * 1024),
+                f"{cap // (1024 * 1024)} MB" if cap else "unlimited",
             )
         except Exception:
             pass

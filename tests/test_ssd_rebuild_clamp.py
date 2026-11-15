@@ -6,6 +6,7 @@ admission until each row refines. The rebuild must clamp the aggregate to
 the global cap, oldest ``created_at`` first, so the earliest-admitted work
 wins. With no configured cap the legacy per-row behavior is unchanged.
 """
+
 from __future__ import annotations
 
 import logging
@@ -20,12 +21,17 @@ from racing_sync.state import State, StateStore, TorrentState
 CAP = 10_000
 
 
-def _row(infohash: str, total: int, state: State, *,
-         created_at: datetime, batches_total: int = 4) -> TorrentState:
+def _row(
+    infohash: str, total: int, state: State, *, created_at: datetime, batches_total: int = 4
+) -> TorrentState:
     return TorrentState(
-        source_infohash=infohash, source_name=infohash,
-        total_bytes=total, state=state, batches_total=batches_total,
-        created_at=created_at)
+        source_infohash=infohash,
+        source_name=infohash,
+        total_bytes=total,
+        state=state,
+        batches_total=batches_total,
+        created_at=created_at,
+    )
 
 
 def _coord_over(store: StateStore, cap: int | None) -> object:
@@ -46,12 +52,9 @@ async def test_rebuild_clamps_aggregate_oldest_first(tmp_path, caplog):
     try:
         rows = [
             _row("a" * 40, 4_000, State.DOWNLOADING, created_at=t0),
-            _row("b" * 40, 4_000, State.QUEUED,
-                 created_at=t0 + timedelta(seconds=1)),
-            _row("c" * 40, 7_000, State.MOVING,
-                 created_at=t0 + timedelta(seconds=2)),
-            _row("d" * 40, 2_000, State.DOWNLOADING,
-                 created_at=t0 + timedelta(seconds=3)),
+            _row("b" * 40, 4_000, State.QUEUED, created_at=t0 + timedelta(seconds=1)),
+            _row("c" * 40, 7_000, State.MOVING, created_at=t0 + timedelta(seconds=2)),
+            _row("d" * 40, 2_000, State.DOWNLOADING, created_at=t0 + timedelta(seconds=3)),
             # Parked row holds nothing and must not count as a candidate.
             _row("w" * 40, 9_000, State.WAITING_DISK, created_at=t0),
         ]
@@ -59,8 +62,7 @@ async def test_rebuild_clamps_aggregate_oldest_first(tmp_path, caplog):
             store.upsert(r)
 
         coord = _coord_over(store, CAP)
-        with caplog.at_level(logging.WARNING,
-                             logger="racing_sync.coordinator"):
+        with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
             await coord._ssd_rebuild_from_db()
 
         reserved = dict(coord._ssd_reserved)
@@ -82,21 +84,19 @@ async def test_rebuild_unlimited_cap_keeps_legacy_behavior(tmp_path, caplog):
     try:
         rows = [
             _row("a" * 40, 6_000, State.DOWNLOADING, created_at=t0),
-            _row("b" * 40, 7_000, State.QUEUED,
-                 created_at=t0 + timedelta(seconds=1)),
-            _row("s" * 40, 9_000, State.MOVING,
-                 created_at=t0 + timedelta(seconds=2), batches_total=1),
+            _row("b" * 40, 7_000, State.QUEUED, created_at=t0 + timedelta(seconds=1)),
+            _row(
+                "s" * 40, 9_000, State.MOVING, created_at=t0 + timedelta(seconds=2), batches_total=1
+            ),
         ]
         for r in rows:
             store.upsert(r)
 
         coord = _coord_over(store, None)
-        with caplog.at_level(logging.WARNING,
-                             logger="racing_sync.coordinator"):
+        with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
             await coord._ssd_rebuild_from_db()
 
-        assert dict(coord._ssd_reserved) == {
-            "a" * 40: 6_000, "b" * 40: 7_000, "s" * 40: 9_000}
+        assert dict(coord._ssd_reserved) == {"a" * 40: 6_000, "b" * 40: 7_000, "s" * 40: 9_000}
         assert coord._ssd_reserved_total() == 22_000
         assert "clamped" not in caplog.text
     finally:
@@ -112,21 +112,18 @@ async def test_rebuild_sorts_missing_created_at_last(tmp_path, caplog):
     try:
         rows = [
             _row("a" * 40, 6_000, State.DOWNLOADING, created_at=t0),
-            _row("b" * 40, 6_000, State.QUEUED,
-                 created_at=t0 + timedelta(seconds=1)),
+            _row("b" * 40, 6_000, State.QUEUED, created_at=t0 + timedelta(seconds=1)),
         ]
         for r in rows:
             store.upsert(r)
         # Wipe the OLDEST row's timestamp (legacy/corrupt cell): it must
         # sort last, so b wins the budget and a is clamped.
         store._conn.execute(
-            "UPDATE torrent_state SET created_at = '' "
-            "WHERE source_infohash = ?",
-            ("a" * 40,))
+            "UPDATE torrent_state SET created_at = '' WHERE source_infohash = ?", ("a" * 40,)
+        )
 
         coord = _coord_over(store, CAP)
-        with caplog.at_level(logging.WARNING,
-                             logger="racing_sync.coordinator"):
+        with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
             await coord._ssd_rebuild_from_db()
 
         reserved = dict(coord._ssd_reserved)

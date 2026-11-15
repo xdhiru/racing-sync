@@ -18,8 +18,14 @@ def test_done_can_only_transition_to_re_adding():
     # Fresh-DB self-heal: falsely adopted DONE (SSD bytes never moved) demotes
     # back to MOVING so the rclone move runs before any fuse injection.
     check_transition(State.DONE, State.MOVING)
-    for s in [State.NEW, State.QUEUED, State.DOWNLOADING,
-              State.WAITING_DISK, State.WAITING_INDEXER, State.FAILED]:
+    for s in [
+        State.NEW,
+        State.QUEUED,
+        State.DOWNLOADING,
+        State.WAITING_DISK,
+        State.WAITING_INDEXER,
+        State.FAILED,
+    ]:
         with pytest.raises(ValueError):
             check_transition(State.DONE, s)
 
@@ -38,8 +44,15 @@ def test_new_can_fast_track_to_done_for_manual_fuse():
 
 
 def test_new_can_go_to_any_inflight():
-    for s in [State.WAITING_INDEXER, State.WAITING_DISK, State.QUEUED,
-              State.DOWNLOADING, State.MOVING, State.RE_ADDING, State.DONE]:
+    for s in [
+        State.WAITING_INDEXER,
+        State.WAITING_DISK,
+        State.QUEUED,
+        State.DOWNLOADING,
+        State.MOVING,
+        State.RE_ADDING,
+        State.DONE,
+    ]:
         check_transition(State.NEW, s)
 
 
@@ -72,13 +85,15 @@ def test_retired_querying_rows_migrate_to_waiting_indexer(tmp_path: Path):
     db = tmp_path / "mig.db"
     store = StateStore(db)
     try:
-        store.upsert(TorrentState(source_infohash="q" * 40, source_name="Q",
-                                  state=State.WAITING_INDEXER))
+        store.upsert(
+            TorrentState(source_infohash="q" * 40, source_name="Q", state=State.WAITING_INDEXER)
+        )
         store.close()
         raw = sqlite3.connect(str(db))
         try:
-            raw.execute("UPDATE torrent_state SET state = 'querying' "
-                        "WHERE source_infohash = ?", ("q" * 40,))
+            raw.execute(
+                "UPDATE torrent_state SET state = 'querying' WHERE source_infohash = ?", ("q" * 40,)
+            )
             raw.commit()
         finally:
             raw.close()
@@ -99,8 +114,7 @@ def test_force_direct_defaults_zero_and_roundtrips(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     try:
         assert TorrentState(source_infohash="a" * 40).force_direct == 0
-        ts = TorrentState(source_infohash="b" * 40, state=State.WAITING_INDEXER,
-                          force_direct=1)
+        ts = TorrentState(source_infohash="b" * 40, state=State.WAITING_INDEXER, force_direct=1)
         store.upsert(ts)
         assert store.get("b" * 40).force_direct == 1
         # list/get paths without blob carry it too.
@@ -115,26 +129,21 @@ def test_force_direct_migrates_1_0_database(tmp_path: Path):
 
     from racing_sync.state import SCHEMA_TABLES
 
-    old_schema = "\n".join(
-        ln for ln in SCHEMA_TABLES.splitlines()
-        if "force_direct" not in ln
-    )
+    old_schema = "\n".join(ln for ln in SCHEMA_TABLES.splitlines() if "force_direct" not in ln)
     db = tmp_path / "old.db"
     conn = sqlite3.connect(str(db))
     conn.executescript(old_schema)
     conn.execute(
         "INSERT INTO torrent_state (source_infohash, state, created_at, updated_at)"
         " VALUES (?, ?, ?, ?)",
-        ("c" * 40, "waiting_indexer", "2026-01-01T00:00:00+00:00",
-         "2026-01-01T00:00:00+00:00"),
+        ("c" * 40, "waiting_indexer", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
     )
     conn.commit()
     conn.close()
 
     store = StateStore(db)
     try:
-        cols = [r[1] for r in store._conn.execute(
-            "PRAGMA table_info(torrent_state)").fetchall()]
+        cols = [r[1] for r in store._conn.execute("PRAGMA table_info(torrent_state)").fetchall()]
         assert "force_direct" in cols
         assert store.get("c" * 40).force_direct == 0
         row = store.get("c" * 40)
@@ -149,8 +158,7 @@ def test_skipped_defaults_zero_and_roundtrips(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     try:
         assert TorrentState(source_infohash="a" * 40).skipped == 0
-        ts = TorrentState(source_infohash="b" * 40, state=State.WAITING_INDEXER,
-                          skipped=1)
+        ts = TorrentState(source_infohash="b" * 40, state=State.WAITING_INDEXER, skipped=1)
         store.upsert(ts)
         assert store.get("b" * 40).skipped == 1
         # list/get paths without blob carry it too.
@@ -169,26 +177,21 @@ def test_skipped_migrates_old_database(tmp_path: Path):
 
     from racing_sync.state import SCHEMA_TABLES
 
-    old_schema = "\n".join(
-        ln for ln in SCHEMA_TABLES.splitlines()
-        if "skipped" not in ln
-    )
+    old_schema = "\n".join(ln for ln in SCHEMA_TABLES.splitlines() if "skipped" not in ln)
     db = tmp_path / "old.db"
     conn = sqlite3.connect(str(db))
     conn.executescript(old_schema)
     conn.execute(
         "INSERT INTO torrent_state (source_infohash, state, created_at, updated_at)"
         " VALUES (?, ?, ?, ?)",
-        ("c" * 40, "waiting_indexer", "2026-01-01T00:00:00+00:00",
-         "2026-01-01T00:00:00+00:00"),
+        ("c" * 40, "waiting_indexer", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
     )
     conn.commit()
     conn.close()
 
     store = StateStore(db)
     try:
-        cols = [r[1] for r in store._conn.execute(
-            "PRAGMA table_info(torrent_state)").fetchall()]
+        cols = [r[1] for r in store._conn.execute("PRAGMA table_info(torrent_state)").fetchall()]
         assert "skipped" in cols
         assert store.get("c" * 40).skipped == 0
     finally:
@@ -201,7 +204,8 @@ def test_move_checkpoint_defaults_and_roundtrips(tmp_path: Path):
         assert TorrentState(source_infohash="a" * 40).move_stage == ""
         assert TorrentState(source_infohash="a" * 40).move_plan == ""
         ts = TorrentState(
-            source_infohash="b" * 40, state=State.MOVING,
+            source_infohash="b" * 40,
+            state=State.MOVING,
             move_stage="entry_deleted",
             move_plan='{"version":1,"layout":"flat","folder":"","keep":[],"flat":[]}',
         )
@@ -224,8 +228,7 @@ def test_move_checkpoint_columns_migrate_old_database(tmp_path: Path):
     from racing_sync.state import SCHEMA_TABLES
 
     old_schema = "\n".join(
-        ln for ln in SCHEMA_TABLES.splitlines()
-        if "move_stage" not in ln and "move_plan" not in ln
+        ln for ln in SCHEMA_TABLES.splitlines() if "move_stage" not in ln and "move_plan" not in ln
     )
     db = tmp_path / "old.db"
     conn = sqlite3.connect(str(db))
@@ -233,16 +236,14 @@ def test_move_checkpoint_columns_migrate_old_database(tmp_path: Path):
     conn.execute(
         "INSERT INTO torrent_state (source_infohash, state, created_at, updated_at)"
         " VALUES (?, ?, ?, ?)",
-        ("c" * 40, "moving", "2026-01-01T00:00:00+00:00",
-         "2026-01-01T00:00:00+00:00"),
+        ("c" * 40, "moving", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
     )
     conn.commit()
     conn.close()
 
     store = StateStore(db)
     try:
-        cols = [r[1] for r in store._conn.execute(
-            "PRAGMA table_info(torrent_state)").fetchall()]
+        cols = [r[1] for r in store._conn.execute("PRAGMA table_info(torrent_state)").fetchall()]
         assert "move_stage" in cols and "move_plan" in cols
         row = store.get("c" * 40)
         assert row.move_stage == "" and row.move_plan == ""
@@ -259,8 +260,11 @@ def test_transition_clears_move_checkpoint_when_crossing_moving(tmp_path: Path):
     store = StateStore(tmp_path / "state.db")
     try:
         ts = TorrentState(
-            source_infohash="m" * 40, source_name="M", state=State.MOVING,
-            move_stage="wiped", move_plan='{"version":1}',
+            source_infohash="m" * 40,
+            source_name="M",
+            state=State.MOVING,
+            move_stage="wiped",
+            move_plan='{"version":1}',
         )
         store.upsert(ts)
         row = store.get("m" * 40)
@@ -272,8 +276,10 @@ def test_transition_clears_move_checkpoint_when_crossing_moving(tmp_path: Path):
 
         # A stale checkpoint on a pre-MOVING row is cleared on entry too.
         stale = TorrentState(
-            source_infohash="n" * 40, source_name="N",
-            state=State.DOWNLOADING, move_stage="moved",
+            source_infohash="n" * 40,
+            source_name="N",
+            state=State.DOWNLOADING,
+            move_stage="moved",
             move_plan='{"version":1}',
         )
         store.upsert(stale)
@@ -287,13 +293,15 @@ def test_transition_clears_move_checkpoint_when_crossing_moving(tmp_path: Path):
         store.close()
 
 
-def test_transition_restores_move_checkpoint_on_failed_write(
-        tmp_path: Path, monkeypatch):
+def test_transition_restores_move_checkpoint_on_failed_write(tmp_path: Path, monkeypatch):
     store = StateStore(tmp_path / "state.db")
     try:
         ts = TorrentState(
-            source_infohash="f" * 40, source_name="F", state=State.MOVING,
-            move_stage="entry_deleted", move_plan='{"version":1}',
+            source_infohash="f" * 40,
+            source_name="F",
+            state=State.MOVING,
+            move_stage="entry_deleted",
+            move_plan='{"version":1}',
         )
         store.upsert(ts)
         row = store.get("f" * 40)
@@ -320,15 +328,20 @@ def test_update_columns_move_checkpoint_guarded_by_moving(tmp_path: Path):
     try:
         ts = TorrentState(source_infohash="g" * 40, state=State.MOVING)
         store.upsert(ts)
-        assert store.update_columns(
-            "g" * 40, {"move_stage": "moved", "move_plan": "{}"},
-            expected_state=State.MOVING) > 0
+        assert (
+            store.update_columns(
+                "g" * 40, {"move_stage": "moved", "move_plan": "{}"}, expected_state=State.MOVING
+            )
+            > 0
+        )
         assert store.get("g" * 40).move_stage == "moved"
         # Concurrent state move: the checkpoint write must not clobber it.
         row = store.get("g" * 40)
         store.transition(row, State.RE_ADDING)
-        assert store.update_columns(
-            "g" * 40, {"move_stage": "wiped"}, expected_state=State.MOVING) == 0
+        assert (
+            store.update_columns("g" * 40, {"move_stage": "wiped"}, expected_state=State.MOVING)
+            == 0
+        )
         reloaded = store.get("g" * 40)
         assert reloaded.state == State.RE_ADDING
         assert reloaded.move_stage == ""
@@ -586,6 +599,7 @@ def test_transition_clears_last_error(tmp_path: Path):
 
 def test_transition_resets_retry_timers(tmp_path: Path):
     import datetime as dt
+
     store = StateStore(tmp_path / "test_timers.db")
     try:
         past = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
@@ -605,6 +619,7 @@ def test_transition_resets_retry_timers(tmp_path: Path):
 
 def test_transition_to_done_sets_completed_at(tmp_path: Path):
     import datetime as dt
+
     store = StateStore(tmp_path / "test_done_at.db")
     try:
         ts = TorrentState(source_infohash="4" * 40, state=State.QUEUED)
@@ -650,8 +665,7 @@ def test_tombstone_hides_and_refuses_writes(tmp_path: Path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        ts = TorrentState(source_infohash="t" * 40, source_name="Tomb",
-                          state=State.MOVING)
+        ts = TorrentState(source_infohash="t" * 40, source_name="Tomb", state=State.MOVING)
         store.upsert(ts)
         assert store.tombstone("t" * 40) is True
         assert store.tombstone("t" * 40) is False  # already stamped
@@ -670,7 +684,9 @@ def test_tombstone_hides_and_refuses_writes(tmp_path: Path):
         assert store.gc_tombstones() == 0
         store._conn.execute(
             "UPDATE torrent_state SET deleted_at = '2000-01-01T00:00:00+00:00' "
-            "WHERE source_infohash = ?", ("t" * 40,))
+            "WHERE source_infohash = ?",
+            ("t" * 40,),
+        )
         assert store.gc_tombstones() == 1
     finally:
         store.close()
@@ -680,19 +696,18 @@ def test_upsert_reports_written_and_tombstoned(tmp_path: Path):
     """upsert tells callers whether the row actually landed (H2)."""
     store = StateStore(tmp_path / "s.db")
     try:
-        ts = TorrentState(source_infohash="r" * 40, source_name="R",
-                          state=State.NEW)
+        ts = TorrentState(source_infohash="r" * 40, source_name="R", state=State.NEW)
         assert store.upsert(ts) is UpsertResult.WRITTEN
         assert store.tombstone("r" * 40) is True
         before = store._conn.execute(
-            "SELECT updated_at, version FROM torrent_state "
-            "WHERE source_infohash = ?", ("r" * 40,)).fetchone()
+            "SELECT updated_at, version FROM torrent_state WHERE source_infohash = ?", ("r" * 40,)
+        ).fetchone()
         stamp = ts.updated_at
         ts.source_name = "R2"
         assert store.upsert(ts) is UpsertResult.TOMBSTONED
         after = store._conn.execute(
-            "SELECT updated_at, version FROM torrent_state "
-            "WHERE source_infohash = ?", ("r" * 40,)).fetchone()
+            "SELECT updated_at, version FROM torrent_state WHERE source_infohash = ?", ("r" * 40,)
+        ).fetchone()
         # A refused write must not touch the row or the in-memory snapshot.
         assert after["updated_at"] == before["updated_at"]
         assert after["version"] == before["version"]
@@ -710,8 +725,7 @@ def test_transition_new_row_refused_by_tombstone_raises(tmp_path: Path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        ts = TorrentState(source_infohash="z" * 40, source_name="Z",
-                          state=State.NEW)
+        ts = TorrentState(source_infohash="z" * 40, source_name="Z", state=State.NEW)
         # First probe: transition's pre-check (no tombstone). Second probe:
         # upsert inside the transaction (tombstone landed concurrently).
         store._is_tombstoned = MagicMock(side_effect=[False, True])
@@ -719,8 +733,7 @@ def test_transition_new_row_refused_by_tombstone_raises(tmp_path: Path):
             store.transition(ts, State.QUEUED)
         del store._is_tombstoned  # restore the bound method
         assert store.all() == []
-        assert store._conn.execute(
-            "SELECT COUNT(*) FROM torrent_state").fetchone()[0] == 0
+        assert store._conn.execute("SELECT COUNT(*) FROM torrent_state").fetchone()[0] == 0
         assert ts.state == State.NEW
     finally:
         store.close()
@@ -732,15 +745,16 @@ def test_tombstone_case_insensitive_and_restamp_refreshes(tmp_path: Path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        ts = TorrentState(source_infohash="ab" * 20, source_name="Case",
-                          state=State.NEW)
+        ts = TorrentState(source_infohash="ab" * 20, source_name="Case", state=State.NEW)
         store.upsert(ts)
         assert store.tombstone("AB" * 20) is True
         assert store.get("ab" * 20) is None
         # Re-stamp reports False (no live row) but refreshes the stamp.
         store._conn.execute(
             "UPDATE torrent_state SET deleted_at = '2000-01-01T00:00:00+00:00' "
-            "WHERE source_infohash = ?", ("ab" * 20,))
+            "WHERE source_infohash = ?",
+            ("ab" * 20,),
+        )
         assert store.tombstone("ab" * 20) is False
         assert store.gc_tombstones(ttl_seconds=_TOMBSTONE_TTL_SECONDS) == 0
         # Lowercase clear lifts an uppercase-stamped tombstone.
@@ -757,8 +771,7 @@ def test_transition_refuses_concurrent_move(tmp_path: Path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="m" * 40, source_name="M",
-                                  state=State.NEW))
+        store.upsert(TorrentState(source_infohash="m" * 40, source_name="M", state=State.NEW))
         stale = store.get("m" * 40)
         fresh = store.get("m" * 40)
         assert stale.version == fresh.version == 0
@@ -778,8 +791,7 @@ def test_transition_refuses_concurrent_move(tmp_path: Path):
 def test_upsert_bumps_version_and_preserves_it_on_read(tmp_path: Path):
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="v" * 40, source_name="V",
-                                  state=State.NEW))
+        store.upsert(TorrentState(source_infohash="v" * 40, source_name="V", state=State.NEW))
         assert store.get("v" * 40).version == 0
         ts = store.get("v" * 40)
         ts.source_name = "V2"
@@ -795,9 +807,15 @@ def test_set_vps1_activity_is_narrow(tmp_path: Path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="w" * 40, source_name="W",
-                                  state=State.DONE, last_error="boom",
-                                  total_bytes=1234))
+        store.upsert(
+            TorrentState(
+                source_infohash="w" * 40,
+                source_name="W",
+                state=State.DONE,
+                last_error="boom",
+                total_bytes=1234,
+            )
+        )
         when = dt.datetime.now(dt.timezone.utc)
         assert store.set_vps1_activity("w" * 40, when) is True
         row = store.get("w" * 40)
@@ -816,8 +834,7 @@ def test_transition_refuses_stale_version_same_state(tmp_path: Path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="s" * 40, source_name="S",
-                                  state=State.NEW))
+        store.upsert(TorrentState(source_infohash="s" * 40, source_name="S", state=State.NEW))
         a = store.get("s" * 40)
         b = store.get("s" * 40)
         assert a.version == b.version == 0
@@ -829,8 +846,7 @@ def test_transition_refuses_stale_version_same_state(tmp_path: Path):
         with pytest.raises(AbandonedError):
             store.transition(b, State.QUEUED)
         row = store.get("s" * 40)
-        assert (row.state, row.last_error, row.version) == (
-            State.NEW, "parked", 1)
+        assert (row.state, row.last_error, row.version) == (State.NEW, "parked", 1)
         assert b.state == State.NEW
     finally:
         store.close()
@@ -840,8 +856,7 @@ def test_transition_chain_same_object(tmp_path: Path):
     """Sequential transitions on one object keep working (revision chains)."""
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="c" * 40, source_name="C",
-                                  state=State.NEW))
+        store.upsert(TorrentState(source_infohash="c" * 40, source_name="C", state=State.NEW))
         ts = store.get("c" * 40)
         store.transition(ts, State.QUEUED)
         assert (ts.version, store.get("c" * 40).version) == (1, 1)
@@ -856,8 +871,7 @@ def test_upsert_then_transition_same_object(tmp_path: Path):
     """Demote-style upsert+transition must not trip the version guard."""
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="u" * 40, source_name="U",
-                                  state=State.MOVING))
+        store.upsert(TorrentState(source_infohash="u" * 40, source_name="U", state=State.MOVING))
         ts = store.get("u" * 40)
         ts.save_path = "/ssd"
         store.upsert(ts)
@@ -871,24 +885,25 @@ def test_upsert_then_transition_same_object(tmp_path: Path):
 def test_update_columns_narrow_guarded(tmp_path: Path):
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="n" * 40, source_name="N",
-                                  state=State.MOVING, last_error="",
-                                  total_bytes=100))
+        store.upsert(
+            TorrentState(
+                source_infohash="n" * 40,
+                source_name="N",
+                state=State.MOVING,
+                last_error="",
+                total_bytes=100,
+            )
+        )
         v1 = store.update_columns("n" * 40, {"last_error": "parked"})
         assert v1 == 1
         row = store.get("n" * 40)
-        assert (row.last_error, row.state, row.total_bytes) == (
-            "parked", State.MOVING, 100)
+        assert (row.last_error, row.state, row.total_bytes) == ("parked", State.MOVING, 100)
         # Guards: wrong state / wrong version write nothing.
-        assert store.update_columns(
-            "n" * 40, {"last_error": "x"},
-            expected_state=State.QUEUED) == 0
-        assert store.update_columns(
-            "n" * 40, {"last_error": "x"}, expected_version=999) == 0
+        assert store.update_columns("n" * 40, {"last_error": "x"}, expected_state=State.QUEUED) == 0
+        assert store.update_columns("n" * 40, {"last_error": "x"}, expected_version=999) == 0
         assert store.get("n" * 40).last_error == "parked"
         # Unknown + managed columns never reach SQL.
-        assert store.update_columns(
-            "n" * 40, {"nope": 1, "updated_at": "zzz", "version": 9}) == 0
+        assert store.update_columns("n" * 40, {"nope": 1, "updated_at": "zzz", "version": 9}) == 0
         assert store.get("n" * 40).version == 1
         # Tombstoned rows never match.
         assert store.tombstone("n" * 40) is True
@@ -904,9 +919,11 @@ def test_transition_tombstoned_no_diverge(tmp_path: Path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="t" * 40, source_name="T",
-                                  state=State.MOVING,
-                                  last_error="before"))
+        store.upsert(
+            TorrentState(
+                source_infohash="t" * 40, source_name="T", state=State.MOVING, last_error="before"
+            )
+        )
         ts = store.get("t" * 40)
         assert store.tombstone("t" * 40) is True
         with pytest.raises(AbandonedError):
@@ -921,8 +938,7 @@ def test_delete_tombstones_live_row(tmp_path: Path):
     """delete() stamps a tombstone, never hard-deletes a live row."""
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="d" * 40, source_name="D",
-                                  state=State.MOVING))
+        store.upsert(TorrentState(source_infohash="d" * 40, source_name="D", state=State.MOVING))
         store.delete("d" * 40)
         assert store.get("d" * 40) is None  # invisible, not gone
         assert store.is_ignored("d" * 40) is False
@@ -938,8 +954,7 @@ def test_delete_propagates_tombstone_failure(tmp_path: Path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="e" * 40, source_name="E",
-                                  state=State.MOVING))
+        store.upsert(TorrentState(source_infohash="e" * 40, source_name="E", state=State.MOVING))
         store.tombstone = MagicMock(side_effect=RuntimeError("disk gone"))
         with pytest.raises(RuntimeError, match="disk gone"):
             store.delete("e" * 40)
@@ -954,10 +969,8 @@ def test_get_many_batches(tmp_path: Path):
     """One round-trip for many hashes; missing/tombstoned map to None."""
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A",
-                                  state=State.QUEUED))
-        store.upsert(TorrentState(source_infohash="b" * 40, source_name="B",
-                                  state=State.DONE))
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A", state=State.QUEUED))
+        store.upsert(TorrentState(source_infohash="b" * 40, source_name="B", state=State.DONE))
         assert store.tombstone("b" * 40) is True
         res = store.get_many(["a" * 40, "b" * 40, "c" * 40, "A" * 40])
         assert set(res) == {"a" * 40, "b" * 40, "c" * 40}
@@ -992,9 +1005,10 @@ def test_append_log_insert_and_prune_share_one_transaction(tmp_path: Path):
         finally:
             StateStore._write_tx = real_tx  # type: ignore[method-assign]
         assert entered == [True]
-        assert store._conn.execute(
-            "SELECT COUNT(*) FROM run_log WHERE message='hello'"
-        ).fetchone()[0] == 1
+        assert (
+            store._conn.execute("SELECT COUNT(*) FROM run_log WHERE message='hello'").fetchone()[0]
+            == 1
+        )
     finally:
         store.close()
 
@@ -1010,8 +1024,8 @@ def test_append_log_prune_caps_table(tmp_path: Path):
         # Force the prune path on the next append.
         for i in range(5000):
             store._conn.execute(
-                "INSERT INTO run_log (ts, level, message) VALUES (?,?,?)",
-                ("t", "INFO", f"pad{i}"))
+                "INSERT INTO run_log (ts, level, message) VALUES (?,?,?)", ("t", "INFO", f"pad{i}")
+            )
         store._log_append_counter = 499
         store.append_log("INFO", "trip")
         n = store._conn.execute("SELECT COUNT(*) FROM run_log").fetchone()[0]
@@ -1044,12 +1058,10 @@ def test_upsert_refuses_write_when_tombstone_probe_fails(tmp_path: Path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A",
-                                  state=State.NEW))
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A", state=State.NEW))
         store._is_tombstoned = MagicMock(side_effect=RuntimeError("disk gone"))
         with pytest.raises(RuntimeError, match="disk gone"):
-            store.upsert(TorrentState(source_infohash="a" * 40,
-                                      source_name="B", state=State.NEW))
+            store.upsert(TorrentState(source_infohash="a" * 40, source_name="B", state=State.NEW))
         del store._is_tombstoned  # restore the bound method
         assert store.get("a" * 40).source_name == "A"
     finally:
@@ -1060,8 +1072,7 @@ def test_find_by_name_rejects_degenerate_patterns(tmp_path: Path):
     """Post-strip empties never degrade to LIKE '%' (match everything)."""
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A",
-                                  state=State.NEW))
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A", state=State.NEW))
         assert store.find_by_name(".mkv") == []
         assert store.find_by_name("[FL]") == []
         assert store.find_by_name("   ") == []
@@ -1075,9 +1086,9 @@ def test_find_by_name_caps_results(tmp_path: Path):
     store = StateStore(tmp_path / "s.db")
     try:
         for i in range(250):
-            store.upsert(TorrentState(
-                source_infohash=f"{i:040d}", source_name="Same.Show",
-                state=State.NEW))
+            store.upsert(
+                TorrentState(source_infohash=f"{i:040d}", source_name="Same.Show", state=State.NEW)
+            )
         assert len(store.find_by_name("Same.Show")) <= 200
     finally:
         store.close()
@@ -1086,8 +1097,7 @@ def test_find_by_name_caps_results(tmp_path: Path):
 def test_close_nulls_connection(tmp_path: Path):
     """Post-shutdown use raises loudly; double close is safe."""
     store = StateStore(tmp_path / "s.db")
-    store.upsert(TorrentState(source_infohash="a" * 40, source_name="A",
-                              state=State.NEW))
+    store.upsert(TorrentState(source_infohash="a" * 40, source_name="A", state=State.NEW))
     store.close()
     assert store._conn is None
     store.close()
@@ -1100,8 +1110,7 @@ def test_advisory_narrow_write_skips_version_bump(tmp_path: Path):
     snapshots; state-affecting columns still bump."""
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A",
-                                  state=State.NEW))
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A", state=State.NEW))
         assert store.get("a" * 40).version == 0
         assert store.update_columns("a" * 40, {"indexer_attempts": 3}) == 0
         assert store.get("a" * 40).version == 0
@@ -1119,8 +1128,12 @@ def test_active_index_exists(tmp_path: Path):
     """The active-list partial index serves state-filtered recency scans."""
     store = StateStore(tmp_path / "s.db")
     try:
-        names = {r["name"] for r in store._conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+        names = {
+            r["name"]
+            for r in store._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
         assert "ix_active_updated" in names
     finally:
         store.close()
@@ -1133,10 +1146,8 @@ def test_display_list_shared_until_write(tmp_path: Path):
 
     store = StateStore(tmp_path / "s.db")
     try:
-        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A",
-                                  state=State.NEW))
-        assert [t.source_infohash
-                for t in store.list_active_inflight()] == ["a" * 40]
+        store.upsert(TorrentState(source_infohash="a" * 40, source_name="A", state=State.NEW))
+        assert [t.source_infohash for t in store.list_active_inflight()] == ["a" * 40]
         assert store._display_cache is not None
         # Sneak a row past the write API: the cached tap still shows
         # the old list (staleness requires a real write to lift).
@@ -1145,14 +1156,15 @@ def test_display_list_shared_until_write(tmp_path: Path):
             "INSERT INTO torrent_state (source_infohash, source_name, "
             "state, deleted_at, created_at, updated_at) "
             "VALUES (?,?,?,?,?,?)",
-            ("b" * 40, "B", "new", "", _now_iso, _now_iso))
-        assert [t.source_infohash
-                for t in store.list_active_inflight()] == ["a" * 40]
+            ("b" * 40, "B", "new", "", _now_iso, _now_iso),
+        )
+        assert [t.source_infohash for t in store.list_active_inflight()] == ["a" * 40]
         # A real write invalidates: the next tap rescans.
-        store.upsert(TorrentState(source_infohash="c" * 40, source_name="C",
-                                  state=State.NEW))
-        assert {t.source_infohash
-                for t in store.list_active_inflight()} == {
-                    "a" * 40, "b" * 40, "c" * 40}
+        store.upsert(TorrentState(source_infohash="c" * 40, source_name="C", state=State.NEW))
+        assert {t.source_infohash for t in store.list_active_inflight()} == {
+            "a" * 40,
+            "b" * 40,
+            "c" * 40,
+        }
     finally:
         store.close()

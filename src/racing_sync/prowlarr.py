@@ -40,8 +40,12 @@ def _is_fetchable_http_url(url: str) -> bool:
         host = (parts.hostname or "").strip().lower().strip("[]")
         if not host:
             return False
-        if host in ("metadata.google.internal", "metadata.google",
-                    "instance-data", "instance-data-compute"):
+        if host in (
+            "metadata.google.internal",
+            "metadata.google",
+            "instance-data",
+            "instance-data-compute",
+        ):
             return False
         try:
             ip = _ip(host)
@@ -77,6 +81,7 @@ def _scrub_url(url: str) -> str:
     except Exception:
         return "<scrubbed_url>"
 
+
 log = logging.getLogger(__name__)
 
 # Upper bound for one Newznab feed payload (10 MiB): a bloated or
@@ -101,8 +106,7 @@ _PROWLARR_COUNTERS = {"searches": 0, "hits": 0, "errors": 0}
 def prowlarr_counters() -> dict[str, int]:
     """Snapshot of lifetime search counters. Never raises."""
     try:
-        return {k: int(_PROWLARR_COUNTERS.get(k, 0))
-                for k in ("searches", "hits", "errors")}
+        return {k: int(_PROWLARR_COUNTERS.get(k, 0)) for k in ("searches", "hits", "errors")}
     except Exception:
         return {"searches": 0, "hits": 0, "errors": 0}
 
@@ -141,7 +145,7 @@ def _retry_delay_from_exc(exc: BaseException | None, attempt: int) -> float:
 class Indexer:
     id: int
     name: str
-    protocol: str          # "torrent" / "usenet"
+    protocol: str  # "torrent" / "usenet"
     enable: bool
     capabilities: list[str]
 
@@ -153,7 +157,7 @@ class TorrentHit:
     indexer: str
     indexer_id: int
     size_bytes: int
-    download_url: str       # absolute URL — the .torrent file behind it
+    download_url: str  # absolute URL — the .torrent file behind it
     magnet_url: str
     info_url: str
     publish_date: str
@@ -188,6 +192,7 @@ class ProwlarrClient:
         if self._session is not None and not self._session.closed:
             return
         import socket
+
         try:
             use_v6 = bool(getattr(self._cfg, "use_ipv6", False))
         except Exception:
@@ -228,7 +233,11 @@ class ProwlarrClient:
 
     @property
     def _auth_headers(self) -> dict[str, str]:
-        key = self._cfg.api_key.get_secret_value() if hasattr(self._cfg.api_key, "get_secret_value") else str(self._cfg.api_key)
+        key = (
+            self._cfg.api_key.get_secret_value()
+            if hasattr(self._cfg.api_key, "get_secret_value")
+            else str(self._cfg.api_key)
+        )
         return {"X-Api-Key": key}
 
     async def close(self) -> None:
@@ -259,16 +268,22 @@ class ProwlarrClient:
                     if e.status in _INDEXER_TRANSIENT_STATUSES:
                         last_exc = e
                         if attempt == 2:
-                            raise ProwlarrError(f"prowlarr indexer refresh failed: HTTP {e.status}") from e
+                            raise ProwlarrError(
+                                f"prowlarr indexer refresh failed: HTTP {e.status}"
+                            ) from e
                         await asyncio.sleep(_retry_delay_from_exc(e, attempt))
                         continue
                     raise ProwlarrError(f"prowlarr indexer refresh failed: HTTP {e.status}") from e
             if data is None:
                 if last_exc:
-                    raise ProwlarrError(f"prowlarr indexer refresh failed: {last_exc}") from last_exc
+                    raise ProwlarrError(
+                        f"prowlarr indexer refresh failed: {last_exc}"
+                    ) from last_exc
                 raise ProwlarrError("prowlarr indexer refresh returned no data")
             if not isinstance(data, list):
-                raise ProwlarrError(f"prowlarr indexer refresh returned unexpected shape: {type(data).__name__}")
+                raise ProwlarrError(
+                    f"prowlarr indexer refresh returned unexpected shape: {type(data).__name__}"
+                )
             # Build temp dicts then swap atomically so readers never see empty.
             # One malformed indexer entry must not abort the whole refresh.
             by_name: dict[str, Indexer] = {}
@@ -323,8 +338,9 @@ class ProwlarrClient:
                 usable.append(idx)
         for name in missing:
             log.warning(
-                "download-target indexer %r not found in prowlarr; skipping. "
-                "Known: %s", name, sorted(self._indexers_by_name),
+                "download-target indexer %r not found in prowlarr; skipping. Known: %s",
+                name,
+                sorted(self._indexers_by_name),
             )
         for name in disabled:
             log.warning(
@@ -339,9 +355,7 @@ class ProwlarrClient:
             )
         return usable
 
-    def resolve_indexer_for_announce(
-        self, announce_url: str, tracker_map
-    ) -> Indexer | None:
+    def resolve_indexer_for_announce(self, announce_url: str, tracker_map) -> Indexer | None:
         """Map a torrent's announce URL to a prowlarr indexer."""
         name = tracker_map.resolve(announce_url)
         if not name:
@@ -359,14 +373,17 @@ class ProwlarrClient:
     ) -> list[TorrentHit]:
         """Run a Newznab-style search against a single indexer."""
         if self._cfg.should_skip_title(query):
-            log.info("prowlarr: skipping search on %s for %r (matches skip_query_substrings)", indexer.name, query)
+            log.info(
+                "prowlarr: skipping search on %s for %r (matches skip_query_substrings)",
+                indexer.name,
+                query,
+            )
             return []
         if not self._session:
             raise ProwlarrError("not started")
         _note_prowlarr_search()
         try:
-            hits = await self._search_indexer_inner(
-                indexer, query, limit=limit)
+            hits = await self._search_indexer_inner(indexer, query, limit=limit)
         except Exception:
             _note_prowlarr_error()
             raise
@@ -408,7 +425,8 @@ class ProwlarrClient:
                         if len(raw) > _MAX_FEED_BYTES:
                             raise ProwlarrError(
                                 f"prowlarr feed from {indexer.name!r} exceeds "
-                                f"{_MAX_FEED_BYTES} bytes; refusing")
+                                f"{_MAX_FEED_BYTES} bytes; refusing"
+                            )
                         try:
                             text = bytes(raw).decode("utf-8", errors="replace")
                         except Exception as e:
@@ -428,7 +446,8 @@ class ProwlarrClient:
                                 if _streamed > _MAX_FEED_BYTES:
                                     raise ProwlarrError(
                                         f"prowlarr feed from {indexer.name!r} exceeds "
-                                        f"{_MAX_FEED_BYTES} bytes; refusing")
+                                        f"{_MAX_FEED_BYTES} bytes; refusing"
+                                    )
                                 chunks.append(_part)
                             text = b"".join(chunks).decode("utf-8", errors="replace")
                         except ProwlarrError:
@@ -438,7 +457,8 @@ class ProwlarrClient:
                             if len(text) > _MAX_FEED_BYTES:
                                 raise ProwlarrError(
                                     f"prowlarr feed from {indexer.name!r} exceeds "
-                                    f"{_MAX_FEED_BYTES} bytes; refusing")
+                                    f"{_MAX_FEED_BYTES} bytes; refusing"
+                                )
                 break
             except (aiohttp.ClientConnectionError, asyncio.TimeoutError, OSError) as e:
                 last_exc = e
@@ -447,10 +467,14 @@ class ProwlarrClient:
                 # flaky indexers, and a miss only parks); anything else
                 # fails fast so bad queries don't burn 3 attempts.
                 if e.status not in _INDEXER_TRANSIENT_STATUSES:
-                    raise ProwlarrError(f"prowlarr search on {indexer.name!r} failed: HTTP {e.status}") from e
+                    raise ProwlarrError(
+                        f"prowlarr search on {indexer.name!r} failed: HTTP {e.status}"
+                    ) from e
                 last_exc = e
             if attempt == 2:
-                raise ProwlarrError(f"prowlarr search on {indexer.name!r} failed: {last_exc}") from last_exc
+                raise ProwlarrError(
+                    f"prowlarr search on {indexer.name!r} failed: {last_exc}"
+                ) from last_exc
             await asyncio.sleep(_retry_delay_from_exc(last_exc, attempt))
         return await asyncio.to_thread(_parse_newznab, text, indexer)
 
@@ -468,6 +492,7 @@ class ProwlarrClient:
         # base_url) requires the key — without it same-host downloads 401.
         if not _is_fetchable_http_url(hit.download_url):
             raise ProwlarrError(f"refusing non-routable download_url: {safe_url!r}")
+
         # Compare origin as (scheme, host, effective port): a bare
         # "host" vs "host:8080" (or userinfo/query/fragment smuggled
         # into base_url) must not confuse the same-host key decision.
@@ -508,9 +533,7 @@ class ProwlarrClient:
                 headers = _headers_for(url)
                 redirects = 0
                 while True:
-                    async with self._session.get(
-                        url, headers=headers, allow_redirects=False
-                    ) as r:
+                    async with self._session.get(url, headers=headers, allow_redirects=False) as r:
                         status = getattr(r, "status", None)
                         if status in (301, 302, 303, 307, 308):
                             redirects += 1
@@ -631,21 +654,25 @@ class ProwlarrClient:
             if not hits:
                 continue
             exact = [
-                h for h in hits
+                h
+                for h in hits
                 if h.download_url
                 and _is_exact_release_match(h.title, h.size_bytes, query, target_size)
             ]
             if not exact:
                 log.info(
                     "prowlarr: %d hit(s) on %r for %r but none is the exact release; ignoring",
-                    len(hits), idx.name, query,
+                    len(hits),
+                    idx.name,
+                    query,
                 )
                 continue
             exact.sort(key=lambda h: -h.size_bytes)
             return exact[0]
         log.info(
             "prowlarr: no exact release for %r on any of %d download-target indexer(s); ignoring",
-            query, len(ordered),
+            query,
+            len(ordered),
         )
         return None
 
@@ -662,17 +689,20 @@ class ProwlarrClient:
         _fields_set = getattr(self._cfg, "model_fields_set", None) or set()
         try:
             if "parallel_search_concurrency" in _fields_set:
-                _conc = max(1, int(getattr(
-                    self._cfg, "parallel_search_concurrency", 4) or 4))
+                _conc = max(1, int(getattr(self._cfg, "parallel_search_concurrency", 4) or 4))
             else:
                 _conc = max(1, int(self._PARALLEL_SEARCH_CONCURRENCY))
         except (TypeError, ValueError):
             _conc = 4
         try:
             if "parallel_search_timeout_seconds" in _fields_set:
-                _timeout = float(getattr(
-                    self._cfg, "parallel_search_timeout_seconds",
-                    self._PARALLEL_SEARCH_TIMEOUT_S))
+                _timeout = float(
+                    getattr(
+                        self._cfg,
+                        "parallel_search_timeout_seconds",
+                        self._PARALLEL_SEARCH_TIMEOUT_S,
+                    )
+                )
             else:
                 _timeout = float(self._PARALLEL_SEARCH_TIMEOUT_S)
             if not (_timeout > 0):
@@ -688,7 +718,9 @@ class ProwlarrClient:
     ) -> dict[str, list[TorrentHit]]:
         """Search multiple indexers concurrently and return hits keyed by indexer name (lowercase)."""
         if self._cfg.should_skip_title(query):
-            log.info("prowlarr: skipping parallel search for %r (matches skip_query_substrings)", query)
+            log.info(
+                "prowlarr: skipping parallel search for %r (matches skip_query_substrings)", query
+            )
             return {}
 
         _conc, _timeout = self._parallel_bounds()
@@ -710,13 +742,17 @@ class ProwlarrClient:
                 timeout=_timeout,
             )
         except asyncio.TimeoutError:
-            log.warning("prowlarr parallel search timed out after %.0fs for %r; "
-                        "using partial hits", _timeout, query)
+            log.warning(
+                "prowlarr parallel search timed out after %.0fs for %r; using partial hits",
+                _timeout,
+                query,
+            )
             return {}
         return dict(results)
 
 
 # ---------- helpers ----------
+
 
 def _norm_title_for_match(name: str) -> str:
     """Normalize a release title for exact-release comparison.
@@ -734,13 +770,16 @@ def _norm_title_for_match(name: str) -> str:
     return normalize_content_name(name, unify_separators=True)
 
 
-def _is_exact_release_match(hit_title: str, hit_size: int, target_name: str, target_size: int) -> bool:
+def _is_exact_release_match(
+    hit_title: str, hit_size: int, target_name: str, target_size: int
+) -> bool:
     """True iff a Prowlarr hit is the same release (not just similar)."""
     return release_title_matches(hit_title, hit_size, target_name, target_size)
 
 
-def release_title_matches(hit_title: str, hit_size: int, target_name: str, target_size: int,
-                          *, kind: str | None = None) -> bool:
+def release_title_matches(
+    hit_title: str, hit_size: int, target_name: str, target_size: int, *, kind: str | None = None
+) -> bool:
     """Public exact-release predicate shared with the coordinator.
 
     Same rules as the `best_match` selection gate (normalized title equality
@@ -750,8 +789,9 @@ def release_title_matches(hit_title: str, hit_size: int, target_name: str, targe
     """
     from .coordinator_content import normalize_content_name, size_within_tolerance
 
-    if (normalize_content_name(hit_title, unify_separators=True)
-            != normalize_content_name(target_name, unify_separators=True)):
+    if normalize_content_name(hit_title, unify_separators=True) != normalize_content_name(
+        target_name, unify_separators=True
+    ):
         return False
     return size_within_tolerance(hit_size, target_size, kind=kind)
 
@@ -776,7 +816,7 @@ def _findtext_ns(item: Any, name: str) -> str:
             continue
         if tag.rpartition("}")[2].split(":")[-1].lower() == target:
             try:
-                return (child.text or "")
+                return child.text or ""
             except Exception:
                 return ""
     return ""
@@ -797,6 +837,7 @@ def _parse_newznab(xml_text: str, indexer: Indexer) -> list[TorrentHit]:
     # EntitiesForbidden instead when one slips through.
     try:
         import re as _re
+
         if _re.search(r"<!\s*(DOCTYPE|ENTITY|ELEMENT|ATTLIST)", xml_text, _re.IGNORECASE):
             raise ProwlarrError("untrusted XML contains DTD or entity declaration")
     except ProwlarrError:

@@ -1,4 +1,5 @@
 """Supervisor fail-fast: a dead enabled API stops the daemon."""
+
 from __future__ import annotations
 
 import asyncio

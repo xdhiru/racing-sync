@@ -191,9 +191,6 @@ def test_logging_sink_plaintext_fails_closed():
     except pydantic.ValidationError as e:
         assert "allow_plaintext" in str(e)
     # Opt-in, https, and localhost stay valid.
-    LoggingSinkConfig(enabled=True, url="http://logs.example.com/ingest",
-                      allow_plaintext=True)
+    LoggingSinkConfig(enabled=True, url="http://logs.example.com/ingest", allow_plaintext=True)
     LoggingSinkConfig(enabled=True, url="https://logs.example.com/ingest")
     LoggingSinkConfig(enabled=True, url="http://localhost:8080/ingest")
-
-

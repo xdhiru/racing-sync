@@ -28,9 +28,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-def validate_safe_delete_path(
-    path: Path, base_dir: Path | Iterable[Path] | None = None
-) -> None:
+def validate_safe_delete_path(path: Path, base_dir: Path | Iterable[Path] | None = None) -> None:
     """Raise ValueError when `path` must not be deleted.
 
     Refuses filesystem roots unconditionally; with `base_dir`, also
@@ -46,9 +44,7 @@ def validate_safe_delete_path(
             if resolved == br:
                 raise ValueError(f"refusing to delete base directory: {path}")
         if not any(resolved.is_relative_to(br) for br in bases_resolved):
-            raise ValueError(
-                f"path {path} is not within allowed base directories: {bases}"
-            )
+            raise ValueError(f"path {path} is not within allowed base directories: {bases}")
 
 
 def is_safe_dir_to_clear(path: Path, label: str = "log dir") -> str | None:
@@ -88,18 +84,41 @@ def is_safe_dir_to_clear(path: Path, label: str = "log dir") -> str | None:
     # far beyond racing-sync logs. Compare both Path and posix forms so
     # POSIX-style config values are caught on Windows test hosts too.
     denied = {
-        Path("/var"), Path("/var/log"), Path("/etc"), Path("/usr"),
-        Path("/bin"), Path("/sbin"), Path("/home"), Path("/root"),
-        Path("/tmp"), Path("/var/tmp"), Path("/var/lib"),
+        Path("/var"),
+        Path("/var/log"),
+        Path("/etc"),
+        Path("/usr"),
+        Path("/bin"),
+        Path("/sbin"),
+        Path("/home"),
+        Path("/root"),
+        Path("/tmp"),
+        Path("/var/tmp"),
+        Path("/var/lib"),
     }
     denied_posix = {p.as_posix() for p in denied} | {
-        "/var", "/var/log", "/etc", "/usr", "/bin", "/sbin",
-        "/home", "/root", "/tmp", "/var/tmp", "/var/lib", "/",
+        "/var",
+        "/var/log",
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/home",
+        "/root",
+        "/tmp",
+        "/var/tmp",
+        "/var/lib",
+        "/",
         # Windows system/profile roots (exact + case variants compare
         # lowercased below): a Windows host must not wipe these.
-        "c:/windows", "c:/windows/system32", "c:/program files",
-        "c:/program files (x86)", "c:/programdata",
-        "c:/users", "c:/users/administrator", "c:/users/public",
+        "c:/windows",
+        "c:/windows/system32",
+        "c:/program files",
+        "c:/program files (x86)",
+        "c:/programdata",
+        "c:/users",
+        "c:/users/administrator",
+        "c:/users/public",
     }
     try:
         home = Path.home().resolve()
@@ -166,8 +185,17 @@ def state_db_parent_refusal(cfg: object) -> str | None:
     except OSError:
         pass
     denied_posix = {
-        "/var", "/var/log", "/etc", "/usr", "/bin", "/sbin",
-        "/home", "/root", "/tmp", "/var/tmp", "/",
+        "/var",
+        "/var/log",
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/home",
+        "/root",
+        "/tmp",
+        "/var/tmp",
+        "/",
     }
     if parent.as_posix() in denied_posix or str(parent) in denied_posix:
         return f"refusing reset: state_db inside system directory: {db}"
@@ -185,8 +213,7 @@ def fuse_roots(cfg: object) -> list[Path]:
     roots: list[Path] = []
     try:
         fuse = getattr(getattr(cfg, "rclone", None), "fuse", None)
-        for raw in (getattr(fuse, "mount", None),
-                    getattr(fuse, "mount_unsorted", None)):
+        for raw in (getattr(fuse, "mount", None), getattr(fuse, "mount_unsorted", None)):
             if isinstance(raw, (str, Path)) and str(raw).strip():
                 roots.append(Path(str(raw)))
     except Exception:
@@ -342,8 +369,7 @@ class DaemonLock:
         # lock is held elsewhere — an ignored False here would race the
         # daemon exactly like having no lock at all.
         if not self.acquire():
-            raise RuntimeError(
-                f"daemon lock busy (state.db guarded): {self._path}")
+            raise RuntimeError(f"daemon lock busy (state.db guarded): {self._path}")
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -463,14 +489,16 @@ def backup_db(cfg: object, *, tag: str = "manual") -> tuple[str | None, str]:
         if not src.is_file():
             return None, "no-db"
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        safe_tag = "".join(c if (c.isalnum() or c in ("-", "_")) else "_"
-                           for c in (tag or "manual"))[:24] or "manual"
+        safe_tag = (
+            "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in (tag or "manual"))[:24]
+            or "manual"
+        )
         dest = src.parent / f"{src.name}.{stamp}.{safe_tag}.bak"
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(src), timeout=30.0)
             try:
-                conn.execute(f"VACUUM INTO '{str(dest).replace(chr(39), chr(39)*2)}'")
+                conn.execute(f"VACUUM INTO '{str(dest).replace(chr(39), chr(39) * 2)}'")
             finally:
                 try:
                     conn.close()
@@ -482,8 +510,7 @@ def backup_db(cfg: object, *, tag: str = "manual") -> tuple[str | None, str]:
             return None, "snapshot missing after VACUUM"
         # Prune: newest 7 backups for this DB survive.
         try:
-            siblings = sorted(src.parent.glob(f"{src.name}.*.bak"),
-                              key=lambda p: p.name)
+            siblings = sorted(src.parent.glob(f"{src.name}.*.bak"), key=lambda p: p.name)
             for old in siblings[:-7]:
                 try:
                     old.unlink()

@@ -6,6 +6,7 @@ the folder while the fuse gate still expected it (stall to 24h FAILED
 plus destroyed bytes). Now all variants classify together and verified
 siblings move alongside the single file.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -20,12 +21,9 @@ from racing_sync.state import State, StateStore, TorrentState
 
 def _files():
     return [
-        TorrentFile(name="Show.S01E01.mkv", size_bytes=1000, progress=1.0,
-                    priority=1),
-        TorrentFile(name="Show.S01E01.mp4", size_bytes=100, progress=1.0,
-                    priority=1),
-        TorrentFile(name="Show.S01E01.srt", size_bytes=10, progress=1.0,
-                    priority=1),
+        TorrentFile(name="Show.S01E01.mkv", size_bytes=1000, progress=1.0, priority=1),
+        TorrentFile(name="Show.S01E01.mp4", size_bytes=100, progress=1.0, priority=1),
+        TorrentFile(name="Show.S01E01.srt", size_bytes=10, progress=1.0, priority=1),
     ]
 
 
@@ -38,7 +36,8 @@ def test_classifier_keeps_all_variants():
     assert cls.kind == "episode"
     assert cls.single_file == "Show.S01E01.mkv"
     assert sorted(e.file_name for e in cls.episodes) == [
-        "Show.S01E01.mkv", "Show.S01E01.mp4",
+        "Show.S01E01.mkv",
+        "Show.S01E01.mp4",
     ]
 
 
@@ -79,10 +78,14 @@ def _moving_episode(tmp_path, files):
 
     coord._rclone_move = AsyncMock(side_effect=_move)
     ts = TorrentState(
-        source_infohash="d" * 40, source_name="Show",
-        dest_infohash="d" * 40, save_path=str(ssd),
+        source_infohash="d" * 40,
+        source_name="Show",
+        dest_infohash="d" * 40,
+        save_path=str(ssd),
         classification_kind="episode",
-        batches_total=1, batch_index=0, state=State.MOVING,
+        batches_total=1,
+        batch_index=0,
+        state=State.MOVING,
     )
     coord.store.upsert(ts)
     return coord, coord.store
@@ -93,8 +96,7 @@ async def test_siblings_move_with_single(tmp_path):
     """mkv (bare) + mp4/srt (files_from) all move; nothing wiped early."""
     coord, store = _moving_episode(tmp_path, _files())
     try:
-        with patch("racing_sync.coordinator.wipe_local_tree",
-                   new_callable=AsyncMock) as mock_wipe:
+        with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock) as mock_wipe:
             await coord._do_moving(store.get("d" * 40))
         assert store.get("d" * 40).state == State.RE_ADDING
         # One bare single move + one sibling files_from move.
@@ -104,7 +106,8 @@ async def test_siblings_move_with_single(tmp_path):
         assert str(first.args[0]).endswith("Show.S01E01.mkv")
         second = coord._rclone_move.await_args_list[1]
         assert sorted(second.kwargs["files_from"]) == [
-            "Show.S01E01.mp4", "Show.S01E01.srt",
+            "Show.S01E01.mp4",
+            "Show.S01E01.srt",
         ]
         mock_wipe.assert_not_awaited()  # flat layout: no folder to wipe
         assert not (tmp_path / "ssd" / "Show.S01E01.mkv").exists()
@@ -117,12 +120,10 @@ async def test_siblings_move_with_single(tmp_path):
 async def test_short_sibling_not_moved(tmp_path):
     """A genuinely partial variant is cleaned, never shipped."""
     files = _files()
-    files[1] = TorrentFile(name="Show.S01E01.mp4", size_bytes=100,
-                            progress=0.2, priority=1)
+    files[1] = TorrentFile(name="Show.S01E01.mp4", size_bytes=100, progress=0.2, priority=1)
     coord, store = _moving_episode(tmp_path, files)
     try:
-        with patch("racing_sync.coordinator.wipe_local_tree",
-                   new_callable=AsyncMock):
+        with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock):
             await coord._do_moving(store.get("d" * 40))
         # Only the bare single move ran (mp4 partial cleaned, srt moved).
         assert coord._rclone_move.await_count == 2

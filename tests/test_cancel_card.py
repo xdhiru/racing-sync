@@ -39,8 +39,9 @@ def _setup(tmp_path: Path, h: str, *, db_msg_id: int = 0):
     ssd = tmp_path / "ssd"
     ssd.mkdir(exist_ok=True)
     store = StateStore(tmp_path / "state.db")
-    store.upsert(TorrentState(source_infohash=h, source_name="Show",
-                              save_path=str(ssd), state=State.MOVING))
+    store.upsert(
+        TorrentState(source_infohash=h, source_name="Show", save_path=str(ssd), state=State.MOVING)
+    )
     if db_msg_id:
         store.set_telegram_message_id(h, db_msg_id)
     coord = MagicMock()
