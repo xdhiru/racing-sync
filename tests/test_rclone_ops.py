@@ -6,6 +6,7 @@ import pytest
 from unittest.mock import MagicMock
 
 from racing_sync.rclone_ops import (
+    RcloneError,
     build_move_cmd,
     redact_rclone_cmd,
     validate_safe_delete_path,
@@ -152,7 +153,7 @@ def test_build_move_cmd_rejects_include_plus_files_from(tmp_path: Path):
     cfg.rclone.config_path = None
     cfg.rclone.extra_move_flags = []
 
-    with _pytest.raises(Exception):
+    with _pytest.raises(RcloneError):
         build_move_cmd(
             cfg,
             tmp_path / "src",
@@ -416,7 +417,7 @@ async def test_reaped_orphan_releases_tree(monkeypatch, tmp_path):
     import asyncio as _asyncio
     from unittest.mock import AsyncMock
     from racing_sync import rclone_ops
-    from racing_sync.rclone_ops import run_rclone
+    from racing_sync.rclone_ops import RcloneTimeoutError, run_rclone
 
     tree = tmp_path / "Top"
     tree.mkdir()
@@ -427,7 +428,7 @@ async def test_reaped_orphan_releases_tree(monkeypatch, tmp_path):
     spawn = AsyncMock(side_effect=[proc, proc2])
     monkeypatch.setattr(_asyncio, "create_subprocess_exec", spawn)
     try:
-        with pytest.raises(Exception):
+        with pytest.raises(RcloneTimeoutError):
             await run_rclone(_rclone_cfg(), ["rclone", "move", "x", "y"], timeout=0.01, tree=tree)
         assert spawn.await_count == 1
         proc.returncode = 0  # loop reaps the orphan meanwhile

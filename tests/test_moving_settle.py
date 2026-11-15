@@ -207,7 +207,6 @@ async def test_moving_waits_out_check_quietly(tmp_path):
                 save_path=str(tmp_path / "ssd"),
             )
         )
-        row = store.get("s" * 40)
         with patch("racing_sync.coordinator.wipe_local_tree", new_callable=AsyncMock) as mock_wipe:
             for _ in range(7):
                 await coord._do_moving(store.get("s" * 40))

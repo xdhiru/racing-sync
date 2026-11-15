@@ -1627,10 +1627,6 @@ class ReaddMixin:
                 if h_low in known:
                     continue
                 try:
-                    ht = getattr(hit, "title", "") or ""
-                except Exception:
-                    ht = ""
-                try:
                     if self._abandoned(ts):
                         raise AbandonedError(f"row gone for {(ts.source_infohash or '')[:10]}")
                 except AbandonedError:

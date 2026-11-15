@@ -8,6 +8,8 @@ applies.
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
+
 import pytest
 from conftest import make_coordinator
 from unittest.mock import AsyncMock, MagicMock
@@ -704,9 +706,11 @@ async def test_loops_run_their_own_step_and_stop():
         coord.cfg.cleanup.janitor_interval_seconds = 9999
         calls = []
 
-        async def fake_step():
-            calls.append(1)
-            coord.request_stop()
+        async def fake_step(_calls=calls, _coord=coord):
+            # Bind the loop variables explicitly: the closure would
+            # otherwise capture them late (the next iteration's list/coord).
+            _calls.append(1)
+            _coord.request_stop()
 
         setattr(coord, step_name, fake_step)
         await getattr(coord, loop_name)()

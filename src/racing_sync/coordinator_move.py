@@ -2414,7 +2414,9 @@ class MoveMixin:
                 break
             try:
 
-                async def _wait_mev() -> None:
+                async def _wait_mev(_mev=_mev) -> None:
+                    # Bind `_mev` explicitly: the closure would otherwise
+                    # capture the loop variable late (next tick's event).
                     try:
                         await asyncio.wait_for(_mev.wait(), 60.0)
                     except (TimeoutError, asyncio.TimeoutError):

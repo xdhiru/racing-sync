@@ -2981,7 +2981,6 @@ def _all_remote_season_coord(tmp_path, fuse_files: dict[str, int], cap_bytes: in
     )
     coord.dest_client.set_file_priorities = AsyncMock()
     coord.dest_client.resume = AsyncMock()
-    names = sorted(fuse_files)
     ts = TorrentState(
         source_infohash="e" * 40,
         source_name="Example.Show.S01.1080p.ATVP.WEB-DL",

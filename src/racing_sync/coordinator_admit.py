@@ -36,7 +36,6 @@ from .coordinator_errors import (
     is_retryable_client_error,
 )
 from .coordinator_paths import _left_on_disk, _safe_ssd_join, _watch_cross_seed_dir
-from .coordinator_paths import _watch_cross_seed_dir
 from .io_bounds import chunked, offload, rpc
 from .prowlarr import TorrentHit
 from .recovery import _save_path_on_ssd, _ssd_roots_known, find_content_on_ssd
@@ -2086,7 +2085,9 @@ class AdmitMixin:
             )
             try:
 
-                async def _wait_ev() -> None:
+                async def _wait_ev(ev=ev) -> None:
+                    # Bind `ev` explicitly: the closure would otherwise
+                    # capture the loop variable late (next tick's event).
                     try:
                         await asyncio.wait_for(ev.wait(), 60.0)
                     except (TimeoutError, asyncio.TimeoutError):

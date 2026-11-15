@@ -40,7 +40,9 @@ def _live_member(cfg, payload: bytes = b"d4:infod4:name4:teste"):
 
 
 def test_sftp_exporter_requires_auth():
-    with pytest.raises(Exception):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
         DelugeSFTPConfig(
             enabled=True,
             ssh_host="localhost",

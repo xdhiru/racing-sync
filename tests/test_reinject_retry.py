@@ -1453,8 +1453,6 @@ async def test_ensure_fuse_entry_unconfirmed_replace_is_retryable(tmp_path: Path
 async def test_re_add_cross_seed_unconfirmed_replace_retries_not_fails(tmp_path: Path):
     """The S36E174 incident: accepted-but-invisible re-add must raise the
     retryable error (RE_ADDING parks) instead of FAILED."""
-    from racing_sync.coordinator import WebUIUnresponsiveError
-
     coord = make_coordinator()
     coord.cfg.rclone.fuse.mount = tmp_path / "fuse"
     coord.cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-unsorted"

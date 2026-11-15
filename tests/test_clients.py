@@ -114,8 +114,10 @@ async def test_qbittorrent_export_rejects_non_bencoded():
 
     for bad in (b"", b"<html>login</html>", b"Fails."):
 
-        async def mock_request(method, endpoint, params=None, **kwargs):
-            return _ctx(bad)
+        async def mock_request(method, endpoint, params=None, _bad=bad, **kwargs):
+            # Bind `bad` explicitly: the closure would otherwise capture
+            # the loop variable late (the next payload).
+            return _ctx(_bad)
 
         client.request = mock_request
         with pytest.raises(ValueError, match="not bencoded"):
@@ -1610,7 +1612,6 @@ async def test_qb_prio_failure_logs_applied_and_raises():
             pass
 
     async def mock_request(method, path, **kwargs):
-        data = kwargs.get("data")
         calls.append(path)
         if len(calls) > 1:
             raise aiohttp.ClientResponseError(

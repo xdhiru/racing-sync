@@ -141,8 +141,6 @@ async def test_process_caption_variant(tmp_path):
 @pytest.mark.anyio
 async def test_process_add_revives_failed(tmp_path):
     """Re-provided .torrent for a FAILED row re-queues it (fuse-seed goal)."""
-    from conftest import make_coordinator
-
     from racing_sync.state import TorrentState
 
     store = StateStore(tmp_path / "state.db")
@@ -184,8 +182,6 @@ async def test_process_add_revives_failed(tmp_path):
 @pytest.mark.anyio
 async def test_process_add_refuses_ignored_failed(tmp_path):
     """Cancelled (ignored) hashes stay away even when re-provided."""
-    from conftest import make_coordinator
-
     from racing_sync.state import TorrentState
 
     store = StateStore(tmp_path / "state.db")
