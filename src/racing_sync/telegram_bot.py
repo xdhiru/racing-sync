@@ -867,7 +867,7 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                         )
                         self._mark_detail_sent(infohash, state_value)
                     elif (_w := _rate_limit_wait(e)) is not None:
-                        raise _FloodBackoff(_w)
+                        raise _FloodBackoff(_w) from e
                     elif _is_transient_tg_error(e):
                         # Timeout on EDIT: the row may settle (DONE/FAILED)
                         # right after, leaving the active list where the

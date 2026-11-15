@@ -390,7 +390,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 except Exception:
                     raise ValueError(
                         f"qbittorrent add_torrent refusing unparsable URL: {_scrub_add_url(u)}"
-                    )
+                    ) from None
                 if _p.scheme not in ("http", "https", "magnet"):
                     raise ValueError(
                         f"qbittorrent add_torrent refusing scheme "

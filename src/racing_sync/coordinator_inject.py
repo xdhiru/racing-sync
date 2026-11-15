@@ -592,7 +592,7 @@ class InjectMixin:
                 p_size = 0
             trackers = list(getattr(primary, "trackers", None) or [])
         except Exception:
-            raise LookupError("group changed; run the command again")
+            raise LookupError("group changed; run the command again") from None
         blob = blobs.get(p_hash) if isinstance(blobs, dict) else None
         if not blob:
             raise LookupError("primary .torrent bytes missing; run again")

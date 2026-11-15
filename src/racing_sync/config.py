@@ -231,7 +231,7 @@ class SourceConfig(BaseModel):
         except ValueError:
             raise
         except Exception as e:
-            raise ValueError(f"source.host is not a valid URL: {e}")
+            raise ValueError(f"source.host is not a valid URL: {e}") from None
         for label, secret in (
             ("username", self.username),
             (
@@ -385,7 +385,7 @@ def _redos_probe(pattern: str) -> None:
             "episode_regex did not finish the backtracking probe "
             "within 5s — likely catastrophic backtracking (ReDoS); "
             "simplify nested quantifiers"
-        )
+        ) from None
     except ValueError:
         raise
     except Exception:
@@ -955,7 +955,7 @@ class ProwlarrConfig(BaseModel):
             except ValueError:
                 raise
             except Exception as e:
-                raise ValueError(f"prowlarr.base_url is not a valid URL: {e}")
+                raise ValueError(f"prowlarr.base_url is not a valid URL: {e}") from None
             key = (
                 self.api_key.get_secret_value().strip()
                 if isinstance(self.api_key, SecretStr)
@@ -1291,7 +1291,7 @@ class APIConfig(BaseModel):
                         raise ValueError(
                             f"api.trusted_proxies entry {entry!r} is not an "
                             f"IP, CIDR range, or 'localhost'"
-                        )
+                        ) from None
                     if net.prefixlen == 0:
                         raise ValueError(
                             f"api.trusted_proxies entry {entry!r} trusts the "

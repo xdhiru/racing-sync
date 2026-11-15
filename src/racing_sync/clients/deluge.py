@@ -785,7 +785,9 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                 try:
                     _p = _us(u)
                 except Exception:
-                    raise ValueError(f"deluge add_torrent_url refusing unparsable URL: {u!r}")
+                    raise ValueError(
+                        f"deluge add_torrent_url refusing unparsable URL: {u!r}"
+                    ) from None
                 if _p.scheme not in ("http", "https", "magnet"):
                     raise ValueError(
                         f"deluge add_torrent_url refusing scheme "

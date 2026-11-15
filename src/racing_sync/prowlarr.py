@@ -458,7 +458,7 @@ class ProwlarrClient:
                                 raise ProwlarrError(
                                     f"prowlarr feed from {indexer.name!r} exceeds "
                                     f"{_MAX_FEED_BYTES} bytes; refusing"
-                                )
+                                ) from None
                 break
             except (TimeoutError, aiohttp.ClientConnectionError, OSError) as e:
                 last_exc = e
