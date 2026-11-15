@@ -8,6 +8,7 @@ Used as a fallback when a torrent's .torrent file is not otherwise retrievable:
 from __future__ import annotations
 
 import logging
+import re as _re
 import socket
 import threading
 import time
@@ -40,6 +41,9 @@ _POOL_SIZE_MAX: int = 8
 # wait_for abandon leaves the thread holding the member lock.
 _SFTP_IO_TIMEOUT_S: float = 15.0
 
+# Infohash filenames in the deluge/qBittorrent state dirs.
+_HEX40_RE = _re.compile(r"[0-9a-fA-F]{40}")
+
 
 def _coerce_pool_size(raw: object) -> int:
     """Clamp pool size to [_POOL_SIZE_MIN, _POOL_SIZE_MAX]; default on garbage."""
@@ -50,13 +54,6 @@ def _coerce_pool_size(raw: object) -> int:
     except (TypeError, ValueError):
         return _POOL_SIZE_DEFAULT
     return max(_POOL_SIZE_MIN, min(_POOL_SIZE_MAX, n))
-
-
-_HEX40_RE = None  # lazy compiled in list_state_dir to avoid import cost
-
-import re as _re
-
-_HEX40_RE = _re.compile(r"[0-9a-fA-F]{40}")
 
 
 class SFTPError(RuntimeError):
@@ -615,7 +612,7 @@ class _SFTPConnection:
                         continue
                     if name.endswith(".torrent"):
                         digest = name[: -len(".torrent")]
-                        if _HEX40_RE is not None and _HEX40_RE.fullmatch(digest):
+                        if _HEX40_RE.fullmatch(digest):
                             out.append(digest.lower())
             except OSError as e:
                 raise SFTPError(f"sftp listdir failed for {remote_dir}: {e}") from e

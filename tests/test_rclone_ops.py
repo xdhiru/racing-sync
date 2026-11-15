@@ -187,7 +187,7 @@ async def test_move_local_to_remote_files_from_writes_and_cleans_list(tmp_path: 
 
     async def _fake_run(cfg_, cmd, **kwargs):
         idx = cmd.index("--files-from-raw")
-        with open(cmd[idx + 1], encoding="utf-8") as fh:
+        with open(cmd[idx + 1], encoding="utf-8") as fh:  # noqa: ASYNC230 (test double reads its own temp file)
             seen["content"] = fh.read()
         seen["list_path"] = cmd[idx + 1]
         from racing_sync.rclone_ops import RcloneResult

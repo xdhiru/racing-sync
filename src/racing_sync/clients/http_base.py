@@ -585,7 +585,7 @@ class HTTPClientBase:
         json_body: Any | None = None,
         headers: dict[str, str] | None = None,
         retry_auth: bool = True,
-        timeout: float | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109 (aiohttp ClientTimeout is the deadline)
     ) -> aiohttp.ClientResponse:
         if not self._authed:
             # Initial login also goes through single-flight: workers

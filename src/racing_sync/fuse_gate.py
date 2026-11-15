@@ -20,7 +20,7 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
-class FuseVerdict(str, enum.Enum):
+class FuseVerdict(str, enum.Enum):  # noqa: UP042  (StrEnum changes str(Enum); .value is the contract)
     PRESENT = "present"
     MISSING = "missing"
     UNVERIFIABLE = "unverifiable"

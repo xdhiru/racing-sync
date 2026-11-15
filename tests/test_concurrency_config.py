@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from conftest import make_coordinator
 
+from racing_sync.clients.abstract import AddResult, TorrentFile
 from racing_sync.config import AppConfig
+from racing_sync.state import State, TorrentState
 
 
 def test_concurrency_defaults():
@@ -206,14 +210,6 @@ def test_secret_str_masking_in_repr_and_string_equality():
     assert "SecretStr('**********')" in repr(cfg)
     assert "mypassword" not in cfg.model_dump_json()
     assert cfg.password.get_secret_value() == "mypassword"
-
-
-from unittest.mock import AsyncMock, MagicMock
-
-from conftest import make_coordinator
-
-from racing_sync.clients.abstract import AddResult, TorrentFile
-from racing_sync.state import State, TorrentState
 
 
 @pytest.mark.anyio

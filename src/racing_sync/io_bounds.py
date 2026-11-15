@@ -55,7 +55,12 @@ def rpc_timeout_seconds(cfg: object | None) -> float:
         return DEFAULT_RPC_TIMEOUT_SECONDS
 
 
-async def bounded(awaitable: Awaitable[T], *, timeout: float | None, label: str = "rpc") -> T:
+async def bounded(
+    awaitable: Awaitable[T],
+    *,
+    timeout: float | None,  # noqa: ASYNC109 (wait_for enforces the deadline)
+    label: str = "rpc",
+) -> T:
     """Await with a deadline; TimeoutError propagates (retryable)."""
     import math as _math
 

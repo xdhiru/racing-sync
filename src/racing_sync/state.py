@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 
 
-class State(str, enum.Enum):
+class State(str, enum.Enum):  # noqa: UP042  (StrEnum changes str(Enum); .value is the contract)
     """Lifecycle of a torrent we are processing on VPS2.
 
     SSD download + rclone move + fuse re-add has these stages:

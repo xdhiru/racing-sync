@@ -312,7 +312,7 @@ def _with_stats_flags(cmd: list[str]) -> list[str]:
 async def _communicate_with_progress(
     proc: object,
     key: str,
-    timeout: float,
+    timeout: float,  # noqa: ASYNC109 (wait_for enforces the deadline)
 ) -> tuple[bytes, bytes]:
     """Pump stderr stats lines while the move runs; then collect output.
 
@@ -676,7 +676,7 @@ async def run_rclone(
     cfg: AppConfig,
     cmd: list[str],
     *,
-    timeout: float | None = None,
+    timeout: float | None = None,  # noqa: ASYNC109 (wait_for enforces the deadline)
     tree: Path | None = None,
     progress: bool = False,
 ) -> RcloneResult:
@@ -887,7 +887,7 @@ async def move_local_to_remote(
     include: list[str] | None = None,
     files_from: list[str] | None = None,
     extra: list[str] | None = None,
-    timeout: float | None = None,
+    timeout: float | None = None,  # noqa: ASYNC109 (wait_for enforces the deadline)
     progress: bool = False,
 ) -> RcloneResult:
     if not local.exists():
@@ -1039,7 +1039,7 @@ async def _remote_has_bytes(
     return True
 
 
-from .safety import validate_safe_delete_path  # noqa: F401 (re-exported)
+from .safety import validate_safe_delete_path  # noqa: E402, F401 (re-exported)
 
 
 async def wipe_local_tree(path: Path, *, base_dir: Path | Iterable[Path] | None = None) -> None:

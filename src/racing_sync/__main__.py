@@ -92,7 +92,7 @@ async def _runner(coord: Coordinator) -> int:
             log.warning("shutdown timed out after 60s; exiting anyway")
 
 
-from .safety import (
+from .safety import (  # noqa: E402 (re-export kept below the entrypoint code)
     clear_dir_children as _clear_dir_children,
     db_sidecar_paths as _db_sidecar_paths,
     fuse_roots as _fuse_roots,

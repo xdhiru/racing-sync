@@ -455,7 +455,7 @@ class WatchDirScanner:
                         if entry.is_symlink():
                             log.warning("watch-dir: skipping symlink %s", entry.name)
                             continue
-                        with open(entry, "rb") as _fh:
+                        with open(entry, "rb") as _fh:  # noqa: ASYNC230 (capped small local read; no thread hop)
                             data = _fh.read(MAX_TORRENT_BYTES + 1)
                     except OSError as e:
                         log.warning("watch-dir: error accessing %s (%s)", entry.name, e)
