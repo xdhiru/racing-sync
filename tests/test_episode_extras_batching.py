@@ -12,11 +12,10 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from test_ssd_ledger import _coord_with_cap
 
 from racing_sync.clients.abstract import TorrentFile
 from racing_sync.state import State, TorrentState
-
-from test_ssd_ledger import _coord_with_cap
 
 
 @pytest.mark.anyio

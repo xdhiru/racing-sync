@@ -19,9 +19,9 @@ from .coordinator_content import (
     normalize_content_name,
 )
 from .coordinator_errors import (
-    AbandonedError,
     TRACKER_AUTH_MARKER,
     TRACKER_UNREGISTERED_MARKER,
+    AbandonedError,
     UnregisteredTorrentError,
     classify_tracker_message,
 )
@@ -306,7 +306,7 @@ class WatchdogMixin:
         # their own timers. Attempts and max-age clocks are untouched, so no
         # retry budget is burned either way.
         try:
-            _now_utc = dt.datetime.now(dt.timezone.utc)
+            _now_utc = dt.datetime.now(dt.UTC)
             _cands: list[tuple[tuple[int, float, str], object]] = []
             for r in rows or []:
                 try:

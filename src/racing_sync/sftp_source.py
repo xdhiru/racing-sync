@@ -7,7 +7,6 @@ Used as a fallback when a torrent's .torrent file is not otherwise retrievable:
 
 from __future__ import annotations
 
-import io
 import logging
 import socket
 import threading

@@ -513,11 +513,11 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                         _r = _fn()
                         if asyncio.isfuture(_r) or asyncio.iscoroutine(_r):
                             await asyncio.wait_for(_r, timeout=5.0)
-                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                    except (TimeoutError, asyncio.CancelledError):
                         raise
                     except Exception:
                         continue
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except (TimeoutError, asyncio.CancelledError):
             raise
         except Exception:
             pass
@@ -631,7 +631,7 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                         timeout=interval,
                     )
                     batch[first_hash] = first_prog
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
                 # Drain anything else queued.
                 while not self._detail_queue.empty():

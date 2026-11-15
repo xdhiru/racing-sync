@@ -7,8 +7,9 @@ from ``racing_sync.coordinator`` for backwards compatibility.
 
 from __future__ import annotations
 
-import aiohttp
 import errno as _errno
+
+import aiohttp
 
 
 class WebUIUnresponsiveError(RuntimeError):

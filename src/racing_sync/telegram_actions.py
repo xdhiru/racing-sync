@@ -17,11 +17,11 @@ from .telegram_buttons import ButtonMaker
 from .telegram_protocol import (
     _MATCH_MAX_BYTES,
     _MATCH_MIN_CHARS,
-    _action_error_text,
-    _scrubbed,
     CancelScope,
+    _action_error_text,
     _match_token,
     _resume_command,
+    _scrubbed,
 )
 from .telegram_views import (
     _batch_display,
@@ -1522,9 +1522,9 @@ class ActionsMixin:
                 # stays WAITING_INDEXER with its timer due now, so the next
                 # scheduler wakeup picks it up without an intermediate state.
                 row.force_direct = 1
-                row.indexer_first_queried_at = dt.datetime.now(dt.timezone.utc)
+                row.indexer_first_queried_at = dt.datetime.now(dt.UTC)
                 row.indexer_attempts = 0
-                row.indexer_next_retry_at = dt.datetime.now(dt.timezone.utc)
+                row.indexer_next_retry_at = dt.datetime.now(dt.UTC)
                 try:
                     store.upsert(row)
                 except Exception as e:  # noqa: BLE001
@@ -1710,7 +1710,7 @@ class ActionsMixin:
         except Exception as e:  # noqa: BLE001
             return f"{verb.capitalize()} failed: {_scrubbed(e)}"
         if not acted:
-            return f"Already gone from tracking" if gone else f"Nothing to {verb} (states changed)"
+            return "Already gone from tracking" if gone else f"Nothing to {verb} (states changed)"
         try:
             _names = []
             for h in acted:

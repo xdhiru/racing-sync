@@ -6,10 +6,9 @@ requires SFTP, rclone remote paths must be `name:path/`).
 
 from __future__ import annotations
 
-import functools
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
@@ -81,7 +80,7 @@ class HTTPClientConfig(BaseModel):
         return self.nginx_mode in ("basic", "form_post")
 
     @classmethod
-    def from_source(cls, src: "SourceConfig") -> "HTTPClientConfig":
+    def from_source(cls, src: SourceConfig) -> HTTPClientConfig:
         return cls(
             host=src.host,
             username=src.username,
@@ -95,7 +94,7 @@ class HTTPClientConfig(BaseModel):
         )
 
     @classmethod
-    def from_dest(cls, dst: "DestConfig") -> "HTTPClientConfig":
+    def from_dest(cls, dst: DestConfig) -> HTTPClientConfig:
         return cls(
             host=dst.host,
             username=dst.username,
@@ -151,7 +150,7 @@ class DelugeSFTPConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _check_auth(self) -> "DelugeSFTPConfig":
+    def _check_auth(self) -> DelugeSFTPConfig:
         # Only enforce credentials when the section is actually in use.
         has_pwd = bool(
             self.ssh_password.get_secret_value().strip()
@@ -205,13 +204,13 @@ class SourceConfig(BaseModel):
     use_ipv6: bool = False
 
     @model_validator(mode="after")
-    def _deluge_needs_sftp(self) -> "SourceConfig":
+    def _deluge_needs_sftp(self) -> SourceConfig:
         if self.type == "deluge" and (self.deluge_sftp is None or not self.deluge_sftp.enabled):
             raise ValueError("Deluge source requires [source.deluge_sftp] enabled")
         return self
 
     @model_validator(mode="after")
-    def _check_host(self) -> "SourceConfig":
+    def _check_host(self) -> SourceConfig:
         """Fail fast on unusable WebUI origins (not at first RPC)."""
         host = (self.host or "").strip()
         if not host.startswith(("http://", "https://")):
@@ -311,7 +310,7 @@ class RemoteConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _no_shared_tree(self) -> "RemoteConfig":
+    def _no_shared_tree(self) -> RemoteConfig:
         """default and unsorted must not be the same tree.
 
         The identical tree for both makes moves land inside their own
@@ -618,7 +617,7 @@ class TelegramConfig(BaseModel):
     delete_processed_torrent: bool = True
 
     @model_validator(mode="after")
-    def _validate(self) -> "TelegramConfig":
+    def _validate(self) -> TelegramConfig:
         if self.enabled:
             token = self.bot_token.get_secret_value().strip()
             if not token or token.upper() in ("CHANGE_ME", "YOUR_BOT_TOKEN"):
@@ -682,7 +681,7 @@ class LoggingSinkConfig(BaseModel):
     allow_plaintext: bool = False
 
     @model_validator(mode="after")
-    def _validate(self) -> "LoggingSinkConfig":
+    def _validate(self) -> LoggingSinkConfig:
         if self.enabled:
             if not self.url or not self.url.strip().startswith(("http://", "https://")):
                 raise ValueError("logging_sink.url must be a valid http(s) URL when enabled")
@@ -913,7 +912,7 @@ class ProwlarrConfig(BaseModel):
         return any(sub and sub.lower() in low for sub in self.skip_query_substrings)
 
     @model_validator(mode="after")
-    def _validate(self) -> "ProwlarrConfig":
+    def _validate(self) -> ProwlarrConfig:
         entries = list(self.download_indexers or [])
         seen: set[str] = set()
         for entry in entries:
@@ -1066,7 +1065,7 @@ class CrossSeedConfig(BaseModel):
     fallback_to_racing_torrent_on_prowlarr_timeout: bool = False
 
     @model_validator(mode="after")
-    def _check_strategy(self) -> "CrossSeedConfig":
+    def _check_strategy(self) -> CrossSeedConfig:
         if not self.allow_prowlarr_cross_seed and not self.allow_ssh_export:
             raise ValueError(
                 "cross_seed: allow_prowlarr_cross_seed=false + allow_ssh_export=false "
@@ -1192,7 +1191,7 @@ class CleanupConfig(BaseModel):
     janitor_startup_delay_seconds: float = Field(default=300.0, ge=0)
 
     @model_validator(mode="after")
-    def _check_bounds(self) -> "CleanupConfig":
+    def _check_bounds(self) -> CleanupConfig:
         if self.max_grace_hours < self.min_grace_hours:
             raise ValueError("cleanup: max_grace_hours must be >= min_grace_hours")
         if self.high_watermark_free_bytes <= self.low_watermark_free_bytes:
@@ -1239,7 +1238,7 @@ class APIConfig(BaseModel):
     tls_keyfile: str = ""
 
     @model_validator(mode="after")
-    def _validate(self) -> "APIConfig":
+    def _validate(self) -> APIConfig:
         if self.enabled:
             token = (
                 self.api_token.get_secret_value().strip()
@@ -1359,7 +1358,7 @@ class AppConfig(BaseModel):
     cleanup: CleanupConfig = CleanupConfig()
 
     @classmethod
-    def from_toml(cls, path: str | Path) -> "AppConfig":
+    def from_toml(cls, path: str | Path) -> AppConfig:
         try:
             import tomllib
         except ModuleNotFoundError:
@@ -1425,7 +1424,7 @@ class AppConfig(BaseModel):
         return self.rclone.fuse.readd_heal_missing_after_seconds
 
     @model_validator(mode="after")
-    def _warn_suspicious_combos(self) -> "AppConfig":
+    def _warn_suspicious_combos(self) -> AppConfig:
         """Log suspicious cross-section combos (warn, never refuse).
 
         Refusing to start on a merely-slow combination would strand
@@ -1476,7 +1475,7 @@ class AppConfig(BaseModel):
         return bool(self.classifier._episode_re.search(name))
 
     @model_validator(mode="after")
-    def _cross_validate_storage(self) -> "AppConfig":
+    def _cross_validate_storage(self) -> AppConfig:
         """Reject storage layouts that silently corrupt data.
 
         SSD dirs nested inside (or containing) a fuse mount misclassify

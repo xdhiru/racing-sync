@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
-
 
 def test_disk_free_prefers_stat_over_df():
     """Single-path stat: no mount-table walk, parses avail blocks."""

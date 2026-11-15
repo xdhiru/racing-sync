@@ -619,6 +619,7 @@ async def test_worker_never_resurrects_forgotten_row(tmp_path: Path):
     to write for a gone row instead of upsert-resurrecting it.
     """
     from conftest import make_coordinator
+
     from racing_sync.coordinator_errors import AbandonedError
 
     store = StateStore(tmp_path / "state.db")
@@ -744,8 +745,9 @@ async def test_stop_workers_for_times_out_on_wedged_worker(tmp_path, caplog):
     import asyncio
     import time
 
-    import racing_sync.coordinator as _core
     from conftest import make_coordinator
+
+    import racing_sync.coordinator as _core
 
     store = StateStore(tmp_path / "state.db")
     real_timeout = _core._STOP_WORKERS_TIMEOUT_S
@@ -785,7 +787,6 @@ async def test_stop_workers_for_times_out_on_wedged_worker(tmp_path, caplog):
 async def test_spawn_worker_tracks_task_until_done(tmp_path: Path):
     """Spawned workers are tracked for stop_workers_for, then released."""
     import asyncio
-
     from unittest.mock import AsyncMock
 
     from conftest import make_coordinator

@@ -262,14 +262,14 @@ def abort_move_tree(tree_key: str | None) -> bool:
                 async def _reap() -> None:
                     try:
                         await _asyncio.wait_for(proc.wait(), timeout=10.0)
-                    except _asyncio.TimeoutError:
+                    except TimeoutError:
                         try:
                             proc.kill()
                         except Exception:
                             pass
                         try:
                             await _asyncio.wait_for(proc.wait(), timeout=10.0)
-                        except _asyncio.TimeoutError:
+                        except TimeoutError:
                             pass
 
                 try:
@@ -338,7 +338,7 @@ async def _communicate_with_progress(
                         break
                 try:
                     line = await asyncio.wait_for(proc.stderr.readline(), 60.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     if _rc is not None:
                         break
                     continue
@@ -724,7 +724,7 @@ async def run_rclone(
                 pass
             try:
                 await asyncio.wait_for(proc.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 try:
                     proc.kill()
                 except Exception:
@@ -734,7 +734,7 @@ async def run_rclone(
                     # as a zombie while the caller treats the move as
                     # failed and a later tick may start a duplicate move.
                     await asyncio.wait_for(proc.wait(), timeout=10.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
         except Exception:
             pass
@@ -758,20 +758,20 @@ async def run_rclone(
                 pass
             try:
                 await asyncio.wait_for(proc.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 try:
                     proc.kill()
                 except Exception:
                     pass
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=10.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
         except Exception:
             pass
         _active_drop(_move_key, keep=not _proc_reaped(proc))
         raise
-    except asyncio.TimeoutError:
+    except TimeoutError:
         import inspect as _inspect
 
         async def _stop(p, meth: str) -> None:
@@ -789,7 +789,7 @@ async def run_rclone(
             await _stop(proc, "terminate")
             try:
                 await asyncio.wait_for(proc.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 await _stop(proc, "kill")
                 try:
                     # Bounded: an unkillable (D-state) process must not wedge
@@ -798,14 +798,14 @@ async def run_rclone(
                     # parks with RcloneBusyError instead of racing it; the
                     # row stays put for retry via the straggler check.
                     await asyncio.wait_for(proc.wait(), timeout=10.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
         except Exception:
             try:
                 await _stop(proc, "kill")
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=10.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
             except Exception:
                 pass

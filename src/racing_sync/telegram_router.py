@@ -17,12 +17,12 @@ from telegram.error import NetworkError, TimedOut
 from .state import State, TorrentState
 from .telegram_protocol import (
     _CHAT_COMMANDS,
-    _action_error_text,
-    _scrubbed,
     CancelScope,
     ScopeGone,
+    _action_error_text,
     _now_command,
     _parse_action_data,
+    _scrubbed,
     _slow_tap,
 )
 from .telegram_views import (

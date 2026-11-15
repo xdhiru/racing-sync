@@ -17,7 +17,6 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
 
 from .coordinator_errors import AbandonedError
 
@@ -220,8 +219,8 @@ class TorrentState:
     # loses loudly instead of clobbering silently).
     version: int = 0
     last_error: str = ""
-    created_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc))
-    updated_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc))
+    created_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.UTC))
+    updated_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.UTC))
     # Telegram detail message id (0 if not yet sent).
     telegram_message_id: int = 0
     # Forget tombstone (forget() stamps instead of deleting): tombstoned
@@ -502,7 +501,7 @@ class StateStore:
             _cur = self._conn.execute(
                 "UPDATE torrent_state SET state = 'waiting_indexer', "
                 "updated_at = ? WHERE state = 'querying'",
-                (dt.datetime.now(dt.timezone.utc).isoformat(),),
+                (dt.datetime.now(dt.UTC).isoformat(),),
             )
             if (_cur.rowcount or 0) > 0:
                 log.info(
@@ -766,7 +765,7 @@ class StateStore:
                         return UpsertResult.CONFLICT
                 if expected_state is not None and cur["state"] != expected_state.value:
                     return UpsertResult.CONFLICT
-            ts.updated_at = dt.datetime.now(dt.timezone.utc)
+            ts.updated_at = dt.datetime.now(dt.UTC)
             row = ts.to_row()
             cols = ", ".join(row.keys())
             placeholders = ", ".join(["?"] * len(row))
@@ -841,7 +840,7 @@ class StateStore:
         `which` is "indexer", "public", or "both" (default).
         """
         self._ensure_open()
-        now = now or dt.datetime.now(dt.timezone.utc)
+        now = now or dt.datetime.now(dt.UTC)
         clauses: list[str] = []
         if which in ("indexer", "both"):
             clauses.append("(indexer_next_retry_at != '' AND indexer_next_retry_at <= ?)")
@@ -918,7 +917,7 @@ class StateStore:
             self._conn.execute(
                 "UPDATE torrent_state SET telegram_message_id = ?, "
                 "updated_at = ? WHERE source_infohash = ? AND deleted_at = ''",
-                (message_id, dt.datetime.now(dt.timezone.utc).isoformat(), norm),
+                (message_id, dt.datetime.now(dt.UTC).isoformat(), norm),
             )
 
     def all_active(
@@ -1107,7 +1106,7 @@ class StateStore:
         norm = (source_infohash or "").strip().lower()
         if not norm:
             return False
-        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        now = dt.datetime.now(dt.UTC).isoformat()
         with self._write_tx():
             cur = self._conn.execute(
                 "UPDATE torrent_state SET deleted_at = ?, updated_at = ?, "
@@ -1146,7 +1145,7 @@ class StateStore:
                 "UPDATE torrent_state SET deleted_at = '', updated_at = ?, "
                 "version = version + 1 "
                 "WHERE source_infohash = ? AND deleted_at != ''",
-                (dt.datetime.now(dt.timezone.utc).isoformat(), norm),
+                (dt.datetime.now(dt.UTC).isoformat(), norm),
             )
             if (cur.rowcount or 0) > 0:
                 self._invalidate_display()
@@ -1157,8 +1156,7 @@ class StateStore:
         self._ensure_open()
         try:
             cutoff = (
-                dt.datetime.now(dt.timezone.utc)
-                - dt.timedelta(seconds=max(0, int(ttl_seconds or 0)))
+                dt.datetime.now(dt.UTC) - dt.timedelta(seconds=max(0, int(ttl_seconds or 0)))
             ).isoformat()
         except (TypeError, ValueError):
             return 0
@@ -1189,7 +1187,7 @@ class StateStore:
             self._conn.execute(
                 "INSERT OR REPLACE INTO ignored_torrents "
                 "(source_infohash, source_name, created_at) VALUES (?,?,?)",
-                (norm, source_name or "", dt.datetime.now(dt.timezone.utc).isoformat()),
+                (norm, source_name or "", dt.datetime.now(dt.UTC).isoformat()),
             )
 
     def unignore_torrent(self, source_infohash: str) -> bool:
@@ -1289,7 +1287,7 @@ class StateStore:
             )
         check_transition(ts.state, dst)
         src = ts.state
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         try:
             expected_version = int(ts.version or 0)
         except (TypeError, ValueError):
@@ -1488,7 +1486,7 @@ class StateStore:
         with self._write_tx():
             self._conn.execute(
                 "INSERT INTO run_log (ts, source_infohash, level, message) VALUES (?,?,?,?)",
-                (dt.datetime.now(dt.timezone.utc).isoformat(), source_infohash, level, message),
+                (dt.datetime.now(dt.UTC).isoformat(), source_infohash, level, message),
             )
             self._log_append_counter += 1
             if self._log_append_counter >= 500:
@@ -1566,7 +1564,7 @@ class StateStore:
             cur = self._conn.execute(
                 "UPDATE torrent_state SET fuse_verified = ?, updated_at = ? "
                 "WHERE source_infohash = ? AND deleted_at = ''",
-                (1 if verified else 0, dt.datetime.now(dt.timezone.utc).isoformat(), norm),
+                (1 if verified else 0, dt.datetime.now(dt.UTC).isoformat(), norm),
             )
             return (cur.rowcount or 0) > 0
 
@@ -1586,7 +1584,7 @@ class StateStore:
             cur = self._conn.execute(
                 "UPDATE torrent_state SET cross_seed_blob = ?, updated_at = ? "
                 "WHERE source_infohash = ? AND deleted_at = ''",
-                (bytes(blob), dt.datetime.now(dt.timezone.utc).isoformat(), norm),
+                (bytes(blob), dt.datetime.now(dt.UTC).isoformat(), norm),
             )
             return (cur.rowcount or 0) > 0
 
@@ -1717,7 +1715,7 @@ class StateStore:
                 params.append(int(expected_version))
             except (TypeError, ValueError):
                 return 0
-        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        now = dt.datetime.now(dt.UTC).isoformat()
         _ver = ", version = version + 1" if bump else ""
         with self._lock:
             cur = self._conn.execute(
@@ -1756,7 +1754,7 @@ class StateStore:
         if not norm:
             return False
         try:
-            stamp = (when or dt.datetime.now(dt.timezone.utc)).isoformat()
+            stamp = (when or dt.datetime.now(dt.UTC)).isoformat()
         except Exception:
             return False
         with self._lock:
@@ -1764,7 +1762,7 @@ class StateStore:
                 "UPDATE torrent_state SET vps1_last_activity_at = ?, "
                 "updated_at = ? "
                 "WHERE source_infohash = ? AND deleted_at = ''",
-                (stamp, dt.datetime.now(dt.timezone.utc).isoformat(), norm),
+                (stamp, dt.datetime.now(dt.UTC).isoformat(), norm),
             )
             return (cur.rowcount or 0) > 0
 
@@ -1819,7 +1817,7 @@ def _safe_dt(value: object) -> dt.datetime | None:
         # Legacy naive cells break aware arithmetic (now_utc - completed).
         # Normalize to UTC instead of raising per-row forever.
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            parsed = parsed.replace(tzinfo=dt.UTC)
         return parsed
     except (TypeError, ValueError):
         log.warning("state DB has corrupt datetime %r; treating as None", value)
@@ -1910,12 +1908,12 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         readd_cycles=_safe_int(row["readd_cycles"]) if "readd_cycles" in keys else 0,
         version=_safe_int(row["version"]) if "version" in keys else 0,
         last_error=row["last_error"] if "last_error" in keys else "",
-        created_at=(_safe_dt(row["created_at"]) or dt.datetime.now(dt.timezone.utc))
+        created_at=(_safe_dt(row["created_at"]) or dt.datetime.now(dt.UTC))
         if "created_at" in keys
-        else dt.datetime.now(dt.timezone.utc),
-        updated_at=(_safe_dt(row["updated_at"]) or dt.datetime.now(dt.timezone.utc))
+        else dt.datetime.now(dt.UTC),
+        updated_at=(_safe_dt(row["updated_at"]) or dt.datetime.now(dt.UTC))
         if "updated_at" in keys
-        else dt.datetime.now(dt.timezone.utc),
+        else dt.datetime.now(dt.UTC),
         telegram_message_id=_safe_int(row["telegram_message_id"])
         if "telegram_message_id" in keys
         else 0,

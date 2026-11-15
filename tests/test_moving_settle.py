@@ -8,13 +8,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from conftest import make_coordinator
 
-from racing_sync.state import State, StateStore, TorrentState
 from racing_sync.clients.abstract import TorrentFile
+from racing_sync.state import State, StateStore, TorrentState
 
 
 def _moving_single(tmp_path, *, progress=0.0):
     """Single-file MOVING row, full bytes on disk, lagging client progress."""
-    from racing_sync.clients.abstract import Torrent
 
     ssd = tmp_path / "ssd"
     ssd.mkdir(exist_ok=True)
@@ -190,7 +189,6 @@ async def test_pause_verified_short_circuits_checking(tmp_path):
 @pytest.mark.anyio
 async def test_moving_waits_out_check_quietly(tmp_path):
     """Checking at move time: quiet park, no resume storm, no wipe, no move."""
-    import logging
 
     coord, store = _moving_single(tmp_path, progress=0.0)
     try:
@@ -644,9 +642,10 @@ async def test_check_absolute_cap_despite_progress(tmp_path):
 @pytest.mark.anyio
 async def test_recheck_serialized_across_rows(tmp_path):
     """One settle recheck in flight: the second row waits its turn."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
     from racing_sync.clients.abstract import TorrentFile
     from racing_sync.state import State, StateStore, TorrentState
-    from unittest.mock import AsyncMock, MagicMock, patch
 
     def _row(h, name):
         ssd = tmp_path / "ssd"
@@ -1280,7 +1279,6 @@ async def test_moving_desync_fails_without_wipe(tmp_path):
     fuse) fails loudly with bytes kept — never wiped toward a hopeless
     RE_ADDING."""
     from types import SimpleNamespace
-
     from unittest.mock import patch
 
     ssd = tmp_path / "ssd"

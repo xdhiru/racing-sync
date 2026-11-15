@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+
 import pytest
 from conftest import make_coordinator
 
@@ -395,13 +396,13 @@ def test_find_by_name_extension_matching(tmp_path):
 
 def test_upsert_preserves_created_at(tmp_path):
     import datetime as dt
-    import time
+
     from racing_sync.state import StateStore, TorrentState
 
     db_path = tmp_path / "test.db"
     store = StateStore(db_path)
 
-    orig_time = dt.datetime(2025, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
+    orig_time = dt.datetime(2025, 1, 1, 12, 0, 0, tzinfo=dt.UTC)
     ts = TorrentState(
         source_infohash="hash456",
         source_name="Test.Release",
@@ -415,7 +416,7 @@ def test_upsert_preserves_created_at(tmp_path):
     assert loaded.created_at == orig_time
 
     # Subsequent upsert with different created_at in memory must NOT overwrite DB created_at
-    newer_time = dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
+    newer_time = dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt.UTC)
     ts2 = TorrentState(
         source_infohash="hash456",
         source_name="Test.Release",
@@ -450,8 +451,7 @@ def test_iter_logs_returns_list_and_handles_pruning(tmp_path):
 
 
 def test_row_to_state_handles_string_and_none_blob(tmp_path):
-    import datetime as dt
-    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.state import State, StateStore, TorrentState
 
     db_path = tmp_path / "test.db"
     store = StateStore(db_path)
@@ -528,6 +528,7 @@ def test_state_store_blob_lazy_load_and_preservation(tmp_path: Path):
 @pytest.mark.anyio
 async def test_coordinator_lazy_loads_blob_on_queued_and_re_adding(tmp_path: Path):
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.config import AppConfig
 
     cfg = AppConfig.from_toml(Path(__file__).parent.parent / "config.example.toml")
@@ -602,7 +603,7 @@ def test_transition_resets_retry_timers(tmp_path: Path):
 
     store = StateStore(tmp_path / "test_timers.db")
     try:
-        past = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+        past = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
         ts = TorrentState(
             source_infohash="2" * 40,
             state=State.FAILED,
@@ -625,7 +626,7 @@ def test_transition_to_done_sets_completed_at(tmp_path: Path):
         ts = TorrentState(source_infohash="4" * 40, state=State.QUEUED)
         assert ts.completed_at is None
         store.upsert(ts)
-        before = dt.datetime.now(dt.timezone.utc)
+        before = dt.datetime.now(dt.UTC)
         store.transition(ts, State.DONE)
         assert ts.completed_at is not None
         assert ts.completed_at >= before
@@ -634,7 +635,7 @@ def test_transition_to_done_sets_completed_at(tmp_path: Path):
         assert reloaded.completed_at is not None
         assert reloaded.vps1_last_activity_at is None
         # Activity timestamp round-trips too.
-        stamp = dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
+        stamp = dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.UTC)
         reloaded.vps1_last_activity_at = stamp
         store.upsert(reloaded)
         assert store.get("4" * 40).vps1_last_activity_at == stamp
@@ -816,7 +817,7 @@ def test_set_vps1_activity_is_narrow(tmp_path: Path):
                 total_bytes=1234,
             )
         )
-        when = dt.datetime.now(dt.timezone.utc)
+        when = dt.datetime.now(dt.UTC)
         assert store.set_vps1_activity("w" * 40, when) is True
         row = store.get("w" * 40)
         assert row.vps1_last_activity_at is not None
@@ -1151,7 +1152,7 @@ def test_display_list_shared_until_write(tmp_path: Path):
         assert store._display_cache is not None
         # Sneak a row past the write API: the cached tap still shows
         # the old list (staleness requires a real write to lift).
-        _now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        _now_iso = _dt.datetime.now(_dt.UTC).isoformat()
         store._conn.execute(
             "INSERT INTO torrent_state (source_infohash, source_name, "
             "state, deleted_at, created_at, updated_at) "

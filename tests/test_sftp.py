@@ -79,6 +79,7 @@ def test_sftp_config_rejects_empty_or_whitespace_password():
 
 def test_pool_size_config_defaults_and_validates():
     from pydantic import ValidationError
+
     from racing_sync.sftp_source import SFTPExporter, _coerce_pool_size
 
     assert _sftp_cfg().pool_size == 3
@@ -135,6 +136,7 @@ def test_sftp_exporter_connect_closes_prior_connection():
 
 def test_pool_connect_opens_one_ssh_per_member():
     from unittest.mock import MagicMock, patch
+
     from racing_sync.sftp_source import SFTPExporter
 
     exporter = SFTPExporter(_sftp_cfg(), pool_size=3)
@@ -153,6 +155,7 @@ def test_sftp_pool_serves_concurrent_fetches():
     """Re-inject bursts must fly in parallel, not serialize on one transport."""
     import concurrent.futures
     import time
+
     from racing_sync.sftp_source import SFTPExporter
 
     exporter = SFTPExporter(_sftp_cfg(), pool_size=3)
@@ -189,8 +192,9 @@ def test_sftp_pool_serves_concurrent_fetches():
 
 
 def test_sftp_host_key_policy_defaults_to_reject():
-    import paramiko
     from unittest.mock import MagicMock, patch
+
+    import paramiko
 
     exporter = _SFTPConnection(_sftp_cfg())
 
@@ -223,8 +227,9 @@ def test_sftp_host_key_policy_custom_known_hosts():
 
 
 def test_sftp_host_key_policy_auto_add_opt_in():
-    import paramiko
     from unittest.mock import MagicMock, patch
+
+    import paramiko
 
     exporter = _SFTPConnection(_sftp_cfg(auto_add_host_key=True))
 
@@ -242,7 +247,8 @@ def test_sftp_host_key_policy_auto_add_opt_in():
 def test_ipv4_socket_closes_socket_on_oserror():
     import socket
     from unittest.mock import MagicMock, patch
-    from racing_sync.sftp_source import _ipv4_socket, SFTPError
+
+    from racing_sync.sftp_source import SFTPError, _ipv4_socket
 
     mock_s1 = MagicMock()
     mock_s1.connect.side_effect = OSError("connect failed")
@@ -285,6 +291,7 @@ def test_connect_failure_cleans_up_socket_and_client():
 
 def test_fetch_torrent_uses_posix_path_and_caps_read():
     from unittest.mock import MagicMock
+
     from racing_sync.sftp_source import MAX_TORRENT_BYTES
 
     exporter = _SFTPConnection(_sftp_cfg(state_dir=Path(r"\var\data\deluge\state")))
@@ -409,6 +416,7 @@ def test_member_fetch_fails_fast_when_lock_wedged(monkeypatch):
     fast (TimeoutError) so coordinator retry/backoff paths engage.
     """
     import time
+
     import racing_sync.sftp_source as sftp_mod
 
     monkeypatch.setattr(sftp_mod, "_SFTP_LOCK_TIMEOUT", 0.2)
@@ -460,6 +468,7 @@ def test_pool_fails_over_wedged_member():
 def test_pool_all_wedged_fails_fast(monkeypatch):
     """Wedged-everywhere degrades to a fast TimeoutError for retry paths."""
     import time
+
     import racing_sync.sftp_source as sftp_mod
     from racing_sync.sftp_source import SFTPExporter
 
@@ -482,6 +491,7 @@ def test_pool_all_wedged_fails_fast(monkeypatch):
 
 def test_pool_close_does_not_hang_on_wedged_member():
     import time
+
     from racing_sync.sftp_source import SFTPExporter
 
     exporter = SFTPExporter(_sftp_cfg(), pool_size=2)
@@ -504,6 +514,7 @@ def test_pool_close_does_not_hang_on_wedged_member():
 def test_pool_connect_failure_closes_all_members():
     """A failed pool dial must close every member, not just completed ones."""
     from unittest.mock import patch
+
     from racing_sync.sftp_source import SFTPExporter, _SFTPConnection
 
     exporter = SFTPExporter(_sftp_cfg(), pool_size=3)
@@ -525,12 +536,11 @@ def test_pool_connect_failure_closes_all_members():
 
 def test_disk_free_via_df_wedge_returns_none():
     """A wedged df read (channel timeout) yields None, not a stuck member."""
-    import socket
     from unittest.mock import MagicMock
 
     m = _live_member(_sftp_cfg())
     stdout = MagicMock()
-    stdout.read.side_effect = socket.timeout("wedged")
+    stdout.read.side_effect = TimeoutError("wedged")
     m._client.exec_command.return_value = (MagicMock(), stdout, MagicMock())
 
     assert m._disk_free_via_df("/data") is None
@@ -603,7 +613,8 @@ def test_pool_connect_timeout(monkeypatch):
     """One wedged dial fails the pool fast instead of hanging connect()."""
     import threading
     from unittest.mock import MagicMock
-    from racing_sync.sftp_source import SFTPExporter, SFTPError
+
+    from racing_sync.sftp_source import SFTPError, SFTPExporter
 
     exporter = SFTPExporter(_sftp_cfg(), pool_size=1)
     gate = threading.Event()
@@ -627,7 +638,7 @@ def test_connect_sets_sftp_channel_timeout():
     transport surfaces as an error, never an infinite stall."""
     from unittest.mock import MagicMock, patch
 
-    from racing_sync.sftp_source import _SFTPConnection, _SFTP_IO_TIMEOUT_S
+    from racing_sync.sftp_source import _SFTP_IO_TIMEOUT_S, _SFTPConnection
 
     exporter = _SFTPConnection(_sftp_cfg())
     with patch("racing_sync.sftp_source._ipv4_socket"), patch("paramiko.SSHClient") as mock_ssh_cls:

@@ -1,32 +1,25 @@
 from __future__ import annotations
 
 import asyncio
-
-import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+from conftest import make_coordinator
+
+from racing_sync.clients.abstract import AddResult
 from racing_sync.config import (
-    AppConfig,
     DownloadIndexerConfig,
     ProwlarrConfig,
     WatchDirConfig,
-    GeneralConfig,
-    DestConfig,
-    SSDConfig,
-    RcloneConfig,
 )
+from racing_sync.prowlarr import Indexer, TorrentHit
+from racing_sync.state import State, StateStore, TorrentState
 from racing_sync.watchdir import (
     WatchDirScanner,
-    WatchItem,
     _bencode,
     _bencoded_info_hash,
-    parse_torrent_file,
 )
-from conftest import make_coordinator
-from racing_sync.state import State, StateStore, TorrentState
-from racing_sync.prowlarr import TorrentHit, Indexer
-from racing_sync.clients.abstract import AddResult
 
 
 def _create_sample_torrent_data(
@@ -915,7 +908,8 @@ def test_bencoded_info_hash_preserves_raw_unsorted_info_bytes():
 
 def test_bdecode_security_caps():
     import pytest
-    from racing_sync.watchdir import _bdecode, MAX_BENCODE_DEPTH
+
+    from racing_sync.watchdir import MAX_BENCODE_DEPTH, _bdecode
 
     # String length pointing past EOF
     bad_str = b"50:short"
@@ -943,8 +937,8 @@ def test_bdecode_security_caps():
 
 @pytest.mark.anyio
 async def test_watchdir_bad_file_caching_and_half_write(tmp_path: Path):
-    import time
     import os
+    import time
     from unittest.mock import patch
 
     watch_dir = tmp_path / "watch"
@@ -2194,7 +2188,7 @@ async def test_watch_sacrificial_proceeds_after_grace(tmp_path: Path):
     try:
         coord = _grace_coord(tmp_path, store)
         ts = _watch_drop(store, "Grace.Aged.1080p", 5000, _PRIV_ANNOUNCE, 16384)
-        ts.created_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)
+        ts.created_at = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
         store.upsert(ts)
         await coord._do_new_watch_dir(ts)
         assert coord.transitioned == [State.WAITING_DISK]
@@ -2334,7 +2328,7 @@ def _grace_pair(store: StateStore):
     a = _watch_drop(store, "Skip.Grace.1080p", 5000, _PRIV_ANNOUNCE, 16384)
     b = _watch_drop(store, "Skip.Grace.1080p", 5000, _PRIV_ANNOUNCE, 32768)
     assert a.source_infohash != b.source_infohash
-    a.created_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=10)
+    a.created_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=10)
     store.upsert(a)
     return a, b
 
@@ -2350,7 +2344,7 @@ def _prefer_pair(store: StateStore):
     a = _watch_drop(store, "Prefer.Pair.1080p", 5000, _PRIV_ANNOUNCE, 16384)
     b = _watch_drop(store, "Prefer.Pair.1080p", 5000, _PRIV_ANNOUNCE, 32768)
     assert a.source_infohash != b.source_infohash
-    a.created_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=10)
+    a.created_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=10)
     store.upsert(a)
     return a, b
 
@@ -2385,7 +2379,7 @@ def test_election_locked_earliest_created_wins():
 
     from racing_sync.coordinator_content import watch_election_winner
 
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
 
     def _lock(h, age_s):
         return TorrentState(
@@ -2603,7 +2597,6 @@ def test_exempt_peer_blocks_election(tmp_path: Path):
 
 def _on_ssd_coord(tmp_path: Path, store, *, complete: bool):
     """Watch harness with a dest entry for the dropped hash (manual seed)."""
-    from unittest.mock import AsyncMock, MagicMock
 
     from racing_sync.config import ClassifierConfig
 

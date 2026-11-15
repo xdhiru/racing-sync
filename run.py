@@ -39,6 +39,5 @@ _ensure_src_on_path()
 
 from racing_sync.__main__ import main  # noqa: E402  (import after sys.path fix)
 
-
 if __name__ == "__main__":
     raise SystemExit(main())

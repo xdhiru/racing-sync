@@ -505,7 +505,7 @@ async def pick_ssd_source_for_racing(
             ),
             timeout=_PICKER_DEADLINE_S,
         )
-    except (TimeoutError, asyncio.TimeoutError):
+    except TimeoutError:
         log.warning(
             "picker exceeded %ds overall deadline for %s; parking",
             _PICKER_DEADLINE_S,

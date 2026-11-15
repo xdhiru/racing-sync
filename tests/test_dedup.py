@@ -19,6 +19,7 @@ def test_looks_public():
 
 def test_fold_path_case_folds_only_on_windows():
     import os
+
     from racing_sync.coordinator_content import fold_path_case
 
     if os.name == "nt":

@@ -168,11 +168,11 @@ def test_retry_after_honored_and_capped():
     assert _retry_after_delay({"Retry-After": "3600"}, 0.5) == 5.0
     assert _retry_after_delay({}, 1.0) == 1.0
     assert _retry_after_delay({"Retry-After": "garbage"}, 1.0) == 1.0
-    future = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=60)).strftime(
+    future = (dt.datetime.now(dt.UTC) + dt.timedelta(seconds=60)).strftime(
         "%a, %d %b %Y %H:%M:%S GMT"
     )
     assert _retry_after_delay({"Retry-After": future}, 0.5) == 5.0
-    past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=60)).strftime(
+    past = (dt.datetime.now(dt.UTC) - dt.timedelta(seconds=60)).strftime(
         "%a, %d %b %Y %H:%M:%S GMT"
     )
     assert _retry_after_delay({"Retry-After": past}, 0.5) == 0.0

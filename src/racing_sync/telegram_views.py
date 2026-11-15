@@ -256,7 +256,7 @@ def _as_aware_utc(value: object) -> dt.datetime | None:
         return None
     try:
         if value.tzinfo is None:
-            return value.replace(tzinfo=dt.timezone.utc)
+            return value.replace(tzinfo=dt.UTC)
         return value
     except Exception:
         return None
@@ -268,7 +268,7 @@ def _retry_in_future_seconds(value: object) -> float | None:
     if aware is None:
         return None
     try:
-        delta = (aware - dt.datetime.now(dt.timezone.utc)).total_seconds()
+        delta = (aware - dt.datetime.now(dt.UTC)).total_seconds()
         return delta if delta > 0 else None
     except Exception:
         return None

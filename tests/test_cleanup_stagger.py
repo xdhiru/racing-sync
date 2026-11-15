@@ -17,7 +17,7 @@ from racing_sync.state import State, StateStore, TorrentState
 def _stagger_pair(tmp_path: Path, db_name: str = "s.db", **cleanup_over):
     """Two eligible DONE rows with matching source members."""
     store = StateStore(tmp_path / db_name)
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     rows = []
     members = []
     for h, name, size in (("a" * 40, "ShowA.mkv", 700), ("b" * 40, "ShowB.mkv", 701)):

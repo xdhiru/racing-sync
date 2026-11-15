@@ -54,3 +54,8 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "ASYNC"]
 ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+# Keep `from x import (a as _a, b as _b)` in one statement — the module
+# re-export guards rely on that grouping to stay readable.
+combine-as-imports = true

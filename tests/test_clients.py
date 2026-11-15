@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from racing_sync.config import DestConfig, SourceConfig
-from racing_sync.clients.qbittorrent import QBittorrentClient
-from racing_sync.clients.deluge import DelugeClient
+import pytest
+
 from racing_sync.clients.abstract import TorrentFile
+from racing_sync.clients.deluge import DelugeClient
+from racing_sync.clients.qbittorrent import QBittorrentClient
+from racing_sync.config import DestConfig, SourceConfig
 
 
 def test_instantiate_qbittorrent_client():
@@ -197,7 +198,7 @@ async def test_qbittorrent_set_save_path_uses_hashes_field():
 
 @pytest.mark.anyio
 async def test_http_client_base_nginx_modes():
-    from racing_sync.clients.http_base import HTTPClientBase, AuthError
+    from racing_sync.clients.http_base import AuthError, HTTPClientBase
     from racing_sync.config import HTTPClientConfig
 
     # mode="off": no Authorization header
@@ -347,7 +348,7 @@ async def test_http_client_start_idempotent():
 
 @pytest.mark.anyio
 async def test_http_client_form_post_verifies_login_body():
-    from racing_sync.clients.http_base import HTTPClientBase, AuthError
+    from racing_sync.clients.http_base import AuthError, HTTPClientBase
     from racing_sync.config import HTTPClientConfig
 
     cfg = HTTPClientConfig(
@@ -385,6 +386,7 @@ async def test_http_client_form_post_verifies_login_body():
 @pytest.mark.anyio
 async def test_http_client_request_releases_connection_on_4xx():
     import aiohttp
+
     from racing_sync.clients.http_base import HTTPClientBase
     from racing_sync.config import HTTPClientConfig
 
@@ -410,6 +412,7 @@ async def test_http_client_request_releases_connection_on_4xx():
 @pytest.mark.anyio
 async def test_http_client_files_param_handling():
     import aiohttp
+
     from racing_sync.clients.http_base import HTTPClientBase
     from racing_sync.config import HTTPClientConfig
 
@@ -624,6 +627,7 @@ async def test_deluge_set_file_priorities_indexed():
 @pytest.mark.anyio
 async def test_deluge_add_torrent_rejects_none_result_and_uses_uuid_filename():
     from unittest.mock import AsyncMock
+
     from racing_sync.clients.deluge import DelugeClient
     from racing_sync.config import SourceConfig
 
@@ -673,6 +677,7 @@ async def test_deluge_add_torrent_rejects_none_result_and_uses_uuid_filename():
 async def test_deluge_add_torrent_rejects_garbage_hash():
     """Daemon garbage never becomes a row hash (accepted, hash empty)."""
     from unittest.mock import AsyncMock
+
     from racing_sync.clients.deluge import DelugeClient
     from racing_sync.config import SourceConfig
 
@@ -697,6 +702,7 @@ async def test_deluge_add_torrent_rejects_garbage_hash():
 @pytest.mark.anyio
 async def test_deluge_set_file_priorities_propagates_auth_error():
     from unittest.mock import AsyncMock
+
     from racing_sync.clients.deluge import DelugeClient
     from racing_sync.clients.http_base import AuthError
     from racing_sync.config import SourceConfig
@@ -722,6 +728,7 @@ async def test_deluge_set_file_priorities_propagates_auth_error():
 @pytest.mark.anyio
 async def test_deluge_get_torrent_files_scales_progress_and_propagates_auth():
     from unittest.mock import AsyncMock
+
     from racing_sync.clients.deluge import DelugeClient
     from racing_sync.clients.http_base import AuthError
     from racing_sync.config import SourceConfig
@@ -764,6 +771,7 @@ async def test_deluge_get_torrent_files_scales_progress_and_propagates_auth():
 @pytest.mark.anyio
 async def test_deluge_files_from_torrent_file_catches_sftp_error():
     from unittest.mock import patch
+
     from racing_sync.clients.deluge import DelugeClient
     from racing_sync.config import SourceConfig
 
@@ -791,7 +799,8 @@ async def test_deluge_files_from_torrent_file_catches_sftp_error():
 @pytest.mark.anyio
 async def test_deluge_files_prefers_shared_sftp_exporter():
     """Shared exporter must be reused; no fresh handshake per call."""
-    from unittest.mock import AsyncMock, MagicMock, patch
+    from unittest.mock import MagicMock, patch
+
     from racing_sync.clients.deluge import DelugeClient
     from racing_sync.config import SourceConfig
 
@@ -845,6 +854,7 @@ async def test_http_client_authed_reset_on_close_and_origin_rfc6454():
 @pytest.mark.anyio
 async def test_http_client_form_data_rebuilt_per_attempt_and_tuple_specs():
     import aiohttp
+
     from racing_sync.clients.http_base import HTTPClientBase
     from racing_sync.config import HTTPClientConfig
 
@@ -933,7 +943,8 @@ async def test_http_client_retries_transient_status_codes():
 @pytest.mark.anyio
 async def test_http_client_does_not_conflate_403_with_auth_error():
     import aiohttp
-    from racing_sync.clients.http_base import HTTPClientBase, AuthError
+
+    from racing_sync.clients.http_base import HTTPClientBase
     from racing_sync.config import HTTPClientConfig
 
     cfg = HTTPClientConfig(host="http://127.0.0.1:8080", nginx_mode="off")
@@ -966,6 +977,7 @@ async def test_http_client_does_not_conflate_403_with_auth_error():
 async def test_http_client_concurrent_401s_share_one_login():
     """N workers hitting 401 at once must trigger one login, not N."""
     import asyncio
+
     from racing_sync.clients.http_base import HTTPClientBase
     from racing_sync.config import HTTPClientConfig
 
@@ -1015,9 +1027,10 @@ async def test_http_client_concurrent_401s_share_one_login():
 @pytest.mark.anyio
 async def test_http_client_reauth_transient_error_retries_login():
     """A network blip during re-auth retries instead of escaping."""
+    import aiohttp
+
     from racing_sync.clients.http_base import HTTPClientBase
     from racing_sync.config import HTTPClientConfig
-    import aiohttp
 
     cfg = HTTPClientConfig(host="http://127.0.0.1:8080", nginx_mode="off")
     client = HTTPClientBase(cfg)
@@ -1683,7 +1696,6 @@ async def test_deluge_prio_warns_and_skips_unknown():
 @pytest.mark.anyio
 async def test_deluge_not_found_reraise_auth():
     """Auth expiry surfaces from idempotent ops, never reads as gone."""
-    from unittest.mock import AsyncMock
 
     from racing_sync.clients.http_base import AuthError
 

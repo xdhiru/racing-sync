@@ -6,7 +6,6 @@ import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -56,7 +55,6 @@ async def test_is_watch_row_negative(tmp_path: Path):
 @pytest.mark.anyio
 async def test_bad_files_capped(tmp_path: Path):
     """600 broken drops must not grow _bad_files without bound."""
-    import asyncio as _asyncio
 
     from racing_sync.config import WatchDirConfig
     from racing_sync.watchdir import WatchDirScanner

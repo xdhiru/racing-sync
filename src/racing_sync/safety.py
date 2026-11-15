@@ -24,8 +24,8 @@ import os
 import shutil
 import sqlite3
 import time
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 
 def validate_safe_delete_path(path: Path, base_dir: Path | Iterable[Path] | None = None) -> None:
@@ -364,7 +364,7 @@ class DaemonLock:
         except OSError:
             pass
 
-    def __enter__(self) -> "DaemonLock":
+    def __enter__(self) -> DaemonLock:
         # Fail shut: `with` users must never proceed unguarded when the
         # lock is held elsewhere — an ignored False here would race the
         # daemon exactly like having no lock at all.
@@ -394,7 +394,7 @@ def _lock_file_nonblocking(fh) -> bool:
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
-        except (OSError, IOError):
+        except OSError:
             return False
     except ImportError:
         pass
@@ -430,7 +430,7 @@ def _lock_file_nonblocking(fh) -> bool:
 def _pidfile_holder_alive(pid_path: str) -> bool:
     """True when a pid-file holder looks live (fail-closed True on doubt)."""
     try:
-        with open(pid_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(pid_path, encoding="utf-8", errors="replace") as f:
             pid = int((f.read() or "").strip().split()[0])
     except Exception:
         return True
@@ -455,7 +455,7 @@ def _unlock_file(fh) -> None:
 
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        except (OSError, IOError):
+        except OSError:
             pass
         return
     except ImportError:

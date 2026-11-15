@@ -32,7 +32,7 @@ def _is_fetchable_http_url(url: str) -> bool:
     what a compromised/malicious feed entry can make us fetch.
     """
     try:
-        from ipaddress import ip_address as _ip, IPv4Address as _v4
+        from ipaddress import IPv4Address as _v4, ip_address as _ip
 
         parts = urlsplit(url or "")
         if parts.scheme not in ("http", "https"):
@@ -179,7 +179,7 @@ class ProwlarrClient:
 
     # ---------- lifecycle ----------
 
-    async def __aenter__(self) -> "ProwlarrClient":
+    async def __aenter__(self) -> ProwlarrClient:
         await self.start()
         return self
 
@@ -259,7 +259,7 @@ class ProwlarrClient:
                         r.raise_for_status()
                         data = await r.json()
                     break
-                except (aiohttp.ClientConnectionError, asyncio.TimeoutError, OSError) as e:
+                except (TimeoutError, aiohttp.ClientConnectionError, OSError) as e:
                     last_exc = e
                     if attempt == 2:
                         raise ProwlarrError(f"prowlarr indexer refresh failed: {e}") from e
@@ -460,7 +460,7 @@ class ProwlarrClient:
                                     f"{_MAX_FEED_BYTES} bytes; refusing"
                                 )
                 break
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError, OSError) as e:
+            except (TimeoutError, aiohttp.ClientConnectionError, OSError) as e:
                 last_exc = e
             except aiohttp.ClientResponseError as e:
                 # Rate-limit / gateway hiccups are retryable (500 included:
@@ -590,7 +590,7 @@ class ProwlarrClient:
                         f"torrent download from {safe_url} failed with HTTP status {e.status}"
                     ) from e
                 last_exc = e
-            except (TimeoutError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+            except (TimeoutError, aiohttp.ClientError, OSError) as e:
                 last_exc = e
             if attempt == 2:
                 raise ProwlarrError(
@@ -741,7 +741,7 @@ class ProwlarrClient:
                 asyncio.gather(*tasks),
                 timeout=_timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.warning(
                 "prowlarr parallel search timed out after %.0fs for %r; using partial hits",
                 _timeout,

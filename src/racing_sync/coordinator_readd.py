@@ -691,7 +691,7 @@ class ReaddMixin:
 
     async def _do_re_add(self, ts: TorrentState) -> None:
         store = getattr(self, "store", None)
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         try:
             _cycles = int(getattr(ts, "readd_cycles", 0) or 0)
         except (TypeError, ValueError):
@@ -950,7 +950,7 @@ class ReaddMixin:
                 # failures) fail loudly via the worker wrapper
                 # instead of riding the retry clock.
                 raise
-            now_curr = dt.datetime.now(dt.timezone.utc)
+            now_curr = dt.datetime.now(dt.UTC)
             elapsed_curr = now_curr - ts.readd_first_attempted_at
             if elapsed_curr >= max_age:
                 err = (
@@ -1164,7 +1164,7 @@ class ReaddMixin:
             ]
             if _pending:
                 _outs = await asyncio.gather(*(_one(h, b, t) for h, b, t in _pending))
-                for (h, _b, _t), (_h2, ok, detail) in zip(_pending, _outs):
+                for (h, _b, _t), (_h2, ok, detail) in zip(_pending, _outs, strict=False):
                     _results[h] = (ok, detail)
                     injected_set.add(h)
             for p, pay, prob in _ready:
@@ -1342,7 +1342,7 @@ class ReaddMixin:
             ]
             if _pending:
                 _outs = await asyncio.gather(*(_one(h, b, t) for h, b, t in _pending))
-                for (h, _b, _t), (_h2, ok, detail) in zip(_pending, _outs):
+                for (h, _b, _t), (_h2, ok, detail) in zip(_pending, _outs, strict=False):
                     _results[h] = (ok, detail)
                     injected_set.add(h)
             for t, pay, prob in _loaded:

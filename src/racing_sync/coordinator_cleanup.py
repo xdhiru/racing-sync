@@ -173,7 +173,7 @@ class CleanupMixin:
         pressure. Dry-run only logs. Fail-closed throughout: any doubt about
         bytes, health, identity or activity skips the row for this run.
         """
-        now_utc = dt.datetime.now(dt.timezone.utc)
+        now_utc = dt.datetime.now(dt.UTC)
         arrivals = self._cleanup_arrivals_per_hour(time.monotonic())
         free_bytes = await self._source_free_bytes()
         # Calm-and-roomy short-circuit: plenty of free space and a quiet
@@ -595,7 +595,7 @@ class CleanupMixin:
                 if added > now_ts + 300:
                     return False
                 youngest_added = max(youngest_added, added)
-            added_dt = dt.datetime.fromtimestamp(youngest_added, tz=dt.timezone.utc)
+            added_dt = dt.datetime.fromtimestamp(youngest_added, tz=dt.UTC)
             return (now_utc - added_dt).total_seconds() >= window_s
         except Exception:
             return False

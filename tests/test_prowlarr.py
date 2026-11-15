@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
-from racing_sync.config import AppConfig, DownloadIndexerConfig, ProwlarrConfig
-from racing_sync.prowlarr import ProwlarrClient, Indexer, TorrentHit
-from racing_sync.coordinator import pick_ssd_source_for_racing
+import pytest
 from conftest import make_coordinator
-from racing_sync.state import StateStore, TorrentState, State
+
 from racing_sync.clients.abstract import Torrent
+from racing_sync.config import DownloadIndexerConfig, ProwlarrConfig
+from racing_sync.coordinator import pick_ssd_source_for_racing
+from racing_sync.prowlarr import Indexer, ProwlarrClient, TorrentHit
+from racing_sync.state import State, StateStore, TorrentState
 from racing_sync.watchdir import _bencode, _bencoded_info_hash
 
 
@@ -223,7 +224,7 @@ async def test_do_new_watch_dir_skips_prowlarr(tmp_path: Path):
 
 
 def test_parse_newznab_blocks_dtd_entity_expansion():
-    from racing_sync.prowlarr import _parse_newznab, ProwlarrError, Indexer
+    from racing_sync.prowlarr import Indexer, ProwlarrError, _parse_newznab
 
     idx = Indexer(1, "Indexer", "torrent", True, [])
     malicious_xml = """<?xml version="1.0"?>
@@ -240,7 +241,7 @@ def test_parse_newznab_blocks_dtd_entity_expansion():
 
 def test_parse_newznab_blocks_obfuscated_doctype():
     """Case/whitespace-obfuscated DTD must still be rejected."""
-    from racing_sync.prowlarr import _parse_newznab, ProwlarrError, Indexer
+    from racing_sync.prowlarr import Indexer, ProwlarrError, _parse_newznab
 
     idx = Indexer(1, "Indexer", "torrent", True, [])
     for variant in (
@@ -258,7 +259,8 @@ def test_parse_newznab_blocks_obfuscated_doctype():
 async def test_search_indexer_refuses_oversize_feed():
     """A bloated feed is refused before decode, not OOMed."""
     from unittest.mock import MagicMock
-    from racing_sync.prowlarr import Indexer, ProwlarrClient, ProwlarrError, _MAX_FEED_BYTES
+
+    from racing_sync.prowlarr import _MAX_FEED_BYTES, Indexer, ProwlarrClient, ProwlarrError
 
     cfg = MagicMock()
     cfg.base_url = "http://localhost:9696"
@@ -302,7 +304,7 @@ async def test_search_indexer_refuses_oversize_feed():
 
 
 def test_parse_newznab_sanitizes_unsafe_download_url():
-    from racing_sync.prowlarr import _parse_newznab, Indexer
+    from racing_sync.prowlarr import Indexer, _parse_newznab
 
     idx = Indexer(1, "Indexer", "torrent", True, [])
     xml = """<?xml version="1.0"?>
@@ -318,7 +320,7 @@ def test_parse_newznab_sanitizes_unsafe_download_url():
 
 
 def test_parse_newznab_preserves_magnet_enclosure_url():
-    from racing_sync.prowlarr import _parse_newznab, Indexer
+    from racing_sync.prowlarr import Indexer, _parse_newznab
 
     idx = Indexer(1, "Indexer", "torrent", True, [])
     xml = """<?xml version="1.0"?>
@@ -334,7 +336,7 @@ def test_parse_newznab_preserves_magnet_enclosure_url():
 
 
 def test_parse_newznab_extracts_namespaced_magnet_url():
-    from racing_sync.prowlarr import _parse_newznab, Indexer
+    from racing_sync.prowlarr import Indexer, _parse_newznab
 
     idx = Indexer(1, "Indexer", "torrent", True, [])
     xml = """<?xml version="1.0"?>
@@ -544,7 +546,8 @@ async def test_best_match_size_gate_needs_target_size():
 @pytest.mark.anyio
 async def test_prowlarr_headers_not_leaked_to_external_hosts():
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.prowlarr import ProwlarrClient, TorrentHit, Indexer
+
+    from racing_sync.prowlarr import Indexer, ProwlarrClient, TorrentHit
 
     cfg = ProwlarrConfig(
         enabled=True,
@@ -605,6 +608,7 @@ async def test_prowlarr_headers_not_leaked_to_external_hosts():
 @pytest.mark.anyio
 async def test_prowlarr_download_url_scrubbed_in_exceptions():
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.prowlarr import ProwlarrClient, ProwlarrError, TorrentHit
 
     cfg = ProwlarrConfig(
@@ -1292,7 +1296,7 @@ def _dl_resp(payload: bytes):
 
 
 def _dl_cm(resp):
-    from unittest.mock import MagicMock, AsyncMock
+    from unittest.mock import AsyncMock, MagicMock
 
     cm = MagicMock()
     cm.__aenter__ = AsyncMock(return_value=resp)
@@ -1304,6 +1308,7 @@ def _dl_cm(resp):
 async def test_download_torrent_retries_transient_then_succeeds():
     """One 429 must not fail the row: download retries like search does."""
     import aiohttp
+
     from racing_sync.prowlarr import ProwlarrClient
 
     cfg = ProwlarrConfig(
@@ -1360,6 +1365,7 @@ async def test_download_torrent_sends_key_to_same_host_only():
 async def test_parallel_search_overall_deadline(monkeypatch):
     """A hung indexer batch returns a miss fast instead of outliving the tick."""
     import asyncio as _asyncio
+
     from racing_sync.prowlarr import Indexer, ProwlarrClient
 
     cfg = ProwlarrConfig(
@@ -1551,10 +1557,10 @@ async def test_picker_deadline_parks():
     """A wedged transport tree parks via the overall deadline instead of
     pinning the worker slot."""
     import asyncio
+    from types import SimpleNamespace
     from unittest.mock import patch
 
     import racing_sync.coordinator_picker as _picker
-    from types import SimpleNamespace
 
     real = _picker._PICKER_DEADLINE_S
     _picker._PICKER_DEADLINE_S = 0.1
@@ -1597,8 +1603,9 @@ def _search_cm(xml: bytes):
 
 def _err_cm(status: int, retry_after: str | None = None):
     """Failing-response double raising ClientResponseError on status."""
-    import aiohttp
     from unittest.mock import AsyncMock, MagicMock
+
+    import aiohttp
 
     resp = MagicMock()
     headers = {"Retry-After": retry_after} if retry_after else {}

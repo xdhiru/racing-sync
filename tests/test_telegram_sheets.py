@@ -200,7 +200,6 @@ async def test_refresh_stamps_rendered_generation():
     """The active refresh records the group count taps resolve against."""
     import asyncio
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import State, TorrentState
 
     bot = object.__new__(TelegramBot)
     bot._bot = MagicMock()

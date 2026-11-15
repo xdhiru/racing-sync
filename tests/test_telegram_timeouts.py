@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 
 def test_make_bot_uses_generous_timeouts():
     """Telegram Bot carries 30s reads (slow routes stop flapping)."""

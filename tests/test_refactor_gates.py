@@ -55,7 +55,8 @@ async def test_intake_handoff_off_for_bare_doubles():
 
     sys.path.insert(0, "tests")
     from conftest import make_coordinator
-    from racing_sync.state import TorrentState, State
+
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     ts = TorrentState(source_infohash="a" * 40, source_name="Fresh", state=State.NEW)
@@ -70,7 +71,8 @@ async def test_intake_handoff_spawns_fresh_new_when_started():
 
     sys.path.insert(0, "tests")
     from conftest import make_coordinator
-    from racing_sync.state import TorrentState, State
+
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._coordinator_started = True
@@ -90,7 +92,8 @@ async def test_intake_handoff_skips_running_and_held():
 
     sys.path.insert(0, "tests")
     from conftest import make_coordinator
-    from racing_sync.state import TorrentState, State
+
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._coordinator_started = True
@@ -110,7 +113,8 @@ async def test_intake_pause_holds_new_and_resumes():
 
     sys.path.insert(0, "tests")
     from conftest import make_coordinator
-    from racing_sync.state import TorrentState, State
+
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     assert coord._intake_paused is False
@@ -132,7 +136,8 @@ async def test_schedule_step_paused_intake_parks_new(tmp_path):
 
     sys.path.insert(0, "tests")
     from conftest import make_coordinator
-    from racing_sync.state import StateStore, TorrentState, State
+
+    from racing_sync.state import State, StateStore, TorrentState
 
     store = StateStore(tmp_path / "paused.db")
     try:

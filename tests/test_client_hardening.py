@@ -46,7 +46,6 @@ async def test_qb_add_rejects_bad_urls():
     cfg = MagicMock()
     cfg.username = "u"
     client = QBittorrentClient.__new__(QBittorrentClient)
-    from racing_sync.config import HTTPClientConfig
 
     http_cfg = MagicMock()  # plain: spec'd mocks hide real attrs
     from racing_sync.clients.http_base import HTTPClientBase
@@ -97,8 +96,8 @@ async def test_deluge_health_check_failure_is_auth_error():
         },
     )
     client = DelugeClient.__new__(DelugeClient)
-    from racing_sync.config import HTTPClientConfig
     from racing_sync.clients.http_base import HTTPClientBase
+    from racing_sync.config import HTTPClientConfig
 
     HTTPClientBase.__init__(client, HTTPClientConfig.from_source(src), label="t")
 
@@ -130,7 +129,7 @@ async def test_deluge_health_check_failure_is_auth_error():
 
 @pytest.mark.anyio
 async def test_nginx_form_post_rejects_bad_url():
-    from racing_sync.clients.http_base import HTTPClientBase, AuthError
+    from racing_sync.clients.http_base import AuthError, HTTPClientBase
     from racing_sync.config import HTTPClientConfig
 
     for bad in ("file:///etc/nginx-auth", "notaurl", "http:///no-host"):
@@ -147,9 +146,10 @@ async def test_nginx_form_post_rejects_bad_url():
 
 
 def test_deluge_scan_lock_eager():
+    import asyncio
+
     from racing_sync.clients.deluge import DelugeClient
     from racing_sync.config import SourceConfig
-    import asyncio
 
     client = DelugeClient(
         SourceConfig(

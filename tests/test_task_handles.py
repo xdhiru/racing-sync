@@ -32,6 +32,7 @@ async def test_handle_cancel_task_lifecycle():
 @pytest.mark.anyio
 async def test_handle_cancel_aborts_owned_tree():
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync import rclone_ops
     from racing_sync.task import TaskHandle
 
@@ -52,6 +53,7 @@ async def test_handle_cancel_aborts_owned_tree():
 
 def test_abort_move_tree_edge_cases():
     from unittest.mock import MagicMock
+
     from racing_sync import rclone_ops
     from racing_sync.rclone_ops import abort_move_tree
 
@@ -69,6 +71,7 @@ def test_abort_move_tree_edge_cases():
 
 def test_registry_register_and_unregister():
     from types import SimpleNamespace
+
     from racing_sync.task import (
         TaskHandle,
         handles_for,
@@ -93,7 +96,9 @@ def test_registry_register_and_unregister():
 @pytest.mark.anyio
 async def test_stop_workers_for_cancels_via_handles():
     from unittest.mock import AsyncMock, MagicMock
+
     from conftest import make_coordinator
+
     from racing_sync.task import handles_for
 
     coord = make_coordinator(MagicMock())
@@ -119,6 +124,7 @@ async def test_stop_workers_for_cancels_via_handles():
 
 def test_status_for_lanes():
     from unittest.mock import MagicMock
+
     from racing_sync.state import State, TorrentState
     from racing_sync.task_status import (
         DownloadStatus,
@@ -163,6 +169,7 @@ def test_status_for_lanes():
 
 def test_status_for_move_reads_rclone_map():
     from types import SimpleNamespace
+
     from racing_sync.state import State, TorrentState
     from racing_sync.task_status import status_for
 

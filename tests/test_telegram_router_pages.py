@@ -140,6 +140,7 @@ async def test_filtered_refresh_narrows_render():
     """Inner honors _status_filter; detail nets still see everything."""
     import asyncio
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.config import TelegramConfig
     from racing_sync.state import State, TorrentState
     from racing_sync.telegram_bot import TelegramBot
@@ -183,6 +184,7 @@ async def test_filtered_refresh_narrows_render():
 @pytest.mark.anyio
 async def test_overview_button_sends_aggregate():
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.state import State, TorrentState
 
     bot = _page_bot([])

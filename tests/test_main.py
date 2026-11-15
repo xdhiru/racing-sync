@@ -356,6 +356,7 @@ def test_check_config_flags_same_remote_and_cap(tmp_path: Path):
     """default==unsorted refuses at load; cap>disk surfaces as check-config problem."""
     import pytest
     from pydantic import ValidationError
+
     from racing_sync.__main__ import _check_config_env
     from racing_sync.config import AppConfig
 

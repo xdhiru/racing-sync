@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 from conftest import make_coordinator
 
-from racing_sync.state import State, TorrentState
-from racing_sync.telegram_bot import render_active, TelegramBot
 from racing_sync.config import TelegramConfig
+from racing_sync.state import State, TorrentState
+from racing_sync.telegram_bot import TelegramBot, render_active
 
 
 def test_render_active_empty():
@@ -141,8 +141,9 @@ def test_render_detail_formatting():
 @pytest.mark.anyio
 async def test_refresh_live_status_filters_by_hashes():
     from unittest.mock import AsyncMock
-    from racing_sync.coordinator import LiveItem
+
     from racing_sync.clients.abstract import Torrent
+    from racing_sync.coordinator import LiveItem
 
     coord = make_coordinator()
     coord.dest_client = AsyncMock()
@@ -177,8 +178,9 @@ async def test_refresh_live_status_filters_by_hashes():
 async def test_refresh_live_status_updates_speed():
     """The periodic refresh carries download rates, not just progress."""
     from unittest.mock import AsyncMock
-    from racing_sync.coordinator import LiveItem
+
     from racing_sync.clients.abstract import Torrent
+    from racing_sync.coordinator import LiveItem
 
     coord = make_coordinator()
     coord.dest_client = AsyncMock()
@@ -207,6 +209,7 @@ async def test_send_one_detail_handles_timedelta_retry_after():
     import asyncio
     import datetime as dt
     from unittest.mock import AsyncMock, MagicMock, patch
+
     from telegram.error import RetryAfter
 
     bot = object.__new__(TelegramBot)
@@ -245,8 +248,9 @@ async def test_send_one_detail_handles_timedelta_retry_after():
 
 def test_flood_wait_seconds_helper():
     import datetime as dt
-    from unittest.mock import MagicMock
+
     from telegram.error import RetryAfter, TelegramError
+
     from racing_sync.telegram_bot import _flood_wait_seconds
 
     assert _flood_wait_seconds(TelegramError("Flood control exceeded. Retry in 39 seconds")) == 47
@@ -276,6 +280,7 @@ async def test_send_one_detail_recovers_plain_flood_edit():
     """
     import asyncio
     from unittest.mock import AsyncMock, MagicMock, patch
+
     from telegram.error import TelegramError
 
     from racing_sync.telegram_bot import _FloodBackoff
@@ -317,6 +322,7 @@ async def test_send_one_detail_recovers_plain_flood_edit():
 async def test_send_one_detail_send_path_flood_raises_to_loop():
     import asyncio
     from unittest.mock import AsyncMock, MagicMock, patch
+
     from telegram.error import TelegramError
 
     from racing_sync.telegram_bot import _FloodBackoff
@@ -349,6 +355,7 @@ async def test_send_one_detail_send_path_flood_raises_to_loop():
 async def test_send_one_detail_non_flood_error_still_drops():
     import asyncio
     from unittest.mock import AsyncMock, MagicMock, patch
+
     from telegram.error import TelegramError
 
     bot = object.__new__(TelegramBot)
@@ -609,6 +616,7 @@ async def test_refresh_attaches_watch_wait_notes():
 
 def test_inflight_note_for_shapes():
     from unittest.mock import MagicMock
+
     from racing_sync.telegram_bot import _inflight_note_for
 
     ts = TorrentState(source_infohash="a" * 40, source_name="Show", state=State.WAITING_INDEXER)
@@ -1099,8 +1107,8 @@ async def test_detail_queue_overflow_evicts_oldest():
 
 @pytest.mark.anyio
 async def test_active_msg_id_restored_from_store():
-    from unittest.mock import AsyncMock, MagicMock, patch
     import unittest.mock
+    from unittest.mock import AsyncMock, MagicMock, patch
 
     bot = object.__new__(TelegramBot)
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
@@ -1126,8 +1134,8 @@ async def test_active_msg_id_restored_from_store():
 
 @pytest.mark.anyio
 async def test_online_ping_debounced_when_recent():
-    from unittest.mock import AsyncMock, MagicMock, patch
     import time as _time
+    from unittest.mock import AsyncMock, MagicMock, patch
 
     bot = object.__new__(TelegramBot)
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="12345")
@@ -1174,6 +1182,7 @@ def test_safe_truncate_markdown_balances_tags():
 @pytest.mark.anyio
 async def test_notify_falls_back_to_plain_text_on_parse_error():
     from unittest.mock import AsyncMock, MagicMock
+
     from telegram.error import TelegramError
 
     bot = object.__new__(TelegramBot)
@@ -1461,7 +1470,7 @@ def test_render_active_wait_indexer_shows_retry_countdown():
     """WAITING_INDEXER lines name the live retry timer (no fake positions)."""
     import datetime as dt
 
-    soon = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=12)
+    soon = dt.datetime.now(dt.UTC) + dt.timedelta(minutes=12)
     ts = TorrentState(
         source_infohash="a" * 40,
         source_name="Wait.Show",

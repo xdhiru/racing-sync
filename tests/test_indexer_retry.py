@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import datetime as dt
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from conftest import make_coordinator
-from unittest.mock import AsyncMock, MagicMock
 
 from racing_sync.config import AppConfig
 from racing_sync.state import State, TorrentState
@@ -30,7 +30,7 @@ def test_first_attempt_sets_first_queried_at():
     assert ts.indexer_first_queried_at is None
     assert ts.indexer_attempts == 0
 
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     interval = cfg.cross_seed.prowlarr_retry_interval_seconds
     ts.indexer_first_queried_at = now
     ts.indexer_attempts = 1
@@ -60,7 +60,7 @@ async def test_vanished_source_grants_fresh_window(tmp_path):
         coord = make_coordinator()
         coord.cfg = _cfg()
         coord.store = store
-        _old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=86400 + 60)
+        _old = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=86400 + 60)
         for h, reason, final in (
             ("a" * 40, "source vanished from VPS1", State.WAITING_INDEXER),
             ("b" * 40, "indexer miss", State.FAILED),
@@ -114,12 +114,12 @@ def test_expired_max_age_marks_failed():
     ts = TorrentState(
         source_infohash="a" * 40,
         state=State.WAITING_INDEXER,
-        indexer_first_queried_at=dt.datetime.now(dt.timezone.utc)
+        indexer_first_queried_at=dt.datetime.now(dt.UTC)
         - dt.timedelta(seconds=cfg.cross_seed.prowlarr_max_age_seconds + 1),
-        indexer_next_retry_at=dt.datetime.now(dt.timezone.utc),
+        indexer_next_retry_at=dt.datetime.now(dt.UTC),
         indexer_attempts=10,
     )
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     elapsed = now - ts.indexer_first_queried_at
     assert elapsed > dt.timedelta(seconds=cfg.cross_seed.prowlarr_max_age_seconds)
 
@@ -141,6 +141,7 @@ async def test_process_torrent_inner_dispatches_waiting_indexer_state():
 @pytest.mark.anyio
 async def test_list_source_torrents_caches_within_ttl():
     from unittest.mock import AsyncMock
+
     from racing_sync.clients.abstract import Torrent
 
     coord = make_coordinator()
@@ -207,6 +208,7 @@ async def test_fetch_source_prefers_snapshot_on_deluge():
     trackerless qB rows still do the live lookup for full trackers.
     """
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.clients.abstract import Torrent
     from racing_sync.clients.deluge import DelugeClient
 
@@ -316,7 +318,6 @@ async def test_do_waiting_indexer_transitions_failed_when_source_vanished():
 
 def _ssd_dest(entries):
     """Fake VPS2 client: {hash: (progress, blob-for-export)}."""
-    from unittest.mock import AsyncMock
 
     from racing_sync.clients.abstract import Torrent
 
@@ -381,12 +382,11 @@ async def test_do_waiting_indexer_adopts_complete_ssd_entry():
 @pytest.mark.anyio
 async def test_do_waiting_indexer_heals_blob_from_ssd_entry():
     """No bytes on the row: export the live SSD entry, then adopt."""
+    import tempfile
+    from pathlib import Path
     from unittest.mock import AsyncMock, MagicMock
 
     from racing_sync.state import StateStore
-
-    import tempfile
-    from pathlib import Path
 
     raw, h = _operator_blob(name="Hand.Added.mkv")
     tmp = Path(tempfile.mkdtemp())
@@ -546,6 +546,7 @@ async def test_do_re_add_skips_when_already_injected_in_step_1():
 @pytest.mark.anyio
 async def test_do_re_add_accepts_when_dest_client_returns_fails_but_already_exists():
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.clients.abstract import AddResult, Torrent
 
     coord = make_coordinator()
@@ -691,7 +692,7 @@ async def test_coordinator_run_stops_immediately_when_stop_requested():
 @pytest.mark.anyio
 async def test_loops_run_their_own_step_and_stop():
     """Poller/scheduler/janitor loops run once and honor _stop."""
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import MagicMock
 
     for loop_name, step_name in (
         ("_poller_loop", "_poll_source_step"),
@@ -749,6 +750,7 @@ async def test_public_sftp_timeout_retried_once_then_succeeds(caplog):
     """A single SFTP stall must not fail a public SSD pick (cf. prod 15s gap)."""
     import logging
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.clients.abstract import Torrent
     from racing_sync.coordinator import pick_ssd_source_for_racing
 
@@ -793,6 +795,7 @@ async def test_public_export_failure_parks_as_source_export_miss(caplog):
     honest reason — never an 'indexer miss' (no indexer was ever queried)."""
     import logging
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.clients.abstract import Torrent
 
     cfg = MagicMock()
@@ -889,7 +892,7 @@ async def test_waiting_indexer_retry_republishes_public_schedule(tmp_path: Path,
         coord.dest_client.list_torrents = AsyncMock(return_value=[])
         coord.transition = MagicMock(side_effect=lambda t, s, **k: setattr(t, "state", s))
 
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         ts = TorrentState(
             source_infohash="p" * 40,
             source_name="Public.Show.S01E01.mkv",
@@ -933,9 +936,7 @@ async def test_public_export_miss_never_hits_max_age_failed(tmp_path: Path):
             source_infohash="p" * 40,
             source_name="Public.Show",
             state=State.NEW,
-            public_export_first_attempted_at=(
-                dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
-            ),
+            public_export_first_attempted_at=(dt.datetime.now(dt.UTC) - dt.timedelta(days=30)),
             public_export_attempts=100,
         )
         coord._park_for_indexer_retry(ts, reason="source export miss")
@@ -961,11 +962,12 @@ async def test_public_export_miss_never_hits_max_age_failed(tmp_path: Path):
 
 def test_list_public_retry_ready_only_elapsed(tmp_path: Path):
     import datetime as dt
+
     from racing_sync.state import StateStore
 
     store = StateStore(tmp_path / "s.db")
     try:
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         old = TorrentState(
             source_infohash="o" * 40,
             state=State.WAITING_INDEXER,
@@ -1046,7 +1048,7 @@ def _decision():
 
 
 def _past_max_age(cfg):
-    return dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+    return dt.datetime.now(dt.UTC) - dt.timedelta(
         seconds=cfg.cross_seed.prowlarr_max_age_seconds + 10
     )
 
@@ -1140,7 +1142,7 @@ async def test_pick_and_admit_timeout_resets_public_clock():
     from unittest.mock import AsyncMock, patch
 
     coord = _pick_coord(fallback_to_racing_torrent_on_prowlarr_timeout=True)
-    _now = dt.datetime.now(dt.timezone.utc)
+    _now = dt.datetime.now(dt.UTC)
     ts = TorrentState(
         source_infohash="d" * 40,
         state=State.WAITING_INDEXER,
@@ -1186,6 +1188,7 @@ async def test_pick_and_admit_timeout_without_flag_parks():
 async def test_pick_and_admit_timeout_skips_public_groups():
     """Public misses never queried Prowlarr — no racing fallback applies."""
     from unittest.mock import AsyncMock, patch
+
     from racing_sync.clients.abstract import Torrent
 
     coord = _pick_coord(fallback_to_racing_torrent_on_prowlarr_timeout=True)
@@ -1311,6 +1314,7 @@ async def test_pick_and_admit_ignores_mismatched_blob():
 async def test_private_fallback_retries_sftp_timeout_once():
     """A single stalled SFTP read costs one retry, not the whole fallback."""
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.clients.abstract import Torrent
     from racing_sync.coordinator import pick_ssd_source_for_racing
 
@@ -1347,6 +1351,7 @@ async def test_private_fallback_retries_sftp_timeout_once():
 @pytest.mark.anyio
 async def test_private_fallback_double_timeout_falls_to_export():
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.clients.abstract import Torrent
     from racing_sync.coordinator import pick_ssd_source_for_racing
 
@@ -1407,8 +1412,8 @@ async def test_fallback_trip_opens_fresh_direct_window():
     assert ts.force_direct == 1
     assert ts.state == State.WAITING_INDEXER
     assert ts.indexer_next_retry_at is not None
-    assert ts.indexer_next_retry_at > dt.datetime.now(dt.timezone.utc)
-    fresh_elapsed = (dt.datetime.now(dt.timezone.utc) - ts.indexer_first_queried_at).total_seconds()
+    assert ts.indexer_next_retry_at > dt.datetime.now(dt.UTC)
+    fresh_elapsed = (dt.datetime.now(dt.UTC) - ts.indexer_first_queried_at).total_seconds()
     assert fresh_elapsed < 60
 
 
@@ -1416,7 +1421,7 @@ def test_prowlarr_timed_out_helper():
     coord = _pick_coord()
     ts = TorrentState(source_infohash="d" * 40)
     assert coord._prowlarr_timed_out(ts) is False  # no first attempt yet
-    ts.indexer_first_queried_at = dt.datetime.now(dt.timezone.utc)
+    ts.indexer_first_queried_at = dt.datetime.now(dt.UTC)
     assert coord._prowlarr_timed_out(ts) is False  # flag off anyway
     coord.cfg.cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout = True
     assert coord._prowlarr_timed_out(ts) is False  # window fresh
@@ -1434,6 +1439,7 @@ async def test_reset_empty_db_rediscovers_waiting_row_from_zero(tmp_path: Path):
     """
     import time
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.clients.abstract import Torrent
     from racing_sync.state import StateStore
 
@@ -1655,7 +1661,7 @@ def test_prefer_racing_row_refusals(tmp_path):
         )
         import datetime as dt
 
-        old.created_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)
+        old.created_at = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
         store.upsert(old)
         row3, msg3 = coord.prefer_grace_row("c" * 40)
         assert row3 is None and "past its grace" in msg3
@@ -1801,7 +1807,7 @@ def _waiting_pair(tmp_path, *, leader_state, same_content=True):
     from racing_sync.state import StateStore
 
     store = StateStore(tmp_path / "state.db")
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     waiter = TorrentState(
         source_infohash="w" * 40,
         source_name="Twin.Show",
@@ -1868,7 +1874,7 @@ async def test_inflight_both_unknown_size_proceeds(tmp_path):
         coord = make_coordinator()
         coord.cfg = _cfg()
         coord.store = store
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         store.upsert(
             TorrentState(
                 source_infohash="l" * 40,
@@ -1924,7 +1930,7 @@ async def test_ssd_downloading_quiet_park_keeps_public_schedule(tmp_path):
         coord = make_coordinator()
         coord.cfg = _cfg()
         coord.store = store
-        _now = dt.datetime.now(dt.timezone.utc)
+        _now = dt.datetime.now(dt.UTC)
         ts = TorrentState(
             source_infohash="w" * 40,
             source_name="Twin.Show",
@@ -2061,12 +2067,11 @@ async def test_concurrent_source_lists_share_one_scan():
 @pytest.mark.anyio
 async def test_wakeup_indexer_row_ignores_skipped():
     """Timer-fired wakeups never revive a held row."""
+    import tempfile
+    from pathlib import Path
     from unittest.mock import MagicMock
 
     from racing_sync.state import StateStore
-
-    import tempfile
-    from pathlib import Path
 
     raw, h = _operator_blob(name="Hand.Added.mkv")
     tmp = Path(tempfile.mkdtemp())
@@ -2100,7 +2105,6 @@ async def test_process_torrent_inner_honors_hold():
 @pytest.mark.anyio
 async def test_schedule_step_never_spawns_held_rows(tmp_path):
     """The scheduler gives held rows no workers (but still works others)."""
-    import asyncio
 
     from racing_sync.state import StateStore
 

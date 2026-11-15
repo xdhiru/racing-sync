@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable, Iterable, TypeVar
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Any, TypeVar
 
 log = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ async def bounded(awaitable: Awaitable[T], *, timeout: float | None, label: str 
         seconds = DEFAULT_RPC_TIMEOUT_SECONDS
     try:
         return await asyncio.wait_for(awaitable, timeout=seconds)
-    except asyncio.TimeoutError as e:
+    except TimeoutError as e:
         log.warning("%s timed out after %.0fs", label, seconds)
         raise TimeoutError(f"{label} timed out after {seconds:.0f}s") from e
 

@@ -122,8 +122,8 @@ class DelugeClient(TorrentClient, HTTPClientBase):
                         login_data = await r.json()
                 break
             except (
+                TimeoutError,
                 aiohttp.ClientConnectionError,
-                asyncio.TimeoutError,
                 aiohttp.ClientPayloadError,
                 aiohttp.ClientOSError,
             ) as e:

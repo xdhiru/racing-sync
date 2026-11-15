@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import time
 
 import pytest
 
 
 def _coord(cap_dl=1, cap_mv=1):
     from unittest.mock import MagicMock
+
     from conftest import make_coordinator
 
     coord = make_coordinator(MagicMock())
@@ -20,7 +20,7 @@ def _coord(cap_dl=1, cap_mv=1):
 
 
 def _row(h, state, **kw):
-    from racing_sync.state import State, TorrentState
+    from racing_sync.state import TorrentState
 
     args = dict(source_infohash=h, source_name=f"Show-{h[:6]}", state=state, total_bytes=1000)
     args.update(kw)
@@ -28,8 +28,8 @@ def _row(h, state, **kw):
 
 
 def _handle(h, kind):
-    from racing_sync.task import TaskHandle, register_handle
-    import asyncio as _a
+
+    from racing_sync.task import TaskHandle
 
     hd = TaskHandle(infohash=h, gid=h[:12], kind=kind)
     return hd
@@ -37,7 +37,9 @@ def _handle(h, kind):
 
 def test_check_running_tasks_gates_and_forces():
     from unittest.mock import MagicMock
+
     from conftest import make_coordinator
+
     from racing_sync.state import State
     from racing_sync.task import register_handle
 
@@ -69,18 +71,19 @@ def test_check_running_tasks_gates_and_forces():
 @pytest.mark.anyio
 async def test_park_waits_without_db_churn_and_wakes_by_priority():
     """Parked workers idle (no upsert); start_from_queued wakes oldest."""
-    from unittest.mock import MagicMock
-    from racing_sync.state import State
-    from racing_sync.task import TaskHandle, register_handle
     import datetime as dt
+    from unittest.mock import MagicMock
+
+    from racing_sync.state import State
+    from racing_sync.task import register_handle
 
     coord = _coord()
     store = coord.store
     # Lane full: A downloading.
     ha = _handle("a" * 40, "downloading")
     register_handle(coord, ha)
-    old = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
-    new = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+    old = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
+    new = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
     ts_b = _row("b" * 40, State.QUEUED, updated_at=old)
     ts_c = _row("c" * 40, State.QUEUED, updated_at=new)
     store.get = MagicMock(side_effect=lambda h, **k: {"b" * 40: ts_b, "c" * 40: ts_c}.get(h))
@@ -129,6 +132,7 @@ async def test_forcestart_single_arms_and_wakes():
     """Full-hash /forcestart sets in-memory force + wakes the waiter."""
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.config import TelegramConfig
     from racing_sync.state import State
     from racing_sync.task import TaskHandle, register_handle
@@ -154,6 +158,7 @@ async def test_forcestart_single_arms_and_wakes():
 async def test_forcestart_group_number_arms_group():
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.config import TelegramConfig
     from racing_sync.state import State
     from racing_sync.telegram_bot import TelegramBot
@@ -175,7 +180,6 @@ async def test_forcestart_group_number_arms_group():
 
 
 def test_forcestart_command_registered():
-    import re
     from racing_sync.telegram_protocol import _CHAT_COMMANDS
 
     names = [c.name for c in _CHAT_COMMANDS]

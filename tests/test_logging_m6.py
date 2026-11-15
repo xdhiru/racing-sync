@@ -22,7 +22,6 @@ def _handler(tmp_path, monkeypatch):
 
 def test_handler_disables_after_persistent_oserror(tmp_path, monkeypatch):
     import logging.handlers as _lh
-    from racing_sync import logging_setup as _ls
 
     h = _handler(tmp_path, monkeypatch)
 
@@ -95,6 +94,7 @@ def _sink_cfg(tmp_path, **kw):
 
 def test_sink_plaintext_opt_in_logged_loudly(tmp_path):
     import logging as _logging
+
     from racing_sync import logging_setup as _ls
 
     seen: list[str] = []
@@ -179,6 +179,7 @@ async def test_post_log_event_returns_bool_and_logs_non_2xx(caplog):
 async def test_stats_carries_ring_tail():
     """The dead ring buffer lives: /stats shows recent warnings."""
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync import logging_setup as _ls
     from racing_sync.telegram_protocol import _cmd_stats
 

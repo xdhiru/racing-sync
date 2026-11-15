@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
-from typing import Any
 import urllib.parse
+from typing import Any
 
 import aiohttp
 
@@ -236,14 +236,14 @@ def _retry_after_delay(headers: Any, default: float) -> float:
     except (ValueError, TypeError, OverflowError):
         pass
     try:
-        from email.utils import parsedate_to_datetime as _p2d
         import datetime as _dt
+        from email.utils import parsedate_to_datetime as _p2d
 
         _dtv = _p2d(str(retry_after).strip())
         if _dtv is not None:
             if _dtv.tzinfo is None:
-                _dtv = _dtv.replace(tzinfo=_dt.timezone.utc)
-            _secs = (_dtv - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+                _dtv = _dtv.replace(tzinfo=_dt.UTC)
+            _secs = (_dtv - _dt.datetime.now(_dt.UTC)).total_seconds()
             return max(0.0, min(_RETRY_AFTER_MAX_S, _secs))
     except Exception:
         pass
@@ -522,7 +522,7 @@ class HTTPClientBase:
                     )
                     await asyncio.sleep(0.5 * (2**attempt))
                     continue
-                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+                except (TimeoutError, aiohttp.ClientError, OSError) as e:
                     log.warning(
                         "[%s] re-auth attempt %d/3 hit transient error (%s)",
                         self._label,
@@ -642,10 +642,10 @@ class HTTPClientBase:
                         **_timeout_kw,
                     )
                 except (
+                    TimeoutError,
                     aiohttp.ClientConnectionError,
                     aiohttp.ClientPayloadError,
                     aiohttp.ClientOSError,
-                    asyncio.TimeoutError,
                 ) as e:
                     if not idempotent or attempt == 2:
                         raise

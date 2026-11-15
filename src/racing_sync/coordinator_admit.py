@@ -135,7 +135,7 @@ class AdmitMixin:
                     # runs a direct phase, and a stale public schedule
                     # would misroute its wakeups.
                     ts.force_direct = 1
-                    ts.indexer_first_queried_at = dt.datetime.now(dt.timezone.utc)
+                    ts.indexer_first_queried_at = dt.datetime.now(dt.UTC)
                     ts.indexer_attempts = 0
                     ts.public_export_first_attempted_at = None
                     ts.public_export_attempts = 0
@@ -775,7 +775,7 @@ class AdmitMixin:
             if first is None:
                 return False
             max_age = dt.timedelta(seconds=self.cfg.cross_seed.prowlarr_max_age_seconds)
-            return (dt.datetime.now(dt.timezone.utc) - first) >= max_age
+            return (dt.datetime.now(dt.UTC) - first) >= max_age
         except Exception:
             return False
 
@@ -797,7 +797,7 @@ class AdmitMixin:
         if reason == "source export miss":
             self._park_for_public_retry(ts)
             return
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         if ts.indexer_first_queried_at is None:
             ts.indexer_first_queried_at = now
         ts.indexer_attempts += 1
@@ -897,7 +897,7 @@ class AdmitMixin:
             interval = max(60.0, float(self.cfg.cross_seed.public_export_retry_interval_seconds))
         except (TypeError, ValueError, AttributeError):
             interval = 1800.0
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         if ts.public_export_first_attempted_at is None:
             ts.public_export_first_attempted_at = now
         ts.public_export_attempts += 1
@@ -1099,13 +1099,11 @@ class AdmitMixin:
             if self._abandoned(ts):
                 return
             if ts.public_export_next_retry_at and not ts.indexer_next_retry_at:
-                ts.public_export_next_retry_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+                ts.public_export_next_retry_at = dt.datetime.now(dt.UTC) + dt.timedelta(
                     seconds=_public_interval
                 )
             else:
-                ts.indexer_next_retry_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
-                    seconds=_interval
-                )
+                ts.indexer_next_retry_at = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=_interval)
             self.store.upsert(ts)
         except Exception:
             pass
@@ -1244,11 +1242,11 @@ class AdmitMixin:
                         )
                     except (TypeError, ValueError, AttributeError):
                         _public_interval = 1800.0
-                    ts.public_export_next_retry_at = dt.datetime.now(
-                        dt.timezone.utc
-                    ) + dt.timedelta(seconds=_public_interval)
+                    ts.public_export_next_retry_at = dt.datetime.now(dt.UTC) + dt.timedelta(
+                        seconds=_public_interval
+                    )
                 else:
-                    ts.indexer_next_retry_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+                    ts.indexer_next_retry_at = dt.datetime.now(dt.UTC) + dt.timedelta(
                         seconds=_interval
                     )
                 self.store.upsert(ts)
@@ -1777,8 +1775,6 @@ class AdmitMixin:
         except Exception:
             return 0
         try:
-            from .task import handles_for as _hf
-
             _reg = getattr(self, "_task_handles", None)
             if not isinstance(_reg, dict):
                 return 0
@@ -2090,7 +2086,7 @@ class AdmitMixin:
                     # capture the loop variable late (next tick's event).
                     try:
                         await asyncio.wait_for(ev.wait(), 60.0)
-                    except (TimeoutError, asyncio.TimeoutError):
+                    except TimeoutError:
                         pass
                     try:
                         ev.clear()
@@ -2581,10 +2577,10 @@ class AdmitMixin:
             created = getattr(ts, "created_at", None)
             if created is None:
                 return False
-            now = dt.datetime.now(dt.timezone.utc)
+            now = dt.datetime.now(dt.UTC)
             try:
                 if created.tzinfo is None:
-                    created = created.replace(tzinfo=dt.timezone.utc)
+                    created = created.replace(tzinfo=dt.UTC)
             except Exception:
                 return False
             return (now - created).total_seconds() < grace
@@ -2598,10 +2594,10 @@ class AdmitMixin:
             created = getattr(ts, "created_at", None)
             if grace <= 0 or created is None:
                 return 0
-            now = dt.datetime.now(dt.timezone.utc)
+            now = dt.datetime.now(dt.UTC)
             try:
                 if created.tzinfo is None:
-                    created = created.replace(tzinfo=dt.timezone.utc)
+                    created = created.replace(tzinfo=dt.UTC)
             except Exception:
                 return 0
             return max(0, int(grace - (now - created).total_seconds()))

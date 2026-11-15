@@ -15,10 +15,10 @@ from pathlib import Path, PurePath
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import make_coordinator
 
 from racing_sync.clients.abstract import AddResult, Torrent
 from racing_sync.config import AppConfig  # noqa: F401  (spec reference)
-from conftest import make_coordinator
 from racing_sync.coordinator import Coordinator
 from racing_sync.recovery import reconcile
 from racing_sync.state import State, StateStore, TorrentState

@@ -37,7 +37,6 @@ from .coordinator_errors import (
 from .coordinator_paths import _safe_ssd_join, left_on_disk_many
 from .io_bounds import rpc
 from .rclone_ops import (
-    RcloneBusyError,
     _tree_key,
     move_local_to_remote,
     rclone_progress_map,
@@ -1779,7 +1778,7 @@ class MoveMixin:
                     try:
                         _mp = getattr(self, "_moving_parks", None)
                         _pn = (
-                            int((_mp.get((ts.source_infohash or "").lower(), 0) or 0))
+                            int(_mp.get((ts.source_infohash or "").lower(), 0) or 0)
                             if isinstance(_mp, dict)
                             else 0
                         )
@@ -2419,7 +2418,7 @@ class MoveMixin:
                     # capture the loop variable late (next tick's event).
                     try:
                         await asyncio.wait_for(_mev.wait(), 60.0)
-                    except (TimeoutError, asyncio.TimeoutError):
+                    except TimeoutError:
                         pass
                     try:
                         _mev.clear()

@@ -32,8 +32,10 @@ def _torrent(h, progress=0.5, state="downloading"):
 @pytest.mark.anyio
 async def test_listener_pass_records_verdicts_and_wakes():
     from unittest.mock import AsyncMock, MagicMock
+
     from conftest import make_coordinator
-    from racing_sync.task import TaskHandle, handles_for, register_handle
+
+    from racing_sync.task import TaskHandle, register_handle
 
     coord = make_coordinator(MagicMock())
     coord._stop = False
@@ -57,6 +59,7 @@ async def test_listener_pass_records_verdicts_and_wakes():
 @pytest.mark.anyio
 async def test_listener_pass_detects_error_and_stall():
     from unittest.mock import AsyncMock, MagicMock
+
     from conftest import make_coordinator
 
     coord = make_coordinator(MagicMock())
@@ -80,7 +83,9 @@ async def test_listener_pass_detects_error_and_stall():
 async def test_worker_completes_without_per_row_rpc():
     """Fresh snapshot + complete verdict: no get_torrent call."""
     from unittest.mock import AsyncMock, MagicMock
+
     from conftest import make_coordinator
+
     from racing_sync.state import State, TorrentState
 
     coord = make_coordinator(MagicMock())
@@ -106,7 +111,9 @@ async def test_worker_completes_without_per_row_rpc():
 async def test_worker_falls_back_to_direct_fetch_when_stale():
     """No listener snapshot: today's direct get_torrent path."""
     from unittest.mock import AsyncMock, MagicMock
+
     from conftest import make_coordinator
+
     from racing_sync.state import State, TorrentState
 
     coord = make_coordinator(MagicMock())
@@ -183,8 +190,8 @@ async def test_listener_loop_records_failure(monkeypatch):
 @pytest.mark.anyio
 async def test_listener_loop_idle_without_client():
     from unittest.mock import MagicMock
+
     from conftest import make_coordinator
-    import racing_sync.coordinator_live as _live_mod
 
     coord = make_coordinator(MagicMock())
     coord._stop = False

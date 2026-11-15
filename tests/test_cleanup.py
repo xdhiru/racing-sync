@@ -11,10 +11,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from conftest import make_coordinator
 
 from racing_sync.clients.abstract import Torrent, TorrentFile
 from racing_sync.config import CleanupConfig
-from conftest import make_coordinator
 from racing_sync.coordinator import Coordinator, cleanup_grace_seconds
 from racing_sync.state import State, StateStore, TorrentState
 
@@ -115,7 +115,7 @@ def _row(
     save_path: str = "",
     created_h_ago: float | None = None,
 ) -> TorrentState:
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     ts = TorrentState(
         source_infohash=h,
         source_name=FNAME,
@@ -639,7 +639,7 @@ async def test_verdicts_evaluate_concurrently(tmp_path: Path):
     import asyncio
 
     store = StateStore(tmp_path / "s.db")
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     members = []
     names = ("Show.A", "Show.B")
     try:

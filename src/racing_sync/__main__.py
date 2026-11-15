@@ -88,7 +88,7 @@ async def _runner(coord: Coordinator) -> int:
         # the coordinator stage budget table (see shutdown()).
         try:
             await asyncio.wait_for(coord.shutdown(), timeout=60.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.warning("shutdown timed out after 60s; exiting anyway")
 
 

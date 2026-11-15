@@ -100,7 +100,6 @@ def test_clear_dir_children_never_root_itself(tmp_path: Path):
 
 
 def test_daemon_lock_exclusive_and_released(tmp_path: Path):
-    from racing_sync.state import StateStore
 
     cfg = _cfg(state_db=str(tmp_path / "state.db"))
     lock_path = daemon_lock_path(cfg)

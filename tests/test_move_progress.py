@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
 from racing_sync.rclone_ops import RcloneProgress
 from racing_sync.state import State, TorrentState
 
@@ -67,7 +65,9 @@ def test_moving_card_plain_without_fresh_progress():
 def test_park_counter_resets_on_transferred_growth():
     """A pumping move restarts the stall clock instead of escalating."""
     from unittest.mock import MagicMock
+
     from conftest import make_coordinator
+
     from racing_sync import rclone_ops
 
     h = "a" * 40
@@ -90,7 +90,9 @@ def test_park_counter_resets_on_transferred_growth():
 
 def test_move_progress_map_joins_row_to_tree():
     from unittest.mock import MagicMock
+
     from conftest import make_coordinator
+
     from racing_sync import rclone_ops
 
     coord = make_coordinator(MagicMock())
@@ -106,6 +108,7 @@ def test_move_progress_map_joins_row_to_tree():
 
 def test_transition_clears_progress_join_maps():
     from unittest.mock import MagicMock
+
     from conftest import make_coordinator
 
     coord = make_coordinator(MagicMock())

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 from conftest import make_coordinator
 
@@ -212,8 +213,9 @@ def test_make_batches_empty_input():
 @pytest.mark.anyio
 async def test_moving_empty_episodes_raises_and_prevents_wipe(tmp_path):
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.classifier import Classification
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord.cfg.ssd.path = tmp_path
@@ -250,7 +252,8 @@ async def test_moving_empty_episodes_raises_and_prevents_wipe(tmp_path):
 @pytest.mark.anyio
 async def test_do_downloading_iterates_batches():
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import TorrentState, State
+
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -283,10 +286,9 @@ async def test_do_downloading_iterates_batches():
 @pytest.mark.anyio
 async def test_batch_interleaved_download_move_and_clean(tmp_path):
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
-    from racing_sync.batcher import Batch
-    from racing_sync.classifier import Episode
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -359,7 +361,8 @@ async def test_batch_interleaved_download_move_and_clean(tmp_path):
 @pytest.mark.anyio
 async def test_coordinator_gate_uses_min_total_and_batch_cap():
     from unittest.mock import MagicMock, patch
-    from racing_sync.state import TorrentState, State
+
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -395,8 +398,9 @@ async def test_coordinator_gate_uses_min_total_and_batch_cap():
 @pytest.mark.anyio
 async def test_wait_for_completion_resolves_when_expected_files_complete(tmp_path):
     from unittest.mock import AsyncMock, MagicMock
+
+    from racing_sync.clients.abstract import Torrent, TorrentFile
     from racing_sync.state import TorrentState
-    from racing_sync.clients.abstract import TorrentFile, Torrent
 
     coord = make_coordinator()
     coord._stop = False
@@ -433,8 +437,9 @@ async def test_wait_for_completion_resolves_when_expected_files_complete(tmp_pat
 async def test_wait_for_completion_waits_when_bytes_missing_on_disk(tmp_path):
     """Client-complete but short on SSD keeps polling (desynced piece map)."""
     from unittest.mock import AsyncMock, MagicMock
+
+    from racing_sync.clients.abstract import Torrent, TorrentFile
     from racing_sync.state import TorrentState
-    from racing_sync.clients.abstract import TorrentFile, Torrent
 
     coord = make_coordinator()
     coord._stop = False
@@ -598,9 +603,10 @@ def test_classify_tracker_message():
 async def test_wait_for_completion_raises_on_unregistered_tracker(tmp_path):
     """A tracker-deleted release aborts the wait instead of stalling."""
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import TorrentState
+
     from racing_sync.clients.abstract import Torrent
     from racing_sync.coordinator_errors import UnregisteredTorrentError
+    from racing_sync.state import TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -633,8 +639,9 @@ async def test_wait_for_completion_raises_on_unregistered_tracker(tmp_path):
 async def test_wait_for_completion_raises_on_missing_files(tmp_path):
     """SSD-wiped files fail fast instead of polling a hopeless torrent."""
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import TorrentState
+
     from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -691,9 +698,10 @@ def _downloading_pair(tmp_path):
 async def test_do_downloading_fails_unregistered_row(tmp_path):
     """Tracker-deleted DOWNLOADING row: FAILED + SSD freed + Telegram paged."""
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import State
+
     from racing_sync.clients.abstract import Torrent
     from racing_sync.coordinator_errors import TRACKER_UNREGISTERED_MARKER
+    from racing_sync.state import State
 
     coord, store, ts = _downloading_pair(tmp_path)
     coord.dest_client = MagicMock()
@@ -725,8 +733,9 @@ async def test_do_downloading_fails_unregistered_row(tmp_path):
 async def test_do_downloading_parks_then_fails_stalled_row(tmp_path):
     """No-progress windows park; exceeding max parks fails the row."""
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import State
+
     from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import State
 
     coord, store, ts = _downloading_pair(tmp_path)
     coord.cfg.general.download_stall_timeout_seconds = 0.05
@@ -760,8 +769,9 @@ async def test_do_downloading_parks_then_fails_stalled_row(tmp_path):
 async def test_do_downloading_progress_resets_stall_parks(tmp_path):
     """A trickling swarm never trips the terminal stall counter."""
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import State
+
     from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import State
 
     coord, store, ts = _downloading_pair(tmp_path)
     coord.cfg.general.download_stall_timeout_seconds = 0.05
@@ -802,8 +812,9 @@ async def test_tracker_death_cascades_to_same_tracker_siblings(tmp_path):
     removed with files.
     """
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import State
+
     from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import State
 
     coord, store, ts = _downloading_pair(tmp_path)
     ts.source_name = "Dead.Show.S01E01"
@@ -850,7 +861,7 @@ async def test_tracker_death_cascades_to_same_tracker_siblings(tmp_path):
     import datetime as dt
 
     _b1 = store.get("b1")
-    _b1.indexer_next_retry_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5)
+    _b1.indexer_next_retry_at = dt.datetime.now(dt.UTC) + dt.timedelta(hours=5)
     store.upsert(_b1)
 
     coord.dest_client = MagicMock()
@@ -886,7 +897,7 @@ async def test_tracker_death_cascades_to_same_tracker_siblings(tmp_path):
 
     _b1t = store.get("b1").indexer_next_retry_at
     assert _b1t is not None
-    assert (_b1t - dt.datetime.now(dt.timezone.utc)).total_seconds() < 60
+    assert (_b1t - dt.datetime.now(dt.UTC)).total_seconds() < 60
     # Corpse dest entries (leader + admitted QUEUED sibling) wiped with files.
     deleted = {c.args[0] for c in coord.dest_client.delete.await_args_list}
     assert {"dl1", "q1"} <= deleted
@@ -906,8 +917,9 @@ async def test_cascade_wakes_best_ranked_sibling_first(tmp_path):
     """
     import datetime as dt
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import State
+
     from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import State
 
     coord, store, ts = _downloading_pair(tmp_path)
     coord.cfg.prowlarr.enabled = False
@@ -927,7 +939,7 @@ async def test_cascade_wakes_best_ranked_sibling_first(tmp_path):
             state=State.WAITING_INDEXER,
             source_tracker=tracker,
             source_announce_url=tracker,
-            indexer_next_retry_at=(dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5)),
+            indexer_next_retry_at=(dt.datetime.now(dt.UTC) + dt.timedelta(hours=5)),
         )
         store.upsert(r)
 
@@ -956,10 +968,10 @@ async def test_cascade_wakes_best_ranked_sibling_first(tmp_path):
     assert store.get("dl1").state == State.FAILED
     _pubt = store.get("pub1").indexer_next_retry_at
     assert _pubt is not None
-    assert (_pubt - dt.datetime.now(dt.timezone.utc)).total_seconds() < 60
+    assert (_pubt - dt.datetime.now(dt.UTC)).total_seconds() < 60
     _privt = store.get("priv1").indexer_next_retry_at
     assert _privt is not None
-    assert (_privt - dt.datetime.now(dt.timezone.utc)).total_seconds() > 3600
+    assert (_privt - dt.datetime.now(dt.UTC)).total_seconds() > 3600
     for c in coord.dest_client.delete.await_args_list:
         assert c.kwargs.get("delete_files") is True
 
@@ -968,8 +980,9 @@ async def test_cascade_wakes_best_ranked_sibling_first(tmp_path):
 async def test_tracker_auth_death_does_not_cascade(tmp_path):
     """Revoked passkey fails only its own row (fixable account-side)."""
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import State, TorrentState
+
     from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import State, TorrentState
 
     coord, store, ts = _downloading_pair(tmp_path)
     ts.source_name = "Auth.Show.S01E01"
@@ -1024,8 +1037,9 @@ async def test_do_moving_sweep_moves_only_verified_complete_leftovers(tmp_path):
     for the folder wipe, and still finish RE_ADDING.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import StateStore, TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, StateStore, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -1113,8 +1127,9 @@ async def test_do_moving_hands_lagging_selected_file_to_downloading(tmp_path):
     resumes into DOWNLOADING (no flap, nothing wiped) until the files verify.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import StateStore, TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, StateStore, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -1202,10 +1217,10 @@ async def test_move_and_clean_batch_raises_when_files_remain(tmp_path):
     never reached the remote, silently losing data while the batch was
     marked complete.
     """
-    from racing_sync.coordinator import BatchMoveIncompleteError
-    from racing_sync.state import TorrentState, State
     from racing_sync.batcher import Batch
     from racing_sync.classifier import Episode
+    from racing_sync.coordinator import BatchMoveIncompleteError
+    from racing_sync.state import State, TorrentState
 
     ssd = tmp_path / "ssd"
     top = ssd / "Pack"
@@ -1237,9 +1252,9 @@ async def test_move_and_clean_batch_raises_when_files_remain(tmp_path):
 @pytest.mark.anyio
 async def test_move_and_clean_batch_passes_when_rclone_moved_files(tmp_path):
     """When rclone really moved the files (gone locally), no error."""
-    from racing_sync.state import TorrentState, State
     from racing_sync.batcher import Batch
     from racing_sync.classifier import Episode
+    from racing_sync.state import State, TorrentState
 
     ssd = tmp_path / "ssd"
     (ssd / "Pack").mkdir(parents=True)
@@ -1272,8 +1287,8 @@ async def test_move_and_clean_batch_passes_when_rclone_moved_files(tmp_path):
 @pytest.mark.anyio
 async def test_do_moving_sweep_stays_moving_when_leftovers_stuck(tmp_path):
     """Sweep 0-transfer must not proceed to the folder wipe (data loss)."""
-    from racing_sync.state import StateStore, TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, StateStore, TorrentState
 
     ssd = tmp_path / "ssd"
     top = ssd / "Big.Show.S01"
@@ -1330,8 +1345,9 @@ async def test_do_moving_sweep_stays_moving_when_leftovers_stuck(tmp_path):
 async def test_do_moving_skips_move_when_no_verified_leftovers(tmp_path):
     """All-remaining-are-partials: no rclone call at all, still RE_ADDING."""
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import StateStore, TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, StateStore, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -1415,8 +1431,8 @@ def test_make_batches_huge_season_many_small_nested_episodes():
 @pytest.mark.anyio
 async def test_do_moving_skips_move_when_already_batched(tmp_path):
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import TorrentState, State
-    from racing_sync.clients.abstract import TorrentFile
+
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -1456,8 +1472,9 @@ async def test_do_moving_skips_move_when_already_batched(tmp_path):
 @pytest.mark.anyio
 async def test_do_moving_purges_only_own_temp_files_when_no_season_folder(tmp_path):
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -1520,7 +1537,8 @@ async def test_do_moving_purges_only_own_temp_files_when_no_season_folder(tmp_pa
 @pytest.mark.anyio
 async def test_do_downloading_falls_back_to_full_move_when_batch_unresolvable():
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import TorrentState, State
+
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -1551,8 +1569,9 @@ async def test_do_downloading_falls_back_to_full_move_when_batch_unresolvable():
 @pytest.mark.anyio
 async def test_wait_for_completion_fails_fast_on_missing_expected_files():
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import Torrent, TorrentFile
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -1594,8 +1613,9 @@ async def test_wait_for_completion_fails_fast_on_missing_expected_files():
 @pytest.mark.anyio
 async def test_do_moving_moves_remaining_files_when_batches_incomplete(tmp_path):
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -1664,8 +1684,9 @@ async def test_do_moving_preserves_top_folder_on_remote(tmp_path):
     Moving verified per-file names from src_dir preserves it.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -1742,8 +1763,9 @@ async def test_do_moving_fallback_never_bare_moves_folder(tmp_path):
     from src_dir instead.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -1841,6 +1863,7 @@ async def test_frozen_batch_cap_stable_across_free_space_changes():
 @pytest.mark.anyio
 async def test_get_batches_respects_custom_episode_regex():
     import re
+
     from racing_sync.clients.abstract import TorrentFile
     from racing_sync.state import TorrentState
 
@@ -1890,7 +1913,8 @@ async def test_fuse_skipped_matches_size_only(tmp_path):
 async def test_wait_for_completion_empty_expected_returns_immediately():
     """A fully-skipped batch waits on nothing (and fetches nothing)."""
     from unittest.mock import AsyncMock
-    from racing_sync.state import TorrentState, State
+
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -1906,9 +1930,9 @@ async def test_wait_for_completion_empty_expected_returns_immediately():
 @pytest.mark.anyio
 async def test_move_and_clean_batch_honors_skip(tmp_path):
     """Already-remote batch members are neither moved nor verified."""
-    from racing_sync.state import TorrentState, State
     from racing_sync.batcher import Batch
     from racing_sync.classifier import Episode
+    from racing_sync.state import State, TorrentState
 
     ssd = tmp_path / "ssd"
     (ssd / "Pack").mkdir(parents=True)
@@ -1952,7 +1976,7 @@ async def test_move_and_clean_batch_honors_skip(tmp_path):
 async def test_setup_queued_download_skips_remote_batch0(tmp_path):
     """Batch-0 members already on the remote stay deselected from the start."""
     from racing_sync.clients.abstract import AddResult, TorrentFile
-    from racing_sync.state import TorrentState, State
+    from racing_sync.state import State, TorrentState
 
     fuse = tmp_path / "fuse"
     (fuse / "Pack").mkdir(parents=True)
@@ -2002,8 +2026,8 @@ async def test_setup_queued_download_skips_remote_batch0(tmp_path):
 @pytest.mark.anyio
 async def test_setup_queued_download_single_on_fuse_goes_moving(tmp_path):
     """A single file already archived needs no SSD download at all."""
-    from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, TorrentState
 
     fuse = tmp_path / "fuse"
     fuse.mkdir()
@@ -2042,8 +2066,8 @@ async def test_setup_queued_download_single_on_fuse_goes_moving(tmp_path):
 @pytest.mark.anyio
 async def test_do_moving_mixed_skips_remote_episode(tmp_path):
     """Mixed redo: the already-archived episode is not moved again."""
-    from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, TorrentState
 
     fuse_unsorted = tmp_path / "fuse-unsorted"
     fuse_unsorted.mkdir()
@@ -2105,9 +2129,9 @@ async def test_do_moving_mixed_skips_remote_episode(tmp_path):
 
 @pytest.mark.anyio
 async def test_move_and_clean_batch_all_skipped_skips_rclone(tmp_path):
-    from racing_sync.state import TorrentState, State
     from racing_sync.batcher import Batch
     from racing_sync.classifier import Episode
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     ssd = tmp_path / "ssd"
@@ -2135,8 +2159,8 @@ async def test_move_and_clean_batch_all_skipped_skips_rclone(tmp_path):
 @pytest.mark.anyio
 async def test_flip_to_next_batch_selects_in_place_without_readd(tmp_path):
     """In-place batch advance: no delete/add, entry hash unchanged."""
-    from racing_sync.state import TorrentState, State
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -2186,7 +2210,7 @@ async def test_flip_to_next_batch_selects_in_place_without_readd(tmp_path):
 
 @pytest.mark.anyio
 async def test_flip_to_next_batch_parks_when_file_list_missing():
-    from racing_sync.state import TorrentState, State
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord.cfg = MagicMock()
@@ -2219,7 +2243,8 @@ async def test_park_moving_records_reason_and_escalates(tmp_path, caplog):
     and escalate to ERROR after consecutive parks.
     """
     import logging
-    from racing_sync.state import StateStore, TorrentState, State
+
+    from racing_sync.state import State, StateStore, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -2256,9 +2281,9 @@ async def test_do_moving_branches_on_pinned_kind_despite_flip(tmp_path):
     layout: cursors untouched, leftovers swept, RE_ADDING reached.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
-    from pathlib import Path
-    from racing_sync.state import StateStore, TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, StateStore, TorrentState
 
     ssd = tmp_path / "ssd"
     top = ssd / "Pack"
@@ -2328,9 +2353,10 @@ async def test_do_moving_timeout_parks_instead_of_failing(tmp_path):
     never injected. Timeouts now park for retry with the reason recorded.
     """
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.rclone_ops import RcloneTimeoutError
-    from racing_sync.state import StateStore, TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.rclone_ops import RcloneTimeoutError
+    from racing_sync.state import State, StateStore, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -2382,10 +2408,11 @@ async def test_batch_loop_timeout_parks_downloading_without_retry_burn(tmp_path)
     """A batch-move timeout parks at once; same-tick retries would each
     block for the full timeout again."""
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.rclone_ops import RcloneTimeoutError
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.batcher import Batch
     from racing_sync.classifier import Episode
+    from racing_sync.rclone_ops import RcloneTimeoutError
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -2424,9 +2451,10 @@ async def test_batch_loop_timeout_parks_downloading_without_retry_burn(tmp_path)
 @pytest.mark.anyio
 async def test_process_torrent_timeout_safety_net_parks(tmp_path):
     """A timeout leaking from any future path still parks, never FAILs."""
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import AsyncMock
+
     from racing_sync.rclone_ops import RcloneTimeoutError
-    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.state import State, StateStore, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -2455,8 +2483,9 @@ async def test_queued_burst_respects_download_cap(tmp_path):
     parked rows proceed without re-adding once slots free.
     """
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import StateStore, TorrentState, State
-    from racing_sync.clients.abstract import TorrentFile, AddResult
+
+    from racing_sync.clients.abstract import AddResult, TorrentFile
+    from racing_sync.state import State, StateStore, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -2552,8 +2581,9 @@ async def test_queued_burst_respects_download_cap(tmp_path):
 async def test_queued_existing_entry_parks_when_full(tmp_path):
     """The resume path for already-added entries obeys the cap too."""
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.clients.abstract import Torrent
-    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.state import State, StateStore, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -2632,7 +2662,7 @@ async def test_queued_gate_ignores_non_int_configs():
 async def test_try_admit_excludes_self(tmp_path):
     """A DOWNLOADING row judging its own (adopted) admission must not
     count itself toward the cap."""
-    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.state import State, StateStore, TorrentState
 
     store = StateStore(tmp_path / "state.db")
     try:
@@ -2661,8 +2691,9 @@ async def test_setup_footprint_excludes_remote_skipped_bytes(tmp_path):
     footprint now subtracts fuse-present bytes.
     """
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -2721,8 +2752,9 @@ async def test_setup_footprint_zero_when_fully_remote(tmp_path):
     for a paused, fully-deselected entry that can never complete.
     """
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -2776,8 +2808,9 @@ async def test_setup_corpse_delete_drops_entry_only(tmp_path):
     the entry never downloaded, so bytes at those paths belong to
     someone else (shared save_path)."""
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -2834,9 +2867,10 @@ async def test_download_loop_tightens_reservation_per_batch(tmp_path):
     still downloading.
     """
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.batcher import Batch
     from racing_sync.classifier import Episode
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
@@ -2889,8 +2923,9 @@ async def test_do_moving_single_file_parks_when_client_progress_incomplete(tmp_p
     partial files to the remote. Now it parks in MOVING instead.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import StateStore, TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, StateStore, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -2950,10 +2985,9 @@ def _all_remote_season_coord(tmp_path, fuse_files: dict[str, int], cap_bytes: in
     `fuse_files`: torrent-relative name -> bytes present on the fuse mount.
     Returns (coord, ts, ssd).
     """
-    from pathlib import Path
     from racing_sync.clients.abstract import TorrentFile
     from racing_sync.config import ClassifierConfig
-    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.state import State, StateStore, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir(exist_ok=True)
@@ -3033,6 +3067,7 @@ async def test_setup_queued_all_remote_multi_batch_skips_to_readding(tmp_path):
 async def test_setup_queued_partial_remote_still_downloads(tmp_path):
     """One file missing on fuse: normal download path, first batch resumed."""
     from pathlib import Path
+
     from racing_sync.state import State
 
     files = {f"Example.Show.S01E{i:02d}.mkv": 1000 for i in range(1, 4)}
@@ -3050,7 +3085,7 @@ async def test_setup_queued_partial_remote_still_downloads(tmp_path):
 async def test_do_downloading_clears_live_on_batch_resolve_miss(tmp_path):
     """A batch-resolution park must not leave a stale live entry polled."""
     from racing_sync.coordinator import LiveItem
-    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.state import State, StateStore, TorrentState
 
     coord = make_coordinator()
     coord.store = StateStore(tmp_path / "state.db")
@@ -3101,7 +3136,7 @@ async def test_fuse_sweep_skips_client_lookup_without_pre_ssd_rows(tmp_path):
 async def test_do_moving_parks_on_transient_file_list_error(tmp_path):
     """One qB timeout at MOVING entry parks instead of failing the row."""
     from racing_sync.coordinator_errors import WebUIUnresponsiveError
-    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.state import State, StateStore, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -3135,8 +3170,9 @@ async def test_move_and_clean_batch_refuses_traversal_names(tmp_path):
     itself against any present/future caller passing raw names.)
     """
     from unittest.mock import MagicMock
+
     from racing_sync.coordinator_errors import BatchMoveIncompleteError
-    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.state import State, StateStore, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -3345,7 +3381,7 @@ async def test_queued_existing_entry_reapplies_batch_priorities_before_resume(tm
     existing-entry path resumed it blind past the SSD cap.
     """
     from racing_sync.clients.abstract import Torrent
-    from racing_sync.state import TorrentState, State
+    from racing_sync.state import State, TorrentState
 
     coord, _files = _batch_pack_coordinator(tmp_path)
     coord.dest_client.list_torrents = AsyncMock(
@@ -3386,7 +3422,7 @@ async def test_queued_existing_entry_reapplies_batch_priorities_before_resume(tm
 async def test_queued_existing_entry_parks_when_priorities_unverifiable(tmp_path):
     """Unlistable files park QUEUED without resume (never blind full-wanted)."""
     from racing_sync.clients.abstract import Torrent
-    from racing_sync.state import TorrentState, State
+    from racing_sync.state import State, TorrentState
 
     coord, _files = _batch_pack_coordinator(tmp_path)
     coord.dest_client.list_torrents = AsyncMock(
@@ -3424,7 +3460,7 @@ async def test_queued_existing_entry_parks_when_priorities_unverifiable(tmp_path
 @pytest.mark.anyio
 async def test_downloading_entry_reverifies_batch_priorities(tmp_path):
     """A drifted client selection is corrected to the current batch on entry."""
-    from racing_sync.state import TorrentState, State
+    from racing_sync.state import State, TorrentState
 
     coord, _files = _batch_pack_coordinator(tmp_path)
     coord.transition = MagicMock(side_effect=lambda t, s, **kw: setattr(t, "state", s))
@@ -3460,7 +3496,7 @@ async def test_frozen_cap_freeze_keeps_transition_valid(tmp_path):
     transition as a "concurrent writer" — the Gangs.of.London 16:33:26
     incident signature.
     """
-    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.state import State, StateStore, TorrentState
 
     store = StateStore(tmp_path / "state.db")
     try:
@@ -3483,7 +3519,7 @@ async def test_frozen_cap_freeze_keeps_transition_valid(tmp_path):
 async def test_scheduler_skips_downloading_spawn_at_cap(tmp_path):
     """A workerless DOWNLOADING row over the download cap is not spawned:
     spawning would only park inside _try_admit after burning a worker."""
-    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.state import State, StateStore, TorrentState
 
     store = StateStore(tmp_path / "state.db")
     try:
@@ -3510,7 +3546,7 @@ async def test_worker_skips_version_moved_row(tmp_path):
     write. Advisory-only parks (timers) don't trip the guard."""
     from unittest.mock import AsyncMock
 
-    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.state import State, StateStore, TorrentState
 
     store = StateStore(tmp_path / "state.db")
     try:
@@ -3566,7 +3602,7 @@ async def test_scheduler_budgets_phases_independently(tmp_path):
     slots; the move budget still holds."""
     import asyncio
 
-    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.state import State, StateStore, TorrentState
 
     store = StateStore(tmp_path / "state.db")
     try:
@@ -3607,8 +3643,9 @@ async def test_do_moving_multi_top_moves_files_individually(tmp_path):
     move per-file instead of raising FileNotFoundError."""
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, TorrentState
 
     (tmp_path / "TopA").mkdir()
     (tmp_path / "TopB").mkdir()
@@ -3673,9 +3710,10 @@ async def test_do_moving_oversized_sibling_survives_wipe(tmp_path):
     """Bigger-than-metadata bytes are foreign: they never block the wipe
     as _blockers, and the folder wipe spares them."""
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import TorrentState, State
+    from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, TorrentState
 
     ssd = tmp_path / "ssd"
     top = ssd / "Show.S01"
@@ -3745,8 +3783,9 @@ async def test_do_moving_flat_single_cleans_shells(tmp_path):
     from pathlib import Path
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()
@@ -3821,9 +3860,10 @@ async def test_do_moving_mixed_loop_keeps_cursor_in_memory(tmp_path):
     point at different episodes."""
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock, patch
-    from racing_sync.state import StateStore, TorrentState, State
-    from racing_sync.clients.abstract import TorrentFile
+
     from racing_sync.classifier import Episode
+    from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, StateStore, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()

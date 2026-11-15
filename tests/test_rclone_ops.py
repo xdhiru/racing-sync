@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
-import pytest
 from unittest.mock import MagicMock
 
+import pytest
+
+from racing_sync.config import AppConfig
 from racing_sync.rclone_ops import (
     RcloneError,
     build_move_cmd,
     redact_rclone_cmd,
     validate_safe_delete_path,
-    wipe_local_tree,
     wipe_local_files,
+    wipe_local_tree,
 )
-from racing_sync.config import AppConfig
 
 
 def test_validate_safe_delete_path_refuses_root(tmp_path: Path):
@@ -166,6 +166,7 @@ def test_build_move_cmd_rejects_include_plus_files_from(tmp_path: Path):
 @pytest.mark.anyio
 async def test_move_local_to_remote_files_from_writes_and_cleans_list(tmp_path: Path):
     from unittest.mock import AsyncMock, patch
+
     from racing_sync import rclone_ops
     from racing_sync.rclone_ops import move_local_to_remote
 
@@ -208,6 +209,7 @@ async def test_move_local_to_remote_files_from_writes_and_cleans_list(tmp_path: 
 @pytest.mark.anyio
 async def test_move_local_to_remote_rejects_empty_files_from(tmp_path: Path):
     import pytest as _pytest
+
     from racing_sync.rclone_ops import move_local_to_remote
 
     src = tmp_path / "src"
@@ -223,7 +225,8 @@ async def test_move_local_to_remote_rejects_empty_files_from(tmp_path: Path):
 @pytest.mark.anyio
 async def test_run_rclone_timeout_redacts_command(monkeypatch):
     from unittest.mock import AsyncMock
-    from racing_sync.rclone_ops import run_rclone, RcloneError
+
+    from racing_sync.rclone_ops import RcloneError, run_rclone
 
     cfg = MagicMock(spec=AppConfig)
     cfg.rclone = MagicMock()
@@ -249,7 +252,8 @@ async def test_run_rclone_timeout_redacts_command(monkeypatch):
 async def test_run_rclone_timeout_raises_timeout_error(monkeypatch):
     """A hung remote must raise RcloneTimeoutError (park), not plain RcloneError."""
     from unittest.mock import AsyncMock
-    from racing_sync.rclone_ops import run_rclone, RcloneError, RcloneTimeoutError
+
+    from racing_sync.rclone_ops import RcloneError, RcloneTimeoutError, run_rclone
 
     cfg = MagicMock(spec=AppConfig)
     cfg.rclone = MagicMock()
@@ -274,6 +278,7 @@ async def test_run_rclone_cancel_terminates_child(monkeypatch):
     """Shutdown mid-move must kill the child, not orphan an uploader."""
     import asyncio as _asyncio
     from unittest.mock import AsyncMock
+
     from racing_sync.rclone_ops import run_rclone
 
     cfg = MagicMock(spec=AppConfig)
@@ -296,6 +301,7 @@ async def test_run_rclone_cancel_terminates_child(monkeypatch):
 async def test_run_rclone_kills_child_on_communicate_error(monkeypatch):
     """Non-timeout communicate() failures must not orphan a running move."""
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.rclone_ops import run_rclone
 
     cfg = MagicMock(spec=AppConfig)
@@ -317,7 +323,7 @@ async def test_run_rclone_kills_child_on_communicate_error(monkeypatch):
 
 
 def test_reject_hijack_flags_normalizes_variants():
-    from racing_sync.rclone_ops import _reject_hijack_flags, RcloneError
+    from racing_sync.rclone_ops import RcloneError, _reject_hijack_flags
 
     for bad in (
         "--config",
@@ -367,7 +373,7 @@ def _orphan_proc():
     proc.communicate.side_effect = TimeoutError()
     proc.terminate = MagicMock()
     proc.kill = MagicMock()
-    proc.wait = AsyncMock(side_effect=asyncio.TimeoutError())
+    proc.wait = AsyncMock(side_effect=TimeoutError())
     proc.returncode = None
     proc.pid = 4242
     return proc
@@ -385,6 +391,7 @@ async def test_unreaped_orphan_blocks_duplicate_tree(monkeypatch, tmp_path):
     """Timeout + unkillable child keeps the tree guard: retry parks, never races."""
     import asyncio as _asyncio
     from unittest.mock import AsyncMock
+
     from racing_sync import rclone_ops
     from racing_sync.rclone_ops import (
         RcloneBusyError,
@@ -416,6 +423,7 @@ async def test_reaped_orphan_releases_tree(monkeypatch, tmp_path):
     """Once the orphan exits, the next move for the tree proceeds."""
     import asyncio as _asyncio
     from unittest.mock import AsyncMock
+
     from racing_sync import rclone_ops
     from racing_sync.rclone_ops import RcloneTimeoutError, run_rclone
 
@@ -444,6 +452,7 @@ async def test_reaped_orphan_releases_tree(monkeypatch, tmp_path):
 async def test_success_drops_tree_guard(monkeypatch, tmp_path):
     import asyncio as _asyncio
     from unittest.mock import AsyncMock
+
     from racing_sync import rclone_ops
     from racing_sync.rclone_ops import run_rclone
 
@@ -502,6 +511,7 @@ def test_build_move_cmd_rejects_empty_remote(tmp_path: Path):
 async def test_empty_source_with_remote_bytes_skips_move(tmp_path: Path):
     """Already-moved bytes: verified skip, no move spawned."""
     from unittest.mock import AsyncMock, patch
+
     from racing_sync import rclone_ops
     from racing_sync.rclone_ops import move_local_to_remote
 
@@ -528,8 +538,10 @@ async def test_empty_source_with_remote_bytes_skips_move(tmp_path: Path):
 @pytest.mark.anyio
 async def test_empty_source_without_remote_bytes_fails_loud(tmp_path: Path):
     """Source gone + remote empty: RcloneError, never silent success."""
-    import pytest as _pytest
     from unittest.mock import AsyncMock, patch
+
+    import pytest as _pytest
+
     from racing_sync import rclone_ops
     from racing_sync.rclone_ops import RcloneError, move_local_to_remote
 
@@ -555,6 +567,7 @@ async def test_empty_source_without_remote_bytes_fails_loud(tmp_path: Path):
 async def test_move_cmd_carries_error_on_no_transfer(tmp_path: Path):
     """Non-empty moves fail loudly when nothing transfers."""
     from unittest.mock import AsyncMock, patch
+
     from racing_sync import rclone_ops
     from racing_sync.rclone_ops import move_local_to_remote
 
@@ -600,7 +613,7 @@ async def test_wipe_reports_partial_failures(tmp_path: Path):
 
 
 def test_parse_rclone_size_and_eta():
-    from racing_sync.rclone_ops import _parse_rclone_size, _parse_rclone_eta
+    from racing_sync.rclone_ops import _parse_rclone_eta, _parse_rclone_size
 
     assert _parse_rclone_size("80.5M") == int(80.5 * 1024**2)
     assert _parse_rclone_size("1.2G") == int(1.2 * 1024**3)
@@ -655,6 +668,7 @@ async def test_progress_run_pumps_stats_and_evicts(monkeypatch, tmp_path):
     """A progress move ingests stats lines, keeps stderr, evicts after."""
     import asyncio as _asyncio
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync import rclone_ops
     from racing_sync.rclone_ops import (
         _tree_key,
@@ -716,6 +730,7 @@ async def test_single_file_source_counts_as_having_files(tmp_path: Path):
 async def test_single_file_move_reaches_spawn(tmp_path: Path):
     """End to end: an existing single file proceeds to the move call."""
     from unittest.mock import AsyncMock, patch
+
     from racing_sync import rclone_ops
     from racing_sync.rclone_ops import RcloneResult, move_local_to_remote
 

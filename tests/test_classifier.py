@@ -5,9 +5,9 @@ from pathlib import Path
 import pytest
 from conftest import make_coordinator
 
-from racing_sync.config import AppConfig
 from racing_sync.classifier import classify
 from racing_sync.clients.abstract import TorrentFile
+from racing_sync.config import AppConfig
 
 
 def _cfg() -> AppConfig:
@@ -128,7 +128,8 @@ async def test_do_moving_missing_content_goes_readding(tmp_path: Path):
     per-file handling finds nothing to move and the row goes RE_ADDING
     (recovery re-fetches) instead of FAILED."""
     from unittest.mock import AsyncMock
-    from racing_sync.state import TorrentState, State
+
+    from racing_sync.state import State, TorrentState
 
     cfg = _cfg()
     # The row's save_path is a configured SSD root (as in production), so the
@@ -160,8 +161,9 @@ async def test_do_moving_missing_content_goes_readding(tmp_path: Path):
 @pytest.mark.anyio
 async def test_do_queued_deletes_torrent_when_oversize_movie_skipped(tmp_path: Path):
     from unittest.mock import AsyncMock
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import AddResult
+    from racing_sync.state import State, TorrentState
 
     cfg = _cfg()
     cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
@@ -201,7 +203,8 @@ async def test_do_queued_deletes_torrent_when_oversize_movie_skipped(tmp_path: P
 @pytest.mark.anyio
 async def test_do_moving_moves_mixed_content_in_batches(tmp_path: Path):
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import TorrentState, State
+
+    from racing_sync.state import State, TorrentState
 
     cfg = _cfg()
     cfg.dest.save_path = str(tmp_path)
@@ -385,8 +388,9 @@ def test_season_folder_for_ignores_file_order(tmp_path):
 
 
 def test_parse_episode_without_digits_returns_none():
-    from racing_sync.classifier import parse_episode
     import re
+
+    from racing_sync.classifier import parse_episode
 
     # Custom regex matching words without digits
     regex = re.compile(r"SPECIAL")
@@ -471,6 +475,7 @@ def test_classifier_episode_delimiter_support():
 
 def test_oversize_single_file_flags_only_the_big_member():
     from unittest.mock import MagicMock
+
     from racing_sync.classifier import oversize_single_file
     from racing_sync.clients.abstract import TorrentFile
 
@@ -488,6 +493,7 @@ def test_oversize_single_file_flags_only_the_big_member():
 
 def test_oversize_single_file_ignores_non_numeric_cap():
     from unittest.mock import MagicMock
+
     from racing_sync.classifier import oversize_single_file
     from racing_sync.clients.abstract import TorrentFile
 

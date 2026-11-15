@@ -1058,7 +1058,7 @@ async def test_chat_message_fetch_flags_and_wakes_row(tmp_path: Path):
         assert row.force_direct == 1
         assert row.state == State.WAITING_INDEXER
         assert row.indexer_next_retry_at is not None
-        assert row.indexer_next_retry_at <= dt.datetime.now(dt.timezone.utc)
+        assert row.indexer_next_retry_at <= dt.datetime.now(dt.UTC)
         bot._bot.send_message.assert_awaited_once()
         sent_text = bot._bot.send_message.call_args[0][1]
         assert sent_text.startswith("Fetching original for")
@@ -1078,7 +1078,7 @@ async def test_chat_message_fetch_opens_fresh_direct_window(tmp_path: Path):
             source_name="Old",
             state=State.WAITING_INDEXER,
             indexer_attempts=40,
-            indexer_first_queried_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=23),
+            indexer_first_queried_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=23),
         )
     )
     bot = _bot()
@@ -1090,7 +1090,7 @@ async def test_chat_message_fetch_opens_fresh_direct_window(tmp_path: Path):
         assert row.force_direct == 1
         assert row.state == State.WAITING_INDEXER
         assert row.indexer_attempts == 0
-        fresh = (dt.datetime.now(dt.timezone.utc) - row.indexer_first_queried_at).total_seconds()
+        fresh = (dt.datetime.now(dt.UTC) - row.indexer_first_queried_at).total_seconds()
         assert fresh < 60
     finally:
         store.close()
@@ -1253,7 +1253,6 @@ def test_status_scope_parses_and_resolves():
     """cancel/forget/keep status shapes round-trip; unknown keys are stale."""
     from racing_sync.telegram_protocol import (
         CancelScope,
-        ScopeGone,
         _parse_action_data,
     )
 
@@ -1275,6 +1274,7 @@ def test_status_scope_parses_and_resolves():
 @pytest.mark.anyio
 async def test_status_scope_resolve_filters_lane():
     from unittest.mock import MagicMock
+
     from racing_sync.state import State, TorrentState
     from racing_sync.telegram_protocol import CancelScope, ScopeGone
 
@@ -1323,7 +1323,6 @@ async def test_cancel_status_menu_empty_replies():
 @pytest.mark.anyio
 async def test_status_keep_flow_executes_with_stagger():
     """keep:status:dl:1:yes forgets the lane with 2s between rows."""
-    import asyncio
     from unittest.mock import patch
 
     bot = _bot()

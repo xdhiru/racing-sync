@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+
 import pytest
+
 from racing_sync.config import AppConfig
 
 
@@ -207,9 +209,11 @@ def test_secret_str_masking_in_repr_and_string_equality():
 
 
 from unittest.mock import AsyncMock, MagicMock
+
 from conftest import make_coordinator
-from racing_sync.state import TorrentState, State
+
 from racing_sync.clients.abstract import AddResult, TorrentFile
+from racing_sync.state import State, TorrentState
 
 
 @pytest.mark.anyio
@@ -224,8 +228,8 @@ async def test_coordinator_wait_disk_stops_on_stop():
 
 @pytest.mark.anyio
 async def test_coordinator_do_queued_extracts_infohash_from_blob():
-    from racing_sync.watchdir import _bencode
     from racing_sync.config import ClassifierConfig
+    from racing_sync.watchdir import _bencode
 
     coord = make_coordinator()
     coord.cfg.dest.save_path = "/downloads"
@@ -274,9 +278,10 @@ async def test_coordinator_do_queued_extracts_infohash_from_blob():
 
 @pytest.mark.anyio
 async def test_late_cross_seeds_handles_none_detail_and_expires_failures(tmp_path: Path):
+    import datetime as dt
+
     from racing_sync.clients.abstract import Torrent
     from racing_sync.watchdir import _bencode
-    import datetime as dt
 
     fuse_dir = tmp_path / "fuse"
     fuse_dir.mkdir()
@@ -332,9 +337,7 @@ async def test_late_cross_seeds_handles_none_detail_and_expires_failures(tmp_pat
     assert "late1" in coord._failed_late_cross_seeds
 
     # Simulate 31 minutes passing
-    coord._failed_late_cross_seeds["late1"] = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
-        minutes=31
-    )
+    coord._failed_late_cross_seeds["late1"] = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=31)
 
     # Now add_torrent succeeds with detail=None
     coord.dest_client.add_torrent = AsyncMock(
@@ -496,14 +499,15 @@ async def test_process_torrent_still_fails_live_row(tmp_path: Path):
 
 def test_config_strict_validations():
     from pydantic import ValidationError
+
     from racing_sync.config import (
-        NginxAuthConfig,
+        APIConfig,
         DelugeSFTPConfig,
         DownloadIndexerConfig,
+        LoggingSinkConfig,
+        NginxAuthConfig,
         ProwlarrConfig,
         TelegramConfig,
-        LoggingSinkConfig,
-        APIConfig,
     )
 
     # 1. Nginx auth mode defaults to "off"
@@ -583,6 +587,7 @@ def test_sched_priority_sorts_readding_before_new():
 
 def test_rclone_flag_validator_rejects_dash_variants():
     from pydantic import ValidationError
+
     from racing_sync.config import RcloneConfig
 
     base = {
@@ -642,6 +647,7 @@ def test_warn_unknown_keys_descends_into_indexer_lists(caplog):
 
 def test_api_token_example_placeholder_rejected():
     from pydantic import ValidationError
+
     from racing_sync.config import APIConfig
 
     with pytest.raises(ValidationError, match="placeholder"):
@@ -651,7 +657,6 @@ def test_api_token_example_placeholder_rejected():
 
 @pytest.mark.anyio
 async def test_pick_ssd_source_public_and_private_paths():
-    from unittest.mock import patch
     from racing_sync.clients.abstract import Torrent
     from racing_sync.coordinator import pick_ssd_source_for_racing
 
@@ -889,7 +894,7 @@ async def test_do_queued_remote_first_skips_slot_park(tmp_path):
     from unittest.mock import AsyncMock, MagicMock
 
     from conftest import make_coordinator
-    from racing_sync.clients.abstract import TorrentFile
+
     from racing_sync.state import State, StateStore, TorrentState
     from racing_sync.watchdir import _bencode
 
@@ -1026,6 +1031,7 @@ def test_config_strategy_rejects():
     """Cross-section strategy contradictions fail at load, not silently."""
     import pytest
     from pydantic import ValidationError
+
     from racing_sync.config import (
         CrossSeedConfig,
         ProwlarrConfig,
@@ -1060,6 +1066,7 @@ def test_remote_dotdot_rejected_and_overlap_resolves():
     """`..` escapes refuse; resolved paths catch symlink-style overlap."""
     import pytest
     from pydantic import ValidationError
+
     from racing_sync.config import RemoteConfig
 
     with pytest.raises(ValidationError, match=r"\.\."):
@@ -1072,9 +1079,11 @@ def test_remote_dotdot_rejected_and_overlap_resolves():
 
 def test_storage_overlap_resolves_dotdot(tmp_path: Path):
     """An SSD path resolving into a fuse mount refuses at load."""
-    import pytest
     import tomllib
+
+    import pytest
     from pydantic import ValidationError
+
     from racing_sync.config import AppConfig
 
     fuse = tmp_path / "fuse"
@@ -1094,6 +1103,7 @@ def test_episode_regex_redos_probe():
     """Catastrophic-backtracking patterns refuse at load; defaults pass."""
     import pytest
     from pydantic import ValidationError
+
     from racing_sync.config import ClassifierConfig
 
     assert ClassifierConfig().episode_regex.startswith("(?i)")

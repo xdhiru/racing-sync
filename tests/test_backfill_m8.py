@@ -10,6 +10,7 @@ import pytest
 def test_gc_tombstones_ttl(tmp_path: Path):
     """Only tombstones older than the TTL are hard-deleted."""
     import datetime as dt
+
     from racing_sync.state import State, StateStore, TorrentState
 
     store = StateStore(tmp_path / "s.db")
@@ -18,7 +19,7 @@ def test_gc_tombstones_ttl(tmp_path: Path):
         store.upsert(TorrentState(source_infohash="b" * 40, source_name="New", state=State.FAILED))
         store.delete("a" * 40)
         store.delete("b" * 40)
-        old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=49)).isoformat()
+        old = (dt.datetime.now(dt.UTC) - dt.timedelta(hours=49)).isoformat()
         store._conn.execute(
             "UPDATE torrent_state SET deleted_at = ? WHERE source_infohash = ?",
             (old, "a" * 40),
@@ -37,15 +38,15 @@ def test_null_deleted_at_normalized_on_open(tmp_path: Path):
     """Legacy NULL deleted_at rows become visible live rows, not ghosts."""
     import datetime as dt
     import sqlite3
+
     from racing_sync.state import (
         SCHEMA_TABLES,
         State,
         StateStore,
-        TorrentState,
     )
 
     db = tmp_path / "legacy.db"
-    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    now = dt.datetime.now(dt.UTC).isoformat()
     legacy_schema = SCHEMA_TABLES.replace(
         "deleted_at               TEXT NOT NULL DEFAULT ''", "deleted_at               TEXT"
     )
@@ -88,9 +89,10 @@ def test_find_by_name_empty_string(tmp_path: Path):
 async def test_forget_hard_deletes_pairs_without_zombies(tmp_path: Path):
     """forget(hard) on an owner hard-deletes waiters too: re-drop works."""
     from test_forget import FakeDest, _cfg, _watch_pair_store
-    from racing_sync.state import State, TorrentState
+
     from racing_sync.clients.abstract import TorrentFile
     from racing_sync.forget import forget_torrent
+    from racing_sync.state import State, TorrentState
 
     ssd = tmp_path / "ssd"
     ssd.mkdir()

@@ -21,7 +21,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Deque
+from typing import Any
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -171,13 +171,13 @@ class RingBufferHandler(logging.Handler):
 
     def __init__(self, capacity: int = 500):
         super().__init__()
-        self._buf: Deque[LogEvent] = deque(maxlen=capacity)
+        self._buf: deque[LogEvent] = deque(maxlen=capacity)
         self._lock = threading.Lock()
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             ev = LogEvent(
-                ts=dt.datetime.fromtimestamp(record.created, tz=dt.timezone.utc),
+                ts=dt.datetime.fromtimestamp(record.created, tz=dt.UTC),
                 level=record.levelno,
                 logger=record.name,
                 message=sanitize_log_text(record.getMessage())[:2000],
@@ -202,7 +202,7 @@ class RingBufferHandler(logging.Handler):
 class JsonlFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
-            "ts": dt.datetime.fromtimestamp(record.created, tz=dt.timezone.utc).isoformat(),
+            "ts": dt.datetime.fromtimestamp(record.created, tz=dt.UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": sanitize_log_text(record.getMessage()),
@@ -356,7 +356,7 @@ class HTTPSinkHandler(logging.handlers.QueueHandler):
             except queue.Empty:
                 continue
             payload = {
-                "ts": dt.datetime.fromtimestamp(record.created, tz=dt.timezone.utc).isoformat(),
+                "ts": dt.datetime.fromtimestamp(record.created, tz=dt.UTC).isoformat(),
                 "level": record.levelname,
                 "logger": record.name,
                 "message": sanitize_log_text(record.getMessage()),

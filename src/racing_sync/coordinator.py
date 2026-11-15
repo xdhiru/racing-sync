@@ -26,21 +26,20 @@ import stat  # noqa: F401  (runtime use via coordinator_move lazy lookup + compa
 import time
 from dataclasses import dataclass, field
 
-from .classifier import classify  # noqa: F401  (runtime use via coordinator_admit lazy lookup + compat)
+from .classifier import (
+    classify,  # noqa: F401  (runtime use via coordinator_admit lazy lookup + compat)
+)
 from .clients.abstract import Torrent, TorrentClient
 from .clients.deluge import DelugeClient
 from .clients.http_base import AuthError
 from .clients.qbittorrent import QBittorrentClient
 from .config import AppConfig
+from .content_keys import same_content as _same_content_key, same_release_name as _same_release_name
 from .coordinator_admit import AdmitMixin
 from .coordinator_cleanup import CleanupMixin
 from .coordinator_content import (
     _TELEGRAM_NOTIFY_STATES as _TELEGRAM_NOTIFY_STATES,  # noqa: F401  (re-exported API)
-)
-from .coordinator_content import (
     PUBLIC_TRACKER_HOSTS as PUBLIC_TRACKER_HOSTS,  # noqa: F401  (re-exported API)
-)
-from .coordinator_content import (
     SourceDecision,
     _looks_public,
     _matches_release,
@@ -50,19 +49,19 @@ from .coordinator_content import (
     cleanup_grace_seconds,
     normalize_content_name,
 )
+from .coordinator_download import DownloadMixin, LiveItem
 from .coordinator_errors import (
     _NOT_VISIBLE_DETAIL,
+    TRACKER_UNREGISTERED_MARKER,
     AbandonedError,
     BatchMoveIncompleteError,
     DownloadStalledError,
     RcloneTransientError,
-    TRACKER_UNREGISTERED_MARKER,
     TorrentCheckingError,
     UnregisteredTorrentError,
     WebUIUnresponsiveError,
     is_fatal_os_error,  # noqa: F401  (runtime use via coordinator_move lazy lookup + compat)
 )
-from .coordinator_download import DownloadMixin, LiveItem
 from .coordinator_fuse import FuseMixin
 from .coordinator_inject import InjectMixin, _group_is_ignored
 from .coordinator_live import LiveStatusMixin
@@ -71,8 +70,6 @@ from .coordinator_picker import pick_ssd_source_for_racing
 from .coordinator_readd import ReaddMixin
 from .coordinator_ssd import SSDLedgerMixin
 from .coordinator_watchdog import WatchdogMixin
-from .content_keys import same_content as _same_content_key
-from .content_keys import same_release_name as _same_release_name
 from .io_bounds import offload, rpc
 from .prowlarr import ProwlarrClient
 from .rclone_ops import (
@@ -163,7 +160,7 @@ def _sched_priority(ts) -> tuple[int, dt.datetime]:
     (or unparsable) updated_at sort LAST, never first — broken rows must
     not permanently prioritize themselves.
     """
-    _FAR = dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+    _FAR = dt.datetime.max.replace(tzinfo=dt.UTC)
     try:
         prio = _SCHED_STATE_PRIORITY.get(ts.state, 1)
     except Exception:
@@ -178,7 +175,7 @@ def _sched_priority(ts) -> tuple[int, dt.datetime]:
             updated = dt.datetime.fromisoformat(updated)
         if isinstance(updated, dt.datetime):
             if updated.tzinfo is None:
-                updated = updated.replace(tzinfo=dt.timezone.utc)
+                updated = updated.replace(tzinfo=dt.UTC)
             return (prio, updated)
     except Exception:
         pass
@@ -287,7 +284,7 @@ async def _start_with_backoff(
     raise last
 
 
-def _log_api_task_done(task: "asyncio.Task") -> None:
+def _log_api_task_done(task: asyncio.Task) -> None:
     """Done-callback for the API serve task: a dead API must be loud.
 
     Without this, `OSError: port in use` (or a missing uvicorn) kills the
@@ -786,7 +783,7 @@ class Coordinator(
             # _process_torrent AuthError arm — rows must never fail over
             # an ops incident.
             raise
-        except (TimeoutError, asyncio.TimeoutError, OSError, ValueError, RuntimeError) as e:
+        except (TimeoutError, OSError, ValueError, RuntimeError) as e:
             # Wedged/unreachable VPS1 poll: serve the stale cache when
             # there is one, else an empty view — a source outage must
             # degrade the poll, never fail rows or abort the tick from
@@ -884,7 +881,7 @@ class Coordinator(
                     asyncio.gather(*self._tasks, return_exceptions=True),
                     timeout=15.0,
                 )
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
         for t in list(getattr(self, "_tg_tasks", set())):
             t.cancel()
@@ -894,13 +891,13 @@ class Coordinator(
                     asyncio.gather(*list(self._tg_tasks), return_exceptions=True),
                     timeout=10.0,
                 )
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
         tg = getattr(self, "_tg", None)
         if tg is not None:
             try:
                 await asyncio.wait_for(tg.stop(), timeout=10.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
             except Exception:  # noqa: BLE001
                 pass
@@ -916,7 +913,7 @@ class Coordinator(
                 pass
             try:
                 await asyncio.wait_for(api_task, timeout=10.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            except (TimeoutError, asyncio.CancelledError, Exception):
                 try:
                     if not api_task.done():
                         api_task.cancel()
@@ -929,7 +926,7 @@ class Coordinator(
         if self.prowlarr is not None:
             try:
                 await asyncio.wait_for(self.prowlarr.close(), timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
             except Exception:  # noqa: BLE001
                 pass
@@ -941,13 +938,13 @@ class Coordinator(
         if self._coordinator_started:
             try:
                 await asyncio.wait_for(self.source_client.close(), timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
             except Exception:  # noqa: BLE001
                 pass
             try:
                 await asyncio.wait_for(self.dest_client.close(), timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
             except Exception:  # noqa: BLE001
                 pass
@@ -1128,9 +1125,9 @@ class Coordinator(
                             asyncio.gather(*_lt, return_exceptions=True),
                             timeout=10.0,
                         )
-                except (asyncio.TimeoutError, asyncio.CancelledError):
+                except (TimeoutError, asyncio.CancelledError):
                     pass
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
             except Exception:
                 pass
@@ -1423,7 +1420,7 @@ class Coordinator(
                     asyncio.gather(*_live_tasks, return_exceptions=True),
                     timeout=_STOP_WORKERS_TIMEOUT_S,
                 )
-            except (TimeoutError, asyncio.TimeoutError):
+            except TimeoutError:
                 log.warning(
                     "stop_workers_for %s timed out; %d worker(s) linger", h[:10], len(_live_tasks)
                 )
@@ -1914,7 +1911,7 @@ class Coordinator(
 
             # Skip RE_ADDING rows whose backoff timer has not yet elapsed
             if ts.state == State.RE_ADDING and ts.readd_next_retry_at:
-                now_utc = dt.datetime.now(dt.timezone.utc)
+                now_utc = dt.datetime.now(dt.UTC)
                 if ts.readd_next_retry_at > now_utc:
                     continue
 
@@ -3019,7 +3016,7 @@ class Coordinator(
                 getattr(self, "cfg", None),
                 "source get_torrent",
             )
-        except (TimeoutError, asyncio.TimeoutError) as e:
+        except TimeoutError as e:
             # Hung VPS1 lookup degrades to a quiet retry next tick —
             # never a terminal FAILED over one wedged poll.
             log.warning(

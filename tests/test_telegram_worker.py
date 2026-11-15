@@ -13,7 +13,7 @@ from racing_sync.telegram_bot import TelegramBot, _FloodBackoff
 @pytest.mark.anyio
 async def test_worker_loop_backs_off_once_and_requeues_remainder():
     """A flooded first card sleeps once at loop level; both cards send."""
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import MagicMock
 
     bot = object.__new__(TelegramBot)
     bot._cfg = TelegramConfig(enabled=True, bot_token="fake", chat_id="123", outbound_rate=30.0)
@@ -48,6 +48,7 @@ async def test_worker_loop_backs_off_once_and_requeues_remainder():
 async def test_start_fails_fast_on_401():
     """A rejected token raises before any loop starts (no retry hiding)."""
     from unittest.mock import AsyncMock, MagicMock, patch
+
     from telegram.error import TelegramError
 
     bot = object.__new__(TelegramBot)

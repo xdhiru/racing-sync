@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -80,7 +79,7 @@ async def test_calm_and_roomy_skips_scan(tmp_path: Path):
 
     coord, store = _gate_coord(tmp_path)
     try:
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         store.upsert(
             TorrentState(
                 source_infohash="a" * 40,
@@ -109,7 +108,7 @@ async def test_pressure_still_runs(tmp_path: Path):
 
     coord, store = _gate_coord(tmp_path)
     try:
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         store.upsert(
             TorrentState(
                 source_infohash="a" * 40,
@@ -137,7 +136,7 @@ async def test_unknown_free_space_runs_fail_closed(tmp_path: Path):
 
     coord, store = _gate_coord(tmp_path)
     try:
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         store.upsert(
             TorrentState(
                 source_infohash="a" * 40,

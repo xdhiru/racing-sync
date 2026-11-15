@@ -865,7 +865,7 @@ class DownloadMixin:
             pass
         try:
             await asyncio.wait_for(_ev.wait(), _to)
-        except (TimeoutError, asyncio.TimeoutError):
+        except TimeoutError:
             pass
         except asyncio.CancelledError:
             raise

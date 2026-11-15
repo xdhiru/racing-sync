@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 from conftest import make_coordinator
-from unittest.mock import AsyncMock, MagicMock
-from pathlib import Path
 
-from racing_sync.config import AppConfig
+from racing_sync.clients.abstract import Torrent
 from racing_sync.recovery import reconcile
 from racing_sync.state import State, StateStore, TorrentState
-from racing_sync.clients.abstract import Torrent
 
 
 @pytest.mark.anyio
@@ -212,8 +212,9 @@ async def test_fix_orphan_readd_stays_paused_for_priority_setup(tmp_path: Path):
 @pytest.mark.anyio
 async def test_do_re_add_fails_if_add_torrent_rejected():
     from unittest.mock import AsyncMock
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import AddResult
+    from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord.cfg.fuse_reinject_delay_seconds = 0
@@ -243,8 +244,9 @@ async def test_do_re_add_fails_if_add_torrent_rejected():
 @pytest.mark.anyio
 async def test_check_and_inject_late_cross_seeds(tmp_path: Path):
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import AddResult, Torrent
+    from racing_sync.state import State, TorrentState
     from racing_sync.watchdir import _bencode
 
     fuse_dir = tmp_path / "fuse"
@@ -323,8 +325,9 @@ async def test_check_and_inject_late_cross_seeds(tmp_path: Path):
 @pytest.mark.anyio
 async def test_check_and_inject_late_cross_seeds_recognizes_existing_torrent(tmp_path: Path):
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import TorrentState, State
+
     from racing_sync.clients.abstract import AddResult, Torrent
+    from racing_sync.state import State, TorrentState
     from racing_sync.watchdir import _bencode
 
     fuse_dir = tmp_path / "fuse"
@@ -404,9 +407,10 @@ async def test_check_and_inject_late_cross_seeds_recognizes_existing_torrent(tmp
 @pytest.mark.anyio
 async def test_reconcile_links_same_name_torrents_to_single_state(tmp_path: Path):
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import StateStore, State
-    from racing_sync.recovery import reconcile
+
     from racing_sync.clients.abstract import Torrent
+    from racing_sync.recovery import reconcile
+    from racing_sync.state import State, StateStore
 
     cfg = MagicMock()
     cfg.rclone.fuse.mount = tmp_path / "fuse"
@@ -451,9 +455,10 @@ async def test_reconcile_links_same_name_torrents_to_single_state(tmp_path: Path
 @pytest.mark.anyio
 async def test_reconcile_recognizes_dest_and_cross_seed_infohash(tmp_path: Path):
     from unittest.mock import AsyncMock, MagicMock
-    from racing_sync.state import StateStore, State, TorrentState
-    from racing_sync.recovery import reconcile
+
     from racing_sync.clients.abstract import Torrent
+    from racing_sync.recovery import reconcile
+    from racing_sync.state import State, StateStore, TorrentState
 
     cfg = MagicMock()
     cfg.rclone.fuse.mount = tmp_path / "fuse"
@@ -950,6 +955,7 @@ async def test_auto_retry_skips_tracker_deleted_rows(tmp_path: Path):
     ordinary failure is revived to NEW.
     """
     from unittest.mock import patch
+
     from racing_sync.coordinator_errors import TRACKER_UNREGISTERED_MARKER
 
     db_path = tmp_path / "state.db"
@@ -1101,6 +1107,7 @@ async def test_do_downloading_fresh_row_prioritizes_batch_zero(tmp_path: Path):
     downloading a stale batch selection while the loop waits on batch 0.
     """
     from unittest.mock import AsyncMock, MagicMock
+
     from racing_sync.clients.abstract import TorrentFile
 
     ssd = tmp_path / "ssd"
@@ -1334,7 +1341,7 @@ def test_revive_clears_stale_dest_pointer(tmp_path):
     the live entry itself instead of attaching to a stranger's."""
     from conftest import make_coordinator
 
-    from racing_sync.state import StateStore, TorrentState, State
+    from racing_sync.state import State, StateStore, TorrentState
 
     store = StateStore(tmp_path / "state.db")
     try:
@@ -1357,7 +1364,6 @@ def test_revive_clears_stale_dest_pointer(tmp_path):
 
 def _fuse_coord(tmp_path):
     """Real-store coordinator with SSD + fuse mounts for late-seed tests."""
-    from racing_sync.watchdir import _bencode
 
     ssd = tmp_path / "ssd"
     fuse = tmp_path / "fuse"
@@ -1482,6 +1488,7 @@ async def test_demote_ssd_probe_runs_off_loop(tmp_path: Path):
     """The SSD content probe must not stall the event loop on slow disks."""
     import threading
     from unittest.mock import patch
+
     from racing_sync.clients.abstract import TorrentFile
 
     coord, store, ssd, _fuse, _fuse_u = _fuse_coord(tmp_path)
@@ -1587,6 +1594,7 @@ async def test_fuse_outage_short_defers_never_30m_backoff(tmp_path: Path):
     """
     import shutil
     import time
+
     from racing_sync import coordinator_paths as _cp
     from racing_sync.clients.abstract import AddResult
     from racing_sync.watchdir import _bencode

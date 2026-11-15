@@ -18,9 +18,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable
-
-import aiohttp
+from typing import Any
 
 from .config import WatchDirConfig
 from .prowlarr import ProwlarrClient, TorrentHit

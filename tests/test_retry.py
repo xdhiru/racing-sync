@@ -10,6 +10,7 @@ import pytest
 @pytest.mark.anyio
 async def test_retry_then_success_and_delays():
     from unittest.mock import AsyncMock, patch
+
     from racing_sync.retry import retryable
 
     fn = AsyncMock(side_effect=[TimeoutError("b1"), OSError("b2"), "ok"])
@@ -22,6 +23,7 @@ async def test_retry_then_success_and_delays():
 @pytest.mark.anyio
 async def test_exhaustion_reraises_last():
     from unittest.mock import AsyncMock, patch
+
     from racing_sync.retry import retryable
 
     fn = AsyncMock(
@@ -36,6 +38,7 @@ async def test_exhaustion_reraises_last():
 @pytest.mark.anyio
 async def test_deterministic_errors_fail_fast():
     from unittest.mock import AsyncMock, patch
+
     from racing_sync.retry import retryable
 
     for exc in (ValueError("bad"), RuntimeError("nope"), LookupError("gone")):
@@ -50,6 +53,7 @@ async def test_deterministic_errors_fail_fast():
 @pytest.mark.anyio
 async def test_cancel_is_never_swallowed():
     from unittest.mock import AsyncMock, patch
+
     from racing_sync.retry import retryable
 
     fn = AsyncMock(side_effect=asyncio.CancelledError())
@@ -63,6 +67,7 @@ async def test_cancel_is_never_swallowed():
 @pytest.mark.anyio
 async def test_single_attempt_and_custom_delays():
     from unittest.mock import AsyncMock, patch
+
     from racing_sync.retry import retryable
 
     fn = AsyncMock(side_effect=TimeoutError("x"))
@@ -87,8 +92,9 @@ def test_is_retryable_read_error_shapes():
     assert is_retryable_read_error(ValueError("v")) is False
     assert is_retryable_read_error(RuntimeError("r")) is False
     try:
-        import aiohttp
         from unittest.mock import MagicMock
+
+        import aiohttp
 
         r404 = aiohttp.ClientResponseError(request_info=MagicMock(), history=(), status=404)
         r400 = aiohttp.ClientResponseError(request_info=MagicMock(), history=(), status=400)

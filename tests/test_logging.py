@@ -162,7 +162,7 @@ def test_sanitize_redacts_announce_path_passkey():
 
 
 def test_sanitizing_formatter_scrubs_secrets_in_text_logs():
-    from racing_sync.logging_setup import SanitizingFormatter, LOG_FORMAT, DATE_FORMAT
+    from racing_sync.logging_setup import DATE_FORMAT, LOG_FORMAT, SanitizingFormatter
 
     formatter = SanitizingFormatter(LOG_FORMAT, DATE_FORMAT)
     record = logging.LogRecord(

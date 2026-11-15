@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
 import re
-from typing import Any, Iterable
-from urllib.parse import urlencode
+from collections.abc import Iterable
+from typing import Any
 
 import aiohttp
 
 from ..config import DestConfig, SourceConfig
 from .abstract import AddResult, Torrent, TorrentClient, TorrentFile
-from .http_base import HTTPClientBase, AuthError
+from .http_base import AuthError, HTTPClientBase
 
 log = logging.getLogger(__name__)
 

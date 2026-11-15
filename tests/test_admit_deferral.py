@@ -7,7 +7,9 @@ import pytest
 
 def _coord_with_store(tmp_path, **kw):
     from unittest.mock import AsyncMock, MagicMock
+
     from conftest import make_coordinator
+
     from racing_sync.state import StateStore
 
     coord = make_coordinator(StateStore(tmp_path / "s.db"))
@@ -32,6 +34,7 @@ def _mkrow(h, name, state, size=1000):
 async def test_do_new_defers_to_inflight_sibling(tmp_path):
     """NEW row with a QUEUED same-content copy parks — no second search."""
     from unittest.mock import AsyncMock
+
     from racing_sync.clients.abstract import Torrent
     from racing_sync.state import State
 
@@ -64,6 +67,7 @@ async def test_do_new_defers_to_inflight_sibling(tmp_path):
 @pytest.mark.anyio
 async def test_do_new_picks_without_sibling(tmp_path):
     from unittest.mock import AsyncMock
+
     from racing_sync.clients.abstract import Torrent
     from racing_sync.state import State
 
@@ -95,6 +99,7 @@ async def test_do_new_picks_without_sibling(tmp_path):
 async def test_waiting_indexer_fast_path_skips_prowlarr(tmp_path):
     """Recorded + live owner: no VPS1 fetch, no scan, timer pushed."""
     from unittest.mock import AsyncMock
+
     from racing_sync.state import State
 
     coord = _coord_with_store(tmp_path)
@@ -115,6 +120,7 @@ async def test_waiting_indexer_fast_path_skips_prowlarr(tmp_path):
 @pytest.mark.anyio
 async def test_waiting_indexer_owner_gone_clears_and_picks(tmp_path):
     from unittest.mock import AsyncMock
+
     from racing_sync.clients.abstract import Torrent
     from racing_sync.state import State
 
@@ -146,9 +152,9 @@ async def test_waiting_indexer_owner_gone_clears_and_picks(tmp_path):
 
 
 def test_deferral_record_helpers():
-    from types import SimpleNamespace
-    from conftest import make_coordinator
     from unittest.mock import MagicMock
+
+    from conftest import make_coordinator
 
     coord = make_coordinator(MagicMock())
     assert coord._deferred_owner_of("w" * 40) is None

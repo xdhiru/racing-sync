@@ -7,11 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
+from conftest import make_coordinator
 
 from racing_sync.clients.abstract import AddResult, Torrent
 from racing_sync.clients.http_base import HTTPClientBase, HTTPClientConfig
 from racing_sync.coordinator import WebUIUnresponsiveError
-from conftest import make_coordinator
 from racing_sync.state import State, StateStore, TorrentState
 from racing_sync.telegram_bot import render_active, render_detail
 
@@ -41,6 +41,7 @@ async def test_fetch_retries_sftp_timeout_once():
 async def test_fetch_deluge_export_failure_stays_debug(caplog):
     """Deluge has no torrent-file RPC; the failed fallback must not warn."""
     import logging
+
     from racing_sync.clients.deluge import DelugeClient
 
     coord = make_coordinator()
@@ -116,7 +117,7 @@ def test_state_store_readd_fields_roundtrip(tmp_path: Path):
     db_path = tmp_path / "test.db"
     store = StateStore(db_path)
 
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     next_retry = now + dt.timedelta(seconds=1800)
 
     ts = TorrentState(
@@ -142,6 +143,7 @@ def test_state_store_readd_fields_roundtrip(tmp_path: Path):
 
 def test_state_store_readd_fields_round_trip(tmp_path: Path):
     import sqlite3
+
     from racing_sync.state import SCHEMA_TABLES
 
     db_path = tmp_path / "state.db"
@@ -182,7 +184,7 @@ async def test_reinject_retry_parks_then_succeeds_next_tick():
 
     # Attempt 1: TimeoutError; Attempt 2: Success
     coord.dest_client.add_torrent.side_effect = [
-        asyncio.TimeoutError("WebUI connection timed out"),
+        TimeoutError("WebUI connection timed out"),
         AddResult(hash=None, accepted=True, detail="Ok."),
     ]
     # Registration is visible at the fuse target (verified first-add path).
@@ -238,8 +240,8 @@ async def test_reinject_cycle_fails_triggers_30m_backoff():
 
     # Both attempts fail with TimeoutError
     coord.dest_client.add_torrent.side_effect = [
-        asyncio.TimeoutError("WebUI timeout 1"),
-        asyncio.TimeoutError("WebUI timeout 2"),
+        TimeoutError("WebUI timeout 1"),
+        TimeoutError("WebUI timeout 2"),
     ]
 
     ts = TorrentState(
@@ -253,7 +255,7 @@ async def test_reinject_cycle_fails_triggers_30m_backoff():
     def mock_transition(t, s, error=""):
         nonlocal transition_called
         transition_called = True
-        setattr(t, "state", s)
+        t.state = s
 
     coord.transition = mock_transition
 
@@ -275,7 +277,7 @@ async def test_reinject_cycle_fails_triggers_30m_backoff():
     assert ts.state == State.RE_ADDING
     assert ts.readd_attempts == 2
     assert ts.readd_next_retry_at is not None
-    now_utc = dt.datetime.now(dt.timezone.utc)
+    now_utc = dt.datetime.now(dt.UTC)
     remaining_sec = (ts.readd_next_retry_at - now_utc).total_seconds()
     assert 1700 <= remaining_sec <= 1810
     coord._schedule_telegram_update.assert_called_once_with(ts)
@@ -288,7 +290,7 @@ async def test_reinject_24h_hard_deadline_fails():
     coord.cfg.fuse_reinject_max_age_seconds = 86400
     coord.dest_client = AsyncMock()
 
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     ts = TorrentState(
         source_infohash="deadline_hash",
         source_name="Old.Dead.Torrent",
@@ -301,7 +303,7 @@ async def test_reinject_24h_hard_deadline_fails():
     def mock_transition(t, s, error=""):
         nonlocal failed_error
         failed_error = error
-        setattr(t, "state", s)
+        t.state = s
 
     coord.transition = mock_transition
 
@@ -322,7 +324,7 @@ async def test_reinject_tick_skips_backed_off_torrent():
     coord.store.list_indexer_ready.return_value = []
     coord._check_and_inject_late_cross_seeds = AsyncMock()
 
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
 
     # Torrent 1: In RE_ADDING with backoff timer in the future (skip!)
     ts_backed_off = TorrentState(
@@ -363,7 +365,7 @@ async def test_reinject_tick_skips_backed_off_torrent():
 
 
 def test_telegram_messages_show_reinject_retry_countdown():
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     ts = TorrentState(
         source_infohash="tg_hash",
         source_name="Cyberpunk.Edgerunners.S01",
@@ -399,7 +401,7 @@ async def test_http_base_request_retries_on_timeout_and_connector_error():
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            raise asyncio.TimeoutError("Simulated timeout")
+            raise TimeoutError("Simulated timeout")
         if call_count == 2:
             raise aiohttp.ClientConnectorError(
                 connection_key=MagicMock(), os_error=OSError("Simulated connector error")
@@ -796,6 +798,7 @@ async def test_do_queued_fuse_fast_track_persists_classification(tmp_path: Path)
 async def test_do_queued_retries_files_listing_after_add(tmp_path: Path):
     """A 404 right after add (loaded client registration lag) must not FAILED."""
     from unittest.mock import MagicMock, patch
+
     from racing_sync.clients.abstract import AddResult, TorrentFile
 
     coord = make_coordinator()
@@ -844,6 +847,7 @@ async def test_do_queued_persistent_files_failure_stays_queued(tmp_path: Path):
     existing-torrent check instead of re-adding a duplicate.
     """
     from unittest.mock import patch
+
     from racing_sync.clients.abstract import AddResult
 
     coord = make_coordinator()
@@ -1300,6 +1304,7 @@ async def test_ensure_fuse_entry_retries_delayed_visibility_after_replace(tmp_pa
     """A re-add accepted by qB but invisible to immediate lookups (10k-torrent
     registration lag) must be confirmed via retry, not reported as rejected."""
     from unittest.mock import patch
+
     from racing_sync.watchdir import _bencoded_info_hash
 
     fuse_dir = tmp_path / "fuse"
@@ -1362,6 +1367,7 @@ async def test_ensure_fuse_entry_refuses_when_bytes_vanished_post_add(tmp_path: 
     verification and injection.
     """
     from unittest.mock import patch
+
     from racing_sync.watchdir import _bencoded_info_hash
 
     fuse_dir = tmp_path / "fuse"
@@ -1407,6 +1413,7 @@ async def test_ensure_fuse_entry_unconfirmed_replace_is_retryable(tmp_path: Path
     absurd message "fuse re-add rejected: Ok."
     """
     from unittest.mock import patch
+
     from racing_sync.coordinator import _NOT_VISIBLE_DETAIL
     from racing_sync.watchdir import _bencoded_info_hash
 
@@ -1671,7 +1678,6 @@ def _original_row(fuse_dir, h="o" * 40):
 
 
 def _original_coord(tmp_path, blob):
-    from pathlib import Path as _Path
 
     coord = make_coordinator()
     coord._stop = False
@@ -1751,6 +1757,7 @@ def test_blob_kind_and_announce_cached_per_blob(tmp_path: Path):
     """Repeat blob decodes collapse to one classify + one info-hash parse."""
     import os
     from unittest.mock import patch
+
     from racing_sync.watchdir import _bencode
 
     blob = _bencode(

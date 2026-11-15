@@ -242,7 +242,7 @@ class FuseMixin:
                 fm = getattr(self, "_failed_late_cross_seeds", None)
                 if not isinstance(fm, dict) or not fm:
                     return False
-                _now = dt.datetime.now(dt.timezone.utc)
+                _now = dt.datetime.now(dt.UTC)
                 for k, v in fm.items():
                     if k in rel:
                         try:
@@ -256,7 +256,7 @@ class FuseMixin:
 
         if not hasattr(self, "_failed_late_cross_seeds"):
             self._failed_late_cross_seeds = {}
-        now_utc = dt.datetime.now(dt.timezone.utc)
+        now_utc = dt.datetime.now(dt.UTC)
 
         # Repair a racing (source) injection that RE_ADDING step 1 silently
         # skipped (SFTP timeout bursts + no Deluge export fallback): the
@@ -426,7 +426,7 @@ class FuseMixin:
         try:
             d = getattr(self, "_failed_late_cross_seeds", None)
             if isinstance(d, dict) and h_low:
-                d[h_low] = dt.datetime.now(dt.timezone.utc)
+                d[h_low] = dt.datetime.now(dt.UTC)
         except Exception:
             pass
 
@@ -522,7 +522,7 @@ class FuseMixin:
             if not isinstance(fm, dict) or len(fm) <= 2000:
                 return
             try:
-                cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=30)
+                cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=30)
             except Exception:
                 return
             for k in list(fm.keys()):
@@ -899,7 +899,7 @@ class FuseMixin:
             _fa = _failed.get(h) if isinstance(_failed, dict) else None
             if _fa is not None:
                 try:
-                    if (dt.datetime.now(dt.timezone.utc) - _fa).total_seconds() < 1800:
+                    if (dt.datetime.now(dt.UTC) - _fa).total_seconds() < 1800:
                         return
                 except Exception:
                     pass

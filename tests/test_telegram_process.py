@@ -575,6 +575,7 @@ async def test_start_publishes_command_menu(tmp_path):
     """Bot startup registers the `/` menu; publish is best-effort."""
     import asyncio
     from unittest.mock import MagicMock, patch
+
     from racing_sync.telegram_bot import TelegramBot
 
     store = StateStore(tmp_path / "state.db")
@@ -630,6 +631,7 @@ async def test_start_survives_menu_publish_failure(tmp_path):
     """No setMyCommands support (or API down): startup still succeeds."""
     import asyncio
     from unittest.mock import MagicMock, patch
+
     from racing_sync.telegram_bot import TelegramBot
 
     store = StateStore(tmp_path / "state.db")
@@ -667,7 +669,6 @@ async def test_start_survives_menu_publish_failure(tmp_path):
 @pytest.mark.anyio
 async def test_process_old_ptb_file_shape(tmp_path):
     """PTB versions with required download_to_memory(out) still ingest."""
-    import io as _io
 
     store = StateStore(tmp_path / "state.db")
     try:

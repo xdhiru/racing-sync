@@ -16,7 +16,6 @@ import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-
 from pathlib import Path
 
 from .clients.abstract import TorrentFile

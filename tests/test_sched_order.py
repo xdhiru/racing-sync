@@ -16,14 +16,14 @@ def _row(h, when):
 
 
 def test_sched_priority_none_sorts_last():
-    dated = _row("a" * 40, dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc))
+    dated = _row("a" * 40, dt.datetime(2020, 1, 1, tzinfo=dt.UTC))
     undated = _row("b" * 40, None)
     assert _sched_priority(dated) < _sched_priority(undated)
 
 
 def test_sched_priority_mixed_naive_aware_chronological():
     naive_later = _row("a" * 40, dt.datetime(2020, 1, 2))  # assumed UTC
-    aware_earlier = _row("b" * 40, dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc))
+    aware_earlier = _row("b" * 40, dt.datetime(2020, 1, 1, tzinfo=dt.UTC))
     assert _sched_priority(aware_earlier) < _sched_priority(naive_later)
     broken = _row("c" * 40, "not-a-date")
     assert _sched_priority(naive_later) < _sched_priority(broken)

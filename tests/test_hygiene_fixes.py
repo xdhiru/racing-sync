@@ -41,7 +41,7 @@ def test_done_rapid_demotions_count_flaps(tmp_path):
         assert ts.readd_cycles == 2
         # ...while a demotion long after DONE starts a new incident count.
         store.transition(ts, State.DONE)
-        ts.completed_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)
+        ts.completed_at = dt.datetime.now(dt.UTC) - dt.timedelta(days=3)
         store.upsert(ts)
         store.transition(ts, State.RE_ADDING)
         assert ts.readd_cycles == 0
@@ -69,7 +69,7 @@ async def test_do_re_add_trips_on_flap_limit():
     ts = _ts(
         state=State.RE_ADDING,
         readd_cycles=5,
-        readd_first_attempted_at=dt.datetime.now(dt.timezone.utc),
+        readd_first_attempted_at=dt.datetime.now(dt.UTC),
     )
     await coord._do_re_add(ts)
     assert transitioned.get("dst") == State.FAILED
@@ -134,9 +134,7 @@ async def test_late_seed_healthy_check_memoized(tmp_path):
     await coord._check_and_inject_late_cross_seeds(ts, group)
     assert "late1" in coord._failed_late_cross_seeds
 
-    coord._failed_late_cross_seeds["late1"] = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
-        minutes=31
-    )
+    coord._failed_late_cross_seeds["late1"] = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=31)
     coord.dest_client.add_torrent = AsyncMock(
         return_value=AddResult(hash="late1", accepted=True, detail=None)
     )
@@ -173,7 +171,7 @@ def test_cleanup_idle_rejects_skewed_added_on():
     coord = make_coordinator()
     cfg = MagicMock()
     cfg.idle_confirm_minutes = 45.0
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     ts = TorrentState(source_infohash="h", source_name="S", state=State.DONE)
 
     def _member(added):

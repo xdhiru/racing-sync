@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import logging
 import time
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import MagicMock
-
-from racing_sync.config import APIConfig, AppConfig
-
 from test_api import _api_coord
+
 from racing_sync.api import build_app
+from racing_sync.config import APIConfig, AppConfig
 
 
 def _clear_throttle():
@@ -41,6 +40,7 @@ def test_subnet_spray_trips_throttle_together():
 def test_throttle_eviction_is_lru_not_oldest_half():
     """Over-cap pressure drops stale entries; live bans survive."""
     import time as _time
+
     from racing_sync import api as api_mod
 
     _clear_throttle()
@@ -137,6 +137,7 @@ def test_count_by_state_counts_all_states(tmp_path):
 @pytest.mark.anyio
 async def test_tick_records_health_attrs():
     from unittest.mock import AsyncMock
+
     from conftest import make_coordinator
 
     coord = make_coordinator()
@@ -195,9 +196,10 @@ def test_forget_keeps_per_pair_attribution_and_identity(caplog):
 
 
 def test_ts_to_dict_carries_admission_flags():
+    from unittest.mock import MagicMock
+
     from racing_sync.api import _ts_to_dict
     from racing_sync.state import State, TorrentState
-    from unittest.mock import MagicMock
 
     ts = TorrentState(
         source_infohash="a" * 40,

@@ -125,6 +125,7 @@ async def test_drift_net_skips_fail_streak_hashes():
 async def test_hopeless_prev_id_remembered_for_sweep():
     """An abandoned prev id feeds the orphan sweep (rights may return)."""
     from unittest.mock import AsyncMock
+
     from telegram.error import TelegramError
 
     bot = _bot()
@@ -143,6 +144,7 @@ async def test_hopeless_prev_id_remembered_for_sweep():
 @pytest.mark.anyio
 async def test_pin_failure_persists_without_mutating_cfg():
     from unittest.mock import AsyncMock
+
     from telegram.error import TelegramError
 
     bot = _bot()

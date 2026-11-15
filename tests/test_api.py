@@ -1,6 +1,7 @@
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 from conftest import make_coordinator
-from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 
 from racing_sync.api import build_app
@@ -161,6 +162,7 @@ def test_scan_watch_endpoint():
 @pytest.mark.anyio
 async def test_coordinator_scan_watch_ingests_and_returns_items(anyio_backend):
     from unittest.mock import AsyncMock
+
     from racing_sync.watchdir import WatchItem
 
     coord = make_coordinator()
