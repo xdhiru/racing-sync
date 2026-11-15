@@ -1014,7 +1014,7 @@ def test_chat_command_registry_covers_all_verbs():
     from racing_sync.telegram_bot import _CHAT_COMMANDS
 
     names = [c.name for c in _CHAT_COMMANDS]
-    assert len(names) == len(set(names)) == 23
+    assert len(names) == len(set(names)) == 24
     for c in _CHAT_COMMANDS:
         assert callable(c.pattern.match)
         assert callable(c.handle)
@@ -1041,6 +1041,7 @@ def test_chat_command_registry_covers_all_verbs():
         "/pause_intake": ["pause_intake"],
         "/resume_intake": ["resume_intake"],
         "/tick": ["tick"],
+        "/active": ["active"],
         "/stats": ["stats"],
         "/find evil show": ["find"],
         "/find": ["find"],
@@ -1053,7 +1054,7 @@ def test_chat_command_registry_covers_all_verbs():
     for text in ("/hello", "/cancel_xyz", "/cancel_", "/act_", "/now_",
                  "/forcestart_", "/forcestartx", "/cancel_statusx",
                  "/cancel_match_foo", "/cancel_stalledx", "/pause_intakex",
-                 "/statsx", "/findx", "/files_", ""):
+                 "/statsx", "/findx", "/files_", "", "/activex"):
         assert [c.name for c in _CHAT_COMMANDS
                 if c.pattern.match(text)] == [], text
 

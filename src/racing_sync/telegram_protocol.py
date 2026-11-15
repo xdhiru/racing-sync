@@ -121,6 +121,11 @@ RESUME_INTAKE_RE = re.compile(r"^/resume_intake(?:@[\w_]+)?\s*$")
 #: Optional `@bot` suffix; no argument.
 TICK_RE = re.compile(r"^/tick(?:@[\w_]+)?\s*$")
 
+#: `/active` — send a fresh Active Tasks card now (recovery when the
+#: long-lived card went missing or was deleted from the chat).
+#: Optional `@bot` suffix; no argument.
+ACTIVE_RE = re.compile(r"^/active(?:@[\w_]+)?\s*$")
+
 #: `/stats` — pipeline snapshot (rows by state, workers, intake, ignored,
 #: storage footer). Optional `@bot` suffix; no argument.
 STATS_RE = re.compile(r"^/stats(?:@[\w_]+)?\s*$")
@@ -293,6 +298,33 @@ async def _cmd_tick(bot, match, message):
     try:
         bot._last_active_cache = None
         await bot._refresh_active_message()
+    except Exception:
+        pass
+
+
+async def _cmd_active(bot, match, message):
+    """`/active`: send a fresh Active Tasks card now."""
+    render = getattr(bot, "render_active_now", None)
+    if not callable(render):
+        try:
+            await bot._reply("Action failed: bot not attached.",
+                             reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        ok = await render()
+    except Exception as e:  # noqa: BLE001
+        try:
+            await bot._reply(_action_error_text(e), reply_to=message)
+        except Exception:
+            pass
+        return
+    try:
+        await bot._reply(
+            "Active tasks sent." if ok
+            else "Active tasks could not be sent — see the log.",
+            reply_to=message)
     except Exception:
         pass
 
@@ -487,6 +519,7 @@ _CHAT_COMMANDS: tuple = (
     _ChatCommand("pause_intake", PAUSE_INTAKE_RE, _cmd_pause_intake),
     _ChatCommand("resume_intake", RESUME_INTAKE_RE, _cmd_resume_intake),
     _ChatCommand("tick", TICK_RE, _cmd_tick),
+    _ChatCommand("active", ACTIVE_RE, _cmd_active),
     _ChatCommand("stats", STATS_RE, _cmd_stats),
     _ChatCommand("find", FIND_RE, _cmd_find),
     _ChatCommand("files", FILES_RE, _cmd_group("files")),
@@ -1032,6 +1065,9 @@ def _bot_command_menu() -> list:
         ), BotCommand(
             "tick",
             "Run one pipeline tick now (poll + schedule + janitor)",
+        ), BotCommand(
+            "active",
+            "Send a fresh Active Tasks card now",
         ), BotCommand(
             "stats",
             "Pipeline snapshot — rows by state, workers, storage",

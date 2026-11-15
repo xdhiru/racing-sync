@@ -510,6 +510,9 @@ async def test_bot_command_menu_lists_add(tmp_path):
         "tick",
         "Run one pipeline tick now (poll + schedule + janitor)",
     ), (
+        "active",
+        "Send a fresh Active Tasks card now",
+    ), (
         "stats",
         "Pipeline snapshot — rows by state, workers, storage",
     ), (
@@ -559,7 +562,7 @@ async def test_start_publishes_command_menu(tmp_path):
             assert [c.command for c in cmds] == [
                 "add", "cancel_match", "cancel_stalled", "cancel_status",
                 "pause_intake",
-                "resume_intake", "tick", "stats", "find", "files"]
+                "resume_intake", "tick", "active", "stats", "find", "files"]
         finally:
             try:
                 await bot.stop()

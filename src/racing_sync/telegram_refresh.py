@@ -110,6 +110,54 @@ class RefreshMixin:
                 if not dirty:
                     break
 
+    async def render_active_now(self) -> bool:
+        """Send a fresh Active Tasks card now (operator recovery).
+
+        The periodic refresh edits one long-lived card in place, so a card
+        deleted from the chat — or a bot that latched the "chat not found"
+        kill switch — leaves the operator with nothing and no way back.
+        Re-arms the switch, forgets the cached render and sends a brand
+        new card as the newest message.
+
+        Returns True when a card was sent.
+        """
+        try:
+            old_id = self._active_msg_id
+        except Exception:
+            old_id = None
+        try:
+            old_int = int(old_id) if old_id is not None else 0
+        except (TypeError, ValueError):
+            old_int = 0
+        # Re-arm the kill switch ("chat not found" latched it to -1 and
+        # every refresh has skipped the send since) and forget the cached
+        # render, so the refresh cannot skip the send.
+        try:
+            self._active_msg_id = None
+            self._prev_active_msg_id = None
+            self._last_active_cache = None
+            self._send_uncertain_key = None
+            self._send_uncertain_skips = 0
+        except Exception:
+            pass
+        # The stale card is retired by the orphan sweep (bounded, best
+        # effort) instead of blocking the send on a delete.
+        if old_int > 0:
+            try:
+                self._remember_orphan(old_int)
+            except Exception:
+                pass
+        try:
+            await self._refresh_active_message_inner(force=True)
+        except Exception:
+            log.exception("active-tasks manual re-render failed")
+            return False
+        try:
+            new_id = self._active_msg_id
+        except Exception:
+            new_id = None
+        return isinstance(new_id, int) and new_id > 0
+
     def _valid_byte_count(self, value: object) -> int | None:
         """int byte count, or None when missing/nonsense. Never raises."""
         try:
@@ -227,10 +275,10 @@ class RefreshMixin:
         except Exception:
             return ""
 
-    async def _refresh_active_message_inner(self) -> None:
+    async def _refresh_active_message_inner(self, force: bool = False) -> None:
         assert self._bot is not None
         # Sentinel -1 means "stop trying to edit" (e.g. chat permission issue)
-        if self._active_msg_id == -1:
+        if self._active_msg_id == -1 and not force:
             return
         # Retired active ids first: a flood-delayed delete from an earlier
         # repost must not strand an old card in history forever.
@@ -429,7 +477,10 @@ class RefreshMixin:
             cache_key = (cur_page, total_pages, text)
 
         repost_due = self._repost_due()
-        if cache_key == self._last_active_cache and self._active_msg_id is not None and not repost_due:
+        if (cache_key == self._last_active_cache
+                and self._active_msg_id is not None
+                and not repost_due
+                and not force):
             return
         # Uncertain-send guard: a send that timed out may still have landed
         # (lost response looks identical) — resending blindly next tick mints
@@ -442,7 +493,7 @@ class RefreshMixin:
             _ukey = getattr(self, "_send_uncertain_key", None)
         except Exception:
             _ukey = None
-        if _ukey is not None and not repost_due:
+        if _ukey is not None and not repost_due and not force:
             try:
                 _same_key = (_ukey == cache_key)
             except Exception:
