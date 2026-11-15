@@ -36,6 +36,11 @@ from .telegram_views import (
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.telegram_bot")
 
+#: Unchanged-card refreshes between liveness probes. The refresh edits
+#: one long-lived card, so an unchanged card is never touched — a card
+#: deleted from the chat would stay gone until the content changed.
+_ACTIVE_PROBE_EVERY = 20
+
 
 class RefreshMixin:
     async def _mark_detail_cancelled(
@@ -480,7 +485,8 @@ class RefreshMixin:
         if (cache_key == self._last_active_cache
                 and self._active_msg_id is not None
                 and not repost_due
-                and not force):
+                and not force
+                and not self._active_probe_due()):
             return
         # Uncertain-send guard: a send that timed out may still have landed
         # (lost response looks identical) — resending blindly next tick mints
@@ -758,6 +764,23 @@ class RefreshMixin:
             last = 0.0
         return (time.monotonic() - last) >= interval
 
+    def _active_probe_due(self) -> bool:
+        """True every N-th unchanged refresh: prove the card still exists.
+
+        An unchanged card is never edited, so one deleted from the chat
+        would stay gone until the content changed. A periodic edit
+        attempt proves liveness (Telegram answers "not modified") and the
+        message-not-found path resends it.
+        """
+        n = getattr(self, "_active_probe_count", 0) + 1
+        if n >= _ACTIVE_PROBE_EVERY:
+            # Probe fired: restart the cadence so the next probe is
+            # another N-th unchanged refresh away.
+            self._active_probe_count = 0
+            return True
+        self._active_probe_count = n
+        return False
+
     def _note_outbound(self, message_id: object) -> None:
         """Record an outbound message id for burial detection (best-effort)."""
         try:
@@ -916,6 +939,10 @@ class RefreshMixin:
                 chat_id=self._cfg.chat_id,
                 message_id=old_int,
             )
+            # The old card is proven gone: forget the dead id so the
+            # uncertain-send guard treats the bot as having no known
+            # message and retries the send instead of stranding the chat.
+            self._prev_active_msg_id = None
         except (RetryAfter, TimedOut, NetworkError) as e:
             log.warning(
                 "active-tasks repost delete deferred "
@@ -932,6 +959,9 @@ class RefreshMixin:
             if self._delete_gone(msg):
                 log.debug("active-tasks repost: old message %s already "
                           "gone; resending", old_int)
+                # Already gone: the dead id must not survive as a
+                # "live" id — the guard would skip the resend forever.
+                self._prev_active_msg_id = None
             elif self._delete_hopeless(msg):
                 log.warning(
                     "active-tasks repost delete refused (%s); keeping "

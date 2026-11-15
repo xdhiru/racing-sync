@@ -11,6 +11,7 @@ from telegram.error import TelegramError, TimedOut
 
 from racing_sync.state import State, StateStore, TorrentState
 from racing_sync.telegram_bot import TelegramBot
+from racing_sync.telegram_refresh import _ACTIVE_PROBE_EVERY
 
 
 def _bot(**kw):
@@ -276,6 +277,87 @@ async def test_repost_send_failure_clears_for_fresh_resend(tmp_path):
         bot._bot.delete_message.assert_awaited_once()
         assert bot._active_msg_id is None
         assert bot._send_uncertain_key == ("p", 1, "text")
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_repost_send_failure_does_not_strand_the_card(tmp_path):
+    """A failed resend must not strand the chat without any card.
+
+    The delete succeeds and the send times out: the deleted card's id
+    must not survive as a "live" id, or the uncertain-send guard skips
+    every resend and the card never comes back.
+    """
+    store = StateStore(tmp_path / "state.db")
+    try:
+        bot = _repost_bot(_active_msg_id=111, _prev_active_msg_id=111)
+        bot._store = store
+        bot._active_footer = AsyncMock(return_value="")
+
+        # Render the real cache key (the live card is edited in place).
+        await bot._refresh_active_message_inner()
+        cache_key = bot._last_active_cache
+        assert cache_key is not None
+
+        bot._bot.delete_message = AsyncMock()
+        bot._bot.send_message = AsyncMock(side_effect=TimedOut("slow"))
+
+        await bot._repost_active_message("text", None, cache_key)
+
+        assert bot._active_msg_id is None
+        assert bot._prev_active_msg_id is None
+
+        # The next refreshes must bring the card back (the uncertain-send
+        # guard retries a throttled send while no message is known).
+        bot._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=222))
+        bot._active_footer = AsyncMock(return_value="")
+        bot._store = store
+        for _ in range(5):
+            await bot._refresh_active_message_inner()
+
+        assert bot._bot.send_message.await_count >= 1
+        assert bot._active_msg_id == 222
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_card_deleted_from_chat_is_detected_by_the_probe(tmp_path):
+    """A card deleted from the chat is noticed by the liveness probe.
+
+    Unchanged content never edits the card, so a deleted one would stay
+    gone forever. Every N-th unchanged refresh edits anyway: the
+    message-not-found answer proves the card died and triggers a resend.
+    """
+    store = StateStore(tmp_path / "state.db")
+    try:
+        bot = _bot()
+        bot._store = store
+        bot._active_footer = AsyncMock(return_value="")
+
+        await bot._refresh_active_message_inner()
+        assert bot._active_msg_id == 7
+
+        # The card is deleted from the chat: edits now fail with
+        # "message to edit not found".
+        bot._bot.edit_message_text = AsyncMock(
+            side_effect=TelegramError(
+                "Bad Request: message to edit not found"))
+        bot._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=8))
+
+        # Unchanged card: no resend before the probe is due.
+        for _ in range(3):
+            await bot._refresh_active_message_inner()
+        assert bot._bot.send_message.await_count == 0
+
+        # The probe fires and the dead card is replaced.
+        for _ in range(_ACTIVE_PROBE_EVERY + 3):
+            await bot._refresh_active_message_inner()
+
+        assert bot._active_msg_id == 8
     finally:
         store.close()
 

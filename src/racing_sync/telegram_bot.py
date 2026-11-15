@@ -316,6 +316,8 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         # Cached "last active-tasks (page, total_pages, text, buttons)" so
         # we skip identical edits.
         self._last_active_cache: tuple | None = None
+        # Unchanged refreshes since the last liveness probe of the card.
+        self._active_probe_count: int = 0
         # Per-chat debounce (monotonic timestamps by chat/user key): one
         # chat's burst must not starve pagination for everyone else.
         self._callback_times: dict[str, float] = {}
