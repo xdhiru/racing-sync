@@ -1449,6 +1449,26 @@ class AdmitMixin:
         except Exception:
             return None
 
+    def _note_waiting_disk_check(self, ts: TorrentState) -> None:
+        """Schedule the next quiet re-check for a parked row (bounded map).
+
+        Parked rows that are forgotten or renamed never reach the pop on
+        promotion, so the map is capped like the other per-hash notes.
+        """
+        try:
+            _wd = getattr(self, "_waiting_disk_next_check", None)
+            if not isinstance(_wd, dict):
+                _wd = {}
+                self._waiting_disk_next_check = _wd  # type: ignore[attr-defined]
+            _wd[(ts.source_infohash or "").lower()] = (
+                time.monotonic() + self.WAITING_DISK_RECHECK_SECONDS
+            )
+            if len(_wd) > 5000:
+                for _k in list(_wd.keys())[: len(_wd) - 5000]:
+                    _wd.pop(_k, None)
+        except Exception:
+            pass
+
     async def _wait_disk_then_queue(self, ts: TorrentState) -> None:
         # Global ledger re-check (quiet 60s cadence): reserves before QUEUED
         # so a new arrival mid-batch can't over-commit the budget that batch
@@ -1475,16 +1495,7 @@ class AdmitMixin:
                 )
                 # Refresh the quiet-wait window like the SSD-full path so a
                 # deferred row re-checks election at most once per interval.
-                try:
-                    _wd = getattr(self, "_waiting_disk_next_check", None)
-                    if _wd is None:
-                        _wd = {}
-                        self._waiting_disk_next_check = _wd  # type: ignore[attr-defined]
-                    _wd[(ts.source_infohash or "").lower()] = (
-                        time.monotonic() + self.WAITING_DISK_RECHECK_SECONDS
-                    )
-                except Exception:
-                    pass
+                self._note_waiting_disk_check(ts)
                 return
         # Parked-row on-SSD shortcut (mirrors the admit-time one above):
         # a complete dest entry may have appeared — or been added
@@ -1522,16 +1533,7 @@ class AdmitMixin:
         except (TypeError, ValueError):
             _pre_max = 0
         if _pre_max > 0 and await self._live_download_count() >= _pre_max:
-            try:
-                _wd0 = getattr(self, "_waiting_disk_next_check", None)
-                if _wd0 is None:
-                    _wd0 = {}
-                    self._waiting_disk_next_check = _wd0  # type: ignore[attr-defined]
-                _wd0[(ts.source_infohash or "").lower()] = (
-                    time.monotonic() + self.WAITING_DISK_RECHECK_SECONDS
-                )
-            except Exception:
-                pass
+            self._note_waiting_disk_check(ts)
             log.debug(
                 "downloads full (%d/%d); %s stays waiting_disk (no reserve churn)",
                 _pre_max,
@@ -1615,16 +1617,7 @@ class AdmitMixin:
                     # Downloads full: release the just-made reservation and
                     # stay parked (never FAILED — space, not an error).
                     await self._ssd_release(ts.source_infohash)
-                    try:
-                        _wd2 = getattr(self, "_waiting_disk_next_check", None)
-                        if _wd2 is None:
-                            _wd2 = {}
-                            self._waiting_disk_next_check = _wd2  # type: ignore[attr-defined]
-                        _wd2[(ts.source_infohash or "").lower()] = (
-                            time.monotonic() + self.WAITING_DISK_RECHECK_SECONDS
-                        )
-                    except Exception:
-                        pass
+                    self._note_waiting_disk_check(ts)
                     log.debug(
                         "downloads full (%d/%d); %s stays waiting_disk",
                         _active_dl,
@@ -1647,16 +1640,7 @@ class AdmitMixin:
             return
         # Still full: stay parked quietly until the next interval instead of
         # hot-looping every tick while batch moves drain.
-        try:
-            _wd = getattr(self, "_waiting_disk_next_check", None)
-            if _wd is None:
-                _wd = {}
-                self._waiting_disk_next_check = _wd  # type: ignore[attr-defined]
-            _wd[(ts.source_infohash or "").lower()] = (
-                time.monotonic() + self.WAITING_DISK_RECHECK_SECONDS
-            )
-        except Exception:
-            pass
+        self._note_waiting_disk_check(ts)
         log.debug(
             "ssd still full; %s stays waiting_disk (need ~%d MB, re-check in %ds)",
             ts.source_name[:60],

@@ -119,3 +119,15 @@ async def test_setup_empty_file_list_fails_after_persistent_streak(tmp_path):
         await coord._setup_queued_download(ts, b"blob")
 
     assert ts.state == State.FAILED
+
+
+def test_waiting_disk_map_is_capped(tmp_path):
+    """Wait notes from forgotten/renamed rows must not grow without bound."""
+    coord = make_coordinator()
+    coord._waiting_disk_next_check = {f"{i:040x}": 0.0 for i in range(5005)}
+
+    ts = TorrentState(source_infohash="f" * 40, source_name="Late")
+    coord._note_waiting_disk_check(ts)
+
+    assert len(coord._waiting_disk_next_check) == 5000
+    assert ("f" * 40) in coord._waiting_disk_next_check
