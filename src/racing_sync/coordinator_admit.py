@@ -52,6 +52,11 @@ _BLOB_PARSE_TTL_S = 300.0
 # (workers + Telegram notes) share one all_active() scan per window.
 _INFLIGHT_SNAPSHOT_S = 30.0
 
+#: Consecutive empty file lists after add before the row fails. The client
+#: parses metadata in seconds, so an empty list that survives several
+#: admission retries is a broken torrent, not a slow one.
+_SETUP_EMPTY_FILES_FAIL_TRIES = 5
+
 
 class AdmitMixin:
     async def _pick_and_admit(
@@ -3582,6 +3587,62 @@ class AdmitMixin:
             )
 
         files: list[TorrentFile] = await retryable(label="dest setup files")(_fetch_setup_files)()
+        _setup_h = (ts.dest_infohash or ts.source_infohash or "").lower()
+        try:
+            _empty_seen = getattr(self, "_setup_files_empty", None)
+            if not isinstance(_empty_seen, dict):
+                _empty_seen = {}
+                self._setup_files_empty = _empty_seen  # type: ignore[attr-defined]
+        except Exception:
+            _empty_seen = {}
+        if not files:
+            # An empty list is a valid retryable answer (metadata still
+            # parsing right after add), so it gets here instead of raising.
+            # Falling through would run the single-flow path: reserve the
+            # whole torrent and resume it with no priorities, so a season
+            # whose list lands mid-download floods the SSD. Park and retry;
+            # a list that never fills is a broken torrent, not a slow one.
+            try:
+                _n = int(_empty_seen.get(_setup_h, 0) or 0) + 1
+                _empty_seen[_setup_h] = _n
+                if len(_empty_seen) > 5000:
+                    for _k in list(_empty_seen.keys())[: len(_empty_seen) - 5000]:
+                        _empty_seen.pop(_k, None)
+            except Exception:
+                _n = 1
+            if _setup_h:
+                try:
+                    await self.dest_client.delete(_setup_h, delete_files=False)
+                except Exception:
+                    pass
+            if _n < _SETUP_EMPTY_FILES_FAIL_TRIES:
+                log.info(
+                    "file list empty for %s after add (%d/%d); parking to retry",
+                    ts.source_name,
+                    _n,
+                    _SETUP_EMPTY_FILES_FAIL_TRIES,
+                )
+                self.transition(
+                    ts,
+                    State.WAITING_DISK,
+                    error=f"file list empty after add ({_n}/{_SETUP_EMPTY_FILES_FAIL_TRIES})",
+                )
+                return
+            log.warning(
+                "file list still empty for %s after %d attempts; failing",
+                ts.source_name,
+                _n,
+            )
+            self.transition(
+                ts,
+                State.FAILED,
+                error=f"file list still empty after {_n} attempts; is the torrent broken?",
+            )
+            return
+        try:
+            _empty_seen.pop(_setup_h, None)
+        except Exception:
+            pass
         from . import coordinator as _coordinator
 
         cls = _coordinator.classify(files, self.cfg)

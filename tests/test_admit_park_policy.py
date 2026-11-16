@@ -59,3 +59,63 @@ async def test_setup_movie_batch_budget_park_keeps_files(tmp_path):
     coord.dest_client.delete.assert_awaited_once_with("b" * 40, delete_files=False)
     assert ts.state == State.WAITING_DISK
     coord.dest_client.resume.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_setup_empty_file_list_parks_instead_of_full_torrent_flow(tmp_path):
+    """An empty list is a transient retryable answer, not a zero-file torrent.
+
+    Audit D5: falling through reserved the whole torrent and resumed it with
+    no priorities, so a season whose file list lands late floods the SSD.
+    """
+    coord = make_coordinator()
+    coord.cfg.dest.save_path = tmp_path
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
+    coord.dest_client.delete = AsyncMock()
+    coord.dest_client.resume = AsyncMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(
+        source_infohash="c" * 40,
+        source_name="Season",
+        total_bytes=10_000,
+        dest_infohash="c" * 40,
+        save_path=str(tmp_path),
+        state=State.QUEUED,
+    )
+
+    await coord._setup_queued_download(ts, b"blob")
+
+    assert ts.state == State.WAITING_DISK
+    coord.dest_client.delete.assert_awaited_once_with("c" * 40, delete_files=False)
+    coord.dest_client.resume.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_setup_empty_file_list_fails_after_persistent_streak(tmp_path):
+    """A list that never fills must fail loudly instead of parking forever."""
+    from racing_sync.coordinator_admit import _SETUP_EMPTY_FILES_FAIL_TRIES
+
+    coord = make_coordinator()
+    coord.cfg.dest.save_path = tmp_path
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
+    coord.dest_client.delete = AsyncMock()
+    coord.dest_client.resume = AsyncMock()
+    coord.transition = MagicMock(side_effect=lambda t, s, error="": setattr(t, "state", s))
+
+    ts = TorrentState(
+        source_infohash="d" * 40,
+        source_name="Broken",
+        total_bytes=10_000,
+        dest_infohash="d" * 40,
+        save_path=str(tmp_path),
+        state=State.QUEUED,
+    )
+
+    for _ in range(_SETUP_EMPTY_FILES_FAIL_TRIES):
+        ts.state = State.QUEUED
+        await coord._setup_queued_download(ts, b"blob")
+
+    assert ts.state == State.FAILED
