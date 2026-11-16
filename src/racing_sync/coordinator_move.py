@@ -857,7 +857,12 @@ class MoveMixin:
             ts.classification_kind = cls.kind
             pinned_kind = cls.kind
             try:
-                self.store.upsert(ts, expected_version=ts.version)
+                # Narrow write: this runs after several awaits, and a
+                # whole-row upsert would replay a stale snapshot over a
+                # concurrent transition. Only the pin is ours to write.
+                self.store.update_columns(
+                    h, {"classification_kind": cls.kind}, expected_version=ts.version
+                )
             except Exception:  # noqa: BLE001
                 pass
         elif cls.kind and cls.kind != pinned_kind:
