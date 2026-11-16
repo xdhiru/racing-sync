@@ -53,7 +53,11 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "ASYNC"]
-ignore = ["E501"]
+# ASYNC240 flags every pathlib call inside an async function, and cannot
+# tell a single exists()/resolve() syscall from a recursive walk. The
+# heavy filesystem work here already runs on a thread (offload/rpc,
+# asyncio.to_thread); the remaining hits are one syscall on a local path.
+ignore = ["E501", "ASYNC240"]
 
 [tool.ruff.lint.isort]
 # Keep `from x import (a as _a, b as _b)` in one statement — the module
