@@ -53,20 +53,25 @@ def is_retryable_read_error(exc: BaseException) -> bool:
 
 
 def retryable(
-    attempts: int = 3,
+    retries: int = 3,
     delays: tuple[float, ...] = (1.0, 2.0, 5.0),
     *,
     label: str = "read",
 ) -> Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]:
-    """Decorate an async read with bounded retries (default 3, 1/2/5s).
+    """Decorate an async read with bounded retries (default 3 retries, 1/2/5s).
+
+    One initial attempt plus `retries` more: the default is four tries
+    spaced 1s, 2s and 5s — the tolerance the hand-rolled loops had before
+    this policy replaced them. Counting retries rather than attempts keeps
+    every delay reachable.
 
     Retries only :func:`is_retryable_read_error` failures; every other
     exception (auth, validation, lookup, programming errors) propagates
     on the first attempt. CancelledError is never swallowed. The last
-    error re-raises when attempts exhaust.
+    error re-raises when the retries exhaust.
     """
     try:
-        _n = max(1, int(attempts))
+        _n = max(0, int(retries))
     except (TypeError, ValueError):
         _n = 3
     try:
@@ -80,7 +85,7 @@ def retryable(
         @functools.wraps(fn)
         async def _wrapper(*args: Any, **kwargs: Any) -> T:
             _last: BaseException | None = None
-            for _i in range(_n):
+            for _i in range(_n + 1):
                 try:
                     return await fn(*args, **kwargs)
                 except asyncio.CancelledError:
@@ -89,7 +94,7 @@ def retryable(
                     if not is_retryable_read_error(e):
                         raise
                     _last = e
-                    if _i >= _n - 1:
+                    if _i >= _n:
                         break
                     _wait = _delays[min(_i, len(_delays) - 1)]
                     try:
@@ -99,7 +104,7 @@ def retryable(
                             e,
                             _wait,
                             _i + 2,
-                            _n,
+                            _n + 1,
                         )
                     except Exception:
                         pass

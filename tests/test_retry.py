@@ -27,12 +27,33 @@ async def test_exhaustion_reraises_last():
     from racing_sync.retry import retryable
 
     fn = AsyncMock(
-        side_effect=[TimeoutError("one"), TimeoutError("two"), TimeoutError("three"), "never"]
+        side_effect=[
+            TimeoutError("one"),
+            TimeoutError("two"),
+            TimeoutError("three"),
+            TimeoutError("four"),
+            "never",
+        ]
     )
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        with pytest.raises(TimeoutError, match="three"):
+        with pytest.raises(TimeoutError, match="four"):
             await retryable()(fn)()
-    assert fn.await_count == 3
+    assert fn.await_count == 4
+
+
+@pytest.mark.anyio
+async def test_default_covers_the_full_delay_ladder():
+    """Three retries means four tries, so every delay is reachable."""
+    from unittest.mock import AsyncMock, patch
+
+    from racing_sync.retry import retryable
+
+    fn = AsyncMock(side_effect=TimeoutError("x"))
+    with patch("asyncio.sleep", new_callable=AsyncMock) as _sleep:
+        with pytest.raises(TimeoutError):
+            await retryable()(fn)()
+    assert fn.await_count == 4
+    assert [c.args[0] for c in _sleep.await_args_list] == [1.0, 2.0, 5.0]
 
 
 @pytest.mark.anyio
@@ -73,7 +94,7 @@ async def test_single_attempt_and_custom_delays():
     fn = AsyncMock(side_effect=TimeoutError("x"))
     with patch("asyncio.sleep", new_callable=AsyncMock) as _sleep:
         with pytest.raises(TimeoutError):
-            await retryable(attempts=1)(fn)()
+            await retryable(retries=0)(fn)()
     assert fn.await_count == 1
     _sleep.assert_not_awaited()
 
