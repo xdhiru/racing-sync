@@ -1379,6 +1379,94 @@ async def test_do_new_watch_dir_sacrificial_prefers_first_download_indexer(tmp_p
     assert ts.state == State.QUEUED
 
 
+@pytest.mark.anyio
+async def test_do_new_watch_dir_sacrificial_falls_through_failed_indexer(tmp_path: Path):
+    """A failed fetch from the top download indexer must try the next one.
+
+    Audit D7: the loop broke on the first failure and fell back to the
+    dropped file, giving up on a viable preferred source.
+    """
+    raw_data = _create_sample_torrent_data("Private.Movie.1080p", 5000, "http://alpha.cc/announce")
+    infohash, name, total, announce = _bencoded_info_hash(raw_data)
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    coord = make_coordinator()
+    coord.cfg.dest.save_path = tmp_path / "downloads"
+    coord.cfg.ssd.path = tmp_path
+    coord.cfg.ssd.max_inflight_bytes = 100000000
+    coord.cfg.general.state_db = db_path
+    coord.cfg.general.disk_safety_margin_bytes = 1000
+    coord.cfg.prowlarr.enabled = True
+    coord.cfg.prowlarr.is_download_indexer = lambda url: False
+    coord.cfg.prowlarr.should_skip_title.return_value = False
+    coord.cfg.prowlarr.tracker_map.entries = {}
+    coord.store = store
+    coord.transition = lambda t, s, **kwargs: setattr(t, "state", s)
+
+    first_idx = Indexer(1, "First (API)", "torrent", True, [])
+    second_idx = Indexer(2, "Second (API)", "torrent", True, [])
+    coord.prowlarr = MagicMock()
+    coord.prowlarr.get_download_indexers = MagicMock(return_value=[first_idx, second_idx])
+    coord.prowlarr.get_indexer_by_name = MagicMock(return_value=None)
+    coord.prowlarr.search_indexers_parallel = AsyncMock()
+    coord.prowlarr.download_torrent = AsyncMock()
+
+    first_hit = TorrentHit(
+        title="Private.Movie.1080p",
+        guid="1",
+        indexer="First (API)",
+        indexer_id=1,
+        size_bytes=5000,
+        download_url="http://prowlarr/dl/1",
+        magnet_url="",
+        info_url="",
+        publish_date="",
+    )
+    second_hit = TorrentHit(
+        title="Private.Movie.1080p",
+        guid="2",
+        indexer="Second (API)",
+        indexer_id=2,
+        size_bytes=5000,
+        download_url="http://prowlarr/dl/2",
+        magnet_url="",
+        info_url="",
+        publish_date="",
+    )
+    coord.prowlarr.search_indexers_parallel.return_value = {
+        "first (api)": [first_hit],
+        "second (api)": [second_hit],
+    }
+    second_bytes = _create_sample_torrent_data(
+        "Private.Movie.1080p", 5000, "http://second.example/announce"
+    )
+
+    async def mock_dl(hit):
+        if hit.indexer_id == 1:
+            raise RuntimeError("indexer 500")
+        return second_bytes
+
+    coord.prowlarr.download_torrent.side_effect = mock_dl
+
+    ts = TorrentState(
+        source_infohash=infohash,
+        source_name=name,
+        total_bytes=total,
+        source_announce_url=announce,
+        cross_seed_blob=raw_data,
+        cross_seed_source="watch-dir",
+        state=State.NEW,
+    )
+
+    await coord._do_new_watch_dir(ts)
+
+    assert ts.cross_seed_source == "public-prowlarr"
+    assert ts.cross_seed_blob == second_bytes
+    assert ts.state == State.QUEUED
+
+
 def test_watchdir_pickup_log_shows_domain_not_passkey(tmp_path: Path, caplog):
     """The scanner log must never contain the announce passkey."""
     import logging

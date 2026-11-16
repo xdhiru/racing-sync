@@ -3227,10 +3227,6 @@ class AdmitMixin:
                         from .watchdir import _bencoded_info_hash
 
                         dl_h, _, _, _ = _bencoded_info_hash(dl_blob)
-                        chosen_blob = dl_blob
-                        chosen_label = "public-prowlarr"
-                        chosen_size = best_dl.size_bytes
-                        chosen_infohash = dl_h
                         # Persist alongside the dropped + discovered blobs:
                         # the watch blob dir is the single source of truth
                         # for fuse injection, so flows that skip RE_ADDING
@@ -3251,6 +3247,13 @@ class AdmitMixin:
                                 await asyncio.to_thread(
                                     (watch_cross_dir / f"{dl_h}.torrent").write_bytes, dl_blob
                                 )
+                        # Commit the choice only once every step landed: a
+                        # failure above must leave the dropped file as the
+                        # default and let the next indexer try.
+                        chosen_blob = dl_blob
+                        chosen_label = "public-prowlarr"
+                        chosen_size = best_dl.size_bytes
+                        chosen_infohash = dl_h
                         log.info(
                             "watch-dir: using sacrificial download torrent from %s (%s)",
                             best_dl.indexer,
@@ -3262,8 +3265,12 @@ class AdmitMixin:
                         _found_preferred = True
                     except Exception as e:  # noqa: BLE001
                         log.warning(
-                            "failed to fetch download indexer torrent: %s; using dropped file", e
+                            "failed to fetch download indexer torrent from %s: %s; "
+                            "trying the next one",
+                            best_dl.indexer,
+                            e,
                         )
+                        continue
                     break
 
             # 2. Collect other private tracker cross-seeds to inject onto FUSE
