@@ -3936,3 +3936,92 @@ async def test_do_moving_mixed_loop_keeps_cursor_in_memory(tmp_path):
         assert store.get("x" * 40).batch_index == 0
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_do_moving_mixed_never_moves_unverified_files(tmp_path):
+    """A mixed batch must not upload a file the client has not verified.
+
+    Step 3 leaves incomplete files in place while a hash check is running.
+    batch.file_names() still lists them, so a --files-from-raw built from it
+    would upload a piece-boundary partial as-is. The batch must park instead.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from racing_sync.classifier import Episode
+    from racing_sync.clients.abstract import TorrentFile
+    from racing_sync.state import State, StateStore, TorrentState
+
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    (ssd / "E01.mkv").write_bytes(b"a" * 100)
+    (ssd / "E02.mkv").write_bytes(b"b" * 100)
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        coord._stop = False
+        coord.cfg = MagicMock()
+        coord.cfg.dest.save_path = ssd
+        coord.cfg.ssd.path = ssd
+        coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+        coord.cfg.rclone.remote.default = "remote:media"
+        coord.cfg.rclone.remote.unsorted = "remote:unsorted"
+        coord.cfg.rclone.fuse.mount = ssd / "fuse"
+        coord.cfg.rclone.fuse.mount_unsorted = ssd / "fuse-unsorted"
+        coord.cfg.cross_seed.inject_racing_torrents_to_fuse = False
+        coord.dest_client = MagicMock()
+        # Pre-read says downloading, the post-list proves a hash check
+        # started mid-move: step 3 must keep the short file on disk.
+        coord.dest_client.list_torrents = AsyncMock(
+            side_effect=[
+                [SimpleNamespace(state="downloading", progress=1.0)],
+                [SimpleNamespace(state="checkingDL", progress=1.0)],
+            ]
+        )
+        coord.dest_client.get_torrent_files = AsyncMock(
+            return_value=[
+                TorrentFile(name="E01.mkv", size_bytes=100, progress=1.0),
+                TorrentFile(name="E02.mkv", size_bytes=100, progress=0.5),
+            ]
+        )
+        coord.dest_client.pause = AsyncMock()
+        coord.dest_client.get_torrent = AsyncMock(
+            return_value=SimpleNamespace(state="pausedDL", progress=1.0)
+        )
+        coord.dest_client.delete = AsyncMock()
+        coord.dest_client.set_file_priorities = AsyncMock()
+        # One batch for both episodes: the partial shares the batch.
+        coord._batch_cap_cache = {"x" * 40: 1000}
+        coord._rclone_move = AsyncMock()
+        eps = [
+            Episode(file_name="E01.mkv", season=1, episode=1, size_bytes=100),
+            Episode(file_name="E02.mkv", season=1, episode=2, size_bytes=100),
+        ]
+
+        ts = TorrentState(
+            source_infohash="x" * 40,
+            source_name="Mixed",
+            classification_kind="mixed",
+            batches_total=1,
+            batch_index=0,
+            state=State.MOVING,
+        )
+        ts._blob = b"blob"
+        store.upsert(ts)
+
+        with patch("racing_sync.coordinator.classify") as mock_classify:
+            mock_cls = MagicMock()
+            mock_cls.kind = "mixed"
+            mock_cls.episodes = eps
+            mock_classify.return_value = mock_cls
+            with patch.object(type(coord), "_fuse_skipped", AsyncMock(return_value=set())):
+                await coord._do_moving(store.get("x" * 40))
+
+        coord._rclone_move.assert_not_awaited()
+        assert store.get("x" * 40).state == State.MOVING
+        assert (ssd / "E01.mkv").exists()
+        assert (ssd / "E02.mkv").exists()
+    finally:
+        store.close()

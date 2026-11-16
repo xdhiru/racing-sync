@@ -1988,7 +1988,23 @@ class MoveMixin:
                     branch_kind,
                 )
                 skip_norm = {(s or "").replace("\\", "/").strip("/") for s in skip}
-                names = [n for n in batch.file_names() if n not in skip_norm]
+                # Same guarantee as the strict branch: only a file the client
+                # reports complete AND that stats at full size on SSD may move.
+                # batch.file_names() also lists files step 3 left in place
+                # during an in-flight hash check — those can be piece-boundary
+                # partials, and --files-from-raw would upload them as-is.
+                verified = set(files_from_names([f.name or "" for f in completed_files]))
+                batch_names = batch.file_names()
+                unverified = [n for n in batch_names if n not in verified and n not in skip_norm]
+                if unverified:
+                    self._park_moving(
+                        ts,
+                        f"mixed-torrent batch {i + 1}/{len(batches)} has "
+                        f"{len(unverified)} unverified file(s) (e.g. "
+                        f"{unverified[0]}); staying in MOVING without moving",
+                    )
+                    return
+                names = [n for n in batch_names if n not in skip_norm]
                 if not names:
                     log.info(
                         "mixed batch %d/%d for %s already on remote; skipping move",
