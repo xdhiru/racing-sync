@@ -1023,7 +1023,7 @@ async def test_do_queued_resumes_ssd_flow_when_fuse_entry_missing_but_ssd_has_fi
 
 
 @pytest.mark.anyio
-async def test_late_cross_seeds_defer_when_fuse_content_missing(tmp_path: Path):
+async def test_late_cross_seeds_defer_when_fuse_content_missing(tmp_path: Path, mounted_fuse):
     """Regression: DONE row + unknown VPS1 matches + empty fuse => defer, not inject.
 
     Mirrors the reported incident ("detected late cross-seed ..." followed by
@@ -1719,7 +1719,7 @@ async def test_original_healthy_memo_skips_reprobe(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_original_defer_never_memoizes(tmp_path: Path):
+async def test_original_defer_never_memoizes(tmp_path: Path, mounted_fuse):
     """Missing bytes keep re-probing (failure backoff only, no healthy memo)."""
     blob = _single_file_torrent_bytes("Orig.Movie.2026.mkv", 100)
     coord, fuse_dir = _original_coord(tmp_path, blob)

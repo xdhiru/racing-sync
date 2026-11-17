@@ -15,9 +15,39 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import os
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+#: Mount-point probes are meaningful on POSIX only; tests flip this to
+#: exercise the POSIX path on any host (patching os.name would also
+#: change how pathlib picks its flavour).
+_POSIX = os.name == "posix"
+
+
+def mount_is_mounted(mount: Path | str) -> bool:
+    """True when `mount` is really mounted (POSIX) or unknowable (elsewhere).
+
+    An unmounted mountpoint is an ordinary empty directory: its stat
+    succeeds, so every expected file reads "missing" — the row records a
+    content miss and the healer can re-download bytes that are present on
+    the remote. A directory that holds entries is a working tree even when
+    the kernel does not call it a mountpoint (bind layouts, alternate
+    mount tooling), so only the empty non-mountpoint directory is treated
+    as unavailable. Windows has no ismount semantics for this setup
+    (rclone uses drive letters, and a dead drive fails the stat), so it
+    keeps the stat-only path.
+    """
+    if not _POSIX:
+        return True
+    try:
+        if os.path.ismount(str(mount)):
+            return True
+        with os.scandir(str(mount)) as _it:
+            return next(_it, None) is not None
+    except OSError:
+        return False
 
 
 class FuseVerdict(str, enum.Enum):  # noqa: UP042  (StrEnum changes str(Enum); .value is the contract)
@@ -85,7 +115,7 @@ async def missing_under(
                 mount_ok, _ = fuse_stat_cached(m)
             except Exception:
                 return None
-            if not mount_ok:
+            if not mount_ok or not mount_is_mounted(m):
                 return [f"<mount unavailable: {m}>"]
             missing: list[str] = []
             for name, want in expected or []:

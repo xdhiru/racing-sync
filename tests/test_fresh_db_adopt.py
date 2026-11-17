@@ -472,7 +472,7 @@ async def test_false_done_with_ssd_save_path_demotes_and_moves_before_injecting(
 
 
 @pytest.mark.anyio
-async def test_false_done_claiming_fuse_but_ssd_bytes_demotes(tmp_path: Path):
+async def test_false_done_claiming_fuse_but_ssd_bytes_demotes(tmp_path: Path, mounted_fuse):
     """DONE claims a fuse save_path but bytes never moved (SSD leftover).
 
     Fuse gate misses, SSD probe hits → no injection, demote to MOVING so the

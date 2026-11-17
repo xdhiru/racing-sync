@@ -177,6 +177,41 @@ async def test_fuse_gate_skipped_strict_equality(tmp_path):
     assert await skipped_present(mount, [("d/nope.mkv", 5)]) == set()
 
 
+@pytest.mark.anyio
+async def test_fuse_gate_reports_unmounted_mount(tmp_path, monkeypatch):
+    """An empty non-mountpoint dir is "unavailable", not "content missing".
+
+    The stat on an unmounted mountpoint succeeds, so without the mount
+    probe every expected file reads missing and the healer can re-download
+    bytes that are present on the remote.
+    """
+    from racing_sync import fuse_gate
+    from racing_sync.fuse_gate import missing_under
+
+    mount = tmp_path / "fuse"
+    mount.mkdir()
+    monkeypatch.setattr(fuse_gate, "_POSIX", True)
+    monkeypatch.setattr(fuse_gate.os.path, "ismount", lambda _p: False)
+
+    got = await missing_under(mount, [("Show/a.mkv", 10)])
+    assert got == [f"<mount unavailable: {mount}>"]
+
+
+@pytest.mark.anyio
+async def test_fuse_gate_trusts_a_populated_directory(tmp_path, monkeypatch):
+    """A directory holding entries is a working tree even off-mountpoint."""
+    from racing_sync import fuse_gate
+    from racing_sync.fuse_gate import missing_under
+
+    mount = tmp_path / "fuse"
+    (mount / "Show").mkdir(parents=True)
+    (mount / "Show" / "a.mkv").write_bytes(b"x" * 10)
+    monkeypatch.setattr(fuse_gate, "_POSIX", True)
+    monkeypatch.setattr(fuse_gate.os.path, "ismount", lambda _p: False)
+
+    assert await missing_under(mount, [("Show/a.mkv", 10)]) == []
+
+
 def test_title_normalizer_is_single_implementation():
     """Prowlarr matching delegates to the one coordinator normalizer."""
     from racing_sync.coordinator_content import normalize_content_name

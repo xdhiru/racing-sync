@@ -216,7 +216,7 @@ async def test_verify_broken_fuse_cfg_fails_closed(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_verify_missing_no_state_change(tmp_path):
+async def test_verify_missing_no_state_change(tmp_path, mounted_fuse):
     coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     blob = _blob()
     coord.source_client.export_torrent = AsyncMock(return_value=blob)
@@ -282,7 +282,7 @@ async def test_confirmed_keeps_existing_blob(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_confirmed_missing_keeps_prior_state(tmp_path):
+async def test_confirmed_missing_keeps_prior_state(tmp_path, mounted_fuse):
     coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     blob = _blob()
     coord.source_client.export_torrent = AsyncMock(return_value=blob)

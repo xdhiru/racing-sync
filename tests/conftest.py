@@ -21,6 +21,19 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.fixture
+def mounted_fuse(monkeypatch):
+    """Declare temp-dir fuse stand-ins as mounted.
+
+    Tests use ordinary directories as the rclone mount, which the mount
+    probe cannot see; without this an empty stand-in is reported as
+    "<mount unavailable>" instead of "content missing".
+    """
+    from racing_sync import fuse_gate
+
+    monkeypatch.setattr(fuse_gate, "mount_is_mounted", lambda _mount: True)
+
+
 def make_coordinator(store=None, **attrs) -> Coordinator:
     """Bare Coordinator with mock cfg/store plus worker bookkeeping.
 
