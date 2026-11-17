@@ -543,6 +543,54 @@ async def test_reconcile_adopts_ssd_complete_as_moving_and_fuse_as_done(tmp_path
 
 
 @pytest.mark.anyio
+async def test_reconcile_skips_adoption_claimed_mid_pass(tmp_path, monkeypatch):
+    """A row admitted while recovery verifies must not be duplicated."""
+    from racing_sync import recovery as rec
+    from racing_sync.state import State, StateStore, TorrentState
+
+    store = StateStore(tmp_path / "state.db")
+    cfg = MagicMock()
+    cfg.rclone.fuse.mount = Path("/mnt/fuse/torrents")
+    cfg.rclone.fuse.mount_unsorted = Path("/mnt/fuse/unsorted")
+
+    dest = AsyncMock()
+    dest.list_torrents.return_value = [
+        Torrent(
+            hash="ssd_done_hash",
+            name="Show.S01.1080p",
+            size_bytes=4000,
+            save_path="/home/user/torrents/qbittorrent",
+            category="racing",
+            progress=1.0,
+            state="uploading",
+        ),
+    ]
+
+    async def _classify_and_claim(cfg_, dest_, h_):
+        # The coordinator admits the same release mid-verification.
+        store.upsert(
+            TorrentState(
+                source_infohash="s" * 40,
+                source_name="Show.S01.1080p",
+                total_bytes=4000,
+                state=State.QUEUED,
+            )
+        )
+        return "unknown"
+
+    monkeypatch.setattr(rec, "_classify_adopted", _classify_and_claim)
+
+    report = await rec.reconcile(cfg, dest=dest, store=store)
+
+    assert report.adopted == []
+    assert store.get("ssd_done_hash") is None
+    owner = store.get("s" * 40)
+    assert owner is not None
+    injected = {x.strip().lower() for x in (owner.injected_private_hashes or "").split(",")}
+    assert "ssd_done_hash" in injected
+
+
+@pytest.mark.anyio
 async def test_reconcile_adopts_fuse_entry_with_missing_files_as_moving_when_on_ssd(tmp_path: Path):
     """Fuse-pointing entry + bytes on SSD = never-moved data: adopt MOVING fixed up."""
     from racing_sync.clients.abstract import TorrentFile

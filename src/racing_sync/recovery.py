@@ -20,6 +20,7 @@ from pathlib import Path
 
 from .clients.abstract import TorrentClient
 from .config import AppConfig
+from .content_keys import same_content
 from .coordinator_errors import AbandonedError
 from .io_bounds import bounded, chunked, offload, rpc
 from .state import State, StateStore, TorrentState
@@ -388,6 +389,48 @@ async def _verify_fuse_adopted(
         missing[0],
     )
     return True, save_path, kind, False
+
+
+def _claimed_since_snapshot(store, rpt, h: str, name: str, size_bytes: int) -> bool:
+    """Link-and-skip when a row claimed this content while we verified.
+
+    `actual_by_hash` and the row snapshot are read before the verification
+    awaits, which can run for minutes on a big fleet. A coordinator that
+    admitted the same content meanwhile owns the torrent: adopting a
+    second row would give two workers one torrent with divergent cursors.
+    Re-read live right before the adoption write.
+    """
+    try:
+        row = store.get_many([h]).get(h.lower())
+    except Exception:
+        row = None
+    if row is None:
+        try:
+            for m in store.find_by_name(name) or []:
+                if same_content(name, size_bytes, m.source_name or "", m.total_bytes or 0):
+                    row = m
+                    break
+        except Exception:
+            row = None
+    if row is None:
+        return False
+    try:
+        link = h.lower()
+        have = [x.strip() for x in (row.injected_private_hashes or "").split(",") if x.strip()]
+        lower = {x.lower() for x in have}
+        if link not in lower and link != (row.source_infohash or "").lower():
+            have.append(link)
+            row.injected_private_hashes = ",".join(have)
+            store.upsert(row, expected_version=row.version)
+    except Exception:
+        pass
+    rpt.kept.append(h)
+    log.info(
+        "reconcile: %s was claimed while verifying; linked to %s instead of adopting",
+        h[:10],
+        (row.source_infohash or "")[:10],
+    )
+    return True
 
 
 async def reconcile(
@@ -960,6 +1003,8 @@ async def _reconcile_snapshot(
                     if _adopted_blob:
                         ts.cross_seed_blob = _adopted_blob
                         ts._blob = _adopted_blob
+                if _claimed_since_snapshot(store, rpt, h, name, size_bytes):
+                    continue
                 store.upsert(ts)
                 rpt.kept.append(h)
                 rpt.adopted.append(h)
@@ -997,6 +1042,8 @@ async def _reconcile_snapshot(
                     if _adopted_blob:
                         ts.cross_seed_blob = _adopted_blob
                         ts._blob = _adopted_blob
+                if _claimed_since_snapshot(store, rpt, h, name, size_bytes):
+                    continue
                 store.upsert(ts)
                 rpt.resumed.append(h)
                 rpt.adopted.append(h)
