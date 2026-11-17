@@ -105,11 +105,18 @@ async def test_single_attempt_and_custom_delays():
 
 
 def test_is_retryable_read_error_shapes():
+    import errno
+
     from racing_sync.retry import is_retryable_read_error
 
     assert is_retryable_read_error(TimeoutError("t")) is True
     assert is_retryable_read_error(ConnectionError("c")) is True
     assert is_retryable_read_error(OSError("o")) is True
+    # Fatal errnos fail fast, same policy as the worker phases.
+    assert is_retryable_read_error(OSError(errno.ENOSPC, "full")) is False
+    assert is_retryable_read_error(FileNotFoundError(errno.ENOENT, "gone")) is False
+    assert is_retryable_read_error(PermissionError(errno.EACCES, "denied")) is False
+    assert is_retryable_read_error(ConnectionResetError(errno.ECONNRESET, "reset")) is True
     assert is_retryable_read_error(ValueError("v")) is False
     assert is_retryable_read_error(RuntimeError("r")) is False
     try:

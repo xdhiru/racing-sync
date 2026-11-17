@@ -33,8 +33,16 @@ _RETRYABLE_HTTP_STATUSES = frozenset({404, 408, 425, 429, 500, 502, 503, 504})
 def is_retryable_read_error(exc: BaseException) -> bool:
     """True when a failed read deserves another attempt. Never raises."""
     try:
-        if isinstance(exc, (TimeoutError, OSError)):
+        if isinstance(exc, TimeoutError):
             return True
+        if isinstance(exc, OSError):
+            # One errno policy with the worker phases: a full or unwritable
+            # disk (ENOSPC/EACCES/ENOENT/...) will not heal in two seconds,
+            # so retrying only delays the loud failure. Socket-backed
+            # errnos (reset, refused, interrupted) stay retryable.
+            from .coordinator_errors import is_fatal_os_error
+
+            return not is_fatal_os_error(exc)
         try:
             import aiohttp
 
