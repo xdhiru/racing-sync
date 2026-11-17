@@ -911,6 +911,24 @@ def test_is_fuse_save_path_resolves_symlinks(tmp_path: Path):
     assert _is_fuse_save_path(cfg, str(tmp_path / "ssd")) is False
 
 
+def test_is_fuse_save_path_folds_case(monkeypatch):
+    """On a case-insensitive host `G:/FUSE` is the same dir as `g:/fuse`.
+
+    Misclassifying it as SSD lets delete_files=True delete remote data
+    through the mount, so the comparison must fold like the OS does.
+    """
+    from racing_sync.forget import _is_fuse_save_path
+
+    monkeypatch.setattr("os.name", "nt")
+    cfg = MagicMock()
+    cfg.rclone.fuse.mount = "g:/fuse"
+    cfg.rclone.fuse.mount_unsorted = "g:/fuse-unsorted"
+
+    assert _is_fuse_save_path(cfg, "G:/FUSE") is True
+    assert _is_fuse_save_path(cfg, "G:/FUSE/Show") is True
+    assert _is_fuse_save_path(cfg, "G:/ssd") is False
+
+
 def test_watch_cross_seed_dir_rejects_hostile_hash(tmp_path: Path):
     """Infohash path joins accept 40-hex only (no traversal, no root)."""
     from racing_sync.coordinator_paths import _watch_cross_seed_dir

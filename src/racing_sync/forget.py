@@ -23,7 +23,7 @@ import logging
 import shutil
 from pathlib import Path
 
-from .coordinator_content import watch_election_winner
+from .coordinator_content import fold_path_case, watch_election_winner
 from .rclone_ops import wipe_local_tree
 from .safety import state_db_parent_refusal, validate_safe_delete_path
 from .state import State
@@ -284,8 +284,13 @@ def _is_fuse_save_path(cfg, save_path: str) -> bool:
         except OSError:
             pass
         for cand in candidates:
+            # OS-aware fold: on Windows `G:/Fuse` and `g:/fuse` are the same
+            # directory, and a miss here classifies a fuse entry as local
+            # SSD — then delete_files=True deletes remote data via the mount.
+            _cand = fold_path_case(cand)
             for base in fm_cands:
-                if cand == base or cand.startswith(base + "/"):
+                _base = fold_path_case(base)
+                if _cand == _base or _cand.startswith(_base + "/"):
                     return True
     return False
 
