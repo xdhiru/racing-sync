@@ -233,11 +233,14 @@ def overlaps_fuse(path: Path, fuse_mounts: list[Path]) -> bool:
         return True
     for f in fuse_mounts or []:
         try:
-            if not f.exists():
-                continue
+            # No exists() gate: Path.exists() is False both for "absent"
+            # and for a failed stat, and an absent mount is exactly when a
+            # wipe must still refuse its path. A configured mount path
+            # resolves lexically either way.
             fres = f.resolve()
         except OSError:
-            continue
+            # Cannot prove where the mount points: fail closed.
+            return True
         # Exact, nested either way: dir inside fuse wipes remote,
         # fuse inside dir wipes the mount via the clear.
         if resolved == fres or resolved.is_relative_to(fres) or fres.is_relative_to(resolved):

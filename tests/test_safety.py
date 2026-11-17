@@ -81,6 +81,31 @@ def test_overlaps_fuse_both_directions(tmp_path: Path):
     assert overlaps_fuse(mnt, []) is False
 
 
+def test_overlaps_fuse_honours_absent_mount(tmp_path: Path):
+    """An unmounted (absent) mount path still overlaps: bytes may return."""
+    absent = tmp_path / "not-mounted"
+    assert overlaps_fuse(absent / "sub", [absent]) is True
+    assert overlaps_fuse(tmp_path, [absent]) is True  # fuse inside dir
+    assert overlaps_fuse(tmp_path / "other", [absent]) is False
+
+
+def test_overlaps_fuse_fails_closed_when_mount_unresolvable(tmp_path: Path, monkeypatch):
+    """A wedged mount that cannot be resolved must count as overlapping."""
+    import pathlib
+
+    wedged = tmp_path / "wedged"
+    wedged.mkdir()
+    real_resolve = pathlib.Path.resolve
+
+    def _resolve(self, *args, **kwargs):
+        if self == wedged:
+            raise OSError("ESTALE")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "resolve", _resolve)
+    assert overlaps_fuse(tmp_path / "other", [wedged]) is True
+
+
 def test_fuse_roots_skips_blanks():
     cfg = _cfg(mount="  ", mount_unsorted="/mnt/remote")
     assert fuse_roots(cfg) == [Path("/mnt/remote")]
