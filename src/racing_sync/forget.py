@@ -428,7 +428,9 @@ async def _forget_one(
                 f"{'y' if len(still) == 1 else 'ies'} still present"
             )
         result["ignored"] = False
+        result["row_kept"] = True
         return result
+    local_failed = False
     if delete_files:
         bases = _ssd_bases(cfg)
         try:
@@ -454,6 +456,15 @@ async def _forget_one(
                 log.info("forget: removed local path %s", p)
             except Exception as e:  # noqa: BLE001
                 result["errors"].append(f"local path {p}: {e}")
+                local_failed = True
+    if local_failed:
+        # Dest entries are gone but the bytes are not: dropping the row here
+        # would orphan them (no owner, no retry, SSD fills until admission
+        # stalls). Keep the row so `forget --apply` can retry the removal.
+        result["errors"].append("kept db row: local bytes could not be removed")
+        result["ignored"] = False
+        result["row_kept"] = True
+        return result
     if ignore:
         try:
             store.ignore_torrent(row.source_infohash, row.source_name)
@@ -551,6 +562,12 @@ async def forget_torrent(
     if _stop_errors:
         result["errors"] = _stop_errors + list(result.get("errors") or [])
     result["paired_cancelled"] = []
+    if result.get("row_kept"):
+        # The owner survived the apply (dest entries or local bytes could not
+        # be removed). Cancelling its waiters now would leave a half-applied
+        # cancel: the next `forget --apply` re-runs the owner and must find
+        # its pairs still live.
+        return result
     if not apply:
         result["paired_cancelled"] = [
             {"source_infohash": p["source_infohash"], "source_name": p["source_name"], "errors": []}

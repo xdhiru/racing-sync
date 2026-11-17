@@ -412,6 +412,73 @@ async def test_forget_cascades_to_waiting_pairs(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_forget_keeps_row_when_local_delete_fails(tmp_path: Path, monkeypatch):
+    """Bytes that survive the wipe must keep their row: no orphan files."""
+    ssd = tmp_path / "ssd"
+    top = ssd / "Pack.One"
+    top.mkdir(parents=True)
+    (top / "a.mkv").write_bytes(b"x" * 10)
+    store = StateStore(tmp_path / "state.db")
+    store.upsert(_row(save_path=str(ssd)))
+    dest = FakeDest()
+    dest.seed("a" * 40, str(ssd), [TorrentFile(name="Pack.One/a.mkv", size_bytes=10)])
+
+    async def _boom(path, bases):
+        raise OSError("EBUSY")
+
+    monkeypatch.setattr("racing_sync.forget._remove_path", _boom)
+
+    result = await forget_torrent(
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
+    )
+
+    assert result["row_kept"] is True
+    assert any("local bytes" in e for e in result["errors"])
+    # The row survives so `forget --apply` can retry the removal.
+    assert store.get("a" * 40) is not None
+
+
+@pytest.mark.anyio
+async def test_forget_keeps_waiters_when_owner_row_kept(tmp_path: Path):
+    """A half-applied forget must not tombstone the owner's waiters."""
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store, _owner, _waiters, _bystanders = _watch_pair_store(tmp_path)
+    dest = FakeDest()
+    dest.seed("a" * 40, str(ssd), [TorrentFile(name="Shared/a.mkv", size_bytes=10)])
+    _orig_delete = dest.delete
+
+    async def _delete(h, *, delete_files=False):
+        if h.lower() == "a" * 40:
+            raise RuntimeError("dest refused")
+        return await _orig_delete(h, delete_files=delete_files)
+
+    dest.delete = _delete
+
+    result = await forget_torrent(
+        _cfg(ssd),
+        dest=dest,
+        store=store,
+        target="a" * 40,
+        apply=True,
+        delete_files=True,
+        ignore=True,
+    )
+
+    assert result["row_kept"] is True
+    assert result["paired_cancelled"] == []
+    assert store.get("a" * 40) is not None
+    assert store.get("b" * 40) is not None
+    assert store.get("c" * 40) is not None
+    assert store.is_ignored("b" * 40) is False
+
+
+@pytest.mark.anyio
 async def test_forget_dry_run_plans_pairs_without_deleting(tmp_path: Path):
     ssd = tmp_path / "ssd"
     ssd.mkdir()
