@@ -1006,7 +1006,11 @@ class FuseMixin:
         except Exception:  # noqa: BLE001
             return missing
         if fresh_missing is None:
-            return missing
+            # Indeterminate re-probe (dead mount, stat error) is an outage,
+            # not proof the content is gone. Returning the cached miss here
+            # charged a 30-minute content backoff for a mount that may be
+            # back in seconds; the next probe confirms a real miss instead.
+            return [f"<mount unavailable: {target_mount}>"]
         return fresh_missing
 
     async def _fetch_racing_torrent_bytes(self, infohash: str) -> bytes | None:

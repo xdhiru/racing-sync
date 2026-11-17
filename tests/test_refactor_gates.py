@@ -212,6 +212,27 @@ async def test_fuse_gate_trusts_a_populated_directory(tmp_path, monkeypatch):
     assert await missing_under(mount, [("Show/a.mkv", 10)]) == []
 
 
+@pytest.mark.anyio
+async def test_confirmed_miss_treats_indeterminate_probe_as_outage(tmp_path, monkeypatch):
+    """A dead mount must not be charged as a 30-minute content miss."""
+    from unittest.mock import AsyncMock
+
+    from conftest import make_coordinator
+
+    from racing_sync import fuse_gate
+
+    coord = make_coordinator()
+    coord._missing_fuse_files = AsyncMock(return_value=["Show/a.mkv"])
+
+    async def _indeterminate(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(fuse_gate, "missing_under", _indeterminate)
+
+    got = await coord._confirmed_fuse_missing(tmp_path, [("Show/a.mkv", 10)])
+    assert got == [f"<mount unavailable: {tmp_path}>"]
+
+
 def test_title_normalizer_is_single_implementation():
     """Prowlarr matching delegates to the one coordinator normalizer."""
     from racing_sync.coordinator_content import normalize_content_name
