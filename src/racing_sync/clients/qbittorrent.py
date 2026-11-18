@@ -623,17 +623,30 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                 await r.read()
             self._legacy_pause_api = False
         except aiohttp.ClientResponseError as e:
-            if e.status == 404:
-                # Legacy qBittorrent (< v5.0) fallback, remembered.
-                self._legacy_pause_api = True
-                data2 = aiohttp.FormData()
-                data2.add_field("hashes", torrent_hash)
+            if e.status != 404:
+                raise
+            # Legacy qBittorrent (< v5.0) fallback. Latch only after the
+            # legacy call lands: a 404 on both spellings means the torrent
+            # is gone (or a proxy is answering), not that the server is
+            # old — latching there disables pause/resume for the process
+            # lifetime.
+            data2 = aiohttp.FormData()
+            data2.add_field("hashes", torrent_hash)
+            try:
                 async with await self.request(
                     "POST", f"/api/v2/torrents/{'pause' if pause else 'resume'}", data=data2
                 ) as r:
                     await r.read()
-            else:
+            except aiohttp.ClientResponseError as e2:
+                if e2.status == 404:
+                    log.debug(
+                        "%s pause/resume: %s not found under either API name; skipping",
+                        self._label,
+                        (torrent_hash or "")[:10],
+                    )
+                    return
                 raise
+            self._legacy_pause_api = True
 
     async def pause(self, torrent_hash: str) -> None:
         await self._pause_resume(torrent_hash, pause=True)

@@ -1601,6 +1601,47 @@ async def test_qb_pause_probes_version_once():
 
 
 @pytest.mark.anyio
+async def test_qb_pause_does_not_latch_on_double_404():
+    """Two 404s mean a missing torrent, not a legacy server.
+
+    Latching on the first 404 disabled pause/resume for the process
+    lifetime when the fallback also 404'd.
+    """
+    import aiohttp
+
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+    seen = []
+
+    class DummyCtx:
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.read = AsyncMock()
+            return resp
+
+        async def __aexit__(self, *args):
+            pass
+
+    async def mock_request(method, path, **kwargs):
+        seen.append(path)
+        raise aiohttp.ClientResponseError(
+            request_info=MagicMock(), history=(), status=404, message="not found"
+        )
+
+    client.request = mock_request
+    await client.pause("a" * 40)
+    await client.pause("a" * 40)
+
+    assert client._legacy_pause_api is None
+    assert seen == [
+        "/api/v2/torrents/stop",
+        "/api/v2/torrents/pause",
+        "/api/v2/torrents/stop",
+        "/api/v2/torrents/pause",
+    ]
+
+
+@pytest.mark.anyio
 async def test_qb_prio_failure_logs_applied_and_raises():
     """A mid-set 404 names what landed before failing."""
     import aiohttp
