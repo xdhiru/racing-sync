@@ -2706,7 +2706,10 @@ class Coordinator(
             # prevents same-tick fallthrough (NEW that just parked must
             # wait out its timer).
             await self._do_waiting_indexer(ts)
-        if ts.state == State.WAITING_DISK:
+        if ts.state == State.WAITING_DISK and _entry_state == State.WAITING_DISK:
+            # Entry-state guard like WAITING_INDEXER: a row that parked
+            # itself in this pass (NEW -> WAITING_DISK) must wait out its
+            # quiet timer instead of re-checking the ledger immediately.
             await self._wait_disk_then_queue(ts)
         if ts.state == State.QUEUED:
             # download_sem guards QUEUED admission only (_do_queued is

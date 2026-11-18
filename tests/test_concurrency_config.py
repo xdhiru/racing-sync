@@ -854,6 +854,28 @@ async def test_wait_disk_then_queue_does_not_block_worker():
 
 
 @pytest.mark.anyio
+async def test_new_row_parking_on_disk_waits_for_quiet_timer():
+    """A row that just parked in WAITING_DISK must not re-check same tick.
+
+    Without the entry-state guard the worker ran _wait_disk_then_queue
+    immediately after _do_new parked, defeating the quiet period the
+    scheduler just set.
+    """
+    coord = make_coordinator()
+    coord._wait_disk_then_queue = AsyncMock()
+
+    async def _park(t):
+        t.state = State.WAITING_DISK
+
+    coord._do_new = AsyncMock(side_effect=_park)
+    ts = TorrentState(source_infohash="h1", state=State.NEW, total_bytes=1000)
+
+    await coord._process_torrent_inner(ts)
+
+    coord._wait_disk_then_queue.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_do_queued_happy_path():
     coord = make_coordinator()
     coord.cfg.rclone.fuse.mount = "/mnt/fuse"
