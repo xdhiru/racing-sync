@@ -280,6 +280,66 @@ async def test_fuse_first_add_verified_before_trust(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_fuse_replace_verifies_bytes_before_success(tmp_path):
+    """The replace exit must run the same byte check as a fresh add.
+
+    A gate→add race can leave the replacement pointing at a target whose
+    bytes are gone; trusting save_path alone marked such rows injected.
+    """
+    from unittest.mock import AsyncMock
+
+    from test_watchdir import _create_sample_torrent_data
+
+    from racing_sync.clients.abstract import AddResult, Torrent
+    from racing_sync.coordinator import _NOT_VISIBLE_DETAIL
+
+    h = "cd" * 20
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+    blob = _create_sample_torrent_data("Top.Show", 300, "http://x/announce")
+
+    coord = make_coordinator()
+    coord.dest_client = AsyncMock()
+    # First add is a duplicate whose entry sits on the SSD; after the
+    # delete+re-add the entry points at the fuse target.
+    coord.dest_client.add_torrent = AsyncMock(
+        side_effect=[
+            AddResult(hash=h, accepted=False, detail="already added"),
+            AddResult(hash=h, accepted=True, detail="Ok."),
+        ]
+    )
+    coord.dest_client.get_torrent = AsyncMock(
+        side_effect=[
+            Torrent(
+                hash=h,
+                name="Top.Show",
+                category="racing",
+                save_path="/ssd/x",
+                size_bytes=300,
+                state="pausedUP",
+                progress=1.0,
+            ),
+            Torrent(
+                hash=h,
+                name="Top.Show",
+                category="racing",
+                save_path=str(fuse),
+                size_bytes=300,
+                state="pausedUP",
+                progress=1.0,
+            ),
+        ]
+    )
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
+    coord.dest_client.delete = AsyncMock()
+
+    ok, detail = await coord._ensure_fuse_entry(blob=blob, infohash=h, target_mount=fuse, label="t")
+
+    assert ok is False
+    assert detail == _NOT_VISIBLE_DETAIL
+
+
+@pytest.mark.anyio
 async def test_deluge_scan_cached_across_hash_lookups():
     """Single-hash get_torrent bursts share one full scan (5s TTL)."""
     from unittest.mock import AsyncMock

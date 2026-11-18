@@ -1499,6 +1499,18 @@ class FuseMixin:
                     getattr(dest_st2, "save_path", ""), target_mount
                 ):
                     log.info("re-injected %s %s on fuse (%s)", label, h_low[:10], target_mount)
+                    # Same post-add byte check as the fresh-add and
+                    # already-on-fuse exits: a gate→add race can leave the
+                    # replacement pointing at a target whose bytes vanished.
+                    if not await self._fuse_entry_bytes_ok(blob, target_mount):
+                        log.warning(
+                            "%s %s replaced entry visible but bytes unverifiable "
+                            "at %s; parking re-add",
+                            label,
+                            h_low[:10],
+                            target_mount,
+                        )
+                        return False, _NOT_VISIBLE_DETAIL
                     if not await self._select_all_fuse_files(h_low, label=label):
                         return False, _NOT_VISIBLE_DETAIL
                     if pause_public:
