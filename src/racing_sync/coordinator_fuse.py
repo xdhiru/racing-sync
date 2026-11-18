@@ -799,7 +799,7 @@ class FuseMixin:
         if not expected:
             return None
         try:
-            target = self._target_mount_for_blob(blob, self._target_mount_for(ts))
+            target = self._verify_mount_for(ts, blob, self._target_mount_for(ts))
         except Exception:  # noqa: BLE001
             return None
         missing_entries = hashes - have
@@ -1210,6 +1210,24 @@ class FuseMixin:
         if kind == "unknown":
             return fallback
         return self._target_mount_for_kind(kind, fallback)
+
+    def _verify_mount_for(self, ts: TorrentState, blob: bytes | None, fallback: Path) -> Path:
+        """Where a row's fuse bytes should be verified.
+
+        An adopted entry can live in a subfolder of the mount (its own
+        save_path, e.g. mount/SUB). Verifying at the blob-derived root
+        would report every expected file missing — VPS1 never gets cleaned
+        and repair defers forever — so a save_path recorded on a
+        configured fuse mount wins; the blob-derived target stays the
+        fallback for rows that were never adopted.
+        """
+        try:
+            sp = str(getattr(ts, "save_path", "") or "").replace("\\", "/").rstrip("/")
+            if sp and self._save_path_is_on_fuse(sp):
+                return Path(sp)
+        except Exception:
+            pass
+        return self._target_mount_for_blob(blob, fallback)
 
     def _save_path_points_at_target(self, save_path: object, target_mount: object) -> bool:
         """Does an existing client entry point at the fuse target we inject to?

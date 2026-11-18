@@ -340,6 +340,59 @@ async def test_fuse_replace_verifies_bytes_before_success(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_done_row_in_fuse_subfolder_verifies_at_its_own_path(tmp_path):
+    """A row adopted at mount/SUB must verify there, not at the mount root.
+
+    Verifying at the configured root reports every expected file missing,
+    so cleanup keeps VPS1 forever and repair defers on a healthy seed.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from test_watchdir import _create_sample_torrent_data
+
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import State, TorrentState
+
+    h = "ef" * 20
+    fuse = tmp_path / "fuse"
+    sub = fuse / "SUB"
+    sub.mkdir(parents=True)
+    blob = _create_sample_torrent_data("Top.Show", 300, "http://x/announce")
+    (sub / "Top.Show").write_bytes(b"x" * 300)
+
+    coord = make_coordinator()
+    coord.cfg = MagicMock()
+    coord.cfg.rclone.fuse.mount = str(fuse)
+    coord.cfg.rclone.fuse.mount_unsorted = str(fuse / "unsorted")
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash=h,
+                name="Top.Show",
+                category="racing",
+                save_path=str(sub),
+                size_bytes=300,
+                state="seeding",
+                progress=1.0,
+            )
+        ]
+    )
+
+    ts = TorrentState(
+        source_infohash=h,
+        dest_infohash=h,
+        source_name="Top.Show",
+        save_path=str(sub),
+        total_bytes=300,
+        state=State.DONE,
+    )
+    ts._blob = blob
+
+    assert await coord._verified_fuse_mount_for_done_row(ts) == sub
+
+
+@pytest.mark.anyio
 async def test_deluge_scan_cached_across_hash_lookups():
     """Single-hash get_torrent bursts share one full scan (5s TTL)."""
     from unittest.mock import AsyncMock

@@ -681,7 +681,7 @@ class CleanupMixin:
             )
             return False
         try:
-            target = self._target_mount_for_blob(blob, self._target_mount_for(ts))
+            target = self._verify_mount_for(ts, blob, self._target_mount_for(ts))
         except Exception:  # noqa: BLE001
             return False
         try:
