@@ -331,7 +331,13 @@ class HTTPClientBase:
         host_clean = host_str.strip().rstrip("/")
         parsed = urllib.parse.urlsplit(host_str.strip())
         if parsed.scheme and parsed.hostname:
-            origin = f"{parsed.scheme}://{parsed.hostname}"
+            _origin_host = parsed.hostname
+            if ":" in _origin_host:
+                # urlsplit strips the brackets from an IPv6 literal; RFC
+                # 6454 needs them back, or "http://::1:8080" parses as
+                # garbage and every CSRF check rejects the POST.
+                _origin_host = f"[{_origin_host}]"
+            origin = f"{parsed.scheme}://{_origin_host}"
             try:
                 if parsed.port:
                     origin += f":{parsed.port}"

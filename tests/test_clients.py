@@ -1568,6 +1568,22 @@ async def test_qb_trackers_survive_bad_rows_and_auth_propagates():
 
 
 @pytest.mark.anyio
+async def test_http_client_origin_brackets_ipv6_literal():
+    """RFC 6454 needs the brackets that urlsplit strips from an IPv6 host."""
+    from racing_sync.clients.http_base import HTTPClientBase
+    from racing_sync.config import HTTPClientConfig
+
+    cfg = HTTPClientConfig(host="http://[::1]:8080", nginx_mode="off")
+    client = HTTPClientBase(cfg)
+    await client.start()
+    try:
+        assert client.session.headers["Origin"] == "http://[::1]:8080"
+        assert client.session.headers["Referer"] == "http://[::1]:8080/"
+    finally:
+        await client.close()
+
+
+@pytest.mark.anyio
 async def test_qb_pause_probes_version_once():
     """Legacy fallback remembers; modern servers skip probing entirely."""
     cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
