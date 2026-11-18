@@ -555,7 +555,8 @@ def build_app(coord: Coordinator) -> FastAPI:
         try:
             _mount = getattr(getattr(getattr(cfg, "rclone", None), "fuse", None), "mount", None)
             _mpath = os.fspath(_mount) if _mount is not None else ""
-            checks["fuse_mount"] = bool(_mpath) and os.path.isdir(_mpath)
+            # A stat against a wedged mount can block: keep it off the loop.
+            checks["fuse_mount"] = bool(_mpath) and await asyncio.to_thread(os.path.isdir, _mpath)
         except Exception:
             checks["fuse_mount"] = False
         # SSD path writable with readable free space.
@@ -564,7 +565,9 @@ def build_app(coord: Coordinator) -> FastAPI:
             _spath_s = os.fspath(_spath) if _spath is not None else ""
             _writable = bool(_spath_s) and os.access(_spath_s, os.W_OK)
             _free = await asyncio.to_thread(ssd_free_bytes, cfg)
-            checks["ssd_writable"] = bool(_writable and int(_free) >= 0)
+            # 0 means "unknown or full" (statvfs failure returns 0), so the
+            # test must be strictly positive — `>= 0` could never fail.
+            checks["ssd_writable"] = bool(_writable and int(_free) > 0)
         except Exception:
             checks["ssd_writable"] = False
         # Per-lane freshness: production loops heartbeat independently;

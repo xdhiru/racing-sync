@@ -395,6 +395,28 @@ def test_readyz_reports_checks_when_authed(tmp_path):
     assert client.get("/readyz").status_code == 401
 
 
+def test_readyz_ssd_writable_fails_on_zero_free(tmp_path, monkeypatch):
+    """statvfs failure reports 0 free, which must fail readiness."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    coord, _ = _api_coord()
+    cfg = MagicMock()
+    cfg.api = APIConfig(enabled=True, api_token="secret", trust_nginx_header=False)
+    cfg.rclone = SimpleNamespace(fuse=SimpleNamespace(mount=tmp_path))
+    cfg.ssd = SimpleNamespace(path=tmp_path)
+    coord.cfg = cfg
+    coord._last_tick_at = 1e18  # fresh
+
+    with patch("racing_sync.api.ssd_free_bytes", return_value=0):
+        app = build_app(coord)
+        client = TestClient(app)
+        data = client.get("/readyz", headers={"X-Api-Token": "secret"}).json()
+
+    assert data["checks"]["ssd_writable"] is False
+    assert data["ready"] is False
+
+
 def test_metrics_exposes_state_counts():
     import time as _time
 
