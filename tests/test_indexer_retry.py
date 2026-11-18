@@ -1914,6 +1914,49 @@ async def test_inflight_both_unknown_size_proceeds(tmp_path):
         store.close()
 
 
+def test_inflight_same_content_elects_oldest_pre_admit_row(tmp_path):
+    """Two NEW same-content rows: the older proceeds, the newer defers.
+
+    Nothing is QUEUED yet, so before the election both rows admitted in
+    the same pass and downloaded the same bytes twice.
+    """
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator()
+        coord.cfg = _cfg()
+        coord.store = store
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Twin.Show",
+                total_bytes=100,
+                state=State.NEW,
+                created_at=base,
+            )
+        )
+        store.upsert(
+            TorrentState(
+                source_infohash="b" * 40,
+                source_name="Twin.Show",
+                total_bytes=100,
+                state=State.NEW,
+                created_at=base + dt.timedelta(minutes=1),
+            )
+        )
+        older = store.get("a" * 40)
+        newer = store.get("b" * 40)
+
+        assert coord._inflight_same_content(older) is None
+        winner = coord._inflight_same_content(newer)
+        assert winner is not None
+        assert winner.source_infohash == "a" * 40
+    finally:
+        store.close()
+
+
 @pytest.mark.anyio
 async def test_ssd_downloading_quiet_park_keeps_public_schedule(tmp_path):
     """A public-export row whose SSD entry is still downloading pushes

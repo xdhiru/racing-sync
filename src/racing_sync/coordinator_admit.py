@@ -21,6 +21,7 @@ from .content_keys import same_content as _same_content_key
 from .coordinator_content import (
     WATCH_ELECTION_WAITER_STATES,
     WATCH_ORIGIN_LABELS,
+    _created_ts,
     _looks_public,
     _matches_release,
     announce_domain,
@@ -51,6 +52,11 @@ _BLOB_PARSE_TTL_S = 300.0
 # Live-content snapshot sharing window: _inflight_same_content callers
 # (workers + Telegram notes) share one all_active() scan per window.
 _INFLIGHT_SNAPSHOT_S = 30.0
+
+#: States that already own (or are acquiring) the SSD bytes for their content.
+_INFLIGHT_OWNER_STATES = frozenset({State.QUEUED, State.DOWNLOADING, State.MOVING, State.RE_ADDING})
+#: Pre-admission states that can still race into admission in one pass.
+_INFLIGHT_PREADMIT_STATES = frozenset({State.NEW, State.WAITING_INDEXER, State.WAITING_DISK})
 
 #: Consecutive empty file lists after add before the row fails. The client
 #: parses metadata in seconds, so an empty list that survives several
@@ -942,14 +948,22 @@ class AdmitMixin:
             self._schedule_telegram_update(ts)
 
     def _inflight_same_content(self, ts: TorrentState):
-        """Live same-content row already past admission, else None.
+        """Row that owns (or is winning) this content, else None.
 
-        Covers QUEUED/DOWNLOADING/MOVING/RE_ADDING in any origin (watch
-        or racing): either way its bytes are on (or heading to) the SSD,
-        so a fresh Prowlarr search here would only duplicate them. DONE
-        is excluded on purpose — a finished sibling no longer holds SSD
-        work, and the normal pick (with its all-remote shortcut) is the
-        right path then. Fail-open None: any doubt runs the normal pick.
+        Owners (QUEUED/DOWNLOADING/MOVING/RE_ADDING) hold the SSD bytes in
+        any origin (watch or racing): a fresh Prowlarr search here would
+        only duplicate them. DONE is excluded on purpose — a finished
+        sibling no longer holds SSD work, and the normal pick (with its
+        all-remote shortcut) is the right path then.
+
+        With no owner yet, pre-admission rows are elected deterministically
+        (oldest row, then hash): two NEW rows with the same content used to
+        both admit in one pass, because nothing QUEUED existed to stop
+        either. The losers defer and retry on the normal indexer schedule.
+        Watch rows are skipped here — their election ranks by tracker
+        (public first) and an age-based pick would override it.
+
+        Fail-open None: any doubt runs the normal pick.
 
         Stays synchronous: the Telegram refresh loop calls this (via
         _watch_wait_note) inline, and it is one indexed SELECT — the
@@ -964,34 +978,58 @@ class AdmitMixin:
             rows = self._inflight_snapshot_rows()
         except Exception:
             return None
+        owners: list = []
+        waiters: list = []
         try:
             for r in rows or []:
                 try:
-                    if (r.source_infohash or "").lower() == me or r.state not in (
-                        State.QUEUED,
-                        State.DOWNLOADING,
-                        State.MOVING,
-                        State.RE_ADDING,
-                    ):
+                    if (r.source_infohash or "").lower() == me:
+                        continue
+                    if r.state in _INFLIGHT_OWNER_STATES:
+                        bucket = owners
+                    elif r.state in _INFLIGHT_PREADMIT_STATES:
+                        bucket = waiters
+                    else:
                         continue
                     # Single content-key rule (see content_keys.same_content):
                     # same normalized name + same size when both known.
                     # Unknown sizes match (fail toward dedup, like the watch
                     # election) to avoid duplicate SSD downloads — except
                     # both-unknown, which would mutually defer forever.
-                    if _same_content_key(
+                    if not _same_content_key(
                         r.source_name or "",
                         r.total_bytes or 0,
                         ts.source_name or "",
                         ts.total_bytes or 0,
                         require_size=True,
                     ):
-                        return r
+                        continue
+                    bucket.append(r)
                 except Exception:
                     continue
         except Exception:
             pass
-        return None
+        if owners:
+            return owners[0]
+        if not waiters:
+            return None
+        try:
+            if self._is_watch_row(ts):
+                return None
+            waiters = [r for r in waiters if not self._is_watch_row(r)]
+        except Exception:
+            return None
+        if not waiters:
+            return None
+
+        def _election_key(row) -> tuple:
+            return (_created_ts(row), (row.source_infohash or "").lower())
+
+        try:
+            winner = min([*waiters, ts], key=_election_key)
+        except Exception:
+            return None
+        return None if winner is ts else winner
 
     def _inflight_snapshot_rows(self):
         """all_active() snapshot shared for _INFLIGHT_SNAPSHOT_S seconds."""

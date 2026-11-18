@@ -1769,6 +1769,14 @@ class Coordinator(
         loop or API ops cannot double-schedule or clobber rows.
         """
         log.debug("scheduler: enter")
+        # A scheduling pass decides which same-content row owns the bytes.
+        # Deciding from a 30s-old snapshot would miss rows created since
+        # (and transitions), letting two rows admit together — drop it so
+        # the pass elects against the live table.
+        try:
+            self._inflight_snapshot = None
+        except Exception:
+            pass
         # 3. Wake up WAITING_INDEXER rows whose retry timer has elapsed —
         # both the download-target indexer schedule and the independent
         # public-export schedule. Indexer wakeups still respect worker
