@@ -1754,3 +1754,45 @@ def test_parallel_bounds_explicit_config_wins():
         )
     )
     assert plain._parallel_bounds() == (4, 90.0)
+
+
+@pytest.mark.anyio
+async def test_parallel_search_returns_completed_hits_on_timeout(monkeypatch):
+    """A slow indexer must not discard the hits others already returned."""
+    import asyncio
+
+    from racing_sync.prowlarr import Indexer, ProwlarrClient, TorrentHit
+
+    cfg = ProwlarrConfig(
+        enabled=True,
+        base_url="http://localhost:9696",
+        api_key="secret",
+        download_indexers=[DownloadIndexerConfig(name="Fast (API)", announce_substrings=["fast"])],
+    )
+    client = ProwlarrClient(cfg)
+    monkeypatch.setattr(client, "_parallel_bounds", lambda: (4, 0.05))
+    fast = Indexer(1, "Fast (API)", "torrent", True, [])
+    slow = Indexer(2, "Slow (API)", "torrent", True, [])
+    hit = TorrentHit(
+        title="Show.S01.1080p",
+        guid="1",
+        indexer="Fast (API)",
+        indexer_id=1,
+        size_bytes=100,
+        download_url="http://x/1",
+        magnet_url="",
+        info_url="",
+        publish_date="",
+    )
+
+    async def _search(idx, query):
+        if idx is slow:
+            await asyncio.sleep(5)
+            return []
+        return [hit]
+
+    monkeypatch.setattr(client, "search_indexer", _search)
+    results = await client.search_indexers_parallel([fast, slow], "Show.S01.1080p")
+
+    assert results.get("fast (api)") == [hit]
+    assert "slow (api)" not in results

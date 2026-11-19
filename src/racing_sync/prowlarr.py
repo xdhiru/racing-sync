@@ -735,20 +735,33 @@ class ProwlarrClient:
                     log.warning("prowlarr search on indexer %r failed: %s", idx.name, e)
                     return idx.name.lower(), []
 
-        tasks = [_search_one(idx) for idx in indexers]
-        try:
-            results = await asyncio.wait_for(
-                asyncio.gather(*tasks),
-                timeout=_timeout,
-            )
-        except TimeoutError:
+        tasks = [asyncio.create_task(_search_one(idx)) for idx in indexers]
+        if not tasks:
+            return {}
+        # wait() instead of wait_for(gather()): a timeout used to discard
+        # every hit already collected while the log promised "partial hits".
+        _done, _pending = await asyncio.wait(tasks, timeout=_timeout)
+        if _pending:
             log.warning(
-                "prowlarr parallel search timed out after %.0fs for %r; using partial hits",
+                "prowlarr parallel search timed out after %.0fs for %r; "
+                "using %d/%d partial result(s)",
                 _timeout,
                 query,
+                len(_done),
+                len(tasks),
             )
-            return {}
-        return dict(results)
+            for _task in _pending:
+                _task.cancel()
+            # Drain the cancellations so no task outlives this call.
+            await asyncio.gather(*_pending, return_exceptions=True)
+        results: dict[str, list[TorrentHit]] = {}
+        for _task in _done:
+            try:
+                _name, _hits = _task.result()
+            except Exception:  # noqa: BLE001 — cancelled/failed indexer
+                continue
+            results[_name] = _hits
+        return results
 
 
 # ---------- helpers ----------
