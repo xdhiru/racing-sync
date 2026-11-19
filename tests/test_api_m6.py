@@ -148,12 +148,31 @@ async def test_tick_records_health_attrs():
     assert coord._last_tick_at <= time.monotonic()
 
 
-def test_prowlarr_and_rclone_counters_roundtrip():
-    from racing_sync.prowlarr import prowlarr_counters
-    from racing_sync.rclone_ops import rclone_counters
+def test_prowlarr_and_rclone_counters_roundtrip(monkeypatch):
+    """Counters reflect activity, from their own baseline.
 
-    assert prowlarr_counters() == {"searches": 0, "hits": 0, "errors": 0}
-    assert rclone_counters() == {"moves": 0, "move_ok": 0, "move_fail": 0}
+    Asserting absolute zeros made the test depend on whatever ran earlier
+    in the process (and broke under pytest-xdist, where another file can
+    claim the worker first).
+    """
+    import racing_sync.prowlarr as prowlarr_mod
+    import racing_sync.rclone_ops as rclone_mod
+
+    monkeypatch.setattr(
+        prowlarr_mod, "_PROWLARR_COUNTERS", {"searches": 0, "hits": 0, "errors": 0}
+    )
+    monkeypatch.setattr(
+        rclone_mod, "_RCLONE_COUNTERS", {"moves": 0, "move_ok": 0, "move_fail": 0}
+    )
+
+    prowlarr_mod._note_prowlarr_search()
+    prowlarr_mod._note_prowlarr_hits(3)
+    prowlarr_mod._note_prowlarr_error()
+    rclone_mod._note_rclone_move(True)
+    rclone_mod._note_rclone_move(False)
+
+    assert prowlarr_mod.prowlarr_counters() == {"searches": 1, "hits": 3, "errors": 1}
+    assert rclone_mod.rclone_counters() == {"moves": 2, "move_ok": 1, "move_fail": 1}
 
 
 def test_forget_keeps_per_pair_attribution_and_identity(caplog):
