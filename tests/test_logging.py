@@ -181,6 +181,82 @@ def test_sanitizing_formatter_scrubs_secrets_in_text_logs():
     assert "Bearer ***" in formatted
 
 
+def test_sanitize_redacts_header_keys_in_bodies():
+    """Header names quoted as JSON keys must redact like api_key does."""
+    from racing_sync.logging_setup import sanitize_log_text
+
+    cases = (
+        ('{"X-Api-Key": "abc123secret"}', "abc123secret"),
+        ('{"x-api-token": "tok-9"}', "tok-9"),
+        ('{"Cookie": "session=deadbeef"}', "deadbeef"),
+        ('{"Set-Cookie": "sid=deadbeef"}', "deadbeef"),
+    )
+    for leaked, secret in cases:
+        assert secret not in sanitize_log_text(leaked), leaked
+
+
+def test_sanitizing_formatter_blocks_log_injection():
+    """A newline in a torrent name must not forge a second log line."""
+    from racing_sync.logging_setup import DATE_FORMAT, LOG_FORMAT, SanitizingFormatter
+
+    formatter = SanitizingFormatter(LOG_FORMAT, DATE_FORMAT)
+    record = logging.LogRecord(
+        name="racing_sync.test",
+        level=logging.INFO,
+        pathname="test.py",
+        lineno=1,
+        msg="picked up Evil.Name\n2026-01-01 00:00:00 INFO racing_sync :: forged line",
+        args=(),
+        exc_info=None,
+    )
+    formatted = formatter.format(record)
+    assert "\n" not in formatted
+    assert "forged line" in formatted  # flattened, not dropped
+
+
+def test_sanitizing_formatter_keeps_traceback_lines():
+    """Stripping control chars from the message must not flatten tracebacks."""
+    import sys
+
+    from racing_sync.logging_setup import DATE_FORMAT, LOG_FORMAT, SanitizingFormatter
+
+    formatter = SanitizingFormatter(LOG_FORMAT, DATE_FORMAT)
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            name="racing_sync.test",
+            level=logging.ERROR,
+            pathname="test.py",
+            lineno=1,
+            msg="move failed: %s",
+            args=("x",),
+            exc_info=sys.exc_info(),
+        )
+    formatted = formatter.format(record)
+    assert "\n" in formatted
+    assert "ValueError: boom" in formatted
+
+
+def test_jsonl_formatter_strips_control_chars():
+    import json
+
+    from racing_sync.logging_setup import JsonlFormatter
+
+    record = logging.LogRecord(
+        name="racing_sync.test",
+        level=logging.INFO,
+        pathname="test.py",
+        lineno=1,
+        msg="picked up Evil.Name\nforged",
+        args=(),
+        exc_info=None,
+    )
+    payload = json.loads(JsonlFormatter().format(record))
+    assert "\n" not in payload["message"]
+    assert "forged" in payload["message"]
+
+
 def test_logging_sink_plaintext_fails_closed():
     """Plaintext http:// to a non-local host needs explicit opt-in."""
     import pydantic

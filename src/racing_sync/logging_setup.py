@@ -31,16 +31,19 @@ from .config import AppConfig, LoggingSinkConfig
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s :: %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-SENSITIVE_KEY_WORDS = ("passkey", "api_key", "apikey", "token", "auth", "secret", "password")
-
 _SENSITIVE_PARAM_RE = re.compile(
     r"((?:passkey|passwd|pwd|pass[_-]?key|api[_-]?key|auth[_-]?key|secret[_-]?key|token|secret|password|auth|torrent[_-]?pass)\s*[:=]\s*[\"']?)([^&\s\"'},;]+)",
     re.IGNORECASE,
 )
 # JSON bodies: {"password": "x"} / {'api_key':'y'} — the param pattern
 # above misses the closing-quote/space variants; catch them explicitly.
+# Header names (X-Api-Key, Cookie, Set-Cookie) appear verbatim in bodies
+# dumps, so they are part of the key set too.
 _SENSITIVE_JSON_RE = re.compile(
-    r"([\"'](?:passkey|passwd|pwd|pass[_-]?key|api[_-]?key|auth[_-]?key|secret[_-]?key|token|secret|password|auth|torrent[_-]?pass)[\"']\s*:\s*[\"'])([^\"']+)",
+    r"([\"'](?:passkey|passwd|pwd|pass[_-]?key|apikey"
+    r"|x[_-]?api[_-]?(?:key|token)|api[_-]?(?:key|token)"
+    r"|auth[_-]?key|secret[_-]?key|set[_-]?cookie|cookie"
+    r"|token|secret|password|auth|torrent[_-]?pass)[\"']\s*:\s*[\"'])([^\"']+)",
     re.IGNORECASE,
 )
 _BEARER_TOKEN_RE = re.compile(
@@ -134,6 +137,23 @@ def sanitize_log_text(text: str) -> str:
     return text
 
 
+#: C0 controls + DEL. Message text is untrusted (torrent names, tracker
+#: payloads), and a newline in it can forge a second log line.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def strip_control_chars(text: str) -> str:
+    """Keep untrusted text on one line.
+
+    Applied to the message and its args only: the traceback a formatter
+    appends afterwards keeps the newlines it was built with.
+    """
+    try:
+        return _CONTROL_CHARS_RE.sub(" ", text)
+    except Exception:
+        return text
+
+
 def is_sensitive_key(key: object) -> bool:
     """Check if a dictionary key indicates sensitive credentials."""
     try:
@@ -149,6 +169,22 @@ class SanitizingFormatter(logging.Formatter):
     """Formatter that sanitizes sensitive tokens, passkeys, and passwords from formatted text."""
 
     def format(self, record: logging.LogRecord) -> str:
+        # Untrusted message text must not forge extra lines; the traceback
+        # super().format() appends keeps its own newlines.
+        try:
+            if isinstance(record.msg, str):
+                record.msg = strip_control_chars(record.msg)
+            if isinstance(record.args, tuple):
+                record.args = tuple(
+                    strip_control_chars(a) if isinstance(a, str) else a for a in record.args
+                )
+            elif isinstance(record.args, dict):
+                record.args = {
+                    k: (strip_control_chars(v) if isinstance(v, str) else v)
+                    for k, v in record.args.items()
+                }
+        except Exception:
+            pass
         formatted = super().format(record)
         return sanitize_log_text(formatted)
 
@@ -180,7 +216,7 @@ class RingBufferHandler(logging.Handler):
                 ts=dt.datetime.fromtimestamp(record.created, tz=dt.UTC),
                 level=record.levelno,
                 logger=record.name,
-                message=sanitize_log_text(record.getMessage())[:2000],
+                message=strip_control_chars(sanitize_log_text(record.getMessage()))[:2000],
             )
             with self._lock:
                 self._buf.append(ev)
@@ -205,7 +241,7 @@ class JsonlFormatter(logging.Formatter):
             "ts": dt.datetime.fromtimestamp(record.created, tz=dt.UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": sanitize_log_text(record.getMessage()),
+            "message": strip_control_chars(sanitize_log_text(record.getMessage())),
         }
         if record.exc_info:
             payload["exc"] = sanitize_log_text(self.formatException(record.exc_info))
@@ -359,7 +395,7 @@ class HTTPSinkHandler(logging.handlers.QueueHandler):
                 "ts": dt.datetime.fromtimestamp(record.created, tz=dt.UTC).isoformat(),
                 "level": record.levelname,
                 "logger": record.name,
-                "message": sanitize_log_text(record.getMessage()),
+                "message": strip_control_chars(sanitize_log_text(record.getMessage())),
             }
             try:
                 data = json.dumps(payload).encode("utf-8")
