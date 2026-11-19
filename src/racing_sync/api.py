@@ -27,12 +27,14 @@ from pydantic import BaseModel
 
 try:
     from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+    from fastapi.responses import JSONResponse
 
     HAS_FASTAPI = True
 except ImportError:
     HAS_FASTAPI = False
     Depends = Header = HTTPException = Query = Request = object  # type: ignore[assignment,misc]
     FastAPI = Any  # type: ignore[assignment,misc]
+    JSONResponse = Any  # type: ignore[assignment,misc]
 
 from .config import AppConfig
 from .coordinator import Coordinator
@@ -415,52 +417,45 @@ def build_app(coord: Coordinator) -> FastAPI:
 
     # Request guards: 1 MiB body cap (no endpoint takes a body — query
     # params only) + a generous authed rate limit. /healthz stays
-    # unguarded (load-balancer liveness must never 429).
-    try:
-        from fastapi.responses import JSONResponse as _JSONResponse
-
-        @app.middleware("http")
-        async def _request_guards(request, call_next):
+    # unguarded (load-balancer liveness must never 429). Registration is
+    # unconditional on purpose: swallowing a failure here silently ran the
+    # control plane with neither guard, and only the bucket bookkeeping
+    # (below) is allowed to degrade.
+    @app.middleware("http")
+    async def _request_guards(request, call_next):
+        try:
+            _path = request.url.path or ""
+        except Exception:
+            _path = ""
+        if _path != "/healthz":
             try:
-                _path = request.url.path or ""
+                _cl = request.headers.get("content-length")
+                if _cl is not None and int(str(_cl).strip()) > 1048576:
+                    return JSONResponse({"detail": "body too large"}, status_code=413)
             except Exception:
-                _path = ""
-            if _path != "/healthz":
-                try:
-                    _cl = request.headers.get("content-length")
-                    if _cl is not None and int(str(_cl).strip()) > 1048576:
-                        return _JSONResponse({"detail": "body too large"}, status_code=413)
-                except Exception:
-                    pass
-                try:
-                    _rip = request.client.host if request.client else "unknown"
-                except Exception:
-                    _rip = "unknown"
-                try:
-                    _bucket = _AUTHD_HITS.get(_rip)
-                    if not isinstance(_bucket, list):
-                        _bucket = []
-                        _AUTHD_HITS[_rip] = _bucket
-                    _now = time.monotonic()
-                    _cut = _now - 60.0
-                    while _bucket and _bucket[0] < _cut:
-                        _bucket.pop(0)
-                    _bucket.append(_now)
-                    if len(_bucket) > 300:
-                        return _JSONResponse(
-                            {"detail": "rate limited; backing off"}, status_code=429
-                        )
-                    if len(_AUTHD_HITS) > 1000:
-                        for k in list(_AUTHD_HITS)[: len(_AUTHD_HITS) - 1000]:
-                            _AUTHD_HITS.pop(k, None)
-                except Exception:
-                    pass
+                pass
             try:
-                return await call_next(request)
+                _rip = request.client.host if request.client else "unknown"
             except Exception:
-                raise
-    except Exception:
-        pass
+                _rip = "unknown"
+            try:
+                _bucket = _AUTHD_HITS.get(_rip)
+                if not isinstance(_bucket, list):
+                    _bucket = []
+                    _AUTHD_HITS[_rip] = _bucket
+                _now = time.monotonic()
+                _cut = _now - 60.0
+                while _bucket and _bucket[0] < _cut:
+                    _bucket.pop(0)
+                _bucket.append(_now)
+                if len(_bucket) > 300:
+                    return JSONResponse({"detail": "rate limited; backing off"}, status_code=429)
+                if len(_AUTHD_HITS) > 1000:
+                    for k in list(_AUTHD_HITS)[: len(_AUTHD_HITS) - 1000]:
+                        _AUTHD_HITS.pop(k, None)
+            except Exception:
+                pass
+        return await call_next(request)
 
     def auth(
         request: Request,

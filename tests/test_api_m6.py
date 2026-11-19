@@ -158,12 +158,8 @@ def test_prowlarr_and_rclone_counters_roundtrip(monkeypatch):
     import racing_sync.prowlarr as prowlarr_mod
     import racing_sync.rclone_ops as rclone_mod
 
-    monkeypatch.setattr(
-        prowlarr_mod, "_PROWLARR_COUNTERS", {"searches": 0, "hits": 0, "errors": 0}
-    )
-    monkeypatch.setattr(
-        rclone_mod, "_RCLONE_COUNTERS", {"moves": 0, "move_ok": 0, "move_fail": 0}
-    )
+    monkeypatch.setattr(prowlarr_mod, "_PROWLARR_COUNTERS", {"searches": 0, "hits": 0, "errors": 0})
+    monkeypatch.setattr(rclone_mod, "_RCLONE_COUNTERS", {"moves": 0, "move_ok": 0, "move_fail": 0})
 
     prowlarr_mod._note_prowlarr_search()
     prowlarr_mod._note_prowlarr_hits(3)
