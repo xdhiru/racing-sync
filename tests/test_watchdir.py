@@ -76,6 +76,25 @@ def test_prowlarr_config_is_download_indexer():
 
 
 @pytest.mark.anyio
+async def test_watchdir_scan_honours_glob(tmp_path: Path):
+    """The case-folded suffix sweep must not bypass the configured glob."""
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    (watch_dir / "private-Show.torrent").write_bytes(
+        _create_sample_torrent_data("Private.Show", 1000, "http://a/announce")
+    )
+    (watch_dir / "Other.torrent").write_bytes(
+        _create_sample_torrent_data("Other.Show", 2000, "http://b/announce")
+    )
+    cfg = WatchDirConfig(path=watch_dir, glob="private-*.torrent", delete_after_pickup=False)
+    scanner = WatchDirScanner(cfg, prowlarr=None)
+
+    items = await scanner.scan_once()
+
+    assert [i.name for i in items] == ["Private.Show"]
+
+
+@pytest.mark.anyio
 async def test_watchdir_scanner_scan_once(tmp_path: Path):
     watch_dir = tmp_path / "watch"
     watch_dir.mkdir()

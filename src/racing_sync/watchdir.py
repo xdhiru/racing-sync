@@ -13,6 +13,7 @@ req #3:
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import logging
 import time
@@ -402,14 +403,22 @@ class WatchDirScanner:
             patterns.append(self._cfg.glob.replace(".torrent", ".TORRENT"))
         # Mixed-case drops (Show.Torrent) are missed by glob on Linux:
         # sweep the directory once and match suffix case-insensitively.
+        # The sweep must still respect the configured glob — it used to
+        # accept every *.torrent, so glob="private-*.torrent" also picked
+        # up (and with delete_after_pickup, deleted) unrelated drops.
+        _glob = (self._cfg.glob or "*").strip()
+        _glob_is_name = "/" not in _glob and "\\" not in _glob
         # Declared BEFORE the sweep: adding inside the loop NameErrors
         # per file (swallowed below) and drops the file silently.
         entries: set[Path] = set()
         try:
             for _p in Path(self._cfg.path).iterdir():
                 try:
-                    if _p.is_file() and not _p.is_symlink() and _p.suffix.lower() == ".torrent":
-                        entries.add(_p)
+                    if not _p.is_file() or _p.is_symlink() or _p.suffix.lower() != ".torrent":
+                        continue
+                    if _glob_is_name and not fnmatch.fnmatchcase(_p.name.lower(), _glob.lower()):
+                        continue
+                    entries.add(_p)
                 except Exception:
                     continue
         except Exception:
