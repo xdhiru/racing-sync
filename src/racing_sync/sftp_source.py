@@ -803,6 +803,15 @@ class SFTPExporter:
             except _fut.TimeoutError as e:
                 raise SFTPError(f"sftp dial timed out after {self._DIAL_TIMEOUT_S:.0f}s") from e
         except Exception:
+            # Invalidate every in-flight dial BEFORE closing: one still
+            # inside connect() would otherwise finish after this loop,
+            # install its transport, and see an unchanged generation —
+            # leaving a live connection on a member the pool considers
+            # poisoned (_dial_one tears down only a stale generation).
+            try:
+                self._generation += 1
+            except Exception:
+                pass
             for m in members:
                 try:
                     m.close()

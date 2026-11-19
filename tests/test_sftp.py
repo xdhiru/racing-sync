@@ -768,3 +768,49 @@ def test_df_parses_wrapped_last_line():
     exporter._sftp = mock_sftp
 
     assert exporter.disk_free_bytes("/home") == 4000000 * 1024
+
+
+def test_dial_failure_tears_down_late_connecting_member(monkeypatch):
+    """A dial that finishes after the failure path must not leak.
+
+    The failure path closes every member, but one still inside connect()
+    installs its transport afterwards; without a generation bump that
+    late success looks current and the member stays live.
+    """
+    import time
+
+    from racing_sync import sftp_source
+
+    exporter = sftp_source.SFTPExporter(_sftp_cfg(), pool_size=2)
+    late, failing = exporter._members_snapshot()
+    started = threading.Event()
+    release = threading.Event()
+    events: list[tuple[str, int]] = []
+
+    def _connect(m):
+        if m is failing:
+            started.set()
+            raise OSError("connection refused")
+        started.wait(5)
+        release.wait(5)
+        events.append(("installed", id(m)))
+        m._closed = False
+
+    def _close(m):
+        events.append(("closed", id(m)))
+        m._closed = True
+
+    monkeypatch.setattr(sftp_source._SFTPConnection, "connect", _connect)
+    monkeypatch.setattr(sftp_source._SFTPConnection, "close", _close)
+
+    with pytest.raises(OSError):
+        exporter.connect()
+
+    release.set()
+    for _ in range(200):
+        if events and events[-1] == ("closed", id(late)):
+            break
+        time.sleep(0.01)
+
+    assert events[-1] == ("closed", id(late))
+    assert ("installed", id(late)) in events
