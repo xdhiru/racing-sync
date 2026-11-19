@@ -1431,14 +1431,15 @@ class Coordinator(
             return False
 
     async def _tick(self) -> None:
-        """One iteration: poll sources, schedule work (serialized vs API ops)."""
-        lock = getattr(self, "_ops_lock", None)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._ops_lock = lock
+        """One iteration: poll sources, schedule work, run the janitor.
+
+        Each step takes its production loop's lock inside `_tick_inner`, so
+        this pass serialises against the live loops step by step. (It used
+        to hold `_ops_lock` across the whole pass, a lock the scheduler and
+        janitor loops never take — so it never actually excluded them.)
+        """
         _t0 = time.monotonic()
-        async with lock:
-            await self._tick_inner()
+        await self._tick_inner()
         # Tick health for /readyz + /metrics (strict numerics; a wedged
         # loop shows as ever-growing age while the process stays up).
         try:
@@ -2037,16 +2038,28 @@ class Coordinator(
     async def _tick_inner(self) -> None:
         """One full pass: poll sources, schedule work, run janitor.
 
-        Compatibility path for single-pass callers (tests, manual ticks):
+        Compatibility path for single-pass callers (tests, manual /tick):
         the production `run()` loop instead runs the three steps on
         independent loops with separate locks and clocks (see
         `_poller_loop` / `_scheduler_loop` / `_janitor_loop`).
         Each step is isolated: one step throwing must not starve the
         others (a source outage skips scheduling/janitor otherwise).
+        Each step also takes its production loop's lock, so a manual tick
+        cannot overlap the same step on a live loop — or another manual
+        tick.
         """
-        for _step in (self._poll_source_step, self._schedule_step, self._janitor_step):
+        for _step, _lock_name in (
+            (self._poll_source_step, "_ops_lock"),
+            (self._schedule_step, "_schedule_lock"),
+            (self._janitor_step, "_janitor_lock"),
+        ):
             try:
-                await _step()
+                lock = self._loop_lock(_lock_name)
+                if lock is not None:
+                    async with lock:
+                        await _step()
+                else:
+                    await _step()
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001

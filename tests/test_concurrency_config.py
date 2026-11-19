@@ -876,6 +876,38 @@ async def test_new_row_parking_on_disk_waits_for_quiet_timer():
 
 
 @pytest.mark.anyio
+async def test_tick_inner_waits_for_the_live_scheduler_step():
+    """A manual tick must not run a step the scheduler loop is running.
+
+    `/tick` calls _tick_inner directly; without the per-step lock it ran
+    scheduling concurrently with the loop, and both dispatched workers
+    from their own snapshot.
+    """
+    import asyncio
+
+    coord = make_coordinator()
+    coord._poll_source_step = AsyncMock()
+    coord._janitor_step = AsyncMock()
+    ran: list[str] = []
+
+    async def _schedule():
+        ran.append("schedule")
+
+    coord._schedule_step = _schedule
+    coord._schedule_lock = asyncio.Lock()
+
+    # The scheduler loop is mid-step: it holds the lock.
+    await coord._schedule_lock.acquire()
+    task = asyncio.create_task(coord._tick_inner())
+    await asyncio.sleep(0.05)
+    assert ran == []  # waiting, not racing
+
+    coord._schedule_lock.release()
+    await task
+    assert ran == ["schedule"]
+
+
+@pytest.mark.anyio
 async def test_do_queued_happy_path():
     coord = make_coordinator()
     coord.cfg.rclone.fuse.mount = "/mnt/fuse"
