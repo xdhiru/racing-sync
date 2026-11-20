@@ -75,3 +75,38 @@ def test_admin_ids_deduped():
     cfg = _tg_cfg(admin_user_ids=[123, 456, 123])
     assert cfg.admin_user_ids == [123, 456]
     assert _tg_cfg().admin_user_ids == []
+
+
+def test_deluge_sftp_disabled_needs_no_state_dir():
+    """A leftover disabled stub must load; "" means unset, not Path(".")."""
+    import pydantic
+
+    from racing_sync.config import DelugeSFTPConfig
+
+    assert DelugeSFTPConfig(enabled=False).state_dir is None
+    assert DelugeSFTPConfig(enabled=False, state_dir="").state_dir is None
+
+    with pytest.raises(pydantic.ValidationError, match="state_dir"):
+        DelugeSFTPConfig(enabled=True, ssh_password="pwd", state_dir="")
+
+
+def test_dest_config_rejects_unusable_origin_and_relative_path():
+    """Bad origins and a relative save_path must fail at load, not at RPC."""
+    import pydantic
+
+    from racing_sync.config import DestConfig
+
+    good = DestConfig(host="http://localhost:8080", save_path="/downloads")
+    assert str(good.save_path).replace("\\", "/") == "/downloads"
+
+    for bad_host in (
+        "localhost:8080",
+        "ftp://x.example",
+        "http://user:pw@x.example",
+        "http://x.example?q=1",
+    ):
+        with pytest.raises(pydantic.ValidationError):
+            DestConfig(host=bad_host, save_path="/downloads")
+
+    with pytest.raises(pydantic.ValidationError, match="absolute"):
+        DestConfig(host="http://localhost:8080", save_path="downloads")

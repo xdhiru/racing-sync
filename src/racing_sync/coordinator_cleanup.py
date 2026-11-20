@@ -60,6 +60,8 @@ class CleanupMixin:
             return None
         try:
             state_dir = self.cfg.source.deluge_sftp.state_dir  # type: ignore[union-attr]
+            if state_dir is None:
+                return None
             path = state_dir.as_posix() if hasattr(state_dir, "as_posix") else str(state_dir)
         except Exception:
             return None

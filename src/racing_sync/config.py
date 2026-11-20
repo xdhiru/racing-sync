@@ -134,14 +134,14 @@ class DelugeSFTPConfig(BaseModel):
     ssh_key_passphrase: SecretStr = SecretStr("")
     known_hosts_path: Path | None = None
     auto_add_host_key: bool = False
-    state_dir: Path
+    state_dir: Path | None = None
     # Independent SSH/SFTP connections in the exporter pool. Re-inject
     # bursts from concurrent workers used to serialize on one transport
     # (15s-timeout clusters); 3 lets a few fetches fly in parallel while
     # a wedged member fails over instead of wedging everyone.
     pool_size: int = Field(default=3, ge=1, le=8)
 
-    @field_validator("ssh_key_path", "known_hosts_path", mode="before")
+    @field_validator("ssh_key_path", "known_hosts_path", "state_dir", mode="before")
     @classmethod
     def _empty_path_is_none(cls, v: object) -> object:
         """TOML "" coerces to Path(".") which is truthy; treat as None."""
@@ -159,6 +159,8 @@ class DelugeSFTPConfig(BaseModel):
         )
         if self.enabled and not self.ssh_key_path and not has_pwd:
             raise ValueError("Deluge SFTP requires ssh_password or ssh_key_path when enabled")
+        if self.enabled and self.state_dir is None:
+            raise ValueError("Deluge SFTP requires state_dir when enabled")
         return self
 
 
@@ -262,6 +264,49 @@ class DestConfig(BaseModel):
     # Network family for the WebUI session. False (default) forces IPv4:
     # intentional — see [source].use_ipv6.
     use_ipv6: bool = False
+
+    @model_validator(mode="after")
+    def _check_host_and_path(self) -> DestConfig:
+        """Fail fast on an unusable WebUI origin or save_path.
+
+        Otherwise these surface only later: a relative save_path is
+        resolved against qBittorrent's own cwd, and a scheme/userinfo
+        mistake shows up as an unrelated connection error.
+        """
+        host = (self.host or "").strip()
+        if not host.startswith(("http://", "https://")):
+            raise ValueError(f"dest.host must start with http(s):// (got: {host!r})")
+        try:
+            from urllib.parse import urlsplit as _us
+
+            _p = _us(host)
+            if _p.username or _p.password:
+                raise ValueError(
+                    "dest.host must not embed userinfo "
+                    "(creds would leak to logs — use username/password)"
+                )
+            if _p.query or _p.fragment:
+                raise ValueError("dest.host must be a bare origin (no query/fragment)")
+            if not _p.hostname:
+                raise ValueError("dest.host must include a host")
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"dest.host is not a valid URL: {e}") from None
+        # save_path is a path on the *remote* client: a POSIX root is
+        # absolute there even when this process runs on Windows.
+        try:
+            _sp = str(self.save_path).replace("\\", "/")
+            if not (_sp.startswith("/") or self.save_path.is_absolute()):
+                raise ValueError(
+                    "dest.save_path must be absolute — qBittorrent resolves a "
+                    f"relative path against its own cwd (got: {self.save_path})"
+                )
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"dest.save_path is not a valid path: {e}") from None
+        return self
 
 
 class SSDConfig(BaseModel):
