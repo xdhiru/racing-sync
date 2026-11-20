@@ -38,16 +38,18 @@ async def test_qbittorrent_export_torrent():
     cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
     client = QBittorrentClient(cfg, label="dest-qb")
 
+    from test_watchdir import _create_sample_torrent_data
+
+    payload = _create_sample_torrent_data("Good.Show", 100, "http://x/announce")
+
     async def _chunks(payload: bytes):
         yield payload
 
     class DummyResponseContext:
         async def __aenter__(self):
             resp = MagicMock()
-            resp.read = AsyncMock(return_value=b"d8:announce...")
-            resp.content.iter_chunked = MagicMock(
-                side_effect=lambda size: _chunks(b"d8:announce...")
-            )
+            resp.read = AsyncMock(return_value=payload)
+            resp.content.iter_chunked = MagicMock(side_effect=lambda size: _chunks(payload))
             return resp
 
         async def __aexit__(self, *args):
@@ -61,7 +63,7 @@ async def test_qbittorrent_export_torrent():
 
     client.request = mock_request
     data = await client.export_torrent("abc12345")
-    assert data == b"d8:announce..."
+    assert data == payload
 
 
 @pytest.mark.anyio
@@ -113,7 +115,9 @@ async def test_qbittorrent_export_rejects_non_bencoded():
 
         return DummyResponseContext()
 
-    for bad in (b"", b"<html>login</html>", b"Fails."):
+    # A leading "d" is not proof: truncated/HTML bodies that start with it
+    # must fail the same way as an empty or error page.
+    for bad in (b"", b"<html>login</html>", b"Fails.", b"d", b"d<html>"):
 
         async def mock_request(method, endpoint, params=None, _bad=bad, **kwargs):
             # Bind `bad` explicitly: the closure would otherwise capture
@@ -121,7 +125,7 @@ async def test_qbittorrent_export_rejects_non_bencoded():
             return _ctx(_bad)
 
         client.request = mock_request
-        with pytest.raises(ValueError, match="not bencoded"):
+        with pytest.raises(ValueError, match="not a valid torrent"):
             await client.export_torrent("abc12345")
 
 
@@ -1884,3 +1888,44 @@ async def test_deluge_web_connected_false_without_hosts_fails_auth():
     with pytest.raises(AuthError, match="503"):
         await broken._do_client_auth()
     assert broken._session.post.call_count == 3
+
+
+@pytest.mark.anyio
+async def test_qb_export_requires_a_decodable_torrent():
+    """A leading 'd' is not enough: truncated/HTML bodies must fail loudly."""
+    import aiohttp  # noqa: F401  (kept for the shared error shapes)
+    from test_watchdir import _create_sample_torrent_data
+
+    cfg = DestConfig(type="qbittorrent", host="http://localhost:8080", save_path="/downloads")
+    client = QBittorrentClient(cfg, label="dest-qb")
+
+    async def _serve(payload: bytes):
+        class DummyCtx:
+            async def __aenter__(self):
+                resp = MagicMock()
+
+                async def _chunks(_n):
+                    yield payload
+
+                resp.content.iter_chunked = _chunks
+                return resp
+
+            async def __aexit__(self, *args):
+                pass
+
+        async def mock_request(method, path, **kwargs):
+            return DummyCtx()
+
+        client.request = mock_request
+
+    await _serve(b"d<html>not a torrent")
+    with pytest.raises(ValueError, match="not a valid torrent"):
+        await client.export_torrent("a" * 40)
+
+    await _serve(b"d")  # truncated dict header
+    with pytest.raises(ValueError, match="not a valid torrent"):
+        await client.export_torrent("a" * 40)
+
+    good = _create_sample_torrent_data("Good.Show", 100, "http://x/announce")
+    await _serve(good)
+    assert await client.export_torrent("a" * 40) == good

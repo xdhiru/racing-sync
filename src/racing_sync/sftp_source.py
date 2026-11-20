@@ -387,7 +387,9 @@ class _SFTPConnection:
                     if len(data) > MAX_TORRENT_BYTES:
                         log.warning("sftp: %s exceeds %d bytes limit", path_str, MAX_TORRENT_BYTES)
                         continue
-                    if data.startswith(b"d"):
+                    from .watchdir import is_bencoded_torrent
+
+                    if is_bencoded_torrent(data):
                         return data
                     log.warning("sftp: %s does not look like a bencoded torrent", path_str)
                 except FileNotFoundError:

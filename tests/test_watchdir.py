@@ -2976,3 +2976,14 @@ async def test_scan_watch_done_duplicate_single_lookup(tmp_path: Path):
         assert calls == [infohash, infohash]
     finally:
         store.close()
+
+
+def test_is_bencoded_torrent_requires_a_real_info_dict():
+    from racing_sync.watchdir import is_bencoded_torrent
+
+    good = _create_sample_torrent_data("Good.Show", 100, "http://x/announce")
+    assert is_bencoded_torrent(good) is True
+    # Prefix checks are not enough: truncated bodies and error pages start
+    # with "d" too, and an empty dict has no info.
+    for bad in (b"", b"d", b"d<html>", b"de", b"d4:spam4:eggse"):
+        assert is_bencoded_torrent(bad) is False, bad

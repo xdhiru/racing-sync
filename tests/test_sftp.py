@@ -5,9 +5,13 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from test_watchdir import _create_sample_torrent_data
 
 from racing_sync.config import DelugeSFTPConfig
 from racing_sync.sftp_source import _SFTPConnection
+
+#: A payload the fetcher accepts: it must decode as a real torrent now.
+SAMPLE_TORRENT = _create_sample_torrent_data("Test", 100, "http://x/announce")
 
 
 def _sftp_cfg(**overrides):
@@ -22,7 +26,7 @@ def _sftp_cfg(**overrides):
     return DelugeSFTPConfig(**args)
 
 
-def _live_member(cfg, payload: bytes = b"d4:infod4:name4:teste"):
+def _live_member(cfg, payload: bytes = SAMPLE_TORRENT):
     """Hand-built pool member with a working (mocked) transport."""
     m = object.__new__(_SFTPConnection)
     m._cfg = cfg
@@ -163,7 +167,7 @@ def test_sftp_pool_serves_concurrent_fetches():
     def _slow_open(path, mode):
         time.sleep(0.05)
         file_mock = MagicMock()
-        file_mock.read.return_value = b"d4:infod4:name4:teste"
+        file_mock.read.return_value = SAMPLE_TORRENT
         file_mock.__enter__.return_value = file_mock
         return file_mock
 
@@ -184,7 +188,7 @@ def test_sftp_pool_serves_concurrent_fetches():
         results = list(pool.map(lambda _: _fetch(), range(6)))
 
     assert len(results) == 6
-    assert all(r == b"d4:infod4:name4:teste" for r in results)
+    assert all(r == SAMPLE_TORRENT for r in results)
     # Every fetch cost exactly one open (no reconnect storms) ...
     assert sum(m._sftp.open.call_count for m in members) == 6
     # ... spread over more than one member (parallel, not serialized).
@@ -303,13 +307,13 @@ def test_fetch_torrent_uses_posix_path_and_caps_read():
 
     # 1. Normal file read
     mock_file = MagicMock()
-    mock_file.read.return_value = b"d8:announcee"
+    mock_file.read.return_value = SAMPLE_TORRENT
     mock_file.__enter__.return_value = mock_file
     mock_sftp.open.return_value = mock_file
 
     hash_val = "1" * 40
     data = exporter.fetch_torrent(hash_val)
-    assert data == b"d8:announcee"
+    assert data == SAMPLE_TORRENT
 
     # Verify POSIX forward slashes were used in SFTP remote open call
     opened_path = mock_sftp.open.call_args[0][0]
@@ -456,7 +460,7 @@ def test_pool_fails_over_wedged_member():
 
     _, release_holder, holder = _wedge_lock_in_thread(exporter._members[0]._lock)
     try:
-        assert exporter.fetch_torrent("a" * 40) == b"d4:infod4:name4:teste"
+        assert exporter.fetch_torrent("a" * 40) == SAMPLE_TORRENT
         # The wedged member was skipped; the healthy one served.
         assert exporter._members[0]._sftp.open.call_count == 0
         assert exporter._members[1]._sftp.open.call_count == 1
@@ -686,7 +690,7 @@ def test_lease_revives_single_member_lazily():
 
         m.connect = _dial
     data = exporter.fetch_torrent("a" * 40)
-    assert data == b"d4:infod4:name4:teste"
+    assert data == SAMPLE_TORRENT
     assert len(dials) == 1
 
 

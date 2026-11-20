@@ -695,7 +695,7 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
         metadata. Stream-capped like the Prowlarr/Deluge download paths so
         a rogue endpoint cannot OOM the daemon with one response.
         """
-        from ..watchdir import MAX_TORRENT_BYTES
+        from ..watchdir import MAX_TORRENT_BYTES, is_bencoded_torrent
 
         async with await self.request(
             "GET", "/api/v2/torrents/export", params={"hash": torrent_hash}
@@ -710,11 +710,12 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
                     )
                 chunks.append(chunk)
             data = b"".join(chunks)
-            # A bencoded torrent is always a dict: refuse empty/error
-            # pages before they travel as "bytes" (callers treat b""
-            # as a clean miss, but HTML garbage must fail loudly).
-            if not data.startswith(b"d"):
-                raise ValueError(f"qB .torrent export for {torrent_hash} is not bencoded data")
+            # A bencoded torrent must decode as a root dict carrying an
+            # info dict: a leading "d" alone also matches truncated bodies
+            # and HTML error pages (callers treat b"" as a clean miss, but
+            # garbage must fail loudly).
+            if not is_bencoded_torrent(data):
+                raise ValueError(f"qB .torrent export for {torrent_hash} is not a valid torrent")
             return data
 
     async def get_properties(self, torrent_hash: str) -> dict[str, Any]:

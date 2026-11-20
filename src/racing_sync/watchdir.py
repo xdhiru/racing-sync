@@ -186,6 +186,20 @@ def _decode_torrent_root(data: bytes) -> tuple[dict[bytes, object], bytes]:
     return root, raw_info_bytes
 
 
+def is_bencoded_torrent(data: bytes) -> bool:
+    """True when `data` decodes as a bencoded torrent (root dict + info).
+
+    A leading ``b"d"`` alone is not proof: truncated or error-page bodies
+    can start with it, and adding one later fails deep in the client with
+    an unrelated error.
+    """
+    try:
+        _decode_torrent_root(data)
+    except Exception:
+        return False
+    return True
+
+
 def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
     """Decode a bencoded .torrent and return (infohash, name, total_size, announce_url).
 
