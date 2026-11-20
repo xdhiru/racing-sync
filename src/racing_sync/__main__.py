@@ -793,6 +793,18 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 2
+            # Prove logging will come up before deleting state.db: a
+            # setup_logging failure afterwards would exit 2 with no state and
+            # no log of why. (The real setup has to run after the reset — it
+            # would hold open the log files the reset deletes.)
+            try:
+                Path(cfg.general.log_dir).mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                print(
+                    f"refusing --reset: log directory not usable ({cfg.general.log_dir}): {e}",
+                    file=sys.stderr,
+                )
+                return 2
             _backup, _backup_reason = backup_db(cfg, tag="pre-reset")
             if _backup is not None:
                 print(f"state.db backed up to: {_backup}")

@@ -163,6 +163,32 @@ def test_main_run_reset_clears_state_db_and_logs(tmp_path: Path):
     assert list(log_dir.iterdir()) == []
 
 
+def test_run_reset_refuses_when_log_dir_is_unusable(tmp_path: Path, capsys):
+    """--reset must not delete state.db when logging cannot come up after it."""
+    from racing_sync.config import AppConfig
+    from racing_sync.state import StateStore
+
+    state_db = tmp_path / "state.db"
+    store = StateStore(state_db)
+    store.close()
+    log_dir = tmp_path / "logs"
+    log_dir.write_text("not a directory")  # mkdir on this path must fail
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(MINIMAL_CONFIG)
+    cfg = AppConfig.from_toml(cfg_file)
+    cfg.general.state_db = state_db
+    cfg.general.log_dir = log_dir
+
+    with patch("racing_sync.__main__.AppConfig") as mock_cfg_cls:
+        mock_cfg_cls.from_toml.return_value = cfg
+        rc = main(["run", "--config", str(cfg_file), "--reset", "--yes"])
+
+    assert rc == 2
+    assert state_db.exists()
+    assert "log directory not usable" in capsys.readouterr().err
+
+
 def test_run_reset_requires_yes(tmp_path: Path):
     """--reset without --yes refuses (destructive bookkeeping wipe)."""
     from racing_sync.__main__ import main
