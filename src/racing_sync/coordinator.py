@@ -1134,6 +1134,15 @@ class Coordinator(
             await self.shutdown()
         return 0
 
+    def _unmark_watch_drop(self, item: WatchItem) -> None:
+        """Let a failed handoff be retried by the next watch scan."""
+        try:
+            forget = getattr(self.watch, "forget", None)
+            if callable(forget):
+                forget(item)
+        except Exception:
+            pass
+
     async def scan_watch(self) -> list[WatchItem]:
         """Scan watch directory for releases, ingest into state store, and return items."""
         if self.watch is None:
@@ -1149,7 +1158,18 @@ class Coordinator(
             ingested = False
             # Sync store I/O rides a worker thread: a WAL stall must not
             # block the poller loop behind the GIL.
-            _existing = await asyncio.to_thread(self.store.get, item_hash, include_blob=False)
+            try:
+                _existing = await asyncio.to_thread(self.store.get, item_hash, include_blob=False)
+            except Exception as e:  # noqa: BLE001
+                # The scan already marked this hash consumed: without a
+                # re-emit the drop would be invisible until restart.
+                log.warning(
+                    "watch-dir: cannot read %s (%s); will retry next scan",
+                    item.name[:60],
+                    e,
+                )
+                self._unmark_watch_drop(item)
+                continue
             if _existing is None:
                 try:
                     _ignored = await asyncio.to_thread(self.store.is_ignored, item_hash) is True
@@ -1177,7 +1197,16 @@ class Coordinator(
                     state=State.NEW,
                 )
                 ts._blob = item.torrent_bytes
-                _res = await asyncio.to_thread(self.store.upsert, ts)
+                try:
+                    _res = await asyncio.to_thread(self.store.upsert, ts)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "watch-dir: ingest of %s failed (%s); will retry next scan",
+                        item.name[:60],
+                        e,
+                    )
+                    self._unmark_watch_drop(item)
+                    continue
                 if _res is not UpsertResult.WRITTEN:
                     # Forget tombstone refused the write: never mark the
                     # drop consumed or delete it. The file stays for the
@@ -1217,6 +1246,7 @@ class Coordinator(
                     continue
                 except Exception as e:  # noqa: BLE001
                     log.warning("watch-dir: revive failed for %s: %s", item.name[:60], e)
+                    self._unmark_watch_drop(item)
                     continue
                 ingested = True
                 log.info(

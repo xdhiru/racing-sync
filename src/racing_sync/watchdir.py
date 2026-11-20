@@ -593,6 +593,19 @@ class WatchDirScanner:
 
         return out
 
+    def forget(self, item: WatchItem) -> None:
+        """Let this drop be emitted again on the next scan.
+
+        A scan marks a hash consumed as soon as it emits it. When the
+        handoff then fails for an unexpected reason, the drop would never
+        be retried until restart (and with `delete_after_pickup` it also
+        stops being pruned) — so the caller clears the mark instead.
+        """
+        try:
+            self._seen.discard((item.infohash or "").lower())
+        except Exception:
+            pass
+
     async def delete_picked_up(self, item: WatchItem) -> None:
         if not self._cfg.delete_after_pickup:
             return

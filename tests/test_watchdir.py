@@ -1745,6 +1745,45 @@ def test_watch_election_held_locked_row_still_blocks(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_scan_watch_retries_drop_after_ingest_error(tmp_path: Path, monkeypatch):
+    """A drop whose handoff failed must come back on the next scan."""
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    raw = _create_sample_torrent_data("Retry.Show.S01E01", 5000, "https://alpha.cc/announce/xyz")
+    (watch_dir / "retry.torrent").write_bytes(raw)
+    infohash, _, _, _ = _bencoded_info_hash(raw)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = make_coordinator()
+    coord.store = store
+    wcfg = WatchDirConfig(path=watch_dir, glob="*.torrent", delete_after_pickup=False)
+    coord.watch = WatchDirScanner(wcfg, prowlarr=None)
+    coord.cfg.watch_dir = wcfg
+
+    real_get = store.get
+    calls = {"n": 0}
+
+    def _get(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("db busy")
+        return real_get(*args, **kwargs)
+
+    try:
+        monkeypatch.setattr(store, "get", _get)
+        first = await coord.scan_watch()
+        assert len(first) == 1
+        assert real_get(infohash) is None  # nothing ingested
+
+        second = await coord.scan_watch()
+        assert [i.infohash for i in second] == [infohash]
+        row = real_get(infohash)
+        assert row is not None and row.state == State.NEW
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
 async def test_scan_watch_keeps_done_duplicate_when_pickup_disabled(tmp_path: Path):
     from racing_sync.state import StateStore
 
