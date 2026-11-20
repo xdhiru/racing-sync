@@ -315,3 +315,27 @@ async def test_downloads_run_concurrently(tmp_path):
         assert coord._ensure_fuse_entry.await_count == 1
     finally:
         coord.store.close()
+
+
+@pytest.mark.anyio
+async def test_inject_failure_short_memos_not_six_hours(tmp_path):
+    """A verified blob whose injection failed must not suppress retries 6h.
+
+    Registration lag (entry not yet visible) returns not-ok; treating that
+    as a successful harvest hid a retry for six hours.
+    """
+    import time
+
+    coord, _, _, fuse_u = _coord(tmp_path)
+    coord.prowlarr.search_indexers_parallel = AsyncMock(return_value={"PrivIdx": [_hit()]})
+    coord.prowlarr.download_torrent = AsyncMock(return_value=_blob())
+    (fuse_u / NAME).write_bytes(b"x" * SIZE)
+    coord._ensure_fuse_entry = AsyncMock(return_value=(False, "not visible yet"))
+    try:
+        coord.store.upsert(_row())
+        await coord._re_inject_tracker_map_supplements(coord.store.get("e" * 40))
+        remaining = coord._supplement_ok_at["e" * 40] - time.monotonic()
+        assert remaining < 3600  # short window, not the 6h harvest memo
+        assert coord.store.get("e" * 40).injected_private_hashes == ""
+    finally:
+        coord.store.close()

@@ -1430,8 +1430,8 @@ class ReaddMixin:
     # VPS1 late arrivals are still checked every tick by the caller.
     _SUPPLEMENT_RETRY_S = 21600.0
     # Failed/empty searches re-run soon (a new release under a new hash
-    # may appear at any time); only a search that fetched ≥1 usable blob
-    # earns the long suppress window.
+    # may appear at any time); only a search that actually injected a
+    # hash earns the long suppress window.
     _SUPPLEMENT_FAIL_S = 300.0
 
     async def _re_inject_tracker_map_supplements(self, ts: TorrentState) -> None:
@@ -1549,7 +1549,6 @@ class ReaddMixin:
             except Exception:
                 return
             added = 0
-            fetched = 0
             changed = False
 
             async def _fetch_hit(hit):
@@ -1623,7 +1622,6 @@ class ReaddMixin:
                 if _item is None:
                     continue
                 hit, _blob, h_low = _item
-                fetched += 1
                 if h_low in known:
                     continue
                 try:
@@ -1681,11 +1679,12 @@ class ReaddMixin:
                     ts.source_name[:60],
                     getattr(hit, "indexer", "?"),
                 )
-            # Memo only after ≥1 usable fetch: a search that yielded
-            # nothing (or only known/cancelled hits) re-runs soon instead
-            # of suppressing 6h. Failures already memoize short above.
+            # Memo only after ≥1 INJECTED hash: a blob that fetched and
+            # verified but whose entry never became visible (registration
+            # lag) must retry soon, not six hours later — otherwise one
+            # unlucky event hides the supplement for the rest of the day.
             try:
-                if fetched or added:
+                if added > 0:
                     memo[row_key] = time.monotonic() + self._SUPPLEMENT_RETRY_S
                 else:
                     memo[row_key] = time.monotonic() + self._SUPPLEMENT_FAIL_S
