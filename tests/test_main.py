@@ -694,3 +694,66 @@ def test_run_full_aborts_on_unreachable_dest(tmp_path: Path, capsys):
     out = capsys.readouterr().out
     assert "aborted, nothing wiped" in out
     assert (ssd / "stranded.bin").exists()
+
+
+@pytest.fixture
+def restore_signals():
+    """Put the process signal handlers back after a test raises one."""
+    import signal
+
+    prev = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+    yield
+    for sig, handler in prev.items():
+        try:
+            signal.signal(sig, handler)
+        except Exception:
+            pass
+
+
+@pytest.mark.anyio
+async def test_sigterm_is_a_clean_stop(restore_signals):
+    """systemd/containers mark a non-zero exit from SIGTERM as failed."""
+    import asyncio
+    import signal
+    from unittest.mock import AsyncMock, MagicMock
+
+    from racing_sync.__main__ import _runner
+
+    coord = MagicMock()
+    coord.request_stop = MagicMock()
+    coord.shutdown = AsyncMock()
+
+    async def _run():
+        await asyncio.sleep(3600)
+
+    coord.run = _run
+
+    task = asyncio.create_task(_runner(coord))
+    await asyncio.sleep(0.05)  # let the handlers install
+    signal.raise_signal(signal.SIGTERM)
+
+    assert await asyncio.wait_for(task, 5) == 0
+
+
+@pytest.mark.anyio
+async def test_sigint_keeps_exit_130(restore_signals):
+    import asyncio
+    import signal
+    from unittest.mock import AsyncMock, MagicMock
+
+    from racing_sync.__main__ import _runner
+
+    coord = MagicMock()
+    coord.request_stop = MagicMock()
+    coord.shutdown = AsyncMock()
+
+    async def _run():
+        await asyncio.sleep(3600)
+
+    coord.run = _run
+
+    task = asyncio.create_task(_runner(coord))
+    await asyncio.sleep(0.05)
+    signal.raise_signal(signal.SIGINT)
+
+    assert await asyncio.wait_for(task, 5) == 130

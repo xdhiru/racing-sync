@@ -47,16 +47,24 @@ async def _runner(coord: Coordinator) -> int:
     log = logging.getLogger("racing_sync")
     loop = asyncio.get_running_loop()
     main_task = asyncio.create_task(coord.run())
+    # Which signal asked us to stop. SIGTERM is a clean shutdown and
+    # systemd/containers mark a non-zero exit from it as a failed unit;
+    # Ctrl-C keeps the conventional 130.
+    _signalled: list[int] = []
 
-    def _signal_handler(*_args: object) -> None:
-        log.info("Signal received, stopping...")
+    def _signal_handler(signum: int, *_args: object) -> None:
+        log.info("Signal %s received, stopping...", signum)
+        try:
+            _signalled.append(int(signum))
+        except Exception:
+            pass
         coord.request_stop()
         if not main_task.done():
             loop.call_soon_threadsafe(main_task.cancel)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, _signal_handler)
+            loop.add_signal_handler(sig, _signal_handler, sig)
         except (NotImplementedError, RuntimeError):
             try:
                 signal.signal(sig, _signal_handler)
@@ -74,7 +82,7 @@ async def _runner(coord: Coordinator) -> int:
         except (TypeError, ValueError):
             return 0
     except asyncio.CancelledError:
-        return 130
+        return 0 if signal.SIGTERM in _signalled else 130
     finally:
         if not main_task.done():
             main_task.cancel()
