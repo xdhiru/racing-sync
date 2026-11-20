@@ -309,6 +309,32 @@ class CleanupMixin:
             # at phantom counts.
             if not dry_run and deleted >= cap:
                 break
+            # The verdict ran on a snapshot, and the stagger below leaves
+            # time for a cancel, a retry or an operator re-add. Re-read
+            # before deleting: a row that moved on (or was rewritten) still
+            # needs its VPS1 copy, and its worker may be re-injecting now.
+            try:
+                _fresh = await asyncio.to_thread(
+                    self.store.get, ts.source_infohash, include_blob=False
+                )
+            except Exception:
+                _fresh = None
+            try:
+                _fresh_version = int(getattr(_fresh, "version", 0) or 0)
+                _snap_version = int(getattr(ts, "version", 0) or 0)
+            except (TypeError, ValueError, AttributeError):
+                _fresh_version = _snap_version = 0
+            if (
+                _fresh is None
+                or _fresh.state not in (State.DONE, State.MOVING)
+                or _fresh_version != _snap_version
+            ):
+                log.info(
+                    "cleanup: %s changed since its verdict (%s); keeping the VPS1 copy",
+                    (ts.source_infohash or "")[:10],
+                    getattr(getattr(_fresh, "state", None), "value", "row gone"),
+                )
+                continue
             try:
                 ok = await self._delete_source_group(ts, group, cfg, dry_run)
             except Exception as e:  # noqa: BLE001

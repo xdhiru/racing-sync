@@ -140,3 +140,58 @@ async def test_stagger_zero_disables_pause(tmp_path: Path):
         mock_sleep.assert_not_called()
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_row_moved_since_verdict_keeps_vps1_copy(tmp_path: Path):
+    """A row that transitions after its verdict must keep its VPS1 copy.
+
+    An operator re-add or a recovery demote can land between the verdict
+    and the delete (the stagger leaves seconds of room); deleting then
+    races the worker that is re-injecting the content.
+    """
+    coord, store = _stagger_pair(tmp_path, delete_stagger_seconds=0.0)
+    try:
+        verdicts = [
+            (0.0, 700.0, store.get("a" * 40), ["g1"]),
+            (1.0, 701.0, store.get("b" * 40), ["g2"]),
+        ]
+        calls = {"n": 0}
+
+        async def _verdict(*_args, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Someone else moves the row after its snapshot was taken.
+                store.update_columns("a" * 40, {"state": State.RE_ADDING})
+            return verdicts[calls["n"] - 1]
+
+        coord._cleanup_verdict = _verdict
+        coord._delete_source_group = AsyncMock(return_value=True)
+
+        await coord._maybe_cleanup_source()
+
+        deleted = [c.args[0].source_infohash for c in coord._delete_source_group.await_args_list]
+        assert deleted == ["b" * 40]
+        assert store.get("a" * 40).state == State.RE_ADDING
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_unchanged_rows_still_delete_after_recheck(tmp_path: Path):
+    """The re-read must not block ordinary deletions."""
+    coord, store = _stagger_pair(tmp_path, delete_stagger_seconds=0.0)
+    try:
+        coord._cleanup_verdict = AsyncMock(
+            side_effect=[
+                (0.0, 700.0, store.get("a" * 40), ["g1"]),
+                (1.0, 701.0, store.get("b" * 40), ["g2"]),
+            ]
+        )
+        coord._delete_source_group = AsyncMock(return_value=True)
+
+        await coord._maybe_cleanup_source()
+
+        assert coord._delete_source_group.await_count == 2
+    finally:
+        store.close()
