@@ -76,3 +76,32 @@ def test_chunked_bounds_and_defaults():
     assert chunked([], 100) == []
     assert chunked([1, 2, 3], 0) == [[1, 2, 3]]
     assert chunked(None) == []
+
+
+@pytest.mark.anyio
+async def test_bounded_keeps_an_inner_timeout_subclass():
+    """Only the outer deadline may be relabelled.
+
+    An inner TimeoutError (e.g. DownloadStalledError) reaching the caller
+    as a plain TimeoutError loses the handler that knows how to park it.
+    """
+
+    class Stalled(TimeoutError):
+        pass
+
+    async def _boom():
+        raise Stalled("inner stall")
+
+    with pytest.raises(Stalled):
+        await bounded(_boom(), timeout=5.0, label="read")
+
+
+@pytest.mark.anyio
+async def test_bounded_labels_its_own_deadline():
+    import asyncio
+
+    async def _slow():
+        await asyncio.sleep(5)
+
+    with pytest.raises(TimeoutError, match="read timed out"):
+        await bounded(_slow(), timeout=0.01, label="read")

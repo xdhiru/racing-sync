@@ -72,9 +72,17 @@ async def bounded(
         seconds = DEFAULT_RPC_TIMEOUT_SECONDS
     if seconds <= 0:
         seconds = DEFAULT_RPC_TIMEOUT_SECONDS
+    import time as _time
+
+    deadline = _time.monotonic() + seconds
     try:
         return await asyncio.wait_for(awaitable, timeout=seconds)
     except TimeoutError as e:
+        # Only our own deadline gets the label: a TimeoutError raised by the
+        # inner callable (e.g. DownloadStalledError) surfaced before the
+        # deadline and must keep its type for the caller's handler.
+        if _time.monotonic() < deadline:
+            raise
         log.warning("%s timed out after %.0fs", label, seconds)
         raise TimeoutError(f"{label} timed out after {seconds:.0f}s") from e
 
