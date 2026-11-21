@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote_plus, urljoin, urlsplit, urlunsplit
@@ -176,6 +177,10 @@ class ProwlarrClient:
         self._indexers_by_name: dict[str, Indexer] = {}
         self._indexers_by_id: dict[int, Indexer] = {}
         self._refresh_lock = asyncio.Lock()
+        # Background refresh of the indexer list when a configured download
+        # target goes missing (see _schedule_indexer_refresh).
+        self._indexer_refresh_attempted_at: float = 0.0
+        self._refresh_task: asyncio.Task | None = None
 
     # ---------- lifecycle ----------
 
@@ -347,6 +352,11 @@ class ProwlarrClient:
                 "download-target indexer %r is disabled in prowlarr; skipping",
                 name,
             )
+        if missing or disabled:
+            # Prowlarr can be edited while we run: refresh in the background
+            # so an added/renamed/re-enabled target does not need a restart
+            # (every row parks on "indexer not found" until then).
+            self._schedule_indexer_refresh()
         if not usable:
             raise ProwlarrError(
                 f"none of the configured download-target indexers {wanted!r} "
@@ -354,6 +364,47 @@ class ProwlarrClient:
                 f"Known: {sorted(self._indexers_by_name)}"
             )
         return usable
+
+    #: Minimum gap between background indexer refreshes triggered by a
+    #: missing/disabled download target (Prowlarr edits are rare).
+    _INDEXER_REFRESH_MIN_INTERVAL_S = 300.0
+
+    def _schedule_indexer_refresh(self) -> None:
+        """Re-fetch the indexer list in the background, throttled.
+
+        Best-effort: no running loop (sync callers, tests), a stopped
+        client, or a recent attempt all just skip.
+        """
+        try:
+            if self._session is None or self._session.closed:
+                return
+            now = time.monotonic()
+            if now - float(self._indexer_refresh_attempted_at or 0.0) < (
+                self._INDEXER_REFRESH_MIN_INTERVAL_S
+            ):
+                return
+            self._indexer_refresh_attempted_at = now
+            task = asyncio.get_running_loop().create_task(self._refresh_indexers_quietly())
+            self._refresh_task = task
+            task.add_done_callback(self._forget_refresh_task)
+        except Exception:
+            pass
+
+    def _forget_refresh_task(self, task: object) -> None:
+        try:
+            if self._refresh_task is task:
+                self._refresh_task = None
+        except Exception:
+            pass
+
+    async def _refresh_indexers_quietly(self) -> None:
+        try:
+            await self._refresh_indexers()
+            log.info("prowlarr indexer list refreshed after a stale download target")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("prowlarr indexer refresh (background) failed: %s", e)
 
     def resolve_indexer_for_announce(self, announce_url: str, tracker_map) -> Indexer | None:
         """Map a torrent's announce URL to a prowlarr indexer."""

@@ -1796,3 +1796,45 @@ async def test_parallel_search_returns_completed_hits_on_timeout(monkeypatch):
 
     assert results.get("fast (api)") == [hit]
     assert "slow (api)" not in results
+
+
+@pytest.mark.anyio
+async def test_missing_indexer_triggers_a_throttled_refresh(monkeypatch):
+    """A Prowlarr edit must not need a daemon restart to take effect."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from racing_sync.prowlarr import Indexer, ProwlarrClient
+
+    cfg = ProwlarrConfig(
+        enabled=True,
+        base_url="http://localhost:9696",
+        api_key="secret",
+        download_indexers=[DownloadIndexerConfig(name="New (API)", announce_substrings=["new"])],
+    )
+    client = ProwlarrClient(cfg)
+    client._session = SimpleNamespace(closed=False)  # pretend started
+    client._indexers_by_name = {"old (api)": Indexer(1, "Old (API)", "torrent", True, [])}
+    calls = {"n": 0}
+
+    async def _refresh():
+        calls["n"] += 1
+        client._indexers_by_name = {"new (api)": Indexer(2, "New (API)", "torrent", True, [])}
+
+    monkeypatch.setattr(client, "_refresh_indexers", _refresh)
+
+    # Nothing usable yet: the call raises, and schedules a refresh.
+    import pytest as _pt
+
+    with _pt.raises(Exception, match="none of the configured"):
+        client.get_download_indexers()
+    await asyncio.sleep(0)
+    assert calls["n"] == 1
+    assert [i.name for i in client.get_download_indexers()] == ["New (API)"]
+
+    # A second miss inside the throttle window does not schedule again.
+    client._indexers_by_name = {}
+    with _pt.raises(Exception, match="none of the configured"):
+        client.get_download_indexers()
+    await asyncio.sleep(0)
+    assert calls["n"] == 1
