@@ -14,7 +14,7 @@ from typing import Any
 
 from telegram.error import NetworkError, TimedOut
 
-from .state import State, TorrentState
+from .state import State, TorrentState, UpsertResult
 from .telegram_protocol import (
     _CHAT_COMMANDS,
     CancelScope,
@@ -938,11 +938,25 @@ class RouterMixin:
         except Exception:
             pass
         try:
-            store.upsert(ts)
+            _res = store.upsert(ts)
         except Exception as e:  # noqa: BLE001
             await self._reply(
                 f"Action failed: could not track {name} ({_scrubbed(e)}).", reply_to=message
             )
+            return
+        # A tombstoned hash refuses the write (forget/cancel deleted the row).
+        # Answering "Queued" there would claim a download that never starts.
+        try:
+            _written = _res is UpsertResult.WRITTEN
+        except Exception:
+            _written = True
+        if not _written:
+            await self._reply(
+                f"Not queued: {name} ({infohash[:10]}) is tombstoned "
+                "(forgotten or cancelled); run unignore first.",
+                reply_to=message,
+            )
+            await self._delete_chat_file(message, doc_msg)
             return
         try:
             log.info(

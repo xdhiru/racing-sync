@@ -444,3 +444,50 @@ def test_drift_skip_map_drops_settled_hashes():
     bot._prune_detail_drift_skip({"a" * 40})
 
     assert bot._detail_drift_skip == {"a" * 40: 3}
+
+
+@pytest.mark.anyio
+async def test_add_reports_a_tombstoned_write(tmp_path):
+    """A refused (tombstoned) insert must not answer 'Queued'."""
+    from types import SimpleNamespace
+
+    from test_watchdir import _create_sample_torrent_data
+
+    from racing_sync.state import StateStore
+
+    blob = _create_sample_torrent_data("Show.S01E01", 100, "http://x/announce")
+    from racing_sync.watchdir import _bencoded_info_hash
+
+    infohash, _, _, _ = _bencoded_info_hash(blob)
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        # Tombstoning stamps an existing row (a fresh insert is allowed).
+        store.upsert(TorrentState(source_infohash=infohash, source_name="Show.S01E01"))
+        store.tombstone(infohash)
+
+        bot = _bot()
+        bot._store = store
+        bot._coord = None
+        bot._reply = AsyncMock()
+        bot._delete_chat_file = AsyncMock()
+
+        class _TgFile:
+            def download_to_memory(self, buf):
+                buf.write(blob)
+                return buf
+
+        bot._bot = MagicMock()
+        bot._bot.get_file = AsyncMock(return_value=_TgFile())
+
+        message = SimpleNamespace(
+            document=SimpleNamespace(file_name="show.torrent", file_size=len(blob), file_id="f1")
+        )
+
+        await bot._process_document_command(message)
+
+        replies = [c.args[0] for c in bot._reply.await_args_list]
+        assert any("tombstoned" in r for r in replies), replies
+        assert not any(r.startswith("Queued ") for r in replies), replies
+    finally:
+        store.close()
