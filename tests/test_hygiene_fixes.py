@@ -634,3 +634,31 @@ async def test_demote_reraises_abandoned_error(tmp_path, monkeypatch):
     ts = TorrentState(source_infohash="a" * 40, source_name="Show", state=State.DONE)
     with pytest.raises(AbandonedError):
         await coord._demote_false_done_to_moving(ts)
+
+
+@pytest.mark.anyio
+async def test_blob_healing_prefers_the_rows_own_hash():
+    """Healing from an injected cross-seed would change future re-adds."""
+    from racing_sync.state import State, TorrentState
+
+    coord = make_coordinator()
+    coord.cfg = MagicMock()
+    coord.store = MagicMock()
+
+    async def _export(h):
+        return b"own-bytes" if h == "f" * 40 else b"injected-bytes"
+
+    coord.dest_client = AsyncMock()
+    coord.dest_client.export_torrent = _export
+
+    ts = TorrentState(
+        source_infohash="s" * 40,
+        dest_infohash="F" * 40,
+        source_name="Show",
+        injected_private_hashes="a" * 40,  # sorts first
+        state=State.DONE,
+    )
+
+    assert await coord._cleanup_heal_blob(ts, {"a" * 40, "f" * 40}, dry_run=False) is True
+    assert ts.cross_seed_blob == b"own-bytes"
+    coord.store.set_blob.assert_called_once_with("s" * 40, b"own-bytes")

@@ -755,14 +755,29 @@ class CleanupMixin:
         (persisted via narrow update — in-memory only under dry-run).
         Failures keep the old blobless behavior — the VPS1 copy stays
         until bytes are verifiable.
+
+        The export is RPC-bounded (a wedged WebUI must not stall the whole
+        janitor), and the row's own hashes are tried before injected
+        cross-seeds: healing from a private copy would quietly change the
+        blob future re-adds route by.
         """
         try:
             export = getattr(self.dest_client, "export_torrent", None)
             if not callable(export):
                 return False
-            for h in sorted(hashes):
+            order: list[str] = []
+            for h in (ts.dest_infohash, ts.cross_seed_infohash):
+                norm = (h or "").lower()
+                if norm and norm in hashes and norm not in order:
+                    order.append(norm)
+            order.extend(sorted(h for h in hashes if h not in order))
+            for h in order:
                 try:
-                    blob = await export(h)
+                    blob = await rpc(
+                        export(h),
+                        getattr(self, "cfg", None),
+                        "dest cleanup export_torrent",
+                    )
                 except Exception:
                     continue
                 if isinstance(blob, (bytes, bytearray)) and blob:
