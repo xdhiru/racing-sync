@@ -673,7 +673,17 @@ class CleanupMixin:
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup: dest lookup failed for %s: %s", ts.source_infohash[:10], e)
             return False
-        have = {t.hash.lower() for t in (present or [])}
+        # An entry carrying the hash while seeding from the SSD is not a
+        # fuse seed — the byte check below would pass on bytes that are
+        # about to move. Only entries off the SSD count as present.
+        from .recovery import _save_path_on_ssd as _on_ssd
+
+        present = [
+            t
+            for t in (present or [])
+            if not _on_ssd(self.cfg, str(getattr(t, "save_path", "") or ""))
+        ]
+        have = {t.hash.lower() for t in present}
         missing = sorted(hashes - have)
         if missing:
             log.warning(

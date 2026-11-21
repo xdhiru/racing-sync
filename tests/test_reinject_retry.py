@@ -1923,3 +1923,20 @@ async def test_re_inject_racing_matches_fetch_concurrently(tmp_path: Path):
     assert peak == 2
     assert coord._ensure_fuse_entry.await_count == 2
     assert set(ts.injected_private_hashes.split(",")) == {"1" * 40, "2" * 40}
+
+
+def test_late_seed_sweep_prunes_outage_map_independently():
+    """The outage map must shed expired keys even when the other map is small.
+
+    It used to be pruned only past the failure-map threshold, so outage
+    keys survived for the daemon's lifetime on a healthy fleet.
+    """
+    from conftest import make_coordinator
+
+    coord = make_coordinator()
+    coord._failed_late_cross_seeds = {"x" * 40: dt.datetime.now(dt.UTC)}
+    coord._fuse_outage_until = {f"{i:040x}": 0.0 for i in range(2001)}
+
+    coord._late_seed_sweep()
+
+    assert coord._fuse_outage_until == {}

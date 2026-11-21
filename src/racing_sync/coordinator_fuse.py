@@ -20,7 +20,7 @@ from .classifier import classify
 from .clients.abstract import Torrent
 from .clients.deluge import DelugeClient
 from .coordinator_content import _looks_public, fold_path_case
-from .coordinator_errors import _NOT_VISIBLE_DETAIL
+from .coordinator_errors import _NOT_VISIBLE_DETAIL, AbandonedError
 from .coordinator_inject import _group_is_ignored
 from .io_bounds import chunked, rpc
 from .state import State, TorrentState
@@ -379,6 +379,8 @@ class FuseMixin:
                         )
                         await self._demote_false_done_to_moving(ts)
                         return
+                except AbandonedError:
+                    raise
                 except Exception:  # noqa: BLE001
                     pass
                 continue
@@ -499,11 +501,14 @@ class FuseMixin:
             pass
 
     def _late_seed_sweep(self) -> None:
-        """Bound the late-seed failure map + healthy memo (30m TTL, 5000 cap).
+        """Bound the late-seed failure map + healthy/outage memos (TTL + cap).
 
         Called at the top of every late-seed check; cheap fast path unless a
-        map grew large. Restart-wiped maps simply re-warm (thundering herd
-        bounded by one full scan per DONE row, then memoized).
+        map grew large. Each map prunes on its own size — one staying small
+        must not keep another from shedding expired keys (the outage map
+        used to be pruned only when the failure map grew). Restart-wiped
+        maps simply re-warm (thundering herd bounded by one full scan per
+        DONE row, then memoized).
         """
         try:
             d = getattr(self, "_fuse_healthy_until", None)
@@ -519,21 +524,21 @@ class FuseMixin:
                     for k in list(d.keys())[: len(d) - 5000]:
                         d.pop(k, None)
             fm = getattr(self, "_failed_late_cross_seeds", None)
-            if not isinstance(fm, dict) or len(fm) <= 2000:
-                return
-            try:
-                cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=30)
-            except Exception:
-                return
-            for k in list(fm.keys()):
+            if isinstance(fm, dict) and len(fm) > 2000:
                 try:
-                    if fm[k] < cutoff:
-                        fm.pop(k, None)
+                    cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=30)
                 except Exception:
-                    fm.pop(k, None)
-            if len(fm) > 5000:
-                for k in list(fm.keys())[: len(fm) - 5000]:
-                    fm.pop(k, None)
+                    cutoff = None
+                if cutoff is not None:
+                    for k in list(fm.keys()):
+                        try:
+                            if fm[k] < cutoff:
+                                fm.pop(k, None)
+                        except Exception:
+                            fm.pop(k, None)
+                if len(fm) > 5000:
+                    for k in list(fm.keys())[: len(fm) - 5000]:
+                        fm.pop(k, None)
             ou = getattr(self, "_fuse_outage_until", None)
             if isinstance(ou, dict) and len(ou) > 2000:
                 now_m = time.monotonic()
@@ -788,7 +793,17 @@ class FuseMixin:
         present = await self._dest_entries_for_hashes(hashes)
         if present is None:
             return None
-        have = {t.hash.lower() for t in (present or [])}
+        # An entry carrying the hash but seeding from the SSD is not a fuse
+        # seed: it would pass the entry gate while nothing serves from the
+        # mount. Only entries off the SSD count as alive here.
+        from .recovery import _save_path_on_ssd as _on_ssd
+
+        present = [
+            t
+            for t in (present or [])
+            if not _on_ssd(self.cfg, str(getattr(t, "save_path", "") or ""))
+        ]
+        have = {t.hash.lower() for t in present}
         blob = ts._blob or ts.cross_seed_blob
         if not blob and getattr(self, "store", None) is not None:
             try:
@@ -868,6 +883,10 @@ class FuseMixin:
                 ts.source_name[:50],
                 ssd_root,
             )
+        except AbandonedError:
+            # Row forgotten mid-flight: the caller must unwind instead of
+            # logging "demote failed" and carrying on as if it ran.
+            raise
         except ValueError as e:
             log.warning(
                 "late cross-seed: could not demote %s to MOVING: %s",

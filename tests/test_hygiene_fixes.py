@@ -550,3 +550,87 @@ def test_unknown_config_keys_warned(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         AppConfig.from_toml(cfg_file)
     assert any("max_active_download" in r.message for r in caplog.records)
+
+
+@pytest.mark.anyio
+async def test_ssd_backed_entry_is_not_a_fuse_seed(tmp_path):
+    """A hash carried by an SSD-backed entry must not count as seeded.
+
+    Such an entry passes an entry-only gate while nothing serves from the
+    mount; it has to be re-injected like a missing one.
+    """
+    from test_watchdir import _create_sample_torrent_data
+
+    from racing_sync.clients.abstract import Torrent
+    from racing_sync.state import State, TorrentState
+
+    h = "ab" * 20
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+
+    coord = make_coordinator()
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = ssd
+    coord.cfg.ssd.path = ssd
+    coord.cfg.rclone.fuse.mount = str(fuse)
+    coord.cfg.rclone.fuse.mount_unsorted = str(fuse / "unsorted")
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[
+            Torrent(
+                hash=h,
+                name="Show",
+                category="racing",
+                save_path=str(ssd),  # still on the SSD, not seeding from fuse
+                size_bytes=100,
+                state="pausedUP",
+                progress=1.0,
+            )
+        ]
+    )
+    coord._reinject_missing_done_entries = AsyncMock(return_value=True)
+
+    ts = TorrentState(
+        source_infohash=h,
+        dest_infohash=h,
+        source_name="Show",
+        save_path=str(ssd),
+        total_bytes=100,
+        state=State.DONE,
+    )
+    ts._blob = _create_sample_torrent_data("Show", 100, "http://x/announce")
+
+    await coord._verified_fuse_mount_for_done_row(ts)
+
+    coord._reinject_missing_done_entries.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_demote_reraises_abandoned_error(tmp_path, monkeypatch):
+    """A forgotten row must unwind, not log "demote failed" and carry on."""
+    from types import SimpleNamespace
+
+    from racing_sync.coordinator_errors import AbandonedError
+    from racing_sync.state import State, TorrentState
+
+    coord = make_coordinator()
+    coord.cfg = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[SimpleNamespace(name="a.mkv", size_bytes=10)]
+    )
+    coord.store = MagicMock()
+    coord.store.get.return_value = TorrentState(
+        source_infohash="a" * 40, source_name="Show", state=State.DONE
+    )
+    coord.transition = MagicMock(side_effect=AbandonedError("row gone"))
+
+    import racing_sync.recovery as recovery_mod
+
+    monkeypatch.setattr(recovery_mod, "find_content_on_ssd", lambda *a, **k: tmp_path)
+
+    ts = TorrentState(source_infohash="a" * 40, source_name="Show", state=State.DONE)
+    with pytest.raises(AbandonedError):
+        await coord._demote_false_done_to_moving(ts)
