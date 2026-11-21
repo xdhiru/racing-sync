@@ -202,8 +202,13 @@ def allowlist_open_warning(cfg: Any) -> str | None:
                 "(cancel/inject). Set admin_user_ids to restrict."
             )
     except Exception:
-        # Fail closed: a broken allowlist must not open destructive flows.
-        return False
+        # Cannot prove the allowlist is set: warn rather than stay silent
+        # (this function returns a message, never a boolean).
+        return (
+            "telegram admin allowlist could not be read: destructive "
+            "buttons may be open to the whole chat; check admin_user_ids."
+        )
+    return None
 
 
 # --------------------------------------------------------------------------- #

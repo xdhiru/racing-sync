@@ -110,3 +110,14 @@ def test_dest_config_rejects_unusable_origin_and_relative_path():
 
     with pytest.raises(pydantic.ValidationError, match="absolute"):
         DestConfig(host="http://localhost:8080", save_path="downloads")
+
+
+def test_allowlist_warning_survives_a_broken_config():
+    """The function returns a message or None — never a boolean."""
+    class _Bad:
+        @property
+        def admin_user_ids(self):
+            raise RuntimeError("boom")
+
+    out = allowlist_open_warning(_Bad())
+    assert isinstance(out, str) and out
