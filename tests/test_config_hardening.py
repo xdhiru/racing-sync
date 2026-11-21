@@ -114,6 +114,7 @@ def test_dest_config_rejects_unusable_origin_and_relative_path():
 
 def test_allowlist_warning_survives_a_broken_config():
     """The function returns a message or None — never a boolean."""
+
     class _Bad:
         @property
         def admin_user_ids(self):

@@ -434,3 +434,13 @@ async def test_orphan_sweep_keeps_flooded_and_drops_gone(tmp_path):
         assert bot._orphan_ids() == [42]
     finally:
         store.close()
+
+
+def test_drift_skip_map_drops_settled_hashes():
+    """A hash that left the active list must not keep a drift counter."""
+    bot = _bot()
+    bot._detail_drift_skip = {"a" * 40: 3, "b" * 40: 1}
+
+    bot._prune_detail_drift_skip({"a" * 40})
+
+    assert bot._detail_drift_skip == {"a" * 40: 3}

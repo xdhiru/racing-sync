@@ -359,6 +359,7 @@ class RefreshMixin:
                         self._enqueue_detail(_h, _prog)
                 except Exception:
                     continue
+            self._prune_detail_drift_skip({(t.source_infohash or "") for t, _ in items})
         except Exception:
             pass
         # Terminal-card net: DONE/FAILED rows leave the active list above,
@@ -781,6 +782,25 @@ class RefreshMixin:
         except (TypeError, ValueError):
             last = 0.0
         return (time.monotonic() - last) >= interval
+
+    def _prune_detail_drift_skip(self, live: set[str]) -> None:
+        """Drop drift counters for hashes no longer on the active list.
+
+        The counter is only cleared when it reaches the re-drive threshold,
+        so a hash that drifted once and then settled kept its key forever —
+        one entry per torrent the daemon had ever shown.
+        """
+        try:
+            d = getattr(self, "_detail_drift_skip", None)
+            if not isinstance(d, dict):
+                return
+            for k in [k for k in d if k not in live]:
+                d.pop(k, None)
+            if len(d) > 5000:
+                for k in list(d.keys())[: len(d) - 5000]:
+                    d.pop(k, None)
+        except Exception:
+            pass
 
     def _active_probe_due(self) -> bool:
         """True every N-th unchanged refresh: prove the card still exists.
