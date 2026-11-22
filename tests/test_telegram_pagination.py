@@ -1494,3 +1494,14 @@ def test_render_active_wait_indexer_shows_retry_countdown():
     text2, _, _ = render_active([(ts2, None)], page=0, page_size=5)
     assert "Wait indexer miss #3" in text2
     assert "retry in" not in text2
+
+
+def test_safe_truncate_markdown_counts_utf16_units():
+    """Emoji cost two units each: code points alone overrun Telegram's 4096."""
+    from racing_sync.telegram_bot import _safe_truncate_markdown
+
+    emoji_heavy = "🎬" * 3000  # 3000 code points, 6000 UTF-16 units
+    out = _safe_truncate_markdown(emoji_heavy, max_len=4096)
+
+    assert len(out.encode("utf-16-le")) // 2 <= 4096
+    assert out.endswith("...")

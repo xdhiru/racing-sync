@@ -65,18 +65,47 @@ def _unclosed_markdown_delims(text: str) -> str:
     return to_close
 
 
+def _tg_len(text: str) -> int:
+    """Length Telegram counts: UTF-16 code units, not code points.
+
+    An astral character (emoji, rare CJK) is two units, so budgeting by
+    code points lets an emoji-heavy card exceed 4096 and the edit is
+    rejected outright.
+    """
+    try:
+        return len(text.encode("utf-16-le")) // 2
+    except Exception:
+        return len(text)
+
+
+def _truncate_to_units(text: str, max_units: int) -> str:
+    """Longest prefix of `text` whose UTF-16 length fits `max_units`."""
+    if max_units <= 0:
+        return ""
+    if _tg_len(text) <= max_units:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _tg_len(text[:mid]) <= max_units:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo]
+
+
 def _safe_truncate_markdown(text: str, max_len: int = 4096) -> str:
     """Truncate text to max_len while keeping markdown tags properly closed and ending with '...'."""
-    if len(text) <= max_len:
+    if _tg_len(text) <= max_len:
         return text
 
     lines = text.split("\n")
     acc: list[str] = []
     curr_len = 0
     suffix = "\n..."
-    budget = max(0, max_len - len(suffix))
+    budget = max(0, max_len - _tg_len(suffix))
     for line in lines:
-        added = len(line) + (1 if acc else 0)
+        added = _tg_len(line) + (1 if acc else 0)
         if curr_len + added <= budget:
             acc.append(line)
             curr_len += added
@@ -88,14 +117,14 @@ def _safe_truncate_markdown(text: str, max_len: int = 4096) -> str:
         suffix = "\n..."
     else:
         suffix = "..."
-        truncated = text[: max(0, max_len - len(suffix))]
+        truncated = _truncate_to_units(text, max(0, max_len - _tg_len(suffix)))
 
     to_close = _unclosed_markdown_delims(truncated)
 
     if to_close:
-        excess = (len(truncated) + len(to_close) + len(suffix)) - max_len
+        excess = (_tg_len(truncated) + _tg_len(to_close) + _tg_len(suffix)) - max_len
         if excess > 0:
-            truncated = truncated[:-excess]
+            truncated = _truncate_to_units(truncated, max(0, _tg_len(truncated) - excess))
             to_close = _unclosed_markdown_delims(truncated)
 
     return truncated + to_close + suffix
