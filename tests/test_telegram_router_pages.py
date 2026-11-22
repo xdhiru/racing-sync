@@ -202,3 +202,34 @@ async def test_overview_button_sends_aggregate():
     assert text.startswith("📊")
     assert "2 downloading" in text
     assert "DL1" in text and "MV1" in text
+
+
+@pytest.mark.anyio
+async def test_page_wrap_counts_only_filtered_groups():
+    """Under a status filter, paging wraps over what the keyboard shows.
+
+    Counting every row let "Prev" step past the filtered view; the render
+    clamped it back, so the button looked dead.
+    """
+    filtered = [  # downloading: visible under the dl filter
+        TorrentState(
+            source_infohash="a" * 40,
+            source_name="Dl.One",
+            state=State.DOWNLOADING,
+            total_bytes=1000,
+        )
+    ]
+    hidden = [  # queued: filtered out, and enough for a second page
+        _row("b" * 40, "Q.Two"),
+        _row("c" * 40, "Q.Three"),
+        _row("d" * 40, "Q.Four"),
+        _row("e" * 40, "Q.Five"),
+        _row("f" * 40, "Q.Six"),
+    ]
+    bot = _page_bot(filtered + hidden, _status_filter="dl")
+    bot._cfg.page_size = 1
+
+    await bot._handle_callback(_query("page:prev"))
+
+    assert bot._current_page == 0  # one filtered page: prev wraps to itself
+    bot._refresh_active_message.assert_awaited_once()

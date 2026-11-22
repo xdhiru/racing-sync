@@ -551,9 +551,12 @@ class RouterMixin:
         # Page over rendered GROUPS (election identity), not raw rows:
         # the renderer groups same-file copies, so row-based wrapping
         # desyncs prev/next (taps wrap early or look dead) whenever
-        # duplicates share a page.
+        # duplicates share a page. The status filter applies here too —
+        # the keyboard's totals count what the renderer shows.
         try:
-            total_groups = len(_group_active_items([(r, None) for r in rows or []]))
+            total_groups = len(
+                _group_active_items([(r, None) for r in self._positional_active_rows(rows or [])])
+            )
         except Exception:
             try:
                 total_groups = len(rows or [])
