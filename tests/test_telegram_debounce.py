@@ -33,6 +33,10 @@ def _msg(text):
     m.from_user.id = 12345
     m.text = text
     m.caption = None
+    # Real PTB messages carry None here; a MagicMock attribute is truthy
+    # and would look like a .torrent upload to the debounce rule.
+    m.document = None
+    m.reply_to_message = None
     return m
 
 
@@ -151,3 +155,78 @@ async def test_overlapping_cancel_scope_conflicts_per_hash():
     # The sibling's speculative hold was rolled back, not leaked.
     assert f"keep:{'b' * 40}:1:del" not in bot._action_inflight
     assert bot._action_inflight == {f"keep:{'a' * 40}:1:del": now}
+
+
+@pytest.mark.anyio
+async def test_different_mutating_commands_both_run():
+    """A different verb/target inside the window is not a duplicate."""
+    import racing_sync.telegram_router as _router
+
+    calls: list[str] = []
+
+    async def _fake_handle(bot, match, message):
+        calls.append(match.string)
+
+    fake_table = (
+        _ChatCommand("skip", re.compile(r"^/skip_"), _fake_handle),
+        _ChatCommand("resume", re.compile(r"^/resume_"), _fake_handle),
+    )
+    bot = _cmd_bot()
+    orig = _router._CHAT_COMMANDS
+    _router._CHAT_COMMANDS = fake_table
+    try:
+        await bot._handle_chat_message(_msg("/skip_abc123"))
+        await bot._handle_chat_message(_msg("/resume_abc123"))
+        await bot._handle_chat_message(_msg("/skip_def456"))
+    finally:
+        _router._CHAT_COMMANDS = orig
+    assert calls == ["/skip_abc123", "/resume_abc123", "/skip_def456"]
+
+
+@pytest.mark.anyio
+async def test_duplicate_command_answers_instead_of_silent_drop():
+    import racing_sync.telegram_router as _router
+
+    calls: list[str] = []
+
+    async def _fake_handle(bot, match, message):
+        calls.append("handled")
+
+    fake_table = (_ChatCommand("cancel", re.compile(r"^/cancel_"), _fake_handle),)
+    bot = _cmd_bot()
+    orig = _router._CHAT_COMMANDS
+    _router._CHAT_COMMANDS = fake_table
+    try:
+        await bot._handle_chat_message(_msg("/cancel_abc"))
+        await bot._handle_chat_message(_msg("/cancel_abc"))
+    finally:
+        _router._CHAT_COMMANDS = orig
+    assert calls == ["handled"]
+    assert bot._reply.call_count == 1
+    assert "Ignored duplicate cancel" in bot._reply.call_args[0][0]
+
+
+@pytest.mark.anyio
+async def test_document_add_is_never_debounced():
+    """Two .torrent uploads in a row are distinct work (and must be deleted)."""
+    from unittest.mock import MagicMock
+
+    import racing_sync.telegram_router as _router
+
+    calls: list[str] = []
+
+    async def _fake_handle(bot, match, message):
+        calls.append("handled")
+
+    fake_table = (_ChatCommand("add", re.compile(r"^/add"), _fake_handle),)
+    bot = _cmd_bot()
+    orig = _router._CHAT_COMMANDS
+    _router._CHAT_COMMANDS = fake_table
+    try:
+        for _ in range(2):
+            m = _msg("/add")
+            m.document = MagicMock()
+            await bot._handle_chat_message(m)
+    finally:
+        _router._CHAT_COMMANDS = orig
+    assert calls == ["handled", "handled"]

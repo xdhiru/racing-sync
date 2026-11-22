@@ -609,6 +609,10 @@ def _message(chat="1", user="9", text="/cancel_aaaaaaaaaa"):
     m.text = text
     m.caption = None
     m.message_id = 42
+    # Real PTB messages carry None here; a MagicMock attribute is truthy
+    # and would look like a .torrent upload to the debounce rule.
+    m.document = None
+    m.reply_to_message = None
     return m
 
 
@@ -2022,8 +2026,11 @@ async def test_chat_command_double_tap_debounced(tmp_path: Path):
     try:
         await bot._handle_chat_message(_message(text="/cancel_dddddddddd"))
         await bot._handle_chat_message(_message(text="/cancel_dddddddddd"))
-        # Unknown hash replies once; the second tap is dropped silently.
-        bot._bot.send_message.assert_awaited_once()
+        # Unknown hash replies once; the second tap is answered as a
+        # duplicate instead of resolving and acting again.
+        assert bot._bot.send_message.await_count == 2
+        replies = [c.args[1] for c in bot._bot.send_message.await_args_list]
+        assert "Ignored duplicate" in replies[1]
     finally:
         store.close()
 

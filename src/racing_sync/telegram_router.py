@@ -689,15 +689,36 @@ class RouterMixin:
                     pass
             # Debounce mutating verbs only (double-sent command must not
             # resolve+act twice): read-only /stats|/find|/files always
-            # answer, even inside another command's window. Namespaced
-            # apart from callback keys, keyed chat+user so one spammer
-            # cannot block other operators.
-            if _matched.name not in self._READ_ONLY_COMMANDS:
+            # answer, even inside another command's window. The key carries
+            # the verb AND its target, so /skip_x followed by /resume_x is
+            # two actions rather than one dropped duplicate. A message that
+            # carries a .torrent is never debounced: each upload is distinct
+            # work, and the sender's passkey must not linger in chat.
+            try:
+                _has_doc = bool(getattr(message, "document", None)) or bool(
+                    getattr(getattr(message, "reply_to_message", None), "document", None)
+                )
+            except Exception:
+                _has_doc = False
+            if _matched.name not in self._READ_ONLY_COMMANDS and not _has_doc:
                 try:
-                    _ckey = f"cmd:{chat_id}:{user_id}" if chat_id is not None else f"cmd:{user_id}"
+                    _ckey = (
+                        f"cmd:{_matched.name}:{chat_id}:{user_id}:"
+                        f"{(text or '').strip().lower()[:200]}"
+                        if chat_id is not None
+                        else f"cmd:{_matched.name}:{user_id}:{(text or '').strip().lower()[:200]}"
+                    )
                 except Exception:
                     _ckey = ""
                 if _ckey and self._debounced(_ckey, window=2.0):
+                    try:
+                        await self._reply(
+                            f"Ignored duplicate {_matched.name} command (sent "
+                            "twice in a row); re-run it in a moment.",
+                            reply_to=message,
+                        )
+                    except Exception:
+                        pass
                     return
             await _matched.handle(self, _match, message)
             return
