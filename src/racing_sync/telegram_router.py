@@ -461,12 +461,14 @@ class RouterMixin:
                 # invites the re-tap this guard exists to absorb.
                 await self._mark_sheet_working(query)
             await self._on_action_button(query, data)
-            if not data.startswith("abort"):
+            if data != "abort":
                 # The tapped sheet served its purpose: remove it so
                 # answered questions don't linger behind their follow-up
                 # (`abort` already deletes itself above; the active-list
                 # message never carries action buttons, only pagination,
-                # so this only ever removes disposable sheets).
+                # so this only ever removes disposable sheets). Exact
+                # match: "aborted"/"abortx" are stale buttons, and their
+                # sheet was left behind when a prefix check skipped this.
                 try:
                     await self._delete_query_message(query)
                 except Exception:

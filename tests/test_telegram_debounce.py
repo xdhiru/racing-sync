@@ -230,3 +230,25 @@ async def test_document_add_is_never_debounced():
     finally:
         _router._CHAT_COMMANDS = orig
     assert calls == ["handled", "handled"]
+
+
+@pytest.mark.anyio
+async def test_abort_prefixed_data_still_removes_the_dead_sheet():
+    """`aborted` is a stale button: answered AND its sheet deleted.
+
+    The delete-skip used a prefix match, so any data starting with
+    "abort" left the dead sheet in the chat.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    bot = _cmd_bot()
+    bot._delete_query_message = AsyncMock()
+    q = MagicMock()
+    q.message.chat.id = 12345
+    q.from_user.id = 12345
+    q.data = "aborted"
+    q.answer = AsyncMock()
+
+    await bot._handle_callback(q)
+
+    bot._delete_query_message.assert_awaited_once()
