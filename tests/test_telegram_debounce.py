@@ -252,3 +252,57 @@ async def test_abort_prefixed_data_still_removes_the_dead_sheet():
     await bot._handle_callback(q)
 
     bot._delete_query_message.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_send_sheet_binds_the_opener():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    bot = _cmd_bot()
+    bot._bot = MagicMock()
+    bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=777))
+    await bot._send_sheet(
+        "Forget X?",
+        [[("Yes", "keep:" + "a" * 40 + ":1:yes")]],
+        opener=111,
+    )
+    assert bot._sheet_owner == {777: 111}
+
+    # Falls back to the replied-to message's sender for command sheets.
+    bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=778))
+    await bot._send_sheet(
+        "Forget Y?",
+        [[("Yes", "keep:" + "b" * 40 + ":1:yes")]],
+        reply_to=SimpleNamespace(from_user=SimpleNamespace(id=222)),
+    )
+    assert bot._sheet_owner[778] == 222
+
+
+@pytest.mark.anyio
+async def test_destructive_sheet_answers_only_its_opener():
+    from unittest.mock import AsyncMock, MagicMock
+
+    def _tap(user, data="keep:" + "a" * 40 + ":1:yes"):
+        q = MagicMock()
+        q.message.chat.id = 12345
+        q.message.message_id = 500
+        q.from_user.id = user
+        q.data = data
+        q.answer = AsyncMock()
+        return q
+
+    bot = _cmd_bot()
+    bot._sheet_owner = {500: 111}
+    bot._on_action_button = AsyncMock()
+
+    # Another member: refused, handler never runs.
+    other = _tap(222)
+    await bot._handle_callback(other)
+    bot._on_action_button.assert_not_awaited()
+    assert "another operator" in other.answer.await_args.args[0]
+
+    # The opener: proceeds.
+    own = _tap(111)
+    await bot._handle_callback(own)
+    bot._on_action_button.assert_awaited_once()

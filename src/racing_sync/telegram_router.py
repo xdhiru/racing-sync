@@ -36,6 +36,15 @@ from .telegram_views import (
 log = logging.getLogger("racing_sync.telegram_bot")
 
 
+def _tap_user_id(query: Any) -> int | None:
+    """Tapper's user id (None when the update carries no usable sender)."""
+    try:
+        uid = getattr(getattr(query, "from_user", None), "id", None)
+        return int(uid) if uid is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _tg_actor_allowed(cfg: Any, user_id: object) -> bool:
     """Admin-allowlist gate for destructive commands and taps.
 
@@ -139,7 +148,7 @@ class RouterMixin:
                     # Standalone sheet: query.message (the tapped sheet)
                     # is deleted by the caller below — a reply_to would
                     # dangle off a deleted message.
-                    await self._send_sheet(_text, _rows)
+                    await self._send_sheet(_text, _rows, opener=_tap_user_id(query))
                 except Exception:
                     pass
                 return
@@ -164,7 +173,7 @@ class RouterMixin:
                 )
                 try:
                     # Standalone (see remember-sheet above).
-                    await self._send_sheet(_text, _rows)
+                    await self._send_sheet(_text, _rows, opener=_tap_user_id(query))
                 except Exception:
                     pass
                 return
@@ -444,6 +453,28 @@ class RouterMixin:
             pass
 
         data = str(getattr(query, "data", "") or "")
+        # A destructive sheet belongs to the operator who opened it: its
+        # keep/forget buttons finish a decision only that operator made.
+        # Anyone else's tap is answered and the sheet is left for its owner.
+        if data.startswith(("keep:", "forget:")):
+            owner = None
+            try:
+                owners = getattr(self, "_sheet_owner", None)
+                mid = getattr(getattr(query, "message", None), "message_id", None)
+                if isinstance(owners, dict) and isinstance(mid, int):
+                    owner = owners.get(mid)
+            except Exception:
+                owner = None
+            tapper = _tap_user_id(query)
+            if owner is not None and tapper is not None and tapper != owner:
+                try:
+                    await query.answer(
+                        "This sheet belongs to another operator; open your own.",
+                        show_alert=True,
+                    )
+                except Exception:
+                    pass
+                return
         if (
             data.startswith("pick:")
             or data.startswith("keep:")

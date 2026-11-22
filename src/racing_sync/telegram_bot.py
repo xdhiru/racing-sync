@@ -326,6 +326,8 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         self._last_active_cache: tuple | None = None
         # Unchanged refreshes since the last liveness probe of the card.
         self._active_probe_count: int = 0
+        # sheet message id -> operator who opened it (destructive sheets).
+        self._sheet_owner: dict[int, int] = {}
         # Per-chat debounce (monotonic timestamps by chat/user key): one
         # chat's burst must not starve pagination for everyone else.
         self._callback_times: dict[str, float] = {}
@@ -1037,12 +1039,19 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         text: str,
         rows: list,
         reply_to: Any = None,
+        *,
+        opener: Any = None,
     ) -> None:
         """Best-effort sheet reply with action buttons (plain text).
 
         `rows` is a ButtonMaker (strict, validated at build time) or
         legacy ``(label, data)`` rows (validated leniently: invalid
         buttons are logged and dropped, never silently).
+
+        `opener` is the operator who started the flow (defaults to the
+        replied-to message's sender). Destructive sheet buttons only
+        answer to that operator — another member tapping them would
+        otherwise finish a decision they never made.
         """
         bot = getattr(self, "_bot", None)
         if bot is None:
@@ -1066,8 +1075,32 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                 kwargs["reply_markup"] = InlineKeyboardMarkup(_btns)
             sent = await bot.send_message(self._cfg.chat_id, text, **kwargs)
             self._note_outbound(getattr(sent, "message_id", None))
+            if opener is None:
+                opener = getattr(getattr(reply_to, "from_user", None), "id", None)
+            self._note_sheet_owner(sent, opener)
         except Exception as e:  # noqa: BLE001
             log.debug("sheet reply failed: %s", e)
+
+    def _note_sheet_owner(self, sent: Any, opener: Any) -> None:
+        """Bind a sent sheet to its opener (bounded per-message map)."""
+        try:
+            mid = int(getattr(sent, "message_id", 0) or 0)
+            uid = int(opener or 0)
+        except (TypeError, ValueError):
+            return
+        if mid <= 0 or uid <= 0:
+            return
+        try:
+            owners = getattr(self, "_sheet_owner", None)
+            if not isinstance(owners, dict):
+                owners = {}
+                self._sheet_owner = owners
+            owners[mid] = uid
+            if len(owners) > 500:
+                for _k in list(owners.keys())[: len(owners) - 500]:
+                    owners.pop(_k, None)
+        except Exception:
+            pass
 
     async def _delete_query_message(self, query: Any) -> None:
         """Best-effort delete of the message holding the tapped button."""
