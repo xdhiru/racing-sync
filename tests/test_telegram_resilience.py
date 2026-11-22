@@ -491,3 +491,14 @@ async def test_add_reports_a_tombstoned_write(tmp_path):
         assert not any(r.startswith("Queued ") for r in replies), replies
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_send_one_detail_skips_the_blob():
+    bot = _bot()
+    bot._store = MagicMock()
+    bot._store.get = MagicMock(return_value=None)
+
+    await bot._send_one_detail("a" * 40, None)
+
+    assert bot._store.get.call_args.kwargs.get("include_blob") is False

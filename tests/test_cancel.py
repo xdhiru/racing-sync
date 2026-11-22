@@ -3095,3 +3095,20 @@ async def test_working_mark_failure_still_executes(tmp_path: Path):
         assert sent.startswith("Cancelled")
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_cancel_scope_and_detail_skip_blob_loads():
+    """Resolution reads the row only: blobs are multi-MB and unused."""
+    from types import SimpleNamespace
+
+    from racing_sync.telegram_protocol import CancelScope
+
+    bot = MagicMock()
+    bot._store.get = MagicMock(return_value=SimpleNamespace(source_name="Show"))
+    await CancelScope("single", "a" * 40).resolve(bot)
+    assert bot._store.get.call_args.kwargs.get("include_blob") is False
+
+    bot._store.get.reset_mock()
+    await CancelScope("group", "a" * 40).resolve(bot)
+    assert bot._store.get.call_args.kwargs.get("include_blob") is False

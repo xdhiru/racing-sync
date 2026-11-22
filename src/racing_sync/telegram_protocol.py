@@ -645,7 +645,11 @@ class CancelScope(NamedTuple):
         if self.kind == "single":
             get = getattr(store, "get", None) if store else None
             try:
-                row = await asyncio.to_thread(get, self.key) if callable(get) else None
+                row = (
+                    await asyncio.to_thread(get, self.key, include_blob=False)
+                    if callable(get)
+                    else None
+                )
             except Exception as e:  # noqa: BLE001
                 raise RuntimeError(f"resolve failed: {e}") from e
             if row is None:
@@ -663,7 +667,11 @@ class CancelScope(NamedTuple):
             title = self.key[:10]
             try:
                 get = getattr(store, "get", None) if store else None
-                leader = get(self.key) if callable(get) else None
+                leader = (
+                    await asyncio.to_thread(get, self.key, include_blob=False)
+                    if callable(get)
+                    else None
+                )
                 if leader is not None:
                     title = str(getattr(leader, "source_name", "") or self.key[:10])[:60]
             except Exception:

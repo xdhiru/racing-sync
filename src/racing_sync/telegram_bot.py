@@ -768,7 +768,7 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         """Send or edit the detail message for a single torrent."""
         if self._bot is None:
             return
-        ts = await asyncio.to_thread(self._store.get, infohash)
+        ts = await asyncio.to_thread(self._store.get, infohash, include_blob=False)
         if ts is None:
             return
         note = ""
