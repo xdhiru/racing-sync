@@ -159,3 +159,41 @@ def test_state_prefill_query_is_narrow(tmp_path):
         except Exception:
             pass
     assert rows == [("a" * 40, 77, "done")]
+
+
+def test_detail_queue_overflow_reports_dropped_updates(caplog):
+    """A refill that loses entries must say so, not vanish silently.
+
+    A concurrent producer can fill the queue between the drain and the
+    refill; the old loop broke out and left the remaining updates lost
+    with no trace in the log.
+    """
+    import asyncio
+    import logging
+
+    from racing_sync.telegram_bot import TelegramBot
+
+    bot = object.__new__(TelegramBot)
+    q = asyncio.Queue(maxsize=5)
+    for i in range(5):
+        real_put = q.put_nowait
+        real_put((f"h{i}", 0.0))
+    bot._detail_queue = q
+
+    real_put = q.put_nowait
+    calls = {"n": 0}
+
+    def _flaky(item):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise asyncio.QueueFull
+        return real_put(item)
+
+    q.put_nowait = _flaky
+
+    with caplog.at_level(logging.WARNING, logger="racing_sync.telegram_bot"):
+        bot._enqueue_detail("new", 0.0)
+
+    assert any("dropped" in r.message for r in caplog.records)
+    queued = [q.get_nowait() for _ in range(q.qsize())]
+    assert ("new", 0.0) in queued

@@ -594,24 +594,32 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                     coalesced = True
                     continue
                 pending.append(item)
-            for item in pending:
+            # Refill oldest-first. A concurrent producer can fill the queue
+            # between the drain and the refill, so anything that no longer
+            # fits is counted and logged: silently losing an update is how a
+            # card freezes with no trace.
+            while pending:
                 try:
-                    q.put_nowait(item)
+                    q.put_nowait(pending[0])
                 except asyncio.QueueFull:
                     break
-            q.put_nowait((infohash, progress))
-        except asyncio.QueueFull:
-            try:
-                q.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
+                pending.pop(0)
+            dropped = len(pending)
             try:
                 q.put_nowait((infohash, progress))
             except asyncio.QueueFull:
-                log.warning(
-                    "telegram detail queue full; dropping update for %s",
-                    infohash[:10],
-                )
+                # No room even for the update we were asked to show: the
+                # oldest queued one is the stalest thing here.
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                q.put_nowait((infohash, progress))
+                dropped += 1
+            if dropped:
+                log.warning("telegram detail queue overflow: dropped %d stale update(s)", dropped)
+        except Exception as e:  # noqa: BLE001
+            log.warning("telegram detail queue overflow handling failed: %s", e)
 
     async def _detail_worker_loop(self) -> None:
         """Drain the per-torrent detail-message queue.
