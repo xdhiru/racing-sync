@@ -1374,14 +1374,45 @@ async def test_ops_pause_and_resume_intake():
 
 @pytest.mark.anyio
 async def test_ops_tick_runs_and_reports():
-    """Tick runs the pipeline step and refreshes the list."""
+    """Tick runs the pipeline step in the background and refreshes the list."""
     bot = _bot()
     bot._coord = MagicMock()
     bot._coord._tick_inner = AsyncMock()
     await bot._handle_chat_message(_message(text="/tick"))
+    # The handler returns immediately; the pass and its answer run as a task.
+    task = bot._tick_task
+    assert not task.done()
+    await task
     bot._coord._tick_inner.assert_awaited_once()
     assert bot._bot.send_message.call_args[0][1] == "Tick done."
     bot._refresh_active_message.assert_awaited()
+
+
+@pytest.mark.anyio
+async def test_ops_tick_second_tap_answers_instead_of_stacking():
+    """A tap while a pass is running answers, never queues another pass."""
+    import asyncio
+
+    bot = _bot()
+    bot._coord = MagicMock()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow():
+        started.set()
+        await release.wait()
+
+    bot._coord._tick_inner = _slow
+    from racing_sync.telegram_protocol import _cmd_tick
+
+    await _cmd_tick(bot, MagicMock(), _message(text="/tick"))
+    await started.wait()
+
+    # Direct call: the chat-level debounce would otherwise answer first.
+    await _cmd_tick(bot, MagicMock(), _message(text="/tick"))
+    assert "already running" in bot._bot.send_message.call_args[0][1]
+    release.set()
+    await bot._tick_task
 
 
 @pytest.mark.anyio

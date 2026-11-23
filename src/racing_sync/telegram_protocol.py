@@ -274,7 +274,7 @@ async def _cmd_resume_intake(bot, match, message):
 
 
 async def _cmd_tick(bot, match, message):
-    """`/tick`: run one full pipeline tick now."""
+    """`/tick`: run one full pipeline tick now, without blocking polling."""
     coord = getattr(bot, "_coord", None)
     step = getattr(coord, "_tick_inner", None)
     if coord is None or not callable(step):
@@ -283,23 +283,44 @@ async def _cmd_tick(bot, match, message):
         except Exception:
             pass
         return
+
+    async def _run() -> None:
+        try:
+            await step()
+        except Exception as e:  # noqa: BLE001
+            try:
+                await bot._reply(_action_error_text(e), reply_to=message)
+            except Exception:
+                pass
+            return
+        try:
+            await bot._reply("Tick done.", reply_to=message)
+        except Exception:
+            pass
+        try:
+            bot._last_active_cache = None
+            await bot._refresh_active_message()
+        except Exception:
+            pass
+
+    # A full pass can take a minute (worker scheduling, janitor). Awaiting it
+    # inline stalls polling for the whole pass and Telegram retries the
+    # update; run it as a task and answer when it finishes. A second tap
+    # answers instead of stacking another pass behind the locks.
+    prev = getattr(bot, "_tick_task", None)
+    if prev is not None and not prev.done():
+        try:
+            await bot._reply("Tick already running; its result will follow.", reply_to=message)
+        except Exception:
+            pass
+        return
     try:
-        await step()
+        bot._tick_task = asyncio.create_task(_run())
     except Exception as e:  # noqa: BLE001
         try:
             await bot._reply(_action_error_text(e), reply_to=message)
         except Exception:
             pass
-        return
-    try:
-        await bot._reply("Tick done.", reply_to=message)
-    except Exception:
-        pass
-    try:
-        bot._last_active_cache = None
-        await bot._refresh_active_message()
-    except Exception:
-        pass
 
 
 async def _cmd_active(bot, match, message):
@@ -352,7 +373,8 @@ async def _cmd_stats(bot, match, message):
         return
     try:
         _all = getattr(store, "all", None)
-        rows = list(_all() or []) if callable(_all) else []
+        # A full-table read must not run on the polling loop.
+        rows = list(await asyncio.to_thread(_all) or []) if callable(_all) else []
     except Exception:
         rows = []
     counts: dict[str, int] = {}
