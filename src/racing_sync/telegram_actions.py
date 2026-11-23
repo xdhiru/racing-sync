@@ -1685,6 +1685,15 @@ class ActionsMixin:
                 if row is None:
                     gone += 1
                     continue
+                # Settled rows have no pipeline to hold or resume: skipping
+                # one changes nothing, and "resuming" a DONE row spawned a
+                # worker that had no state to act on while reporting success.
+                try:
+                    _st = getattr(getattr(row, "state", None), "value", "")
+                except Exception:
+                    _st = ""
+                if _st in ("done", "failed"):
+                    continue
                 try:
                     _upd = getattr(store, "update_columns", None)
                     if callable(_upd):

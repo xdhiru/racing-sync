@@ -3257,3 +3257,33 @@ async def test_cancel_keeps_reservation_when_the_row_survives():
         await bot._execute_cancel_one("a" * 40, delete_files=True)
 
     coord._ssd_release.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_resume_ignores_settled_rows(tmp_path):
+    """A DONE/FAILED row has no pipeline to resume."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Done.Show",
+                state=State.DONE,
+                skipped=1,
+            )
+        )
+        bot = _bot()
+        bot._store = store
+        coord = MagicMock()
+        coord._spawn_worker = MagicMock()
+        bot._coord = coord
+
+        res = await bot._skip_torrents(["a" * 40], hold=False)
+
+        assert res.startswith("Nothing to unskip")
+        coord._spawn_worker.assert_not_called()
+        assert store.get("a" * 40).skipped == 1
+    finally:
+        store.close()
