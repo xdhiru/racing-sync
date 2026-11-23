@@ -502,3 +502,28 @@ async def test_send_one_detail_skips_the_blob():
     await bot._send_one_detail("a" * 40, None)
 
     assert bot._store.get.call_args.kwargs.get("include_blob") is False
+
+
+@pytest.mark.anyio
+async def test_cancelled_card_reports_the_chosen_policy():
+    """The card must not claim "removed + ignored" for just-forget."""
+    bot = _bot()
+    seen: list[str] = []
+
+    async def _edit(text, **kwargs):
+        seen.append(text)
+
+    bot._bot.edit_message_text = _edit
+    h = "a" * 40
+
+    await bot._mark_detail_cancelled(7, "Show", h, remember=True, delete_files=True)
+    assert "removed + ignored" in seen[-1]
+    assert f"Unignore: `/resume_{h}`" in seen[-1]
+
+    await bot._mark_detail_cancelled(7, "Show", h, remember=False, delete_files=True)
+    assert "can be re-added" in seen[-1]
+    assert "Unignore" not in seen[-1]
+
+    await bot._mark_detail_cancelled(7, "Show", h, remember=True, delete_files=False)
+    assert "data left in place" in seen[-1]
+    assert f"Unignore: `/resume_{h}`" in seen[-1]

@@ -174,7 +174,13 @@ class ActionsMixin:
         except Exception:
             pass
         if detail_msg_id:
-            await self._mark_detail_cancelled(detail_msg_id, name, infohash)
+            await self._mark_detail_cancelled(
+                detail_msg_id,
+                name,
+                infohash,
+                remember=remember,
+                delete_files=delete_files,
+            )
         try:
             for pair in result.get("paired_cancelled") or []:
                 try:

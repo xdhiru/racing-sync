@@ -43,23 +43,41 @@ _ACTIVE_PROBE_EVERY = 20
 
 
 class RefreshMixin:
-    async def _mark_detail_cancelled(self, message_id: int, name: str, infohash: str) -> None:
+    async def _mark_detail_cancelled(
+        self,
+        message_id: int,
+        name: str,
+        infohash: str,
+        *,
+        remember: bool = True,
+        delete_files: bool = True,
+    ) -> None:
         """Edit a forgotten row's detail card to CANCELLED (best-effort).
 
         The DB row is already deleted, so this uses the snapshotted message
         id. Never raises: a deleted card or a down Bot API must not fail
         the cancel itself.
+
+        The line reports the policy the operator picked: whether the row was
+        ignored (and so can be un-ignored) and whether the data was removed.
         """
         bot = getattr(self, "_bot", None)
         if bot is None or not message_id:
             return
         shown = (name or infohash[:10])[:100]
-        text = (
-            f"🚫 CANCELLED `{_esc(shown)}`\n"
-            f"`{(infohash or '').lower()}`\n"
-            "✗ Cancelled by operator (removed + ignored)\n"
-            f"Unignore: `/resume_{(infohash or '').lower()}`"
+        _h = (infohash or "").lower()
+        if delete_files:
+            _what = "removed + ignored" if remember else "removed, can be re-added"
+        else:
+            _what = (
+                "untracked + ignored, data left in place"
+                if remember
+                else "untracked, data left in place (can be re-added)"
+            )
+        _hint = (
+            f"Unignore: `/resume_{_h}`" if remember else "Re-drop the .torrent to track it again"
         )
+        text = f"🚫 CANCELLED `{_esc(shown)}`\n`{_h}`\n✗ Cancelled by operator ({_what})\n{_hint}"
         try:
             await bot.edit_message_text(
                 text,
