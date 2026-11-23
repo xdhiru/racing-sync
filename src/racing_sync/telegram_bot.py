@@ -1006,22 +1006,29 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                 # name/size, so resolve fails cleanly instead of guessing.
                 return []
             try:
-                from .content_keys import same_content as _same
+                # Display key, not `same_content`: the list groups on
+                # normalized name + EXACT size, and `same_content` treats an
+                # unknown size on either side as a match — which would pull a
+                # row the operator never saw into a destructive "all copies".
+                from .content_keys import content_key as _content_key
             except Exception:
-                _same = None  # type: ignore[assignment]
+                _content_key = None  # type: ignore[assignment]
+            try:
+                _leader_key = (
+                    _content_key(leader.source_name or "", leader.total_bytes or 0)
+                    if _content_key is not None
+                    else None
+                )
+            except Exception:
+                _leader_key = None
             out: list[str] = []
             for _r in rows or []:
                 try:
                     _rh = (_r.source_infohash or "").lower()
                     if not _rh:
                         continue
-                    if _same is not None:
-                        if not _same(
-                            _r.source_name or "",
-                            _r.total_bytes or 0,
-                            leader.source_name or "",
-                            leader.total_bytes or 0,
-                        ):
+                    if _leader_key is not None:
+                        if _content_key(_r.source_name or "", _r.total_bytes or 0) != _leader_key:
                             continue
                     elif (_r.source_name or "").strip().lower() != (
                         leader.source_name or ""

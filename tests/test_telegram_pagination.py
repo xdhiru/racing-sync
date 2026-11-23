@@ -1509,3 +1509,37 @@ def test_safe_truncate_markdown_counts_utf16_units():
 
     assert len(out.encode("utf-16-le")) // 2 <= 4096
     assert out.endswith("...")
+
+
+def test_group_scope_uses_the_display_key(tmp_path):
+    """A same-name row with unknown size is a different group on screen."""
+    from racing_sync.state import State, StateStore, TorrentState
+    from racing_sync.telegram_bot import TelegramBot
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Show.S01",
+                total_bytes=1000,
+                state=State.DOWNLOADING,
+            )
+        )
+        store.upsert(
+            TorrentState(
+                source_infohash="b" * 40,
+                source_name="Show.S01",
+                total_bytes=0,  # renders in its own group
+                state=State.QUEUED,
+            )
+        )
+        from unittest.mock import MagicMock
+
+        bot = object.__new__(TelegramBot)
+        bot._store = store
+        bot._cfg = MagicMock()
+
+        assert bot._live_group_hashes("a" * 40) == ["a" * 40]
+    finally:
+        store.close()
