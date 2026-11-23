@@ -1005,6 +1005,10 @@ async def test_callback_keep_yes_no_execute():
         bot._refresh_active_message = AsyncMock()
         q = _action_query(data or f"keep:{'a' * 40}:{which}")
         await bot._on_action_button(q, data or f"keep:{'a' * 40}:{which}")
+        # The wipe runs as a background task (bulk wipes stagger per copy).
+        task = getattr(bot, "_cancel_task", None)
+        if task is not None:
+            await task
         return executed, bot
 
     executed, bot = await _run("yes")

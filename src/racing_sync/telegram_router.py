@@ -190,11 +190,29 @@ class RouterMixin:
                 except Exception as e:  # noqa: BLE001
                     await _say(_action_error_text(e))
                     return
-                result = await self._execute_snapshot_cancel(
-                    _r.hashes, _r.etitle_raw, delete_files=(_choice == "no"), remember=_ig
-                )
-                await _say(result)
-                await _refresh()
+                _hashes = _r.hashes
+                _etitle = _r.etitle_raw
+                _del_files = _choice == "no"
+                _remember = bool(_ig)
+
+                async def _run_cancel() -> None:
+                    try:
+                        _res = await self._execute_snapshot_cancel(
+                            _hashes, _etitle, delete_files=_del_files, remember=_remember
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        _res = _action_error_text(e)
+                    await _say(_res)
+                    await _refresh()
+
+                # Bulk wipes stagger 2s per copy; awaiting that inline stalls
+                # polling for minutes and Telegram retries the update. The
+                # per-hash in-flight guard already absorbs a re-tap.
+                try:
+                    self._cancel_task = asyncio.create_task(_run_cancel())
+                except Exception:
+                    # No loop to spawn on: never lose the tap.
+                    await _run_cancel()
                 return
             if cmd == "inject" and _h and not _choice:
                 coord = getattr(self, "_coord", None)

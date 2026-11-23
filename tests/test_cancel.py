@@ -1352,6 +1352,7 @@ async def test_status_keep_flow_executes_with_stagger():
     q = _query("keep:status:dl:1:yes")
     with patch("asyncio.sleep", new_callable=AsyncMock) as _sleep:
         await bot._handle_callback(q)
+        await _settle_cancel(bot)
     assert sorted(executed) == ["a" * 40, "b" * 40]
     _sleep.assert_awaited_once_with(2.0)
     assert "Kept files for" in bot._reply.call_args[0][0]
@@ -2188,6 +2189,14 @@ def _tap(data):
     return q
 
 
+async def _settle_cancel(bot):
+    """Await the background destructive execution a keep tap spawns."""
+    task = getattr(bot, "_cancel_task", None)
+    if task is not None:
+        await task
+        bot._cancel_task = None
+
+
 @pytest.mark.anyio
 async def test_cancel_group_member_then_yes_keeps_files(tmp_path: Path):
     """Group cancel → member → Just forget → Yes: only it goes, no ignore."""
@@ -2214,6 +2223,7 @@ async def test_cancel_group_member_then_yes_keeps_files(tmp_path: Path):
         assert f"keep:{'b' * 40}:0:yes" in _data
         # Yes: forget with files kept and NOT ignored; a-copy untouched.
         await bot._on_action_button(_tap(f"keep:{'b' * 40}:0:yes"), f"keep:{'b' * 40}:0:yes")
+        await _settle_cancel(bot)
         assert store.get("b" * 40) is None
         assert store.is_ignored("b" * 40) is False
         assert store.get("a" * 40) is not None
@@ -2249,6 +2259,7 @@ async def test_cancel_all_then_no_deletes_everything(tmp_path: Path):
         await bot._on_action_button(
             _tap(f"keep:all:{_leader}:{_ig}:no"), f"keep:all:{_leader}:{_ig}:no"
         )
+        await _settle_cancel(bot)
         assert store.get("a" * 40) is None
         assert store.get("b" * 40) is None
         sent = bot._bot.send_message.call_args[0][1]
@@ -2359,6 +2370,7 @@ async def test_shifted_numbering_cannot_misroute(tmp_path: Path):
         # nothing acted on, certainly not the new row.
         await bot._on_action_button(_tap(f"cancel:{'b' * 40}"), f"cancel:{'b' * 40}")
         await bot._on_action_button(_tap(f"keep:{'b' * 40}:yes"), f"keep:{'b' * 40}:yes")
+        await _settle_cancel(bot)
         assert store.get("c" * 40) is not None  # untouched
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Already gone")
@@ -2508,6 +2520,7 @@ async def test_cancel_match_bulk_forgets_matched_groups_only(tmp_path: Path):
 
         bot._callback_times.clear()
         await bot._handle_callback(_query(f"keep:match:{_tok}:1:no"))
+        await _settle_cancel(bot)
         assert store.get("a" * 40) is None
         assert store.get("b" * 40) is None
         assert store.get("c" * 40) is None
@@ -2537,6 +2550,7 @@ async def test_cancel_match_reresolves_between_questions(tmp_path: Path):
         assert store.hard_delete("b" * 40) is True
         bot._callback_times.clear()
         await bot._handle_callback(_query(f"keep:match:{_tok}:0:yes"))
+        await _settle_cancel(bot)
         assert store.get("a" * 40) is None
         assert store.get("b" * 40) is None
         assert store.is_ignored("a" * 40) is False
@@ -2629,6 +2643,7 @@ async def test_answered_sheets_are_deleted(tmp_path: Path):
         bot._bot.delete_message.reset_mock()
         bot._callback_times.clear()
         await bot._handle_callback(_query(f"keep:{'a' * 40}:1:yes"))
+        await _settle_cancel(bot)
         bot._bot.delete_message.assert_awaited_once_with("1", 43)
         sent = bot._bot.send_message.call_args[0][1]
         assert "Kept files for" in sent
@@ -2728,11 +2743,16 @@ async def test_duplicate_keep_tap_gets_working_on_it(tmp_path: Path):
             await asyncio.sleep(0.01)
         assert getattr(bot, "_action_inflight", None)
         bot._callback_times.clear()
+        exec_task = getattr(bot, "_cancel_task", None)  # the running wipe
         await bot._handle_callback(_query(f"keep:{'a' * 40}:1:yes"))
+        # The duplicate tap answers from its own background task.
+        await _settle_cancel(bot)
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Already working on it")
         _release.set()
         await first
+        if exec_task is not None:
+            await exec_task
         assert _calls == ["a" * 40]
         assert store.get("a" * 40) is None
         assert store.is_ignored("a" * 40) is True
@@ -2862,6 +2882,7 @@ async def test_cancel_stalled_flow(tmp_path: Path):
 
         bot._callback_times.clear()
         await bot._handle_callback(_query("keep:stalled:1:no"))
+        await _settle_cancel(bot)
         assert store.get("a" * 40) is None
         assert store.get("b" * 40) is None
         assert store.get("c" * 40) is not None
@@ -3081,6 +3102,7 @@ async def test_slow_keep_tap_marks_sheet_working(tmp_path: Path):
         q = _query(f"keep:{'a' * 40}:1:no")
         q.message.text = "Cancel Work.Show — keep downloaded files?"
         await bot._handle_callback(q)
+        await _settle_cancel(bot)
         _pos, _kw = bot._bot.edit_message_text.call_args
         assert _kw["message_id"] == 43
         assert _pos[0].endswith("⏳ Working on it…")
@@ -3100,6 +3122,7 @@ async def test_fast_keep_tap_skips_working_mark(tmp_path: Path):
         q = _query(f"keep:{'a' * 40}:1:yes")
         q.message.text = "Cancel Work.Show — keep downloaded files?"
         await bot._handle_callback(q)
+        await _settle_cancel(bot)
         bot._bot.edit_message_text.assert_not_called()
         assert store.get("a" * 40) is None
         sent = bot._bot.send_message.call_args[0][1]
@@ -3121,6 +3144,7 @@ async def test_working_mark_failure_still_executes(tmp_path: Path):
         q = _query(f"keep:{'a' * 40}:1:no")
         q.message.text = "Cancel Work.Show — keep downloaded files?"
         await bot._handle_callback(q)
+        await _settle_cancel(bot)
         assert store.get("a" * 40) is None
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Cancelled")
@@ -3143,3 +3167,44 @@ async def test_cancel_scope_and_detail_skip_blob_loads():
     bot._store.get.reset_mock()
     await CancelScope("group", "a" * 40).resolve(bot)
     assert bot._store.get.call_args.kwargs.get("include_blob") is False
+
+
+@pytest.mark.anyio
+async def test_bulk_cancel_sheet_runs_in_the_background():
+    """A 100-copy wipe staggers 2s per copy: it must not block polling."""
+    import asyncio
+
+    from racing_sync.telegram_protocol import _parse_action_data
+
+    bot = _bot()
+    bot._store = MagicMock()
+    bot._store.get = MagicMock(return_value=SimpleNamespace(source_name="Show"))
+    bot._live_group_hashes = MagicMock(return_value=["a" * 40])
+    bot._last_active_cache = None
+    bot._refresh_active_message = AsyncMock()
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow(hashes, title, *, delete_files, remember=True):
+        started.set()
+        await release.wait()
+        return "Cancelled Show (1/1 copies)"
+
+    bot._execute_snapshot_cancel = _slow
+    data = f"keep:all:{'a' * 40}:1:no"
+    assert _parse_action_data(data)[0] == "keep"
+
+    handler = asyncio.create_task(bot._on_action_button(_query(data), data))
+    await started.wait()
+    await asyncio.sleep(0)  # let the handler return, if it can
+    # Returned while the wipe is still running: the reply arrives later.
+    assert handler.done()
+    assert bot._bot.send_message.await_count == 0
+
+    release.set()
+    for _ in range(100):
+        if bot._bot.send_message.await_count:
+            break
+        await asyncio.sleep(0.01)
+    assert "Cancelled Show" in bot._bot.send_message.call_args[0][1]
