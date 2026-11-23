@@ -2987,3 +2987,36 @@ def test_is_bencoded_torrent_requires_a_real_info_dict():
     # with "d" too, and an empty dict has no info.
     for bad in (b"", b"d", b"d<html>", b"de", b"d4:spam4:eggse"):
         assert is_bencoded_torrent(bad) is False, bad
+
+
+def test_v2_only_torrent_is_rejected_with_a_reason():
+    """A v2-only torrent would sync under a SHA-256 hash no client knows."""
+    v2_only = _bencode(
+        {
+            b"info": {
+                b"name": b"V2.Show",
+                b"meta version": 2,
+                b"file tree": {b"a.mkv": {b"": {b"length": 10}}},
+                b"piece layers": {},
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="v2-only"):
+        _bencoded_info_hash(v2_only)
+
+
+def test_hybrid_torrent_still_parses():
+    """v2 metadata plus a v1 pieces list keeps a valid v1 identity."""
+    hybrid = _bencode(
+        {
+            b"info": {
+                b"name": b"Hybrid.Show",
+                b"meta version": 2,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+                b"length": 100,
+            }
+        }
+    )
+    infohash, name, size, _ = _bencoded_info_hash(hybrid)
+    assert len(infohash) == 40 and name == "Hybrid.Show" and size == 100

@@ -211,6 +211,16 @@ def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
     root, raw_info_bytes = _decode_torrent_root(data)
     info = root[b"info"]
     assert isinstance(info, dict)
+    # BitTorrent v2 keys identity by SHA-256 over the info dict. This
+    # pipeline is SHA-1-keyed end to end (client lookups, state rows,
+    # SFTP filenames), so a v2-only torrent would be ingested under a hash
+    # no client ever reports — it would simply never sync. Hybrid torrents
+    # (v2 + a v1 pieces list) still carry a valid v1 identity.
+    if info.get(b"meta version") == 2 and b"pieces" not in info:
+        raise ValueError(
+            "BitTorrent v2-only torrent (SHA-256 infohash): this pipeline is "
+            "v1-keyed, so it would never sync — use the hybrid or v1 .torrent"
+        )
 
     name = info.get(b"name", b"")
     if isinstance(name, bytes):
