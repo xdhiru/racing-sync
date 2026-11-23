@@ -3208,3 +3208,52 @@ async def test_bulk_cancel_sheet_runs_in_the_background():
             break
         await asyncio.sleep(0.01)
     assert "Cancelled Show" in bot._bot.send_message.call_args[0][1]
+
+
+@pytest.mark.anyio
+async def test_cancel_releases_ssd_reservation_when_forget_raises():
+    """A forget that raises must not strand its SSD budget until restart."""
+    from unittest.mock import patch
+
+    bot = _bot()
+    coord = MagicMock()
+    coord.cfg = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord._ssd_release = AsyncMock()
+    bot._coord = coord
+    bot._store.get_telegram_message_id = MagicMock(return_value=0)
+
+    async def _boom(*_args, **_kw):
+        raise RuntimeError("lock timeout")
+
+    with patch("racing_sync.forget.forget_torrent", _boom):
+        res = await bot._execute_cancel_one("a" * 40, delete_files=True)
+
+    assert "lock timeout" in res
+    coord._ssd_release.assert_awaited_once_with("a" * 40)
+
+
+@pytest.mark.anyio
+async def test_cancel_keeps_reservation_when_the_row_survives():
+    """A forget that kept the row still describes bytes on the SSD."""
+    bot = _bot()
+    coord = MagicMock()
+    coord.cfg = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord._ssd_release = AsyncMock()
+    bot._coord = coord
+    bot._store.get_telegram_message_id = MagicMock(return_value=0)
+
+    async def _kept(*_args, **_kw):
+        return {
+            "source_infohash": "a" * 40,
+            "row_kept": True,
+            "errors": ["local path /ssd/x: EBUSY"],
+        }
+
+    from unittest.mock import patch
+
+    with patch("racing_sync.forget.forget_torrent", _kept):
+        await bot._execute_cancel_one("a" * 40, delete_files=True)
+
+    coord._ssd_release.assert_not_awaited()

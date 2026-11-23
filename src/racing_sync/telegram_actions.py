@@ -120,48 +120,45 @@ class ActionsMixin:
                 detail_msg_id = await asyncio.to_thread(store.get_telegram_message_id, infohash)
         except Exception:
             detail_msg_id = None
+        _release_key = infohash
+        _keep_reservation = False
         try:
             _stop = getattr(coord, "stop_workers_for", None)
             # Worker shutdown rides inside forget_torrent (primary + every
             # pair, failures recorded in result errors) — never silent.
             _stop_cb = _stop if callable(_stop) else None
+            _forget_kwargs = dict(
+                cfg=cfg,
+                dest=dest,
+                store=store,
+                target=infohash,
+                apply=True,
+                delete_files=delete_files,
+                ignore=remember,
+                hard=not remember,
+                stop_workers=_stop_cb,
+            )
             if _hold_ops_lock is not None:
                 async with _hold_ops_lock(coord):
-                    result = await forget_torrent(
-                        cfg,
-                        dest=dest,
-                        store=store,
-                        target=infohash,
-                        apply=True,
-                        delete_files=delete_files,
-                        ignore=remember,
-                        hard=not remember,
-                        stop_workers=_stop_cb,
-                    )
-                    try:
-                        await coord._ssd_release(result.get("source_infohash") or infohash)
-                    except Exception:
-                        pass
+                    result = await forget_torrent(**_forget_kwargs)
             else:
-                result = await forget_torrent(
-                    cfg,
-                    dest=dest,
-                    store=store,
-                    target=infohash,
-                    apply=True,
-                    delete_files=delete_files,
-                    ignore=remember,
-                    hard=not remember,
-                    stop_workers=_stop_cb,
-                )
-                try:
-                    await coord._ssd_release(result.get("source_infohash") or infohash)
-                except Exception:
-                    pass
+                result = await forget_torrent(**_forget_kwargs)
+            _release_key = result.get("source_infohash") or infohash
+            # A forget that kept the row (local bytes could not be removed)
+            # still describes real SSD bytes: its reservation must stay.
+            _keep_reservation = bool(result.get("row_kept"))
         except LookupError:
             return "Already gone from tracking"
         except Exception as e:  # noqa: BLE001
             return _action_error_text(e)
+        finally:
+            # Never let the reservation outlive the attempt: a forget that
+            # raised strands its SSD budget until restart otherwise.
+            if not _keep_reservation:
+                try:
+                    await coord._ssd_release(_release_key)
+                except Exception:
+                    pass
         name = str(result.get("source_name") or infohash[:10])[:50]
         # The row (and its telegram_message_id) is gone: mark its detail
         # card cancelled (best-effort) and drop the cached id so a future
