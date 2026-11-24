@@ -122,3 +122,18 @@ def test_allowlist_warning_survives_a_broken_config():
 
     out = allowlist_open_warning(_Bad())
     assert isinstance(out, str) and out
+
+
+def test_source_category_rejects_a_comma_list():
+    """The value is sent verbatim; a comma list would match nothing."""
+    import pydantic
+
+    from racing_sync.config import SourceConfig
+
+    with pytest.raises(pydantic.ValidationError, match="ONE category"):
+        SourceConfig(type="qbittorrent", host="http://localhost:8080", category="auto,manual")
+
+    assert (
+        SourceConfig(type="qbittorrent", host="http://localhost:8080", category="auto*").category
+        == "auto*"
+    )

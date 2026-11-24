@@ -178,12 +178,27 @@ class SourceConfig(BaseModel):
     # Examples:
     #   category = ""           # sync every torrent
     #   category = "racing"     # only sync torrents in category "racing"
-    #   category = "auto,manual"  # qBittorrent supports comma-separated names
+    #   category = "auto*"      # qBittorrent wildcard (single value)
     #
-    # Deluge uses the term "label" but the field is unified under
-    # `category` for simplicity; the coordinator calls the appropriate
-    # filter parameter on each client.
+    # One value only: the client receives it verbatim as the category /
+    # label filter, so a comma list would match nothing. Deluge uses the
+    # term "label" but the field is unified under `category` for
+    # simplicity; the coordinator calls the appropriate filter parameter
+    # on each client.
     category: str = ""
+
+    @field_validator("category")
+    @classmethod
+    def _category_is_a_single_name(cls, v: str) -> str:
+        if "," in (v or ""):
+            raise ValueError(
+                "source.category takes ONE category/label — the client receives "
+                "it verbatim, so a comma list would match nothing (an empty "
+                "category syncs every torrent; qBittorrent also accepts a "
+                "single wildcard like 'auto*')"
+            )
+        return v
+
     # Minimum age of a torrent (seconds since added on the racing
     # client) before it is eligible for sync. Gives cross-seeds and
     # other private tracker torrents time to be added to the racing

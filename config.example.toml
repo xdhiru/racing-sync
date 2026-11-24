@@ -80,7 +80,10 @@ password = ""
 # Examples:
 #   category = ""           # sync every torrent
 #   category = "racing"     # only sync torrents in category "racing"
-#   category = "auto,manual"  # qBittorrent supports comma-separated names
+#   category = "auto*"      # qBittorrent wildcard (a single value)
+#
+# One value only: it is sent to the client verbatim, so a comma list would
+# match nothing. Leave empty to sync every torrent.
 category = ""
 
 # Only sync torrents added on the racing client at least N seconds ago.
