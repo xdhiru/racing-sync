@@ -144,14 +144,14 @@ class RouterMixin:
                 else:
                     _subject = f"Forget {_safe_display_name((_r.title_raw or '')[:60])}?"
                 _text, _rows = _scope.remember_sheet(_subject)
-                try:
-                    # Standalone sheet: query.message (the tapped sheet)
-                    # is deleted by the caller below — a reply_to would
-                    # dangle off a deleted message.
-                    await self._send_sheet(_text, _rows, opener=_tap_user_id(query))
-                except Exception:
-                    pass
-                return
+                # Standalone sheet: query.message (the tapped sheet) is
+                # deleted by the caller below — a reply_to would dangle off
+                # a deleted message. If the question cannot be posted the
+                # flow is lost, so keep the tapped sheet for a retry.
+                if not await self._send_sheet(_text, _rows, opener=_tap_user_id(query)):
+                    await _say("Could not post the question sheet; tap again.")
+                    return True
+                return False
             if cmd == "forget" and _h:
                 # Q2 keep/delete for any scope, re-resolved live (the set
                 # can shrink between taps, so the question names the live
@@ -171,12 +171,11 @@ class RouterMixin:
                 _text, _rows = self._keepq_text_and_rows(
                     _r.title_raw, _r.qlabel, _r.scope, None, remember=_ig
                 )
-                try:
-                    # Standalone (see remember-sheet above).
-                    await self._send_sheet(_text, _rows, opener=_tap_user_id(query))
-                except Exception:
-                    pass
-                return
+                # Standalone (see remember-sheet above).
+                if not await self._send_sheet(_text, _rows, opener=_tap_user_id(query)):
+                    await _say("Could not post the question sheet; tap again.")
+                    return True
+                return False
             if cmd == "keep" and _choice in ("yes", "no"):
                 if _ig is None:
                     _ig = True
@@ -509,8 +508,8 @@ class RouterMixin:
                 # by a minute while the sheet stays live — a silent sheet
                 # invites the re-tap this guard exists to absorb.
                 await self._mark_sheet_working(query)
-            await self._on_action_button(query, data)
-            if data != "abort":
+            _keep_sheet = await self._on_action_button(query, data)
+            if data != "abort" and not _keep_sheet:
                 # The tapped sheet served its purpose: remove it so
                 # answered questions don't linger behind their follow-up
                 # (`abort` already deletes itself above; the active-list

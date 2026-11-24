@@ -1056,7 +1056,7 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         reply_to: Any = None,
         *,
         opener: Any = None,
-    ) -> None:
+    ) -> bool:
         """Best-effort sheet reply with action buttons (plain text).
 
         `rows` is a ButtonMaker (strict, validated at build time) or
@@ -1067,10 +1067,13 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
         replied-to message's sender). Destructive sheet buttons only
         answer to that operator — another member tapping them would
         otherwise finish a decision they never made.
+
+        Returns True when the sheet was posted. Callers that depend on the
+        sheet existing (the Q1/Q2 questions) must not silently continue.
         """
         bot = getattr(self, "_bot", None)
         if bot is None:
-            return
+            return False
         try:
             _btns = []
             for _row in validate_rows(rows):
@@ -1093,8 +1096,10 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
             if opener is None:
                 opener = getattr(getattr(reply_to, "from_user", None), "id", None)
             self._note_sheet_owner(sent, opener)
+            return True
         except Exception as e:  # noqa: BLE001
             log.debug("sheet reply failed: %s", e)
+            return False
 
     def _note_sheet_owner(self, sent: Any, opener: Any) -> None:
         """Bind a sent sheet to its opener (bounded per-message map)."""

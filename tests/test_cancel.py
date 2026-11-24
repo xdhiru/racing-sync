@@ -3287,3 +3287,26 @@ async def test_resume_ignores_settled_rows(tmp_path):
         assert store.get("a" * 40).skipped == 1
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_failed_question_sheet_keeps_the_tapped_sheet():
+    """A lost Q1/Q2 send must leave a retry path, not silence."""
+    from telegram.error import TelegramError
+
+    bot = _bot()
+    bot._store = MagicMock()
+    bot._store.get.return_value = TorrentState(
+        source_infohash="a" * 40, source_name="Show", state=State.DOWNLOADING
+    )
+    bot._bot.send_message = AsyncMock(side_effect=TelegramError("Flood control exceeded"))
+    bot._delete_query_message = AsyncMock()
+    bot._reply = AsyncMock()
+
+    q = _query(f"cancel:{'a' * 40}")
+    await bot._handle_callback(q)
+
+    # The question could not be posted: the tapped sheet must survive.
+    bot._delete_query_message.assert_not_awaited()
+    sent = [c.args[0] for c in bot._reply.await_args_list]
+    assert any("Could not post the question sheet" in s for s in sent)
