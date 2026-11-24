@@ -419,6 +419,23 @@ class RouterMixin:
         except Exception:
             return False
 
+    def _refresh_actions(self, keys: list[str]) -> None:
+        """Re-stamp live holds so a long run cannot expire mid-flight.
+
+        A bulk wipe can outlive the hold TTL; without this a late tap would
+        see no hold and start a second execution over the same copies.
+        """
+        try:
+            inflight = getattr(self, "_action_inflight", None)
+            if not isinstance(inflight, dict):
+                return
+            now = time.monotonic()
+            for k in keys or []:
+                if k in inflight:
+                    inflight[k] = now
+        except Exception:
+            pass
+
     def _release_action(self, key: str) -> None:
         """Drop a destructive-scope hold (best-effort)."""
         try:

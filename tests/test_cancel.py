@@ -3342,3 +3342,54 @@ async def test_stopped_wipe_reports_what_it_finished(tmp_path):
         bot._execute_cancel_one.assert_not_awaited()
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_bulk_wipe_refreshes_its_holds_each_copy(tmp_path):
+    """A long wipe must keep its claim alive for the whole run."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        for h in ("a" * 40, "b" * 40):
+            store.upsert(
+                TorrentState(
+                    source_infohash=h,
+                    source_name="Show",
+                    state=State.DOWNLOADING,
+                    total_bytes=100,
+                )
+            )
+        bot = _bot()
+        bot._store = store
+        coord = MagicMock()
+        coord._ssd_release = AsyncMock()
+        bot._coord = coord
+        bot._execute_cancel_one = AsyncMock(return_value="Cancelled Show")
+        bot._refresh_actions = MagicMock()
+
+        from unittest.mock import patch
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await bot._execute_snapshot_cancel(["a" * 40, "b" * 40], "Show", delete_files=True)
+
+        assert bot._refresh_actions.call_count == 2
+        # Each call re-stamps the same per-hash holds.
+        first, _second = bot._refresh_actions.call_args_list
+        assert first.args[0] == [
+            f"keep:{'a' * 40}:1:del",
+            f"keep:{'b' * 40}:1:del",
+        ]
+    finally:
+        store.close()
+
+
+def test_refresh_actions_restamps_only_live_holds():
+    bot = _bot()
+    bot._action_inflight = {"keep:x": 0.0, "other": 0.0}
+
+    bot._refresh_actions(["keep:x", "missing"])
+
+    assert bot._action_inflight["keep:x"] > 0
+    assert bot._action_inflight["other"] == 0.0
+    assert "missing" not in bot._action_inflight

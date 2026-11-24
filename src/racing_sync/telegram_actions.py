@@ -262,6 +262,14 @@ class ActionsMixin:
                         break
                 except Exception:
                     pass
+                # The run can outlive the hold TTL: keep every claim fresh so
+                # a concurrent tap still sees this scope as in flight.
+                try:
+                    _refresh = getattr(self, "_refresh_actions", None)
+                    if callable(_refresh):
+                        _refresh(_claimed)
+                except Exception:
+                    pass
                 # Stagger bulk cancels (2s between executions): a lane
                 # wipe otherwise stampedes the clients + DB at once.
                 if _i > 0:
