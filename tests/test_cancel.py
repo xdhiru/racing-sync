@@ -3310,3 +3310,35 @@ async def test_failed_question_sheet_keeps_the_tapped_sheet():
     bot._delete_query_message.assert_not_awaited()
     sent = [c.args[0] for c in bot._reply.await_args_list]
     assert any("Could not post the question sheet" in s for s in sent)
+
+
+@pytest.mark.anyio
+async def test_stopped_wipe_reports_what_it_finished(tmp_path):
+    """Shutdown mid-wipe must say how much was done, not go silent."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        for h in ("a" * 40, "b" * 40):
+            store.upsert(
+                TorrentState(
+                    source_infohash=h,
+                    source_name="Show",
+                    state=State.DOWNLOADING,
+                    total_bytes=100,
+                )
+            )
+        bot = _bot()
+        bot._store = store
+        coord = MagicMock()
+        coord._ssd_release = AsyncMock()
+        bot._coord = coord
+        bot._stopped = True
+        bot._execute_cancel_one = AsyncMock(return_value="Cancelled Show")
+
+        res = await bot._execute_snapshot_cancel(["a" * 40, "b" * 40], "Show", delete_files=True)
+
+        assert "before shutdown" in res and "0/2" in res
+        bot._execute_cancel_one.assert_not_awaited()
+    finally:
+        store.close()

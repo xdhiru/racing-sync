@@ -255,6 +255,13 @@ class ActionsMixin:
                 return "Already gone from tracking"
             outs = []
             for _i, h in enumerate(live):
+                # Shutdown must not leave a wipe half-applied with no word:
+                # finish the copy in flight, then report what was done.
+                try:
+                    if getattr(self, "_stopped", False):
+                        break
+                except Exception:
+                    pass
                 # Stagger bulk cancels (2s between executions): a lane
                 # wipe otherwise stampedes the clients + DB at once.
                 if _i > 0:
@@ -272,11 +279,18 @@ class ActionsMixin:
                     )
                 except Exception as e:  # noqa: BLE001
                     outs.append(_action_error_text(e))
-            if len(outs) == 1:
+            if len(outs) == 1 and len(live) == 1:
                 return outs[0]
             ok = sum(1 for o in outs if o.startswith(("Cancelled", "Kept files")))
             verb = "Cancelled" if delete_files else "Kept files for"
             suffix = "" if delete_files else " (data left in place)"
+            if len(outs) < len(live):
+                # Stopped mid-wipe: name the shortfall so the operator knows
+                # to re-run the cancel for the rest.
+                return (
+                    f"{verb} {len(outs)}/{len(live)} copies of {title} before "
+                    f"shutdown{suffix}; re-run the cancel for the rest"
+                )
             return f"{verb} {title} ({ok}/{len(outs)} copies){suffix}"
         except Exception as e:  # noqa: BLE001
             return _action_error_text(e)

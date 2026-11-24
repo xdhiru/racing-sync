@@ -477,6 +477,19 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                 await self._callback_task
             except (asyncio.CancelledError, Exception):
                 pass
+        # A destructive wipe runs as its own task now: give it a moment to
+        # see _stopped and report what it managed, then cancel it.
+        _cancel_task = getattr(self, "_cancel_task", None)
+        if _cancel_task is not None and not _cancel_task.done():
+            try:
+                await asyncio.wait_for(_cancel_task, timeout=5.0)
+            except (asyncio.CancelledError, TimeoutError):
+                try:
+                    _cancel_task.cancel()
+                except Exception:
+                    pass
+            except Exception:
+                pass
         if self._detail_worker:
             self._detail_worker.cancel()
             try:
