@@ -2528,7 +2528,9 @@ class AdmitMixin:
                 new_hash = None
 
         if not new_hash:
-            new_hash = await self._await_hash_for_name(ts.source_name)
+            new_hash = await self._await_hash_for_name(
+                ts.source_name, size_bytes=int(ts.total_bytes or 0)
+            )
 
         if new_hash:
             ts.dest_infohash = new_hash.lower()
@@ -3979,9 +3981,15 @@ class AdmitMixin:
             await self.dest_client.resume(ts.dest_infohash or ts.source_infohash)
         self.transition(ts, State.DOWNLOADING)
 
-    async def _await_hash_for_name(self, name: str, *, timeout_s: float = 60) -> str | None:
+    async def _await_hash_for_name(
+        self, name: str, *, size_bytes: int | None = None, timeout_s: float = 60
+    ) -> str | None:
         deadline = time.monotonic() + timeout_s
         _gap = 2.0
+        try:
+            _want_size = int(size_bytes or 0)
+        except (TypeError, ValueError):
+            _want_size = 0
         # Normalized fallback: the client may report a differently-cased
         # or punctuated name for the just-added torrent — exact match
         # first, normalized second, per poll.
@@ -4009,15 +4017,33 @@ class AdmitMixin:
                 rows = []
             for t in rows or []:
                 try:
-                    if t.name == name:
-                        return t.hash.lower()
+                    if t.name != name:
+                        continue
+                    try:
+                        _got = int(getattr(t, "size_bytes", 0) or 0)
+                    except (TypeError, ValueError):
+                        _got = 0
+                    if _want_size and _got and _got != _want_size:
+                        continue
+                    return t.hash.lower()
                 except Exception:
                     continue
             if _want_norm:
                 for t in rows or []:
                     try:
-                        if normalize_content_name(getattr(t, "name", "") or "") == _want_norm:
-                            return t.hash.lower()
+                        if normalize_content_name(getattr(t, "name", "") or "") != _want_norm:
+                            continue
+                        # The name alone is not identity: another release can
+                        # share it, and this hash is later used to delete
+                        # files on failure. Require the size we added to
+                        # agree whenever both sides know it.
+                        try:
+                            _got = int(getattr(t, "size_bytes", 0) or 0)
+                        except (TypeError, ValueError):
+                            _got = 0
+                        if _want_size and _got and _got != _want_size:
+                            continue
+                        return t.hash.lower()
                     except Exception:
                         continue
             await asyncio.sleep(_gap)

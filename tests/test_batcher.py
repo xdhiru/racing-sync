@@ -4118,3 +4118,43 @@ async def test_do_moving_pin_does_not_clobber_concurrent_columns(tmp_path):
         assert bool(row.fuse_verified) is True
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_await_hash_requires_size_agreement():
+    """A same-name release with a different size is not our torrent.
+
+    The resolved hash is later used to delete files on failure, so binding
+    the wrong entry is destructive.
+    """
+
+    from racing_sync.clients.abstract import Torrent
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.cfg = MagicMock()
+    coord.dest_client = AsyncMock()
+
+    def _entry(h, size):
+        return Torrent(
+            hash=h,
+            name="Same.Name.1080p",
+            category="racing",
+            save_path="/d",
+            size_bytes=size,
+            state="pausedDL",
+            progress=0.0,
+        )
+
+    # Only a different-size sibling: no match, so the poll times out.
+    coord.dest_client.list_torrents = AsyncMock(return_value=[_entry("a" * 40, 999)])
+    assert (
+        await coord._await_hash_for_name("Same.Name.1080p", size_bytes=1000, timeout_s=0.01) is None
+    )
+
+    # The right size is picked even when a sibling of another size is present.
+    coord.dest_client.list_torrents = AsyncMock(
+        return_value=[_entry("a" * 40, 999), _entry("b" * 40, 1000)]
+    )
+    got = await coord._await_hash_for_name("same.name.1080p", size_bytes=1000, timeout_s=0.01)
+    assert got == "b" * 40
