@@ -204,6 +204,33 @@ class FuseMixin:
                 )
                 await self._demote_false_done_to_moving(ts)
                 return
+        elif ts.save_path:
+            # save_path already points at the mount, but a recorded entry
+            # can still be lost (client restart, manual delete). The
+            # new-torrent loop below skips recorded hashes and the source
+            # repair only covers the original, so nothing would ever
+            # re-add an injected private. Verifying here re-injects what
+            # is missing; unverifiable is not a reason to demote (the
+            # save_path is correct) — the janitor keeps VPS1 meanwhile.
+            try:
+                _hs = {(ts.dest_infohash or "").lower(), _row_key}
+                _hs.update(
+                    h.strip().lower()
+                    for h in (ts.injected_private_hashes or "").split(",")
+                    if h.strip()
+                )
+                _outaged = any(self._fuse_outage_active(h) for h in _hs if h)
+            except Exception:
+                _outaged = False
+            if not _outaged:
+                # An active outage means the mount is unreachable, not that
+                # entries are missing: defer like every other fuse check.
+                try:
+                    await self._verified_fuse_mount_for_done_row(ts)
+                except AbandonedError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    log.debug("late cross-seed: fuse verify failed for %s: %s", _row_key[:10], e)
 
         known_hashes = {
             h.lower()

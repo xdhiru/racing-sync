@@ -662,3 +662,43 @@ async def test_blob_healing_prefers_the_rows_own_hash():
     assert await coord._cleanup_heal_blob(ts, {"a" * 40, "f" * 40}, dry_run=False) is True
     assert ts.cross_seed_blob == b"own-bytes"
     coord.store.set_blob.assert_called_once_with("s" * 40, b"own-bytes")
+
+
+@pytest.mark.anyio
+async def test_fuse_saved_done_row_verifies_recorded_entries(tmp_path):
+    """A lost injected entry must be re-added even when save_path is on fuse.
+
+    Recorded hashes are skipped by the new-torrent loop and the source
+    repair only covers the original, so nothing else re-adds an injected
+    private once its entry disappears.
+    """
+    from racing_sync.state import State, TorrentState
+
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+
+    coord = make_coordinator()
+    coord.cfg = MagicMock()
+    coord.cfg.rclone.fuse.mount = str(fuse)
+    coord.cfg.rclone.fuse.mount_unsorted = str(fuse / "unsorted")
+    coord.store = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    coord._verified_fuse_mount_for_done_row = AsyncMock(return_value=fuse)
+    coord._failed_late_cross_seeds = {}
+    coord._ensure_source_fuse_entry = AsyncMock()
+    coord._ensure_original_fuse_entry = AsyncMock()
+
+    ts = TorrentState(
+        source_infohash="a" * 40,
+        dest_infohash="a" * 40,
+        injected_private_hashes="b" * 40,
+        source_name="Show",
+        save_path=str(fuse),
+        total_bytes=100,
+        state=State.DONE,
+    )
+
+    await coord._check_and_inject_late_cross_seeds(ts, [])
+
+    coord._verified_fuse_mount_for_done_row.assert_awaited_once()
