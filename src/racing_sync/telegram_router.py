@@ -510,6 +510,9 @@ class RouterMixin:
                     pass
                 return
         if (
+            # `pick:` is a legacy snapshot-index format: no parser
+            # shape emits it, but old buttons must still answer
+            # "Stale button" instead of hanging the spinner.
             data.startswith("pick:")
             or data.startswith("keep:")
             or data.startswith("forget:")
@@ -673,10 +676,6 @@ class RouterMixin:
             return _is_grace_note_for_prefer(note_fn(row))
         except Exception:
             return False
-
-    def _fetch_watch_eligible(self, row) -> bool:
-        """Deprecated alias of :meth:`_fetch_new_eligible`."""
-        return self._fetch_new_eligible(row)
 
     def _resolve_fetch_target(self, short: str):
         """Map a `/fetch_<prefix|full-hash>` token to a waiting row.

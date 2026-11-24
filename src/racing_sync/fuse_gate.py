@@ -144,26 +144,6 @@ async def missing_under(
         return None
 
 
-async def verify_blob_on_mount(
-    blob: bytes | None, mount: Path | str
-) -> tuple[FuseVerdict, list[str], list[tuple[str, int]]]:
-    """One gate for all callers: decode blob, stat, return verdict.
-
-    - (PRESENT, [], expected) — every byte verified.
-    - (MISSING, [...], expected) — mount readable, files absent.
-    - (UNVERIFIABLE, [...], []) — no blob / undecodable / mount unreadable.
-    """
-    expected = expected_files_from_blob(blob)
-    if not expected:
-        return FuseVerdict.UNVERIFIABLE, ["<undecodable blob>"], []
-    missing = await missing_under(mount, expected)
-    if missing is None:
-        return FuseVerdict.UNVERIFIABLE, ["<mount unstatable>"], expected or []
-    if missing:
-        return FuseVerdict.MISSING, missing, expected or []
-    return FuseVerdict.PRESENT, [], expected or []
-
-
 async def skipped_present(mount: Path | str, items: list[tuple[str, int]]) -> set[str]:
     """Subset of names already size-verified on mount (fail-open empty).
 
@@ -217,6 +197,5 @@ __all__ = [
     "FuseVerdict",
     "expected_files_from_blob",
     "missing_under",
-    "verify_blob_on_mount",
     "skipped_present",
 ]

@@ -833,19 +833,6 @@ def _cancel_command(infohash: str) -> str:
     return f"/cancel_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
-def _fetch_command(infohash: str) -> str:
-    """Copy-pasteable fetch command for one task (short hash)."""
-    return f"/fetch_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
-
-
-def _prefer_command(infohash: str) -> str:
-    """Copy-pasteable prefer command for one task (short hash).
-
-    Legacy alias: canonical verb is now `/now_` (see _now_command).
-    """
-    return f"/prefer_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
-
-
 def _now_command(infohash: str) -> str:
     """Copy-pasteable now command for one task (short hash)."""
     return f"/now_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
@@ -854,14 +841,6 @@ def _now_command(infohash: str) -> str:
 def _skip_command(infohash: str) -> str:
     """Copy-pasteable skip command for one task (short hash)."""
     return f"/skip_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
-
-
-def _unskip_command(infohash: str) -> str:
-    """Copy-pasteable unskip command for one task (short hash).
-
-    Legacy alias: canonical verb is now `/resume_` (see _resume_command).
-    """
-    return f"/unskip_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 def _resume_command(infohash: str) -> str:

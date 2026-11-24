@@ -13,7 +13,7 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote_plus, urljoin, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import aiohttp
 
@@ -990,7 +990,3 @@ def _first_attr(item: Any, tag: str, *, name: str) -> str:
             if k.lower() == "name" and str(v).lower() == target_name:
                 return attrib.get("value", "") or attrib.get("Value", "")
     return ""
-
-
-def url_quote(s: str) -> str:
-    return quote_plus(s)

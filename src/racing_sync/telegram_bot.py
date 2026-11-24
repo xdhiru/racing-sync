@@ -167,23 +167,6 @@ log = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 
 
-def _tg_actor_id(obj: Any) -> str | None:
-    """Telegram user id behind a message or callback query, if present.
-
-    Only numeric ids count: test doubles and channel posts without a
-    sender yield None (unknown), which fails open for owner-binding but
-    fails closed when an admin allowlist is configured.
-    """
-    try:
-        user = getattr(obj, "from_user", None)
-        uid = getattr(user, "id", None)
-        if uid is None or isinstance(uid, bool):
-            return None
-        return str(int(str(uid)))
-    except Exception:
-        return None
-
-
 def allowlist_open_warning(cfg: Any) -> str | None:
     """Warning when Telegram destructive commands are open to the chat.
 
