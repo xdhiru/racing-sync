@@ -171,21 +171,28 @@ class QBittorrentClient(TorrentClient, HTTPClientBase):
 
         Every blob is tried (not just the first): a multi-blob add whose
         later blob is the duplicate must still resolve. Never raises.
+
+        Both identities per blob, v1 first: a hybrid torrent is also known
+        to a v2-aware client by its SHA-256 hash, and every lookup below
+        (echo resolution, duplicate probe) accepts either.
         """
         out: list[str] = []
         if not torrent_files:
             return out
         try:
-            from ..watchdir import _bencoded_info_hash
+            from ..watchdir import parse_torrent
         except Exception:
             return out
         for blob in torrent_files:
             try:
                 if not isinstance(blob, (bytes, bytearray)) or not blob:
                     continue
-                h, _, _, _ = _bencoded_info_hash(bytes(blob))
-                if h and h.lower() not in out:
-                    out.append(h.lower())
+                ident = parse_torrent(bytes(blob))
+                if ident is None:
+                    continue
+                for h in ident.hashes:
+                    if h and h not in out:
+                        out.append(h)
             except Exception:
                 continue
         return out

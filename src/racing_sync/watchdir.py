@@ -186,45 +186,108 @@ def _decode_torrent_root(data: bytes) -> tuple[dict[bytes, object], bytes]:
     return root, raw_info_bytes
 
 
-def is_bencoded_torrent(data: bytes) -> bool:
-    """True when `data` decodes as a bencoded torrent (root dict + info).
+@dataclass(frozen=True, slots=True)
+class TorrentIdentity:
+    """Identity of one .torrent payload (BEP 3 / BEP 52).
 
-    A leading ``b"d"`` alone is not proof: truncated or error-page bodies
-    can start with it, and adding one later fails deep in the client with
-    an unrelated error.
+    `v1` is the SHA-1 the whole pipeline keys on; `v2` is the SHA-256 a
+    v2-aware client reports for the same info dict (empty unless the
+    torrent declares `meta version 2`). `v2_only` means there is no v1
+    identity to key a row by.
     """
-    try:
-        _decode_torrent_root(data)
-    except Exception:
-        return False
-    return True
+
+    v1: str
+    v2: str
+    name: str
+    total_bytes: int
+    announce: str
+    files: tuple
+    v2_only: bool
+
+    @property
+    def hashes(self) -> tuple[str, ...]:
+        """Every hash a client might know this torrent by (v1 first)."""
+        if self.v2_only:
+            # A v2-only info dict has no v1 identity: its SHA-1 is a value
+            # no client reports, so probing it (or echoing it) would bind
+            # the wrong hash.
+            return (self.v2,) if self.v2 else ()
+        return tuple(h for h in (self.v1, self.v2) if h)
 
 
-def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
-    """Decode a bencoded .torrent and return (infohash, name, total_size, announce_url).
+def _safe_path_part(p: str) -> str | None:
+    """One torrent path segment, or None when it is unsafe to join.
 
-    We avoid `bencodepy` / `torf` as a dep by writing a minimal decoder good
-    enough for top-level info extraction. The raw bytes of the info dict
-    are captured directly from the byte stream without re-encoding to preserve
-    the true SHA1 infohash even for torrents with non-standard key sorting.
+    Path parts come from untrusted .torrent metadata: reject traversal,
+    absolute, drive-letter and control-character segments.
     """
-    root, raw_info_bytes = _decode_torrent_root(data)
-    info = root[b"info"]
-    assert isinstance(info, dict)
-    # BitTorrent v2 keys identity by SHA-256 over the info dict. This
-    # pipeline is SHA-1-keyed end to end (client lookups, state rows,
-    # SFTP filenames), so a v2-only torrent would be ingested under a hash
-    # no client ever reports — it would simply never sync. Hybrid torrents
-    # (v2 + a v1 pieces list) still carry a valid v1 identity.
-    if info.get(b"meta version") == 2 and b"pieces" not in info:
-        raise ValueError(
-            "BitTorrent v2-only torrent (SHA-256 infohash): this pipeline is "
-            "v1-keyed, so it would never sync — use the hybrid or v1 .torrent"
+    if not p or p in (".", ".."):
+        return None
+    if "/" in p or "\\" in p or "\n" in p or "\r" in p or "\0" in p:
+        return None
+    if len(p) >= 2 and p[1] == ":" and p[0].isalpha():
+        return None
+    return p
+
+
+def _files_from_info(info: dict) -> list:
+    """Safe-path (name, size) file entries for a decoded info dict."""
+    from .clients.abstract import TorrentFile
+
+    top_name = info.get(b"name", b"")
+    if isinstance(top_name, bytes):
+        top_name = top_name.decode("utf-8", errors="replace")
+
+    files_list: list[TorrentFile] = []
+    pieces = info.get(b"files")
+    if isinstance(pieces, list):
+        top_safe = _safe_path_part(str(top_name)) if top_name else None
+        # Fall back to a neutral top when the torrent's name itself is
+        # unsafe — never propagate traversal into downstream joins.
+        top_prefix = top_safe if top_safe else "torrent"
+        for f in pieces:
+            if not isinstance(f, dict):
+                continue
+            length_raw = f.get(b"length", 0)
+            length = length_raw if isinstance(length_raw, int) and length_raw >= 0 else 0
+            path_parts = f.get(b"path", [])
+            parts_str: list[str] = []
+            if isinstance(path_parts, list):
+                for p in path_parts:
+                    if isinstance(p, bytes):
+                        part = p.decode("utf-8", errors="replace")
+                    elif isinstance(p, str):
+                        part = p
+                    else:
+                        continue
+                    safe = _safe_path_part(part)
+                    if safe is None:
+                        continue
+                    parts_str.append(safe)
+            rel_path = "/".join(parts_str) if parts_str else "file"
+            files_list.append(
+                TorrentFile(name=f"{top_prefix}/{rel_path}", size_bytes=length, progress=1.0)
+            )
+    else:
+        length_raw = info.get(b"length", 0)
+        length = length_raw if isinstance(length_raw, int) and length_raw >= 0 else 0
+        safe_top = _safe_path_part(str(top_name)) if top_name else None
+        files_list.append(
+            TorrentFile(name=str(safe_top or "file"), size_bytes=length, progress=1.0)
         )
+    return files_list
+
+
+def _identity_from_root(root: dict, raw_info: bytes) -> TorrentIdentity:
+    """Identity of an already-decoded torrent root (strict decoder output)."""
+    info = root.get(b"info")
+    if not isinstance(info, dict) or not raw_info:
+        raise ValueError("torrent has no info dict")
 
     name = info.get(b"name", b"")
     if isinstance(name, bytes):
         name = name.decode("utf-8", errors="replace")
+
     announces: list[str] = []
     announce = root.get(b"announce", b"")
     if isinstance(announce, bytes):
@@ -240,96 +303,92 @@ def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
                         announces.append(u.decode("utf-8", errors="replace"))
                     elif isinstance(u, str):
                         announces.append(u)
-    announce_str = ",".join(dict.fromkeys(a for a in announces if a))
-    pieces = info.get(b"files") or None
+
     total = 0
-    if pieces is None:
+    files = info.get(b"files") or None
+    if files is None:
         length_raw = info.get(b"length", 0)
         total = length_raw if isinstance(length_raw, int) and length_raw >= 0 else 0
-    elif isinstance(pieces, list):
-        for f in pieces:
+    elif isinstance(files, list):
+        for f in files:
             if isinstance(f, dict):
                 length_raw = f.get(b"length", 0)
                 if isinstance(length_raw, int) and length_raw >= 0:
                     total += length_raw
 
-    infohash = hashlib.sha1(raw_info_bytes).hexdigest().lower()
-    return infohash, name, total, announce_str
+    # BEP 52: `meta version 2` (and the file tree) means a SHA-256 v2
+    # identity exists; `pieces` is what a v1 client keys on.
+    _declares_v2 = info.get(b"meta version") == 2 or b"file tree" in info
+    v2 = hashlib.sha256(raw_info).hexdigest().lower() if _declares_v2 else ""
+    v1 = hashlib.sha1(raw_info).hexdigest().lower()
+    return TorrentIdentity(
+        v1=v1,
+        v2=v2,
+        name=name,
+        total_bytes=total,
+        announce=",".join(dict.fromkeys(a for a in announces if a)),
+        files=tuple(_files_from_info(info)),
+        v2_only=bool(_declares_v2) and b"pieces" not in info,
+    )
+
+
+def parse_torrent_strict(data: bytes) -> TorrentIdentity:
+    """Decode a .torrent payload into its identity; raises ValueError.
+
+    One parser for every caller: hashes, display name, size, announce URL
+    and the safe-path file list. `_bencoded_info_hash`,
+    `is_bencoded_torrent` and `extract_torrent_files_from_bencoded` are
+    thin wrappers over this so their views cannot drift apart. The strict
+    form keeps the decoder's reason ("empty torrent", size caps, missing
+    info dict) for callers that report errors to the operator.
+    """
+    root, raw_info = _decode_torrent_root(data)
+    return _identity_from_root(root, raw_info)
+
+
+def parse_torrent(data: bytes) -> TorrentIdentity | None:
+    """Decode a .torrent payload into its identity, or None when invalid."""
+    try:
+        return parse_torrent_strict(data)
+    except Exception:
+        return None
+
+
+def is_bencoded_torrent(data: bytes) -> bool:
+    """True when `data` decodes as a bencoded torrent (root dict + info).
+
+    A leading ``b"d"`` alone is not proof: truncated or error-page bodies
+    can start with it, and adding one later fails deep in the client with
+    an unrelated error.
+    """
+    return parse_torrent(data) is not None
+
+
+def _bencoded_info_hash(data: bytes) -> tuple[str, str, int, str]:
+    """Decode a bencoded .torrent and return (v1 infohash, name, size, announce).
+
+    Wrapper over `parse_torrent` so identity, name/size and file list can
+    never disagree. Raises for an unusable payload and for a v2-only
+    torrent: this pipeline is SHA-1-keyed end to end, so a v2-only hash
+    would be ingested under an identity no client ever reports.
+    """
+    ident = parse_torrent_strict(data)
+    if ident.v2_only:
+        raise ValueError(
+            "BitTorrent v2-only torrent (SHA-256 infohash): this pipeline is "
+            "v1-keyed, so it would never sync — use the hybrid or v1 .torrent"
+        )
+    return ident.v1, ident.name, ident.total_bytes, ident.announce
 
 
 def extract_torrent_files_from_bencoded(data: bytes) -> list[Any]:
     """Extract list of TorrentFile entries from a bencoded .torrent payload.
 
-    Fail-soft (returns []): shares the strict root walk with
-    `_bencoded_info_hash`, converting its ValueError into [].
+    Fail-soft (returns []): the shared parser returns None for anything
+    undecodable, and its file list is the one every caller sees.
     """
-    from .clients.abstract import TorrentFile
-
-    if not data or not data.startswith(b"d"):
-        return []
-    if len(data) > MAX_TORRENT_BYTES:
-        return []
-    try:
-        root, _ = _decode_torrent_root(data)
-    except ValueError:
-        return []
-    info = root.get(b"info")
-    if not isinstance(info, dict):
-        return []
-
-    top_name = info.get(b"name", b"")
-    if isinstance(top_name, bytes):
-        top_name = top_name.decode("utf-8", errors="replace")
-
-    files_list: list[TorrentFile] = []
-    pieces = info.get(b"files")
-
-    def _safe_part(p: str) -> str | None:
-        # Path parts come from untrusted .torrent metadata: reject
-        # traversal, absolute, and control-char segments.
-        if not p or p in (".", ".."):
-            return None
-        if "/" in p or "\\" in p or "\n" in p or "\r" in p or "\0" in p:
-            return None
-        if len(p) >= 2 and p[1] == ":" and p[0].isalpha():
-            return None
-        return p
-
-    if isinstance(pieces, list):
-        top_safe = _safe_part(str(top_name)) if top_name else None
-        # Fall back to a neutral top when the torrent's name itself is
-        # unsafe — never propagate traversal into downstream joins.
-        top_prefix = top_safe if top_safe else "torrent"
-        for f in pieces:
-            if isinstance(f, dict):
-                length_raw = f.get(b"length", 0)
-                length = length_raw if isinstance(length_raw, int) and length_raw >= 0 else 0
-                path_parts = f.get(b"path", [])
-                parts_str: list[str] = []
-                if isinstance(path_parts, list):
-                    for p in path_parts:
-                        if isinstance(p, bytes):
-                            s = p.decode("utf-8", errors="replace")
-                        elif isinstance(p, str):
-                            s = p
-                        else:
-                            continue
-                        safe = _safe_part(s)
-                        if safe is None:
-                            continue
-                        parts_str.append(safe)
-                rel_path = "/".join(parts_str) if parts_str else "file"
-                full_name = f"{top_prefix}/{rel_path}"
-                files_list.append(TorrentFile(name=full_name, size_bytes=length, progress=1.0))
-    else:
-        length_raw = info.get(b"length", 0)
-        length = length_raw if isinstance(length_raw, int) and length_raw >= 0 else 0
-        safe_top = _safe_part(str(top_name)) if top_name else None
-        files_list.append(
-            TorrentFile(name=str(safe_top or "file"), size_bytes=length, progress=1.0)
-        )
-
-    return files_list
+    ident = parse_torrent(data)
+    return list(ident.files) if ident is not None else []
 
 
 def _bencode(obj: object) -> bytes:

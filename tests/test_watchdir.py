@@ -3020,3 +3020,56 @@ def test_hybrid_torrent_still_parses():
     )
     infohash, name, size, _ = _bencoded_info_hash(hybrid)
     assert len(infohash) == 40 and name == "Hybrid.Show" and size == 100
+
+
+def test_parse_torrent_reports_both_identities():
+    """One parser: v1 always, v2 when declared, files and totals together."""
+    from racing_sync.watchdir import _bencoded_info_hash, parse_torrent
+
+    hybrid = _bencode(
+        {
+            b"announce": b"http://x/announce",
+            b"info": {
+                b"name": b"Hybrid.Show",
+                b"meta version": 2,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+                b"files": [{b"length": 100, b"path": [b"a.mkv"]}],
+            },
+        }
+    )
+    ident = parse_torrent(hybrid)
+    assert ident is not None
+    assert ident.v1 and len(ident.v1) == 40
+    assert ident.v2 and len(ident.v2) == 64
+    assert ident.hashes == (ident.v1, ident.v2)
+    assert ident.total_bytes == 100
+    assert [f.name for f in ident.files] == ["Hybrid.Show/a.mkv"]
+    # The legacy tuple agrees with the parser (same bytes, same identity).
+    assert _bencoded_info_hash(hybrid) == (
+        ident.v1,
+        ident.name,
+        ident.total_bytes,
+        ident.announce,
+    )
+
+
+def test_parse_torrent_v2_only_has_no_v1_identity():
+    """A v2-only info dict gets a SHA-256 identity only."""
+    from racing_sync.watchdir import parse_torrent
+
+    v2_only = _bencode(
+        {
+            b"info": {
+                b"name": b"V2.Show",
+                b"meta version": 2,
+                b"file tree": {b"a.mkv": {b"": {b"length": 10}}},
+            }
+        }
+    )
+    ident = parse_torrent(v2_only)
+    assert ident is not None
+    assert ident.v2_only is True
+    assert ident.v2 and len(ident.v2) == 64
+    # The fabricated SHA-1 must never be offered as a candidate.
+    assert ident.hashes == (ident.v2,)

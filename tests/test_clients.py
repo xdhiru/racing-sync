@@ -1929,3 +1929,34 @@ async def test_qb_export_requires_a_decodable_torrent():
     good = _create_sample_torrent_data("Good.Show", 100, "http://x/announce")
     await _serve(good)
     assert await client.export_torrent("a" * 40) == good
+
+
+def test_qb_blob_hashes_include_both_identities():
+    """A hybrid blob yields v1 first and v2 too; v2-only yields v2 only."""
+    from test_watchdir import _bencode
+
+    hybrid = _bencode(
+        {
+            b"info": {
+                b"name": b"Hybrid.Show",
+                b"meta version": 2,
+                b"piece length": 16384,
+                b"pieces": b"12345678901234567890",
+                b"length": 10,
+            }
+        }
+    )
+    hashes = QBittorrentClient._hashes_from_blobs([hybrid])
+    assert len(hashes) == 2
+    assert len(hashes[0]) == 40 and len(hashes[1]) == 64
+
+    v2_only = _bencode(
+        {
+            b"info": {
+                b"name": b"V2.Show",
+                b"meta version": 2,
+                b"file tree": {b"a.mkv": {b"": {b"length": 10}}},
+            }
+        }
+    )
+    assert [len(h) for h in QBittorrentClient._hashes_from_blobs([v2_only])] == [64]
