@@ -27,6 +27,45 @@ from .sftp_source import SFTPExporter
 log = logging.getLogger("racing_sync.coordinator")
 
 
+def _public_size_agrees(candidate: object, want_size: int) -> bool:
+    """May this candidate serve the row's release?
+
+    The racing group is built by name, and normalized names drop trailing
+    `[...]` tags, so a same-name repack or Director's cut of a different
+    size can sit beside the real release. Once both sizes are known a
+    mismatch disqualifies the copy — the bytes would be a different
+    release, not a duplicate of this one.
+    """
+    if want_size <= 0:
+        return True
+    try:
+        got = int(getattr(candidate, "size_bytes", 0) or 0)
+    except (TypeError, ValueError):
+        got = 0
+    return got <= 0 or got == want_size
+
+
+def _blob_is_the_elected_torrent(blob: bytes, infohash: str) -> bool:
+    """Tripwire: the fetched bytes must BE the torrent we asked for.
+
+    Fetches are keyed by hash, so a mismatch means the client or the
+    transport handed back the wrong payload — downloading it onward would
+    move a different release onto the SSD under this row. Undecodable
+    payloads keep the legacy accept: the transport helpers refuse those
+    in production, and older tests pass opaque stubs.
+    """
+    try:
+        from .watchdir import _bencoded_info_hash
+
+        got, _name, _size, _announce = _bencoded_info_hash(blob)
+    except Exception:
+        return True
+    try:
+        return (got or "").lower() == (infohash or "").lower()
+    except Exception:
+        return True
+
+
 async def _pick_ssd_source_inner(
     *,
     cfg: AppConfig,
@@ -69,10 +108,14 @@ async def _pick_ssd_source_inner(
     # be redundant. The only exception is the rare case where the racing
     # client's .torrent is unreachable on VPS1 (then refetch_public_via_prowlarr
     # can fall back to Prowlarr as a last resort).
+    try:
+        _want_size = int(getattr(source_torrent, "size_bytes", 0) or 0)
+    except (TypeError, ValueError):
+        _want_size = 0
     publics = [
         t
         for t in [source_torrent] + other_source_torrents
-        if _looks_public(getattr(t, "trackers", None) or [])
+        if _looks_public(getattr(t, "trackers", None) or []) and _public_size_agrees(t, _want_size)
     ]
     # Deterministic election: client list order is arbitrary, so sort by
     # (size, name, hash) — same content elects the same copy every tick.
@@ -120,7 +163,7 @@ async def _pick_ssd_source_inner(
                 except Exception as e:  # noqa: BLE001
                     log.warning("sftp fetch %s failed: %s", chosen.infohash[:10], e)
                     break
-            if blob:
+            if blob and _blob_is_the_elected_torrent(blob, chosen.infohash):
                 return SourceDecision(
                     torrent_bytes=blob,
                     source_label="public-racing",
@@ -128,6 +171,12 @@ async def _pick_ssd_source_inner(
                     size_bytes=chosen.size_bytes,
                     infohash=chosen.infohash,
                     announce_url=(chosen.trackers[0] if chosen.trackers else ""),
+                )
+            if blob:
+                log.warning(
+                    "public racing torrent %s: exported bytes are a different "
+                    "torrent; ignoring them",
+                    chosen.infohash[:10],
                 )
         # If allow_ssh_export=false (or SFTP returned nothing for the
         # source_infohash), try the source client's own export endpoint
@@ -145,7 +194,7 @@ async def _pick_ssd_source_inner(
             except Exception as e:  # noqa: BLE001
                 log.warning("source export_torrent failed for %s: %s", chosen.infohash[:10], e)
                 blob = None
-        if blob:
+        if blob and _blob_is_the_elected_torrent(blob, chosen.infohash):
             log.info(
                 "public racing torrent present; fetched %s via qB export endpoint for SSD download",
                 chosen.infohash[:10],

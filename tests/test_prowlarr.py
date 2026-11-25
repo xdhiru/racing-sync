@@ -1838,3 +1838,76 @@ async def test_missing_indexer_triggers_a_throttled_refresh(monkeypatch):
         client.get_download_indexers()
     await asyncio.sleep(0)
     assert calls["n"] == 1
+
+
+def _public_torrent(h, size, name="Show.2020.1080p"):
+    from racing_sync.clients.abstract import Torrent
+
+    return Torrent(
+        hash=h,
+        name=name,
+        category="racing",
+        save_path="",
+        size_bytes=size,
+        state="",
+        progress=1.0,
+        trackers=["http://publicbt.com/announce"],
+    )
+
+
+@pytest.mark.anyio
+async def test_public_election_ignores_a_smaller_same_name_repack():
+    """A same-name sibling of a different size is a different release."""
+    cfg = MagicMock()
+    cfg.cross_seed.allow_ssh_export = True
+    cfg.cross_seed.allow_prowlarr_cross_seed = True
+    cfg.cross_seed.refetch_public_via_prowlarr = False
+    cfg.prowlarr.should_skip_title = lambda _t: False
+
+    sftp = MagicMock()
+    sftp.fetch_torrent = MagicMock(return_value=b"public-bytes")
+
+    src = _public_torrent("a" * 40, 1000)
+    repack = _public_torrent("b" * 40, 500)  # smaller, so it used to sort first
+
+    decision = await pick_ssd_source_for_racing(
+        cfg=cfg,
+        source_torrent=src,
+        other_source_torrents=[repack],
+        prowlarr=AsyncMock(),
+        sftp=sftp,
+        source_client=AsyncMock(),
+        attempt_prowlarr=True,
+    )
+
+    assert decision is not None
+    assert decision.infohash == "a" * 40
+    sftp.fetch_torrent.assert_called_once_with("a" * 40)
+
+
+@pytest.mark.anyio
+async def test_public_branch_rejects_bytes_of_another_torrent():
+    """Exported bytes whose infohash differs must not go out as this row."""
+    from test_watchdir import _create_sample_torrent_data
+
+    other = _create_sample_torrent_data("Different.Release", 1000, "http://publicbt.com/announce")
+    cfg = MagicMock()
+    cfg.cross_seed.allow_ssh_export = False
+    cfg.cross_seed.allow_prowlarr_cross_seed = False
+    cfg.cross_seed.refetch_public_via_prowlarr = False
+    cfg.prowlarr.should_skip_title = lambda _t: False
+
+    source_client = AsyncMock()
+    source_client.export_torrent = AsyncMock(return_value=other)
+
+    decision = await pick_ssd_source_for_racing(
+        cfg=cfg,
+        source_torrent=_public_torrent("a" * 40, 1000),
+        other_source_torrents=[],
+        prowlarr=AsyncMock(),
+        sftp=None,
+        source_client=source_client,
+        attempt_prowlarr=True,
+    )
+
+    assert decision is None or decision.source_label != "public-racing"
