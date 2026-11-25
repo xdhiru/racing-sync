@@ -3393,3 +3393,44 @@ def test_refresh_actions_restamps_only_live_holds():
     assert bot._action_inflight["keep:x"] > 0
     assert bot._action_inflight["other"] == 0.0
     assert "missing" not in bot._action_inflight
+
+
+def test_resolve_group_token_shared_ladder(tmp_path):
+    """Numbers address the filtered list; other tokens fall through."""
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        store.upsert(
+            TorrentState(
+                source_infohash="a" * 40,
+                source_name="Dl.One",
+                state=State.DOWNLOADING,
+                total_bytes=1000,
+            )
+        )
+        store.upsert(
+            TorrentState(
+                source_infohash="b" * 40,
+                source_name="Q.Two",
+                state=State.QUEUED,
+                total_bytes=1000,
+            )
+        )
+        bot = _bot()
+        bot._store = store
+        bot._status_filter = "dl"
+        rows = store.list_active_inflight()
+
+        members, live, by_number = bot._resolve_group_token(rows, "1")
+        assert [m.source_infohash for m in members] == ["a" * 40]
+        assert live == 1
+        assert by_number is True
+
+        # Out of range, or not a number/gid: no members, caller falls back.
+        assert bot._resolve_group_token(rows, "9")[0] == []
+        members, _live, by_number = bot._resolve_group_token(rows, "nothex")
+        assert members == []
+        assert by_number is False
+    finally:
+        store.close()

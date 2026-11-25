@@ -739,6 +739,53 @@ class ActionsMixin:
         except Exception:
             return None
 
+    def _positional_groups(self, rows: list) -> list:
+        """Display groups, with the active status filter applied.
+
+        Numbers address what the operator sees; the gid/hash/prefix
+        fallbacks resolve against the full row list.
+        """
+        try:
+            return _group_active_items([(_r, None) for _r in self._positional_active_rows(rows)])
+        except Exception:
+            return []
+
+    def _group_by_number(self, groups: list, token: str) -> list | None:
+        """Members addressed by a 1-based positional number, else None."""
+        try:
+            if not token.isdigit():
+                return None
+            _n = int(token)
+        except (TypeError, ValueError):
+            return None
+        if not 1 <= _n <= len(groups or []):
+            return None
+        try:
+            _gk, _mem = groups[_n - 1]
+        except Exception:
+            return None
+        return [t for (t, _) in _mem]
+
+    def _resolve_group_token(self, rows: list, token: str) -> tuple[list, int, bool]:
+        """Members for a positional number or a group id.
+
+        One ladder for the group verbs: a number addresses the displayed
+        (filtered) list, a group id (older messages) the full row list.
+        Returns (members, live_group_count, matched_by_number); empty
+        members means neither matched, so callers fall back to a full
+        hash / legacy prefix.
+        """
+        groups = self._positional_groups(rows)
+        members = self._group_by_number(groups, token)
+        by_number = members is not None
+        if members is None:
+            try:
+                _by_gid = _live_group_by_gid(list(rows or []), token)
+            except Exception:
+                _by_gid = None
+            members = list(_by_gid[1]) if _by_gid is not None else []
+        return members, len(groups), by_number
+
     async def _act_command_entry(self, token: str, message: Any) -> None:
         """Reply with the action sheet for a content group.
 
@@ -763,23 +810,7 @@ class ActionsMixin:
                 except Exception:
                     pass
                 return
-            try:
-                groups = _group_active_items(
-                    [(_r, None) for _r in self._positional_active_rows(rows)]
-                )
-            except Exception:
-                groups = []
-            members: list = []
-            _positional = False
-            if norm.isdigit():
-                try:
-                    _n = int(norm)
-                except (TypeError, ValueError):
-                    _n = 0
-                if 1 <= _n <= len(groups):
-                    _gk, _mem = groups[_n - 1]
-                    members = [t for (t, _) in _mem]
-                    _positional = True
+            members, _live_n, _positional = self._resolve_group_token(rows, norm)
             # Positional numbers rot when the list changes between render
             # and tap: warn when the live group count differs from the
             # last rendered generation (gid/hash/prefix paths are stable
@@ -791,10 +822,6 @@ class ActionsMixin:
                     _rendered = int(getattr(self, "_last_rendered_groups", 0) or 0)
                 except Exception:
                     _rendered = 0
-                try:
-                    _live_n = len(groups)
-                except Exception:
-                    _live_n = 0
                 if _rendered and _live_n and _rendered != _live_n:
                     _gen_warn = (
                         f"⚠️ List changed since render "
@@ -1204,32 +1231,8 @@ class ActionsMixin:
             except Exception:
                 pass
             return
-        groups: list = []
-        if token.isdigit():
-            # Numbers address the displayed (status-filtered) list; the
-            # gid/hash/prefix fallbacks below stay on the full rows.
-            try:
-                groups = _group_active_items(
-                    [(_r, None) for _r in self._positional_active_rows(rows)]
-                )
-            except Exception:
-                groups = []
-        found: tuple | None = None
-        if token.isdigit():
-            try:
-                _n = int(token)
-            except (TypeError, ValueError):
-                _n = 0
-            if 1 <= _n <= len(groups):
-                _gk, _mem = groups[_n - 1]
-                found = (_gk, [t for (t, _) in _mem])
-        if found is None:
-            # Group id (older messages) or legacy torrent prefix.
-            _by_gid = _live_group_by_gid(list(rows or []), token)
-            if _by_gid is not None:
-                _gk, _mem = _by_gid
-                found = (_gk, list(_mem))
-        if found is None:
+        members, _live_n, _by_number = self._resolve_group_token(rows, token)
+        if not members:
             try:
                 target = await asyncio.to_thread(self._resolve_cancel_target, token, cmd=kind)
                 full_hash = target.source_infohash
@@ -1247,7 +1250,6 @@ class ActionsMixin:
                 return
             await self._start_single_command(kind, full_hash, message)
             return
-        _gkey, members = found
         title = self._group_title(members)
         if kind == "files":
             if not members:
@@ -1870,25 +1872,14 @@ class ActionsMixin:
                     except Exception:
                         pass
                     return
-                try:
-                    groups = _group_active_items(
-                        [(_r, None) for _r in self._positional_active_rows(rows)]
-                    )
-                except Exception:
-                    groups = []
-                try:
-                    _n = int(norm)
-                except (TypeError, ValueError):
-                    _n = 0
-                if 1 <= _n <= len(groups):
-                    _gk, _mem = groups[_n - 1]
-                    for _t in [t for (t, _) in _mem]:
-                        try:
-                            _h = _member_hash(_t)
-                        except Exception:
-                            continue
-                        if _h:
-                            hashes.append(_h)
+                _members = self._group_by_number(self._positional_groups(rows), norm) or []
+                for _t in _members:
+                    try:
+                        _h = _member_hash(_t)
+                    except Exception:
+                        continue
+                    if _h:
+                        hashes.append(_h)
                 if not hashes:
                     try:
                         await self._reply(
