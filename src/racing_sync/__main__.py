@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import shutil
 import signal
 import sys
@@ -611,14 +612,40 @@ def _check_config_env(cfg: AppConfig, *, probe_writes: bool = True) -> list[str]
     return problems
 
 
+_GLOB_CLASS_RE = re.compile(r"\[[^\]]*\]")
+
+
+def _glob_can_match_torrent(pattern: str) -> bool:
+    """True when `pattern` can match a name the watch-dir scanner accepts.
+
+    The scanner only ingests files whose suffix is ``.torrent``, so a glob
+    that cannot produce that suffix (``*.zip``, ``*``, ``*.torrent.bak``)
+    silently drops every watch-dir drop. Wildcards are collapsed to their
+    shortest expansion (``*`` → empty, ``?`` → one char) and a bracket
+    class to its first character, which is enough to answer "can this end
+    in .torrent". A rare false negative only costs an advisory warning.
+    """
+    try:
+        collapsed = _GLOB_CLASS_RE.sub(lambda m: m.group(0)[1:2] or "x", pattern.strip())
+        collapsed = collapsed.replace("*", "").replace("?", "").lower()
+    except Exception:
+        return True
+    return collapsed.endswith(".torrent")
+
+
 def _check_config_warnings(cfg: AppConfig) -> list[str]:
     """Non-fatal check-config advisories (printed, exit still 0).
 
     Fuse mounts fail soft by design: the daemon parks fuse-gated work
     until the mount appears instead of refusing to start, so a down
-    mount must not fail check-config — but the operator should know.
+    mount must not fail check-config — but the operator should know. An
+    unmounted mountpoint looks the same to the gate as an empty working
+    tree (every expected file stats "missing"), and a glob that cannot
+    match `.torrent` drops every manual drop without a trace.
     """
     warnings: list[str] = []
+    from .fuse_gate import mount_is_mounted
+
     for label, val in (
         ("rclone.fuse.mount", getattr(cfg.rclone.fuse, "mount", "")),
         ("rclone.fuse.mount_unsorted", getattr(cfg.rclone.fuse, "mount_unsorted", "")),
@@ -634,8 +661,28 @@ def _check_config_warnings(cfg: AppConfig) -> list[str]:
                     "until the mount appears — start the mount first if rows "
                     "should flow immediately"
                 )
+            elif not mount_is_mounted(p):
+                # Exists but is an empty non-mountpoint directory: rclone is
+                # not attached, so the gate reads every file as missing.
+                warnings.append(
+                    f"{label} exists but is not a mount point ({p}): the "
+                    "rclone mount looks down — fuse-gated work will park "
+                    "until a real mount appears"
+                )
         except Exception:
             pass
+    try:
+        wd = getattr(cfg, "watch_dir", None)
+        if wd is not None:
+            _glob = str(getattr(wd, "glob", "") or "")
+            if not _glob_can_match_torrent(_glob):
+                warnings.append(
+                    f"watch_dir.glob ({_glob!r}) cannot match a .torrent file: "
+                    "the scanner only ingests *.torrent, so dropped files "
+                    "will be ignored — use e.g. '*.torrent'"
+                )
+    except Exception:
+        pass
     return warnings
 
 

@@ -460,6 +460,60 @@ def test_check_config_warns_not_fails_on_down_fuse_mount(tmp_path: Path):
     assert all("parks" in w for w in warnings)
 
 
+def test_check_config_warns_when_fuse_path_exists_but_unmounted(tmp_path: Path):
+    """An empty directory where the rclone mount should be is the down shape."""
+    from racing_sync.__main__ import _check_config_warnings
+    from racing_sync.config import AppConfig
+
+    mount = tmp_path / "fuse"
+    mount.mkdir()
+    unsorted = tmp_path / "fuse-unsorted"
+    unsorted.mkdir()
+    text = MINIMAL_CONFIG.replace('mount = "/mnt/fuse"', f'mount = "{mount.as_posix()}"')
+    text = text.replace(
+        'mount_unsorted = "/mnt/fuse/unsorted"', f'mount_unsorted = "{unsorted.as_posix()}"'
+    )
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(text)
+    cfg = AppConfig.from_toml(cfg_file)
+    with patch("racing_sync.fuse_gate._POSIX", True):
+        warnings = _check_config_warnings(cfg)
+    assert len(warnings) == 2
+    assert all("not a mount point" in w for w in warnings)
+
+    # A directory that holds entries is a working tree (bind layouts, other
+    # mount tooling): it must not be flagged as a dead mount.
+    (mount / "Some.Movie.2024").mkdir()
+    with patch("racing_sync.fuse_gate._POSIX", True):
+        warnings = _check_config_warnings(cfg)
+    assert len(warnings) == 1
+    assert "fuse-unsorted" in warnings[0]
+
+
+def test_check_config_warns_when_watch_glob_cannot_match_torrent(tmp_path: Path):
+    """The scanner only ingests *.torrent; a glob that cannot match is silent."""
+    from racing_sync.__main__ import _check_config_warnings
+    from racing_sync.config import AppConfig
+
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    text = MINIMAL_CONFIG + f'\n[watch_dir]\npath = "{watch.as_posix()}"\nglob = "*.zip"\n'
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(text)
+    cfg = AppConfig.from_toml(cfg_file)
+    warnings = _check_config_warnings(cfg)
+    assert any("watch_dir.glob" in w and "*.zip" in w for w in warnings)
+
+    cfg_file.write_text(text.replace('glob = "*.zip"', 'glob = "private-*.torrent"'))
+    cfg = AppConfig.from_toml(cfg_file)
+    assert not any("watch_dir.glob" in w for w in _check_config_warnings(cfg))
+
+    # Mixed-case / bracket spellings still describe a torrent suffix.
+    cfg_file.write_text(text.replace('glob = "*.zip"', 'glob = "*.[tT]orrent"'))
+    cfg = AppConfig.from_toml(cfg_file)
+    assert not any("watch_dir.glob" in w for w in _check_config_warnings(cfg))
+
+
 def test_forget_releases_lock_on_lookup_error(tmp_path: Path):
     """Error returns in _cmd_forget must not leak the daemon lock."""
     from racing_sync.__main__ import _cmd_forget
