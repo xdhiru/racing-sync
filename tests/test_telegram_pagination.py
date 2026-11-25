@@ -371,13 +371,17 @@ async def test_send_one_detail_non_flood_error_still_drops():
     )
     bot._store.get_telegram_message_id.return_value = 111
     bot._detail_cache[h] = 111
+    # A permanent, non-card error: logging and dropping is all we can do
+    # (a card that cannot be edited or is over the cap is replaced instead).
     bot._bot.edit_message_text = AsyncMock(
-        side_effect=TelegramError("Bad Request: message is too long")
+        side_effect=TelegramError("Bad Request: have no rights to send a message")
     )
+    bot._bot.send_message = AsyncMock()
 
     with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         await bot._send_one_detail(h, None)
         mock_sleep.assert_not_called()
+    bot._bot.send_message.assert_not_called()
     assert bot._detail_queue.empty()
 
 

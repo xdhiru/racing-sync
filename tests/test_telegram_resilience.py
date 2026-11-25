@@ -527,3 +527,29 @@ async def test_cancelled_card_reports_the_chosen_policy():
     await bot._mark_detail_cancelled(7, "Show", h, remember=True, delete_files=False)
     assert "data left in place" in seen[-1]
     assert f"Unignore: `/resume_{h}`" in seen[-1]
+
+
+@pytest.mark.anyio
+async def test_detail_edit_that_cannot_be_edited_resends(tmp_path):
+    """A card that can never be edited must be replaced, not left frozen."""
+    from racing_sync.state import State, StateStore, TorrentState
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        h = "a" * 40
+        store.upsert(TorrentState(source_infohash=h, source_name="Show", state=State.DOWNLOADING))
+        bot = _bot()
+        bot._store = store
+        bot._detail_cache = {h: 55}
+        bot._detail_sent_state = {}
+        bot._bot.edit_message_text = AsyncMock(
+            side_effect=TelegramError("Bad Request: message can't be edited")
+        )
+        bot._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=77))
+
+        await bot._send_one_detail(h, 0.5)
+
+        bot._bot.send_message.assert_awaited_once()
+        assert bot._detail_cache[h] == 77
+    finally:
+        store.close()

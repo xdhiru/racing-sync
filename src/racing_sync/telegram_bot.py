@@ -846,8 +846,15 @@ class TelegramBot(SheetsMixin, RouterMixin, RefreshMixin, ActionsMixin):
                     if "not modified" in msg:
                         self._mark_detail_sent(infohash, state_value)
                         return
-                    if "not found" in msg or "invalid" in msg:
-                        # Message was deleted; resend.
+                    if (
+                        "not found" in msg
+                        or "invalid" in msg
+                        or "can't be edited" in msg
+                        or "too long" in msg
+                    ):
+                        # Deleted, uneditable or over the size cap: the old
+                        # card can never be updated, so a fresh one is the
+                        # only way the operator sees this state.
                         try:
                             sent = await self._bot.send_message(
                                 self._cfg.chat_id,
