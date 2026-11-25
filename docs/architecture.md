@@ -275,17 +275,23 @@ across restarts: `batch_cap_bytes` (frozen batch boundaries) and
 
 ## Recovery (req #4)
 
-On startup the reconciler audits active states against destination client
-torrents and the local/remote filesystem — in two phases, so serving
-never waits on per-row verification:
+With `[recovery].run_on_startup` enabled, startup runs ONE fast snapshot
+pass and nothing more: optimistic adoption (fuse entries adopt as `DONE`
+fuse-*un*verified with unknown kind/blob), orphan parking and ghost
+checks, with no per-row RPCs — so the daemon serves in seconds.
 
-- Phase 1 (blocking, fast): snapshots plus optimistic adoption — fuse
-  entries adopt as `DONE` fuse-*un*verified with unknown kind/blob,
-  orphans stay parked, ghost checks are skipped. No per-row RPCs.
-- Phase 2 (`reconcile_verify()`, background task): byte verification
-  (stamping `fuse_verified`, healing kind/blob, demoting SSD-backed
-  ghosts to `MOVING`) and orphan fixes, 4-wide with per-row isolation.
-  Unverified rows stay fail-closed (the janitor requires the flag).
+Byte verification, classification, blob export and orphan fixes are NOT
+started in the background. They heal lazily on the next worker tick
+through the existing fail-closed gates (the fuse gate re-verifies,
+`_do_queued` classifies, blobs export on demand), and an unverified row
+stays fail-closed (the janitor requires `fuse_verified`).
+
+`POST /api/recover` runs the full pass — `reconcile()`: snapshot plus
+inline per-row verification (4-wide, per-row isolated). It is safe
+against a live daemon: row writes are state/version-guarded, and
+adoption re-reads ownership before inserting, so a row admitted while
+the pass runs is linked rather than duplicated. `reconcile_verify()`
+stays available for callers that already hold a snapshot.
 
 - `state=downloading` + missing on destination -> re-add torrent to continue download.
 - `state=moving` + missing on SSD -> verify if data arrived on remote; transition to `RE_ADDING` if complete.

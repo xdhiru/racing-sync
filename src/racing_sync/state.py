@@ -444,6 +444,12 @@ class StateStore:
             )
             self._conn.execute("PRAGMA synchronous=FULL")
         else:
+            # WAL + NORMAL: commits are not fsynced until a checkpoint, so a
+            # power cut can roll back the most recent transactions (the DB
+            # itself stays consistent). The tradeoff is deliberate — every
+            # per-tick upsert fsyncing would dominate the write path — and
+            # survivable: a lost MOVING checkpoint replays from the last
+            # durable one, and recovery re-derives rows from the clients.
             self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=30000")
         # Bound WAL growth on long-lived coordinators doing per-tick upserts.
