@@ -46,11 +46,12 @@ def _scaffold(tmp_path, *, heal_after=7200):
     fuse = tmp_path / "fuse"
     fuse_u = tmp_path / "fuse-unsorted"
     ssd.mkdir(exist_ok=True)
-    (fuse_u / TOP).mkdir(parents=True, exist_ok=True)
+    (fuse / TOP).mkdir(parents=True, exist_ok=True)
     fuse_u.mkdir(parents=True, exist_ok=True)
     # ep01 present at full size on the fuse target; ep04v2 nowhere.
-    # (Target mount comes from the blob kind -> unsorted for this layout.)
-    (fuse_u / TOP / "ep01.mkv").write_bytes(b"x" * PRESENT_SIZE)
+    # (Target mount comes from the blob kind -> the season mount for a
+    # mixed layout like this one.)
+    (fuse / TOP / "ep01.mkv").write_bytes(b"x" * PRESENT_SIZE)
 
     blob = _blob()
     blob_hash, _, _, _ = _bencoded_info_hash(blob)
@@ -138,7 +139,7 @@ async def test_heal_mount_outage_never_heals(tmp_path):
         # Kill the mount: every fuse stat reads absent-with-marker.
         import shutil
 
-        shutil.rmtree(tmp_path / "fuse-unsorted")
+        shutil.rmtree(tmp_path / "fuse")
         _track(coord, "c" * 40, 10800, (MISSING,))
         await coord._do_re_add(store.get("c" * 40))
         assert store.get("c" * 40).state == State.RE_ADDING
@@ -155,7 +156,7 @@ async def test_heal_set_change_restarts_clock(tmp_path):
     coord, store, blob, _, _, fuse = _scaffold(tmp_path)
     try:
         # ep01 vanishes too now: set differs from the tracked one.
-        (tmp_path / "fuse-unsorted" / TOP / "ep01.mkv").unlink()
+        (tmp_path / "fuse" / TOP / "ep01.mkv").unlink()
         _track(coord, "c" * 40, 10800, (MISSING,))
         await coord._do_re_add(store.get("c" * 40))
         assert store.get("c" * 40).state == State.RE_ADDING
@@ -273,7 +274,7 @@ async def test_heal_truncated_file_still_heals(tmp_path):
     try:
         _track(coord, "c" * 40, 10800, (MISSING,))
         # Truncated copy: regular file, wrong size — must not pass as present.
-        (Path(coord.cfg.rclone.fuse.mount_unsorted) / TOP / "ep04v2.mkv").write_bytes(
+        (Path(coord.cfg.rclone.fuse.mount) / TOP / "ep04v2.mkv").write_bytes(
             b"t" * (MISSING_SIZE - 50)
         )
 

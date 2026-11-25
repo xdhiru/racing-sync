@@ -2071,7 +2071,11 @@ async def test_do_moving_mixed_skips_remote_episode(tmp_path):
 
     fuse_unsorted = tmp_path / "fuse-unsorted"
     fuse_unsorted.mkdir()
-    (fuse_unsorted / "Show.S01E01.mkv").write_bytes(b"x" * 1000)
+    # A mixed release routes to the season mount: that is where its
+    # already-archived episode lives.
+    fuse_default = tmp_path / "fuse"
+    fuse_default.mkdir()
+    (fuse_default / "Show.S01E01.mkv").write_bytes(b"x" * 1000)
     for name in ("Show.S01E01.mkv", "Show.S01E02.mkv", "Extra1.mp4", "Extra2.mp4"):
         (tmp_path / name).write_bytes(b"x" * 1000)
 
@@ -2084,7 +2088,7 @@ async def test_do_moving_mixed_skips_remote_episode(tmp_path):
     coord.cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
     coord.cfg.rclone.remote.default = "remote:media"
     coord.cfg.rclone.remote.unsorted = "remote:unsorted"
-    coord.cfg.rclone.fuse.mount = tmp_path / "fuse"
+    coord.cfg.rclone.fuse.mount = fuse_default
     coord.cfg.rclone.fuse.mount_unsorted = fuse_unsorted
     coord.cfg.rclone.batch_move_extra_flags = []
     coord.dest_client = AsyncMock()

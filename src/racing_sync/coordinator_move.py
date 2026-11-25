@@ -27,6 +27,7 @@ from pathlib import Path
 
 from .batcher import files_from_names, make_batches
 from .clients.abstract import TorrentFile
+from .coordinator_content import route_kind_is_sorted
 from .coordinator_errors import (
     AbandonedError,
     RcloneTransientError,
@@ -1254,7 +1255,7 @@ class MoveMixin:
         # 4. Decide target remote from the PINNED kind (see above): batches
         # were moved under it, so the sweep must land beside them even if the
         # fresh file list classifies differently.
-        if pinned_kind in ("movie", "season"):
+        if route_kind_is_sorted(pinned_kind):
             remote = self.cfg.rclone.remote.default
         else:
             remote = self.cfg.rclone.remote.unsorted

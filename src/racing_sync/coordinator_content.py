@@ -286,6 +286,20 @@ def _should_notify_telegram(prev: State, dst: State) -> bool:
     return dst in _TELEGRAM_NOTIFY_STATES
 
 
+#: Kinds that belong in the "sorted" remote / fuse mount. `mixed` is a
+#: season pack with extras — its episodes decide, so it follows
+#: movie/season instead of being split off into unsorted.
+_SORTED_ROUTE_KINDS = frozenset({"movie", "season", "mixed"})
+
+
+def route_kind_is_sorted(kind: object) -> bool:
+    """True when this classification routes to the default remote/mount."""
+    try:
+        return str(kind or "").strip().lower() in _SORTED_ROUTE_KINDS
+    except Exception:
+        return False
+
+
 PUBLIC_TRACKER_HOSTS = (
     "publicbt",
     "tracker.public",

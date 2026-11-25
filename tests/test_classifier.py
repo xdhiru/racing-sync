@@ -117,9 +117,12 @@ def test_coordinator_target_mount_routing():
     assert coord._target_mount_for(ts_movie) == Path(cfg.rclone.fuse.mount)
     assert coord._target_mount_for(ts_season) == Path(cfg.rclone.fuse.mount)
 
-    # Individual episodes and mixed -> mount_unsorted
+    # A mixed release is a season pack with extras: its episodes decide,
+    # so it follows seasons instead of splitting into unsorted.
+    assert coord._target_mount_for(ts_mixed) == Path(cfg.rclone.fuse.mount)
+
+    # Individual episodes -> mount_unsorted
     assert coord._target_mount_for(ts_ep) == Path(cfg.rclone.fuse.mount_unsorted)
-    assert coord._target_mount_for(ts_mixed) == Path(cfg.rclone.fuse.mount_unsorted)
 
 
 @pytest.mark.anyio
@@ -503,3 +506,16 @@ def test_oversize_single_file_ignores_non_numeric_cap():
 
     cfg.ssd.skip_movie_larger_than_bytes = 0
     assert oversize_single_file(files, cfg) is None
+
+
+def test_route_kind_is_sorted_mapping():
+    """One explicit table decides sorted vs unsorted routing."""
+    from racing_sync.coordinator_content import route_kind_is_sorted
+
+    assert route_kind_is_sorted("movie")
+    assert route_kind_is_sorted("season")
+    assert route_kind_is_sorted("Mixed")  # season pack with extras
+    assert not route_kind_is_sorted("episode")
+    assert not route_kind_is_sorted("unknown")
+    assert not route_kind_is_sorted("")
+    assert not route_kind_is_sorted(None)

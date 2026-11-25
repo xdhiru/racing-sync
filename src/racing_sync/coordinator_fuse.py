@@ -19,7 +19,7 @@ from pathlib import Path
 from .classifier import classify
 from .clients.abstract import Torrent
 from .clients.deluge import DelugeClient
-from .coordinator_content import _looks_public, fold_path_case
+from .coordinator_content import _looks_public, fold_path_case, route_kind_is_sorted
 from .coordinator_errors import _NOT_VISIBLE_DETAIL, AbandonedError
 from .coordinator_inject import _group_is_ignored
 from .io_bounds import chunked, rpc
@@ -1237,9 +1237,9 @@ class FuseMixin:
     def _target_mount_for_kind(self, kind: str, fallback: Path) -> Path:
         """Fuse mount for a classification kind; fallback on error/unknown-cfg."""
         try:
-            if kind in ("movie", "season"):
+            if route_kind_is_sorted(kind):
                 return Path(self.cfg.rclone.fuse.mount)
-            if kind in ("episode", "mixed", "unknown"):
+            if kind in ("episode", "unknown"):
                 return Path(self.cfg.rclone.fuse.mount_unsorted)
         except Exception:
             pass
@@ -1586,6 +1586,6 @@ class FuseMixin:
 
     def _target_mount_for(self, ts: TorrentState) -> Path:
         """Where on the fuse mount should this torrent's data live?"""
-        if ts.classification_kind == "movie" or ts.classification_kind == "season":
+        if route_kind_is_sorted(ts.classification_kind):
             return Path(self.cfg.rclone.fuse.mount)
         return Path(self.cfg.rclone.fuse.mount_unsorted)

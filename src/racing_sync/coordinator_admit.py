@@ -27,6 +27,7 @@ from .coordinator_content import (
     announce_domain,
     is_watch_row,
     normalize_content_name,
+    route_kind_is_sorted,
     watch_election_winner,
     watch_rank,
 )
@@ -4135,7 +4136,7 @@ class AdmitMixin:
         src_dir = Path(save_path).resolve()
         remote = (
             self.cfg.rclone.remote.default
-            if hasattr(self, "cfg") and self.cfg and ts.classification_kind in ("movie", "season")
+            if hasattr(self, "cfg") and self.cfg and route_kind_is_sorted(ts.classification_kind)
             else (
                 self.cfg.rclone.remote.unsorted if hasattr(self, "cfg") and self.cfg else "remote:"
             )

@@ -48,9 +48,10 @@ def _scaffold(tmp_path):
     fuse_u = tmp_path / "fuse-unsorted"
     ssd.mkdir(exist_ok=True)
     fuse_u.mkdir(parents=True, exist_ok=True)
-    (fuse_u / TOP).mkdir(parents=True, exist_ok=True)
-    # ep01 present at full size on the fuse target; ep04v2 nowhere.
-    (fuse_u / TOP / "ep01.mkv").write_bytes(b"x" * PRESENT_SIZE)
+    (fuse / TOP).mkdir(parents=True, exist_ok=True)
+    # ep01 present at full size on the fuse target; ep04v2 nowhere. A mixed
+    # layout targets the season mount.
+    (fuse / TOP / "ep01.mkv").write_bytes(b"x" * PRESENT_SIZE)
 
     blob = _blob()
     blob_hash, _, _, _ = _bencoded_info_hash(blob)
