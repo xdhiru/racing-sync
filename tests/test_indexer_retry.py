@@ -2189,3 +2189,51 @@ def test_prefer_grace_row_refuses_held(tmp_path):
         assert "skipped" in msg
     finally:
         store.close()
+
+
+def test_schedule_retry_writes_one_schedule_and_clears_the_other():
+    """One helper owns the timer arithmetic for both retry schedules."""
+    coord = make_coordinator()
+    ts = TorrentState(source_infohash="a" * 40, state=State.WAITING_INDEXER)
+    ts.indexer_next_retry_at = dt.datetime.now(dt.UTC)
+    ts.public_export_next_retry_at = dt.datetime.now(dt.UTC)
+
+    at = coord._schedule_retry(ts, "public", 120)
+    assert ts.public_export_next_retry_at == at
+    assert ts.indexer_next_retry_at is None, "a leftover indexer timer must be cleared"
+
+    at2 = coord._schedule_retry(ts, "indexer", 120)
+    assert ts.indexer_next_retry_at == at2
+    assert ts.public_export_next_retry_at is None
+
+
+def test_schedule_retry_clamps_bad_delays():
+    coord = make_coordinator()
+    ts = TorrentState(source_infohash="a" * 40, state=State.WAITING_INDEXER)
+    before = dt.datetime.now(dt.UTC)
+
+    at = coord._schedule_retry(ts, "indexer", 0)
+    assert (at - before).total_seconds() >= 59.0, "a zero delay must not spin the scheduler"
+
+    at = coord._schedule_retry(ts, "indexer", "junk")
+    assert (at - before).total_seconds() >= 900.0, "unparsable delays fall back to the default"
+
+
+def test_park_waiting_indexer_transitions_fresh_but_upserts_parked(tmp_path):
+    from racing_sync.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        fresh = TorrentState(source_infohash="a" * 40, source_name="Show", state=State.NEW)
+        store.upsert(fresh)
+
+        coord._park_waiting_indexer(fresh, reason="indexer")
+        assert store.get("a" * 40).state == State.WAITING_INDEXER
+
+        parked = store.get("a" * 40)
+        parked.indexer_attempts = 2
+        coord._park_waiting_indexer(parked, reason="indexer")
+        assert store.get("a" * 40).indexer_attempts == 2
+    finally:
+        store.close()

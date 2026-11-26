@@ -791,6 +791,58 @@ class AdmitMixin:
         except Exception:
             return False
 
+    def _schedule_retry(
+        self,
+        ts: TorrentState,
+        kind: str,
+        delay_s: float,
+        *,
+        clear_other: bool = True,
+    ) -> dt.datetime:
+        """Set one retry timer and return the instant it fires.
+
+        Two schedules share the WAITING_INDEXER state: "indexer" (a
+        cross-seed search) and "public" (the source-export fallback).
+        Writing one clears the other by default — a leftover timer on the
+        inactive schedule sits in the past and makes list_waiting_ready
+        wake the row every tick. The delay is clamped to >=60s so a
+        corrupt config can never spin the scheduler.
+        """
+        try:
+            delay = max(60.0, float(delay_s))
+        except (TypeError, ValueError):
+            delay = 1800.0
+        retry_at = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=delay)
+        if str(kind) == "public":
+            ts.public_export_next_retry_at = retry_at
+            if clear_other:
+                ts.indexer_next_retry_at = None
+        else:
+            ts.indexer_next_retry_at = retry_at
+            if clear_other:
+                ts.public_export_next_retry_at = None
+        return retry_at
+
+    def _park_waiting_indexer(self, ts: TorrentState, *, reason: str) -> None:
+        """Persist a WAITING_INDEXER park after a timer was set.
+
+        A fresh row transitions (notifying Telegram once); an already-
+        parked row takes a whole-row upsert — a transition to the state it
+        already holds is illegal, and re-notifying for a timer refresh
+        would spam the channel. Forgotten rows raise AbandonedError so a
+        stale snapshot never upsert-resurrects them.
+        """
+        if ts.state != State.WAITING_INDEXER:
+            self.transition(ts, State.WAITING_INDEXER)
+            return
+        if self._abandoned(ts):
+            raise AbandonedError(
+                f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}; "
+                f"not refreshing {reason} park"
+            )
+        self.store.upsert(ts)
+        self._schedule_telegram_update(ts)
+
     def _park_for_indexer_retry(self, ts: TorrentState, *, reason: str = "indexer miss") -> None:
         """Park into WAITING_INDEXER with an escalating retry timer.
 
@@ -829,12 +881,7 @@ class AdmitMixin:
             )
         except (TypeError, ValueError):
             _max_age_s = 86400.0
-        next_retry = now + dt.timedelta(seconds=max(60.0, _retry_gap))
-        ts.indexer_next_retry_at = next_retry
-        # The row runs the indexer schedule now: a leftover public-export
-        # timer (e.g. from an earlier public park) stays in the past and
-        # would make list_waiting_ready wake this row every tick.
-        ts.public_export_next_retry_at = None
+        next_retry = self._schedule_retry(ts, "indexer", _retry_gap)
         max_age = dt.timedelta(seconds=max(60.0, _max_age_s))
         elapsed = now - ts.indexer_first_queried_at
 
@@ -878,21 +925,10 @@ class AdmitMixin:
                 )
                 return
 
-        # If we're being called from _do_new (state is NEW), the
-        # transition is legal. If we're being re-called from
-        # _do_waiting_indexer, the state is already WAITING_INDEXER
-        # and we just need to bump the retry timestamp.
-        if ts.state != State.WAITING_INDEXER:
-            self.transition(ts, State.WAITING_INDEXER)
-        else:
-            if self._abandoned(ts):
-                raise AbandonedError(
-                    f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}; "
-                    "not refreshing indexer park"
-                )
-            self.store.upsert(ts)
-            # No transition() fired, so push the updated timer manually.
-            self._schedule_telegram_update(ts)
+        # If we're being called from _do_new (state is NEW), the park
+        # transitions. If we're being re-called from _do_waiting_indexer,
+        # the state is already WAITING_INDEXER and only the timer changed.
+        self._park_waiting_indexer(ts, reason="indexer")
 
     def _park_for_public_retry(self, ts: TorrentState) -> None:
         """Park a public-export miss on its own indefinite schedule.
@@ -913,12 +949,11 @@ class AdmitMixin:
         if ts.public_export_first_attempted_at is None:
             ts.public_export_first_attempted_at = now
         ts.public_export_attempts += 1
-        ts.public_export_next_retry_at = now + dt.timedelta(seconds=interval)
         # The row runs the public schedule now: a leftover indexer timer
-        # (e.g. from a misclassified retry of a public row) stays in the
-        # past and would make list_waiting_ready wake this row every tick,
-        # inflating attempts until the 24h max-age FAILED a public row.
-        ts.indexer_next_retry_at = None
+        # (e.g. from a misclassified retry of a public row) would make
+        # list_waiting_ready wake this row every tick, inflating attempts
+        # until the 24h max-age FAILED a public row.
+        self._schedule_retry(ts, "public", interval)
         # Unbounded schedule by design (no max-age FAILED), so rotate
         # verbosity: first misses log loudly, the long tail at debug —
         # a wedged export must not fill the log disk with its own lines.
@@ -937,16 +972,7 @@ class AdmitMixin:
                 ts.source_name,
                 ts.public_export_next_retry_at.isoformat(timespec="seconds"),
             )
-        if ts.state != State.WAITING_INDEXER:
-            self.transition(ts, State.WAITING_INDEXER)
-        else:
-            if self._abandoned(ts):
-                raise AbandonedError(
-                    f"row gone (forgotten?) for {(ts.source_infohash or '')[:10]}; "
-                    "not refreshing public-export park"
-                )
-            self.store.upsert(ts)
-            self._schedule_telegram_update(ts)
+        self._park_waiting_indexer(ts, reason="public-export")
 
     def _inflight_same_content(self, ts: TorrentState):
         """Row that owns (or is winning) this content, else None.
@@ -1142,12 +1168,14 @@ class AdmitMixin:
         try:
             if self._abandoned(ts):
                 return
-            if ts.public_export_next_retry_at and not ts.indexer_next_retry_at:
-                ts.public_export_next_retry_at = dt.datetime.now(dt.UTC) + dt.timedelta(
-                    seconds=_public_interval
-                )
-            else:
-                ts.indexer_next_retry_at = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=_interval)
+            _public = bool(ts.public_export_next_retry_at and not ts.indexer_next_retry_at)
+            # Refresh only the schedule the row is already parked on.
+            self._schedule_retry(
+                ts,
+                "public" if _public else "indexer",
+                _public_interval if _public else _interval,
+                clear_other=False,
+            )
             self.store.upsert(ts)
         except Exception:
             pass
@@ -1286,13 +1314,9 @@ class AdmitMixin:
                         )
                     except (TypeError, ValueError, AttributeError):
                         _public_interval = 1800.0
-                    ts.public_export_next_retry_at = dt.datetime.now(dt.UTC) + dt.timedelta(
-                        seconds=_public_interval
-                    )
+                    self._schedule_retry(ts, "public", _public_interval, clear_other=False)
                 else:
-                    ts.indexer_next_retry_at = dt.datetime.now(dt.UTC) + dt.timedelta(
-                        seconds=_interval
-                    )
+                    self._schedule_retry(ts, "indexer", _interval, clear_other=False)
                 self.store.upsert(ts)
             except Exception:
                 pass
