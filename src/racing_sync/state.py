@@ -15,7 +15,7 @@ import re
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from pathlib import Path
 
 from .coordinator_errors import AbandonedError
@@ -232,7 +232,7 @@ class TorrentState:
     _blob: bytes = b""
 
     def to_row(self) -> dict:
-        return {
+        row = {
             "source_infohash": self.source_infohash,
             "dest_infohash": self.dest_infohash,
             "source_name": self.source_name,
@@ -292,51 +292,94 @@ class TorrentState:
             "telegram_message_id": self.telegram_message_id,
             "deleted_at": self.deleted_at.isoformat() if self.deleted_at else "",
         }
+        # Canonical schema order, and a column added to the schema without a
+        # value here raises instead of writing a partial INSERT.
+        return {name: row[name] for name in TORRENT_STATE_COLUMNS}
 
 
-SCHEMA_TABLES = """
-CREATE TABLE IF NOT EXISTS torrent_state (
-    source_infohash          TEXT PRIMARY KEY,
-    dest_infohash            TEXT NOT NULL DEFAULT '',
-    source_name              TEXT NOT NULL DEFAULT '',
-    source_tracker           TEXT NOT NULL DEFAULT '',
-    source_announce_url      TEXT NOT NULL DEFAULT '',
-    classification_kind      TEXT NOT NULL DEFAULT 'unknown',
-    total_bytes              INTEGER NOT NULL DEFAULT 0,
-    save_path                TEXT NOT NULL DEFAULT '',
-    cross_seed_infohash      TEXT NOT NULL DEFAULT '',
-    cross_seed_source        TEXT NOT NULL DEFAULT '',
-    cross_seed_blob          BLOB NOT NULL DEFAULT '',
-    injected_private_hashes  TEXT NOT NULL DEFAULT '',
-    indexer_first_queried_at TEXT NOT NULL DEFAULT '',
-    indexer_next_retry_at    TEXT NOT NULL DEFAULT '',
-    indexer_attempts         INTEGER NOT NULL DEFAULT 0,
-    public_export_first_attempted_at TEXT NOT NULL DEFAULT '',
-    public_export_next_retry_at      TEXT NOT NULL DEFAULT '',
-    public_export_attempts           INTEGER NOT NULL DEFAULT 0,
-    fuse_verified            INTEGER NOT NULL DEFAULT 0,
-    force_direct             INTEGER NOT NULL DEFAULT 0,
-    skipped                  INTEGER NOT NULL DEFAULT 0,
-    readd_first_attempted_at  TEXT NOT NULL DEFAULT '',
-    readd_next_retry_at       TEXT NOT NULL DEFAULT '',
-    readd_attempts            INTEGER NOT NULL DEFAULT 0,
-    failed_retries           INTEGER NOT NULL DEFAULT 0,
-    completed_at             TEXT NOT NULL DEFAULT '',
-    vps1_last_activity_at    TEXT NOT NULL DEFAULT '',
-    state                    TEXT NOT NULL,
-    move_stage               TEXT NOT NULL DEFAULT '',
-    move_plan                TEXT NOT NULL DEFAULT '',
-    batch_index              INTEGER NOT NULL DEFAULT 0,
-    batches_total            INTEGER NOT NULL DEFAULT 0,
-    batch_cap_bytes          INTEGER NOT NULL DEFAULT 0,
-    readd_cycles             INTEGER NOT NULL DEFAULT 0,
-    version                  INTEGER NOT NULL DEFAULT 0,
-    last_error               TEXT NOT NULL DEFAULT '',
-    telegram_message_id      INTEGER NOT NULL DEFAULT 0,
-    created_at               TEXT NOT NULL,
-    updated_at               TEXT NOT NULL,
-    deleted_at               TEXT NOT NULL DEFAULT ''
-);
+# --------------------------------------------------------------------------- #
+# Schema: one source of truth
+# --------------------------------------------------------------------------- #
+
+# Every torrent_state column in table order: (name, type/defaults). The
+# CREATE TABLE text, the blob-less SELECT projection, to_row()'s column set
+# and the upgrade path all derive from this tuple, so the schema and the
+# column lists cannot drift apart. New columns go here (and in to_row /
+# _row_to_state); the module-level check below refuses an inconsistent pair.
+_TORRENT_STATE_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
+    ("source_infohash", "TEXT PRIMARY KEY"),
+    ("dest_infohash", "TEXT NOT NULL DEFAULT ''"),
+    ("source_name", "TEXT NOT NULL DEFAULT ''"),
+    ("source_tracker", "TEXT NOT NULL DEFAULT ''"),
+    ("source_announce_url", "TEXT NOT NULL DEFAULT ''"),
+    ("classification_kind", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ("total_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ("save_path", "TEXT NOT NULL DEFAULT ''"),
+    ("cross_seed_infohash", "TEXT NOT NULL DEFAULT ''"),
+    ("cross_seed_source", "TEXT NOT NULL DEFAULT ''"),
+    ("cross_seed_blob", "BLOB NOT NULL DEFAULT ''"),
+    ("injected_private_hashes", "TEXT NOT NULL DEFAULT ''"),
+    ("indexer_first_queried_at", "TEXT NOT NULL DEFAULT ''"),
+    ("indexer_next_retry_at", "TEXT NOT NULL DEFAULT ''"),
+    ("indexer_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("public_export_first_attempted_at", "TEXT NOT NULL DEFAULT ''"),
+    ("public_export_next_retry_at", "TEXT NOT NULL DEFAULT ''"),
+    ("public_export_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("fuse_verified", "INTEGER NOT NULL DEFAULT 0"),
+    ("force_direct", "INTEGER NOT NULL DEFAULT 0"),
+    ("skipped", "INTEGER NOT NULL DEFAULT 0"),
+    ("readd_first_attempted_at", "TEXT NOT NULL DEFAULT ''"),
+    ("readd_next_retry_at", "TEXT NOT NULL DEFAULT ''"),
+    ("readd_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("failed_retries", "INTEGER NOT NULL DEFAULT 0"),
+    ("completed_at", "TEXT NOT NULL DEFAULT ''"),
+    ("vps1_last_activity_at", "TEXT NOT NULL DEFAULT ''"),
+    ("state", "TEXT NOT NULL"),
+    ("move_stage", "TEXT NOT NULL DEFAULT ''"),
+    ("move_plan", "TEXT NOT NULL DEFAULT ''"),
+    ("batch_index", "INTEGER NOT NULL DEFAULT 0"),
+    ("batches_total", "INTEGER NOT NULL DEFAULT 0"),
+    ("batch_cap_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ("readd_cycles", "INTEGER NOT NULL DEFAULT 0"),
+    ("version", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_error", "TEXT NOT NULL DEFAULT ''"),
+    ("telegram_message_id", "INTEGER NOT NULL DEFAULT 0"),
+    ("created_at", "TEXT NOT NULL"),
+    ("updated_at", "TEXT NOT NULL"),
+    ("deleted_at", "TEXT NOT NULL DEFAULT ''"),
+)
+
+TORRENT_STATE_COLUMNS: tuple[str, ...] = tuple(name for name, _ddl in _TORRENT_STATE_COLUMN_SPECS)
+
+# Projection without the blob for get/list paths that never need the bytes.
+_TORRENT_STATE_COLUMNS_NO_BLOB = ", ".join(
+    "'' AS cross_seed_blob" if name == "cross_seed_blob" else name for name in TORRENT_STATE_COLUMNS
+)
+
+#: Bumped whenever a column spec or a data migration changes. Recorded in
+#: `meta` so an upgraded or downgraded DB shows up in the log; the column
+#: diff at open is the actual migration mechanism.
+_SCHEMA_VERSION = 2
+
+#: Persisted TorrentState fields: everything except the transient blob copy.
+_PERSISTED_FIELDS = frozenset(f.name for f in dataclass_fields(TorrentState)) - {"_blob"}
+
+if _PERSISTED_FIELDS != frozenset(TORRENT_STATE_COLUMNS):
+    raise RuntimeError(
+        "torrent_state schema drift: fields without a column "
+        f"{sorted(_PERSISTED_FIELDS - frozenset(TORRENT_STATE_COLUMNS))}; columns "
+        f"without a field {sorted(frozenset(TORRENT_STATE_COLUMNS) - _PERSISTED_FIELDS)}"
+    )
+
+
+def _create_torrent_state_sql() -> str:
+    body = ",\n    ".join(f"{name} {ddl}" for name, ddl in _TORRENT_STATE_COLUMN_SPECS)
+    return f"CREATE TABLE IF NOT EXISTS torrent_state (\n    {body}\n);"
+
+
+SCHEMA_TABLES = (
+    _create_torrent_state_sql()
+    + """
 
 CREATE TABLE IF NOT EXISTS run_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -357,6 +400,7 @@ CREATE TABLE IF NOT EXISTS ignored_torrents (
     created_at      TEXT NOT NULL DEFAULT ''
 );
 """
+)
 
 SCHEMA_INDEXES = """
 CREATE INDEX IF NOT EXISTS ix_state ON torrent_state(state);
@@ -375,18 +419,6 @@ CREATE INDEX IF NOT EXISTS ix_active_updated ON torrent_state(updated_at)
 # migrations, then SCHEMA_INDEXES, because some indexes reference columns
 # that only the migrations add to pre-1.0.0 tables.
 SCHEMA = SCHEMA_TABLES + SCHEMA_INDEXES
-
-
-_TORRENT_STATE_COLUMNS_NO_BLOB = (
-    "source_infohash, dest_infohash, source_name, source_tracker, source_announce_url, "
-    "classification_kind, total_bytes, save_path, cross_seed_infohash, cross_seed_source, "
-    "'' AS cross_seed_blob, injected_private_hashes, indexer_first_queried_at, "
-    "indexer_next_retry_at, indexer_attempts, force_direct, skipped, readd_first_attempted_at, "
-    "readd_next_retry_at, readd_attempts, failed_retries, completed_at, "
-    "vps1_last_activity_at, fuse_verified, public_export_first_attempted_at, "
-    "public_export_next_retry_at, public_export_attempts, state, move_stage, move_plan, batch_index, batches_total, batch_cap_bytes, readd_cycles, version, "
-    "last_error, created_at, updated_at, telegram_message_id, deleted_at"
-)
 
 
 # Forget-tombstone lifetime: stamped rows stay invisible/refusing for a
@@ -458,42 +490,34 @@ class StateStore:
         except Exception:
             pass
         self._conn.executescript(SCHEMA_TABLES)
-        # Columns added after 1.0.0: existing DBs predate them. CREATE TABLE
-        # IF NOT EXISTS never backfills, so migrate idempotently here.
-        # _row_to_state tolerates missing columns on read, but upsert INSERTs
-        # every column and would OperationalError on an old DB.
+        # Upgrade path: diff the one column spec against the live table.
+        # CREATE TABLE IF NOT EXISTS never backfills, so a pre-1.0.0 DB is
+        # missing every column added since; _row_to_state tolerates that on
+        # read, but upsert INSERTs every column and would OperationalError.
         # This MUST run before SCHEMA_INDEXES: ix_public_export_retry and
-        # ix_active_updated reference columns that only the ALTERs add, so
-        # indexing a pre-1.0.0 DB first raises "no such column" and the
-        # daemon cannot start.
-        for _ddl in (
-            "ADD COLUMN force_direct INTEGER NOT NULL DEFAULT 0",
-            "ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0",
-            "ADD COLUMN readd_first_attempted_at TEXT NOT NULL DEFAULT ''",
-            "ADD COLUMN readd_next_retry_at TEXT NOT NULL DEFAULT ''",
-            "ADD COLUMN readd_attempts INTEGER NOT NULL DEFAULT 0",
-            "ADD COLUMN failed_retries INTEGER NOT NULL DEFAULT 0",
-            "ADD COLUMN completed_at TEXT NOT NULL DEFAULT ''",
-            "ADD COLUMN vps1_last_activity_at TEXT NOT NULL DEFAULT ''",
-            "ADD COLUMN batch_cap_bytes INTEGER NOT NULL DEFAULT 0",
-            "ADD COLUMN readd_cycles INTEGER NOT NULL DEFAULT 0",
-            "ADD COLUMN telegram_message_id INTEGER NOT NULL DEFAULT 0",
-            "ADD COLUMN deleted_at TEXT NOT NULL DEFAULT ''",
-            "ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
-            "ADD COLUMN fuse_verified INTEGER NOT NULL DEFAULT 0",
-            "ADD COLUMN public_export_first_attempted_at TEXT NOT NULL DEFAULT ''",
-            "ADD COLUMN public_export_next_retry_at TEXT NOT NULL DEFAULT ''",
-            "ADD COLUMN public_export_attempts INTEGER NOT NULL DEFAULT 0",
-            "ADD COLUMN move_stage TEXT NOT NULL DEFAULT ''",
-            "ADD COLUMN move_plan TEXT NOT NULL DEFAULT ''",
-        ):
+        # ix_active_updated reference migrated columns, so indexing a
+        # pre-1.0.0 DB first raises "no such column" and the daemon cannot
+        # start (B1).
+        try:
+            _have = {
+                _r[1] for _r in self._conn.execute("PRAGMA table_info(torrent_state)").fetchall()
+            }
+        except Exception as e:  # noqa: BLE001
+            _have = set()
+            log.warning("state DB: could not read torrent_state columns: %s", e)
+        for _name, _ddl in _TORRENT_STATE_COLUMN_SPECS:
+            # A PRIMARY KEY column cannot be added by ALTER; only legacy
+            # upgrades of non-key columns exist.
+            if _name in _have or "PRIMARY KEY" in _ddl.upper():
+                continue
             try:
-                self._conn.execute(f"ALTER TABLE torrent_state {_ddl}")
+                self._conn.execute(f"ALTER TABLE torrent_state ADD COLUMN {_name} {_ddl}")
             except Exception as e:
-                # Duplicate-column is the expected rerun path; anything
-                # else (readonly, full-disk, corrupt) must be loud.
+                # Duplicate-column is the expected rerun path (the diff above
+                # already handles it); anything else (readonly, full-disk,
+                # corrupt) must be loud.
                 if "duplicate column" not in str(e).lower():
-                    log.warning("state DB migration %r failed: %s", _ddl, e)
+                    log.warning("state DB migration %r failed: %s", _name, e)
         # Indexes last: they need every migrated column above. Existing DBs
         # may also be missing an index whose columns only just appeared.
         self._conn.executescript(SCHEMA_INDEXES)
@@ -530,6 +554,30 @@ class StateStore:
             _normed = 0
         if _normed:
             log.warning("state DB: normalized %d legacy NULL deleted_at row(s) to ''", _normed)
+        # Schema version marker: the column diff above is the migration
+        # mechanism, but an operator (or a future fenced migration) needs to
+        # see which schema this file was last opened with. A missing marker
+        # is a pre-versioning DB that just got upgraded; a different one is
+        # worth a line in the log in either direction.
+        try:
+            _stored = self.get_meta("schema_version")
+            if _stored is None:
+                self.set_meta("schema_version", str(_SCHEMA_VERSION))
+            else:
+                try:
+                    _stored_i = int(_stored)
+                except (TypeError, ValueError):
+                    _stored_i = -1
+                if _stored_i != _SCHEMA_VERSION:
+                    log.warning(
+                        "state DB schema_version %s != %d from this build; "
+                        "applied the current column set",
+                        _stored,
+                        _SCHEMA_VERSION,
+                    )
+                    self.set_meta("schema_version", str(_SCHEMA_VERSION))
+        except Exception:
+            pass
 
     def _ensure_open(self) -> None:
         if self._closed:

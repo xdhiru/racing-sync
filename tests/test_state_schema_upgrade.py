@@ -89,6 +89,11 @@ def test_state_store_upgrades_pre_1_0_0_db(tmp_path: Path):
         columns = {
             row[1] for row in store._conn.execute("PRAGMA table_info(torrent_state)").fetchall()
         }
+        # The upgrade diff is derived from the one column spec: a legacy DB
+        # must end up with exactly that set, no additions or omissions.
+        from racing_sync.state import _SCHEMA_VERSION, TORRENT_STATE_COLUMNS
+
+        assert columns == set(TORRENT_STATE_COLUMNS)
         assert {
             "deleted_at",
             "public_export_first_attempted_at",
@@ -98,6 +103,7 @@ def test_state_store_upgrades_pre_1_0_0_db(tmp_path: Path):
             "move_plan",
             "version",
         } <= columns
+        assert store.get_meta("schema_version") == str(_SCHEMA_VERSION)
 
         # The legacy row survived the migration and is readable/writable
         # (deleted_at backfilled to '').
@@ -131,5 +137,67 @@ def test_state_store_upgrades_pre_1_0_0_db(tmp_path: Path):
         # And the migrated table participates in tombstone reads/writes.
         assert store.tombstone(NEW_HASH) is True
         assert store.get(NEW_HASH) is None
+    finally:
+        store.close()
+
+
+def test_schema_spec_is_the_single_source_of_truth():
+    """Columns, projection, to_row and dataclass fields come from one tuple."""
+    from dataclasses import fields
+
+    from racing_sync.state import (
+        _TORRENT_STATE_COLUMN_SPECS,
+        _TORRENT_STATE_COLUMNS_NO_BLOB,
+        TORRENT_STATE_COLUMNS,
+        TorrentState,
+    )
+
+    names = tuple(name for name, _ddl in _TORRENT_STATE_COLUMN_SPECS)
+    assert names == TORRENT_STATE_COLUMNS
+    assert len(set(names)) == len(names)
+
+    persisted = {f.name for f in fields(TorrentState)} - {"_blob"}
+    assert persisted == set(TORRENT_STATE_COLUMNS)
+
+    row = TorrentState(source_infohash="a" * 40).to_row()
+    assert tuple(row) == TORRENT_STATE_COLUMNS
+
+    projection = [part.strip() for part in _TORRENT_STATE_COLUMNS_NO_BLOB.split(",")]
+    assert len(projection) == len(TORRENT_STATE_COLUMNS)
+    assert "'' AS cross_seed_blob" in projection
+    assert set(projection) - {"'' AS cross_seed_blob"} == set(TORRENT_STATE_COLUMNS) - {
+        "cross_seed_blob"
+    }
+
+
+def test_fresh_schema_columns_match_the_spec_order(tmp_path: Path):
+    from racing_sync.state import TORRENT_STATE_COLUMNS, StateStore
+
+    store = StateStore(tmp_path / "fresh.db")
+    try:
+        cols = [r[1] for r in store._conn.execute("PRAGMA table_info(torrent_state)").fetchall()]
+        assert tuple(cols) == TORRENT_STATE_COLUMNS
+    finally:
+        store.close()
+
+
+def test_schema_version_recorded_and_foreign_versions_rewritten(tmp_path: Path, caplog):
+    import logging
+
+    from racing_sync.state import _SCHEMA_VERSION, StateStore
+
+    db = tmp_path / "versioned.db"
+    store = StateStore(db)
+    try:
+        assert store.get_meta("schema_version") == str(_SCHEMA_VERSION)
+        store.set_meta("schema_version", "999")
+    finally:
+        store.close()
+
+    with caplog.at_level(logging.WARNING):
+        store = StateStore(db)
+    try:
+        assert store.get_meta("schema_version") == str(_SCHEMA_VERSION)
+        assert "schema_version" in caplog.text
     finally:
         store.close()

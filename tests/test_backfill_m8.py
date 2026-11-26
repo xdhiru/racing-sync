@@ -47,8 +47,9 @@ def test_null_deleted_at_normalized_on_open(tmp_path: Path):
 
     db = tmp_path / "legacy.db"
     now = dt.datetime.now(dt.UTC).isoformat()
-    legacy_schema = SCHEMA_TABLES.replace(
-        "deleted_at               TEXT NOT NULL DEFAULT ''", "deleted_at               TEXT"
+    legacy_schema = "\n".join(
+        "deleted_at TEXT" if ln.strip().startswith("deleted_at ") else ln
+        for ln in SCHEMA_TABLES.splitlines()
     )
     assert legacy_schema != SCHEMA_TABLES
     conn = sqlite3.connect(str(db), isolation_level=None)
