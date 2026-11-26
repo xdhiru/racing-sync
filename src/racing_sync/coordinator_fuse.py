@@ -534,55 +534,17 @@ class FuseMixin:
             pass
 
     def _late_seed_sweep(self) -> None:
-        """Bound the late-seed failure map + healthy/outage memos (TTL + cap).
+        """Bound the late-seed failure map + healthy/outage memos.
 
-        Called at the top of every late-seed check; cheap fast path unless a
-        map grew large. Each map prunes on its own size — one staying small
-        must not keep another from shedding expired keys (the outage map
-        used to be pruned only when the failure map grew). Restart-wiped
-        maps simply re-warm (thundering herd bounded by one full scan per
-        DONE row, then memoized).
+        TTL + cap hygiene now lives in one shared sweep
+        (`Coordinator._sweep_runtime_maps`); this keeps the call-site name
+        the late-seed path uses. Restart-wiped maps simply re-warm
+        (thundering herd bounded by one full scan per DONE row, then
+        memoized).
         """
-        try:
-            d = getattr(self, "_fuse_healthy_until", None)
-            if isinstance(d, dict) and len(d) > 2000:
-                now_m = time.monotonic()
-                for k in list(d.keys()):
-                    try:
-                        if now_m >= float(d[k]):
-                            d.pop(k, None)
-                    except Exception:
-                        d.pop(k, None)
-                if len(d) > 5000:
-                    for k in list(d.keys())[: len(d) - 5000]:
-                        d.pop(k, None)
-            fm = getattr(self, "_failed_late_cross_seeds", None)
-            if isinstance(fm, dict) and len(fm) > 2000:
-                try:
-                    cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=30)
-                except Exception:
-                    cutoff = None
-                if cutoff is not None:
-                    for k in list(fm.keys()):
-                        try:
-                            if fm[k] < cutoff:
-                                fm.pop(k, None)
-                        except Exception:
-                            fm.pop(k, None)
-                if len(fm) > 5000:
-                    for k in list(fm.keys())[: len(fm) - 5000]:
-                        fm.pop(k, None)
-            ou = getattr(self, "_fuse_outage_until", None)
-            if isinstance(ou, dict) and len(ou) > 2000:
-                now_m = time.monotonic()
-                for k in list(ou.keys()):
-                    try:
-                        if now_m >= float(ou[k]):
-                            ou.pop(k, None)
-                    except Exception:
-                        ou.pop(k, None)
-        except Exception:
-            pass
+        sweep = getattr(self, "_sweep_runtime_maps", None)
+        if callable(sweep):
+            sweep()
 
     def _late_seed_memoize(
         self,

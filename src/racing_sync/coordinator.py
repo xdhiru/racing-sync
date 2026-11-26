@@ -258,6 +258,14 @@ _SOURCE_STALE_EXPIRY_S = 300.0
 # Worker-stop join budget: cancel() cannot interrupt a to_thread body.
 _STOP_WORKERS_TIMEOUT_S = 30.0
 
+# In-memory bookkeeping hygiene (I15): one shared sweep prunes expired TTL
+# entries and caps hash-keyed maps. Throttled because the scheduler calls
+# it every pass; maps are small in normal operation, so the walk is cheap.
+_MAP_SWEEP_THROTTLE_S = 60.0
+_MAP_ENTRY_CAP = 5000
+#: Late-seed failure deferrals older than this are dead weight.
+_LATE_SEED_FAILURE_WINDOW = dt.timedelta(minutes=30)
+
 
 async def _start_with_backoff(
     label: str,
@@ -1506,6 +1514,83 @@ class Coordinator(
         except Exception:
             pass
 
+    def _sweep_runtime_maps(self) -> None:
+        """Prune expired TTL memos and cap hash-keyed maps. Never raises.
+
+        One sweep for every in-memory bookkeeping map: TTL maps drop
+        expired entries even while small (a stale memo is never useful
+        again, and a forgotten/cancelled row never gets to pop its own
+        key), while hash-keyed maps shed their oldest entries past the cap
+        (dict insertion order). Restart-wiped maps simply re-warm.
+        """
+        try:
+            _now_m = time.monotonic()
+            _last = float(getattr(self, "_map_sweep_at", 0.0) or 0.0)
+            if _now_m - _last < _MAP_SWEEP_THROTTLE_S:
+                return
+            self._map_sweep_at = _now_m
+        except Exception:
+            pass
+
+        def _prune_expired(attr: str) -> None:
+            try:
+                m = getattr(self, attr, None)
+                if not isinstance(m, dict) or not m:
+                    return
+                for _k in list(m.keys()):
+                    try:
+                        if _now_m >= float(m[_k]):
+                            m.pop(_k, None)
+                    except Exception:
+                        m.pop(_k, None)
+            except Exception:
+                pass
+
+        for _attr in (
+            "_fuse_outage_until",
+            "_fuse_healthy_until",
+            "_waiting_disk_next_check",
+            "_supplement_ok_at",
+        ):
+            _prune_expired(_attr)
+
+        try:
+            _fm = getattr(self, "_failed_late_cross_seeds", None)
+            if isinstance(_fm, dict) and _fm:
+                _cutoff = dt.datetime.now(dt.UTC) - _LATE_SEED_FAILURE_WINDOW
+                for _k in list(_fm.keys()):
+                    try:
+                        if _fm[_k] < _cutoff:
+                            _fm.pop(_k, None)
+                    except Exception:
+                        _fm.pop(_k, None)
+        except Exception:
+            pass
+
+        for _attr in (
+            "_fuse_outage_until",
+            "_fuse_healthy_until",
+            "_waiting_disk_next_check",
+            "_supplement_ok_at",
+            "_failed_late_cross_seeds",
+            "_moving_parks",
+            "_moving_tree",
+            "_moving_progress_bytes",
+            "_readd_heal_track",
+            "_state_budget_hits",
+            "_dl_stall_parks",
+            "_dl_file_drift",
+            "_grace_exempt",
+            "_last_grace_search",
+        ):
+            try:
+                _m = getattr(self, _attr, None)
+                if isinstance(_m, dict) and len(_m) > _MAP_ENTRY_CAP:
+                    for _k in list(_m.keys())[: len(_m) - _MAP_ENTRY_CAP]:
+                        _m.pop(_k, None)
+            except Exception:
+                continue
+
     async def _poll_source_racing(self, src_torrents: list[Torrent]) -> list[TorrentState]:
         """Step 2: group source torrents by release and ingest/track each group.
 
@@ -1827,6 +1912,13 @@ class Coordinator(
         loop or API ops cannot double-schedule or clobber rows.
         """
         log.debug("scheduler: enter")
+        # One place bounds every in-memory bookkeeping map (I15): the
+        # scheduler pass is the natural heartbeat, and the sweep throttles
+        # itself so the walk stays cheap.
+        try:
+            self._sweep_runtime_maps()
+        except Exception:
+            pass
         # A scheduling pass decides which same-content row owns the bytes.
         # Deciding from a 30s-old snapshot would miss rows created since
         # (and transitions), letting two rows admit together — drop it so
