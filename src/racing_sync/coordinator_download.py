@@ -35,13 +35,6 @@ from .io_bounds import rpc
 from .rclone_ops import RcloneTimeoutError
 from .state import State, TorrentState
 
-# Explicit test seam for the download loop: unit tests drive
-# _do_downloading with a mocked move step (or no dest client) and
-# expect the batch index to advance without any download. Production
-# must never take these branches — a missing/unusable client there is
-# a broken invariant (fail loudly), not a shortcut.
-_TESTING = False
-
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
 
@@ -525,19 +518,6 @@ class DownloadMixin:
                                 await self._ssd_adjust(ts.source_infohash, int(_rem))
                         except Exception:
                             pass
-                elif (
-                    _TESTING
-                    and hasattr(self, "_move_and_clean_batch")
-                    and hasattr(self._move_and_clean_batch, "mock_calls")
-                ):
-                    # Mock in unit test (e.g. AsyncMock)
-                    await self._move_and_clean_batch(ts, None)  # type: ignore[arg-type]
-                    ts.batch_index += 1
-                    self.store.upsert(ts)
-                elif _TESTING and not hasattr(self, "dest_client"):
-                    # Test dummy without dest_client attached
-                    ts.batch_index += 1
-                    self.store.upsert(ts)
                 else:
                     # Reachable only when re-resolution yields genuinely no
                     # batches (kind flipped single mid-run): fall through to

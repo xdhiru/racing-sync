@@ -251,14 +251,26 @@ async def test_moving_empty_episodes_raises_and_prevents_wipe(tmp_path):
 
 @pytest.mark.anyio
 async def test_do_downloading_iterates_batches():
-    from unittest.mock import AsyncMock, MagicMock, patch
+    """Production batched flow: wait+move each batch, flip between them."""
+    from unittest.mock import AsyncMock, MagicMock
 
+    from racing_sync.batcher import Batch
+    from racing_sync.classifier import Episode
     from racing_sync.state import State, TorrentState
 
     coord = make_coordinator()
     coord._stop = False
-    coord._wait_for_completion = AsyncMock()
+    coord.dest_client = AsyncMock()
+    batches = [Batch([Episode(f"Test.Show.S01E{idx:02d}.mkv", 1, idx, 1000)]) for idx in (1, 2, 3)]
+    coord._get_batches_for_torrent = AsyncMock(return_value=batches)
     coord._prepare_next_batch = AsyncMock()
+    coord._pause_verified = AsyncMock(return_value=(True, None))
+    coord._move_and_clean_batch = AsyncMock()
+    coord._flip_to_next_batch = AsyncMock(side_effect=lambda _ts, next_index: next_index)
+    coord._fuse_skipped = AsyncMock(return_value=set())
+    coord._remaining_batch_footprint = AsyncMock(return_value=None)
+    coord._ssd_adjust = AsyncMock()
+    coord._wait_for_completion = AsyncMock()
     coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
 
     ts = TorrentState(
@@ -270,14 +282,11 @@ async def test_do_downloading_iterates_batches():
         state=State.DOWNLOADING,
     )
 
-    with patch("racing_sync.coordinator_download._TESTING", True):
-        await coord._do_downloading(ts)
+    await coord._do_downloading(ts)
 
-    # _wait_for_completion called 3 times (once per batch)
     assert coord._wait_for_completion.await_count == 3
-    # Dummy path (no dest_client): no flip, no priority flips —
-    # batch_index still advances to MOVING.
-    assert coord._prepare_next_batch.await_count == 0
+    assert coord._move_and_clean_batch.await_count == 3
+    assert coord._flip_to_next_batch.await_count == 2, "only between batches, not after the last"
     assert ts.batch_index == 3
     assert ts.state == State.MOVING
     assert coord.transition.called
