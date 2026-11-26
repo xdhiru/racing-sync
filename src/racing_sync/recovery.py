@@ -175,26 +175,13 @@ def _save_path_on_ssd(cfg: AppConfig, save_path: str) -> bool:
     """True iff a client entry's save_path lives under a configured SSD root.
 
     Gates DOWNLOADING adoption of partial torrents: entries pointing anywhere
-    else (stale paths, other mounts) stay unknowns. Defensive against test
-    doubles — unresolvable roots simply yield False.
+    else (stale paths, other mounts) stay unknowns. One ownership rule with
+    the delete guards (`path_ownership.classify_save_path`), so adoption and
+    deletion can never disagree about what "local" means.
     """
-    from .coordinator_content import fold_path_case
+    from .path_ownership import PathOwner, classify_save_path
 
-    sp = fold_path_case((save_path or "").rstrip("/\\").replace("\\", "/"))
-    if not sp:
-        return False
-    roots: list[str] = []
-    for raw in (getattr(cfg.dest, "save_path", None), getattr(cfg.ssd, "path", None)):
-        # Real configs always carry str/Path here; anything else (e.g. a
-        # MagicMock in unit tests) means membership is unknowable -> False.
-        if not isinstance(raw, (str, Path)):
-            continue
-        r = fold_path_case(str(raw).rstrip("/\\").replace("\\", "/"))
-        if r:
-            roots.append(r)
-    if not roots:
-        return False
-    return any(sp == r or sp.startswith(r + "/") for r in roots)
+    return classify_save_path(cfg, save_path) is PathOwner.SSD
 
 
 def find_content_on_ssd(cfg: AppConfig, expected: list[tuple[str, int]]) -> Path | None:

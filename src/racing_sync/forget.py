@@ -23,7 +23,7 @@ import logging
 import shutil
 from pathlib import Path
 
-from .coordinator_content import fold_path_case, watch_election_winner
+from .coordinator_content import watch_election_winner
 from .rclone_ops import wipe_local_tree
 from .safety import state_db_parent_refusal, validate_safe_delete_path
 from .state import State
@@ -243,56 +243,17 @@ def _paired_waiter_identities(store, cfg, target) -> list[dict]:
     return sorted(out, key=lambda d: d["source_infohash"])
 
 
-def _fuse_mounts(cfg) -> list[str]:
-    """Normalized fuse mount prefixes (posix, no trailing slash)."""
-    out: list[str] = []
-    try:
-        fuse = getattr(getattr(cfg, "rclone", None), "fuse", None)
-        for raw in (getattr(fuse, "mount", None), getattr(fuse, "mount_unsorted", None)):
-            if raw is None or (isinstance(raw, str) and not raw.strip()):
-                continue
-            try:
-                norm = str(raw).rstrip("/\\").replace("\\", "/")
-            except Exception:
-                continue
-            if norm and norm not in out:
-                out.append(norm)
-    except Exception:
-        pass
-    return out
-
-
 def _is_fuse_save_path(cfg, save_path: str) -> bool:
-    sp = (save_path or "").rstrip("/\\").replace("\\", "/")
-    if not sp:
-        return False
-    # Resolve symlinks/.. on both sides (fail-safe direction): an
-    # SSD-looking path that resolves under a fuse mount must still count
-    # as fuse (delete_files=False), or a symlinked save_path bypasses the
-    # protection and deletes remote data.
-    candidates = {sp}
-    try:
-        candidates.add(str(Path(sp).resolve()).replace("\\", "/"))
-    except OSError:
-        pass
-    for fm in _fuse_mounts(cfg):
-        if not fm:
-            continue
-        fm_cands = {fm}
-        try:
-            fm_cands.add(str(Path(fm).resolve()).replace("\\", "/"))
-        except OSError:
-            pass
-        for cand in candidates:
-            # OS-aware fold: on Windows `G:/Fuse` and `g:/fuse` are the same
-            # directory, and a miss here classifies a fuse entry as local
-            # SSD — then delete_files=True deletes remote data via the mount.
-            _cand = fold_path_case(cand)
-            for base in fm_cands:
-                _base = fold_path_case(base)
-                if _cand == _base or _cand.startswith(_base + "/"):
-                    return True
-    return False
+    """True when a save_path lives under a fuse mount (never delete there).
+
+    Delegates to the shared ownership rule with symlink resolution on:
+    an SSD-looking path that resolves into the mount must still count as
+    fuse, or a symlinked save_path bypasses the protection and deletes
+    remote data.
+    """
+    from .path_ownership import PathOwner, classify_save_path
+
+    return classify_save_path(cfg, save_path, resolve_links=True) is PathOwner.FUSE
 
 
 async def _forget_one(

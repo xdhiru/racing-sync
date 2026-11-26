@@ -1160,15 +1160,14 @@ class FuseMixin:
         return out
 
     def _save_path_is_on_fuse(self, save_path: object) -> bool:
-        """True iff a client save_path points at a configured fuse mount."""
-        if not isinstance(save_path, str) or not save_path:
-            return False
-        sp = fold_path_case(save_path.rstrip("/\\").replace("\\", "/"))
-        for fm in self._fuse_mount_strs():
-            fm_folded = fold_path_case(fm)
-            if sp == fm_folded or (fm_folded and sp.startswith(fm_folded + "/")):
-                return True
-        return False
+        """True iff a client save_path points at a configured fuse mount.
+
+        Delegates to the shared ownership rule (I7): the delete guards and
+        the adoption path must agree about what "on fuse" means.
+        """
+        from .path_ownership import PathOwner, classify_save_path
+
+        return classify_save_path(getattr(self, "cfg", None), save_path) is PathOwner.FUSE
 
     def _classify_blob_kind(self, blob: bytes | None) -> str:
         """Classify .torrent bytes; "unknown" when undecodable or cfg broken.
