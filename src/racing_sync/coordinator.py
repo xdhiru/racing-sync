@@ -150,6 +150,29 @@ _SCHED_STATE_PRIORITY = {
 # Bounds intake bursts without letting long downloads/moves starve them.
 _MISC_WORKER_BUDGET = 12
 
+# Per-state worker-pass budget (seconds): how long ONE handler invocation
+# may run before it is cancelled and retried on the next tick. Without it a
+# wedged pass pins its worker slot (and any semaphore it holds) until the
+# 24h max-age backstop; cancelling releases both. Values stay generous so
+# slow-but-alive work is never interrupted: the picker alone caps a NEW
+# pass at 5 min, and every RPC underneath is timeout-bounded. DOWNLOADING
+# and MOVING are exempt because their handlers own per-poll deadlines
+# (stall/flush/check windows, rclone move_timeout_seconds) and a healthy
+# download or move legitimately runs for hours.
+_STATE_WORK_BUDGET_S: dict[State, float | None] = {
+    State.NEW: 3600.0,
+    State.WAITING_INDEXER: 3600.0,
+    State.WAITING_DISK: 1800.0,
+    State.QUEUED: 3600.0,
+    State.RE_ADDING: 3600.0,
+    State.DOWNLOADING: None,
+    State.MOVING: None,
+}
+
+# Consecutive over-budget passes (same state, same row) before the row is
+# failed for inspection instead of retried forever.
+_MAX_STATE_BUDGET_HITS = 3
+
 
 def _sched_priority(ts) -> tuple[int, dt.datetime]:
     """Worker-scheduling order key (lower first, then oldest first).
@@ -409,6 +432,10 @@ class Coordinator(
     # tracker_map cross-seeds are opportunistic (VPS1 late arrivals are
     # still checked every tick); one Prowlarr round per row per window.
     _supplement_ok_at: dict[str, float] = field(default_factory=dict, init=False)
+    # Worker-pass budget hits: infohash.lower() -> (state, consecutive hits).
+    # A pass that overruns its state's budget is cancelled and retried; a
+    # row that keeps doing so fails for inspection instead of pinning a slot.
+    _state_budget_hits: dict[str, tuple[State, int]] = field(default_factory=dict, init=False)
 
     @property
     def download_sem(self) -> asyncio.Semaphore:
@@ -2740,7 +2767,7 @@ class Coordinator(
         except Exception:
             _entry_state = None
         if ts.state == State.NEW:
-            await self._do_new(ts)
+            await self._run_state_step(ts, self._do_new, ts)
         if ts.state == State.WAITING_INDEXER and _entry_state in (State.WAITING_INDEXER,):
             # Refactor: timer-elapsed WAITING_INDEXER rows work directly.
             # The retired QUERYING hop is gone (see state.py migration);
@@ -2748,12 +2775,12 @@ class Coordinator(
             # without an intermediate transition. Entry-state guard
             # prevents same-tick fallthrough (NEW that just parked must
             # wait out its timer).
-            await self._do_waiting_indexer(ts)
+            await self._run_state_step(ts, self._do_waiting_indexer, ts)
         if ts.state == State.WAITING_DISK and _entry_state == State.WAITING_DISK:
             # Entry-state guard like WAITING_INDEXER: a row that parked
             # itself in this pass (NEW -> WAITING_DISK) must wait out its
             # quiet timer instead of re-checking the ledger immediately.
-            await self._wait_disk_then_queue(ts)
+            await self._run_state_step(ts, self._wait_disk_then_queue, ts)
         if ts.state == State.QUEUED:
             # download_sem guards QUEUED admission only (_do_queued is
             # short: add + prioritize). The multi-hour _do_downloading
@@ -2761,21 +2788,124 @@ class Coordinator(
             # _do_queued releases the slot itself around fuse re-injects
             # (minutes of non-download RPCs) via _holds_download_slot.
             async with self.download_sem:
-                await self._do_queued(ts, _holds_download_slot=True)
+                await self._run_state_step(ts, self._do_queued, ts, _holds_download_slot=True)
             if ts.state == State.DOWNLOADING:
-                await self._do_downloading(ts)
+                await self._run_state_step(ts, self._do_downloading, ts)
         elif ts.state == State.DOWNLOADING:
-            await self._do_downloading(ts)
+            await self._run_state_step(ts, self._do_downloading, ts)
         if ts.state == State.MOVING:
             try:
-                await self._do_moving(ts)
+                await self._run_state_step(ts, self._do_moving, ts)
             except RcloneTimeoutError as e:
                 # Hung remote (flood-wait pileup, stalled uplink): bytes are
                 # intact on SSD, slots freed — park for next tick, never fail.
                 self._park_moving(ts, f"rclone move timed out: {e}")
                 return
         if ts.state == State.RE_ADDING:
-            await self._do_re_add(ts)
+            await self._run_state_step(ts, self._do_re_add, ts)
+
+    async def _run_state_step(self, ts: TorrentState, fn, *args, **kwargs) -> None:
+        """Run one state handler under the per-state dwell budget.
+
+        The budget is captured from the row's state at entry, and every
+        handler call is wrapped separately so a QUEUED pass that promotes
+        itself to DOWNLOADING is not charged the queue budget while it
+        waits hours for bytes. On expiry the handler is cancelled — the
+        same unwinding path shutdown/forget already use — so its worker
+        slot and any semaphore are released and the next tick retries with
+        a fresh snapshot. A row that keeps overrunning fails loudly for
+        inspection (see `_note_state_budget_hit`) instead of idling until
+        the 24h max-age backstop. Re-raises a handler-raised TimeoutError
+        (file-drift/stall re-plan) unchanged: that is a park, not a wedge.
+        """
+        try:
+            state = ts.state
+        except Exception:
+            state = None
+        budget = _STATE_WORK_BUDGET_S.get(state)
+        if budget is None:
+            await fn(*args, **kwargs)
+            return
+        deadline = time.monotonic() + budget
+        try:
+            async with asyncio.timeout_at(deadline):
+                await fn(*args, **kwargs)
+        except TimeoutError:
+            if time.monotonic() < deadline:
+                raise
+            self._note_state_budget_hit(ts, state, budget)
+            return
+        try:
+            key = (ts.source_infohash or "").lower()
+            if self._state_budget_hits.pop(key, None) is None:
+                return
+        except Exception:
+            return
+        # A later pass cleared the wedge: drop the advisory text stamped by
+        # _note_state_budget_hit so the row does not keep advertising it.
+        try:
+            if str(getattr(ts, "last_error", "") or "").startswith("worker exceeded its"):
+                new_rev = self.store.update_columns(
+                    ts.source_infohash, {"last_error": ""}, expected_state=state
+                )
+                if new_rev:
+                    ts.version = new_rev
+                    ts.last_error = ""
+        except Exception:
+            pass
+
+    def _note_state_budget_hit(self, ts: TorrentState, state: State, budget: float) -> None:
+        """Log/persist one over-budget pass; fail the row after N in a row."""
+        key = (ts.source_infohash or "").lower()
+        try:
+            hits_map = self._state_budget_hits
+        except AttributeError:
+            hits_map = {}
+            self._state_budget_hits = hits_map  # type: ignore[attr-defined]
+        try:
+            prev = hits_map.get(key)
+        except Exception:
+            prev = None
+        hits = prev[1] + 1 if isinstance(prev, tuple) and prev and prev[0] == state else 1
+        try:
+            if len(hits_map) > 5000:
+                for _k in list(hits_map.keys())[: len(hits_map) - 5000]:
+                    hits_map.pop(_k, None)
+            hits_map[key] = (state, hits)
+        except Exception:
+            pass
+        msg = (
+            f"worker exceeded its {int(budget)}s budget in {state.value} "
+            f"({hits}/{_MAX_STATE_BUDGET_HITS})"
+        )
+        name = (ts.source_name or "")[:60]
+        if hits >= _MAX_STATE_BUDGET_HITS:
+            try:
+                hits_map.pop(key, None)
+            except Exception:
+                pass
+            err = f"{msg} — wedged condition, needs inspection"
+            log.error("%s for %s", msg, name)
+            try:
+                self.transition(ts, State.FAILED, error=err[:500])
+            except AbandonedError:
+                # The row moved/was forgotten while we were wedged: nothing
+                # to fail, and upserting would resurrect a deleted row.
+                log.info("worker budget: %s no longer current; not failing", key[:10])
+            except Exception as e:  # noqa: BLE001
+                log.warning("worker budget: could not fail %s: %s", key[:10], e)
+            return
+        log.warning("%s for %s; releasing the slot and retrying next tick", msg, name)
+        try:
+            new_rev = self.store.update_columns(
+                ts.source_infohash,
+                {"last_error": f"{msg}; retrying next tick"},
+                expected_state=state,
+            )
+            if new_rev:
+                ts.version = new_rev
+        except Exception:
+            pass
 
     def _wakeup_indexer_row(self, ts: TorrentState) -> None:
         """Wake one timer-elapsed WAITING_INDEXER row (step-3 loop body).
