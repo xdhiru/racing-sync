@@ -157,8 +157,15 @@ class ActionsMixin:
             if not _keep_reservation:
                 try:
                     await coord._ssd_release(_release_key)
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    # A stranded reservation shrinks the SSD budget until the
+                    # next restart: name the row instead of vanishing.
+                    log.warning(
+                        "cancel: SSD ledger release failed for %s "
+                        "(reservation stays until restart): %s",
+                        (_release_key or "")[:10],
+                        e,
+                    )
         name = str(result.get("source_name") or infohash[:10])[:50]
         # The row (and its telegram_message_id) is gone: mark its detail
         # card cancelled (best-effort) and drop the cached id so a future
@@ -183,10 +190,16 @@ class ActionsMixin:
             )
         try:
             for pair in result.get("paired_cancelled") or []:
+                _pair_h = pair.get("source_infohash") or ""
                 try:
-                    await coord._ssd_release(pair.get("source_infohash") or "")
-                except Exception:
-                    pass
+                    await coord._ssd_release(_pair_h)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "cancel: SSD ledger release failed for paired %s "
+                        "(reservation stays until restart): %s",
+                        (_pair_h or "")[:10],
+                        e,
+                    )
         except Exception:
             pass
         pairs = result.get("paired_cancelled") or []

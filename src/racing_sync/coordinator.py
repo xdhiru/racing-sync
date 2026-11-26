@@ -2655,8 +2655,19 @@ class Coordinator(
                 _rsv = getattr(self, "_ssd_reserved", None)
                 if isinstance(_rsv, dict):
                     _rsv.pop((ts.source_infohash or "").lower(), None)
-            except Exception:
-                pass
+                elif _rsv is not None:
+                    log.warning(
+                        "transition: SSD reservation map is %s, not a dict; "
+                        "reservation for %s may leak",
+                        type(_rsv).__name__,
+                        (ts.source_infohash or "")[:10],
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "transition: SSD reservation release failed for %s (budget stays held): %s",
+                    (ts.source_infohash or "")[:10],
+                    e,
+                )
         # Download admission slot: leaving QUEUED frees it (admission is
         # recorded at the QUEUED edge; every exit — DOWNLOADING, FAILED,
         # WAITING_DISK — must release, or parked rows starve).
@@ -2665,8 +2676,19 @@ class Coordinator(
                 _adm = getattr(self, "_download_admissions", None)
                 if isinstance(_adm, set):
                     _adm.discard((ts.source_infohash or "").lower())
-            except Exception:
-                pass
+                elif _adm is not None:
+                    log.warning(
+                        "transition: download-admission set is %s, not a set; "
+                        "slot for %s may stay pinned",
+                        type(_adm).__name__,
+                        (ts.source_infohash or "")[:10],
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "transition: download-admission release failed for %s (slot stays pinned): %s",
+                    (ts.source_infohash or "")[:10],
+                    e,
+                )
         # MOVING stall counter: leaving MOVING resets consecutive parks
         # (a later re-entry starts fresh). transition() also clears the
         # parked last_error via error="".

@@ -597,6 +597,57 @@ async def test_done_stale_save_path_repairs_forward_when_fuse_healthy(tmp_path: 
 
 
 @pytest.mark.anyio
+async def test_done_stale_save_path_repair_write_failure_is_loud(tmp_path: Path, caplog):
+    """A failed save_path repair must warn (hash-named), not vanish.
+
+    The in-memory repair still lets this pass inject; the row simply keeps
+    the stale path in the DB until the next tick retries the write.
+    """
+    import logging
+
+    ssd = tmp_path / "ssd"
+    fuse = tmp_path / "fuse"
+    ssd.mkdir()
+    fuse.mkdir()
+    (fuse / FNAME).write_bytes(b"D" * FSIZE)
+
+    pub_blob = _mk_blob(PUB_ANNOUNCE)
+    pub_hash = _bencoded_info_hash(pub_blob)[0].lower()
+
+    src = _FakeSource([pub_blob], [PUB_ANNOUNCE])
+    dest = _FakeDest()
+    dest.seed(pub_blob, str(fuse), "racing", progress=1.0)
+
+    store = StateStore(tmp_path / "state.db")
+    coord = _make_coord(ssd, fuse, store, src, dest)
+
+    ts = TorrentState(
+        source_infohash=pub_hash,
+        source_name=FNAME,
+        dest_infohash=pub_hash,
+        save_path=str(ssd),
+        total_bytes=FSIZE,
+        state=State.DONE,
+        cross_seed_blob=pub_blob,
+    )
+    store.upsert(ts)
+
+    def _refuse_write(_row):
+        raise RuntimeError("database is locked")
+
+    # Only the repair write is expected on this path.
+    store.upsert = _refuse_write  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING, logger="racing_sync.coordinator"):
+        await coord._check_and_inject_late_cross_seeds(store.get(pub_hash), list(src.torrents))
+
+    assert "could not persist repaired save_path" in caplog.text
+    assert pub_hash[:10] in caplog.text
+    row = store.get(pub_hash)
+    assert row.state == State.DONE, "a failed repair write must not demote"
+    assert row.save_path == str(ssd), "DB keeps the stale path until the retry"
+
+
+@pytest.mark.anyio
 async def test_re_add_success_points_save_path_at_fuse(tmp_path: Path):
     """RE_ADDING -> DONE records the fuse mount, not the SSD dir."""
     ssd = tmp_path / "ssd"

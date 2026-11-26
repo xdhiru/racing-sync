@@ -193,8 +193,14 @@ class FuseMixin:
                 ts.save_path = str(verified_mount)
                 try:
                     self.store.upsert(ts)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    # The repair is applied in memory either way, so this
+                    # pass still injects; the write is retried next tick.
+                    log.warning(
+                        "late cross-seed: could not persist repaired save_path for %s: %s",
+                        _row_key[:10],
+                        e,
+                    )
             else:
                 log.warning(
                     "late cross-seed: %s is DONE but save_path %s is not on fuse; "

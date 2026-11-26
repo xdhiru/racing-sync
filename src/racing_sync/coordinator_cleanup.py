@@ -516,8 +516,15 @@ class CleanupMixin:
                     await asyncio.to_thread(
                         self.store.set_vps1_activity, ts.source_infohash, now_utc
                     )
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    # The veto below still holds this run, but a lost stamp
+                    # makes the row look quieter to the next pass.
+                    log.warning(
+                        "cleanup: could not stamp VPS1 activity for %s "
+                        "(grace window may look stale): %s",
+                        ts.source_infohash[:10],
+                        e,
+                    )
             log.debug(
                 "cleanup: %s still active on VPS1 (%d/%d racing); keeping",
                 ts.source_name[:60],
@@ -739,8 +746,14 @@ class CleanupMixin:
                 if not dry_run:
                     await asyncio.to_thread(self.store.set_fuse_verified, ts.source_infohash, True)
                 ts.fuse_verified = 1
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                # Only the memo is lost: the verdict itself stands, and the
+                # next run re-verifies the bytes before deleting.
+                log.warning(
+                    "cleanup: could not stamp fuse_verified for %s: %s",
+                    ts.source_infohash[:10],
+                    e,
+                )
         return True
 
     async def _cleanup_heal_blob(
@@ -786,7 +799,14 @@ class CleanupMixin:
                             await asyncio.to_thread(
                                 self.store.set_blob, ts.source_infohash, bytes(blob)
                             )
-                    except Exception:
+                    except Exception as e:  # noqa: BLE001
+                        # Not persisted means the next run repeats the export;
+                        # the VPS1 copy stays until bytes are verifiable.
+                        log.warning(
+                            "cleanup: could not persist healed blob for %s: %s",
+                            ts.source_infohash[:10],
+                            e,
+                        )
                         return False
                     ts.cross_seed_blob = bytes(blob)
                     log.info(

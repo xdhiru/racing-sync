@@ -3234,6 +3234,65 @@ async def test_cancel_releases_ssd_reservation_when_forget_raises():
 
 
 @pytest.mark.anyio
+async def test_cancel_logs_ssd_release_failure(caplog):
+    """A failed ledger release strands budget: warn with the hash, keep going."""
+    import logging
+    from unittest.mock import patch
+
+    bot = _bot()
+    coord = MagicMock()
+    coord.cfg = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord._ssd_release = AsyncMock(side_effect=RuntimeError("db locked"))
+    bot._coord = coord
+    bot._store.get_telegram_message_id = MagicMock(return_value=0)
+
+    async def _ok(*_args, **_kw):
+        return {"source_infohash": "a" * 40, "source_name": "Show"}
+
+    with (
+        patch("racing_sync.forget.forget_torrent", _ok),
+        caplog.at_level(logging.WARNING, logger="racing_sync.telegram_bot"),
+    ):
+        res = await bot._execute_cancel_one("a" * 40, delete_files=True)
+
+    assert "Cancelled Show" in res
+    assert "SSD ledger release failed" in caplog.text
+    assert "aaaaaaaaaa" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_cancel_logs_paired_ssd_release_failure(caplog):
+    """The paired (waiting) copy's release failure must be named too."""
+    import logging
+    from unittest.mock import patch
+
+    bot = _bot()
+    coord = MagicMock()
+    coord.cfg = MagicMock()
+    coord.dest_client = AsyncMock()
+    coord._ssd_release = AsyncMock(side_effect=RuntimeError("db locked"))
+    bot._coord = coord
+    bot._store.get_telegram_message_id = MagicMock(return_value=0)
+
+    async def _ok(*_args, **_kw):
+        return {
+            "source_infohash": "a" * 40,
+            "source_name": "Show",
+            "paired_cancelled": [{"source_infohash": "b" * 40, "source_name": "Show Pair"}],
+        }
+
+    with (
+        patch("racing_sync.forget.forget_torrent", _ok),
+        caplog.at_level(logging.WARNING, logger="racing_sync.telegram_bot"),
+    ):
+        res = await bot._execute_cancel_one("a" * 40, delete_files=True)
+
+    assert "Cancelled Show" in res
+    assert "SSD ledger release failed for paired bbbbbbbbbb" in caplog.text
+
+
+@pytest.mark.anyio
 async def test_cancel_keeps_reservation_when_the_row_survives():
     """A forget that kept the row still describes bytes on the SSD."""
     bot = _bot()
