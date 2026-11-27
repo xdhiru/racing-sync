@@ -91,7 +91,9 @@ class DownloadMixin:
                     "could not resolve batches for adopted %s; retry next tick",
                     ts.source_infohash[:10],
                 )
-                self.store.upsert(ts)
+                self._park_row(
+                    ts, "batch resolution unavailable for adopted row; retry next tick", level=None
+                )
                 return
             ts.batches_total = len(batches)
             # Clamp a stale index (e.g. file list shrank since the cursors
@@ -127,7 +129,7 @@ class DownloadMixin:
                     ts.source_infohash[:10],
                     e,
                 )
-                self.store.upsert(ts)
+                self._park_row(ts, f"first batch not prioritizable: {e}", level=None)
                 return
             try:
                 await self.dest_client.resume(h)
@@ -141,8 +143,9 @@ class DownloadMixin:
             # the row DOWNLOADING for the next tick, no state churn.
             try:
                 if await self._park_queued_for_download_slot(ts):
-                    self.store.upsert(ts)
-                    self._live.pop(h.lower(), None)
+                    self._park_row(
+                        ts, "download slot unavailable; retry next tick", live_key=h, level=None
+                    )
                     return
             except Exception:
                 pass
@@ -252,8 +255,12 @@ class DownloadMixin:
                         log.warning(
                             "batch resolution unavailable for %s; retry next tick", ts.source_name
                         )
-                        self.store.upsert(ts)
-                        self._live.pop(h.lower(), None)
+                        self._park_row(
+                            ts,
+                            "batch resolution unavailable; retry next tick",
+                            live_key=h,
+                            level=None,
+                        )
                         return
                     if batches and len(batches) != ts.batches_total:
                         # File list / cap drifted mid-run (tracker sidecar
@@ -368,7 +375,7 @@ class DownloadMixin:
                     _n,
                     max(1, _max_parks),
                 )
-                self.store.upsert(ts)
+                self._park_row(ts, f"download stalled: {e}", live_key=h, level=None)
                 return
             except TimeoutError as e:
                 # Transport/outage park, deliberately NOT counted in the
@@ -378,7 +385,7 @@ class DownloadMixin:
                 # watchdog (unregistered → FAILED). Counting outages here
                 # would fail rows over a client restart.
                 log.warning("download stalled for %s (%s); parking", ts.source_name, e)
-                self.store.upsert(ts)
+                self._park_row(ts, f"download transport error: {e}", live_key=h, level=None)
                 return
             finally:
                 self._live.pop(h.lower(), None)
@@ -403,8 +410,12 @@ class DownloadMixin:
                                     ts.source_name[:60],
                                     pause_err.client_state,
                                 )
-                                self.store.upsert(ts)
-                                self._live.pop(h.lower(), None)
+                                self._park_row(
+                                    ts,
+                                    f"client hash check in flight ({pause_err.client_state})",
+                                    live_key=h,
+                                    level=None,
+                                )
                                 return
                             # Never move while qB is still writing — park at once
                             # instead of holding the worker on sleep(5)
@@ -415,8 +426,12 @@ class DownloadMixin:
                                 h[:10],
                                 pause_err,
                             )
-                            self.store.upsert(ts)
-                            self._live.pop(h.lower(), None)
+                            self._park_row(
+                                ts,
+                                f"pause before batch move failed: {pause_err}",
+                                live_key=h,
+                                level=None,
+                            )
                             return
                     try:
                         await self._move_and_clean_batch(ts, cur_batch, skip=cur_skip)
@@ -427,12 +442,12 @@ class DownloadMixin:
                         # below: each attempt would block for the full
                         # timeout again.)
                         log.error("rclone batch move timed out for %s: %s", ts.source_name[:60], e)
-                        try:
-                            ts.last_error = f"batch move timed out: {e}"[:500]
-                        except Exception:
-                            pass
-                        self.store.upsert(ts)
-                        self._live.pop(h.lower(), None)
+                        self._park_row(
+                            ts,
+                            f"batch move timed out: {e}",
+                            live_key=h,
+                            level=logging.ERROR,
+                        )
                         return
                     except BatchMoveIncompleteError as e:
                         # Same-tick retry like the pause failure above: the
@@ -454,8 +469,12 @@ class DownloadMixin:
                                 ts.source_name,
                                 consecutive_batch_failures,
                             )
-                            self.store.upsert(ts)
-                            self._live.pop(h.lower(), None)
+                            self._park_row(
+                                ts,
+                                f"{consecutive_batch_failures} incomplete batch moves",
+                                live_key=h,
+                                level=None,
+                            )
                             return
                         await asyncio.sleep(5)
                         continue
@@ -481,8 +500,9 @@ class DownloadMixin:
                                 ts.source_name,
                                 e,
                             )
-                            self.store.upsert(ts)
-                            self._live.pop(h.lower(), None)
+                            self._park_row(
+                                ts, f"batch flip transient error: {e}", live_key=h, level=None
+                            )
                             return
                         if flip_pos is False or flip_pos is None:
                             # A perpetually failing flip (priority RPC down)
@@ -494,8 +514,12 @@ class DownloadMixin:
                                 ts.source_name[:60],
                                 consecutive_batch_failures,
                             )
-                            self.store.upsert(ts)
-                            self._live.pop(h.lower(), None)
+                            self._park_row(
+                                ts,
+                                f"batch flip failed ({consecutive_batch_failures} consecutive)",
+                                live_key=h,
+                                level=None,
+                            )
                             return
                         # Position contract: int (possibly reconciled on
                         # grouping shrink).
