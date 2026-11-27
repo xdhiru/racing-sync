@@ -1547,3 +1547,18 @@ def test_group_scope_uses_the_display_key(tmp_path):
         assert bot._live_group_hashes("a" * 40) == ["a" * 40]
     finally:
         store.close()
+
+
+def test_active_card_gate_counts_utf16_units():
+    """The 4096 gate must be UTF-16 units, or an emoji card is never truncated."""
+    from racing_sync.telegram_refresh import _fit_active_card
+    from racing_sync.telegram_views import _tg_len
+
+    emoji_heavy = "🎬" * 3000  # 3000 code points, 6000 UTF-16 units
+    assert len(emoji_heavy) < 4096 < _tg_len(emoji_heavy)
+
+    out = _fit_active_card(emoji_heavy)
+
+    assert out != emoji_heavy
+    assert _tg_len(out) <= 4096
+    assert _fit_active_card("plain card") == "plain card"

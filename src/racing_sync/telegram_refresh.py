@@ -30,6 +30,7 @@ from .telegram_views import (
     _safe_truncate_markdown,
     _size_compact,
     _speed_human,
+    _tg_len,
     render_active,
 )
 
@@ -40,6 +41,25 @@ log = logging.getLogger("racing_sync.telegram_bot")
 #: one long-lived card, so an unchanged card is never touched — a card
 #: deleted from the chat would stay gone until the content changed.
 _ACTIVE_PROBE_EVERY = 20
+
+
+#: Telegram's hard message limit, counted in UTF-16 units (see _tg_len).
+_TG_MESSAGE_LIMIT_UNITS = 4096
+
+
+def _fit_active_card(text: str) -> str:
+    """Truncate the active card only when Telegram would reject it.
+
+    The gate must count UTF-16 units: an emoji-heavy card can stay under
+    4096 code points while exceeding Telegram's 4096-unit limit, so a
+    code-point gate would skip truncation and the edit would be refused.
+    """
+    try:
+        if _tg_len(text) > _TG_MESSAGE_LIMIT_UNITS:
+            return _safe_truncate_markdown(text, _TG_MESSAGE_LIMIT_UNITS)
+        return text
+    except Exception:
+        return text
 
 
 class RefreshMixin:
@@ -489,8 +509,7 @@ class RefreshMixin:
             self._last_rendered_page = cur_page
         except Exception:
             pass
-        if len(text) > 4096:
-            text = _safe_truncate_markdown(text)
+        text = _fit_active_card(text)
         self._current_page = cur_page
         try:
             _kb_filter = getattr(self, "_status_filter", None) or "all"

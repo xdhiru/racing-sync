@@ -323,8 +323,8 @@ class DaemonLock:
     def held(self) -> bool:
         return self._locked
 
-    def acquire(self, *, blocking: bool = False) -> bool:
-        """Take the lock; non-blocking by default (CLI fail-fast).
+    def acquire(self) -> bool:
+        """Take the lock; non-blocking fail-fast (CLI/daemon single-instance).
 
         Returns True when held (idempotent). Never raises: any doubt
         returns False and the caller refuses the mutation.
