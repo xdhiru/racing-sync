@@ -791,14 +791,7 @@ class FuseMixin:
         # An entry carrying the hash but seeding from the SSD is not a fuse
         # seed: it would pass the entry gate while nothing serves from the
         # mount. Only entries off the SSD count as alive here.
-        from .recovery import _save_path_on_ssd as _on_ssd
-
-        present = [
-            t
-            for t in (present or [])
-            if not _on_ssd(self.cfg, str(getattr(t, "save_path", "") or ""))
-        ]
-        have = {t.hash.lower() for t in present}
+        have, missing_entries = self._fuse_entry_split(present, hashes)
         blob = ts._blob or ts.cross_seed_blob
         if not blob and getattr(self, "store", None) is not None:
             try:
@@ -812,21 +805,22 @@ class FuseMixin:
             target = self._verify_mount_for(ts, blob, self._target_mount_for(ts))
         except Exception:  # noqa: BLE001
             return None
-        missing_entries = hashes - have
         if missing_entries:
             if not await self._reinject_missing_done_entries(ts, missing_entries, blob, target):
                 return None
             present = await self._dest_entries_for_hashes(hashes)
             if present is None:
                 return None
-            have = {t.hash.lower() for t in (present or [])}
-            if hashes - have:
+            _, still_missing = self._fuse_entry_split(present, hashes)
+            if still_missing:
                 return None
         try:
-            missing = await self._confirmed_fuse_missing(target, expected)
+            from .fuse_gate import verify_blob_on_mount as _verify
+
+            check = await _verify(target, blob, expected=expected, confirm=True)
         except Exception:  # noqa: BLE001
             return None
-        return target if not missing else None
+        return target if check.verified else None
 
     async def _demote_false_done_to_moving(self, ts: TorrentState) -> None:
         """Self-heal a DONE row whose save_path never left SSD.
@@ -1002,30 +996,18 @@ class FuseMixin:
     ) -> list[str]:
         """Cached miss confirm: re-probe fresh once before reporting absent.
 
-        The shared stat cache (60s) can report an absence the mount has
-        already resolved: a cached-only miss no longer earns a 30m
-        backoff — only a fresh-confirmed miss defers. Outage markers
-        (`<...>`) pass through untouched; callers split dead-mount from
-        content-miss handling.
+        Delegates to fuse_gate.confirm_missing (single implementation): the
+        shared stat cache (60s) can report an absence the mount has already
+        resolved, so a cached-only miss never earns a 30m backoff — only a
+        fresh-confirmed miss defers. Outage markers (`<...>`) pass through
+        untouched; callers split dead-mount from content-miss handling.
         """
-        missing = await self._missing_fuse_files(target_mount, files)
-        if not missing:
-            return []
-        if any(str(m).startswith("<") for m in missing):
-            return missing
         try:
-            from .fuse_gate import missing_under as _missing_under
+            from .fuse_gate import confirm_missing as _confirm
 
-            fresh_missing = await _missing_under(target_mount, files, fresh=True)
+            return await _confirm(target_mount, files)
         except Exception:  # noqa: BLE001
-            return missing
-        if fresh_missing is None:
-            # Indeterminate re-probe (dead mount, stat error) is an outage,
-            # not proof the content is gone. Returning the cached miss here
-            # charged a 30-minute content backoff for a mount that may be
-            # back in seconds; the next probe confirms a real miss instead.
-            return [f"<mount unavailable: {target_mount}>"]
-        return fresh_missing
+            return await self._missing_fuse_files(target_mount, files)
 
     async def _fetch_racing_torrent_bytes(self, infohash: str) -> bytes | None:
         """Fetch the raw .torrent bytes for a racing-client infohash.
@@ -1119,29 +1101,52 @@ class FuseMixin:
             expected = self._expected_fuse_files(blob)
             if not expected:
                 return True
-            return not await self._missing_fuse_files(target_mount, expected)
+            from .fuse_gate import verify_blob_on_mount as _verify
+
+            check = await _verify(target_mount, blob, expected=expected)
+            return check.verified
         except Exception:  # noqa: BLE001
             return False
+
+    def _fuse_entry_split(self, entries: list, hashes: set[str]) -> tuple[set[str], set[str]]:
+        """Split row hashes by whether a live non-SSD dest entry carries them.
+
+        Returns (have, missing). An entry carrying the hash while seeding
+        from the SSD is not a fuse seed: it would pass an entry gate while
+        nothing serves from the mount. Shared by the DONE-row verifier and
+        the cleanup janitor so both apply the same placement rule.
+        """
+        from .recovery import _save_path_on_ssd as _on_ssd
+
+        have: set[str] = set()
+        for t in entries or []:
+            try:
+                h = str(getattr(t, "hash", "") or "").lower()
+                if not h or h not in hashes:
+                    continue
+                if _on_ssd(self.cfg, str(getattr(t, "save_path", "") or "")):
+                    continue
+                have.add(h)
+            except Exception:
+                continue
+        return have, set(hashes) - have
 
     async def _missing_fuse_files(
         self, target_mount: Path, files: list[tuple[str, int]]
     ) -> list[str]:
         """Expected files absent (or size-mismatched) under the fuse target.
 
-        Delegates to fuse_gate.missing_under (single implementation).
-        Fail-closed as before: unstatable mount/check returns a marker
+        Delegates to fuse_gate.missing_or_marker (single implementation).
+        Fail-closed as before: an unstatable mount/check returns a marker
         missing entry, never an empty pass.
         """
         try:
-            from .fuse_gate import missing_under as _missing_under
+            from .fuse_gate import missing_or_marker as _missing
 
-            res = await _missing_under(target_mount, files or [])
+            return await _missing(target_mount, files or [])
         except Exception as e:  # noqa: BLE001
             log.warning("fuse availability check failed for %s: %s", target_mount, e)
             return [f"<availability check failed: {e}>"]
-        if res is None:
-            return [f"<mount unavailable: {target_mount}>"]
-        return res
 
     def _fuse_mount_strs(self) -> list[str]:
         """Normalized fuse mount strings; [] when unconfigured/broken."""

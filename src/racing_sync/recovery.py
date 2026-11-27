@@ -283,32 +283,15 @@ async def _adopt_blob(dest: TorrentClient, h: str) -> bytes:
 async def _missing_under(mount: Path, expected: list[tuple[str, int]]) -> list[str] | None:
     """Files listed-but-absent under `mount`, or None when unverifiable.
 
-    Unverifiable (RPC/stat failure) returns None so callers preserve today's
-    trust behavior — absence of evidence must never manufacture terminal
-    failures (a warming/dead mount also shows nothing).
+    Delegates to fuse_gate.missing_under (single rule) with a fresh probe:
+    recovery must not trust a cached absence while deciding adoption, and
+    the shared mount-availability guard makes a warming/dead mount an
+    outage marker rather than a fabricated content miss. None still means
+    "unverifiable", so callers preserve their trust behavior.
     """
+    from .fuse_gate import missing_under as _shared
 
-    def _check() -> list[str]:
-        missing: list[str] = []
-        for name, want in expected:
-            target = _safe_join(mount, name)
-            if target is None:
-                missing.append(name)
-                continue
-            try:
-                actual = target.stat().st_size
-            except OSError:
-                missing.append(name)
-                continue
-            if want and actual != want:
-                missing.append(f"{name} (size {actual}!={want})")
-        return missing
-
-    try:
-        return await asyncio.to_thread(_check)
-    except Exception as e:  # noqa: BLE001
-        log.warning("reconcile: fuse availability check failed for %s: %s", mount, e)
-        return None
+    return await _shared(mount, expected, fresh=True)
 
 
 async def _verify_fuse_adopted(

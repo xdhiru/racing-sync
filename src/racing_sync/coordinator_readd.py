@@ -858,7 +858,9 @@ class ReaddMixin:
             gate_expected = []
         if gate_expected:
             gate_target = self._target_mount_for_blob(gate_blob, self._target_mount_for(ts))
-            gate_missing = await self._missing_fuse_files(gate_target, gate_expected)
+            from .fuse_gate import verify_blob_on_mount as _verify
+
+            gate_missing = (await _verify(gate_target, gate_blob, expected=gate_expected)).missing
             if gate_missing:
                 preview = ", ".join(gate_missing[:5])
                 if len(gate_missing) > 5:

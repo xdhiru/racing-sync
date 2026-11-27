@@ -13,7 +13,7 @@ to it for backwards compat (tests patch coordinator methods).
 from __future__ import annotations
 
 import asyncio
-import enum
+import dataclasses
 import logging
 import os
 from pathlib import Path
@@ -48,12 +48,6 @@ def mount_is_mounted(mount: Path | str) -> bool:
             return next(_it, None) is not None
     except OSError:
         return False
-
-
-class FuseVerdict(str, enum.Enum):  # noqa: UP042  (StrEnum changes str(Enum); .value is the contract)
-    PRESENT = "present"
-    MISSING = "missing"
-    UNVERIFIABLE = "unverifiable"
 
 
 def expected_files_from_blob(blob: bytes | None) -> list[tuple[str, int]] | None:
@@ -193,9 +187,112 @@ async def skipped_present(mount: Path | str, items: list[tuple[str, int]]) -> se
         return set()
 
 
+async def missing_or_marker(mount: Path | str, expected: list[tuple[str, int]]) -> list[str]:
+    """missing_under, fail-closed: None becomes an outage marker string.
+
+    One implementation for every caller that must never treat an
+    unstatable mount as "all present" (delete guards, re-add gate,
+    late-seed checks).
+    """
+    try:
+        res = await missing_under(mount, expected)
+    except Exception as e:  # noqa: BLE001
+        log.warning("fuse_gate: availability check failed for %s: %s", mount, e)
+        return [f"<availability check failed: {e}>"]
+    if res is None:
+        return [f"<mount unavailable: {mount}>"]
+    return res
+
+
+async def confirm_missing(mount: Path | str, expected: list[tuple[str, int]]) -> list[str]:
+    """Cached check; only a fresh-confirmed content miss stands (E5).
+
+    Outage markers (`<...>`) pass through untouched. A fresh re-probe that
+    is indeterminate is an outage, not a content miss: the caller must not
+    charge a long content backoff for a mount that may be back in seconds.
+    """
+    missing = await missing_or_marker(mount, expected)
+    if not missing:
+        return []
+    if any(str(m).startswith("<") for m in missing):
+        return missing
+    try:
+        fresh_missing = await missing_under(mount, expected, fresh=True)
+    except Exception:  # noqa: BLE001
+        return missing
+    if fresh_missing is None:
+        return [f"<mount unavailable: {mount}>"]
+    return fresh_missing
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FuseCheck:
+    """One fuse verification result: where, what, and what is missing."""
+
+    mount: Path
+    mount_ok: bool
+    expected: list[tuple[str, int]] | None
+    missing: list[str]
+
+    @property
+    def verified(self) -> bool:
+        """True only for a mounted target with every expected file present."""
+        return self.mount_ok and self.expected is not None and not self.missing
+
+    @property
+    def unverifiable(self) -> bool:
+        """True when there is nothing to check or the mount is unavailable."""
+        return self.expected is None or any(str(m).startswith("<") for m in self.missing)
+
+
+async def verify_blob_on_mount(
+    mount: Path | str,
+    blob: bytes | None,
+    *,
+    expected: list[tuple[str, int]] | None = None,
+    fresh: bool = False,
+    confirm: bool = False,
+) -> FuseCheck:
+    """The one "blob -> expected files -> present under mount" check.
+
+    `expected` lets a caller that already decoded the blob skip a second
+    decode (an empty list means "decode from the blob"). `fresh` re-probes
+    cached stats first; `confirm` re-probes only after a content miss,
+    which is what DONE-row/repair callers need (a cached absence is not a
+    content miss until a fresh check agrees). `confirm` wins when both
+    are set.
+    """
+    try:
+        m = Path(mount)
+    except Exception:
+        m = Path(".")
+    exp = expected if expected else expected_files_from_blob(blob)
+    try:
+        mount_ok = mount_is_mounted(m)
+    except Exception:
+        mount_ok = False
+    if exp is None:
+        # Nothing to verify: callers keep their existing behavior and let
+        # the downstream step fail loudly instead of gating on an empty
+        # expectation.
+        return FuseCheck(mount=m, mount_ok=mount_ok, expected=None, missing=[])
+    if confirm:
+        missing = await confirm_missing(m, exp)
+    else:
+        try:
+            res = await missing_under(m, exp, fresh=fresh)
+        except Exception:  # noqa: BLE001
+            res = None
+        missing = res if res is not None else [f"<mount unavailable: {m}>"]
+    return FuseCheck(mount=m, mount_ok=mount_ok, expected=exp, missing=missing)
+
+
 __all__ = [
-    "FuseVerdict",
+    "FuseCheck",
+    "confirm_missing",
     "expected_files_from_blob",
+    "missing_or_marker",
     "missing_under",
     "skipped_present",
+    "verify_blob_on_mount",
 ]

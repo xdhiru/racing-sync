@@ -293,3 +293,110 @@ def test_matches_release_kind_and_separators():
     assert not _matches_release(
         "Show.S01-GRP1", target, "Show.S01-GRP2", target, kind="episode", unify_separators=True
     )
+
+
+def _torrent_blob(name: str = "Show.mkv", size: int = 10) -> bytes:
+    from racing_sync.watchdir import _bencode
+
+    return _bencode({b"info": {b"name": name.encode(), b"length": size}})
+
+
+@pytest.mark.anyio
+async def test_verify_blob_on_mount_reports_presence_and_outage(tmp_path, monkeypatch):
+    """One check answers expected/missing/mount_ok for every caller."""
+    from racing_sync import fuse_gate
+
+    mount = tmp_path / "fuse"
+    mount.mkdir()
+    (mount / "Show.mkv").write_bytes(b"x" * 10)
+    blob = _torrent_blob()
+
+    check = await fuse_gate.verify_blob_on_mount(mount, blob, fresh=True)
+    assert check.verified
+    assert check.mount_ok
+    assert check.expected == [("Show.mkv", 10)]
+    assert check.missing == []
+
+    (mount / "Show.mkv").unlink()
+    check = await fuse_gate.verify_blob_on_mount(mount, blob, fresh=True)
+    assert not check.verified
+    assert check.missing == ["Show.mkv"]
+
+    monkeypatch.setattr(fuse_gate, "mount_is_mounted", lambda _m: False)
+    check = await fuse_gate.verify_blob_on_mount(mount, blob, fresh=True)
+    assert not check.verified
+    assert check.unverifiable
+    assert check.missing and check.missing[0].startswith("<mount unavailable")
+
+
+@pytest.mark.anyio
+async def test_verify_blob_on_mount_unverifiable_blob_is_not_a_miss():
+    from racing_sync import fuse_gate
+
+    check = await fuse_gate.verify_blob_on_mount("/mnt/fuse", b"not-a-torrent")
+    assert check.expected is None
+    assert check.missing == []
+    assert not check.verified
+    assert check.unverifiable
+
+
+@pytest.mark.anyio
+async def test_confirm_missing_reprobes_before_charging_a_content_miss(monkeypatch):
+    """A cached absence only stands when a fresh probe agrees (E5)."""
+    from pathlib import Path
+
+    from racing_sync import fuse_gate
+
+    calls: list[bool] = []
+
+    async def _healed(mount, expected, *, fresh=False):
+        calls.append(fresh)
+        return ["Show.mkv"] if not fresh else []
+
+    monkeypatch.setattr(fuse_gate, "missing_under", _healed)
+    assert await fuse_gate.confirm_missing(Path("/mnt/fuse"), [("Show.mkv", 10)]) == []
+    assert calls == [False, True]
+
+    async def _indeterminate(mount, expected, *, fresh=False):
+        return ["Show.mkv"] if not fresh else None
+
+    monkeypatch.setattr(fuse_gate, "missing_under", _indeterminate)
+    res = await fuse_gate.confirm_missing(Path("/mnt/fuse"), [("Show.mkv", 10)])
+    assert res and res[0].startswith("<mount unavailable"), "an outage is not a content miss"
+
+
+@pytest.mark.anyio
+async def test_missing_or_marker_never_returns_none(monkeypatch):
+    from racing_sync import fuse_gate
+
+    async def _none(*_args, **_kw):
+        return None
+
+    monkeypatch.setattr(fuse_gate, "missing_under", _none)
+    res = await fuse_gate.missing_or_marker("/mnt/fuse", [("a", 1)])
+    assert res and res[0].startswith("<mount unavailable")
+
+
+def test_fuse_entry_split_excludes_ssd_entries(tmp_path):
+    """An entry seeding from the SSD never counts as a fuse placement."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from conftest import make_coordinator
+
+    from racing_sync.config import AppConfig
+
+    cfg = AppConfig.from_toml(Path(__file__).parent.parent / "config.example.toml")
+    cfg.ssd.path = tmp_path / "ssd"
+    cfg.dest.save_path = tmp_path / "ssd"
+    cfg.rclone.fuse.mount = tmp_path / "fuse"
+    cfg.rclone.fuse.mount_unsorted = tmp_path / "fuse-unsorted"
+    coord = make_coordinator(cfg=cfg)
+
+    entries = [
+        SimpleNamespace(hash="a" * 40, save_path=str(tmp_path / "fuse" / "Show")),
+        SimpleNamespace(hash="b" * 40, save_path=str(tmp_path / "ssd" / "Show")),
+    ]
+    have, missing = coord._fuse_entry_split(entries, {"a" * 40, "b" * 40, "c" * 40})
+    assert have == {"a" * 40}
+    assert missing == {"b" * 40, "c" * 40}

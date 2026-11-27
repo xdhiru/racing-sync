@@ -682,16 +682,9 @@ class CleanupMixin:
             return False
         # An entry carrying the hash while seeding from the SSD is not a
         # fuse seed — the byte check below would pass on bytes that are
-        # about to move. Only entries off the SSD count as present.
-        from .recovery import _save_path_on_ssd as _on_ssd
-
-        present = [
-            t
-            for t in (present or [])
-            if not _on_ssd(self.cfg, str(getattr(t, "save_path", "") or ""))
-        ]
-        have = {t.hash.lower() for t in present}
-        missing = sorted(hashes - have)
+        # about to move. Shared placement rule with the DONE-row verifier.
+        _have, _missing_entries = self._fuse_entry_split(present, hashes)
+        missing = sorted(_missing_entries)
         if missing:
             log.warning(
                 "cleanup: %d fuse entr%s missing for %s (%s…); keeping VPS1",
@@ -730,13 +723,15 @@ class CleanupMixin:
         except Exception:  # noqa: BLE001
             return False
         try:
-            file_missing = await self._missing_fuse_files(target, expected)
+            from .fuse_gate import verify_blob_on_mount as _verify
+
+            check = await _verify(target, blob, expected=expected)
         except Exception:  # noqa: BLE001
             return False
-        if file_missing:
+        if check.missing:
             log.warning(
                 "cleanup: %d fuse file(s) missing for %s at %s; keeping VPS1",
-                len(file_missing),
+                len(check.missing),
                 ts.source_name[:60],
                 target,
             )
