@@ -4171,3 +4171,33 @@ async def test_await_hash_requires_size_agreement():
     )
     got = await coord._await_hash_for_name("same.name.1080p", size_bytes=1000, timeout_s=0.01)
     assert got == "b" * 40
+
+
+@pytest.mark.anyio
+async def test_tracker_cascade_spares_an_unknown_size_sibling(tmp_path):
+    """Name-only evidence must never fail a same-name sibling (strict mode)."""
+    from racing_sync.state import State, TorrentState
+
+    coord, store, ts = _downloading_pair(tmp_path)
+    try:
+        ts.source_name = "Dead.Show.S01E01"
+        ts.total_bytes = 1000
+        ts.source_tracker = "https://tracker-a.example/announce/KEY"
+        ts.source_announce_url = ts.source_tracker
+        store.upsert(ts)
+
+        sib = TorrentState(
+            source_infohash="w9",
+            source_name="Dead.Show.S01E01",
+            total_bytes=0,
+            state=State.WAITING_INDEXER,
+            source_tracker="https://tracker-a.example/announce/OTHER",
+            source_announce_url="https://tracker-a.example/announce/OTHER",
+        )
+        store.upsert(sib)
+
+        await coord._cascade_tracker_death(ts, "unregistered: torrent deleted")
+
+        assert store.get("w9").state == State.WAITING_INDEXER
+    finally:
+        store.close()

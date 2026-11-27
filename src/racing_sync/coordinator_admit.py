@@ -1029,6 +1029,7 @@ class AdmitMixin:
                         ts.source_name or "",
                         ts.total_bytes or 0,
                         require_size=True,
+                        allow_unknown=True,
                     ):
                         continue
                     bucket.append(r)
@@ -2907,6 +2908,7 @@ class AdmitMixin:
                             p.total_bytes or 0,
                             ts.source_name or "",
                             ts.total_bytes or 0,
+                            allow_unknown=True,
                         ):
                             continue
                         sibs += 1

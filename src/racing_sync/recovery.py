@@ -377,7 +377,9 @@ def _claimed_since_snapshot(store, rpt, h: str, name: str, size_bytes: int) -> b
     if row is None:
         try:
             for m in store.find_by_name(name) or []:
-                if same_content(name, size_bytes, m.source_name or "", m.total_bytes or 0):
+                if same_content(
+                    name, size_bytes, m.source_name or "", m.total_bytes or 0, allow_unknown=True
+                ):
                     row = m
                     break
         except Exception:

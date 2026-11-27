@@ -18,7 +18,7 @@ import stat
 import time
 from pathlib import Path
 
-from .content_keys import same_release_name as _same_release_name
+from .content_keys import same_content as _same_content_key
 from .coordinator_content import _matches_release, _verified_cross_seed_blob
 from .coordinator_errors import (
     _NOT_VISIBLE_DETAIL,
@@ -1233,25 +1233,21 @@ class ReaddMixin:
         matches = []
         for t in racing or []:
             try:
-                if not (t.name == ts.source_name or _same_release_name(t.name, ts.source_name)):
-                    continue
-            except Exception:
-                continue
-            # Same name alone is not same content: a different-sized
-            # same-name torrent (repack, mislabel) must not ride this
-            # row's injection. Unknown sizes (0) still match.
-            try:
                 t_size = int(getattr(t, "size_bytes", 0) or 0)
             except (TypeError, ValueError):
                 t_size = 0
-            if want_size and t_size and t_size != want_size:
-                log.info(
-                    "re-inject: size mismatch for %s (%s: VPS1 %d != row %d); skipping",
-                    (t.name or "")[:50],
-                    (t.infohash or "")[:10],
-                    t_size,
-                    want_size,
-                )
+            # Same name alone is not same content: a different-sized
+            # same-name torrent (repack, mislabel) must not ride this row's
+            # injection. Unknown sizes (0) still match (single rule).
+            if not _same_content_key(t.name or "", t_size, ts.source_name or "", want_size):
+                if want_size and t_size and t_size != want_size:
+                    log.info(
+                        "re-inject: size mismatch for %s (%s: VPS1 %d != row %d); skipping",
+                        (t.name or "")[:50],
+                        (t.infohash or "")[:10],
+                        t_size,
+                        want_size,
+                    )
                 continue
             matches.append(t)
 

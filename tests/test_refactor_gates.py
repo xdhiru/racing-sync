@@ -400,3 +400,24 @@ def test_fuse_entry_split_excludes_ssd_entries(tmp_path):
     have, missing = coord._fuse_entry_split(entries, {"a" * 40, "b" * 40, "c" * 40})
     assert have == {"a" * 40}
     assert missing == {"b" * 40, "c" * 40}
+
+
+def test_same_content_size_modes_are_explicit():
+    """The two size modes cover one-sided and both-unknown unknowns."""
+    from racing_sync.content_keys import same_content
+
+    assert same_content("Show", 1000, "Show", 1000)
+    assert not same_content("Show", 1000, "Show", 2000)
+
+    # One side unknown: permissive default, rejected for destructive scopes.
+    assert same_content("Show", 0, "Show", 1000)
+    assert same_content("Show", 1000, "Show", 0)
+    assert not same_content("Show", 0, "Show", 1000, allow_unknown=False)
+    assert not same_content("Show", 1000, "Show", 0, allow_unknown=False)
+
+    # Both unknown: default matches; deferral and destructive modes do not.
+    assert same_content("Show", 0, "Show", 0)
+    assert not same_content("Show", 0, "Show", 0, require_size=True)
+    assert not same_content("Show", 0, "Show", 0, allow_unknown=False)
+
+    assert not same_content("Show", 1000, "Other", 1000)

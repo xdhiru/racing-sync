@@ -107,6 +107,7 @@ class InjectMixin:
                     t_size,
                     getattr(anchor, "name", "") or "",
                     want_size,
+                    allow_unknown=True,
                 ):
                     continue
                 out.append(t)
@@ -152,6 +153,7 @@ class InjectMixin:
                         m_size,
                         name,
                         size,
+                        allow_unknown=True,
                     ):
                         continue
                     return m

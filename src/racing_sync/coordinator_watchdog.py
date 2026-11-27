@@ -13,6 +13,7 @@ import datetime as dt
 import logging
 import time
 
+from .content_keys import same_content as _same_content
 from .coordinator_content import (
     _created_ts,
     announce_domain,
@@ -259,9 +260,15 @@ class WatchdogMixin:
                     r_size = int(r.total_bytes or 0)
                 except (TypeError, ValueError):
                     continue
-                if r_size != want_size:
-                    continue
-                if normalize_content_name(r.source_name or "") != want_norm:
+                # Destructive cascade: known-and-equal sizes only
+                # (same_content single rule).
+                if not _same_content(
+                    r.source_name or "",
+                    r_size,
+                    dead_ts.source_name or "",
+                    want_size,
+                    allow_unknown=False,
+                ):
                     continue
                 r_domain = announce_domain(r.source_announce_url or "") or announce_domain(
                     r.source_tracker or ""
@@ -319,9 +326,13 @@ class WatchdogMixin:
                         r_size = int(r.total_bytes or 0)
                     except (TypeError, ValueError):
                         continue
-                    if r_size != want_size:
-                        continue
-                    if normalize_content_name(r.source_name or "") != want_norm:
+                    if not _same_content(
+                        r.source_name or "",
+                        r_size,
+                        dead_ts.source_name or "",
+                        want_size,
+                        allow_unknown=False,
+                    ):
                         continue
                     try:
                         _rank = int(self._watch_rank(r))

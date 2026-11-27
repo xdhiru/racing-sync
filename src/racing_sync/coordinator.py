@@ -1753,6 +1753,7 @@ class Coordinator(
                             m.total_bytes or 0,
                             t.name,
                             t.size_bytes or 0,
+                            allow_unknown=True,
                         )
                     ]
                     if same:

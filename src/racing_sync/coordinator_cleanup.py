@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from .clients.abstract import Torrent
-from .coordinator_content import cleanup_grace_seconds, normalize_content_name
+from .coordinator_content import cleanup_grace_seconds
 from .coordinator_paths import _safe_ssd_join
 from .io_bounds import chunked, offload, rpc
 from .state import State, TorrentState
@@ -372,9 +372,8 @@ class CleanupMixin:
         only VPS1 copy. Only live client entries are returned —
         already-vanished torrents need no work.
         """
-        want_norm = normalize_content_name(ts.source_name or "")
-        if not want_norm:
-            return []
+        from .content_keys import same_content as _same_content
+
         try:
             want_size = int(ts.total_bytes or 0)
         except (TypeError, ValueError):
@@ -383,13 +382,18 @@ class CleanupMixin:
             return []
         out: list[Torrent] = []
         for t in by_hash.values():
-            if normalize_content_name(t.name or "") != want_norm:
-                continue
             try:
                 got_size = int(t.size_bytes or 0)
             except (TypeError, ValueError):
                 got_size = 0
-            if not got_size or got_size != want_size:
+            # Destructive grouping: known-and-equal sizes only.
+            if not _same_content(
+                t.name or "",
+                got_size,
+                ts.source_name or "",
+                want_size,
+                allow_unknown=False,
+            ):
                 continue
             out.append(t)
         return out

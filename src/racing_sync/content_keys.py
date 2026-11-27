@@ -57,18 +57,25 @@ def same_content(
     b_size: int,
     *,
     require_size: bool = False,
+    allow_unknown: bool = True,
 ) -> bool:
-    """Watch/inflight rule: same normalized name AND same size when both known.
+    """Same normalized name, then the size mode decides.
 
-    Mirrors legacy conditions:
-      (not m.total_bytes or not t.size_bytes or m.total_bytes == t.size_bytes)
-    and the election/inflight size equality check.
+    - both sizes known: they must be equal.
+    - any side unknown: rejected when `allow_unknown` is False (the
+      destructive mode — name-only evidence is not enough to delete);
+      otherwise a one-sided unknown matches, and two unsized releases
+      match only when `require_size` is False (distinct unsized releases
+      would otherwise mutually defer forever).
 
-    `require_size=True` (deferral decisions only): two releases with no
-    size metadata on either side do NOT match — distinct unsized
-    releases would otherwise mutually defer forever. Display grouping
-    and dedup keep the default: an unsized row still belongs with its
-    same-name siblings.
+    Callers pick the mode explicitly: deferral/election use
+    `require_size=True`, destructive grouping uses `allow_unknown=False`,
+    and display/dedup keep the permissive default. Legacy inline rules
+    mapped to:
+      name + equal sizes when both known:
+          same_content(..., allow_unknown=False)
+      name + no cross-size check (VPS1 grouping):
+          same_release_name
     """
     try:
         if _norm(a_name) != _norm(b_name):
@@ -83,9 +90,11 @@ def same_content(
         b_s = int(b_size or 0)
     except (TypeError, ValueError):
         b_s = 0
-    if not a_s and not b_s:
-        return not require_size
     if not a_s or not b_s:
+        if not allow_unknown:
+            return False
+        if not a_s and not b_s:
+            return not require_size
         return True
     return a_s == b_s
 

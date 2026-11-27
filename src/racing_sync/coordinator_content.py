@@ -490,6 +490,7 @@ def watch_election_winner(rows, ts: TorrentState, cfg) -> TorrentState | None:
                         ts.source_name or "",
                         ts.total_bytes or 0,
                         require_size=True,
+                        allow_unknown=True,
                     ):
                         continue
                 else:
