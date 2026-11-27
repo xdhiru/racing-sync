@@ -1598,17 +1598,19 @@ class Coordinator(
         *,
         live_key: str | None = None,
         level: int | None = logging.WARNING,
+        extra: dict | None = None,
     ) -> bool:
         """Stay in the current state, record WHY, and release the live entry.
 
         One park primitive for worker early returns. The reason lands in
-        last_error and the write is narrow (`update_columns` with
-        expected_state), so a concurrent transition survives — a whole-row
-        upsert after awaits could regress it (B2). A row that moved on is
-        left alone (False); a forgotten row raises AbandonedError instead
-        of being resurrected. Stores without update_columns fall back to a
-        guarded upsert. Never raises for write failures — the worker is
-        ending either way and the next tick re-derives the row.
+        last_error (plus any `extra` columns, e.g. a retry timer) and the
+        write is narrow (`update_columns` with expected_state), so a
+        concurrent transition survives — a whole-row upsert after awaits
+        could regress it (B2). A row that moved on is left alone (False);
+        a forgotten row raises AbandonedError instead of being resurrected.
+        Stores without update_columns fall back to a guarded upsert. Never
+        raises for write failures — the worker is ending either way and the
+        next tick re-derives the row.
         """
         try:
             ts.last_error = f"parked: {reason}"[:500]
@@ -1625,14 +1627,17 @@ class Coordinator(
         except Exception:
             pass
         key = ts.source_infohash or ""
+        mapping: dict = {"last_error": ts.last_error}
+        if isinstance(extra, dict):
+            mapping.update(extra)
         try:
             _up = getattr(self.store, "update_columns", None)
             if callable(_up):
                 try:
-                    _nv = _up(key, {"last_error": ts.last_error}, expected_state=ts.state)
+                    _nv = _up(key, mapping, expected_state=ts.state)
                 except TypeError:
                     # Test double without the expected_state kwarg.
-                    _nv = _up(key, {"last_error": ts.last_error})
+                    _nv = _up(key, mapping)
                 if isinstance(_nv, int) and _nv > 0:
                     try:
                         ts.version = _nv

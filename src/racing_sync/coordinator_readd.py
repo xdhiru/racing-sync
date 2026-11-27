@@ -689,6 +689,38 @@ class ReaddMixin:
             return True
         return False
 
+    def _park_readd(
+        self,
+        ts: TorrentState,
+        reason: str,
+        *,
+        delay_s: float | None = 0.0,
+        level: int | None = logging.WARNING,
+    ) -> bool:
+        """Park RE_ADDING: record why plus the retry instant.
+
+        Timer-park, never sleep: `readd_next_retry_at` survives a restart.
+        One primitive for every re-add early return, so the reason, the
+        timer and the guarded write cannot drift apart (I12). `delay_s=None`
+        clears the timer (healed bytes: re-check next tick).
+        """
+        retry_at: dt.datetime | None = None
+        if delay_s is not None:
+            try:
+                retry_at = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=max(0.0, float(delay_s)))
+            except (TypeError, ValueError):
+                retry_at = dt.datetime.now(dt.UTC)
+        try:
+            ts.readd_next_retry_at = retry_at
+        except Exception:
+            pass
+        return self._park_row(
+            ts,
+            reason,
+            level=level,
+            extra={"readd_next_retry_at": retry_at or ""},
+        )
+
     async def _do_re_add(self, ts: TorrentState) -> None:
         store = getattr(self, "store", None)
         now = dt.datetime.now(dt.UTC)
@@ -743,9 +775,12 @@ class ReaddMixin:
                 ts.source_name[:50],
                 delay,
             )
-            ts.readd_next_retry_at = now + dt.timedelta(seconds=delay)
-            if store is not None:
-                store.upsert(ts)
+            self._park_readd(
+                ts,
+                f"fuse mount indexing delay ({int(delay)}s)",
+                delay_s=delay,
+                level=None,
+            )
             return
 
         max_age = dt.timedelta(
@@ -828,9 +863,9 @@ class ReaddMixin:
                 "fuse content unverifiable for %s (missing blob); parking re-add",
                 ts.source_name[:50],
             )
-            ts.readd_next_retry_at = now + dt.timedelta(seconds=retry_gap)
-            if store is not None:
-                store.upsert(ts)
+            self._park_readd(
+                ts, "fuse content unverifiable (missing blob)", delay_s=retry_gap, level=None
+            )
             return
         if gate_expected is None:
             # Blob present but undecodable/empty: a real-sized blob is
@@ -847,9 +882,12 @@ class ReaddMixin:
                     _blob_len,
                     ts.source_name[:50],
                 )
-                ts.readd_next_retry_at = now + dt.timedelta(seconds=retry_gap)
-                if store is not None:
-                    store.upsert(ts)
+                self._park_readd(
+                    ts,
+                    f"fuse gate cannot decode {_blob_len}-byte blob",
+                    delay_s=retry_gap,
+                    level=None,
+                )
                 return
             log.warning(
                 "fuse gate cannot decode blob for %s; proceeding without gate",
@@ -891,14 +929,13 @@ class ReaddMixin:
                         e,
                     )
                     _healed = False
-                if _healed:
-                    # Healed bytes just moved: re-check promptly on the next
-                    # tick instead of waiting out a retry gap.
-                    ts.readd_next_retry_at = None
-                else:
-                    ts.readd_next_retry_at = now + dt.timedelta(seconds=retry_gap)
-                if store is not None:
-                    store.upsert(ts)
+                self._park_readd(
+                    ts,
+                    f"fuse content not yet available ({len(gate_missing)}/"
+                    f"{len(gate_expected)} missing)",
+                    delay_s=None if _healed else retry_gap,
+                    level=None,
+                )
                 return
 
         # Gate passed: any heal incident for this row is over — drop its
@@ -976,9 +1013,7 @@ class ReaddMixin:
                     retry_gap,
                     ts.readd_attempts,
                 )
-                ts.readd_next_retry_at = now_curr + dt.timedelta(seconds=retry_gap)
-                if store is not None:
-                    store.upsert(ts)
+                self._park_readd(ts, f"re-inject failed: {e}", delay_s=retry_gap, level=None)
                 return
             ts.readd_next_retry_at = now_curr + dt.timedelta(seconds=backoff_interval)
             log.warning(
@@ -992,8 +1027,12 @@ class ReaddMixin:
                 int(elapsed_curr.total_seconds()),
                 int(max_age.total_seconds()),
             )
-            if store is not None:
-                store.upsert(ts)
+            self._park_readd(
+                ts,
+                f"re-inject still failing after {ts.readd_attempts} attempts: {e}",
+                delay_s=backoff_interval,
+                level=None,
+            )
             self._schedule_telegram_update(ts)
             return
 

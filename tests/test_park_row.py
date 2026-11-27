@@ -88,3 +88,46 @@ def test_park_row_falls_back_to_a_guarded_upsert():
     assert len(store.calls) == 1
     assert store.calls[0][1] == {"expected_state": State.DOWNLOADING}
     assert (store.calls[0][0].last_error or "").startswith("parked: legacy store")
+
+
+def test_park_readd_sets_the_timer_and_reason(tmp_path):
+    import datetime as dt
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        ts = TorrentState(source_infohash="a" * 40, source_name="Show", state=State.RE_ADDING)
+        store.upsert(ts)
+        before = dt.datetime.now(dt.UTC)
+
+        assert coord._park_readd(ts, "fuse lag", delay_s=120) is True
+
+        row = store.get("a" * 40, include_blob=False)
+        assert row.state == State.RE_ADDING, "a park never changes state"
+        assert (row.last_error or "").startswith("parked: fuse lag")
+        assert row.readd_next_retry_at is not None
+        assert (row.readd_next_retry_at - before).total_seconds() >= 110
+    finally:
+        store.close()
+
+
+def test_park_readd_clears_the_timer_when_healed(tmp_path):
+    import datetime as dt
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        ts = TorrentState(
+            source_infohash="b" * 40,
+            source_name="Show",
+            state=State.RE_ADDING,
+            readd_next_retry_at=dt.datetime.now(dt.UTC) + dt.timedelta(hours=1),
+        )
+        store.upsert(ts)
+
+        assert coord._park_readd(ts, "healed bytes moved", delay_s=None) is True
+
+        row = store.get("b" * 40, include_blob=False)
+        assert row.readd_next_retry_at is None
+    finally:
+        store.close()
