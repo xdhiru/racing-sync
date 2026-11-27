@@ -378,3 +378,30 @@ async def test_heal_restores_preheal_dest_pointer(tmp_path):
         coord.dest_client.delete.assert_awaited_once_with(blob_hash, delete_files=False)
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_unmounted_fuse_parks_instead_of_injecting(tmp_path, monkeypatch):
+    """An empty non-mountpoint mount must park, never inject blind (E1).
+
+    Every expected file stats "missing" under an unmounted mountpoint, so
+    the gate would otherwise treat the absence as content drift (or, on a
+    lax path, inject a torrent pointing at nothing).
+    """
+    from racing_sync import fuse_gate
+
+    coord, store, _blob, _h, _ssd, _fuse = _scaffold(tmp_path)
+    try:
+        monkeypatch.setattr(fuse_gate, "mount_is_mounted", lambda _m: False)
+        await coord._do_re_add(store.get("c" * 40))
+
+        row = store.get("c" * 40)
+        assert row.state == State.RE_ADDING
+        assert row.readd_next_retry_at is not None
+        assert "not yet available" in (row.last_error or "")
+        coord.dest_client.add_torrent.assert_not_called()
+        coord._rclone_move.assert_not_called()
+        # An outage must not start (or keep) a sustained-missing heal clock.
+        assert not getattr(coord, "_readd_heal_track", {})
+    finally:
+        store.close()

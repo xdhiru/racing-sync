@@ -786,3 +786,26 @@ async def test_dry_run_heals_in_memory_only(tmp_path: Path, caplog):
     # ...but persists nothing: no blob, no stamp.
     assert not store.get_blob(pub)
     assert store.get(pub).fuse_verified == 0
+
+
+@pytest.mark.anyio
+async def test_fuse_health_unmounted_mount_keeps_vps1(tmp_path, monkeypatch):
+    """An empty non-mountpoint "mount" is an outage: keep the VPS1 copy (E1)."""
+    from racing_sync import fuse_gate
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        (tmp_path / "ssd").mkdir()
+        cfg = _base_cfg(tmp_path / "ssd")
+        h = "a" * 40
+        _row(store, h, State.DONE, 30, None, h)
+        _healthy_fuse(tmp_path, store, [h], cfg)
+        coord = _make_coord(tmp_path / "ssd", store, None, _FakeDest([h]), cfg)
+
+        monkeypatch.setattr(fuse_gate, "mount_is_mounted", lambda _m: False)
+        healthy = await coord._cleanup_fuse_healthy(store.get(h), dry_run=False)
+
+        assert healthy is False, "an unmounted mount must never clear VPS1"
+        assert store.get(h, include_blob=False).fuse_verified == 0
+    finally:
+        store.close()
