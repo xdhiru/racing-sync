@@ -2279,38 +2279,13 @@ class MoveMixin:
         # next tick replays the delete only. Same for the cleanup below �?"
         # a fully-moved row must not FAILED over a releasable handle
         # (Windows open-handle): park and retry from the checkpoint.
-        try:
-            await self.dest_client.delete(h, delete_files=False)
-        except Exception as e:  # noqa: BLE001
-            log.warning("could not delete old torrent from client after move: %s", e)
-            self._park_moving(
-                ts,
-                f"client entry delete failed after move ({e}); staying in "
-                f"MOVING with checkpoint 'moved'",
-            )
-            return
-        if not self._persist_move_stage(ts, _MOVE_STAGE_ENTRY_DELETED):
-            self._park_moving(
-                ts,
-                "could not persist move checkpoint 'entry_deleted'; staying "
-                "in MOVING without cleaning up",
-            )
-            return
-
-        # 10. Delete local content on SSD; checkpoint 'wiped' only when the
-        # cleanup is fully done (partial wipes stay at 'entry_deleted').
-        if not await self._cleanup_move_checkpoint(ts):
-            return
-        if not self._persist_move_stage(ts, _MOVE_STAGE_WIPED):
-            self._park_moving(
-                ts,
-                "could not persist move checkpoint 'wiped'; staying at "
-                "entry_deleted without advancing",
-            )
-            return
-
-        self._finish_moving_tracking(ts)
-        self.transition(ts, State.RE_ADDING)
+        #
+        # 9-10. The persisted 'moved' checkpoint is now the single entry
+        # point for the destructive remainder: delete the client entry →
+        # 'entry_deleted' → wipe SSD → 'wiped' → RE_ADDING. A fresh run and
+        # a crash-resumed run therefore execute the same code (I8) instead
+        # of two near-duplicate sequences that could drift apart.
+        await self._replay_move_checkpoint(ts, _MOVE_STAGE_MOVED)
 
     async def _wipe_folder_except(self, folder: Path, keep: set[str], src_dir: Path) -> bool:
         """Wipe a moved folder but spare foreign (oversized) files.

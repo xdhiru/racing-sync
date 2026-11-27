@@ -1479,6 +1479,50 @@ async def test_do_moving_skips_move_when_already_batched(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_do_moving_fresh_run_uses_the_checkpoint_replay(tmp_path):
+    """A fresh move funnels into the same replay routine a crash resumes (I8)."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from racing_sync.state import State, TorrentState
+
+    coord = make_coordinator()
+    coord._stop = False
+    coord.transition = MagicMock(side_effect=lambda ts, s: setattr(ts, "state", s))
+    coord.cfg = MagicMock()
+    coord.cfg.dest.save_path = tmp_path
+    coord.dest_client = MagicMock()
+    coord.dest_client.get_torrent_files = AsyncMock(return_value=[])
+    coord.dest_client.pause = AsyncMock()
+    coord.dest_client.get_torrent = AsyncMock(return_value=_paused_torrent())
+    coord.dest_client.delete = AsyncMock()
+    coord._rclone_move = AsyncMock()
+    seen: list[str] = []
+    _orig_replay = coord._replay_move_checkpoint
+
+    async def _spy(row, stage):
+        seen.append(stage)
+        return await _orig_replay(row, stage)
+
+    coord._replay_move_checkpoint = _spy
+
+    ts = TorrentState(
+        source_infohash="hash1",
+        source_name="Show.S01",
+        classification_kind="season",
+        batches_total=2,  # batches already moved during downloading
+        batch_index=2,
+        state=State.MOVING,
+    )
+
+    with patch("racing_sync.coordinator.classify") as mock_classify:
+        mock_classify.return_value = MagicMock(kind="season")
+        await coord._do_moving(ts)
+
+    assert seen == ["moved"], "the fresh path must not duplicate steps 9-10"
+    assert ts.state == State.RE_ADDING
+
+
+@pytest.mark.anyio
 async def test_do_moving_purges_only_own_temp_files_when_no_season_folder(tmp_path):
     from unittest.mock import AsyncMock, MagicMock, patch
 
