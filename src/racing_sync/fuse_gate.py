@@ -25,6 +25,11 @@ log = logging.getLogger(__name__)
 #: change how pathlib picks its flavour).
 _POSIX = os.name == "posix"
 
+#: Budget for one fuse availability probe (stat every expected file). A
+#: dead or wedged mount must not hang the worker: the timeout is reported
+#: as "unverifiable", so callers park instead of deleting.
+_FUSE_CHECK_TIMEOUT_S = 30.0
+
 
 def mount_is_mounted(mount: Path | str) -> bool:
     """True when `mount` is really mounted (POSIX) or unknowable (elsewhere).
@@ -129,7 +134,12 @@ async def missing_under(
             return missing
 
         try:
-            return await asyncio.to_thread(_check)
+            from .io_bounds import offload
+
+            # Bounded: a wedged mount would otherwise hang the gate (and
+            # the worker behind it) forever. A timeout is "unverifiable",
+            # which every caller already treats as "park, never delete".
+            return await offload(_check, timeout=_FUSE_CHECK_TIMEOUT_S)
         except Exception as e:  # noqa: BLE001
             log.warning("fuse_gate: availability check failed for %s: %s", mount, e)
             return None

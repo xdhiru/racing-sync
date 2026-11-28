@@ -37,6 +37,11 @@ _PRUNE_THROTTLE_S = 10.0
 # Entries younger than this window are left alone.
 _RESERVATION_GRACE_S = 60.0
 
+# Budget for the physical free-space probe (disk_usage on the SSD path).
+# A wedged mount must not hang the admission path: the timeout falls into
+# the existing "check unavailable" branch, which refuses the grow.
+_DISK_USAGE_TIMEOUT_S = 15.0
+
 # Keep the historic logger name so log output is unchanged by the split.
 log = logging.getLogger("racing_sync.coordinator")
 
@@ -566,7 +571,7 @@ class SSDLedgerMixin:
                     from . import coordinator as _c
                     from .io_bounds import offload as _offload
 
-                    await _offload(_shutil.disk_usage, str(_sp))
+                    await _offload(_shutil.disk_usage, str(_sp), timeout=_DISK_USAGE_TIMEOUT_S)
                     _room_ok = _c.ssd_has_room(self.cfg, res_total_pre - _old_pre + new_amount)
             except Exception as e:
                 log.warning("ssd grow physical check unavailable (%s); refusing grow", e)

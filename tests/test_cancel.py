@@ -3493,3 +3493,25 @@ def test_resolve_group_token_shared_ladder(tmp_path):
         assert by_number is False
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_force_direct_is_cleared_when_a_row_reaches_a_terminal_state(tmp_path: Path):
+    """A revived FAILED row must re-query Prowlarr, not keep the direct flag (D8)."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        coord = make_coordinator(store)
+        ts = TorrentState(
+            source_infohash="a" * 40,
+            source_name="Show",
+            state=State.WAITING_INDEXER,
+            force_direct=1,
+        )
+        store.upsert(ts)
+
+        coord.transition(ts, State.FAILED, error="boom")
+
+        assert store.get("a" * 40).force_direct == 0
+        assert ts.force_direct == 0
+    finally:
+        store.close()

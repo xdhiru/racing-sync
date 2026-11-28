@@ -2686,6 +2686,29 @@ class Coordinator(
         except Exception:
             return False
 
+    def _clear_force_direct(self, ts: TorrentState, dst: State) -> None:
+        """Drop the sticky "skip Prowlarr" flag once a row is terminal (D8).
+
+        `force_direct` (set by Telegram `/now_` or a prowlarr-timeout
+        fallback) must not outlive the attempt it was meant for: a row
+        revived by the auto-retry path would otherwise keep bypassing
+        Prowlarr forever. The operator can re-issue `/now_` if the direct
+        source is still wanted.
+        """
+        try:
+            if not getattr(ts, "force_direct", 0):
+                return
+            ts.force_direct = 0
+            _up = getattr(self.store, "update_columns", None)
+            if callable(_up):
+                _nv = _up(ts.source_infohash, {"force_direct": 0}, expected_state=dst)
+                if isinstance(_nv, int) and _nv > 0:
+                    ts.version = _nv
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "could not clear force_direct for %s: %s", (ts.source_infohash or "")[:10], e
+            )
+
     async def find_release(
         self,
         query: str,
@@ -2778,6 +2801,7 @@ class Coordinator(
         self.store.transition(ts, dst, error=error, batch_index=batch_index)
         if dst in (State.DONE, State.FAILED):
             self._drop_frozen_batch_cap(ts)
+            self._clear_force_direct(ts, dst)
         if dst != State.WAITING_DISK:
             try:
                 _wd = getattr(self, "_waiting_disk_next_check", None)

@@ -105,3 +105,24 @@ async def test_bounded_labels_its_own_deadline():
 
     with pytest.raises(TimeoutError, match="read timed out"):
         await bounded(_slow(), timeout=0.01, label="read")
+
+
+@pytest.mark.anyio
+async def test_offload_timeout_bounds_a_wedged_call():
+    """A wedged disk call must not hang the caller forever (G21)."""
+    import time
+
+    def _wedged():
+        time.sleep(5)
+        return "never"
+
+    with pytest.raises(TimeoutError, match="offload"):
+        await offload(_wedged, timeout=0.05)
+
+
+@pytest.mark.anyio
+async def test_offload_without_timeout_still_waits():
+    def _quick(a, b=0):
+        return a + b
+
+    assert await offload(_quick, 1, b=2) == 3

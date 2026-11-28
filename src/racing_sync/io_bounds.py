@@ -87,9 +87,27 @@ async def bounded(
         raise TimeoutError(f"{label} timed out after {seconds:.0f}s") from e
 
 
-async def offload(fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
-    """Run a blocking sync call in a worker thread."""
-    return await asyncio.to_thread(fn, *args, **kwargs)
+async def offload(
+    fn: Callable[..., T],
+    /,
+    *args: Any,
+    timeout: float | None = None,  # noqa: ASYNC109 (bounded() enforces the deadline)
+    **kwargs: Any,
+) -> T:
+    """Run a blocking sync call in a worker thread.
+
+    `timeout` bounds the wait: a wedged disk (a dead network mount, a
+    stuck filesystem call) otherwise hangs the caller forever, and no
+    caller can give up. The thread itself cannot be cancelled — on
+    timeout it is abandoned (it ends on its own or dies with the
+    process) and the caller gets a labeled TimeoutError, so every
+    caller must treat that as "unknown" and fail closed.
+    """
+    call = asyncio.to_thread(fn, *args, **kwargs)
+    if timeout is None:
+        return await call
+    label = f"offload {getattr(fn, '__name__', 'call')}"
+    return await bounded(call, timeout=timeout, label=label)
 
 
 async def rpc(awaitable: Awaitable[T], cfg: object | None, label: str) -> T:
