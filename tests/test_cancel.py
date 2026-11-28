@@ -1041,7 +1041,7 @@ def test_resolve_fetch_target_requires_waiting(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_chat_message_fetch_flags_and_wakes_row(tmp_path: Path):
-    """Sending `/fetch_<short>` sets force_direct and marks the timer due."""
+    """Sending `/start_<short>` sets force_direct and marks the timer due."""
     import datetime as dt
 
     store = StateStore(tmp_path / "state.db")
@@ -1057,7 +1057,7 @@ async def test_chat_message_fetch_flags_and_wakes_row(tmp_path: Path):
     bot._coord = MagicMock()
     bot._store = store
     try:
-        await bot._handle_chat_message(_message(text="/fetch_aaaaaaaaaa"))
+        await bot._handle_chat_message(_message(text="/start_aaaaaaaaaa"))
         row = store.get("a" * 40)
         assert row.force_direct == 1
         assert row.state == State.WAITING_INDEXER
@@ -1089,7 +1089,7 @@ async def test_chat_message_fetch_opens_fresh_direct_window(tmp_path: Path):
     bot._coord = MagicMock()
     bot._store = store
     try:
-        await bot._handle_chat_message(_message(text="/fetch_eeeeeeeeee"))
+        await bot._handle_chat_message(_message(text="/start_eeeeeeeeee"))
         row = store.get("e" * 40)
         assert row.force_direct == 1
         assert row.state == State.WAITING_INDEXER
@@ -1117,7 +1117,7 @@ async def test_group_now_singleton_executes_immediately(tmp_path: Path):
     bot._coord = MagicMock()
     bot._store = store
     try:
-        await bot._handle_chat_message(_message(text="/fetch_1"))
+        await bot._handle_chat_message(_message(text="/start_1"))
         row = store.get("a" * 40)
         assert row.force_direct == 1
         sent = bot._bot.send_message.call_args[0][1]
@@ -1152,7 +1152,7 @@ async def test_group_now_multi_offers_per_copy_start_buttons(tmp_path: Path):
     bot._coord = MagicMock()
     bot._store = store
     try:
-        await bot._handle_chat_message(_message(text="/now_1"))
+        await bot._handle_chat_message(_message(text="/start_1"))
         assert store.get("a" * 40).force_direct == 0  # nothing started yet
         _kwargs = bot._bot.send_message.call_args[1]
         _labels = [b.text for r in _kwargs["reply_markup"].inline_keyboard for b in r]
@@ -1191,11 +1191,7 @@ def test_keepq_text_shows_size_or_omits():
 
 
 def test_chat_command_registry_covers_all_verbs():
-    """Registry: unique names, valid handlers, mutually exclusive patterns.
-
-    One entry per verb: each pattern accepts the canonical space form,
-    the legacy underscore form and the old verb spellings.
-    """
+    """One entry per verb; both separators; the old spellings are gone."""
     from racing_sync.telegram_bot import _CHAT_COMMANDS
 
     names = [c.name for c in _CHAT_COMMANDS]
@@ -1205,40 +1201,30 @@ def test_chat_command_registry_covers_all_verbs():
         assert callable(c.handle)
     cases = {
         "/add": ["add"],
-        # canonical (space) and legacy (underscore) target forms
+        # Every target-taking verb accepts a space and an underscore.
         "/cancel abc123": ["cancel"],
         "/cancel_abc123": ["cancel"],
-        "/cancel_all evil show": ["cancel_all"],
-        "/cancel_match evil show": ["cancel_all"],
-        "/cancel_all": ["cancel_all"],
-        "/cancel_match": ["cancel_all"],
         "/cancel": ["cancel_lane"],
         "/cancel_lane": ["cancel_lane"],
-        "/cancel_status": ["cancel_lane"],
+        "/cancel_all evil show": ["cancel_all"],
+        "/cancel_all": ["cancel_all"],
         "/cancel_stalled": ["cancel_stalled"],
         "/start abcdef12": ["start"],
-        "/now_abcdef12": ["start"],
-        "/fetch_abc123": ["start"],
-        "/prefer_1": ["start"],
+        "/start_abcdef12": ["start"],
         "/force abcdef12": ["force"],
-        "/forcestart_abcdef12": ["force"],
-        "/forcestart_1": ["force"],
+        "/force_abcdef12": ["force"],
         "/hold abc123": ["hold"],
-        "/skip_3": ["hold"],
+        "/hold_3": ["hold"],
         "/unhold abc123": ["unhold"],
-        "/unskip_abc123": ["unhold"],
-        "/resume_abc123": ["unhold"],
+        "/unhold_abc123": ["unhold"],
         "/unignore abc123": ["unignore"],
         "/unignore_abc123": ["unignore"],
         "/inject abc123": ["inject"],
-        "/injectfuse_2": ["inject"],
-        "/injectfuse abc123": ["inject"],
+        "/inject_2": ["inject"],
         "/act 1": ["act"],
         "/act_1": ["act"],
         "/pause": ["pause"],
-        "/pause_intake": ["pause"],
         "/resume": ["resume"],
-        "/resume_intake": ["resume"],
         "/tick": ["tick"],
         "/active": ["active"],
         "/stats": ["stats"],
@@ -1256,24 +1242,34 @@ def test_chat_command_registry_covers_all_verbs():
         "/cancel_xyz",
         "/cancel_",
         "/act_",
-        "/now_",
         "/start_",
-        "/forcestart_",
-        "/forcestartx",
-        "/cancel_statusx",
-        "/cancel_allx",
-        "/cancel_match_foo",
-        "/cancel_stalledx",
-        "/pause_intakex",
-        "/statsx",
-        "/findx",
-        "/files_",
+        "/force_",
         "/hold_",
         "/unhold_",
         "/inject_",
-        "/resume_",
+        "/files_",
+        "/cancel_lanex",
+        "/cancel_allx",
+        "/cancel_stalledx",
+        "/pausex",
+        "/statsx",
+        "/findx",
         "",
         "/activex",
+        # Removed spellings: they must not resolve to anything.
+        "/now_abc123",
+        "/fetch_abc123",
+        "/prefer_1",
+        "/forcestart_1",
+        "/skip_3",
+        "/unskip_abc123",
+        "/resume_abc123",
+        "/injectfuse_2",
+        "/injectfuse abc123",
+        "/cancel_match evil show",
+        "/cancel_status",
+        "/pause_intake",
+        "/resume_intake",
     ):
         assert [c.name for c in _CHAT_COMMANDS if c.pattern.match(text)] == [], text
 
@@ -1360,7 +1356,7 @@ async def test_cancel_status_menu_lists_lanes():
         TorrentState(source_infohash="c" * 40, source_name="Mv", state=State.MOVING),
     ]
     bot._reply = AsyncMock()
-    await bot._handle_chat_message(_message(text="/cancel_status"))
+    await bot._handle_chat_message(_message(text="/cancel_lane"))
     assert bot._bot.send_message.await_count == 1
     _kwargs = bot._bot.send_message.call_args[1]
     _data = [b.callback_data for r in _kwargs["reply_markup"].inline_keyboard for b in r]
@@ -1374,7 +1370,7 @@ async def test_cancel_status_menu_empty_replies():
     bot = _bot()
     bot._store.list_active_inflight.return_value = []
     bot._reply = AsyncMock()
-    await bot._cancel_status_command_entry(_message(text="/cancel_status"))
+    await bot._cancel_status_command_entry(_message(text="/cancel_lane"))
     bot._reply.assert_awaited_once()
     assert "Nothing live" in bot._reply.call_args[0][0]
 
@@ -1419,11 +1415,11 @@ async def test_ops_pause_and_resume_intake():
     """Pause/resume flip the coordinator flag and confirm in chat."""
     bot = _bot()
     bot._coord = MagicMock()
-    await bot._handle_chat_message(_message(text="/pause_intake"))
+    await bot._handle_chat_message(_message(text="/pause"))
     bot._coord.set_intake_paused.assert_called_once_with(True)
     assert "paused" in bot._bot.send_message.call_args[0][1]
     bot._callback_times.clear()
-    await bot._handle_chat_message(_message(text="/resume_intake"))
+    await bot._handle_chat_message(_message(text="/resume"))
     bot._coord.set_intake_paused.assert_called_with(False)
     assert "resumed" in bot._bot.send_message.call_args[0][1]
 
@@ -1683,7 +1679,7 @@ async def test_chat_message_fetch_rejects_non_waiting(tmp_path: Path):
     bot._coord = MagicMock()
     bot._store = store
     try:
-        await bot._handle_chat_message(_message(text="/fetch_bbbbbbbbbb"))
+        await bot._handle_chat_message(_message(text="/start_bbbbbbbbbb"))
         row = store.get("b" * 40)
         assert row.force_direct == 0
         assert row.state == State.DOWNLOADING
@@ -1844,7 +1840,7 @@ def test_resolve_fetch_target_allows_new_grace(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_chat_message_skip_and_unskip_full_hash(tmp_path: Path):
-    """/skip_<hash> holds the row; /unskip_<hash> resumes + wakes a worker."""
+    """/hold_<hash> holds the row; /unhold_<hash> resumes + wakes a worker."""
     store = StateStore(tmp_path / "state.db")
     store.upsert(
         TorrentState(source_infohash="a" * 40, source_name="Show", state=State.WAITING_INDEXER)
@@ -1853,13 +1849,13 @@ async def test_chat_message_skip_and_unskip_full_hash(tmp_path: Path):
     bot._coord = MagicMock()
     bot._store = store
     try:
-        await bot._handle_chat_message(_message(text="/skip_" + "a" * 40))
+        await bot._handle_chat_message(_message(text="/hold_" + "a" * 40))
         assert store.get("a" * 40).skipped == 1
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Skipped")
 
         bot._callback_times.clear()
-        await bot._handle_chat_message(_message(text="/unskip_" + "a" * 40))
+        await bot._handle_chat_message(_message(text="/unhold_" + "a" * 40))
         assert store.get("a" * 40).skipped == 0
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Resumed")
@@ -1870,7 +1866,7 @@ async def test_chat_message_skip_and_unskip_full_hash(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_chat_message_resume_group_unholds_and_lifts(tmp_path: Path):
-    """/resume_1 resumes held copies and lifts their ignore entries."""
+    """/unhold_1 resumes held copies and lifts their ignore entries."""
     store = StateStore(tmp_path / "state.db")
     store.upsert(
         TorrentState(
@@ -1895,7 +1891,7 @@ async def test_chat_message_resume_group_unholds_and_lifts(tmp_path: Path):
     bot._coord = MagicMock()
     bot._store = store
     try:
-        await bot._handle_chat_message(_message(text="/resume_1"))
+        await bot._handle_chat_message(_message(text="/unhold_1"))
         assert store.get("a" * 40).skipped == 0
         assert store.get("b" * 40).skipped == 0
         assert store.is_ignored("b" * 40) is False
@@ -1908,14 +1904,14 @@ async def test_chat_message_resume_group_unholds_and_lifts(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_chat_message_resume_ignored_only_hash(tmp_path: Path):
-    """/resume_<hash> on an ignored-only hash lifts it (unignore parity)."""
+    """/unhold_<hash> on an ignored-only hash lifts it (unignore parity)."""
     store = StateStore(tmp_path / "state.db")
     store.ignore_torrent("c" * 40, "Gone")
     bot = _bot()
     bot._coord = MagicMock()
     bot._store = store
     try:
-        await bot._handle_chat_message(_message(text="/resume_" + "c" * 40))
+        await bot._handle_chat_message(_message(text="/unhold_" + "c" * 40))
         assert store.is_ignored("c" * 40) is False
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Unignored")
@@ -1925,7 +1921,7 @@ async def test_chat_message_resume_ignored_only_hash(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_chat_message_skip_group_number(tmp_path: Path):
-    """/skip_1 holds every copy in the group at once."""
+    """/hold_1 holds every copy in the group at once."""
     store = StateStore(tmp_path / "state.db")
     store.upsert(
         TorrentState(
@@ -1944,7 +1940,7 @@ async def test_chat_message_skip_group_number(tmp_path: Path):
     bot._coord = MagicMock()
     bot._store = store
     try:
-        await bot._handle_chat_message(_message(text="/skip_1"))
+        await bot._handle_chat_message(_message(text="/hold_1"))
         assert store.get("a" * 40).skipped == 1
         assert store.get("b" * 40).skipped == 1
         sent = bot._bot.send_message.call_args[0][1]
@@ -1974,7 +1970,7 @@ async def test_chat_message_skip_single_hash_holds_whole_group(tmp_path: Path):
     bot._coord = MagicMock()
     bot._store = store
     try:
-        await bot._handle_chat_message(_message(text="/skip_" + "a" * 40))
+        await bot._handle_chat_message(_message(text="/hold_" + "a" * 40))
         assert store.get("a" * 40).skipped == 1
         assert store.get("b" * 40).skipped == 1
         sent = bot._bot.send_message.call_args[0][1]
@@ -2003,7 +1999,7 @@ async def test_fetch_torrent_refuses_held_row(tmp_path: Path):
 
 
 def test_render_active_shows_skip_and_unskip():
-    """Held rows get /resume_N + ⏭; running rows get /skip_N."""
+    """Held rows get /unhold_N + ⏭; running rows get /hold_N."""
     from racing_sync.telegram_bot import render_active
 
     held = TorrentState(
@@ -2047,7 +2043,7 @@ def test_member_labels_include_held_but_eligibility_skips_them():
 
 
 def test_render_detail_shows_held_resume():
-    """Held detail cards carry the /resume_ line."""
+    """Held detail cards carry the /unhold_ line."""
     from racing_sync.telegram_bot import render_detail
 
     ts = TorrentState(
@@ -2124,7 +2120,7 @@ async def test_chat_command_double_tap_debounced(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_chat_message_prefer_starts_grace_held_row(tmp_path: Path):
-    """`/prefer_<hash>` (legacy alias of `/now_`) starts a grace-held drop."""
+    """`/start_<hash>` (legacy alias of `/start_`) starts a grace-held drop."""
     from conftest import make_coordinator
 
     store = StateStore(tmp_path / "state.db")
@@ -2149,7 +2145,7 @@ async def test_chat_message_prefer_starts_grace_held_row(tmp_path: Path):
         bot = _bot()
         bot._coord = coord
         bot._store = store
-        await bot._handle_chat_message(_message(text=f"/prefer_{'e' * 40}"))
+        await bot._handle_chat_message(_message(text=f"/start_{'e' * 40}"))
         bot._bot.send_message.assert_awaited_once()
         sent = bot._bot.send_message.call_args[0][1]
         assert sent.startswith("Using dropped .torrent directly for")
@@ -2160,7 +2156,7 @@ async def test_chat_message_prefer_starts_grace_held_row(tmp_path: Path):
         # (Clear the debounce so the second command is processed.)
         bot._callback_times.clear()
         bot._bot.send_message.reset_mock()
-        await bot._handle_chat_message(_message(text="/prefer_dddddddddd"))
+        await bot._handle_chat_message(_message(text="/start_dddddddddd"))
         bot._bot.send_message.assert_awaited_once()
     finally:
         store.close()
@@ -2168,7 +2164,7 @@ async def test_chat_message_prefer_starts_grace_held_row(tmp_path: Path):
 
 @pytest.mark.anyio
 async def test_chat_message_now_starts_waiting_and_grace_rows(tmp_path: Path):
-    """`/now_<hash>` unites fetch+prefer: WAITING rows and grace rows start."""
+    """`/start_<hash>` unites fetch+prefer: WAITING rows and grace rows start."""
     from conftest import make_coordinator
 
     store = StateStore(tmp_path / "state.db")
@@ -2190,7 +2186,7 @@ async def test_chat_message_now_starts_waiting_and_grace_rows(tmp_path: Path):
         bot = _bot()
         bot._coord = coord
         bot._store = store
-        await bot._handle_chat_message(_message(text=f"/now_{'f' * 40}"))
+        await bot._handle_chat_message(_message(text=f"/start_{'f' * 40}"))
         row = store.get("f" * 40)
         assert row.force_direct == 1
         assert row.indexer_attempts == 0
@@ -2488,7 +2484,7 @@ async def test_chat_message_unignore_space_form(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# /cancel_match bulk cancel (substring over live group titles)
+# /cancel_all bulk cancel (substring over live group titles)
 # ---------------------------------------------------------------------------
 
 
@@ -2524,7 +2520,7 @@ def _match_bot(tmp_path: Path, rows):
 
 @pytest.mark.anyio
 async def test_cancel_match_bulk_forgets_matched_groups_only(tmp_path: Path):
-    """/cancel_match evil → Q1 remember → Q2 keep/delete → matched gone."""
+    """/cancel_all evil → Q1 remember → Q2 keep/delete → matched gone."""
     _root = tmp_path / "ssd"
     bot, store, _ssd = _match_bot(
         tmp_path,
@@ -2560,7 +2556,7 @@ async def test_cancel_match_bulk_forgets_matched_groups_only(tmp_path: Path):
         ],
     )
     try:
-        await bot._handle_chat_message(_message(text="/cancel_match evil"))
+        await bot._handle_chat_message(_message(text="/cancel_all evil"))
         _data = _sheet_data(bot)
         _forget = sorted(d for d in _data if d.startswith("forget:match:"))
         assert _forget == [d for d in _forget if d.endswith((":1", ":0"))]
@@ -2598,7 +2594,7 @@ async def test_cancel_match_reresolves_between_questions(tmp_path: Path):
         ],
     )
     try:
-        await bot._handle_chat_message(_message(text="/cancel_match evil"))
+        await bot._handle_chat_message(_message(text="/cancel_all evil"))
         _tok = next(d.split(":")[2] for d in _sheet_data(bot) if d.startswith("forget:match:"))
         await bot._handle_callback(_query(f"forget:match:{_tok}:0"))
         # Sibling flow removes one group before the keep tap.
@@ -2626,7 +2622,7 @@ async def test_cancel_match_single_copy_uses_normal_sheet(tmp_path: Path):
         ],
     )
     try:
-        await bot._handle_chat_message(_message(text="/cancel_match only"))
+        await bot._handle_chat_message(_message(text="/cancel_all only"))
         _data = _sheet_data(bot)
         assert f"forget:{'a' * 40}:1" in _data
         assert not any(d.startswith("forget:match:") for d in _data)
@@ -2644,16 +2640,16 @@ async def test_cancel_match_no_match_short_and_long(tmp_path: Path):
         ],
     )
     try:
-        await bot._handle_chat_message(_message(text="/cancel_match zzz-nope"))
+        await bot._handle_chat_message(_message(text="/cancel_all zzz-nope"))
         assert "No active groups match" in bot._bot.send_message.call_args[0][1]
         bot._callback_times.clear()
-        await bot._handle_chat_message(_message(text="/cancel_match"))
+        await bot._handle_chat_message(_message(text="/cancel_all"))
         assert "/cancel_all <text>" in bot._bot.send_message.call_args[0][1]
         bot._callback_times.clear()
-        await bot._handle_chat_message(_message(text="/cancel_match e"))
+        await bot._handle_chat_message(_message(text="/cancel_all e"))
         assert "/cancel_all <text>" in bot._bot.send_message.call_args[0][1]
         bot._callback_times.clear()
-        await bot._handle_chat_message(_message(text="/cancel_match " + "x" * 36))
+        await bot._handle_chat_message(_message(text="/cancel_all " + "x" * 36))
         assert "too long" in bot._bot.send_message.call_args[0][1]
     finally:
         store.close()

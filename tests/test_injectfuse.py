@@ -17,8 +17,7 @@ from conftest import make_coordinator
 from racing_sync.clients.abstract import Torrent
 from racing_sync.state import ALLOWED, State, StateStore, TorrentState
 from racing_sync.telegram_bot import (
-    INJECTFUSE_CMD_RE,
-    INJECTFUSE_HASH_RE,
+    INJECT_CMD_RE,
     TelegramBot,
 )
 from racing_sync.watchdir import _bencode
@@ -396,12 +395,12 @@ async def test_confirmed_done_noop(tmp_path):
 
 def test_regexes():
     # One verb, both separators: "/inject 3" (typed) and "/inject_3".
-    assert INJECTFUSE_CMD_RE.match("/injectfuse_3")
-    assert INJECTFUSE_CMD_RE.match("/injectfuse_" + H1)
-    assert INJECTFUSE_CMD_RE.match("/injectfuse " + H1)
-    assert INJECTFUSE_CMD_RE.match("/inject " + H1)
-    assert INJECTFUSE_HASH_RE.match("/injectfuse " + H1)
-    assert INJECTFUSE_HASH_RE.match("/injectfuse  " + H1.upper())
+    assert INJECT_CMD_RE.match("/inject_3")
+    assert INJECT_CMD_RE.match("/inject_" + H1)
+    assert INJECT_CMD_RE.match("/inject " + H1)
+    assert INJECT_CMD_RE.match("/inject  " + H1.upper())
+    # The old spelling is gone.
+    assert not INJECT_CMD_RE.match("/injectfuse_" + H1)
 
 
 def test_no_pending_machine_left():
@@ -436,7 +435,7 @@ async def test_chat_hash_unknown_replies(tmp_path):
                 chat=SimpleNamespace(id="1"),
                 from_user=SimpleNamespace(id="9"),
                 message_id=51,
-                text=f"/injectfuse {H1}",
+                text=f"/inject {H1}",
                 caption=None,
                 document=None,
                 reply_to_message=None,
@@ -464,7 +463,7 @@ async def test_chat_hash_arms_question(tmp_path):
                 chat=SimpleNamespace(id="1"),
                 from_user=SimpleNamespace(id="9"),
                 message_id=51,
-                text=f"/injectfuse {H1}",
+                text=f"/inject {H1}",
                 caption=None,
                 document=None,
                 reply_to_message=None,
@@ -481,7 +480,7 @@ async def test_chat_hash_arms_question(tmp_path):
 
 @pytest.mark.anyio
 async def test_group_number_arms_question(tmp_path):
-    """`/injectfuse_1` on a listed waiting group asks Yes/No, changes nothing."""
+    """`/inject_1` on a listed waiting group asks Yes/No, changes nothing."""
     coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     try:
         coord.store.upsert(
@@ -495,7 +494,7 @@ async def test_group_number_arms_question(tmp_path):
             chat=SimpleNamespace(id="1"),
             from_user=SimpleNamespace(id="9"),
             message_id=51,
-            text="/injectfuse_1",
+            text="/inject_1",
             caption=None,
             document=None,
             reply_to_message=None,
@@ -513,7 +512,7 @@ async def test_group_number_arms_question(tmp_path):
 
 @pytest.mark.anyio
 async def test_underscore_hash_tracked_arms_question(tmp_path):
-    """/injectfuse_<full-hash> on a tracked row resolves like the hash form."""
+    """/inject_<full-hash> on a tracked row resolves like the hash form."""
     coord, _, _fuse = _coord(tmp_path, [_torrent(H1, TRACKER1)])
     try:
         coord.store.upsert(
@@ -527,7 +526,7 @@ async def test_underscore_hash_tracked_arms_question(tmp_path):
             chat=SimpleNamespace(id="1"),
             from_user=SimpleNamespace(id="9"),
             message_id=51,
-            text=f"/injectfuse_{H1}",
+            text=f"/inject_{H1}",
             caption=None,
             document=None,
             reply_to_message=None,
@@ -637,7 +636,7 @@ async def test_group_question_names_live_vps1_count(tmp_path):
             chat=SimpleNamespace(id="1"),
             from_user=SimpleNamespace(id="9"),
             message_id=51,
-            text="/injectfuse_1",
+            text="/inject_1",
             caption=None,
             document=None,
             reply_to_message=None,
@@ -669,7 +668,7 @@ async def test_group_question_falls_back_when_vps1_gone(tmp_path):
             chat=SimpleNamespace(id="1"),
             from_user=SimpleNamespace(id="9"),
             message_id=51,
-            text="/injectfuse_1",
+            text="/inject_1",
             caption=None,
             document=None,
             reply_to_message=None,

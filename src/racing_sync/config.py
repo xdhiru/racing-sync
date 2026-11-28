@@ -647,7 +647,7 @@ class TelegramConfig(BaseModel):
     chat_id: str = ""
     # Destructive-command allowlist (Telegram user ids). Empty (default)
     # preserves today's behavior: anyone in the authorized chat may run
-    # /cancel_//fetch_//prefer_ and tap the buttons. Non-empty restricts
+    # /cancel and tap the buttons. Non-empty restricts
     # commands AND button taps to these users; other chat members get a
     # "not authorized" reply. Pending flows additionally bind to the
     # commanding user, so one operator cannot tap another's picker.
@@ -1120,7 +1120,7 @@ class CrossSeedConfig(BaseModel):
     # .torrent (SFTP / export endpoint) for the SSD download instead of
     # FAILED. VPS2 then leeches the private swarm, which counts toward
     # ratio — opt in deliberately. Default false (fail for manual handling).
-    # A Telegram /fetch_<hash> command triggers the same fallback on
+    # A Telegram /start_<hash> command triggers the same fallback on
     # demand for a WAITING_INDEXER row without needing this flag.
     fallback_to_racing_torrent_on_prowlarr_timeout: bool = False
 

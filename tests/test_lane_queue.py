@@ -186,5 +186,6 @@ def test_forcestart_command_registered():
     assert "force" in names
     row = next(c for c in _CHAT_COMMANDS if c.name == "force")
     assert row.pattern.match("/force " + "a" * 40)
-    assert row.pattern.match("/forcestart_" + "a" * 40)
+    assert row.pattern.match("/force_" + "a" * 40)
     assert not row.pattern.match("/start " + "a" * 40)
+    assert not row.pattern.match("/forcestart_" + "a" * 40)

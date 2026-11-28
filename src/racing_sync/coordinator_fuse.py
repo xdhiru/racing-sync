@@ -1395,7 +1395,7 @@ class FuseMixin:
 
         Returns (ok, detail). Never raises for client rejections; callers
         apply their own retry/fail policy. Exact add kwargs are kept stable
-        for the seeding contract (category/tags/skip_check) apart from the
+        for the seeding contract (category/tags/hold_check) apart from the
         paused flag above.
 
         Registration lag: a loaded client can accept the re-add while the

@@ -80,7 +80,7 @@ class AdmitMixin:
         `park_reason=None` derives source-export-miss vs indexer-miss from
         whether the group is public (a public group never queries the
         download-target indexers, so "indexer miss" would mislead).
-        A sticky per-row `force_direct` (Telegram /fetch_ or a previous
+        A sticky per-row `force_direct` (Telegram /start_ or a previous
         prowlarr-timeout fallback) bypasses Prowlarr for every pick.
         """
         # Grace-hold throttle: a held NEW row re-checks at most once per
@@ -1852,7 +1852,7 @@ class AdmitMixin:
             return 0
 
     def _is_forced(self, key: str) -> bool:
-        """True when /forcestart armed this hash (in-memory bypass)."""
+        """True when /force armed this hash (in-memory bypass)."""
         try:
             _f = getattr(self, "_forced", None)
             return isinstance(_f, set) and (key or "").lower() in _f
@@ -2665,7 +2665,7 @@ class AdmitMixin:
         A waiter that is itself grace-held owns nothing yet — deferring to
         it serializes behind a download that may never start. Follows the
         hold rule exactly (rank-2, prefer-possible, in-window); locked rows
-        always block, /prefer_-exempt rows always block, and anything
+        always block, /start_-exempt rows always block, and anything
         doubtful blocks (fail-safe: skipping is the exceptional path).
         """
         try:
@@ -2731,8 +2731,8 @@ class AdmitMixin:
         so they never block: they are dropped before electing, letting
         fellow waiters evaluate — and hold — independently instead of
         deferring to a phantom owner. Whoever locks first (grace expiry,
-        /prefer_) blocks the rest via the unchanged locked rule; exempt
-        (/prefer_'d) rows always block. Inert when grace is disabled.
+        /start_) blocks the rest via the unchanged locked rule; exempt
+        (/start_'d) rows always block. Inert when grace is disabled.
         """
         try:
             # all_active() suffices: election peers/winners can only be in
@@ -2770,7 +2770,7 @@ class AdmitMixin:
         return False, winner
 
     def _exempt_grace_hash(self, h: str) -> None:
-        """Record a one-shot /prefer_ exemption (bounded, pruned with rows)."""
+        """Record a one-shot /start_ exemption (bounded, pruned with rows)."""
         try:
             if not h:
                 return
@@ -2840,8 +2840,8 @@ class AdmitMixin:
                     for t in cands[:5]
                 )
                 raise LookupError(
-                    f"/prefer_{norm} matches {len(cands)} waiting torrents: "
-                    f"{preview}; send /prefer_<full 40-char hash>"
+                    f"/start_{norm} matches {len(cands)} waiting torrents: "
+                    f"{preview}; send /start_<full 40-char hash>"
                 )
             if not cands:
                 raise LookupError(
@@ -3059,7 +3059,7 @@ class AdmitMixin:
         # Preferred-copy grace candidacy (decided after the Prowlarr search
         # below, which runs as normal): a sacrificial (rank-2) row with no
         # preferred bytes yet holds instead of locking, so a preferred drop
-        # can preempt it. A /prefer_ operator override exempts one row
+        # can preempt it. A /start_ operator override exempts one row
         # (one-shot, consumed here). Public/rank-1 rows, expired graces, and
         # setups with no download indexers configured (rank-1 unreachable)
         # never hold.
@@ -3067,7 +3067,7 @@ class AdmitMixin:
             _rank_now = self._watch_rank(ts)
         except Exception:
             _rank_now = 2
-        # One-shot /prefer_ exemption (consumed here): the operator already
+        # One-shot /start_ exemption (consumed here): the operator already
         # chose this row, so the hold below must not re-arm on it.
         _exempted = False
         try:
@@ -3105,7 +3105,7 @@ class AdmitMixin:
         # already past admission (e.g. a racing row the watch election
         # cannot see) owns this content — stay NEW and ride the remote
         # fast paths after it finishes instead of grace-holding and then
-        # downloading a duplicate. Operator /prefer_ still overrides
+        # downloading a duplicate. Operator /start_ still overrides
         # (exempted rows skip this gate like the hold below).
         if not _exempted:
             try:
@@ -3400,7 +3400,7 @@ class AdmitMixin:
         # Preferred-copy grace, post-search: hold only when falling back to
         # the dropped non-preferred bytes (a preferred drop may still
         # arrive, or a later search may hit). A secured sacrificial copy,
-        # public/rank-1 rows, expired graces, /prefer_'d rows, /fetch'd
+        # public/rank-1 rows, expired graces, /start_'d rows, /fetch'd
         # rows, setups without download indexers — and watch configs with
         # query_prowlarr=False (no search will ever release the hold) —
         # proceed immediately. Nothing is reserved yet, so returning keeps

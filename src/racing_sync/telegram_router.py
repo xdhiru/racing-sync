@@ -365,7 +365,7 @@ class RouterMixin:
     def _debounced(self, key: str, *, window: float = 0.5) -> bool:
         """True when `key` fired within `window` seconds (caller skips).
 
-        Shared by callback pagination and /cancel_/fetch_ chat commands: a
+        Shared by callback pagination and /cancel_/start_ chat commands: a
         double-tap (or flooding client) re-resolves and re-acts otherwise.
         Fail-closed on bookkeeping errors (drop the tap on doubt — a
         re-tap replays it, a double-act cannot be undone). Eviction
@@ -660,7 +660,7 @@ class RouterMixin:
     def _fetch_new_eligible(self, row) -> bool:
         """True when a NEW row is actually waiting (preferred-copy grace).
 
-        Mirrors /prefer_ list eligibility: the grace note is the signal,
+        Mirrors /start_ list eligibility: the grace note is the signal,
         for watch drops (use the starting .torrent) and racing rows
         (use the VPS1 original) alike. Fail-closed (False) when the
         coordinator is unavailable — same as an empty note set.
@@ -679,12 +679,12 @@ class RouterMixin:
             return False
 
     def _resolve_fetch_target(self, short: str):
-        """Map a `/fetch_<prefix|full-hash>` token to a waiting row.
+        """Map a `/start_<prefix|full-hash>` token to a waiting row.
 
         WAITING_INDEXER rows fetch the VPS1 original instead of waiting
         out Prowlarr. NEW grace-held rows (watch or racing) never wait
         on that state — allow fetch while grace-held, mirroring
-        /prefer_ eligibility. Raises LookupError otherwise.
+        /start_ eligibility. Raises LookupError otherwise.
         """
         row = self._resolve_cancel_target(short, cmd="fetch")
         if row.state == State.WAITING_INDEXER:
@@ -698,9 +698,9 @@ class RouterMixin:
         )
 
     async def _handle_chat_message(self, message: Any) -> None:
-        """Execute `/cancel_` / `/cancel_match` / `/now_` / `/resume_` / `/injectfuse` commands.
+        """Execute `/cancel_` / `/cancel_all` / `/start_` / `/resume_` / `/inject` commands.
 
-        Legacy `/fetch_` + `/prefer_` parse as `/now_`; `/unskip_` +
+        Legacy `/start_` + `/start_` parse as `/start_`; `/unhold_` +
         `/unignore_` parse as `/resume_` (same shapes, unified executors).
 
         Group commands (stable content ids from the active list) open
@@ -768,7 +768,7 @@ class RouterMixin:
             # Debounce mutating verbs only (double-sent command must not
             # resolve+act twice): read-only /stats|/find|/files always
             # answer, even inside another command's window. The key carries
-            # the verb AND its target, so /skip_x followed by /resume_x is
+            # the verb AND its target, so /hold_x followed by /resume_x is
             # two actions rather than one dropped duplicate. A message that
             # carries a .torrent is never debounced: each upload is distinct
             # work, and the sender's passkey must not linger in chat.

@@ -361,7 +361,7 @@ def render_detail(ts: TorrentState, progress: float | None = None, note: str = "
 
     # 2. Hash & size line: full hash copiable by click + size in plain text
     # (detail card keeps the FULL hash; the Active Tasks list carries the
-    # short hash inside its /cancel_ · /now_ commands).
+    # short hash inside its /cancel_ · /start_ commands).
     meta_parts = [f"`{full_hash}`", size]
     _bd = _batch_display(ts)
     if _bd:
@@ -785,8 +785,8 @@ def render_active(
     `speeds` maps their lowercase infohash to bytes/s). Each group
     carries one command (``/act_3``)
     opening the action sheet with only the currently eligible actions;
-    the typed verbs (``/cancel_`` / ``/now_`` / ``/skip_`` / ``/resume_``
-    / ``/injectfuse_`` with the same number or hash) all keep working
+    the typed verbs (``/cancel_`` / ``/start_`` / ``/hold_`` / ``/resume_``
+    / ``/inject_`` with the same number or hash) all keep working
     as shortcuts. Detail cards keep per-torrent text commands
     (full-hash cancel). Pages count groups; numbers are global
     across pages.

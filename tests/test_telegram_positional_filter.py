@@ -1,8 +1,8 @@
 """Regression (audit H1): positional commands honor the active status filter.
 
 The active list numbers only the rows passing `_status_filter`
-(telegram_refresh.py), but `/act_1`, `/now_1`, `/cancel_1` and
-`/resume_1` used to resolve their number against the raw unfiltered
+(telegram_refresh.py), but `/act_1`, `/start_1`, `/cancel_1` and
+`/unhold_1` used to resolve their number against the raw unfiltered
 store list. With a DL filter and a MOVING row first in that raw list,
 `/act_1` (or `/cancel_1`) hit the MOVING torrent while the displayed
 #1 was the DOWNLOADING one.
@@ -61,7 +61,7 @@ def _message():
     m = MagicMock()
     m.chat.id = "1"
     m.from_user.id = "9"
-    m.text = "/now_1"
+    m.text = "/start_1"
     m.caption = None
     m.message_id = 42
     return m
@@ -89,7 +89,7 @@ async def test_act_positional_resolves_within_status_filter():
 
 @pytest.mark.anyio
 async def test_now_positional_resolves_within_status_filter():
-    """`/now_1` under the DL filter starts the DOWNLOADING copy."""
+    """`/start_1` under the DL filter starts the DOWNLOADING copy."""
     bot = _bot()
     bot._live_notes_for = MagicMock(return_value={})
     bot._now_eligible_hashes = MagicMock(
@@ -130,7 +130,7 @@ async def test_cancel_positional_resolves_within_status_filter():
 
 @pytest.mark.anyio
 async def test_resume_positional_resolves_within_status_filter():
-    """`/resume_1` under the DL filter unholds the DOWNLOADING hash only."""
+    """`/unhold_1` under the DL filter unholds the DOWNLOADING hash only."""
     bot = _bot()
     bot._resume_hashes_reply = AsyncMock(return_value="Resumed")
 

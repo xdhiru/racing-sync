@@ -1215,7 +1215,7 @@ async def test_notify_falls_back_to_plain_text_on_parse_error():
 
 @pytest.mark.anyio
 async def test_detail_card_offers_prefer_for_grace_note():
-    """Grace-held detail cards carry a copy-paste /now_ line."""
+    """Grace-held detail cards carry a copy-paste /start_ line."""
     from unittest.mock import AsyncMock, MagicMock
 
     bot = object.__new__(TelegramBot)
@@ -1242,7 +1242,7 @@ async def test_detail_card_offers_prefer_for_grace_note():
     assert "Start this copy now:" in sent_text
     assert f"/start {h[:10]}" in sent_text
     assert "/prefer" not in sent_text
-    assert "/fetch_" not in sent_text
+    assert "/start_" not in sent_text
 
 
 def test_render_active_offers_prefer_for_grace_note():

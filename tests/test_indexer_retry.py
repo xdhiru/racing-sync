@@ -1719,7 +1719,7 @@ async def test_pick_and_admit_throttles_held_repick():
 
 @pytest.mark.anyio
 async def test_pick_and_admit_exemption_and_preferred_proceed():
-    """/prefer_ exemption and preferred direct commits skip the hold."""
+    """/start_ exemption and preferred direct commits skip the hold."""
     coord = _pick_coord()
     coord.cfg.general.preferred_copy_grace_seconds = 3600
     coord.cfg.prowlarr.download_indexers = [MagicMock()]

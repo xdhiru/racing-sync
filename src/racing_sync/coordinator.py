@@ -360,7 +360,7 @@ class Coordinator(
     sftp: SFTPExporter | None = field(init=False, default=None)
     watch: WatchDirScanner | None = field(init=False, default=None)
     _stop: bool = field(default=False, init=False)
-    # Operator intake pause (/pause_intake): no NEW work starts until
+    # Operator intake pause (/pause): no NEW work starts until
     # resumed; in-flight rows drain normally. In-memory on purpose — a
     # restart resumes normal intake, so nothing can wedge paused.
     _intake_paused: bool = field(default=False, init=False)
@@ -2109,12 +2109,12 @@ class Coordinator(
             if _tkey in self._running_infohashes:
                 continue
 
-            # Operator hold (/skip_): no workers until resumed — no
+            # Operator hold (/hold_): no workers until resumed — no
             # Prowlarr queries, no downloads, no moves. State is kept.
             if getattr(ts, "skipped", 0):
                 continue
 
-            # Operator intake pause (/pause_intake): NEW rows wait until
+            # Operator intake pause (/pause): NEW rows wait until
             # resumed; every other state keeps draining normally.
             if getattr(ts, "state", None) == State.NEW and getattr(self, "_intake_paused", False):
                 continue
@@ -2689,10 +2689,10 @@ class Coordinator(
     def _clear_force_direct(self, ts: TorrentState, dst: State) -> None:
         """Drop the sticky "skip Prowlarr" flag once a row is terminal (D8).
 
-        `force_direct` (set by Telegram `/now_` or a prowlarr-timeout
+        `force_direct` (set by Telegram `/start_` or a prowlarr-timeout
         fallback) must not outlive the attempt it was meant for: a row
         revived by the auto-retry path would otherwise keep bypassing
-        Prowlarr forever. The operator can re-issue `/now_` if the direct
+        Prowlarr forever. The operator can re-issue `/start_` if the direct
         source is still wanted.
         """
         try:
@@ -2957,7 +2957,7 @@ class Coordinator(
             pass
 
     async def _process_torrent_inner(self, ts: TorrentState) -> None:
-        # Operator hold (/skip_): the row keeps its state but gets no
+        # Operator hold (/hold_): the row keeps its state but gets no
         # work until resumed. Belt-and-braces alongside the scheduler
         # guards (direct spawns must also honor the hold).
         if getattr(ts, "skipped", 0):

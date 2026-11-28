@@ -93,7 +93,7 @@ ALLOWED: dict[State, set[State]] = {
         State.DONE,
         State.FAILED,
     },
-    # DOWNLOADING -> RE_ADDING is the /injectfuse manual preempt: the operator
+    # DOWNLOADING -> RE_ADDING is the /inject manual preempt: the operator
     # moved the bytes to the remote by hand, fuse verification passed, so the
     # SSD download is abandoned (dest entry removed, reservation released)
     # and the row goes fuse-gated RE_ADDING instead of finishing the download.
@@ -105,7 +105,7 @@ ALLOWED: dict[State, set[State]] = {
     # the late cross-seed guard demotes it back to MOVING so the rclone move
     # runs before any fuse injection. DONE -> RE_ADDING stays for lost fuses.
     State.DONE: {State.RE_ADDING, State.MOVING},
-    # Telegram /injectfuse (operator moved the bytes to the remote by
+    # Telegram /inject (operator moved the bytes to the remote by
     # hand): pre-SSD, failed AND SSD-active rows may jump to RE_ADDING, where
     # the fuse gate re-verifies everything before any skip_check inject.
     # SSD-active rows abandon their partial download (dest entry removed,
@@ -183,12 +183,12 @@ class TorrentState:
     # Failure retry tracking
     failed_retries: int = 0
     # Operator/auto fallback to the racing client's own .torrent for the
-    # SSD download (Telegram /fetch_ or prowlarr-timeout fallback). Sticky:
+    # SSD download (Telegram /start_ or prowlarr-timeout fallback). Sticky:
     # once set, every SSD-source pick bypasses Prowlarr for this row.
     force_direct: int = 0
-    # Operator hold (Telegram /skip_): the row keeps its state but gets
+    # Operator hold (Telegram /hold_): the row keeps its state but gets
     # no workers — no Prowlarr queries, no downloads, no moves — until
-    # /unskip_ (or fresh input via /add / watch-dir re-drop) resumes it.
+    # /unhold_ (or fresh input via /add / watch-dir re-drop) resumes it.
     # Sticky across restarts like force_direct.
     skipped: int = 0
     # VPS1 cleanup bookkeeping (see [cleanup]):

@@ -168,19 +168,19 @@ async def test_different_mutating_commands_both_run():
         calls.append(match.string)
 
     fake_table = (
-        _ChatCommand("skip", re.compile(r"^/skip_"), _fake_handle),
-        _ChatCommand("resume", re.compile(r"^/resume_"), _fake_handle),
+        _ChatCommand("skip", re.compile(r"^/hold_"), _fake_handle),
+        _ChatCommand("resume", re.compile(r"^/unhold_"), _fake_handle),
     )
     bot = _cmd_bot()
     orig = _router._CHAT_COMMANDS
     _router._CHAT_COMMANDS = fake_table
     try:
-        await bot._handle_chat_message(_msg("/skip_abc123"))
-        await bot._handle_chat_message(_msg("/resume_abc123"))
-        await bot._handle_chat_message(_msg("/skip_def456"))
+        await bot._handle_chat_message(_msg("/hold_abc123"))
+        await bot._handle_chat_message(_msg("/unhold_abc123"))
+        await bot._handle_chat_message(_msg("/hold_def456"))
     finally:
         _router._CHAT_COMMANDS = orig
-    assert calls == ["/skip_abc123", "/resume_abc123", "/skip_def456"]
+    assert calls == ["/hold_abc123", "/unhold_abc123", "/hold_def456"]
 
 
 @pytest.mark.anyio

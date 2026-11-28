@@ -1,4 +1,4 @@
-"""Manual inject-to-fuse flow (/injectfuse) mixin.
+"""Manual inject-to-fuse flow (/inject) mixin.
 
 Split out of the coordinator god-file. The operator moved release bytes
 to the remote by hand; this drives verified groups into RE_ADDING (or
@@ -53,9 +53,9 @@ def _group_is_ignored(group: list[Torrent], store) -> bool:
 class InjectMixin:
     """Manual inject-to-fuse flow (duck-typed ``self``)."""
 
-    # ---- Telegram /injectfuse: operator-moved manual seeding ----
+    # ---- Telegram /inject: operator-moved manual seeding ----
 
-    # Row states /injectfuse may drive into RE_ADDING (operator moved the
+    # Row states /inject may drive into RE_ADDING (operator moved the
     # bytes to the remote by hand; the fuse gate re-verifies before any
     # skip_check inject). One command covers every case: waiting/failed rows
     # drive straight there, SSD-active rows (QUEUED/DOWNLOADING/MOVING)
@@ -168,7 +168,7 @@ class InjectMixin:
 
         Category-agnostic (manual commands reach torrents the racing poll
         never ingests). Raises LookupError when unknown. Cancelled
-        (ignored) groups are NOT refused: explicit /injectfuse intent
+        (ignored) groups are NOT refused: explicit /inject intent
         overrides the ignore — apply auto-lifts it so one command (plus
         Yes) is the whole manual path. No state change.
         """
@@ -303,7 +303,7 @@ class InjectMixin:
     def _injectfuse_lift_cancel(self, members: list) -> bool:
         """Clear ignore entries + forget tombstones for a group (best-effort).
 
-        Explicit /injectfuse intent overrides a prior /cancel: returns True
+        Explicit /inject intent overrides a prior /cancel: returns True
         when anything was lifted so callers can name it in the reply.
         """
         lifted = False
@@ -662,7 +662,7 @@ class InjectMixin:
         )
 
     async def injectfuse_confirmed(self, hashes: list[str]) -> str:
-        """Execute a confirmed /injectfuse: resolve live, verify, drive.
+        """Execute a confirmed /inject: resolve live, verify, drive.
 
         All-or-nothing per group: any verification problem reports WITHOUT
         changing state (tracked rows keep their prior state; untracked

@@ -30,12 +30,7 @@ CANCEL_SHORT_LEN = 10
 #
 # One pattern per verb, accepting BOTH separators:
 #   `/verb <target>`   — what you type (a space is easier to type)
-#   `/verb_<target>`   — the legacy shape, still accepted
-# and, where a verb was renamed, the old spellings as aliases:
-#   start  ← now / fetch / prefer      force ← forcestart
-#   hold   ← skip                      unhold ← unskip / resume
-#   cancel_all ← cancel_match          cancel_lane ← cancel_status
-#   inject ← injectfuse
+#   `/verb_<target>`   — the same command with an underscore
 # The target is a tracked hash/prefix or a group number from the card.
 # --------------------------------------------------------------------------- #
 
@@ -44,12 +39,12 @@ CANCEL_CMD_RE = re.compile(r"^/cancel(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 #: `/cancel_all <text>` — cancel every live group whose title contains
 #: `<text>` (case-insensitive), after one remember + one keep/delete
-#: question. Legacy alias: `/cancel_match`.
-CANCEL_ALL_RE = re.compile(r"^/(?:cancel_all|cancel_match)(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
+#: question. Legacy alias: `/cancel_all`.
+CANCEL_ALL_RE = re.compile(r"^/cancel_all(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
 
 #: `/cancel_lane` — the lane sheet (DL/MV/RD/QD) to cancel a whole lane.
-#: A bare `/cancel` opens the same sheet. Legacy alias: `/cancel_status`.
-CANCEL_LANE_RE = re.compile(r"^/(?:cancel|cancel_lane|cancel_status)(?:@[\w_]+)?\s*$")
+#: A bare `/cancel` opens the same sheet. Legacy alias: `/cancel_lane`.
+CANCEL_LANE_RE = re.compile(r"^/(?:cancel|cancel_lane)(?:@[\w_]+)?\s*$")
 
 #: `/cancel_stalled` — cancel every group whose download is stalled
 #: (downloading, no seeders, incomplete). No argument.
@@ -59,22 +54,22 @@ CANCEL_STALLED_RE = re.compile(r"^/cancel_stalled(?:@[\w_]+)?\s*$")
 #: uses its starting torrent instead of waiting out Prowlarr, a NEW
 #: grace-held row starts its SSD download at once. Legacy aliases:
 #: `/now`, `/fetch`, `/prefer`.
-START_CMD_RE = re.compile(r"^/(?:start|now|fetch|prefer)(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+START_CMD_RE = re.compile(r"^/start(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 #: `/force <target>` — start past the lane caps for a queued/moving row or
 #: group (in-memory, disarms on lane exit or restart). Legacy alias:
-#: `/forcestart`.
-FORCE_CMD_RE = re.compile(r"^/(?:force|forcestart)(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+#: `/force`.
+FORCE_CMD_RE = re.compile(r"^/force(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 #: `/hold <target>` — hold a tracked release: no workers, no Prowlarr
 #: queries, no downloads, no moves until `/unhold`. The row and its state
 #: are kept. Legacy alias: `/skip`.
-HOLD_CMD_RE = re.compile(r"^/(?:hold|skip)(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+HOLD_CMD_RE = re.compile(r"^/hold(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 #: `/unhold <hash>` — resume a held release. A full 40-char hash also
 #: lifts a cancelled (ignored) release, so it tracks again. Legacy
 #: aliases: `/resume`, `/unskip`.
-UNHOLD_CMD_RE = re.compile(r"^/(?:unhold|unskip|resume)(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+UNHOLD_CMD_RE = re.compile(r"^/unhold(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 #: `/unignore <hash>` — drop a cancelled release from the ignore list
 #: (plus its forget tombstone) so it can be tracked again. Full hash
@@ -82,8 +77,8 @@ UNHOLD_CMD_RE = re.compile(r"^/(?:unhold|unskip|resume)(?:_|\s+)([0-9a-fA-F]+)(?
 UNIGNORE_CMD_RE = re.compile(r"^/unignore(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 #: `/inject <target>` — manual fuse seeding: you moved the bytes to the
-#: remote yourself. Legacy alias: `/injectfuse`.
-INJECT_CMD_RE = re.compile(r"^/(?:inject|injectfuse)(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+#: remote yourself. Legacy alias: `/inject`.
+INJECT_CMD_RE = re.compile(r"^/inject(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 #: `/act <target>` — action sheet for a content group: one entry point
 #: showing only the currently eligible actions (hash-direct buttons).
@@ -93,29 +88,13 @@ ACT_CMD_RE = re.compile(r"^/act(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 FILES_RE = re.compile(r"^/files(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 #: `/pause` — stop starting NEW work; in-flight rows drain normally.
-#: Legacy alias: `/pause_intake`.
-PAUSE_RE = re.compile(r"^/(?:pause|pause_intake)(?:@[\w_]+)?\s*$")
+#: Legacy alias: `/pause`.
+PAUSE_RE = re.compile(r"^/pause(?:@[\w_]+)?\s*$")
 
 #: `/resume` — resume intake of NEW work. The per-release resume is
 #: `/unhold <hash>`.
-RESUME_INTAKE_RE = re.compile(r"^/resume(?:_intake)?(?:@[\w_]+)?\s*$")
+RESUME_INTAKE_RE = re.compile(r"^/resume(?:@[\w_]+)?\s*$")
 
-# Legacy pattern names, kept for import compatibility (they now point at
-# the canonical patterns above).
-FETCH_CMD_RE = START_CMD_RE
-PREFER_CMD_RE = START_CMD_RE
-NOW_CMD_RE = START_CMD_RE
-FORCESTART_CMD_RE = FORCE_CMD_RE
-SKIP_CMD_RE = HOLD_CMD_RE
-UNSKIP_CMD_RE = UNHOLD_CMD_RE
-RESUME_CMD_RE = UNHOLD_CMD_RE
-UNIGNORE_HASH_RE = UNIGNORE_CMD_RE
-INJECTFUSE_CMD_RE = INJECT_CMD_RE
-INJECTFUSE_HASH_RE = INJECT_CMD_RE
-CANCEL_MATCH_RE = CANCEL_ALL_RE
-CANCEL_STATUS_RE = CANCEL_LANE_RE
-PAUSE_INTAKE_RE = PAUSE_RE
-RESUME_INTAKE_RE = RESUME_INTAKE_RE
 
 #: `/add` — ingest the .torrent file in the replied-to message (or in
 #: the same message when sent with /add as caption) as a Telegram
@@ -193,7 +172,7 @@ def _cmd_group(kind: str):
 
 
 async def _cmd_resume(bot, match, message):
-    """`/unskip_` / `/resume_` / `/unignore_` / `/unignore <hash>`."""
+    """`/unhold_` / `/resume_` / `/unignore_` / `/unignore <hash>`."""
     await bot._resume_command_entry(match.group(1).lower(), message)
 
 
@@ -224,7 +203,7 @@ async def _cmd_act(bot, match, message):
 
 
 async def _cmd_cancel_match(bot, match, message):
-    """`/cancel_match <text>` bulk cancel (empty text shows usage)."""
+    """`/cancel_all <text>` bulk cancel (empty text shows usage)."""
     await bot._cancel_match_command_entry(match.group(1) or "", message)
 
 
@@ -234,12 +213,12 @@ async def _cmd_cancel_stalled(bot, match, message):
 
 
 async def _cmd_cancel_status(bot, match, message):
-    """`/cancel_status` lane menu."""
+    """`/cancel_lane` lane menu."""
     await bot._cancel_status_command_entry(message)
 
 
 async def _cmd_pause_intake(bot, match, message):
-    """`/pause_intake`: stop starting NEW work until resumed."""
+    """`/pause`: stop starting NEW work until resumed."""
     coord = getattr(bot, "_coord", None)
     setter = getattr(coord, "set_intake_paused", None)
     if coord is None or not callable(setter):
@@ -259,7 +238,7 @@ async def _cmd_pause_intake(bot, match, message):
     try:
         await bot._reply(
             "Intake paused — no new downloads start until "
-            "/resume_intake. In-flight rows drain normally "
+            "/resume. In-flight rows drain normally "
             "(resets on restart).",
             reply_to=message,
         )
@@ -268,7 +247,7 @@ async def _cmd_pause_intake(bot, match, message):
 
 
 async def _cmd_resume_intake(bot, match, message):
-    """`/resume_intake`: intake of NEW work resumes."""
+    """`/resume`: intake of NEW work resumes."""
     coord = getattr(bot, "_coord", None)
     setter = getattr(coord, "set_intake_paused", None)
     if coord is None or not callable(setter):

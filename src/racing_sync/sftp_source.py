@@ -641,7 +641,7 @@ class SFTPExporter:
     existing retry path.
 
     Public API is unchanged from the old single-connection exporter
-    (connect/close/fetch_torrent/fetch_many/disk_free_bytes/list_state_dir
+    (connect/close/start_torrent/start_many/disk_free_bytes/list_state_dir
     plus the context manager), so all existing call sites keep working.
     `pool_size` defaults to `[source.deluge_sftp].pool_size` (3).
     """

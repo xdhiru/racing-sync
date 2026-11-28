@@ -822,7 +822,7 @@ class ReaddMixin:
                 gate_blob = None
         if not gate_blob:
             # Self-heal for rows driven to RE_ADDING before their blob was
-            # persisted (e.g. /injectfuse on a freshly discovered row):
+            # persisted (e.g. /inject on a freshly discovered row):
             # the racing torrent is still on VPS1, so live-fetch its bytes,
             # persist them, and continue through the gate on this same tick
             # instead of parking until max_age.

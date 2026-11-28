@@ -42,7 +42,7 @@ class ActionsMixin:
     def _positional_active_rows(self, rows: list) -> list:
         """Rows the active list is currently numbering (status filter applied).
 
-        Positional commands (`/act_N`, `/now_N`, `/cancel_N`, `/resume_N`)
+        Positional commands (`/act_N`, `/start_N`, `/cancel_N`, `/resume_N`)
         quote what the operator sees; the renderer numbers only the rows
         passing `_status_filter` (`telegram_refresh.py`), so resolving a
         number against the raw store list would misroute #1 to a
@@ -425,11 +425,9 @@ class ActionsMixin:
     async def _start_single_command(self, kind: str, full_hash: str, message: Any) -> None:
         """Typed full-hash command: keepq for cancel, direct otherwise.
 
-        fetch/prefer merged into "now": WAITING rows and grace-held rows
-        both start at once via the starting-bytes path.
+        The "now" kind is state-dependent: WAITING rows use their starting
+        bytes, grace-held rows start at once.
         """
-        if kind in ("fetch", "prefer"):
-            kind = "now"
         if kind == "injectfuse":
             await self._start_injectfuse_single(full_hash, message)
             return
@@ -530,7 +528,7 @@ class ActionsMixin:
                 pass
             return
         try:
-            if kind in ("fetch", "now"):
+            if kind == "now":
                 result = await self._fetch_torrent(full_hash)
             else:
                 result = await self._prefer_torrent(full_hash)
@@ -642,7 +640,7 @@ class ActionsMixin:
             log.debug("inject ask failed: %s", e)
 
     async def _start_injectfuse_single(self, full_hash: str, message: Any) -> None:
-        """`/injectfuse <hash>`: tracked or untracked VPS1 torrent.
+        """`/inject <hash>`: tracked or untracked VPS1 torrent.
 
         Resolves the live VPS1 group (category-agnostic, so torrents the
         poller never ingested work too) and arms the Yes/No question.
@@ -721,7 +719,7 @@ class ActionsMixin:
     def _group_hashes_for(self, full_hash: str) -> list[str] | None:
         """Live group member hashes containing `full_hash`, else None.
 
-        Group-scoped commands (/skip_, /unskip_) act on the whole
+        Group-scoped commands (/hold_, /unhold_) act on the whole
         release even from a single hash: every copy shares one hold
         because the hold covers the content (fuse-seeding), not the
         tracker — same all-or-nothing shape as injectfuse (cancel /
@@ -1018,7 +1016,7 @@ class ActionsMixin:
         return out
 
     async def _cancel_match_command_entry(self, query: str, message: Any) -> None:
-        """`/cancel_match <text>`: one remember + one keep/delete for all.
+        """`/cancel_all <text>`: one remember + one keep/delete for all.
 
         No match → explanatory reply. A single live copy skips straight
         to its normal forget sheet; otherwise one sheet names every
@@ -1087,7 +1085,7 @@ class ActionsMixin:
 
         Stalled = DOWNLOADING with 0 seeders and incomplete progress
         (dest-client verdict at tap time). Same flow shape as
-        `/cancel_match`: single live copy skips to its normal forget
+        `/cancel_all`: single live copy skips to its normal forget
         sheet, otherwise one sheet names every stalled group and the
         remember buttons carry the `stalled` scope,
         re-resolved live at each tap.
@@ -1127,7 +1125,7 @@ class ActionsMixin:
             pass
 
     async def _cancel_status_command_entry(self, message: Any) -> None:
-        """`/cancel_status`: pick a lane, then the usual remember sheet.
+        """`/cancel_lane`: pick a lane, then the usual remember sheet.
 
         One button per non-empty lane (DL/MV/RD/QD + live counts);
         tapping one opens the same remember -> keep/delete sheets as
@@ -1228,11 +1226,6 @@ class ActionsMixin:
         misroute. Full hashes and legacy prefixes act on one row.
         """
         token = (token or "").strip().lower()
-        # Legacy aliases: fetch/prefer merged into the state-dependent
-        # "now" verb (WAITING rows use original bytes, grace-held rows
-        # start at once).
-        if kind in ("fetch", "prefer"):
-            kind = "now"
         if len(token) == 40 and all(c in "0123456789abcdef" for c in token):
             await self._start_single_command(kind, token, message)
             return
@@ -1685,7 +1678,7 @@ class ActionsMixin:
         return outcome
 
     async def _skip_torrents(self, hashes: list[str], *, hold: bool) -> str:
-        """Hold (`hold=True`, /skip_) or resume (/unskip_) tracked releases.
+        """Hold (`hold=True`, /hold_) or resume (/unhold_) tracked releases.
 
         Whole-hash list (a group acts on every copy): the `skipped` flag
         keeps each row's state but gives it no workers — no Prowlarr
@@ -1859,7 +1852,7 @@ class ActionsMixin:
     async def _resume_command_entry(self, token: str, message: Any) -> None:
         """Unified resume: unhold tracked rows + lift ignored hashes.
 
-        Replaces `/unskip_` + `/unignore_` with one verb branching on
+        Replaces `/unhold_` + `/unignore_` with one verb branching on
         current state (digits address a live group like the other group
         commands; a full hash reaches tracked rows AND invisible ignore
         entries; shorter prefixes resolve tracked rows only — ignored
