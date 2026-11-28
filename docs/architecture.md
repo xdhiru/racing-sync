@@ -171,6 +171,17 @@ Supplementary private cross-seeds are harvested from `tracker_map` indexers
 (same release, per-blob gate, memoized per row) — VPS1 supplements, never
 bounds, the racing set.
 
+Before any pick, a cheap pre-check probes the torrent-name root on the fuse
+target (both configured mounts — a fresh row has no kind yet, and
+`mount_unsorted` is usually nested inside `mount`) with one stat per mount
+and no RPC. Fully present bytes admit straight from the row's own blob
+(QUEUED, no SSD reservation); a *partly* present copy — an operator's manual
+rclone move in progress, or fuse index lag — parks the row without injecting
+and re-checks every `[rclone.fuse].manual_move_check_seconds` (default 1800)
+for up to `manual_move_timeout_seconds` (default 43200, 0 disables), then
+falls back to the normal SSD download. The window start is persisted
+(`fuse_wait_first_at`), so a restart keeps the deadline.
+
 ## Recovery and cleanup
 
 Startup runs one fast snapshot pass: optimistic adoption, orphan parking and

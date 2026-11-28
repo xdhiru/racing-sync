@@ -542,6 +542,33 @@ class FuseConfig(BaseModel):
     # just those files. 0 disables (park until the 24h max-age FAIL, then
     # auto-retry does a full re-download).
     readd_heal_missing_after_seconds: int = Field(default=7200, ge=0)
+    # Manual-move wait (pre-pick): the operator rclone-moves a completed
+    # torrent's files to the remote by hand while racing-sync is offline,
+    # then starts the daemon. The VPS2 client has no entry, so the
+    # exact-infohash adoption misses and the row would otherwise query
+    # Prowlarr / reserve SSD budget for content that already sits on the
+    # fuse mount. When the expected files are *partly* there (a move in
+    # progress, or fuse index lag) the row parks instead of downloading
+    # and re-checks every `manual_move_check_seconds` (default: 1800 /
+    # 30 min) for up to `manual_move_timeout_seconds` (default: 43200 /
+    # 12 hours), then falls back to the normal SSD download. 0 disables
+    # the wait entirely (pick immediately).
+    manual_move_check_seconds: int = Field(default=1800, ge=60)
+    manual_move_timeout_seconds: int = Field(default=43200, ge=0)
+
+    @model_validator(mode="after")
+    def _manual_move_window_consistent(self) -> FuseConfig:
+        """A wait window shorter than one check interval never re-checks."""
+        if (
+            self.manual_move_timeout_seconds > 0
+            and self.manual_move_timeout_seconds < self.manual_move_check_seconds
+        ):
+            raise ValueError(
+                "manual_move_timeout_seconds "
+                f"({self.manual_move_timeout_seconds}) must be 0 (disabled) or "
+                f">= manual_move_check_seconds ({self.manual_move_check_seconds})"
+            )
+        return self
 
 
 class RcloneConfig(BaseModel):
@@ -1482,6 +1509,14 @@ class AppConfig(BaseModel):
     @property
     def fuse_readd_heal_after_seconds(self) -> int:
         return self.rclone.fuse.readd_heal_missing_after_seconds
+
+    @property
+    def fuse_manual_move_check_seconds(self) -> int:
+        return self.rclone.fuse.manual_move_check_seconds
+
+    @property
+    def fuse_manual_move_timeout_seconds(self) -> int:
+        return self.rclone.fuse.manual_move_timeout_seconds
 
     @model_validator(mode="after")
     def _warn_suspicious_combos(self) -> AppConfig:

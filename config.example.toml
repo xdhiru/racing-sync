@@ -293,6 +293,15 @@ reinject_max_age_seconds = 86400
 # those files. 0 disables (park until the 24h FAIL, then auto-retry).
 readd_heal_missing_after_seconds = 7200
 
+# Manual-move wait: files moved to the remote by hand while the daemon was
+# offline. When the torrent's files show up only PARTLY on the fuse target,
+# the row waits instead of downloading: it re-checks every
+# manual_move_check_seconds (default: 1800 / 30 min) for up to
+# manual_move_timeout_seconds (default: 43200 / 12h), then downloads the
+# missing bytes from SSD. 0 disables the wait (pick immediately).
+manual_move_check_seconds = 1800
+manual_move_timeout_seconds = 43200
+
 # ============================================================
 # Classifier (movie / episode / season)
 # ============================================================

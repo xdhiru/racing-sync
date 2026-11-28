@@ -169,6 +169,13 @@ class TorrentState:
     public_export_first_attempted_at: dt.datetime | None = None
     public_export_next_retry_at: dt.datetime | None = None
     public_export_attempts: int = 0
+    # Manual-move wait window (pre-pick): set when a torrent's expected
+    # files are only PARTLY on the fuse target (an operator rclone-move in
+    # progress). While set, the row parks as WAITING_INDEXER — the park
+    # reuses `indexer_next_retry_at` as the wake timer — and falls back to
+    # the SSD download once `manual_move_timeout_seconds` elapsed since
+    # this stamp. Persisted so a restart keeps the deadline.
+    fuse_wait_first_at: dt.datetime | None = None
     # Fuse Adoption verification: 1 once the row's bytes have actually been
     # observed on the fuse mount (not merely claimed complete by a
     # skip_check client). The janitor only clears the VPS1 copy for
@@ -263,6 +270,9 @@ class TorrentState:
                 else ""
             ),
             "public_export_attempts": self.public_export_attempts,
+            "fuse_wait_first_at": (
+                self.fuse_wait_first_at.isoformat() if self.fuse_wait_first_at else ""
+            ),
             "fuse_verified": int(self.fuse_verified or 0),
             "force_direct": int(self.force_direct or 0),
             "skipped": int(self.skipped or 0),
@@ -325,6 +335,7 @@ _TORRENT_STATE_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
     ("public_export_first_attempted_at", "TEXT NOT NULL DEFAULT ''"),
     ("public_export_next_retry_at", "TEXT NOT NULL DEFAULT ''"),
     ("public_export_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("fuse_wait_first_at", "TEXT NOT NULL DEFAULT ''"),
     ("fuse_verified", "INTEGER NOT NULL DEFAULT 0"),
     ("force_direct", "INTEGER NOT NULL DEFAULT 0"),
     ("skipped", "INTEGER NOT NULL DEFAULT 0"),
@@ -359,7 +370,7 @@ _TORRENT_STATE_COLUMNS_NO_BLOB = ", ".join(
 #: Bumped whenever a column spec or a data migration changes. Recorded in
 #: `meta` so an upgraded or downgraded DB shows up in the log; the column
 #: diff at open is the actual migration mechanism.
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 #: Persisted TorrentState fields: everything except the transient blob copy.
 _PERSISTED_FIELDS = frozenset(f.name for f in dataclass_fields(TorrentState)) - {"_blob"}
@@ -1663,6 +1674,7 @@ class StateStore:
             "public_export_first_attempted_at",
             "public_export_next_retry_at",
             "public_export_attempts",
+            "fuse_wait_first_at",
             "fuse_verified",
             "force_direct",
             "skipped",
@@ -1935,6 +1947,11 @@ def _row_to_state(row: sqlite3.Row) -> TorrentState:
         ),
         public_export_attempts=(
             _safe_int(row["public_export_attempts"]) if "public_export_attempts" in keys else 0
+        ),
+        fuse_wait_first_at=(
+            _safe_dt(row["fuse_wait_first_at"])
+            if ("fuse_wait_first_at" in keys and row["fuse_wait_first_at"])
+            else None
         ),
         fuse_verified=(_safe_int(row["fuse_verified"]) if "fuse_verified" in keys else 0),
         force_direct=_safe_int(row["force_direct"]) if "force_direct" in keys else 0,

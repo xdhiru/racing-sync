@@ -528,6 +528,273 @@ class AdmitMixin:
             log.warning("manual fuse check failed for %s: %s", ts.source_infohash[:10], e)
             return False
 
+    async def _fuse_content_evidence(
+        self, ts: TorrentState, *, blob: bytes | None = None
+    ) -> tuple[str, bytes | None, int, int]:
+        """Is this row's content already on the fuse target? (pre-pick)
+
+        Answers one of three, costing at most ONE stat for the common
+        "not on fuse" case (a normal new torrent):
+
+          "present" — every expected file size-verifies at the target, so
+              the row admits straight from its own blob (no Prowlarr
+              query, no SSD budget);
+          "partial" — at least one expected file exists but not all: an
+              operator's manual rclone move is in progress (or the fuse
+              index lags), so the caller parks and re-checks on a timer;
+          "absent"  — nothing at the target, or nothing verifiable (no
+              blob, undecodable, mount outage): keep the existing
+              pick -> SSD flow unchanged.
+
+        Cheapness: probe the torrent-name root first (`missing_under`
+        with want=0 is presence-only). Only when that root exists are the
+        bytes decoded and every expected file verified.
+
+        Returns (status, blob, present_count, expected_count).
+        """
+        # Mount resolution never stats: a broken/unconfigured fuse section
+        # is simply "absent" (the pick below owns that failure loudly).
+        try:
+            target = self._target_mount_for(ts)
+            probe_name = (ts.source_name or "").strip()
+            root = _safe_ssd_join(target, probe_name)
+        except Exception:
+            return "absent", None, 0, 0
+        if root is None:
+            return "absent", None, 0, 0
+        try:
+            probe_name = root.relative_to(target).as_posix()
+        except Exception:
+            return "absent", None, 0, 0
+        # A fresh racing row has no classification yet, so `_target_mount_for`
+        # answers with the UNSORTED mount. Season/movie roots live under the
+        # sorted mount (and the unsorted mount is usually nested inside it),
+        # so probe every configured mount and keep the one that has the root.
+        # The blob decides the authoritative mount only after it is decoded.
+        mounts: list[Path] = [target]
+        try:
+            _fuse = self.cfg.rclone.fuse
+            for _raw in (
+                getattr(_fuse, "mount", None),
+                getattr(_fuse, "mount_unsorted", None),
+            ):
+                if not isinstance(_raw, (str, Path)):
+                    continue
+                _m = Path(str(_raw))
+                if _m not in mounts:
+                    mounts.append(_m)
+        except Exception:
+            pass
+        hit_mount: Path | None = None
+        try:
+            from .fuse_gate import missing_under
+
+            for _m in mounts:
+                probe = await missing_under(_m, [(probe_name, 0)], fresh=False)
+                # None (unstatable) or a marker is not evidence: never start
+                # a manual-move wait from an outage.
+                if probe is None:
+                    continue
+                if not probe:
+                    hit_mount = _m
+                    break
+        except Exception:
+            hit_mount = None
+        if hit_mount is None:
+            return "absent", None, 0, 0
+
+        try:
+            if not blob:
+                blob = ts._blob or ts.cross_seed_blob
+            if not blob:
+                try:
+                    blob = await asyncio.to_thread(self.store.get_blob, ts.source_infohash)
+                except Exception:
+                    blob = None
+            if not blob:
+                h = (ts.source_infohash or "").lower()
+                if h and not self._is_watch_row(ts):
+                    # Racing rows may never have persisted bytes: export
+                    # them once (the same call the pick would make later)
+                    # and cache them for the admit tail.
+                    try:
+                        blob = await self._fetch_racing_torrent_bytes(h)
+                    except Exception:
+                        blob = None
+                    if blob:
+                        try:
+                            await asyncio.to_thread(self.store.set_blob, ts.source_infohash, blob)
+                        except Exception:
+                            pass
+            if not blob:
+                return "absent", None, 0, 0
+
+            expected = self._expected_fuse_files(blob)
+            if not expected:
+                return "absent", None, 0, 0
+            from .fuse_gate import verify_blob_on_mount
+
+            check = await verify_blob_on_mount(hit_mount, blob, expected=expected, confirm=True)
+            if check.verified:
+                return "present", bytes(blob), len(expected), len(expected)
+            if check.expected is None or check.unverifiable:
+                # Mount outage: the existing outage paths park; do not
+                # start a manual-move window on unverifiable evidence.
+                return "absent", None, 0, 0
+            present = len(expected) - len(check.missing)
+            if present > 0:
+                return "partial", bytes(blob), present, len(expected)
+            return "absent", None, 0, 0
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "fuse content evidence check failed for %s: %s",
+                (ts.source_infohash or "?")[:10],
+                e,
+            )
+            return "absent", None, 0, 0
+
+    async def _admit_fuse_existing(self, ts: TorrentState, blob: bytes) -> None:
+        """Admit a row whose bytes are already verified on the fuse target.
+
+        The row seeds from its own torrent blob (no cross-seed lookup);
+        `_admit_resolved`'s all-remote shortcut then takes it straight to
+        QUEUED with no SSD reservation. That helper owns the transition.
+        """
+        ts.cross_seed_infohash = (ts.source_infohash or "").lower()
+        # Keep a watch-origin label: the re-add flow keys its own
+        # (multi-blob) re-injection off it. Racing rows get a label that
+        # says where the bytes were found.
+        try:
+            if (ts.cross_seed_source or "") not in WATCH_ORIGIN_LABELS:
+                ts.cross_seed_source = "fuse-existing"
+        except Exception:
+            ts.cross_seed_source = "fuse-existing"
+        ts.cross_seed_blob = bytes(blob)
+        ts._blob = bytes(blob)
+        ts.fuse_wait_first_at = None
+        # Same pre-admission defaults the pick path sets (the row never
+        # downloads, but QUEUED logic reads them).
+        try:
+            ts.save_path = str(self.cfg.dest.save_path)
+        except Exception:
+            pass
+        if int(ts.total_bytes or 0) <= 0:
+            try:
+                ts.total_bytes = sum(
+                    int(_sz or 0) for _n, _sz in (self._expected_fuse_files(blob) or [])
+                )
+            except Exception:
+                pass
+        log.info(
+            "content for %s already on fuse; admitting without an SSD pick",
+            (ts.source_name or "")[:60],
+        )
+        await self._admit_resolved(
+            ts,
+            blob=bytes(blob),
+            size_bytes=int(ts.total_bytes or 0),
+            display_name=(ts.source_name or "")[:60],
+        )
+
+    def _manual_move_wait_limits(self) -> tuple[float, float]:
+        """(check_seconds, timeout_seconds); timeout 0 disables the wait."""
+        try:
+            _fuse_cfg = self.cfg.rclone.fuse
+        except Exception:
+            _fuse_cfg = None
+        try:
+            timeout_s = float(getattr(_fuse_cfg, "manual_move_timeout_seconds", 43200))
+        except (TypeError, ValueError):
+            timeout_s = 43200.0
+        try:
+            check_s = float(getattr(_fuse_cfg, "manual_move_check_seconds", 1800))
+        except (TypeError, ValueError):
+            check_s = 1800.0
+        return check_s, timeout_s
+
+    def _park_fuse_content_wait(
+        self, ts: TorrentState, *, present: int = 0, total: int = 0
+    ) -> bool:
+        """Park a partly-present row and re-check on a timer; False = give up.
+
+        Uses WAITING_INDEXER (the scheduler already wakes those rows) with
+        `indexer_next_retry_at` as the wake timer and `fuse_wait_first_at`
+        as the persisted window start, so a restart keeps the deadline.
+        Returns False when the wait is disabled (timeout 0) or exceeded —
+        the caller then falls through to the normal pick.
+        """
+        check_s, timeout_s = self._manual_move_wait_limits()
+        if timeout_s <= 0:
+            ts.fuse_wait_first_at = None
+            return False
+        now = dt.datetime.now(dt.UTC)
+        start = ts.fuse_wait_first_at
+        if start is None:
+            start = now
+            ts.fuse_wait_first_at = now
+        elapsed = (now - start).total_seconds()
+        if elapsed >= timeout_s:
+            log.info(
+                "manual-move wait over for %s (%ds >= %ds); falling back to the SSD pick",
+                (ts.source_name or "")[:60],
+                int(elapsed),
+                int(timeout_s),
+            )
+            ts.fuse_wait_first_at = None
+            return False
+        ts.indexer_next_retry_at = now + dt.timedelta(seconds=max(60.0, check_s))
+        ts.public_export_next_retry_at = None
+        reason = (
+            f"fuse content partly present ({present}/{total} files); waiting for "
+            f"the manual move (elapsed {int(elapsed)}s / timeout {int(timeout_s)}s)"
+        )
+        log.info("%s: %s", (ts.source_name or "")[:60], reason)
+        if ts.state != State.WAITING_INDEXER:
+            # A fresh row transitions (notifies once); an already-parked
+            # row must not re-transition (illegal), so the narrow write
+            # below carries the new timer instead.
+            self.transition(ts, State.WAITING_INDEXER)
+        self._park_row(
+            ts,
+            reason,
+            level=None,
+            extra={
+                "indexer_next_retry_at": ts.indexer_next_retry_at.isoformat(),
+                "public_export_next_retry_at": "",
+                "fuse_wait_first_at": ts.fuse_wait_first_at.isoformat(),
+            },
+        )
+        try:
+            self._schedule_telegram_update(ts)
+        except Exception:
+            pass
+        return True
+
+    async def _fuse_content_precheck(self, ts: TorrentState, *, blob: bytes | None = None) -> bool:
+        """Pre-pick manual-move handling; True when the caller must stop.
+
+        Shared by `_do_new`, `_do_waiting_indexer` and `_do_new_watch_dir`
+        so a wake wave re-checks fuse before querying indexers. With the
+        wait disabled (timeout 0) this is a no-op: no probe, no stats.
+        """
+        _check_s, _timeout_s = self._manual_move_wait_limits()
+        if _timeout_s <= 0:
+            return False
+        try:
+            status, found, present, total = await self._fuse_content_evidence(ts, blob=blob)
+        except Exception:
+            status, found, present, total = "absent", None, 0, 0
+        if status == "present" and found:
+            await self._admit_fuse_existing(ts, found)
+            return True
+        if status == "partial":
+            if self._park_fuse_content_wait(ts, present=present, total=total):
+                return True
+        # Absent, or the wait window closed: clear any stale window and
+        # let the caller run the existing pick -> SSD flow.
+        ts.fuse_wait_first_at = None
+        return False
+
     async def _sweep_manual_fuse_adoptions(self) -> None:
         """Batch-adopt pre-SSD rows whose infohash already seeds from fuse.
 
@@ -741,6 +1008,12 @@ class AdmitMixin:
                 return
         except Exception:
             pass
+
+        # Pre-pick manual-move wait: content the operator already pushed to
+        # the remote needs no Prowlarr query or SSD budget. A partial copy
+        # parks here instead of downloading behind an indexer wait.
+        if await self._fuse_content_precheck(ts):
+            return
 
         # Admit-time stop-duplicate (P8): a same-content sibling already
         # past admission owns the SSD bytes — defer to it (recorded, so
@@ -1259,6 +1532,12 @@ class AdmitMixin:
                 return
         except Exception:
             pass
+
+        # Pre-pick manual-move wait, re-run on every wake: a manual move
+        # that finished since the last retry admits here, and a still
+        # partial one re-arms its timer without touching the indexers.
+        if await self._fuse_content_precheck(ts):
+            return
 
         # SSD shortcut: the same hash already lives on the VPS2 client
         # (added by hand and seeding/downloading from SSD) — adopt it
@@ -3030,6 +3309,12 @@ class AdmitMixin:
         if not blob:
             log.error("watch-dir torrent has no bytes: %s", ts.source_name)
             self.transition(ts, State.FAILED, error="missing .torrent bytes for watch-dir drop")
+            return
+
+        # Pre-pick manual-move wait: a watch drop whose bytes are already
+        # on fuse (fully or partly) needs no election/Prowlarr search.
+        # The blob is in hand — never re-export it here.
+        if await self._fuse_content_precheck(ts, blob=blob):
             return
 
         # Same-content election across watch drops: one SSD downloader
