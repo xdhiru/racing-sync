@@ -1145,3 +1145,46 @@ I1-I16, remaining Low findings.
   path.
 - Watch-dir bencode decoder hardening (size caps, recursion limits) apart from the v2 identity issue.
 - API token comparison and trusted-proxy handling (apart from readiness/middleware issues above).
+
+---
+
+## Status (2026-11-28)
+
+Every finding in sections A–H was implemented on `dev-ruff` and re-verified
+against the current code (a full sweep of this document on 2026-11-27, each
+flagged item checked by hand). The I-series is complete as well: I1–I16 all
+landed, with I9's two surviving entries (`StateStore.delete`, the `pick:`
+callback prefix) confirmed as intentional.
+
+**Open**
+
+None. The last two items were closed on 2026-11-28:
+
+- **G21** — `io_bounds.offload()` takes an optional timeout now (enforced by
+  `bounded()`); a wedged disk call is abandoned and reported as "unknown"
+  instead of hanging the caller. Applied to the fuse availability probe and
+  the SSD free-space probe.
+- **D8** — `force_direct` is dropped when a row reaches DONE/FAILED, so a row
+  revived by the auto-retry path re-queries Prowlarr instead of keeping the
+  sticky "skip Prowlarr" flag.
+
+**Resolved by design (deliberate, documented, not pending)**
+
+| ID | Decision |
+|---|---|
+| A4 | `rglob` does not follow symlinked directories on Python 3.11+, so the folder wipe cannot be redirected. |
+| B6 | The frozen batch cap is stable by construction (it is re-derived from the same inputs), so persisting it adds nothing. |
+| B8 | WAL `synchronous=NORMAL` can lose the last commit on a power cut; the durability/comment in `state.py` states the tradeoff (the lost window is one checkpoint, which recovery re-derives). |
+| B9 | `reconcile()` is intentionally API-only: the daemon adopts through the normal intake path. |
+| D8 (counter) | `public_export_attempts` is an unbounded observability counter by design; only the sticky flag was a defect. |
+| D10, D15 | An unknown size reserves the full cap — fail-closed, never over-commit the SSD. |
+| H3 | No await sits between the page read and its write-back, so the drift check cannot race. |
+| H11 | Both sides of the "List changed" comparison are filtered consistently. |
+| H19 | `_poll_conflict_fatal` already prevents the respawn loop the finding describes. |
+
+**Out of scope**
+
+Throughput/performance work was explicitly de-prioritised for this audit.
+The correctness pass says nothing about rclone concurrency, stat-cache
+windows, poll intervals or batch sizing — those remain open as tuning
+questions.
