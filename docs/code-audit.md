@@ -1,5 +1,10 @@
 # Racing Sync — Code Audit
 
+> **Historical document.** This is the original findings list, kept for the
+> reasoning and evidence behind each fix. Every finding is now closed — see
+> the **Status** section at the end for what was implemented versus resolved
+> by design.
+
 - **Date:** 2026-10-25
 - **Commit audited:** `ba8f827` (`dev`)
 - **Scope:** all 41 modules under `src/racing_sync/` (~40.5k LOC) plus config example and docs

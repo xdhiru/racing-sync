@@ -1,496 +1,235 @@
 # Architecture
 
+Racing Sync is one async daemon that moves a torrent through a fixed
+pipeline. The design goal is: **never delete or report "done" on doubt.**
+Everything below follows from that.
+
 ## Layout
 
 ```
 src/racing_sync/
-  __main__.py         CLI (run [--reset --yes | --full --yes] / forget [--apply] [--keep-files] [--ignore] / unignore [--list] / check-config)
-  config.py           Pydantic schema, cross-validates everything
-  logging_setup.py    Rotating files + JSONL + ring buffer + optional HTTP sink
-  state.py            SQLite state machine (State, ALLOWED, StateStore)
-  classifier.py       movie / episode / season
+  __main__.py         CLI: run [--reset|--full --yes], forget, unignore, check-config
+  config.py           Pydantic schema + cross-field validation
+  state.py            SQLite state machine (one schema spec drives all views)
+  classifier.py       movie / episode / season / mixed
   batcher.py          SSD-aware episode batching
-  rclone_ops.py       rclone subprocess wrapper
-  io_bounds.py        RPC timeouts + concurrency bounds (rpc/chunked/offload)
-  safety.py           Central destructive-path guards (delete validation, fuse overlap, reset refusals)
-  sftp_source.py      paramiko-based .torrent export (pooled)
-  prowlarr.py         Prowlarr client (indexers, search, download)
-  watchdir.py         Watch-dir scanner with bencoded torrent parser
+  coordinator*.py     The pipeline, split by stage:
+    coordinator.py             loops + workers, transition/park primitives
+    coordinator_admit.py       source pick, admission, watch intake, retries
+    coordinator_download.py    batch download loop + completion wait
+    coordinator_move.py        verified move, wipe, MOVING checkpoint replay
+    coordinator_readd.py       fuse re-add drive + sustained-missing healer
+    coordinator_fuse.py        late cross-seeds + fuse entry management
+    coordinator_cleanup.py     VPS1 cleanup janitor
+    coordinator_ssd.py         SSD budget + global reservation ledger
+    coordinator_watchdog.py    dead-torrent watchdog + tracker-death cascade
+    coordinator_inject.py      manual inject-to-fuse flow
+    coordinator_picker.py      cross-seed source picker
+    coordinator_content.py     stateless helpers (names, grace, notify)
+  content_keys.py     One same-content rule (explicit size modes)
+  fuse_gate.py        One fuse verifier (mount probe, expected files, confirm)
+  path_ownership.py   One save-path rule: FUSE / SSD / FOREIGN / UNKNOWN
   recovery.py         Startup reconciler
-  forget.py           Abandon-torrent off-switch (row + entries + SSD data + blob cache + optional ignore)
-  coordinator.py      Main async loops + per-torrent workers (poll, schedule, janitor)
-  coordinator_ssd.py  SSD batch caps + global reservation ledger
-  coordinator_watchdog.py Dead-torrent watchdog + tracker-deletion cascade
-  coordinator_live.py Live-download tracking (_live refresh + snapshots)
-  coordinator_inject.py Manual inject-to-fuse flow + group veto rule
-  coordinator_readd.py RE_ADDING drive + sustained-missing healer
-  coordinator_fuse.py Late cross-seeds + fuse-entry management
-  coordinator_download.py Batch download loop + completion wait
-  coordinator_move.py Verified moves, folder wipe, rclone execution
-  coordinator_admit.py SSD-source picking, admission, watch intake,
-    indexer/queued gates, batch/download-setup helpers
-  coordinator_picker.py  Cross-seed SSD-source picker (req #1/#2)
-  coordinator_cleanup.py VPS1 cleanup janitor
-  coordinator_paths.py   Untrusted torrent-relative path guard
-  coordinator_errors.py  Retryable WebUI / batch-move error contract
-  coordinator_content.py  Stateless helpers (normalize, grace, notify filter)
-  content_keys.py     Single same-release/same-content key rule
-  fuse_gate.py        Single fuse verification gate (verdict + missing + skip)
-  telegram_bot.py     Per-torrent detail cards + active-tasks list
-  telegram_protocol.py Chat/callback protocol (patterns, handlers, parsing)
-  telegram_actions.py Cancel execution, command entries, torrent
-    executors (ActionsMixin)
-  telegram_router.py Inbound updates (loops, guards, chat/document,
-    tap dispatcher) + actor-allowlist gate
-  telegram_refresh.py Active-message refresh (list/detail, repost, orphans)
-  telegram_sheets.py Question-sheet builders (act/keep/group titles)
-  telegram_views.py Active-tasks + detail-card rendering (pure functions)
-  telegram_buttons.py ButtonMaker with Telegram budget enforcement
-  api.py              Optional FastAPI control plane (/healthz + authed /readyz, /metrics, state ops)
-  clients/
-    abstract.py       TorrentClient ABC + dataclasses
-    http_base.py      aiohttp + nginx auth helper
-    qbittorrent.py    qBittorrent WebUI v2
-    deluge.py         Deluge JSON-RPC
+  forget.py           Abandon-torrent off-switch
+  rclone_ops.py       rclone subprocess wrapper (timeouts, kill/reap)
+  io_bounds.py        RPC/thread deadlines and chunking
+  safety.py           Delete guards, daemon lock, reset refusals
+  sftp_source.py      Pooled .torrent export over SFTP
+  prowlarr.py         Indexer search + validated download
+  watchdir.py         Watch-dir scanner + the one bencoded parser
+  telegram_*.py       Control plane (commands, actions, routing, views)
+  api.py              Optional FastAPI control plane
+  clients/            qBittorrent + Deluge adapters
 ```
 
-## State machine
+## Pipeline
 
 ```mermaid
 stateDiagram-v2
     direction TB
-
     [*] --> NEW
-    NEW --> WAITING_INDEXER : need SSD source
-    WAITING_INDEXER --> WAITING_DISK : source found
+    NEW --> WAITING_INDEXER : need a source
     NEW --> WAITING_DISK : source found
+    WAITING_INDEXER --> WAITING_DISK : source found
+    WAITING_INDEXER --> QUEUED : source found
     WAITING_DISK --> QUEUED : budget reserved
-    QUEUED --> DOWNLOADING : slot free
+    QUEUED --> DOWNLOADING : add to dest
     DOWNLOADING --> MOVING : batch complete
-    MOVING --> RE_ADDING : verified move
+    MOVING --> RE_ADDING : verified move + wipe
     RE_ADDING --> DONE : fuse verified
     DONE --> [*]
 
-    NEW --> DONE : manual adoption
+    NEW --> DONE : manual fuse adoption
     WAITING_INDEXER --> DONE : manual adoption
     WAITING_DISK --> DONE : manual adoption
     QUEUED --> RE_ADDING : already remote
-    QUEUED --> MOVING : SSD-complete
-    DOWNLOADING --> RE_ADDING : /injectfuse
     MOVING --> DOWNLOADING : resume
-    DOWNLOADING --> QUEUED : back off
-    QUEUED --> WAITING_DISK : over budget
     RE_ADDING --> MOVING : SSD bytes remain
-    DONE --> RE_ADDING : lost fuse
+    DONE --> RE_ADDING : lost fuse entry
     DONE --> MOVING : false DONE
-
+    DOWNLOADING --> RE_ADDING : /inject
+    FAILED --> QUEUED : retry
+    FAILED --> NEW : auto-retry
+    FAILED --> RE_ADDING : /inject
     NEW --> FAILED
     WAITING_INDEXER --> FAILED
     WAITING_DISK --> FAILED
     QUEUED --> FAILED
     DOWNLOADING --> FAILED
     MOVING --> FAILED
-    RE_ADDING --> FAILED : 24h max age
-    FAILED --> QUEUED : retry
-    FAILED --> NEW : retry
-    FAILED --> RE_ADDING : /injectfuse
-
-    classDef doneStyle stroke:#2da44e,stroke-width:3px
-    classDef failedStyle stroke:#cf222e,stroke-width:3px
-    classDef waitStyle stroke:#bf8700,stroke-width:2px
-    classDef moveStyle stroke:#0969da,stroke-width:2px
-    class DONE doneStyle
-    class FAILED failedStyle
-    class WAITING_INDEXER waitStyle
-    class WAITING_DISK waitStyle
-    class MOVING moveStyle
-    class RE_ADDING moveStyle
+    RE_ADDING --> FAILED : max age
 ```
 
-Full edge list is `ALLOWED` in `src/racing_sync/state.py`; the diagram
-shows the travelled edges.
+The edge list is `ALLOWED` in `state.py`. `DONE` is terminal-ish: a lost
+fuse entry demotes it back to `RE_ADDING`, a falsely adopted one to
+`MOVING`; 5 rapid demotions in 24 h fail the row instead of flapping.
+`FAILED → QUEUED/NEW` is manual and auto retry.
 
-`DONE` is terminal-ish but not final: a lost fuse entry demotes
-`DONE → RE_ADDING`, a falsely adopted `DONE` (bytes never moved) demotes
-`DONE → MOVING`. Rapid `DONE` demotions are counted (`readd_cycles`);
-past 5 in 24h the row fails for operator attention instead of flapping
-forever. `FAILED → QUEUED/NEW` allows manual and auto retry.
+**Steps in order.** Discover on VPS1 → pick the SSD source (public copy,
+Prowlarr cross-seed, or a direct export; manual fuse adoption short-circuits
+to `DONE`) → reserve SSD budget → add to VPS2 paused → download in batches →
+`rclone move` with a literal `--files-from-raw` list (verified: exit 0 and
+the files gone) → re-add pointing at the fuse mount with `skip_check=True`
+after the fuse gate passes → `DONE`. Public torrents land paused when
+`cross_seed.pause_public_torrents_on_fuse` is set (default).
 
-Pre-SSD states (`NEW`/`WAITING_INDEXER`/`WAITING_DISK`) may
-fast-track straight to `DONE` on manual fuse adoption: the operator moved
-the files to the remote and added the same infohash on VPS2 pointing at a
-fuse mount (any category) with verified bytes, so no SSD download or rclone
-move is needed. The check is category-agnostic (hash lookup, not the
-`racing`-category filter recovery relies on) and fail-closed on bytes
-(skip_check ghosts never mark `DONE`).
+## Invariants (the audit's single rules)
 
-The state lives in `state.db` (SQLite, WAL journal). Transitions are
-written through `StateStore.transition`, which restores the in-memory row
-if the `upsert` fails (e.g. full disk) so memory never disagrees with the
-DB. Failures are logged to the app log and to the `run_log` table (pruned
-to 5000 rows). Two extra persisted columns keep long-run behavior stable
-across restarts: `batch_cap_bytes` (frozen batch boundaries) and
-`readd_cycles` (flap counter).
+**Destructive steps.** Before any delete or wipe: re-read the row's state
+and version, and classify the path with `path_ownership.classify_save_path`
+(`FUSE` → never delete through the mount, `SSD` → local, `FOREIGN`/`UNKNOWN`
+→ refuse). This gates forget, inject preemption, cleanup, and the MOVING
+wipe.
 
-## Per-torrent workflow
+**Writes.** `StateStore.upsert` takes `expected_state`/`expected_version`;
+`update_columns` is the narrow write. One `(column, ddl)` spec in `state.py`
+generates `CREATE TABLE`, the upgrade `ALTER`s, the blob-less projection and
+`to_row`, and an import-time check refuses drift against the dataclass.
 
-1. **Discover** — VPS1 racing client lists torrents matching configured category (or all if category="").
-   Insert/update row in `state.db` at `state=NEW`.
+**Unknown is not absent.** A fuse probe that cannot answer returns
+"unverifiable", never "missing"; a file-list RPC that fails parks the row; an
+unreadable mount is an outage, not a content miss. Callers must park.
 
-2. **Decide SSD source** (`pick_ssd_source_for_racing`):
+**Parks.** `_park_row` (any state), `_park_readd` (timer + reason) and
+`_park_moving` (escalating counter) are the only "stay put and retry"
+primitives. They record `last_error`, release in-memory slot maps, and never
+resurrect a forgotten row.
 
-   Manual fuse fast-track runs first: if the same infohash already seeds
-   from a fuse mount on VPS2 (any category) with verified bytes, the row
-    goes straight to `DONE` with no Prowlarr query or SSD work. Workers check
-    this at the top of `_do_new` / `_do_waiting_indexer`, and each tick runs
-    one batched hash lookup (`_sweep_manual_fuse_adoptions`) so parked
-    `WAITING_INDEXER` rows are picked up within one poll interval instead of
-    waiting out their 30-minute retry timer. Rows with live workers are
-    skipped by the sweep — their own worker check adopts without racing it.
-    The sweep (like the live-status refresh, the VPS1 footer probe, and the
-    source listing cache) is demand-gated: with no rows that could use it,
-    no client RPC fires — idle ticks stay store-local.
-    - Multiple racing-client torrents for the same content?
-     Prefer public. Try:
-       - `cross_seed.refetch_public_via_prowlarr` → prowlarr → download-target indexers (priority order)
-       - SFTP fallback (Deluge) or qB `export_torrent` (qB)
-    - Only private? Map each racing torrent's announce URL to a prowlarr indexer
-      via `[prowlarr.tracker_map]` (Beta, Alpha, Gamma, …). Search.
-      No tracker_map hit → query the `[[prowlarr.download_indexers]]`
-      download-target indexers in priority order; first exact release wins.
-      Park in `WAITING_INDEXER` + retry per `prowlarr_retry_*` if no hit yet.
-      A retry window is skipped (quiet park, no attempt burned) while
-      another row for the same content is already QUEUED/DOWNLOADING/
-      MOVING/RE_ADDING — its bytes are on the way, so searching Prowlarr
-      again would only duplicate them; a stalled/failed sibling hands
-      back control on a later window. While deferred the row shows
-      `Waiting for <tracker> copy · <stage>` instead of the miss count.
-      The same rule covers watch drops: a NEW drop defers to an in-flight
-      same-content row of any origin (the watch election can't see racing
-      rows) instead of grace-holding and then downloading a duplicate —
-       operator `/now_` still overrides.
-      Past `prowlarr_max_age_seconds` the row fails — unless
-      `cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout` is set,
-      in which case it uses the racing torrent's own bytes instead (with a
-      fresh retry window for the direct attempts, then FAILED if VPS1 stays
-       unreachable), or the operator sends Telegram `/now_<hash>` while it
-       is still waiting (sticky per-row `force_direct` bypasses Prowlarr on
-      every later pick, also with a fresh window). Transient SFTP drops
-      park for the next interval; only a persistently unreachable VPS1 fails
-      the row. `--reset` wipes the flag with the DB — the torrent is
-      re-discovered from VPS1 and retries from zero.
-    - No luck anywhere → SFTP-export the racing torrent.
+**Content identity.** `content_keys.same_content` is the one rule, with
+explicit modes: `require_size=True` for deferral/election (two unsized
+releases must not defer forever), `allow_unknown=False` for destructive
+grouping (name-only evidence never deletes). `watchdir.parse_torrent` is the
+one `.torrent` parser (v1 SHA-1, v2 SHA-256, hybrid; v2-only is refused
+because the pipeline is v1-keyed).
 
-3. **Add to VPS2**:
-    - `save_path = dest.save_path` (local SSD)
-    - `paused = True`, `skip_check = False` (req #3: we *want* the hash check on SSD)
-    - `category = "racing"`
-    - The QUEUED→DOWNLOADING edge re-checks `max_active_downloads`
-      (atomic admit via `_download_admissions`, extras stay QUEUED) so
-      fresh-start bursts can't sail past the tick's snapshot-only gate;
-      already-DOWNLOADING rows are grandfathered and drain naturally.
+**Fuse verification.** `fuse_gate.verify_blob_on_mount` returns
+`mount_ok` / `expected` / `missing`, with `confirm=True` re-probing once
+before a cached absence counts. `_fuse_entry_split` decides entry placement
+(an entry seeding from the SSD is not a fuse seed). The rclone index lags
+while the remote is busy, so "accepted but not yet visible" parks — it is
+never a failure and never `DONE`.
 
-4. **Classify** (`classifier.classify`):
-    - Individual episode matching episode regex -> `episode`
-    - Single file or multi-file bundle without episode tags -> `movie`
-    - Multi-episode pack (>= 90% episodes) -> `season`
-    - Multiple episodes with many extras -> `mixed`
-    - A single *file* larger than `ssd.skip_movie_larger_than_bytes` fails
-      the row; total torrent size never disqualifies batched content.
+**Retries and deadlines.** `retry.py` is the read-retry policy (bounded,
+fatal errnos excluded). Every worker handler runs under a per-state budget
+(`_STATE_WORK_BUDGET_S`); DOWNLOADING and MOVING own their poll deadlines
+(stall/flush/hash-check windows, `move_timeout_seconds`). `offload()` takes
+an optional timeout, used for the fuse probe and the SSD free-space probe.
 
-5. **Batch & download** (global SSD budget + isolated batches):
-    - Admission reserves `min(total, max_inflight_bytes)` from the *global*
-      ledger before `QUEUED`; over-budget rows park in `WAITING_DISK` and
-      re-check quietly (≤1/minute). After classification the reservation
-      refines to the real footprint (max batch for seasons/games, total for
-      singles); singles that no longer fit roll back to `WAITING_DISK`.
-    - For `season`/`mixed`: `make_batches(episodes, cap=frozen_cap)`; for
-      multi-file non-episodic content: name-sorted file groups. The cap is
-      frozen per row and persisted, so restarts keep identical boundaries.
-    - Set file priorities: priority 1 for batch N, 0 for everything else.
-      Resume; poll until the batch's files are client-complete *and* present
-      on SSD at full size (a desynced piece map alone never counts).
-      All batches already remote (remaining footprint zero) skips download
-      + move entirely: QUEUED goes straight to fuse-gated RE_ADDING instead
-      of waiting on a paused, fully-deselected entry that can never complete.
-    - After a verified move (rclone exit 0 *plus* nothing left on disk),
-      the torrent entry is deleted **with files** and re-added fresh for
-      batch N+1, so shared piece-boundary partials can't leak across
-      batches. Only complete files ever reach the remote.
+**Memory.** One throttled sweep (`_sweep_runtime_maps`) prunes expired memos
+and caps every per-hash map.
 
-6. **Move to remote** (`rclone_ops.move_local_to_remote`, ceiling
-    `[rclone].move_timeout_seconds`, 6h default):
+## SSD budget and batching
 
-    A hung remote (flood-wait pileup, stalled uplink) raises
-    `RcloneTimeoutError` after the ceiling; the child is terminated and
-    the row PARKS (source bytes are intact — rclone only removes them
-    after verified transfer), never fails. Repeated MOVING parks escalate
-    to `ERROR "MOVING stalled …"` with the gate reason in `last_error`.
-    - `rclone move <local> <remote> -- <extra_move_flags>` with per-file
-      `--files-from-raw` lists (literal paths, no globs) preserving the
-      torrent-relative tree — including folder-wrapped single files
-      (`Top/file.mkv` moves as `Top/file.mkv`, never flattened to the
-      remote root; only root-level flat singles move bare).
-      `extra_move_flags` / `batch_move_extra_flags`
-      live under `[rclone]` and reject config/credential-hijack flags.
-    - A move only counts when rclone exits 0 *and* the listed files are gone
-      from SSD (symlinks/unreadables count as leftovers); otherwise the
-      batch stays put for retry — never wipe unmoved data.
-    - Movies + full season roots → `rclone.remote.default`
-    - Individual episodes → `rclone.remote.unsorted`
-    - The classification pinned at queue time routes the move, so a file
-      list that changed mid-flight (tracker sidecar added) can't reroute it.
+`ssd.max_inflight_bytes` is a global budget, not a per-torrent cap. Admission
+reserves `min(total, cap)`; unknown sizes reserve the full cap (fail-closed).
+Over-budget rows park in `WAITING_DISK` and re-check quietly (≤1/min).
+After classification the reservation refines to the remaining footprint;
+each completed batch tightens it further. Seasons are split into batches that
+fit the frozen per-row cap; a batch is downloaded, verified, moved, and the
+entry removed before the next starts, so the SSD holds at most one batch at a
+time. Reservations release on `WAITING_DISK`/`RE_ADDING`/`DONE`/`FAILED`/
+forget and rebuild from the DB after a crash.
 
-7. **Re-inject** (`coordinator._do_re_add`):
-    - Fail closed on the fuse gate first: the cross-seed's files must be
-      stat-able at the blob-derived target mount before anything is injected
-      with `skip_check=True`. Missing blob parks; undecodable test blobs
-      warn through.
-    - Sustained-missing heal: files absent on fuse AND on SSD for longer
-      than `[rclone.fuse].readd_heal_missing_after_seconds` (2h default,
-      `0` disables) are selectively re-downloaded (that file only, SSD
-      budget reserved) and moved, capped at 3 attempts — then the 24h
-      max-age `FAILED` (and boot auto-retry) takes over. Fresh absences
-      never heal (usually fuse/rclone index lag).
-    - Delete the SSD torrent entry (`delete_files=False`; bytes already moved).
-    - For each racing-client torrent for the content (+ the cross-seed):
-      `add_torrent(save_path=fuse.mount, skip_check=True, paused=False)`.
-      Supplementary private cross-seeds are harvested from `tracker_map`
-      indexers via Prowlarr (same release, per-blob fuse gate, memoized
-      6h/row) — VPS1 supplements, never bounds, the racing set.
-    - Every fresh add is **verified visible at the target** (4×2s). The fuse
-      index lags while rclone is busy, so accepted-but-invisible parks and
-      retries — never `DONE`, never destructive. Transient rejections park;
-      hard rejections skip just that torrent.
-    - Duplicate entries pointing elsewhere are replaced; already-correct
-      entries are kept as-is.
-    - Public torrents land paused when
-      `cross_seed.pause_public_torrents_on_fuse` is set (default true):
-      fresh adds go in paused and already-seeding fuse entries are paused
-      in place, so operators that don't seed publics still keep the entry.
-      Detection is best-effort from the blob announce URL and fails open
-      toward seeding, so privates always seed. Set false to seed publics.
+## MOVING
 
-8. **Mark DONE** (recording the fuse mount as `save_path`).
+A move checkpoints three stages — `moved` (plan persisted), `entry_deleted`
+(dest entry removed), `wiped` (SSD cleaned). A fresh run and a crash-resumed
+run execute the same `_replay_move_checkpoint` sequence; a failed stage
+parks with its checkpoint intact and the next tick replays from there. A
+hung remote raises `RcloneTimeoutError` after `move_timeout_seconds` and
+parks (bytes are intact on SSD) — it never fails the row. Repeated MOVING
+parks escalate to an ERROR log with the gate reason in `last_error`.
 
-## Recovery (req #4)
+## Re-add and fuse lag
 
-With `[recovery].run_on_startup` enabled, startup runs ONE fast snapshot
-pass and nothing more: optimistic adoption (fuse entries adopt as `DONE`
-fuse-*un*verified with unknown kind/blob), orphan parking and ghost
-checks, with no per-row RPCs — so the daemon serves in seconds.
+The fuse gate fails closed: the cross-seed's files must verify at the target
+mount before anything is injected with `skip_check=True`. A sustained
+absence (same files, mount healthy, SSD bytes also gone) older than
+`readd_heal_missing_after_seconds` triggers a selective re-download + move,
+capped; otherwise the row parks and eventually hits the 24 h max-age failure.
+Supplementary private cross-seeds are harvested from `tracker_map` indexers
+(same release, per-blob gate, memoized per row) — VPS1 supplements, never
+bounds, the racing set.
 
-Byte verification, classification, blob export and orphan fixes are NOT
-started in the background. They heal lazily on the next worker tick
-through the existing fail-closed gates (the fuse gate re-verifies,
-`_do_queued` classifies, blobs export on demand), and an unverified row
-stays fail-closed (the janitor requires `fuse_verified`).
+## Recovery and cleanup
 
-`POST /api/recover` runs the full pass — `reconcile()`: snapshot plus
-inline per-row verification (4-wide, per-row isolated). It is safe
-against a live daemon: row writes are state/version-guarded, and
-adoption re-reads ownership before inserting, so a row admitted while
-the pass runs is linked rather than duplicated. `reconcile_verify()`
-stays available for callers that already hold a snapshot.
+Startup runs one fast snapshot pass: optimistic adoption, orphan parking and
+ghost checks, no per-row RPCs. Byte verification and blob export heal lazily
+on the next worker tick through the existing fail-closed gates. `POST
+/api/recover` runs the full pass (`reconcile()` with inline verification),
+safe against a live daemon because row writes are state/version-guarded and
+adoption re-reads ownership before inserting.
 
-- `state=downloading` + missing on destination -> re-add torrent to continue download.
-- `state=moving` + missing on SSD -> verify if data arrived on remote; transition to `RE_ADDING` if complete.
-- `state=done` + missing on fuse -> re-add to fuse mount via `RE_ADDING` (data already on remote).
-- `state=done` + present but byte-missing (skip_check ghost) with bytes on
-  SSD -> demote to `MOVING` for a real move; without SSD bytes it keeps
-  trust (mount may be warming) and the fuse gate parks re-adds.
-- Torrents on destination client not tracked in `state.db` are adopted
-  (`DONE` on fuse with verified bytes, `MOVING` when SSD-complete,
-  `DOWNLOADING` for partials) only under known SSD/fuse roots — foreign
-  placements stay `unknowns`. Name matching requires the same normalized
-  release, so repacks get their own rows instead of merging.
-- Torrents on destination client not tracked in `state.db` are audited and logged as orphans.
-- Startup recovery only lists `category="racing"`, so manual adds without a
-  category are invisible to it by design — the per-tick manual fuse sweep
-  (hash lookup, any category) covers those after startup.
-
-The state DB is the source of truth; VPS2 + filesystem are reality. The
-reconciler bridges them. After recovery the SSD ledger rebuilds from
-`QUEUED/DOWNLOADING/MOVING` rows, so an abrupt stop resumes with a correct
-budget instead of double-spending freed space.
-
-## SSD budget
-
-`ssd.max_inflight_bytes` is a **global** budget shared by every concurrent
-download — not a per-torrent cap:
-
-- Admission reserves `min(total, max_inflight_bytes)`; over budget parks in
-  `WAITING_DISK` (quiet, ≤1 re-check/minute; download-slot checked too).
-  Content already fully verified on fuse skips reservation entirely (no
-  budget queued for bytes that will never download). Same-hash content
-  already complete on the dest client (e.g. manually added and seeding
-  from SSD) also skips reservation — `_do_queued` adopts + resumes it,
-  so parking it behind a full ledger would only delay its rclone move.
-- Post-classify refinement: max *remaining* batch (fuse-present bytes
-  excluded — a 32 GB season with 20 GB already moved holds ~12 GB, not
-  32 GB), full total for singles; singles that no longer fit roll back
-  (entry deleted, row parked). Each completed batch re-tightens to the
-  batches still outstanding, and WAITING_DISK retries of cursor-having
-  rows reserve the remainder, not the total.
-- Reservations release on `WAITING_DISK` / `RE_ADDING` / `DONE` / `FAILED` /
-  `forget`, stale rows are pruned, and abrupt stops rebuild from the DB.
-
-`ssd_max_inflight_bytes(cfg)` (live free-space headroom) still sizes each
-row's *batch* cap; the ledger caps their *sum*.
-
-## Fuse verification & lag
-
-The fuse (rclone) index updates asynchronously — it can lag while the
-remote is busy with another move. The pipeline treats "accepted but not
-yet visible" as *not yet*, not *failed*: every injection path verifies the
-entry at its target mount and parks on unconfirmed results. A dead mount
-short-circuits on one mount stat instead of one failing stat per file per
-row per tick. Late cross-seeds for `DONE` rows are checked per tick but
-memoized 30 minutes when healthy (new arrivals wait at most one window).
-
-## Logging
-
-- `racing-sync.log` — human, rotated daily. Handlers disable themselves on
-  `ENOSPC` instead of traceback-storming a full disk; startup warns when
-  the log dir shares a filesystem with SSD/state data.
-- `racing-sync.jsonl` — structured, secrets scrubbed recursively, for grep/jq/vector.
-- `RingBufferHandler` — last 300 events in memory.
-- `[logging_sink]` — optional HTTPS POST to a central collector.
+The hourly janitor deletes a VPS1 copy only when the row is `DONE` past its
+grace period, the swarm is idle, the fuse entry is present, and the bytes
+verify; it re-reads the row and version right before each delete.
 
 ## Telegram
 
-One-shot `racing-sync online` message on startup, then one message per torrent (detail card, edited in place as the state
-advances) plus one active-tasks list message, refreshed every
-`status_update_interval` seconds with pagination buttons. The list groups
-same-file copies (normalized name + size, the election identity) under one
-numbered heading with the size once; each tracker gets a display-only
-`▸ <domain> <stage>` line; one positional command per group (`/act_3`)
-opens its action sheet with only the currently eligible actions —
-the typed verbs (`/cancel_` / `/now_` / `/skip_` / `/resume_` /
-`/injectfuse_` with the same number or hash) all keep working as
-shortcuts. Every button carries its copy's hash (single `:<hash>` or
-group `:<all|all-scope>:<leader-hash>`) and is re-resolved live at tap
-time, so renumbering mid-flow cannot misroute and no picker state
-exists to expire. Tapping a group cancel first asks remember-or-not
-(Ignore blocks the release from coming back; Just forget leaves it
-re-addable), then keep/delete (Yes = untrack + optionally ignore with
-files kept, No = wiped); cancelling `All` drops every copy, a single
-copy drops just it
-(leader-tap cascades to deferred pairs as before). `/cancel_match
-<text>` cancels every live group whose title contains `<text>` after
-one remember + one keep/delete question: the substring travels
-base64url-encoded in the buttons (`forget:match:<tok>:<0|1>` /
-`keep:match:<tok>:<0|1>:<yes|no>`) and is re-resolved live at each
-tap, so no stored pending state exists to expire. `/cancel_stalled`
-is the same flow over a predicate scope instead of a substring:
-DOWNLOADING groups whose dest entry reports 0 seeders and incomplete
-progress (rows with no dest entry get no verdict and are skipped).
-All four cancel scopes (single copy, whole group, title match,
-stalled predicate) run through one `CancelScope` model: resolution,
-the remember question, the keep question, and execution are scope
-operations, so the dispatcher branches stay thin and every scope
-re-resolves live at each tap.
-Operator commands share the same chat gates: `/stats` (rows by state,
-workers, intake, ignored, storage footer), `/tick` (one full pass on
-demand), `/pause_intake` / `/resume_intake` (hold NEW work; in-memory,
-so restarts resume normal intake and nothing wedges paused).
-`/find <text>` fans out read-only over the download-target indexers
-(titles + sizes) for triage — it never queues or downloads.
-`/files_<n|hash>` lists one torrent's files with batch position
-(read-only; file priorities stay owned by the batch flow). Tapping any action
-button deletes its sheet once handled, so answered questions never
-linger behind their follow-up (only the outcome reply stays).
-Slow taps (delete-files keeps, confirmed injects) first edit their
-sheet to a working state — best-effort and idempotent — so a silent
-sheet never invites the re-tap the in-flight guard absorbs.
-Liveness is checked at the first question for single-copy scopes
-(dead rows answer at once instead of wasting two taps); a failed
-liveness read reports `Action failed`, never "gone". A duplicate tap
-while one forget is still running gets "working on it" instead of a
-second execution (the 0.5s debounce can't cover a 60s client delete). Without remember
-the row is hard-deleted (no tombstone), so a later re-drop re-ingests
-from scratch. Delete/keep only ever concerns SSD data and client
-entries: fuse/remote copies are never touched (fuse-pointing entries
-are always removed file-less, and local deletes are confined to the
-SSD roots). Full hashes and
-legacy hash prefixes still work when typed; detail cards keep their
-per-torrent text commands. `WAITING_INDEXER` detail cards additionally
-render `Start SSD download now: /now_<short-hash>`, and grace-held NEW
-watch rows' cards render `Start this copy now: /now_<short-hash>`.
-The updates poller also watches
-chat messages: a group/hash command from the configured chat/user
-resolves and runs the flow above, then replies with the outcome
-and frees the SSD reservation. Cancelling an SSD owner also forgets the watch rows
-currently deferred on it (same election winner), reported in the reply;
-cancelling a waiter leaves the rest alone. A `/now_<...>` line starts
-a waiting row at once (`force_direct`, timer due for the next scheduler
-wakeup — the racing torrent's own bytes feed the SSD download) or a
-grace-held row (watch drop or racing row); non-waiting targets get an
-explanatory reply, and later same-content rows defer via the existing
-election (no follower update needed). Unknown/ambiguous prefixes get an
-explanatory reply. `/injectfuse_<group>` (waiting groups in the list) and
-`/injectfuse <full-hash>` (any VPS1 torrent, tracked or not) ask a
-Yes/No question naming the locked group; on Yes every member's
-.torrent must verify complete at its fuse target or nothing changes
-state (tracked rows keep their prior state, untracked groups gain no
-row) — verified groups drive/create a `RE_ADDING` row and the normal
-gate injects `skip_check=True`. Yes auto-lifts a prior cancel
-(ignore + tombstone) and stops any SSD download first (SSD entry
-removed, reservation released), so there is no unignore/cancel
-round-trip. Command and callback handling share a 0.5s per-chat debounce
-(double-sent commands resolve+act once). Cancelled releases live
-in `ignored_torrents` (in state.db, so `--reset` clears them) and are
-skipped at discovery, recovery adoption, re-injection and late-seed
-time. Flood control (including plain-text "Flood control exceeded" errors,
-not just `RetryAfter`) sleeps out the requested window and re-queues the
-update instead of dropping it; every successful detail send records its
-state, and each active-tasks refresh re-queues cards that drifted, so no
-card freezes at a dead state forever.
+One `racing-sync online` message on startup, one long-lived Active Tasks card
+(paginated, status filters), and one detail card per torrent. Every command
+is registered in the `/` popup with a description; targets use a space
+(`/cancel 3`) or an underscore (`/cancel_3`). Full list:
+`docs/telegram-commands.md`. Destructive sheets re-resolve live at each tap,
+are bound to the operator who opened them, and never touch fuse/remote
+copies.
 
-## FastAPI control plane
+## API
 
-`GET /api/state` (paginated) · `GET /api/active` (bounded) ·
-`GET /api/logs` · `GET /api/ssd` · `POST /api/recover` ·
-`POST /api/retry/{hash}` · `POST /api/forget/{hash}?ignore=true&delete_files=false`
-(always applies, full 40-char hash required; `ignore` records the cancellation,
-`delete_files=false` keeps local data like CLI `--keep-files`) ·
-`POST /api/scan-watch`. Useful when the Telegram bot isn't enough. Auth via
-static token in `X-API-Token` header, or nginx-injected `X-Authenticated-User`
-from `trusted_proxies` (token also supports 429 throttle, 422/404/409 on bad/unknown/conflicting hashes).
+Optional FastAPI: `GET /api/state`, `/api/active`, `/api/logs`, `/api/ssd`;
+`POST /api/recover`, `/api/retry/{hash}`,
+`/api/forget/{hash}?ignore=&delete_files=`, `/api/scan-watch`. Auth is a
+static `X-API-Token`, or an nginx-injected `X-Authenticated-User` from
+`trusted_proxies`.
 
-## Cross-seed tracker map
+## Config and logging
 
-`[prowlarr.tracker_map]` is a mapping where keys are announce-URL substrings
-and values are Prowlarr indexer names. The first matching substring wins
-(evaluated in insertion order).
-
-Keys match case-insensitively against the announce URLs of racing torrents.
-Live uses: (1) the watch-dir sacrificial flow adds every mapped indexer to
-its Prowlarr search pool (private cross-seeds for fuse); (2) the racing
-re-inject harvests same-release torrents from mapped indexers as
-supplementary fuse seeds (per-blob gate, 6h memo/row) — VPS1 supplements,
-never bounds, the racing set. The SSD download search itself always walks
-`download_indexers` in priority order; `tracker_map` never narrows it.
+`config.example.toml` documents every key; `config.py` validates and
+cross-checks them. `[prowlarr.tracker_map]` maps announce-URL substrings to
+indexer names (supplementary fuse cross-seeds only — the SSD download search
+always walks `download_indexers` in priority order). Logs are rotating files
+plus JSONL (secrets scrubbed), an in-memory ring buffer, and an optional
+HTTPS sink; the state DB records transitions in `run_log`.
 
 ## Operational notes
 
-- Always run the destination qBittorrent as a separate user; the SSD save_path
-  must be writable by that user.
-- Keep `general.log_dir` on a **different filesystem** from SSD/state data:
-  a full SSD otherwise takes down logging and `state.db` with it (startup
-  warns when they share a device).
-- The fuse mount (`/mnt/remote/...`) should be **read-only** to qBittorrent
-  if possible, but qB doesn't care: it only reads from `save_path` after the
-  files are there.
-- Isolated batches re-download shared boundary pieces per batch: budget a
-  few extra GB of swarm traffic per season for the guarantee that only
-  complete files reach the remote.
-- Extra rclone tuning belongs under `[rclone]` (`extra_move_flags`,
-  `batch_move_extra_flags`); keys under `[rclone.fuse]` are ignored (with a
-  warning). Config flags `--config`/`--password-command`/`--ask-password`
-  are rejected outright.
-- HTTP sessions are IPv4-only by default (`use_ipv6 = false` on
-  `[source]`/`[dest]`/`[prowlarr`) — tracker allowlists and seedbox egress
-  are overwhelmingly v4. Enable only on v6-capable setups.
-- The state DB is append-only-safe; it can be inspected with the `sqlite3` CLI:
+- Run the destination client as its own user; the SSD `save_path` must be
+  writable by it.
+- Keep `log_dir` on a different filesystem from the SSD/state DB
+  (startup warns when they share one).
+- The fuse mount may be read-only to the client; it only reads from
+  `save_path` after the files are there.
+- Isolated batches re-fetch shared boundary pieces per batch: budget a few
+  extra GB of swarm traffic per season.
+- rclone tuning belongs under `[rclone]`; `[rclone.fuse]` extras are ignored
+  with a warning, and `--config`/`--password-command`/`--ask-password` are
+  rejected.
+- HTTP is IPv4-only by default (`use_ipv6 = false`).
+- The state DB can be inspected with the `sqlite3` CLI:
   `sqlite3 /var/lib/racing-sync/state.db "select state, count(*) from torrent_state group by state"`.
+
+## Tests
+
+`pytest -q` (add `-n auto --dist loadfile` for speed). The suite covers the
+state machine, guards, moves, fuse verification, cleanup math, and the
+Telegram protocol.

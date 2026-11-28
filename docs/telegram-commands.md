@@ -22,7 +22,7 @@ with its usage line.
 All commands accept an optional `@bot` suffix in group chats
 (`/active@my_bot`).
 
-## The slash popup (every command the bot answers)
+## Command list (exactly what the popup shows)
 
 | Command | What it does |
 |---|---|
@@ -46,19 +46,9 @@ All commands accept an optional `@bot` suffix in group chats
 | `/unhold <hash>` | Resume a held release. A full 40-char hash also lifts a cancelled (ignored) release. |
 | `/unignore <hash>` | Track a cancelled release again. |
 
-## Older spellings (still work, not advertised)
-
-| Old | New |
-|---|---|
-| `/now_<target>`, `/fetch_<target>`, `/prefer_<target>` | `/start <target>` |
-| `/forcestart_<target>` | `/force <target>` |
-| `/skip_<target>` | `/hold <target>` |
-| `/unskip_<target>`, `/resume_<target>` | `/unhold <target>` |
-| `/unignore_<hash>` | `/unignore <hash>` |
-| `/injectfuse_<target>`, `/injectfuse <hash>` | `/inject <target>` |
-| `/cancel_match <text>` | `/cancel_all <text>` |
-| `/cancel_status` | `/cancel_lane` |
-| `/pause_intake`, `/resume_intake` | `/pause`, `/resume` |
+There are no other spellings: the old names (`/now_`, `/skip_`,
+`/injectfuse_`, `/cancel_match`, …) were removed, so typing one answers with
+nothing (a bare known verb answers with its usage line instead).
 
 ## Buttons
 

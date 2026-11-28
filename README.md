@@ -103,24 +103,46 @@ python3 run.py forget --config config.toml <infohash|name> --apply --ignore
 `unignore`, `--all` to undo every entry). Same thing via API:
 `POST /api/forget/{hash}`. Full API surface in `docs/architecture.md`.
 
-cancels every group whose title contains `<text>` at once; `/now_<id>`
-starts a waiting row immediately; `/cancel_stalled` cancels every
-downloading group with no seeders. Operator commands: `/stats` for a
-pipeline snapshot, `/tick` to run one tick now, `/pause_intake` /
-`/resume_intake` to hold and release new downloads, `/find <text>` to
-search indexers read-only, `/files_<n|hash>` to list a torrent's files.
-Nothing is deleted
-without an explicit choice; fuse/remote copies are never touched.
+### Telegram
 
-`check-config` also warns on unknown config keys (typo catcher).
+The bot is the main control plane: an Active Tasks card, one detail card per
+torrent, and buttons for everything destructive. Typing `/` shows every
+command with a description — the full list is in
+`docs/telegram-commands.md`. The short version:
+
+```
+/cancel 3      cancel one release (no argument: cancel by lane)
+/cancel_all    cancel every group whose title matches
+/start 3       start now (no Prowlarr wait, no grace wait)
+/hold 3        hold it;  /unhold <hash> resumes
+/inject <hash> manual fuse seeding after you moved the bytes
+/active /stats /tick /find <text> /files 3   dashboard + read-only tools
+/pause /resume                               intake pause/resume
+```
+
+Targets accept a space (`/cancel 3`) or an underscore (`/cancel_3`).
+Nothing is deleted without an explicit choice; fuse/remote copies are never
+touched.
+
+`check-config` also warns on unknown config keys (typo catcher) and on
+legal-but-foggy setups: an unmounted fuse path, a watch glob that cannot
+match a `.torrent`, relative paths, a cap above the disk, or a shared
+remote path.
+
+## Status
+
+The correctness/robustness audit is closed: every finding in
+`docs/code-audit.md` is implemented or resolved by design, with the status
+ledger at the end of that document. Throughput tuning was explicitly out of
+scope for that pass.
 
 ## Layout
 
 ```
-src/racing_sync/   # coordinator.py = main loop; classifier/batcher =
-                   # what/how to download; rclone_ops = offload; state.py =
-                   # SQLite state machine; telegram_bot.py = status cards;
-                   # api.py = control plane; clients/ = qBittorrent/Deluge
+src/racing_sync/   # coordinator*.py = the pipeline; state.py = SQLite state
+                   # machine; content_keys/fuse_gate/path_ownership = the
+                   # single rules; telegram_*.py = control plane; api.py =
+                   # optional HTTP API; clients/ = qBittorrent/Deluge
 ```
 
 Full module map in `docs/architecture.md`.
