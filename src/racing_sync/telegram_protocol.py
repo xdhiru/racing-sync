@@ -25,97 +25,103 @@ from telegram.error import NetworkError, RetryAfter, TimedOut
 #: to copy-paste; full 40-char hashes are also accepted by the watcher.
 CANCEL_SHORT_LEN = 10
 
-#: `/cancel_<hex>` (optional `@bot` suffix, extra trailing text ignored).
-CANCEL_CMD_RE = re.compile(r"^/cancel_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+# --------------------------------------------------------------------------- #
+# Command patterns
+#
+# One pattern per verb, accepting BOTH separators:
+#   `/verb <target>`   — what you type (a space is easier to type)
+#   `/verb_<target>`   — the legacy shape, still accepted
+# and, where a verb was renamed, the old spellings as aliases:
+#   start  ← now / fetch / prefer      force ← forcestart
+#   hold   ← skip                      unhold ← unskip / resume
+#   cancel_all ← cancel_match          cancel_lane ← cancel_status
+#   inject ← injectfuse
+# The target is a tracked hash/prefix or a group number from the card.
+# --------------------------------------------------------------------------- #
 
-#: `/fetch_<hex>` — same shape: use the starting torrent for the SSD
-#: download instead of waiting for Prowlarr (WAITING_INDEXER rows use
-#: the VPS1 original; NEW grace-held rows use their starting bytes).
-#: (Legacy alias: canonical verb is now `/now_`.)
-FETCH_CMD_RE = re.compile(r"^/fetch_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+#: `/cancel <target>` — cancel one release (hash, prefix or group number).
+CANCEL_CMD_RE = re.compile(r"^/cancel(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
-#: `/prefer_<hex>` — same shape: start a grace-held row's SSD
-#: download now instead of waiting out its preferred-copy grace.
-#: (Legacy alias: canonical verb is now `/now_`.)
-PREFER_CMD_RE = re.compile(r"^/prefer_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+#: `/cancel_all <text>` — cancel every live group whose title contains
+#: `<text>` (case-insensitive), after one remember + one keep/delete
+#: question. Legacy alias: `/cancel_match`.
+CANCEL_ALL_RE = re.compile(r"^/(?:cancel_all|cancel_match)(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
 
-#: `/now_<hex>` — same shape, replaces `/fetch_` + `/prefer_` with one
-#: state-dependent verb: WAITING_INDEXER rows use the starting torrent
-#: (VPS1 original) instead of waiting out Prowlarr; NEW grace-held
-#: rows (watch or racing) start their SSD download at once.
-NOW_CMD_RE = re.compile(r"^/now_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+#: `/cancel_lane` — the lane sheet (DL/MV/RD/QD) to cancel a whole lane.
+#: A bare `/cancel` opens the same sheet. Legacy alias: `/cancel_status`.
+CANCEL_LANE_RE = re.compile(r"^/(?:cancel|cancel_lane|cancel_status)(?:@[\w_]+)?\s*$")
 
-#: `/forcestart_<n|hex>` — operator override: arm the lane-cap bypass
-#: for a queued/moving row or group (in-memory force + wake). Extends
-#: `/now_` (same token shapes); force disarms on lane exit / restart.
-FORCESTART_CMD_RE = re.compile(r"^/forcestart_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+#: `/cancel_stalled` — cancel every group whose download is stalled
+#: (downloading, no seeders, incomplete). No argument.
+CANCEL_STALLED_RE = re.compile(r"^/cancel_stalled(?:@[\w_]+)?\s*$")
 
-#: `/skip_<hex>` — same shape: hold a tracked release (whole group):
-#: no workers, no Prowlarr queries, no downloads, no moves until
-#: `/unskip_`. State is kept; `/add` / watch-dir re-drop resumes it.
-SKIP_CMD_RE = re.compile(r"^/skip_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+#: `/start <target>` — start now instead of waiting: a WAITING_INDEXER row
+#: uses its starting torrent instead of waiting out Prowlarr, a NEW
+#: grace-held row starts its SSD download at once. Legacy aliases:
+#: `/now`, `/fetch`, `/prefer`.
+START_CMD_RE = re.compile(r"^/(?:start|now|fetch|prefer)(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
-#: `/unskip_<hex>` — same shape: resume a held release immediately.
-#: (Legacy alias: canonical verb is now `/resume_`.)
-UNSKIP_CMD_RE = re.compile(r"^/unskip_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+#: `/force <target>` — start past the lane caps for a queued/moving row or
+#: group (in-memory, disarms on lane exit or restart). Legacy alias:
+#: `/forcestart`.
+FORCE_CMD_RE = re.compile(r"^/(?:force|forcestart)(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
-#: `/resume_<hex>` — same shape, replaces `/unskip_` + `/unignore_`
-#: with one verb: held rows resume, cancelled (ignored) hashes are
-#: lifted so they track again. Full 40-char hash also reaches ignored
-#: entries (invisible in the list, like `/unignore_` before it).
-RESUME_CMD_RE = re.compile(r"^/resume_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+#: `/hold <target>` — hold a tracked release: no workers, no Prowlarr
+#: queries, no downloads, no moves until `/unhold`. The row and its state
+#: are kept. Legacy alias: `/skip`.
+HOLD_CMD_RE = re.compile(r"^/(?:hold|skip)(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
-#: `/unignore_<full-hash>` — legacy alias of `/resume_`: drop a
-#: cancelled release from the ignore list (plus its forget tombstone)
-#: so it can be tracked again. Full 40-char hash only: ignore entries
-#: are invisible in the task list, so prefixes cannot be disambiguated
-#: there.
-UNIGNORE_CMD_RE = re.compile(r"^/unignore_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+#: `/unhold <hash>` — resume a held release. A full 40-char hash also
+#: lifts a cancelled (ignored) release, so it tracks again. Legacy
+#: aliases: `/resume`, `/unskip`.
+UNHOLD_CMD_RE = re.compile(r"^/(?:unhold|unskip|resume)(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
-#: `/unignore <full-hash>` — manual form (no underscore), same effect.
-UNIGNORE_HASH_RE = re.compile(r"^/unignore\s+([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+#: `/unignore <hash>` — drop a cancelled release from the ignore list
+#: (plus its forget tombstone) so it can be tracked again. Full hash
+#: only: ignored rows are invisible in the list.
+UNIGNORE_CMD_RE = re.compile(r"^/unignore(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
-#: `/injectfuse_<n|hex>` — list shortcut: group number or tracked
-#: hash/prefix for manual fuse seeding (operator moved the bytes).
-INJECTFUSE_CMD_RE = re.compile(r"^/injectfuse_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+#: `/inject <target>` — manual fuse seeding: you moved the bytes to the
+#: remote yourself. Legacy alias: `/injectfuse`.
+INJECT_CMD_RE = re.compile(r"^/(?:inject|injectfuse)(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
-#: `/act_<n|hex>` — action sheet for a content group: one entry point
+#: `/act <target>` — action sheet for a content group: one entry point
 #: showing only the currently eligible actions (hash-direct buttons).
-#: Group number, tracked hash/prefix, or group id, like the other
-#: group commands.
-ACT_CMD_RE = re.compile(r"^/act_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+ACT_CMD_RE = re.compile(r"^/act(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
-#: `/injectfuse <full-hash>` — manual form: any VPS1 infohash, tracked
-#: or not yet tracked by the app.
-INJECTFUSE_HASH_RE = re.compile(r"^/injectfuse\s+([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+#: `/files <target>` — read-only file listing for one torrent/group.
+FILES_RE = re.compile(r"^/files(?:_|\s+)([0-9a-fA-F]+)(?:@[\w_]+)?\b")
+
+#: `/pause` — stop starting NEW work; in-flight rows drain normally.
+#: Legacy alias: `/pause_intake`.
+PAUSE_RE = re.compile(r"^/(?:pause|pause_intake)(?:@[\w_]+)?\s*$")
+
+#: `/resume` — resume intake of NEW work. The per-release resume is
+#: `/unhold <hash>`.
+RESUME_INTAKE_RE = re.compile(r"^/resume(?:_intake)?(?:@[\w_]+)?\s*$")
+
+# Legacy pattern names, kept for import compatibility (they now point at
+# the canonical patterns above).
+FETCH_CMD_RE = START_CMD_RE
+PREFER_CMD_RE = START_CMD_RE
+NOW_CMD_RE = START_CMD_RE
+FORCESTART_CMD_RE = FORCE_CMD_RE
+SKIP_CMD_RE = HOLD_CMD_RE
+UNSKIP_CMD_RE = UNHOLD_CMD_RE
+RESUME_CMD_RE = UNHOLD_CMD_RE
+UNIGNORE_HASH_RE = UNIGNORE_CMD_RE
+INJECTFUSE_CMD_RE = INJECT_CMD_RE
+INJECTFUSE_HASH_RE = INJECT_CMD_RE
+CANCEL_MATCH_RE = CANCEL_ALL_RE
+CANCEL_STATUS_RE = CANCEL_LANE_RE
+PAUSE_INTAKE_RE = PAUSE_RE
+RESUME_INTAKE_RE = RESUME_INTAKE_RE
 
 #: `/add` — ingest the .torrent file in the replied-to message (or in
 #: the same message when sent with /add as caption) as a Telegram
 #: origin drop, processed like a watch-dir file. Optional `@bot` suffix,
 #: extra trailing text ignored.
 ADD_CMD_RE = re.compile(r"^/add(?:@[\w_]+)?\b")
-
-#: `/cancel_match <text>` — bulk cancel: every live group whose title
-#: contains `<text>` (case-insensitive) is cancelled together after one
-#: remember + one keep/delete question. Optional `@bot` suffix for group
-#: chats; the text runs to end of line.
-#: (Defined ahead of the command registry, which references it.)
-CANCEL_MATCH_RE = re.compile(r"^/cancel_match(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
-
-#: `/cancel_stalled` — bulk cancel every live group whose download is
-#: stalled (DOWNLOADING with 0 seeders and incomplete progress, per the
-#: dest client at tap time). Optional `@bot` suffix; no argument.
-CANCEL_STALLED_RE = re.compile(r"^/cancel_stalled(?:@[\w_]+)?\s*$")
-
-#: `/cancel_status` — lane menu (DL/MV/RD/QD + live counts), then the
-#: usual remember + keep/delete sheets over the picked lane.
-#: Optional `@bot` suffix; no argument.
-CANCEL_STATUS_RE = re.compile(r"^/cancel_status(?:@[\w_]+)?\s*$")
-
-#: Operator pause/resume for intake of NEW work (in-flight rows drain
-#: normally; the flag resets on restart). Optional `@bot` suffix.
-PAUSE_INTAKE_RE = re.compile(r"^/pause_intake(?:@[\w_]+)?\s*$")
-RESUME_INTAKE_RE = re.compile(r"^/resume_intake(?:@[\w_]+)?\s*$")
 
 #: `/tick` — run one full pipeline tick now (poll + schedule + janitor).
 #: Optional `@bot` suffix; no argument.
@@ -134,10 +140,6 @@ STATS_RE = re.compile(r"^/stats(?:@[\w_]+)?\s*$")
 #: indexers (titles + sizes, nothing queued or downloaded). Optional
 #: `@bot` suffix; the text runs to end of line.
 FIND_RE = re.compile(r"^/find(?:@[\w_]+)?(?:\s+(.+?))?\s*$")
-
-#: `/files_<n|hex>` — read-only file listing for a group (group number,
-#: tracked hash/prefix, or group id, like the other group commands).
-FILES_RE = re.compile(r"^/files_([0-9a-fA-F]+)(?:@[\w_]+)?\b")
 
 
 def _scrubbed(e: object) -> str:
@@ -195,9 +197,25 @@ async def _cmd_resume(bot, match, message):
     await bot._resume_command_entry(match.group(1).lower(), message)
 
 
-async def _cmd_single_injectfuse(bot, match, message):
-    """`/injectfuse <full-hash>` (manual form)."""
-    await bot._start_single_command("injectfuse", match.group(1).lower(), message)
+async def _cmd_inject(bot, match, message):
+    """`/inject <target>`: manual fuse seeding (you moved the bytes).
+
+    A tracked group (number or hash prefix) gets the group sheet; a hash
+    that is not tracked is injected directly, so any VPS1 infohash works.
+    """
+    token = (match.group(1) or "").strip().lower()
+    try:
+        rows = await asyncio.to_thread(bot._store.list_active_inflight)
+    except Exception:
+        rows = []
+    try:
+        members, _live_n, _by_number = bot._resolve_group_token(rows, token)
+    except Exception:
+        members = []
+    if members:
+        await bot._start_group_command("injectfuse", token, message)
+        return
+    await bot._start_single_command("injectfuse", token, message)
 
 
 async def _cmd_act(bot, match, message):
@@ -516,33 +534,63 @@ async def _cmd_find(bot, match, message):
             pass
 
 
+#: Usage line per target-taking verb. The slash menu advertises the bare
+#: verb, so a bare `/start` must answer with how to use it instead of
+#: vanishing (the operator sees the name in the popup and hits enter).
+_COMMAND_USAGE: dict[str, str] = {
+    "start": "/start <group number or hash> — start it now instead of waiting",
+    "force": "/force <group number or hash> — start it past the lane caps",
+    "hold": "/hold <group number or hash> — hold it (no work until unheld)",
+    "unhold": "/unhold <hash> — resume a held release",
+    "unignore": "/unignore <full hash> — track a cancelled release again",
+    "inject": "/inject <hash> — inject a torrent you moved to the remote",
+    "act": "/act <group number or hash> — open the action sheet",
+    "files": "/files <group number or hash> — list its files (read-only)",
+    "cancel_all": "/cancel_all <text> — cancel every group whose title contains the text",
+    "find": "/find <text> — search the download-target indexers (read-only)",
+}
+
+
+def _command_usage_for(text: str) -> str | None:
+    """Usage line for a bare command word, or None when it is not one."""
+    try:
+        raw = str(text or "").strip()
+        if not raw.startswith("/"):
+            return None
+        word = raw[1:].split("@", 1)[0].strip().lower()
+        if not word or " " in word or "\t" in word:
+            return None
+        return _COMMAND_USAGE.get(word)
+    except Exception:
+        return None
+
+
 #: Chat command registry, in dispatch order. First match wins (patterns
 #: are mutually exclusive by construction — see the registry test).
+#:
+#: One entry per verb: each pattern also accepts the legacy spelling and
+#: the underscore separator, so old bookmarks keep working while the
+#: advertised surface stays small (one name per action).
 _CHAT_COMMANDS: tuple = (
     _ChatCommand("add", ADD_CMD_RE, _cmd_add),
-    _ChatCommand("fetch", FETCH_CMD_RE, _cmd_group("fetch")),
-    _ChatCommand("prefer", PREFER_CMD_RE, _cmd_group("prefer")),
-    _ChatCommand("now", NOW_CMD_RE, _cmd_group("now")),
-    _ChatCommand("forcestart", FORCESTART_CMD_RE, _cmd_group("forcestart")),
-    _ChatCommand("skip", SKIP_CMD_RE, _cmd_group("skip")),
-    _ChatCommand("unskip", UNSKIP_CMD_RE, _cmd_resume),
-    _ChatCommand("resume", RESUME_CMD_RE, _cmd_resume),
-    _ChatCommand("unignore", UNIGNORE_CMD_RE, _cmd_resume),
-    _ChatCommand("unignore_hash", UNIGNORE_HASH_RE, _cmd_resume),
-    _ChatCommand("injectfuse_hash", INJECTFUSE_HASH_RE, _cmd_single_injectfuse),
-    _ChatCommand("injectfuse", INJECTFUSE_CMD_RE, _cmd_group("injectfuse")),
-    _ChatCommand("act", ACT_CMD_RE, _cmd_act),
-    _ChatCommand("cancel_match", CANCEL_MATCH_RE, _cmd_cancel_match),
+    _ChatCommand("cancel", CANCEL_CMD_RE, _cmd_group("cancel")),
+    _ChatCommand("cancel_all", CANCEL_ALL_RE, _cmd_cancel_match),
+    _ChatCommand("cancel_lane", CANCEL_LANE_RE, _cmd_cancel_status),
     _ChatCommand("cancel_stalled", CANCEL_STALLED_RE, _cmd_cancel_stalled),
-    _ChatCommand("cancel_status", CANCEL_STATUS_RE, _cmd_cancel_status),
-    _ChatCommand("pause_intake", PAUSE_INTAKE_RE, _cmd_pause_intake),
-    _ChatCommand("resume_intake", RESUME_INTAKE_RE, _cmd_resume_intake),
+    _ChatCommand("start", START_CMD_RE, _cmd_group("now")),
+    _ChatCommand("force", FORCE_CMD_RE, _cmd_group("forcestart")),
+    _ChatCommand("hold", HOLD_CMD_RE, _cmd_group("skip")),
+    _ChatCommand("unhold", UNHOLD_CMD_RE, _cmd_resume),
+    _ChatCommand("unignore", UNIGNORE_CMD_RE, _cmd_resume),
+    _ChatCommand("inject", INJECT_CMD_RE, _cmd_inject),
+    _ChatCommand("act", ACT_CMD_RE, _cmd_act),
+    _ChatCommand("files", FILES_RE, _cmd_group("files")),
+    _ChatCommand("find", FIND_RE, _cmd_find),
+    _ChatCommand("pause", PAUSE_RE, _cmd_pause_intake),
+    _ChatCommand("resume", RESUME_INTAKE_RE, _cmd_resume_intake),
     _ChatCommand("tick", TICK_RE, _cmd_tick),
     _ChatCommand("active", ACTIVE_RE, _cmd_active),
     _ChatCommand("stats", STATS_RE, _cmd_stats),
-    _ChatCommand("find", FIND_RE, _cmd_find),
-    _ChatCommand("files", FILES_RE, _cmd_group("files")),
-    _ChatCommand("cancel", CANCEL_CMD_RE, _cmd_group("cancel")),
 )
 
 
@@ -834,18 +882,18 @@ def _cancel_command(infohash: str) -> str:
 
 
 def _now_command(infohash: str) -> str:
-    """Copy-pasteable now command for one task (short hash)."""
-    return f"/now_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+    """Copy-pasteable start command for one task (short hash)."""
+    return f"/start {(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 def _skip_command(infohash: str) -> str:
-    """Copy-pasteable skip command for one task (short hash)."""
-    return f"/skip_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+    """Copy-pasteable hold command for one task (short hash)."""
+    return f"/hold {(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 def _resume_command(infohash: str) -> str:
-    """Copy-pasteable resume command for one task (short hash)."""
-    return f"/resume_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+    """Copy-pasteable unhold command for one task (short hash)."""
+    return f"/unhold {(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 #: Flood-wait safety margin: sleeping the exact requested window
@@ -1066,56 +1114,88 @@ def _parse_action_data(data: str) -> tuple[str, bool, str, str, bool | None]:
 def _bot_command_menu() -> list:
     """Commands shown in the chat's `/` popup (Bot API menu).
 
-    Listed commands take no ID the operator won't know (`/add` acts on
-    the message, `/cancel_match` takes free text, the rest take none).
-    The pickers need group numbers or hashes, so they stay unlisted to
-    keep the menu short.
+    EVERY command the bot understands is listed here, with a one-line
+    description: the operator should never have to remember a name. The
+    popup shows the bare verb, so a target is typed after a space
+    (`/cancel 3`); the underscore form (`/cancel_3`) keeps working.
     """
     try:
         return [
             BotCommand(
-                "add",
-                "Add a .torrent file — reply to it with /add, or send it with /add as caption",
+                "active",
+                "Show the Active Tasks card now (re-send it if it was deleted)",
             ),
             BotCommand(
-                "cancel_match",
-                "Cancel every active group whose title contains <text> — /cancel_match <text>",
+                "add",
+                "Add a .torrent — reply to it with /add, or send it with /add as caption",
+            ),
+            BotCommand(
+                "act",
+                "Open the action sheet for a group — /act <group number or hash>",
+            ),
+            BotCommand(
+                "cancel",
+                "Cancel one release — /cancel <group number or hash> (no argument: cancel by lane)",
+            ),
+            BotCommand(
+                "cancel_all",
+                "Cancel every group whose title contains the text — /cancel_all <text>",
+            ),
+            BotCommand(
+                "cancel_lane",
+                "Cancel a whole lane (DL/MV/RD/QD) — opens a sheet with live counts",
             ),
             BotCommand(
                 "cancel_stalled",
-                "Cancel every downloading group with no seeders — /cancel_stalled",
+                "Cancel every download with no seeders and no progress",
             ),
             BotCommand(
-                "cancel_status",
-                "Cancel a whole lane (DL/MV/RD/QD) — /cancel_status",
+                "files",
+                "List a torrent's files (read-only) — /files <group number or hash>",
             ),
             BotCommand(
-                "pause_intake",
-                "Pause intake — no new downloads start until /resume_intake",
+                "find",
+                "Search the download-target indexers (read-only) — /find <text>",
             ),
             BotCommand(
-                "resume_intake",
+                "force",
+                "Start a queued/moving row past the lane caps — /force <group number or hash>",
+            ),
+            BotCommand(
+                "hold",
+                "Hold a release (no work until unheld) — /hold <group number or hash>",
+            ),
+            BotCommand(
+                "inject",
+                "Inject a torrent you moved to the remote yourself — /inject <hash>",
+            ),
+            BotCommand(
+                "pause",
+                "Pause intake — no new downloads start until /resume",
+            ),
+            BotCommand(
+                "resume",
                 "Resume intake of new downloads",
             ),
             BotCommand(
-                "tick",
-                "Run one pipeline tick now (poll + schedule + janitor)",
-            ),
-            BotCommand(
-                "active",
-                "Send a fresh Active Tasks card now",
+                "start",
+                "Start now instead of waiting — /start <group number or hash>",
             ),
             BotCommand(
                 "stats",
                 "Pipeline snapshot — rows by state, workers, storage",
             ),
             BotCommand(
-                "find",
-                "Search download-target indexers (read-only) — /find <text>",
+                "tick",
+                "Run one pipeline tick now (poll + schedule + janitor)",
             ),
             BotCommand(
-                "files",
-                "List a torrent's files (read-only) — /files_<n|hash>",
+                "unhold",
+                "Resume a held release — /unhold <hash>",
+            ),
+            BotCommand(
+                "unignore",
+                "Track a cancelled release again — /unignore <full hash>",
             ),
         ]
     except Exception:

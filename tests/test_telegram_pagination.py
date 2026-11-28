@@ -49,7 +49,7 @@ def test_render_active_pagination_and_numbering():
     # Source:/size lines); positional group commands, never hashes.
     assert "▸ nyaa.tracker.wf ⬇️ Downloading · 45.0% · ████░░░░ · Batch 1/2" in text0
     assert "▸ nyaa.tracker.wf 📋 Queued · Batch 1/2" in text0
-    assert "/act\\_1" in text0
+    assert "/act 1" in text0
     assert "/cancel\\_1" not in text0
     assert "Cancel:" not in text0
 
@@ -496,7 +496,7 @@ def test_render_active_groups_same_file_trackers():
     assert "▸ bte.example ⬇️ Downloading · 50.0% · ████░░░░" in text
     assert "Source:" not in text
     # Positional action entry per group (never hashes, never verbs).
-    assert "/act\\_1" in text
+    assert "/act 1" in text
     assert "/cancel\\_aaaaaaaaaa" not in text
     assert "/now\\_aaaaaaaaaa" not in text
     assert "/keep" not in text and "/prefer" not in text and "/fetch" not in text
@@ -532,7 +532,7 @@ def test_render_active_sibling_prefer_uses_own_hash():
     text, _, _ = render_active([(lead, None), (sib, None)], page=0, page_size=5, notes=notes)
     # One group, one heading; action entry per group (no hashes).
     assert text.count("Twin.Show.S01E01") == 1
-    assert "/act\\_1" in text
+    assert "/act 1" in text
     assert "/cancel\\_aaaaaaaaaa" not in text
     assert "/now\\_bbbbbbbbbb" not in text
     # The grace-held sibling labels with its own hash and is eligible.
@@ -1240,8 +1240,8 @@ async def test_detail_card_offers_prefer_for_grace_note():
     await bot._send_one_detail(h, None)
     sent_text = bot._bot.send_message.call_args[0][1]
     assert "Start this copy now:" in sent_text
-    assert f"/now_{h[:10]}" in sent_text
-    assert "/prefer_" not in sent_text
+    assert f"/start {h[:10]}" in sent_text
+    assert "/prefer" not in sent_text
     assert "/fetch_" not in sent_text
 
 
@@ -1259,7 +1259,7 @@ def test_render_active_offers_prefer_for_grace_note():
     )
     notes = {h: "Waiting for preferred copy ?? 42s left"}
     text, _, _ = render_active([(ts, None)], page=0, page_size=5, notes=notes)
-    assert "/act\\_1" in text
+    assert "/act 1" in text
     assert "/cancel\\_1" not in text
     assert f"{h[:10]}" not in text  # no torrent hash in the message
     assert "Start this copy now:" not in text

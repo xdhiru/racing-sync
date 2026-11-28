@@ -871,11 +871,11 @@ def render_active(
                 lines.append(f"▸ {state_text}")
 
         # 3. One short group command (the `/` prefix marks it; every
-        # column counts against the wrap limit). /act_N opens the action
+        # column counts against the wrap limit). /act N opens the action
         # sheet with only the currently eligible actions — the typed
-        # verbs (/cancel_ /now_ /skip_ /resume_ /injectfuse_ with the same
+        # verbs (/cancel /start /hold /unhold /inject with the same
         # number or hash) all keep working as shortcuts.
-        _cmds = [f"/act_{group_num}"]
+        _cmds = [f"/act {group_num}"]
         lines.append(" ".join(_esc(_c) for _c in _cmds))
         lines.append("")
 

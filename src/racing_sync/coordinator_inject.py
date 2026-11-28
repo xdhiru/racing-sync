@@ -174,7 +174,7 @@ class InjectMixin:
         """
         norm = (infohash or "").strip().lower()
         if len(norm) != 40 or not all(c in "0123456789abcdef" for c in norm):
-            raise ValueError("send /injectfuse <full 40-char hash> from VPS1")
+            raise ValueError("send /inject <full 40-char hash> from VPS1")
         try:
             live = await rpc(
                 self.source_client.list_torrents(),

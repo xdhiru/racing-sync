@@ -1029,7 +1029,7 @@ class ActionsMixin:
         if len(q) < _MATCH_MIN_CHARS:
             try:
                 await self._reply(
-                    "Send /cancel_match <text> (at least "
+                    "Send /cancel_all <text> (at least "
                     f"{_MATCH_MIN_CHARS} characters) — cancels every "
                     "active group whose title contains <text>.",
                     reply_to=message,

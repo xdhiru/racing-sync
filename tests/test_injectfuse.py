@@ -395,12 +395,13 @@ async def test_confirmed_done_noop(tmp_path):
 
 
 def test_regexes():
+    # One verb, both separators: "/inject 3" (typed) and "/inject_3".
     assert INJECTFUSE_CMD_RE.match("/injectfuse_3")
     assert INJECTFUSE_CMD_RE.match("/injectfuse_" + H1)
-    assert not INJECTFUSE_CMD_RE.match("/injectfuse " + H1)
+    assert INJECTFUSE_CMD_RE.match("/injectfuse " + H1)
+    assert INJECTFUSE_CMD_RE.match("/inject " + H1)
     assert INJECTFUSE_HASH_RE.match("/injectfuse " + H1)
     assert INJECTFUSE_HASH_RE.match("/injectfuse  " + H1.upper())
-    assert not INJECTFUSE_HASH_RE.match("/injectfuse_3")
 
 
 def test_no_pending_machine_left():

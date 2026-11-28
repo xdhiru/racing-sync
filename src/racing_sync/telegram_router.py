@@ -20,6 +20,7 @@ from .telegram_protocol import (
     CancelScope,
     ScopeGone,
     _action_error_text,
+    _command_usage_for,
     _now_command,
     _parse_action_data,
     _scrubbed,
@@ -745,6 +746,14 @@ class RouterMixin:
                 _matched, _match = _cmd, _m
                 break
             if _matched is None:
+                # A bare verb from the slash menu ("/start") has no target:
+                # answer with the usage line instead of ignoring the message.
+                _usage = _command_usage_for(text)
+                if _usage:
+                    try:
+                        await self._reply(_usage, reply_to=message)
+                    except Exception:
+                        pass
                 return
             if _via_channel:
                 try:

@@ -773,8 +773,8 @@ def test_render_active_has_cancel_command_per_task():
     )
     text, _, _ = render_active([(ts, 0.5), (ts2, None)], page=0, page_size=5)
     # One positional action entry per group (escaped underscore, no labels).
-    assert "/act\\_1" in text
-    assert "/act\\_2" in text
+    assert "/act 1" in text
+    assert "/act 2" in text
     assert "/cancel\\_1" not in text
     assert "/cancel\\_aaaaaaaaaa" not in text
     assert "Cancel:" not in text
@@ -986,8 +986,8 @@ def test_render_active_shows_fetch_only_for_waiting_indexer():
         source_infohash="b" * 40, source_name="Show2", state=State.DOWNLOADING, total_bytes=2000
     )
     text, _, _ = render_active([(waiting, None), (downloading, 0.5)], page=0, page_size=5)
-    assert "/act\\_1" in text
-    assert "/act\\_2" in text
+    assert "/act 1" in text
+    assert "/act 2" in text
     assert "Fetch original:" not in text
     assert "/cancel\\_1" not in text
     assert "/now\\_aaaaaaaaaa" not in text
@@ -1006,12 +1006,12 @@ def test_render_detail_shows_fetch_hint_for_waiting_indexer():
     detail = render_detail(waiting)
     # Full hash untouched in the detail card; now hint added.
     assert "`" + "a" * 40 + "`" in detail
-    assert "`/now_aaaaaaaaaa`" in detail
+    assert "`/start aaaaaaaaaa`" in detail
 
     downloading = TorrentState(
         source_infohash="b" * 40, source_name="Show2", state=State.DOWNLOADING, total_bytes=2000
     )
-    assert "/now_" not in render_detail(downloading)
+    assert "/start" not in render_detail(downloading)
 
 
 def test_resolve_fetch_target_requires_waiting(tmp_path: Path):
@@ -1191,41 +1191,60 @@ def test_keepq_text_shows_size_or_omits():
 
 
 def test_chat_command_registry_covers_all_verbs():
-    """Registry: unique names, valid handlers, mutually exclusive patterns."""
+    """Registry: unique names, valid handlers, mutually exclusive patterns.
+
+    One entry per verb: each pattern accepts the canonical space form,
+    the legacy underscore form and the old verb spellings.
+    """
     from racing_sync.telegram_bot import _CHAT_COMMANDS
 
     names = [c.name for c in _CHAT_COMMANDS]
-    assert len(names) == len(set(names)) == 24
+    assert len(names) == len(set(names)) == 19
     for c in _CHAT_COMMANDS:
         assert callable(c.pattern.match)
         assert callable(c.handle)
     cases = {
         "/add": ["add"],
-        "/fetch_abc123": ["fetch"],
-        "/prefer_1": ["prefer"],
-        "/now_abcdef12": ["now"],
-        "/forcestart_abcdef12": ["forcestart"],
-        "/forcestart_1": ["forcestart"],
-        "/skip_3": ["skip"],
-        "/unskip_abc123": ["unskip"],
-        "/resume_abc123": ["resume"],
-        "/unignore_abc123": ["unignore"],
-        "/unignore abc123": ["unignore_hash"],
+        # canonical (space) and legacy (underscore) target forms
+        "/cancel abc123": ["cancel"],
         "/cancel_abc123": ["cancel"],
-        "/cancel_match evil show": ["cancel_match"],
-        "/cancel_match": ["cancel_match"],
+        "/cancel_all evil show": ["cancel_all"],
+        "/cancel_match evil show": ["cancel_all"],
+        "/cancel_all": ["cancel_all"],
+        "/cancel_match": ["cancel_all"],
+        "/cancel": ["cancel_lane"],
+        "/cancel_lane": ["cancel_lane"],
+        "/cancel_status": ["cancel_lane"],
         "/cancel_stalled": ["cancel_stalled"],
-        "/cancel_status": ["cancel_status"],
-        "/injectfuse_2": ["injectfuse"],
-        "/injectfuse abc123": ["injectfuse_hash"],
+        "/start abcdef12": ["start"],
+        "/now_abcdef12": ["start"],
+        "/fetch_abc123": ["start"],
+        "/prefer_1": ["start"],
+        "/force abcdef12": ["force"],
+        "/forcestart_abcdef12": ["force"],
+        "/forcestart_1": ["force"],
+        "/hold abc123": ["hold"],
+        "/skip_3": ["hold"],
+        "/unhold abc123": ["unhold"],
+        "/unskip_abc123": ["unhold"],
+        "/resume_abc123": ["unhold"],
+        "/unignore abc123": ["unignore"],
+        "/unignore_abc123": ["unignore"],
+        "/inject abc123": ["inject"],
+        "/injectfuse_2": ["inject"],
+        "/injectfuse abc123": ["inject"],
+        "/act 1": ["act"],
         "/act_1": ["act"],
-        "/pause_intake": ["pause_intake"],
-        "/resume_intake": ["resume_intake"],
+        "/pause": ["pause"],
+        "/pause_intake": ["pause"],
+        "/resume": ["resume"],
+        "/resume_intake": ["resume"],
         "/tick": ["tick"],
         "/active": ["active"],
         "/stats": ["stats"],
         "/find evil show": ["find"],
         "/find": ["find"],
+        "/files 3": ["files"],
         "/files_3": ["files"],
         "/files_abcdef12": ["files"],
     }
@@ -1238,19 +1257,55 @@ def test_chat_command_registry_covers_all_verbs():
         "/cancel_",
         "/act_",
         "/now_",
+        "/start_",
         "/forcestart_",
         "/forcestartx",
         "/cancel_statusx",
+        "/cancel_allx",
         "/cancel_match_foo",
         "/cancel_stalledx",
         "/pause_intakex",
         "/statsx",
         "/findx",
         "/files_",
+        "/hold_",
+        "/unhold_",
+        "/inject_",
+        "/resume_",
         "",
         "/activex",
     ):
         assert [c.name for c in _CHAT_COMMANDS if c.pattern.match(text)] == [], text
+
+
+def test_every_command_is_advertised_in_the_slash_menu():
+    """The `/` popup must offer every verb the bot answers (and only those).
+
+    The operator should never have to remember a command name: whatever
+    the bot dispatches has to be discoverable in the chat's command list,
+    with a description.
+    """
+    from racing_sync.telegram_bot import _CHAT_COMMANDS, _bot_command_menu
+
+    menu = _bot_command_menu()
+    assert menu, "the command menu must not be empty"
+    advertised = {c.command for c in menu}
+    assert advertised == {c.name for c in _CHAT_COMMANDS}
+    for c in menu:
+        assert 1 <= len(c.command) <= 32
+        assert c.command == c.command.lower()
+        assert 3 <= len(c.description) <= 256
+
+
+def test_bare_verb_answers_with_its_usage_line():
+    """A bare "/start" (from the popup) must answer, not vanish."""
+    from racing_sync.telegram_protocol import _command_usage_for
+
+    assert "/start" in _command_usage_for("/start")
+    assert "/start" in _command_usage_for("/start@my_bot")
+    assert _command_usage_for("/start abc123") is None
+    assert _command_usage_for("/nonsense") is None
+    assert _command_usage_for("") is None
 
 
 def test_status_scope_parses_and_resolves():
@@ -1960,7 +2015,7 @@ def test_render_active_shows_skip_and_unskip():
     )
     text, _, _ = render_active([(held, None)], page=0, page_size=5)
     assert "⏭ Skipped" in text
-    assert "/act\\_1" in text
+    assert "/act 1" in text
     assert "/skip\\_1" not in text
     assert "/now\\_1" not in text
 
@@ -1968,7 +2023,7 @@ def test_render_active_shows_skip_and_unskip():
         source_infohash="b" * 40, source_name="Free", state=State.WAITING_INDEXER, total_bytes=1000
     )
     text, _, _ = render_active([(free, None)], page=0, page_size=5)
-    assert "/act\\_1" in text
+    assert "/act 1" in text
     assert "/resume\\_1" not in text
 
 
@@ -2004,7 +2059,7 @@ def test_render_detail_shows_held_resume():
     )
     detail = render_detail(ts)
     assert "Skipped" in detail
-    assert f"/resume_{'e' * 10}" in detail
+    assert f"/unhold {'e' * 10}" in detail
 
 
 def test_full_reset_refuses_symlink_ssd(tmp_path: Path, monkeypatch):
@@ -2593,10 +2648,10 @@ async def test_cancel_match_no_match_short_and_long(tmp_path: Path):
         assert "No active groups match" in bot._bot.send_message.call_args[0][1]
         bot._callback_times.clear()
         await bot._handle_chat_message(_message(text="/cancel_match"))
-        assert "/cancel_match <text>" in bot._bot.send_message.call_args[0][1]
+        assert "/cancel_all <text>" in bot._bot.send_message.call_args[0][1]
         bot._callback_times.clear()
         await bot._handle_chat_message(_message(text="/cancel_match e"))
-        assert "/cancel_match <text>" in bot._bot.send_message.call_args[0][1]
+        assert "/cancel_all <text>" in bot._bot.send_message.call_args[0][1]
         bot._callback_times.clear()
         await bot._handle_chat_message(_message(text="/cancel_match " + "x" * 36))
         assert "too long" in bot._bot.send_message.call_args[0][1]
@@ -2769,7 +2824,7 @@ def test_cancel_match_protocol_shapes_fit_buttons():
         _parse_action_data,
     )
 
-    assert any(c.command == "cancel_match" for c in _bot_command_menu())
+    assert any(c.command == "cancel_all" for c in _bot_command_menu())
     tok = _match_token("Flower.of.Evil")
     assert _match_query(tok) == "Flower.of.Evil"
     assert _match_token("x" * 36) == ""

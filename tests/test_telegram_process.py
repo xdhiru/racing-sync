@@ -308,7 +308,7 @@ async def test_process_duplicate_waiting_attaches_bytes(tmp_path):
         assert bytes(store.get_blob(infohash)) == blob
         texts = _sent_texts(bot)
         assert any("Attached supplied .torrent" in t for t in texts)
-        assert any(f"/now_{infohash[:10]}" in t for t in texts)
+        assert any(f"/start {infohash[:10]}" in t for t in texts)
         bot._bot.delete_message.assert_awaited_once_with(chat_id="1", message_id=50)
     finally:
         store.close()
@@ -522,52 +522,31 @@ async def test_bot_command_menu_lists_add(tmp_path):
     from racing_sync.telegram_bot import _bot_command_menu
 
     cmds = _bot_command_menu()
-    assert [(c.command, c.description) for c in cmds] == [
-        (
-            "add",
-            "Add a .torrent file — reply to it with /add, or send it with /add as caption",
-        ),
-        (
-            "cancel_match",
-            "Cancel every active group whose title contains <text> — /cancel_match <text>",
-        ),
-        (
-            "cancel_stalled",
-            "Cancel every downloading group with no seeders — /cancel_stalled",
-        ),
-        (
-            "cancel_status",
-            "Cancel a whole lane (DL/MV/RD/QD) — /cancel_status",
-        ),
-        (
-            "pause_intake",
-            "Pause intake — no new downloads start until /resume_intake",
-        ),
-        (
-            "resume_intake",
-            "Resume intake of new downloads",
-        ),
-        (
-            "tick",
-            "Run one pipeline tick now (poll + schedule + janitor)",
-        ),
-        (
-            "active",
-            "Send a fresh Active Tasks card now",
-        ),
-        (
-            "stats",
-            "Pipeline snapshot — rows by state, workers, storage",
-        ),
-        (
-            "find",
-            "Search download-target indexers (read-only) — /find <text>",
-        ),
-        (
-            "files",
-            "List a torrent's files (read-only) — /files_<n|hash>",
-        ),
+    assert [c.command for c in cmds] == [
+        "active",
+        "add",
+        "act",
+        "cancel",
+        "cancel_all",
+        "cancel_lane",
+        "cancel_stalled",
+        "files",
+        "find",
+        "force",
+        "hold",
+        "inject",
+        "pause",
+        "resume",
+        "start",
+        "stats",
+        "tick",
+        "unhold",
+        "unignore",
     ]
+    # Every entry explains itself: the popup is the only place the operator
+    # learns the verb.
+    for _c in cmds:
+        assert 3 <= len(_c.description) <= 256
 
 
 @pytest.mark.anyio
@@ -604,19 +583,10 @@ async def test_start_publishes_command_menu(tmp_path):
             await bot.start()
         try:
             cmds = fake.set_my_commands.await_args.args[0]
-            assert [c.command for c in cmds] == [
-                "add",
-                "cancel_match",
-                "cancel_stalled",
-                "cancel_status",
-                "pause_intake",
-                "resume_intake",
-                "tick",
-                "active",
-                "stats",
-                "find",
-                "files",
-            ]
+            from racing_sync.telegram_bot import _CHAT_COMMANDS
+
+            # The menu is alphabetical; the registry is dispatch order.
+            assert {c.command for c in cmds} == {c.name for c in _CHAT_COMMANDS}
         finally:
             try:
                 await bot.stop()

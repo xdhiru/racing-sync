@@ -183,7 +183,8 @@ def test_forcestart_command_registered():
     from racing_sync.telegram_protocol import _CHAT_COMMANDS
 
     names = [c.name for c in _CHAT_COMMANDS]
-    assert "forcestart" in names
-    row = next(c for c in _CHAT_COMMANDS if c.name == "forcestart")
+    assert "force" in names
+    row = next(c for c in _CHAT_COMMANDS if c.name == "force")
+    assert row.pattern.match("/force " + "a" * 40)
     assert row.pattern.match("/forcestart_" + "a" * 40)
-    assert not row.pattern.match("/now_" + "a" * 40)
+    assert not row.pattern.match("/start " + "a" * 40)
