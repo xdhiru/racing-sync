@@ -172,7 +172,7 @@ def _cmd_group(kind: str):
 
 
 async def _cmd_resume(bot, match, message):
-    """`/unhold_` / `/resume_` / `/unignore_` / `/unignore <hash>`."""
+    """`/unhold_` / `/unignore_` / `/unignore <hash>`."""
     await bot._resume_command_entry(match.group(1).lower(), message)
 
 
@@ -862,17 +862,17 @@ def _cancel_command(infohash: str) -> str:
 
 def _now_command(infohash: str) -> str:
     """Copy-pasteable start command for one task (short hash)."""
-    return f"/start {(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+    return f"/start_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 def _skip_command(infohash: str) -> str:
     """Copy-pasteable hold command for one task (short hash)."""
-    return f"/hold {(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+    return f"/hold_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 def _resume_command(infohash: str) -> str:
     """Copy-pasteable unhold command for one task (short hash)."""
-    return f"/unhold {(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
+    return f"/unhold_{(infohash or '').lower()[:CANCEL_SHORT_LEN]}"
 
 
 #: Flood-wait safety margin: sleeping the exact requested window

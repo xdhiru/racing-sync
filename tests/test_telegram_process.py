@@ -308,7 +308,7 @@ async def test_process_duplicate_waiting_attaches_bytes(tmp_path):
         assert bytes(store.get_blob(infohash)) == blob
         texts = _sent_texts(bot)
         assert any("Attached supplied .torrent" in t for t in texts)
-        assert any(f"/start {infohash[:10]}" in t for t in texts)
+        assert any(f"/start_{infohash[:10]}" in t for t in texts)
         bot._bot.delete_message.assert_awaited_once_with(chat_id="1", message_id=50)
     finally:
         store.close()

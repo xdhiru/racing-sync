@@ -518,7 +518,7 @@ async def test_cancelled_card_reports_the_chosen_policy():
 
     await bot._mark_detail_cancelled(7, "Show", h, remember=True, delete_files=True)
     assert "removed + ignored" in seen[-1]
-    assert f"Unignore: `/unignore {h}`" in seen[-1]
+    assert f"Unignore: `/unignore_{h}`" in seen[-1]
 
     await bot._mark_detail_cancelled(7, "Show", h, remember=False, delete_files=True)
     assert "can be re-added" in seen[-1]
@@ -526,7 +526,7 @@ async def test_cancelled_card_reports_the_chosen_policy():
 
     await bot._mark_detail_cancelled(7, "Show", h, remember=True, delete_files=False)
     assert "data left in place" in seen[-1]
-    assert f"Unignore: `/unignore {h}`" in seen[-1]
+    assert f"Unignore: `/unignore_{h}`" in seen[-1]
 
 
 @pytest.mark.anyio

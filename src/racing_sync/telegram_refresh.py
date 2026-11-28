@@ -95,7 +95,7 @@ class RefreshMixin:
                 else "untracked, data left in place (can be re-added)"
             )
         _hint = (
-            f"Unignore: `/unignore {_h}`" if remember else "Re-drop the .torrent to track it again"
+            f"Unignore: `/unignore_{_h}`" if remember else "Re-drop the .torrent to track it again"
         )
         text = f"🚫 CANCELLED `{_esc(shown)}`\n`{_h}`\n✗ Cancelled by operator ({_what})\n{_hint}"
         try:

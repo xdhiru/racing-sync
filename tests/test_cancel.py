@@ -773,8 +773,8 @@ def test_render_active_has_cancel_command_per_task():
     )
     text, _, _ = render_active([(ts, 0.5), (ts2, None)], page=0, page_size=5)
     # One positional action entry per group (escaped underscore, no labels).
-    assert "/act 1" in text
-    assert "/act 2" in text
+    assert "/act\_1" in text
+    assert "/act\_2" in text
     assert "/cancel\\_1" not in text
     assert "/cancel\\_aaaaaaaaaa" not in text
     assert "Cancel:" not in text
@@ -986,8 +986,8 @@ def test_render_active_shows_fetch_only_for_waiting_indexer():
         source_infohash="b" * 40, source_name="Show2", state=State.DOWNLOADING, total_bytes=2000
     )
     text, _, _ = render_active([(waiting, None), (downloading, 0.5)], page=0, page_size=5)
-    assert "/act 1" in text
-    assert "/act 2" in text
+    assert "/act\_1" in text
+    assert "/act\_2" in text
     assert "Fetch original:" not in text
     assert "/cancel\\_1" not in text
     assert "/now\\_aaaaaaaaaa" not in text
@@ -1006,7 +1006,7 @@ def test_render_detail_shows_fetch_hint_for_waiting_indexer():
     detail = render_detail(waiting)
     # Full hash untouched in the detail card; now hint added.
     assert "`" + "a" * 40 + "`" in detail
-    assert "`/start aaaaaaaaaa`" in detail
+    assert "`/start_aaaaaaaaaa`" in detail
 
     downloading = TorrentState(
         source_infohash="b" * 40, source_name="Show2", state=State.DOWNLOADING, total_bytes=2000
@@ -2011,7 +2011,7 @@ def test_render_active_shows_skip_and_unskip():
     )
     text, _, _ = render_active([(held, None)], page=0, page_size=5)
     assert "⏭ Skipped" in text
-    assert "/act 1" in text
+    assert "/act\_1" in text
     assert "/skip\\_1" not in text
     assert "/now\\_1" not in text
 
@@ -2019,7 +2019,7 @@ def test_render_active_shows_skip_and_unskip():
         source_infohash="b" * 40, source_name="Free", state=State.WAITING_INDEXER, total_bytes=1000
     )
     text, _, _ = render_active([(free, None)], page=0, page_size=5)
-    assert "/act 1" in text
+    assert "/act\_1" in text
     assert "/resume\\_1" not in text
 
 
@@ -2055,7 +2055,7 @@ def test_render_detail_shows_held_resume():
     )
     detail = render_detail(ts)
     assert "Skipped" in detail
-    assert f"/unhold {'e' * 10}" in detail
+    assert f"/unhold_{'e' * 10}" in detail
 
 
 def test_full_reset_refuses_symlink_ssd(tmp_path: Path, monkeypatch):

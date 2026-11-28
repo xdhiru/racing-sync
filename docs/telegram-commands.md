@@ -19,6 +19,11 @@ a tracked infohash / hash prefix. The slash popup lists the bare verb
 remembering it. Typing a bare verb that needs a target (`/start`) answers
 with its usage line.
 
+Commands the bot *prints* (Active Tasks card, detail cards) always use the
+underscore form — `/act_3`, `/start_aaaaaaaaaa`, `/unhold_eeeeeeeeee` — so
+the whole command is one word you can copy in one go and paste back into the
+chat. The space form is for typing by hand.
+
 All commands accept an optional `@bot` suffix in group chats
 (`/active@my_bot`).
 
