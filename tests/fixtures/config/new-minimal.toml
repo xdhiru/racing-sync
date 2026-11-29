@@ -1,0 +1,26 @@
+# New-spelling twin of minimal.toml: same values, `[client]`/`[storage]`/
+# `[remote]`/`[seed]` names. `[seed].unsorted_path` is left out so the
+# documented `<path>/unsorted` default is exercised.
+
+[general]
+
+
+[client]
+type = "qbittorrent"
+host = "http://127.0.0.1:8080"
+
+[dest]
+host = "http://127.0.0.1:8080"
+
+[storage]
+path = "/downloads"
+save_path = "/downloads"
+max_inflight_bytes = 1000000000
+skip_movie_larger_than_bytes = 1000000000
+
+[remote]
+path = "remote:movies/"
+unsorted = "remote:unsorted/"
+
+[seed]
+path = "/mnt/fuse"

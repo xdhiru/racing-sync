@@ -1453,6 +1453,20 @@ class AppConfig(BaseModel):
 
         with open(path, "rb") as f:
             data = tomllib.load(f)
+        # New capability-chain spellings resolve onto the internal schema
+        # before validation, so every consumer keeps reading today's
+        # sections. Deprecated keys still win; report each once per load.
+        from .config_alias import normalize_config
+
+        normalized = normalize_config(data)
+        import logging as _logging
+
+        _log = _logging.getLogger(__name__)
+        for message in normalized.deprecations:
+            _log.warning("config: %s", message)
+        for key in normalized.unknown:
+            _log.warning("config: unknown key %r — ignored (possible typo)", key)
+        data = normalized.data
         _warn_unknown_keys(cls, data)
         # Secrets at rest: the file holds passwords/api keys/bot tokens —
         # warn when group/other can read it (0600 recommended). POSIX-only:

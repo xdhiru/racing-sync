@@ -1,0 +1,33 @@
+# New-spelling twin of single-fuse.toml: same values, `[client]`/`[storage]`/
+# `[remote]`/`[seed]` names, with an explicit `[seed].unsorted_path`.
+
+[general]
+state_db = "/var/lib/racing-sync/state.db"
+log_dir = "/var/log/racing-sync"
+
+[client]
+type = "qbittorrent"
+host = "http://seedbox:8080"
+username = "admin"
+password = ""
+category = "racing"
+
+[dest]
+host = "http://seedbox:8080"
+username = "admin"
+password = ""
+
+[storage]
+path = "/srv/qbittorrent/data"
+save_path = "/srv/qbittorrent/data"
+max_inflight_bytes = 21474836480
+skip_movie_larger_than_bytes = 21474836480
+
+[remote]
+binary = "/usr/local/bin/rclone"
+path = "remote:qbittorrent/"
+unsorted = "remote:qbittorrent/unsorted/"
+
+[seed]
+path = "/mnt/remote/qbittorrent"
+unsorted_path = "/mnt/remote/qbittorrent/unsorted"

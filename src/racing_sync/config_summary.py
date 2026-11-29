@@ -73,13 +73,26 @@ def _redact(value: object, *, key: object = None) -> object:
     return str(value)
 
 
-def _explicit_keys(path: Path) -> set[Key]:
+def _explicit_keys(path: Path) -> tuple[set[Key], list[str], set[Key]]:
+    """(known-space leaves, new-spelling leftovers, raw leaves).
+
+    Keys are normalised to the internal schema first, so an old and a new
+    spelling of the same config classify identically. Raw leaves keep the
+    section names as written, for the per-section count.
+    """
     try:
         with open(path, "rb") as fh:
             data = tomllib.load(fh)
     except Exception:
-        return set()
-    return flatten_leaves(data)
+        return set(), [], set()
+    raw = flatten_leaves(data)
+    try:
+        from .config_alias import normalize_config
+
+        normalized = normalize_config(data)
+    except Exception:
+        return raw, [], raw
+    return flatten_leaves(normalized.data), list(normalized.unknown), raw
 
 
 def _classify_keys(explicit: set[Key], model: type[BaseModel]) -> tuple[set[Key], list[Key]]:
@@ -210,11 +223,11 @@ def _shape(cfg: AppConfig) -> dict:
 def summarize(cfg: AppConfig, config_path: Path | str) -> dict:
     """Canonical summary document for one loaded config."""
     path = Path(str(config_path))
-    explicit = _explicit_keys(path)
+    explicit, alias_unknown, raw = _explicit_keys(path)
     known, unknown = _classify_keys(explicit, AppConfig)
     model_fields = len(model_leaves(AppConfig))
     by_section: dict[str, int] = {}
-    for key in explicit:
+    for key in raw:
         if key:
             by_section[key[0]] = by_section.get(key[0], 0) + 1
     shape = _shape(cfg)
@@ -237,10 +250,10 @@ def summarize(cfg: AppConfig, config_path: Path | str) -> dict:
         "app_version": version,
         "shape": shape,
         "keys": {
-            "explicit": len(explicit),
+            "explicit": len(raw),
             "model": model_fields,
             "defaulted": max(0, model_fields - len(known)),
-            "unknown": [".".join(key) for key in unknown],
+            "unknown": [*(".".join(key) for key in unknown), *dict.fromkeys(alias_unknown)],
             "by_section": dict(sorted(by_section.items())),
         },
         "resolved": resolved,

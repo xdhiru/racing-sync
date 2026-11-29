@@ -163,3 +163,68 @@ def test_cli_reports_an_invalid_config(tmp_path: Path, capsys):
     rc = main(["config", "summary", "--config", str(cfg_file)])
     assert rc == 2
     assert "Invalid config" in capsys.readouterr().err
+
+
+_NEW_SPELLING_MINIMAL = """\
+[general]
+
+[client]
+type = "qbittorrent"
+host = "http://127.0.0.1:8080"
+
+[dest]
+host = "http://127.0.0.1:8080"
+
+[storage]
+path = "/downloads"
+save_path = "/downloads"
+max_inflight_bytes = 1000000000
+skip_movie_larger_than_bytes = 1000000000
+
+[remote]
+path = "remote:movies/"
+unsorted = "remote:unsorted/"
+
+[seed]
+path = "/mnt/fuse"
+"""
+
+
+def test_new_spelling_resolves_identically(tmp_path: Path):
+    """The new names are aliases: same values in, same shape and digest out."""
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(_NEW_SPELLING_MINIMAL, encoding="utf-8")
+
+    old = _summarize(CASES["minimal"])
+    new = _summarize(cfg_file)
+
+    assert new["digest"] == old["digest"]
+    assert new["shape"] == old["shape"]
+    keys = new["keys"]
+    assert set(keys["by_section"]) == {"client", "dest", "remote", "seed", "storage"}
+    assert keys["unknown"] == []
+    assert keys["explicit"] == 10
+
+
+def test_unknown_key_inside_new_section_is_reported(tmp_path: Path):
+    text = _NEW_SPELLING_MINIMAL.replace(
+        'host = "http://127.0.0.1:8080"\n\n[dest]',
+        'host = "http://127.0.0.1:8080"\nhots = "http://typo"\n\n[dest]',
+        count=1,
+    )
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(text, encoding="utf-8")
+
+    AppConfig.from_toml(cfg_file)  # a typo warns, it does not refuse to load
+    assert _summarize(cfg_file)["keys"]["unknown"] == ["client.hots"]
+
+
+def test_unknown_key_inside_nested_new_table(tmp_path: Path):
+    text = _NEW_SPELLING_MINIMAL + '\n[client.nginx]\nmodee = "basic"\n'
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(text, encoding="utf-8")
+
+    AppConfig.from_toml(cfg_file)  # the nested typo is ignored, not fatal
+    data = _summarize(cfg_file)
+
+    assert data["digest"].startswith("sha256:")
