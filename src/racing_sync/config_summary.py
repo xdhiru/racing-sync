@@ -16,12 +16,18 @@ import datetime as dt
 import hashlib
 import json
 import tomllib
-import typing
 from pathlib import Path
 
 from pydantic import BaseModel, SecretStr
 
 from .config import AppConfig
+from .config_disposition import (
+    Key,
+    extras_prefixes,
+    flatten_leaves,
+    model_leaves,
+    strip_indices,
+)
 
 _SECRET_NAME_HINTS = (
     "password",
@@ -34,8 +40,6 @@ _SECRET_NAME_HINTS = (
 )
 
 _REDACTED = "***"
-
-Key = tuple[str, ...]
 
 
 def _is_secret_name(name: object) -> bool:
@@ -69,107 +73,23 @@ def _redact(value: object, *, key: object = None) -> object:
     return str(value)
 
 
-def _flatten_leaves(value: object, prefix: Key = ()) -> set[Key]:
-    """Leaf paths of a nested mapping (lists carry their indices)."""
-    out: set[Key] = set()
-    if isinstance(value, dict):
-        for k, v in value.items():
-            out |= _flatten_leaves(v, prefix + (str(k),))
-        return out
-    if isinstance(value, (list, tuple)):
-        for i, v in enumerate(value):
-            out |= _flatten_leaves(v, prefix + (str(i),))
-        return out
-    out.add(prefix)
-    return out
-
-
-def _strip_indices(key: Key) -> Key:
-    return tuple(part for part in key if not part.isdigit())
-
-
-def _model_types(annotation: object) -> list[type[BaseModel]]:
-    """BaseModel classes reachable from an annotation (lists/unions included)."""
-    try:
-        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-            return [annotation]
-    except Exception:
-        return []
-    found: list[type[BaseModel]] = []
-    try:
-        for arg in typing.get_args(annotation) or ():
-            found.extend(_model_types(arg))
-    except Exception:
-        pass
-    return found
-
-
-def _is_dict_annotation(annotation: object) -> bool:
-    try:
-        return typing.get_origin(annotation) is dict
-    except Exception:
-        return False
-
-
-def _model_leaves(model: type[BaseModel], prefix: Key = ()) -> set[Key]:
-    """Field paths of a model tree; list multiplicity collapses (no indices)."""
-    out: set[Key] = set()
-    try:
-        fields = model.model_fields or {}
-    except Exception:
-        return out
-    for name, field in fields.items():
-        subs = _model_types(field.annotation)
-        path = prefix + (name,)
-        if subs:
-            for sub in subs:
-                out |= _model_leaves(sub, path)
-        elif _is_dict_annotation(field.annotation):
-            # Arbitrary keys: represented as a prefix, not as leaves.
-            continue
-        else:
-            out.add(path)
-    return out
-
-
-def _extras_prefixes(model: type[BaseModel], prefix: Key = ()) -> set[Key]:
-    """Paths that accept arbitrary keys (extra='allow' models, dict fields)."""
-    out: set[Key] = set()
-    try:
-        fields = model.model_fields or {}
-    except Exception:
-        return out
-    for name, field in fields.items():
-        path = prefix + (name,)
-        if _is_dict_annotation(field.annotation):
-            out.add(path)
-            continue
-        for sub in _model_types(field.annotation):
-            cfg = getattr(sub, "model_config", None) or {}
-            if cfg.get("extra") == "allow":
-                out.add(path)
-            else:
-                out |= _extras_prefixes(sub, path)
-    return out
-
-
 def _explicit_keys(path: Path) -> set[Key]:
     try:
         with open(path, "rb") as fh:
             data = tomllib.load(fh)
     except Exception:
         return set()
-    return _flatten_leaves(data)
+    return flatten_leaves(data)
 
 
 def _classify_keys(explicit: set[Key], model: type[BaseModel]) -> tuple[set[Key], list[Key]]:
     """(known explicit keys, unknown explicit keys) — indices collapsed."""
-    known_paths = _model_leaves(model)
-    extras = _extras_prefixes(model)
+    known_paths = model_leaves(model)
+    extras = extras_prefixes(model)
     known: set[Key] = set()
     unknown: list[Key] = []
     for key in explicit:
-        plain = _strip_indices(key)
+        plain = strip_indices(key)
         if plain in known_paths or any(plain[: len(pref)] == pref for pref in extras):
             known.add(plain)
             continue
@@ -292,7 +212,7 @@ def summarize(cfg: AppConfig, config_path: Path | str) -> dict:
     path = Path(str(config_path))
     explicit = _explicit_keys(path)
     known, unknown = _classify_keys(explicit, AppConfig)
-    model_fields = len(_model_leaves(AppConfig))
+    model_fields = len(model_leaves(AppConfig))
     by_section: dict[str, int] = {}
     for key in explicit:
         if key:
