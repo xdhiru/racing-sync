@@ -1,0 +1,49 @@
+# Legacy shape: optional sections carry real values but are switched off.
+# Characterisation fixture: `enabled = false` must never activate a module,
+# and its secret values must stay out of the summary.
+
+[general]
+
+
+[source]
+type = "qbittorrent"
+host = "http://127.0.0.1:8080"
+
+[dest]
+host = "http://127.0.0.1:8080"
+save_path = "/downloads"
+
+[ssd]
+path = "/downloads"
+max_inflight_bytes = 1000000000
+skip_movie_larger_than_bytes = 1000000000
+
+[rclone.remote]
+default = "remote:movies/"
+unsorted = "remote:unsorted/"
+
+[rclone.fuse]
+mount = "/mnt/fuse"
+mount_unsorted = "/mnt/fuse/unsorted"
+
+[prowlarr]
+enabled = false
+base_url = "http://prowlarr:9696"
+api_key = "prowlarr-api-key-0123456789"
+
+[[prowlarr.download_indexers]]
+name = "Seedpool (API)"
+announce_substrings = ["seedpool"]
+
+[cleanup]
+enabled = false
+dry_run = false
+
+[telegram]
+enabled = false
+bot_token = "999999999:ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+chat_id = "-1009999999999"
+
+[api]
+enabled = false
+api_token = "api-off-token-0123456789abcdef"

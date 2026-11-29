@@ -1,0 +1,248 @@
+{
+  "app_version": "0.1.0",
+  "digest": "sha256:181342c45a9d9087",
+  "keys": {
+    "by_section": {
+      "dest": 2,
+      "rclone": 4,
+      "source": 2,
+      "ssd": 3
+    },
+    "defaulted": 133,
+    "explicit": 11,
+    "model": 144,
+    "unknown": []
+  },
+  "resolved": {
+    "api": {
+      "api_token": "***",
+      "enabled": false,
+      "host": "127.0.0.1",
+      "port": 8765,
+      "tls_certfile": "",
+      "tls_keyfile": "",
+      "trust_nginx_header": false,
+      "trusted_proxies": [
+        "127.0.0.1",
+        "::1",
+        "localhost"
+      ]
+    },
+    "classifier": {
+      "episode_regex": "(?i)(?:\\bS\\d{1,3}E\\d{1,3}\\b| - (\\d{1,3}) \\()"
+    },
+    "cleanup": {
+      "activity_upspeed_bps": 65536,
+      "burst_arrivals_per_hour": 8.0,
+      "calm_arrivals_per_hour": 2.0,
+      "critical_watermark_free_bytes": 8589934592,
+      "delete_files": true,
+      "delete_stagger_seconds": 25.0,
+      "dry_run": true,
+      "enabled": false,
+      "high_watermark_free_bytes": 42949672960,
+      "idle_confirm_minutes": 45.0,
+      "janitor_interval_seconds": 3600,
+      "janitor_startup_delay_seconds": 300.0,
+      "low_watermark_free_bytes": 16106127360,
+      "max_grace_hours": 72.0,
+      "min_grace_hours": 2.0,
+      "min_ratio": 0.0,
+      "min_seed_hours": 0.0,
+      "per_run_cap": 10,
+      "protected_patterns": []
+    },
+    "cross_seed": {
+      "allow_prowlarr_cross_seed": true,
+      "allow_ssh_export": true,
+      "fallback_to_racing_torrent_on_prowlarr_timeout": false,
+      "inject_racing_torrents_to_fuse": true,
+      "pause_public_torrents_on_fuse": true,
+      "prowlarr_max_age_seconds": 86400,
+      "prowlarr_retry_interval_seconds": 1800,
+      "public_export_retry_interval_seconds": 1800,
+      "refetch_public_via_prowlarr": false
+    },
+    "dest": {
+      "host": "http://127.0.0.1:8080",
+      "max_active_downloads": 3,
+      "nginx": {
+        "extra_fields": {},
+        "mode": "off",
+        "pass_field": "password",
+        "url": "",
+        "user_field": "username"
+      },
+      "password": "***",
+      "save_path": "/downloads",
+      "use_ipv6": false,
+      "username": ""
+    },
+    "general": {
+      "client_rpc_timeout_seconds": 30,
+      "dest_poll_interval": 15,
+      "disk_safety_margin_bytes": 0,
+      "download_check_stall_seconds": 3600,
+      "download_max_check_wait_seconds": 43200,
+      "download_max_stall_parks": 3,
+      "download_stall_timeout_seconds": 7200,
+      "log_dir": "/var/log/racing-sync",
+      "log_retention_days": 14,
+      "max_active_downloads": null,
+      "max_concurrent_moves": null,
+      "preferred_copy_grace_seconds": 3600,
+      "source_poll_interval": 30,
+      "state_db": "/var/lib/racing-sync/state.db"
+    },
+    "logging_sink": {
+      "allow_plaintext": false,
+      "auth_token": "***",
+      "enabled": false,
+      "forward_min_level": "INFO",
+      "url": ""
+    },
+    "prowlarr": {
+      "api_key": "***",
+      "base_url": "",
+      "dns_cache_ttl_seconds": 300,
+      "download_indexers": [],
+      "enabled": false,
+      "max_results": 20,
+      "parallel_search_concurrency": 4,
+      "parallel_search_timeout_seconds": 90.0,
+      "pool_limit": 100,
+      "pool_per_host": 20,
+      "skip_query_substrings": [],
+      "timeout_seconds": 30.0,
+      "tracker_map": {
+        "entries": {}
+      },
+      "use_ipv6": false
+    },
+    "rclone": {
+      "batch_move_extra_flags": [],
+      "binary": "/usr/local/bin/rclone",
+      "config_path": null,
+      "extra_move_flags": [],
+      "fuse": {
+        "manual_move_check_seconds": 1800,
+        "manual_move_timeout_seconds": 43200,
+        "mount": "/mnt/fuse",
+        "mount_unsorted": "/mnt/fuse/unsorted",
+        "readd_heal_missing_after_seconds": 7200,
+        "reinject_backoff_seconds": 1800,
+        "reinject_delay_seconds": 30,
+        "reinject_max_age_seconds": 86400,
+        "reinject_retry_gap_seconds": 120
+      },
+      "max_concurrent_moves": 3,
+      "move_timeout_seconds": 21600,
+      "reinject_delay_seconds": null,
+      "remote": {
+        "default": "remote:movies/",
+        "unsorted": "remote:unsorted/"
+      }
+    },
+    "recovery": {
+      "auto_fix_state": true,
+      "auto_retry_failed": true,
+      "batch_size": 50,
+      "max_failed_retries": 3,
+      "run_on_startup": true
+    },
+    "source": {
+      "category": "",
+      "deluge_sftp": null,
+      "host": "http://127.0.0.1:8080",
+      "min_age_seconds": 0,
+      "nginx": {
+        "extra_fields": {},
+        "mode": "off",
+        "pass_field": "password",
+        "url": "",
+        "user_field": "username"
+      },
+      "password": "***",
+      "type": "qbittorrent",
+      "use_ipv6": false,
+      "username": ""
+    },
+    "ssd": {
+      "max_inflight_bytes": 1000000000,
+      "path": "/downloads",
+      "safety_margin_bytes": 0,
+      "skip_movie_larger_than_bytes": 1000000000
+    },
+    "telegram": {
+      "active_repost_interval_seconds": 0,
+      "admin_user_ids": [],
+      "bot_token": "***",
+      "chat_id": "",
+      "delete_processed_torrent": true,
+      "enabled": false,
+      "outbound_rate": 5,
+      "page_size": 5,
+      "pin_status_message": false,
+      "status_update_interval": 45
+    },
+    "watch_dir": null
+  },
+  "shape": {
+    "acquire": [
+      "client_export"
+    ],
+    "acquire_detail": {
+      "allow_prowlarr_cross_seed": true,
+      "allow_ssh_export": true,
+      "download_indexers": 0,
+      "fallback_to_racing_torrent": false,
+      "prowlarr_enabled": false,
+      "tracker_map_entries": 1
+    },
+    "cleanup": {
+      "dry_run": true,
+      "enabled": false
+    },
+    "control": {
+      "api": false,
+      "logging_sink": false,
+      "telegram": false
+    },
+    "dest": {
+      "host": "http://127.0.0.1:8080",
+      "save_path": "/downloads",
+      "type": "qbittorrent"
+    },
+    "mode": "single",
+    "observe": [
+      "source",
+      "dest"
+    ],
+    "seed": {
+      "manual_move_timeout_seconds": 43200,
+      "mount": "/mnt/fuse",
+      "mount_unsorted": "/mnt/fuse/unsorted",
+      "provider": "fuse",
+      "reinject_delay_seconds": 30
+    },
+    "source": {
+      "category": "",
+      "host": "http://127.0.0.1:8080",
+      "min_age_seconds": 0,
+      "type": "qbittorrent"
+    },
+    "stage": {
+      "max_inflight_bytes": 1000000000,
+      "path": "/downloads",
+      "skip_single_file_bytes": 1000000000
+    },
+    "transfer": {
+      "binary": "/usr/local/bin/rclone",
+      "max_concurrent_moves": 3,
+      "move_timeout_seconds": 21600.0,
+      "provider": "rclone",
+      "remote_default": "remote:movies/",
+      "remote_unsorted": "remote:unsorted/"
+    }
+  }
+}

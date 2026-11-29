@@ -1,0 +1,303 @@
+{
+  "app_version": "0.1.0",
+  "digest": "sha256:16dab52b9867b03e",
+  "keys": {
+    "by_section": {
+      "api": 8,
+      "classifier": 1,
+      "cleanup": 18,
+      "cross_seed": 8,
+      "dest": 9,
+      "general": 8,
+      "logging_sink": 5,
+      "prowlarr": 11,
+      "rclone": 23,
+      "recovery": 5,
+      "source": 21,
+      "ssd": 4,
+      "telegram": 9,
+      "watch_dir": 5
+    },
+    "defaulted": 19,
+    "explicit": 135,
+    "model": 144,
+    "unknown": []
+  },
+  "resolved": {
+    "api": {
+      "api_token": "***",
+      "enabled": false,
+      "host": "127.0.0.1",
+      "port": 8765,
+      "tls_certfile": "",
+      "tls_keyfile": "",
+      "trust_nginx_header": false,
+      "trusted_proxies": [
+        "127.0.0.1",
+        "::1",
+        "localhost"
+      ]
+    },
+    "classifier": {
+      "episode_regex": "(?i)(?:\\bS\\d{1,3}E\\d{1,3}\\b| - (\\d{1,3}) \\()"
+    },
+    "cleanup": {
+      "activity_upspeed_bps": 65536,
+      "burst_arrivals_per_hour": 8.0,
+      "calm_arrivals_per_hour": 2.0,
+      "critical_watermark_free_bytes": 8589934592,
+      "delete_files": true,
+      "delete_stagger_seconds": 25.0,
+      "dry_run": true,
+      "enabled": false,
+      "high_watermark_free_bytes": 42949672960,
+      "idle_confirm_minutes": 45.0,
+      "janitor_interval_seconds": 1800,
+      "janitor_startup_delay_seconds": 300.0,
+      "low_watermark_free_bytes": 16106127360,
+      "max_grace_hours": 72.0,
+      "min_grace_hours": 2.0,
+      "min_ratio": 0.0,
+      "min_seed_hours": 0.0,
+      "per_run_cap": 10,
+      "protected_patterns": []
+    },
+    "cross_seed": {
+      "allow_prowlarr_cross_seed": true,
+      "allow_ssh_export": true,
+      "fallback_to_racing_torrent_on_prowlarr_timeout": false,
+      "inject_racing_torrents_to_fuse": true,
+      "pause_public_torrents_on_fuse": true,
+      "prowlarr_max_age_seconds": 86400,
+      "prowlarr_retry_interval_seconds": 900,
+      "public_export_retry_interval_seconds": 1800,
+      "refetch_public_via_prowlarr": false
+    },
+    "dest": {
+      "host": "http://127.0.0.1:8080",
+      "max_active_downloads": 3,
+      "nginx": {
+        "extra_fields": {},
+        "mode": "off",
+        "pass_field": "password",
+        "url": "",
+        "user_field": "username"
+      },
+      "password": "***",
+      "save_path": "/srv/qbittorrent/data",
+      "use_ipv6": false,
+      "username": "admin"
+    },
+    "general": {
+      "client_rpc_timeout_seconds": 30,
+      "dest_poll_interval": 60,
+      "disk_safety_margin_bytes": 1073741824,
+      "download_check_stall_seconds": 3600,
+      "download_max_check_wait_seconds": 43200,
+      "download_max_stall_parks": 3,
+      "download_stall_timeout_seconds": 7200,
+      "log_dir": "/var/log/racing-sync",
+      "log_retention_days": 2,
+      "max_active_downloads": null,
+      "max_concurrent_moves": null,
+      "preferred_copy_grace_seconds": 3600,
+      "source_poll_interval": 75,
+      "state_db": "/var/lib/racing-sync/state.db"
+    },
+    "logging_sink": {
+      "allow_plaintext": false,
+      "auth_token": "***",
+      "enabled": false,
+      "forward_min_level": "INFO",
+      "url": ""
+    },
+    "prowlarr": {
+      "api_key": "***",
+      "base_url": "http://127.0.0.1:9696",
+      "dns_cache_ttl_seconds": 300,
+      "download_indexers": [
+        {
+          "announce_substrings": [
+            "my-indexer"
+          ],
+          "name": "My Indexer (API)"
+        }
+      ],
+      "enabled": false,
+      "max_results": 20,
+      "parallel_search_concurrency": 4,
+      "parallel_search_timeout_seconds": 90.0,
+      "pool_limit": 100,
+      "pool_per_host": 20,
+      "skip_query_substrings": [
+        "dummysub"
+      ],
+      "timeout_seconds": 30.0,
+      "tracker_map": {
+        "entries": {
+          "alpha.cc": "Alpha (API)",
+          "beta": "Beta",
+          "gamma.tv": "Gamma"
+        }
+      },
+      "use_ipv6": false
+    },
+    "rclone": {
+      "batch_move_extra_flags": [
+        "--delete-after"
+      ],
+      "binary": "/usr/local/bin/rclone",
+      "config_path": null,
+      "extra_move_flags": [
+        "--transfers=4",
+        "--checkers=8",
+        "--bwlimit=0",
+        "--size-only",
+        "--retries=10",
+        "--low-level-retries=20",
+        "--log-level=INFO",
+        "--stats=30s",
+        "--stats-one-line"
+      ],
+      "fuse": {
+        "manual_move_check_seconds": 1800,
+        "manual_move_timeout_seconds": 43200,
+        "mount": "/mnt/remote/qbittorrent",
+        "mount_unsorted": "/mnt/remote/qbittorrent/unsorted",
+        "readd_heal_missing_after_seconds": 7200,
+        "reinject_backoff_seconds": 1800,
+        "reinject_delay_seconds": 135,
+        "reinject_max_age_seconds": 86400,
+        "reinject_retry_gap_seconds": 120
+      },
+      "max_concurrent_moves": 3,
+      "move_timeout_seconds": 21600,
+      "reinject_delay_seconds": null,
+      "remote": {
+        "default": "remote:qbittorrent/",
+        "unsorted": "remote:qbittorrent/unsorted/"
+      }
+    },
+    "recovery": {
+      "auto_fix_state": true,
+      "auto_retry_failed": true,
+      "batch_size": 50,
+      "max_failed_retries": 3,
+      "run_on_startup": true
+    },
+    "source": {
+      "category": "",
+      "deluge_sftp": {
+        "auto_add_host_key": false,
+        "enabled": false,
+        "known_hosts_path": null,
+        "pool_size": 3,
+        "ssh_host": "127.0.0.1",
+        "ssh_key_passphrase": "***",
+        "ssh_key_path": null,
+        "ssh_password": "***",
+        "ssh_port": 22,
+        "ssh_user": "deluge",
+        "state_dir": "/home/deluge/.config/deluge/state"
+      },
+      "host": "http://127.0.0.1:8080",
+      "min_age_seconds": 0,
+      "nginx": {
+        "extra_fields": {},
+        "mode": "off",
+        "pass_field": "password",
+        "url": "",
+        "user_field": "username"
+      },
+      "password": "***",
+      "type": "qbittorrent",
+      "use_ipv6": false,
+      "username": "admin"
+    },
+    "ssd": {
+      "max_inflight_bytes": 42949672960,
+      "path": "/srv/qbittorrent/data",
+      "safety_margin_bytes": 0,
+      "skip_movie_larger_than_bytes": 42949672960
+    },
+    "telegram": {
+      "active_repost_interval_seconds": 15,
+      "admin_user_ids": [],
+      "bot_token": "***",
+      "chat_id": "",
+      "delete_processed_torrent": true,
+      "enabled": false,
+      "outbound_rate": 5,
+      "page_size": 5,
+      "pin_status_message": false,
+      "status_update_interval": 15
+    },
+    "watch_dir": {
+      "delete_after_pickup": true,
+      "glob": "*.torrent",
+      "path": "/srv/qbittorrent/watch",
+      "prefer_prowlarr_result": true,
+      "query_prowlarr": true
+    }
+  },
+  "shape": {
+    "acquire": [
+      "client_export",
+      "watch_dir"
+    ],
+    "acquire_detail": {
+      "allow_prowlarr_cross_seed": true,
+      "allow_ssh_export": true,
+      "download_indexers": 1,
+      "fallback_to_racing_torrent": false,
+      "prowlarr_enabled": false,
+      "tracker_map_entries": 1
+    },
+    "cleanup": {
+      "dry_run": true,
+      "enabled": false
+    },
+    "control": {
+      "api": false,
+      "logging_sink": false,
+      "telegram": false
+    },
+    "dest": {
+      "host": "http://127.0.0.1:8080",
+      "save_path": "/srv/qbittorrent/data",
+      "type": "qbittorrent"
+    },
+    "mode": "single",
+    "observe": [
+      "source",
+      "dest",
+      "watch"
+    ],
+    "seed": {
+      "manual_move_timeout_seconds": 43200,
+      "mount": "/mnt/remote/qbittorrent",
+      "mount_unsorted": "/mnt/remote/qbittorrent/unsorted",
+      "provider": "fuse",
+      "reinject_delay_seconds": 135
+    },
+    "source": {
+      "category": "",
+      "host": "http://127.0.0.1:8080",
+      "min_age_seconds": 0,
+      "type": "qbittorrent"
+    },
+    "stage": {
+      "max_inflight_bytes": 42949672960,
+      "path": "/srv/qbittorrent/data",
+      "skip_single_file_bytes": 42949672960
+    },
+    "transfer": {
+      "binary": "/usr/local/bin/rclone",
+      "max_concurrent_moves": 3,
+      "move_timeout_seconds": 21600.0,
+      "provider": "rclone",
+      "remote_default": "remote:qbittorrent/",
+      "remote_unsorted": "remote:qbittorrent/unsorted/"
+    }
+  }
+}

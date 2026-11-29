@@ -1,0 +1,35 @@
+# Single box with a fuse mount: same client for racing and seeding,
+# no indexers, no watch dir, no control planes, no cleanup.
+
+[general]
+state_db = "/var/lib/racing-sync/state.db"
+log_dir = "/var/log/racing-sync"
+
+[source]
+type = "qbittorrent"
+host = "http://seedbox:8080"
+username = "admin"
+password = ""
+category = "racing"
+
+[dest]
+host = "http://seedbox:8080"
+username = "admin"
+password = ""
+save_path = "/srv/qbittorrent/data"
+
+[ssd]
+path = "/srv/qbittorrent/data"
+max_inflight_bytes = 21474836480
+skip_movie_larger_than_bytes = 21474836480
+
+[rclone]
+binary = "/usr/local/bin/rclone"
+
+[rclone.remote]
+default = "remote:qbittorrent/"
+unsorted = "remote:qbittorrent/unsorted/"
+
+[rclone.fuse]
+mount = "/mnt/remote/qbittorrent"
+mount_unsorted = "/mnt/remote/qbittorrent/unsorted"

@@ -1,0 +1,95 @@
+# Two boxes, cross-seed acquisition, every optional module on.
+# Characterisation fixture: the full shape.
+
+[general]
+state_db = "/var/lib/racing-sync/state.db"
+log_dir = "/var/log/racing-sync"
+source_poll_interval = 75
+dest_poll_interval = 60
+
+[source]
+type = "deluge"
+host = "http://seedbox-a:8112"
+username = "admin"
+password = ""
+category = "racing"
+min_age_seconds = 0
+
+[source.nginx]
+mode = "off"
+
+[source.deluge_sftp]
+enabled = true
+ssh_host = "seedbox-a"
+ssh_port = 22
+ssh_user = "deluge"
+ssh_password = "sftp-test-pass"
+state_dir = "/home/deluge/.config/deluge/state"
+
+[dest]
+host = "http://seedbox-b:8080"
+username = "admin"
+password = ""
+save_path = "/srv/qbittorrent/data"
+
+[dest.nginx]
+mode = "off"
+
+[ssd]
+path = "/srv/qbittorrent/data"
+max_inflight_bytes = 42949672960
+skip_movie_larger_than_bytes = 42949672960
+
+[rclone]
+binary = "/usr/local/bin/rclone"
+
+[rclone.remote]
+default = "remote:qbittorrent/"
+unsorted = "remote:qbittorrent/unsorted/"
+
+[rclone.fuse]
+mount = "/mnt/remote/qbittorrent"
+mount_unsorted = "/mnt/remote/qbittorrent/unsorted"
+
+[prowlarr]
+enabled = true
+base_url = "http://prowlarr:9696"
+api_key = "prowlarr-api-key-0123456789"
+
+[[prowlarr.download_indexers]]
+name = "Seedpool (API)"
+announce_substrings = ["seedpool"]
+
+[[prowlarr.download_indexers]]
+name = "TorrentLeech"
+announce_substrings = ["torrentleech"]
+
+[prowlarr.tracker_map]
+"alpha.cc" = "Alpha (API)"
+"beta" = "Beta"
+
+[cross_seed]
+allow_prowlarr_cross_seed = true
+allow_ssh_export = true
+prowlarr_retry_interval_seconds = 900
+prowlarr_max_age_seconds = 86400
+
+[watch_dir]
+path = "/srv/qbittorrent/watch"
+glob = "*.torrent"
+
+[cleanup]
+enabled = true
+dry_run = true
+
+[telegram]
+enabled = true
+bot_token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+chat_id = "-1001234567890"
+
+[api]
+enabled = true
+host = "127.0.0.1"
+port = 8765
+trust_nginx_header = false
+api_token = "api-test-token-0123456789abcdef"
