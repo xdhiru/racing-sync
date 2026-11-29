@@ -1,6 +1,8 @@
 # Refactor plan — capability chain, explicit modules, smaller config
 
-Status: **planned, not started.** Written 2026-10-28.
+Status: **phase 1 landed (2026-11-29); next: phase 2.** Phases 0–1 are in
+`dev`: the read-only `config summary` with its golden corpus, the field
+disposition registry, and the alias layer that accepts the new spellings.
 
 ## Goal
 
@@ -70,6 +72,14 @@ Every optional section has `enabled: bool | None = None`:
 Required keys are validated only for enabled links; cross-field rules live in the
 module that owns them.
 
+As landed in phase 1: the adapter rewrites new spellings onto today's tables before
+validation, so callers see no change. Both spellings of one key may coexist when they
+agree and are refused when they differ. `enabled` is tri-state only where the runtime
+can honour it today (`[indexers]`, `[watch]`); disabling `acquire`/`transfer`/`seed`
+is refused until phase 3 can drain stranded rows. `[acquire]` owns the old
+`[cross_seed]` strategy keys (they describe how bytes arrive, not which indexers
+exist), and `[seed].unsorted_path` defaults to `<seed.path>/unsorted`.
+
 ### Sections
 
 | Old | New |
@@ -79,7 +89,8 @@ module that owns them.
 | `[ssd]` + `dest.save_path` | `[storage]` |
 | `[rclone]` | `[remote]` |
 | `[rclone.fuse]` | `[seed]` (fuse keys map to `seed.path`) |
-| `[prowlarr]` + `[cross_seed]` | `[indexers]` |
+| `[prowlarr]` | `[indexers]` |
+| `[cross_seed]` | `[acquire]` (strategy keys only) |
 | `[watch_dir]` | `[watch]` |
 | `[cleanup] [telegram] [api] [logging_sink]` | same names, explicit `enabled` |
 
@@ -155,8 +166,8 @@ cleanup (proof depends on the chain), and source identity in single-box mode.
 
 | # | Deliverable | Exit criteria |
 |---|---|---|
-| 0 | `config-summary` + golden configs + shape inventory | old configs resolve identically; no behavior change |
-| 1 | Config layer: module models, `enabled` tri-state, renames, legacy adapter, deprecations, exhaustive disposition registry | every old key accepted; one warning per retired key; `AppConfig` facade unchanged for callers |
+| 0 ✅ | `config-summary` + golden configs + shape inventory | old configs resolve identically; no behavior change |
+| 1 ✅ | Config layer: module models, `enabled` tri-state, renames, legacy adapter, deprecations, exhaustive disposition registry | every old key accepted; one warning per retired key; `AppConfig` facade unchanged for callers |
 | 2 | Composition root + capability Protocols + factories | split/full behaves byte-identically; consumers no longer touch raw sections |
 | 3 | Chain engine: derived transitions, checkpoint resolver, stranded-row drain, ledger, cleanup verifier, providers for today's behavior (`rclone`, `path`, `auto`, `none`) | shape matrix green for split/full/move-only/download-only |
 | 4 | New providers/shapes: `local` acquire, `local_move`, `external`, `seed.existing` | single-box, HDD/NAS, out-of-band and adopt-only shapes green |
@@ -212,3 +223,9 @@ editor, and throughput tuning (still separate from this refactor).
 - `seed` targets a path (fuse mount or plain dir), fuse is not a module.
 - First-class now: `none`, `local_move`, `external`, `seed.path/existing`;
   `rsync` execution deferred.
+- Phase 1 (landed): alias layer rewrites TOML new→internal before validation;
+  the facade is untouched. Old and new spellings may coexist when they agree.
+  `[cross_seed]` maps to `[acquire]` (strategy, not indexer config).
+  `[seed].unsorted_path` defaults to `<path>/unsorted`. Disabling a link is
+  refused until phase 3 can drain it. Deprecated: `general.max_active_downloads`,
+  `general.max_concurrent_moves`, `rclone.reinject_delay_seconds` (warn once, still win).
