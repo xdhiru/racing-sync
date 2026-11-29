@@ -686,6 +686,34 @@ def _check_config_warnings(cfg: AppConfig) -> list[str]:
     return warnings
 
 
+def _load_config(path: Path) -> AppConfig | None:
+    """Load a config, printing the same clean errors as the CLI. None = exit 2."""
+    try:
+        return AppConfig.from_toml(path)
+    except FileNotFoundError as e:
+        print(f"Invalid config: file not found: {e}", file=sys.stderr)
+    except Exception as e:
+        # TOML decode errors + pydantic ValidationError — clean message, no traceback.
+        print(f"Invalid config {path}: {e}", file=sys.stderr)
+    return None
+
+
+def _cmd_config(args: argparse.Namespace) -> int:
+    """`config <action>` — read-only inspection (scaffolding arrives later)."""
+    action = getattr(args, "config_cmd", None)
+    if action == "summary":
+        cfg = _load_config(args.config)
+        if cfg is None:
+            return 2
+        from .config_summary import format_summary, summarize, summary_json
+
+        data = summarize(cfg, args.config)
+        print(summary_json(data) if getattr(args, "json", False) else format_summary(data))
+        return 0
+    print(f"unknown config action: {action!r}", file=sys.stderr)
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     prog = Path(sys.argv[0]).name if argv is None and sys.argv else "racing-sync"
     parser = argparse.ArgumentParser(prog=prog)
@@ -771,15 +799,22 @@ def main(argv: list[str] | None = None) -> int:
     p_check = sub.add_parser("check-config", help="Validate config and exit")
     p_check.add_argument("--config", type=Path, required=True)
 
+    p_config = sub.add_parser("config", help="Inspect the resolved configuration")
+    cfg_sub = p_config.add_subparsers(dest="config_cmd", required=True)
+    p_cfg_sum = cfg_sub.add_parser(
+        "summary",
+        help="Print the resolved shape, key counts and a digest (read-only)",
+    )
+    p_cfg_sum.add_argument("--config", type=Path, required=True)
+    p_cfg_sum.add_argument("--json", action="store_true", help="Machine-readable output")
+
     args = parser.parse_args(argv)
-    try:
-        cfg = AppConfig.from_toml(args.config)
-    except FileNotFoundError as e:
-        print(f"Invalid config: file not found: {e}", file=sys.stderr)
-        return 2
-    except Exception as e:
-        # TOML decode errors + pydantic ValidationError — clean message, no traceback.
-        print(f"Invalid config {args.config}: {e}", file=sys.stderr)
+    if args.cmd == "config":
+        # `config` actions own their loading (scaffolding must work without an
+        # existing file), so dispatch before the shared load below.
+        return _cmd_config(args)
+    cfg = _load_config(args.config)
+    if cfg is None:
         return 2
 
     if args.cmd == "check-config":

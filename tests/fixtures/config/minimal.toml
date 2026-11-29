@@ -1,0 +1,26 @@
+# Smallest valid configuration (every optional section omitted).
+# Characterisation fixture: pins the defaulted values and the resolved shape.
+
+[general]
+
+
+[source]
+type = "qbittorrent"
+host = "http://127.0.0.1:8080"
+
+[dest]
+host = "http://127.0.0.1:8080"
+save_path = "/downloads"
+
+[ssd]
+path = "/downloads"
+max_inflight_bytes = 1000000000
+skip_movie_larger_than_bytes = 1000000000
+
+[rclone.remote]
+default = "remote:movies/"
+unsorted = "remote:unsorted/"
+
+[rclone.fuse]
+mount = "/mnt/fuse"
+mount_unsorted = "/mnt/fuse/unsorted"
