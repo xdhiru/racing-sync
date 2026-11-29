@@ -179,8 +179,11 @@ and no RPC. Fully present bytes admit straight from the row's own blob
 rclone move in progress, or fuse index lag — parks the row without injecting
 and re-checks every `[rclone.fuse].manual_move_check_seconds` (default 1800)
 for up to `manual_move_timeout_seconds` (default 43200, 0 disables), then
-falls back to the normal SSD download. The window start is persisted
-(`fuse_wait_first_at`), so a restart keeps the deadline.
+falls back to the normal SSD download. A single file that exceeds the SSD
+cap uses the same window instead of failing at once — a hand-copied remote
+version is its only path. The window start is persisted
+(`fuse_wait_first_at`), so a restart keeps the deadline; after the ceiling it
+latches (a row that cannot download fails rather than restarting the wait).
 
 ## Recovery and cleanup
 

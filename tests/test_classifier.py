@@ -170,6 +170,9 @@ async def test_do_queued_deletes_torrent_when_oversize_movie_skipped(tmp_path: P
 
     cfg = _cfg()
     cfg.ssd.skip_movie_larger_than_bytes = 100_000_000_000
+    # This test pins the terminal cleanup; the manual-move wait is covered
+    # separately (disable it so the oversize branch fails as before).
+    cfg.rclone.fuse.manual_move_timeout_seconds = 0
     coord = make_coordinator()
     coord.cfg = cfg
     coord.dest_client = AsyncMock()

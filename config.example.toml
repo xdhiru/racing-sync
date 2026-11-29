@@ -300,6 +300,8 @@ readd_heal_missing_after_seconds = 7200
 # manual_move_timeout_seconds (default: 43200 / 12h), then downloads the
 # missing bytes from SSD. 0 disables the wait (pick immediately).
 manual_move_check_seconds = 1800
+# Also used by single files that exceed the SSD cap: they wait for the
+# remote copy instead of failing immediately (it is their only path).
 manual_move_timeout_seconds = 43200
 
 # ============================================================

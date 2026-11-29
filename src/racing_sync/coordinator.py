@@ -652,6 +652,9 @@ class Coordinator(
                         )
                         continue
                     ts.failed_retries += 1
+                    # A manual copy may have started while the row was failed:
+                    # give the revived row a fresh manual-move window.
+                    ts.fuse_wait_first_at = None
                     try:
                         self.store.upsert(ts)
                     except AbandonedError:
@@ -3361,6 +3364,7 @@ class Coordinator(
         ts.readd_attempts = 0
         ts.readd_cycles = 0
         ts.force_direct = 0
+        ts.fuse_wait_first_at = None
         ts.batch_index = 0
         ts.batches_total = 0
         self.transition(ts, State.NEW)

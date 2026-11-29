@@ -696,6 +696,21 @@ class AdmitMixin:
             display_name=(ts.source_name or "")[:60],
         )
 
+    def _fuse_mounts_configured(self) -> bool:
+        """True when at least one fuse mount is a real configured path."""
+        try:
+            fuse = self.cfg.rclone.fuse
+        except Exception:
+            return False
+        for _attr in ("mount", "mount_unsorted"):
+            try:
+                raw = getattr(fuse, _attr, None)
+            except Exception:
+                continue
+            if isinstance(raw, (str, Path)) and str(raw).strip():
+                return True
+        return False
+
     def _manual_move_wait_limits(self) -> tuple[float, float]:
         """(check_seconds, timeout_seconds); timeout 0 disables the wait."""
         try:
@@ -715,14 +730,20 @@ class AdmitMixin:
     def _park_fuse_content_wait(
         self, ts: TorrentState, *, present: int = 0, total: int = 0
     ) -> bool:
-        """Park a partly-present row and re-check on a timer; False = give up.
+        """Park awaiting a manual copy and re-check on a timer; False = give up.
 
         Uses WAITING_INDEXER (the scheduler already wakes those rows) with
         `indexer_next_retry_at` as the wake timer and `fuse_wait_first_at`
         as the persisted window start, so a restart keeps the deadline.
-        Returns False when the wait is disabled (timeout 0) or exceeded —
-        the caller then falls through to the normal pick.
+        Returns False when the wait is disabled (timeout 0, or no fuse
+        mount configured) or the ceiling is reached. The stamp is kept on
+        expiry as a latch: callers that would otherwise park again (an
+        oversize row that cannot download at all) must fail instead of
+        restarting the window forever.
         """
+        if not self._fuse_mounts_configured():
+            ts.fuse_wait_first_at = None
+            return False
         check_s, timeout_s = self._manual_move_wait_limits()
         if timeout_s <= 0:
             ts.fuse_wait_first_at = None
@@ -740,12 +761,18 @@ class AdmitMixin:
                 int(elapsed),
                 int(timeout_s),
             )
-            ts.fuse_wait_first_at = None
+            # Keep the stamp: it latches "already gave up" so a caller that
+            # cannot download anyway (oversize single file) fails instead
+            # of starting a fresh window on the next wake.
             return False
         ts.indexer_next_retry_at = now + dt.timedelta(seconds=max(60.0, check_s))
         ts.public_export_next_retry_at = None
+        if total > 0:
+            _what = f"{present}/{total} files present"
+        else:
+            _what = "nothing visible yet"
         reason = (
-            f"fuse content partly present ({present}/{total} files); waiting for "
+            f"fuse content not fully there yet ({_what}); waiting for "
             f"the manual move (elapsed {int(elapsed)}s / timeout {int(timeout_s)}s)"
         )
         log.info("%s: %s", (ts.source_name or "")[:60], reason)
@@ -790,9 +817,14 @@ class AdmitMixin:
         if status == "partial":
             if self._park_fuse_content_wait(ts, present=present, total=total):
                 return True
-        # Absent, or the wait window closed: clear any stale window and
-        # let the caller run the existing pick -> SSD flow.
-        ts.fuse_wait_first_at = None
+            # Ceiling reached/disabled: fall through to the normal flow.
+            return False
+        # Absent: a wait already running (a copy seen earlier, or an
+        # oversize row parked on this path) keeps going until its ceiling
+        # instead of dropping straight back to the pick.
+        if ts.fuse_wait_first_at is not None:
+            if self._park_fuse_content_wait(ts, present=0, total=0):
+                return True
         return False
 
     async def _sweep_manual_fuse_adoptions(self) -> None:
@@ -3667,6 +3699,17 @@ class AdmitMixin:
         # needed) unless one file alone exceeds the SSD cap.
         too_big = oversize_single_file(parsed_files, self.cfg)
         if too_big is not None:
+            # Such a file can never fit on the SSD; an operator copying it
+            # to the remote by hand is its only path, so wait for that copy
+            # instead of failing at once.
+            if self._park_fuse_content_wait(ts, present=0, total=len(parsed_files or [])):
+                log.warning(
+                    "watch-dir: single file %s exceeds the SSD cap; waiting for "
+                    "the remote copy before failing %s",
+                    too_big,
+                    ts.source_name,
+                )
+                return
             log.warning(
                 "watch-dir: single file %s exceeds skip threshold; failing %s",
                 too_big,
@@ -4011,13 +4054,31 @@ class AdmitMixin:
         # disqualifies content anymore.
         too_big = oversize_single_file(files, self.cfg)
         if too_big is not None:
+            # It can never fit on the SSD, so a hand-copied remote version is
+            # the only path: wait for it instead of failing at once. The
+            # entry is dropped either way (it could never download).
+            _h = ts.dest_infohash or ts.source_infohash
+            if self._park_fuse_content_wait(ts, present=0, total=len(files or [])):
+                log.warning(
+                    "single file %s exceeds the SSD cap; dropping the entry and "
+                    "waiting for the remote copy before failing %s",
+                    too_big,
+                    ts.source_name,
+                )
+                if _h:
+                    await self._drop_failed_entry(_h, ts, files, "oversize")
+                try:
+                    # QUEUED -> WAITING_INDEXER is not in transition()'s
+                    # release set; the row no longer occupies SSD.
+                    await self._ssd_release(ts.source_infohash)
+                except Exception:
+                    pass
+                return
             log.warning(
                 "single file %s exceeds skip threshold; failing %s", too_big, ts.source_name
             )
-            # Remove the paused torrent from VPS2 so it does not leak as an orphan
-            h = ts.dest_infohash or ts.source_infohash
-            if h:
-                await self._drop_failed_entry(h, ts, files, "oversize")
+            if _h:
+                await self._drop_failed_entry(_h, ts, files, "oversize")
             self.transition(
                 ts,
                 State.FAILED,

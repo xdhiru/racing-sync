@@ -218,7 +218,9 @@ async def test_timeout_falls_back_to_pick(tmp_path):
         await coord._do_waiting_indexer(ts)
 
         coord._pick_and_admit.assert_awaited_once()
-        assert ts.fuse_wait_first_at is None
+        # The stamp stays as a latch: an oversize row that cannot download
+        # must not start a fresh window on every wake.
+        assert ts.fuse_wait_first_at is not None
     finally:
         store.close()
 
@@ -382,3 +384,87 @@ async def test_present_under_unsorted_mount_for_an_unclassified_row(tmp_path):
         coord._admit_resolved.assert_awaited_once()
     finally:
         store.close()
+
+
+@pytest.mark.anyio
+async def test_absent_with_a_running_window_keeps_waiting(tmp_path):
+    """A copy seen earlier keeps the window open even if it is briefly absent."""
+    start = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=120)
+    coord, store, _blob_bytes, _ = _scaffold(
+        tmp_path,
+        state=State.WAITING_INDEXER,
+        root_exists=False,
+        fuse_wait_first_at=start,
+    )
+    try:
+        before = dt.datetime.now(dt.UTC)
+        await coord._do_waiting_indexer(store.get(H))
+
+        coord._pick_and_admit.assert_not_called()
+        row = store.get(H)
+        assert row.state == State.WAITING_INDEXER
+        assert row.fuse_wait_first_at is not None
+        assert abs((row.indexer_next_retry_at - before).total_seconds() - 1800) < 60
+        assert "manual move" in (row.last_error or "")
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_oversize_single_file_waits_instead_of_failing(tmp_path):
+    """A file too big for the SSD waits for the external copy, then fails."""
+    from pathlib import Path as _Path
+
+    from racing_sync.clients.abstract import AddResult, TorrentFile
+    from racing_sync.config import AppConfig
+
+    cfg = AppConfig.from_toml(_Path(__file__).parent.parent / "config.example.toml")
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    fuse = tmp_path / "fuse"
+    fuse.mkdir()
+    cfg.dest.save_path = ssd
+    cfg.ssd.path = ssd
+    cfg.rclone.fuse.mount = fuse
+    cfg.rclone.fuse.mount_unsorted = fuse / "unsorted"
+    cfg.ssd.skip_movie_larger_than_bytes = 10_000
+    cfg.ssd.max_inflight_bytes = 100_000_000_000
+    cfg.rclone.fuse.manual_move_timeout_seconds = 43200
+    cfg.rclone.fuse.manual_move_check_seconds = 1800
+
+    coord = make_coordinator()
+    coord.cfg = cfg
+    coord.dest_client = AsyncMock()
+    coord.dest_client.list_torrents = AsyncMock(return_value=[])
+    coord.dest_client.add_torrent = AsyncMock(
+        return_value=AddResult(hash="dd" * 20, accepted=True, detail="Ok.")
+    )
+    coord.dest_client.get_torrent_files = AsyncMock(
+        return_value=[TorrentFile(name="Pack/huge.bin", size_bytes=50_000, progress=0.0)]
+    )
+    coord.dest_client.delete = AsyncMock()
+    coord._await_hash_for_name = AsyncMock(return_value="dd" * 20)
+    coord._ssd_release = AsyncMock()
+    coord._schedule_telegram_update = MagicMock()
+
+    def _set_state(t, s, error="", **kwargs):
+        t.state = s
+        t.last_error = error
+
+    coord.transition = MagicMock(side_effect=_set_state)
+
+    ts = TorrentState(
+        source_infohash="e" * 40,
+        source_name="Pack",
+        total_bytes=51000,
+        cross_seed_blob=b"blob",
+        save_path=str(ssd),
+        state=State.QUEUED,
+    )
+    await coord._do_queued(ts)
+
+    assert ts.state == State.WAITING_INDEXER, "an unfittable file must wait, not fail"
+    assert ts.fuse_wait_first_at is not None
+    assert "manual move" in (ts.last_error or "")
+    coord.dest_client.delete.assert_awaited_once_with("dd" * 20, delete_files=False)
+    coord._ssd_release.assert_awaited()
