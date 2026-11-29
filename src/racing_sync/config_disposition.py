@@ -187,3 +187,27 @@ def disposition(path: str) -> str:
         if path == old or path.startswith(old + "."):
             return "rename"
     return "keep"
+
+
+def canonical_leaves(model: type[BaseModel]) -> tuple[set[str], set[str]]:
+    """New-spelling field paths (and arbitrary-key prefixes) for a model tree.
+
+    The alias adapter uses this to spot typos inside a new table before the
+    rename moves the table: a key that is not in the canonical set (and not
+    under an arbitrary-key prefix such as a tracker map) is reported — and
+    dropped — under the spelling the user actually wrote.
+    """
+    pairs = [(tuple(old.split(".")), tuple(new.split("."))) for old, new in RENAMES.items()]
+
+    def _map(path: Key) -> str:
+        for old, new in pairs:
+            if path == old:
+                return ".".join(new)
+            if len(path) > len(old) and path[: len(old)] == old:
+                return ".".join(new + path[len(old) :])
+        return ".".join(path)
+
+    return (
+        {_map(path) for path in model_leaves(model)},
+        {_map(path) for path in extras_prefixes(model)},
+    )

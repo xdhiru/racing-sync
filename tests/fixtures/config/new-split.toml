@@ -1,0 +1,94 @@
+# New-spelling twin of split.toml: same values, `[client]`/`[storage]`/
+# `[remote]`/`[seed]`/`[indexers]`/`[acquire]`/`[watch]` names.
+
+[general]
+state_db = "/var/lib/racing-sync/state.db"
+log_dir = "/var/log/racing-sync"
+source_poll_interval = 75
+dest_poll_interval = 60
+
+[client]
+type = "deluge"
+host = "http://seedbox-a:8112"
+username = "admin"
+password = ""
+category = "racing"
+min_age_seconds = 0
+
+[client.nginx]
+mode = "off"
+
+[client.deluge_sftp]
+enabled = true
+ssh_host = "seedbox-a"
+ssh_port = 22
+ssh_user = "deluge"
+ssh_password = "sftp-test-pass"
+state_dir = "/home/deluge/.config/deluge/state"
+
+[dest]
+host = "http://seedbox-b:8080"
+username = "admin"
+password = ""
+
+[dest.nginx]
+mode = "off"
+
+[storage]
+path = "/srv/qbittorrent/data"
+save_path = "/srv/qbittorrent/data"
+max_inflight_bytes = 42949672960
+skip_movie_larger_than_bytes = 42949672960
+
+[remote]
+binary = "/usr/local/bin/rclone"
+path = "remote:qbittorrent/"
+unsorted = "remote:qbittorrent/unsorted/"
+
+[seed]
+path = "/mnt/remote/qbittorrent"
+unsorted_path = "/mnt/remote/qbittorrent/unsorted"
+
+[indexers]
+enabled = true
+base_url = "http://prowlarr:9696"
+api_key = "prowlarr-api-key-0123456789"
+
+[[indexers.download_indexers]]
+name = "Seedpool (API)"
+announce_substrings = ["seedpool"]
+
+[[indexers.download_indexers]]
+name = "TorrentLeech"
+announce_substrings = ["torrentleech"]
+
+[indexers.tracker_map]
+"alpha.cc" = "Alpha (API)"
+"beta" = "Beta"
+
+[acquire]
+provider = "auto"
+allow_prowlarr_cross_seed = true
+allow_ssh_export = true
+prowlarr_retry_interval_seconds = 900
+prowlarr_max_age_seconds = 86400
+
+[watch]
+path = "/srv/qbittorrent/watch"
+glob = "*.torrent"
+
+[cleanup]
+enabled = true
+dry_run = true
+
+[telegram]
+enabled = true
+bot_token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+chat_id = "-1001234567890"
+
+[api]
+enabled = true
+host = "127.0.0.1"
+port = 8765
+trust_nginx_header = false
+api_token = "api-test-token-0123456789abcdef"
