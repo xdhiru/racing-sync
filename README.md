@@ -64,6 +64,11 @@ python3 run.py run --config config.toml
 
 There is no config reload: restart the daemon after editing `config.toml`.
 
+`python3 run.py config summary --config config.toml` prints what the file
+resolves to — single-box or split topology, which capabilities are active,
+how many keys are explicit vs defaulted, and a digest. Secrets are redacted,
+so the output is safe to paste when asking for help. Add `--json` to diff.
+
 Help for every command:
 
 ```bash
