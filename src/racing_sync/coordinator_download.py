@@ -563,7 +563,7 @@ class DownloadMixin:
 
         self._live.pop(h.lower(), None)
         if not self._stop:
-            self.transition(ts, State.MOVING)
+            self.transition(ts, self.rt.chain.after_download())
 
     async def _wait_for_completion(
         self, ts: TorrentState, expected_files: list[str] | None = None

@@ -61,14 +61,16 @@ def test_downloading_to_moving_is_ok():
     check_transition(State.DOWNLOADING, State.MOVING)
 
 
-def test_downloading_to_done_is_illegal():
-    with pytest.raises(ValueError):
-        check_transition(State.DOWNLOADING, State.DONE)
+def test_short_chain_terminal_edges_are_tolerated():
+    """No transfer / no seed ends the chain early (the chain picks the edge)."""
+    check_transition(State.DOWNLOADING, State.DONE)
+    check_transition(State.MOVING, State.DONE)
 
 
-def test_moving_to_done_is_illegal():
+def test_downloading_to_re_adding_is_still_guarded():
+    """Sanity: the tolerant table is not a free-for-all."""
     with pytest.raises(ValueError):
-        check_transition(State.MOVING, State.DONE)
+        check_transition(State.RE_ADDING, State.WAITING_DISK)
 
 
 def test_indexer_park_and_retry():

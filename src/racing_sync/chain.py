@@ -37,8 +37,10 @@ class Chain:
         transfer_on = bool(getattr(pipeline, "transfer", True))
         seed_on = bool(getattr(pipeline, "seed", True))
         watch_on = getattr(cfg, "watch_dir", None) is not None
-        has_remote = getattr(cfg.rclone, "remote", None) is not None
-        has_fuse = getattr(cfg.rclone, "fuse", None) is not None
+        rclone = getattr(cfg, "rclone", None)
+        # A partial config double without [rclone] keeps today's full chain.
+        has_remote = True if rclone is None else getattr(rclone, "remote", None) is not None
+        has_fuse = True if rclone is None else getattr(rclone, "fuse", None) is not None
         cleanup = getattr(getattr(cfg, "cleanup", None), "enabled", False)
         return cls(
             observe=("source", "dest", *(("watch",) if watch_on else ())),

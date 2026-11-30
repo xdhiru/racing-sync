@@ -545,6 +545,43 @@ class Coordinator(
         except Exception:
             return
 
+    async def _drain_disabled_links(self) -> None:
+        """Move rows stranded in a link this chain no longer runs.
+
+        Runs before the SSD ledger rebuild so a drained row never reserves
+        budget. RE_ADDING rows are safe to finish when seeding is off: their
+        bytes were verified on the seed target before the state was entered.
+        A MOVING row with a checkpoint may be split between SSD and remote,
+        so it fails loudly for the operator instead of claiming DONE.
+        """
+        chain = self.rt.chain
+        if chain.seeds and chain.moves:
+            return
+        try:
+            rows = await offload(self.store.all)
+        except Exception as e:  # noqa: BLE001
+            log.warning("stranded-row drain could not list rows: %s", e)
+            return
+        for ts in rows or []:
+            name = (ts.source_name or ts.source_infohash or "")[:60]
+            try:
+                if ts.state == State.RE_ADDING and not chain.seeds:
+                    log.warning("draining %s: RE_ADDING -> DONE (seed link disabled)", name)
+                    self.transition(ts, State.DONE)
+                elif ts.state == State.MOVING and not chain.moves:
+                    if str(getattr(ts, "move_stage", "") or "").strip():
+                        self.transition(
+                            ts,
+                            State.FAILED,
+                            error="transfer link disabled while a move is in progress — "
+                            "re-enable transfer and retry the row",
+                        )
+                    else:
+                        log.warning("draining %s: MOVING -> DONE (transfer link disabled)", name)
+                        self.transition(ts, State.DONE)
+            except Exception as e:  # noqa: BLE001
+                log.warning("stranded-row drain failed for %s: %s", name, e)
+
     async def start(self) -> None:
         log.info("coordinator starting")
         self._boot_mono = time.monotonic()
@@ -669,6 +706,13 @@ class Coordinator(
                             e,
                         )
                         continue
+
+            # A disabled link must not strand rows in a stage that will
+            # never run; drain them before the ledger rebuild below.
+            try:
+                await self._drain_disabled_links()
+            except Exception as e:  # noqa: BLE001
+                log.warning("stranded-row drain failed: %s", e)
 
             # Optional Telegram bot (lazy import: python-telegram-bot is
             # only required when enabled).
