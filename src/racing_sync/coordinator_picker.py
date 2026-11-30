@@ -21,6 +21,7 @@ from .coordinator_content import (
 )
 from .io_bounds import bounded
 from .prowlarr import ProwlarrClient
+from .runtime import Runtime
 from .sftp_source import SFTPExporter
 
 # Keep the historic logger name so log output is unchanged by the split.
@@ -101,6 +102,7 @@ async def _pick_ssd_source_inner(
                                                                for a cross-seed
                                                                copy
     """
+    rt = Runtime(cfg)
 
     # If the source torrent is itself a "public" tracker, we use IT for
     # the SSD download directly. We do NOT consult Prowlarr — the racing
@@ -138,7 +140,7 @@ async def _pick_ssd_source_inner(
         # via qBittorrent's `/api/v2/torrents/export` endpoint (handled
         # by the source_client.export_torrent() helper) or via SFTP from
         # the Deluge state directory.
-        if cfg.cross_seed.allow_ssh_export and sftp is not None:
+        if rt.acquire.allow_ssh_export and sftp is not None:
             log.info(
                 "public racing torrent present; SFTP-exporting %s from VPS1 for SSD download",
                 chosen.infohash[:10],
@@ -213,10 +215,10 @@ async def _pick_ssd_source_inner(
         # and intended for cases where the racing client's torrent file
         # is unreachable (e.g. VPS1 crash mid-cycle).
         if (
-            cfg.cross_seed.refetch_public_via_prowlarr
-            and cfg.cross_seed.allow_prowlarr_cross_seed
+            rt.acquire.refetch_public_via_prowlarr
+            and rt.acquire.allow_prowlarr_cross_seed
             and prowlarr is not None
-            and not cfg.prowlarr.should_skip_title(chosen.name)
+            and not rt.indexers.should_skip_title(chosen.name)
         ):
             log.warning(
                 "racing client's public .torrent unavailable; "
@@ -289,7 +291,7 @@ async def _pick_ssd_source_inner(
             "public torrent present but could not export .torrent for %s (sftp=%s, qb=%s); "
             "trying direct-export fallback",
             chosen.name,
-            cfg.cross_seed.allow_ssh_export and sftp is not None,
+            rt.acquire.allow_ssh_export and sftp is not None,
             source_client is not None,
         )
         attempt_prowlarr = False
@@ -302,11 +304,9 @@ async def _pick_ssd_source_inner(
     # entering the WAITING_INDEXER retry loop for a query that will never
     # run. Private torrents are never downloaded directly on SSD unless
     # allow_ssh_export (or the source export endpoint) is used.
-    should_skip_prowlarr = cfg.prowlarr.should_skip_title(source_torrent.name)
+    should_skip_prowlarr = rt.indexers.should_skip_title(source_torrent.name)
     can_query_prowlarr = (
-        prowlarr is not None
-        and cfg.cross_seed.allow_prowlarr_cross_seed
-        and not should_skip_prowlarr
+        prowlarr is not None and rt.acquire.allow_prowlarr_cross_seed and not should_skip_prowlarr
     )
     if should_skip_prowlarr:
         log.info(
@@ -317,7 +317,7 @@ async def _pick_ssd_source_inner(
     elif can_query_prowlarr and attempt_prowlarr:
         log.info(
             "private release; querying Prowlarr download-target indexer(s) %s for cross-seed of %s",
-            cfg.prowlarr.download_indexer_names,
+            rt.indexers.download_indexer_names,
             source_torrent.name,
         )
         try:
@@ -408,7 +408,7 @@ async def _pick_ssd_source_inner(
                 except Exception:
                     continue
                 try:
-                    if any(cfg.prowlarr.is_download_indexer(u or "") for u in _urls):
+                    if any(rt.indexers.is_download_indexer(u or "") for u in _urls):
                         # Same-name repacks must not supply mismatched
                         # bytes: sizes must agree when both are known.
                         try:
@@ -430,7 +430,7 @@ async def _pick_ssd_source_inner(
     try:
         _st_urls = getattr(source_torrent, "trackers", None) or []
         _st_preferred = _looks_public(_st_urls) or any(
-            cfg.prowlarr.is_download_indexer(u or "") for u in _st_urls
+            rt.indexers.is_download_indexer(u or "") for u in _st_urls
         )
     except Exception:
         _st_preferred = False
@@ -444,7 +444,7 @@ async def _pick_ssd_source_inner(
             )
         except Exception:
             pass
-    if cfg.cross_seed.allow_ssh_export:
+    if rt.acquire.allow_ssh_export:
         blob = None
         label = ""
         if sftp is not None:

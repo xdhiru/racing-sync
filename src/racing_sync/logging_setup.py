@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 import aiohttp
 
 from .config import AppConfig, LoggingSinkConfig
+from .runtime import Runtime
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s :: %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -426,7 +427,7 @@ def setup_logging(cfg: AppConfig) -> None:
     """Wire up file handlers, console, sink and ring buffer."""
     global _ring
 
-    log_dir: Path = cfg.general.log_dir
+    log_dir: Path = Runtime(cfg).paths.log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
 
     root = logging.getLogger()
@@ -454,7 +455,7 @@ def setup_logging(cfg: AppConfig) -> None:
     fh = ENOSPCSafeTimedRotatingFileHandler(
         log_dir / "racing-sync.log",
         when="midnight",
-        backupCount=cfg.general.log_retention_days,
+        backupCount=Runtime(cfg).paths.log_retention_days,
         encoding="utf-8",
     )
     fh.setLevel(logging.DEBUG)
@@ -465,7 +466,7 @@ def setup_logging(cfg: AppConfig) -> None:
     jh = ENOSPCSafeTimedRotatingFileHandler(
         log_dir / "racing-sync.jsonl",
         when="midnight",
-        backupCount=cfg.general.log_retention_days,
+        backupCount=Runtime(cfg).paths.log_retention_days,
         encoding="utf-8",
     )
     jh.setLevel(logging.DEBUG)
@@ -554,9 +555,9 @@ def setup_logging(cfg: AppConfig) -> None:
     try:
         log_dev = log_dir.stat().st_dev
         for _label, _raw in (
-            ("state_db", cfg.general.state_db),
-            ("ssd.path", cfg.ssd.path),
-            ("dest.save_path", cfg.dest.save_path),
+            ("state_db", Runtime(cfg).paths.state_db),
+            ("ssd.path", Runtime(cfg).storage.path),
+            ("dest.save_path", Runtime(cfg).storage.save_path),
         ):
             try:
                 _p = Path(str(_raw)).parent if str(_raw).endswith(".db") else Path(str(_raw))
@@ -578,7 +579,7 @@ def setup_logging(cfg: AppConfig) -> None:
     logging.getLogger("racing_sync").info(
         "logging initialised: dir=%s retention=%dd",
         log_dir,
-        cfg.general.log_retention_days,
+        Runtime(cfg).paths.log_retention_days,
     )
 
 

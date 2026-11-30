@@ -15,6 +15,7 @@ from pathlib import Path
 from .config import AppConfig
 from .coordinator import Coordinator
 from .logging_setup import setup_logging
+from .runtime import Runtime
 
 
 def _run_async(coro):
@@ -119,9 +120,10 @@ def _do_reset(cfg: AppConfig) -> list[str]:
     Never raises on missing files — a fresh start on a clean machine is fine.
     """
     removed: list[str] = []
+    rt = Runtime(cfg)
     db_refusal = _state_db_parent_refusal(cfg)
     try:
-        db = Path(cfg.general.state_db)
+        db = Path(rt.paths.state_db)
     except Exception:
         db = None
     if db is not None and db_refusal is not None:
@@ -138,7 +140,7 @@ def _do_reset(cfg: AppConfig) -> list[str]:
             except OSError as e:
                 removed.append(f"could not delete {candidate}: {e}")
     try:
-        log_dir = Path(cfg.general.log_dir)
+        log_dir = Path(rt.paths.log_dir)
     except Exception:
         log_dir = None
     if log_dir is not None:
@@ -173,6 +175,7 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
     from .safety import validate_safe_delete_path
 
     done: list[str] = []
+    rt = Runtime(cfg)
     dest = QBittorrentClient(cfg.dest, label="dest-reset")
     try:
         await dest.start()
@@ -215,11 +218,11 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
     # worthless when parent is / or /etc).
     blob_refusal = _state_db_parent_refusal(cfg)
     try:
-        blob_root = Path(cfg.general.state_db).parent / "watch_cross_seeds"
+        blob_root = Path(rt.paths.state_db).parent / "watch_cross_seeds"
         if blob_refusal is not None:
             done.append(f"{blob_refusal}; blob cache kept")
         elif blob_root.is_dir() and not blob_root.is_symlink():
-            validate_safe_delete_path(blob_root, base_dir=Path(cfg.general.state_db).parent)
+            validate_safe_delete_path(blob_root, base_dir=Path(rt.paths.state_db).parent)
             shutil.rmtree(blob_root)
             done.append(f"deleted blob cache: {blob_root}")
         else:
@@ -230,7 +233,7 @@ async def _do_full_reset(cfg: AppConfig) -> list[str]:
     # were already deleted with files above; this catches orphans from
     # crashed downloads or non-racing categories left mid-testing.
     try:
-        raw_roots = [getattr(cfg.ssd, "path", None), getattr(cfg.dest, "save_path", None)]
+        raw_roots = [rt.storage.path, rt.storage.save_path]
         seen: set[str] = set()
         ssd_roots: list[Path] = []
         for raw in raw_roots:
@@ -323,7 +326,8 @@ def _cmd_forget(cfg: AppConfig, args: argparse.Namespace) -> int:
             return 2
 
     async def _run() -> dict:
-        store = StateStore(cfg.general.state_db)
+        rt = Runtime(cfg)
+        store = StateStore(rt.paths.state_db)
         dest = QBittorrentClient(cfg.dest, label="dest-forget")
         try:
             await dest.start()
@@ -403,6 +407,7 @@ def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
     from .safety import DaemonLock, daemon_lock_path
     from .state import StateStore
 
+    rt = Runtime(cfg)
     _mutating = bool(getattr(args, "all", False) or getattr(args, "target", None))
     _lock = None
     if _mutating:
@@ -420,14 +425,14 @@ def _cmd_unignore(cfg: AppConfig, args: argparse.Namespace) -> int:
         # Read-only --list must never mkdir/init the DB as a side effect:
         # a missing DB simply means an empty ignore list.
         try:
-            _db_missing = not Path(str(cfg.general.state_db)).is_file()
+            _db_missing = not Path(str(rt.paths.state_db)).is_file()
         except Exception:
             _db_missing = False
         if _db_missing:
             print("ignore list is empty (no state.db yet)")
             return 0
     try:
-        store = StateStore(cfg.general.state_db)
+        store = StateStore(rt.paths.state_db)
     except Exception as e:
         print(f"unignore failed: {e}", file=sys.stderr)
         return 1
@@ -494,6 +499,7 @@ def _check_config_env(cfg: AppConfig, *, probe_writes: bool = True) -> list[str]
     harmless but the subset rule keeps startup side-effect free).
     """
     problems: list[str] = []
+    rt = Runtime(cfg)
 
     def _need_dir(label: str, raw: object, *, must_exist: bool, writable: bool = False) -> None:
         try:
@@ -537,12 +543,12 @@ def _check_config_env(cfg: AppConfig, *, probe_writes: bool = True) -> list[str]
             problems.append(f"{label} check failed ({raw!r}): {e}")
 
     try:
-        _need_dir("general.log_dir", cfg.general.log_dir, must_exist=False, writable=True)
+        _need_dir("general.log_dir", rt.paths.log_dir, must_exist=False, writable=True)
     except Exception:
         pass
     for label, val in (
-        ("dest.save_path", getattr(cfg.dest, "save_path", "")),
-        ("ssd.path", getattr(cfg.ssd, "path", "")),
+        ("dest.save_path", rt.storage.save_path),
+        ("ssd.path", rt.storage.path),
     ):
         try:
             _need_dir(label, val, must_exist=True)
@@ -552,19 +558,19 @@ def _check_config_env(cfg: AppConfig, *, probe_writes: bool = True) -> list[str]
     try:
         _need_dir(
             "general.state_db parent",
-            Path(str(getattr(cfg.general, "state_db", ""))).parent,
+            Path(str(rt.paths.state_db)).parent,
             must_exist=True,
         )
     except Exception:
         pass
-    if getattr(cfg, "watch_dir", None) is not None:
+    if rt.intake.watch is not None:
         try:
-            _need_dir("watch_dir.path", cfg.watch_dir.path, must_exist=True)
+            _need_dir("watch_dir.path", rt.intake.watch.path, must_exist=True)
         except Exception:
             pass
     # rclone binary: absolute + exists + executable (PATH hijack / typo guard).
     try:
-        b = Path(str(cfg.rclone.binary))
+        b = Path(str(rt.transfer.binary))
         if not b.is_absolute():
             problems.append(f"rclone.binary must be absolute: {b}")
         elif not b.exists():
@@ -577,18 +583,18 @@ def _check_config_env(cfg: AppConfig, *, probe_writes: bool = True) -> list[str]
     # validator; these stay check-config warnings (existing setups keep
     # running, new ones get told).
     try:
-        if cfg.rclone.remote.default == cfg.rclone.remote.unsorted:
+        if rt.transfer.remote_default == rt.transfer.remote_unsorted:
             problems.append(
                 "rclone.remote.default == rclone.remote.unsorted "
-                f"({cfg.rclone.remote.default!r}): movies and unsorted "
+                f"({rt.transfer.remote_default!r}): movies and unsorted "
                 "content share one remote path — intentional?"
             )
     except Exception:
         pass
     for _label, _raw in (
-        ("ssd.path", getattr(cfg.ssd, "path", "")),
-        ("dest.save_path", getattr(cfg.dest, "save_path", "")),
-        ("general.state_db", getattr(cfg.general, "state_db", "")),
+        ("ssd.path", rt.storage.path),
+        ("dest.save_path", rt.storage.save_path),
+        ("general.state_db", rt.paths.state_db),
     ):
         try:
             if str(_raw).strip() and not Path(str(_raw)).is_absolute():
@@ -599,8 +605,8 @@ def _check_config_env(cfg: AppConfig, *, probe_writes: bool = True) -> list[str]
         except Exception:
             pass
     try:
-        _cap = int(getattr(cfg.ssd, "max_inflight_bytes", 0) or 0)
-        _total = shutil.disk_usage(str(cfg.ssd.path)).total
+        _cap = int(rt.storage.max_inflight_bytes or 0)
+        _total = shutil.disk_usage(str(rt.storage.path)).total
         if _cap > _total:
             problems.append(
                 f"ssd.max_inflight_bytes ({_cap}) exceeds the SSD disk total "
@@ -646,9 +652,10 @@ def _check_config_warnings(cfg: AppConfig) -> list[str]:
     warnings: list[str] = []
     from .fuse_gate import mount_is_mounted
 
+    rt = Runtime(cfg)
     for label, val in (
-        ("rclone.fuse.mount", getattr(cfg.rclone.fuse, "mount", "")),
-        ("rclone.fuse.mount_unsorted", getattr(cfg.rclone.fuse, "mount_unsorted", "")),
+        ("rclone.fuse.mount", rt.seed.mount),
+        ("rclone.fuse.mount_unsorted", rt.seed.mount_unsorted),
     ):
         try:
             p = Path(str(val))
@@ -816,6 +823,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = _load_config(args.config)
     if cfg is None:
         return 2
+    rt = Runtime(cfg)
 
     if args.cmd == "check-config":
         problems = _check_config_env(cfg)
@@ -880,10 +888,10 @@ def main(argv: list[str] | None = None) -> int:
             # no log of why. (The real setup has to run after the reset — it
             # would hold open the log files the reset deletes.)
             try:
-                Path(cfg.general.log_dir).mkdir(parents=True, exist_ok=True)
+                Path(rt.paths.log_dir).mkdir(parents=True, exist_ok=True)
             except OSError as e:
                 print(
-                    f"refusing --reset: log directory not usable ({cfg.general.log_dir}): {e}",
+                    f"refusing --reset: log directory not usable ({rt.paths.log_dir}): {e}",
                     file=sys.stderr,
                 )
                 return 2
@@ -912,7 +920,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             setup_logging(cfg)
         except Exception as e:
-            print(f"Failed to initialise logging ({cfg.general.log_dir}): {e}", file=sys.stderr)
+            print(f"Failed to initialise logging ({rt.paths.log_dir}): {e}", file=sys.stderr)
             return 2
         log = logging.getLogger("racing-sync")
         log.info("starting racing-sync")

@@ -20,6 +20,7 @@ from pathlib import Path
 
 from .clients.abstract import TorrentFile
 from .config import AppConfig
+from .runtime import Runtime
 
 log = logging.getLogger(__name__)
 
@@ -171,6 +172,7 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
         (routed to rclone remote default and fuse mount).
     """
     files = list(files)
+    rt = Runtime(cfg)
     normed: list[tuple[TorrentFile, str, int]] = []
     for f in files:
         coerced = _safe_file_name_size(f)
@@ -238,12 +240,12 @@ def classify(files: Iterable[TorrentFile], cfg: AppConfig) -> Classification:
         # If single file -> movie
         if len(normed) == 1:
             _, name, size = normed[0]
-            if size > cfg.ssd.skip_movie_larger_than_bytes:
+            if size > rt.storage.skip_single_file_bytes:
                 log.warning(
                     "movie '%s' (%d B) exceeds skip threshold (%d B)",
                     name,
                     size,
-                    cfg.ssd.skip_movie_larger_than_bytes,
+                    rt.storage.skip_single_file_bytes,
                 )
             return Classification(
                 kind="movie",
@@ -281,11 +283,11 @@ def oversize_single_file(files: Iterable[TorrentFile], cfg: AppConfig) -> str | 
     only an individual file bigger than `skip_movie_larger_than_bytes`
     (games, disc images, giant episodes alike) is refused upfront.
     """
+    rt = Runtime(cfg)
     try:
-        ssd_cfg = cfg.ssd
+        cap_raw = rt.storage.skip_single_file_bytes
     except AttributeError:
         return None
-    cap_raw = getattr(ssd_cfg, "skip_movie_larger_than_bytes", 0)
     # Strictly numeric only: a MagicMock (unit tests) int()s to 1, which
     # would refuse every file. Real configs always carry an int here.
     if isinstance(cap_raw, bool) or not isinstance(cap_raw, (int, float)):

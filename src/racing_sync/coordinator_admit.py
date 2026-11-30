@@ -113,7 +113,7 @@ class AdmitMixin:
             # No SSD source right now → park and retry.
             if park_reason is None:
                 try:
-                    _skip_title = self.cfg.prowlarr.should_skip_title(st.name) is True
+                    _skip_title = self.rt.indexers.should_skip_title(st.name) is True
                 except Exception:
                     _skip_title = False
                 # Skipped titles park on the public (max-age-free) schedule:
@@ -209,14 +209,7 @@ class AdmitMixin:
                 # parity): re-check when grace ends or the next search is
                 # due, whichever comes first — not every tick.
                 try:
-                    _ri = float(
-                        getattr(
-                            getattr(self.cfg, "cross_seed", None),
-                            "prowlarr_retry_interval_seconds",
-                            1800,
-                        )
-                        or 1800
-                    )
+                    _ri = float(self.rt.acquire.prowlarr_retry_interval_seconds or 1800)
                 except (TypeError, ValueError):
                     _ri = 1800.0
                 try:
@@ -236,7 +229,7 @@ class AdmitMixin:
 
         ts.cross_seed_infohash = decision.infohash.lower()
         ts.cross_seed_source = decision.source_label
-        ts.save_path = str(self.cfg.dest.save_path)
+        ts.save_path = str(self.rt.storage.save_path)
 
         # Persist the picked .torrent bytes so that recovery after a
         # restart can re-add the cross-seed torrent. Also keep the
@@ -441,7 +434,7 @@ class AdmitMixin:
                 except Exception:  # noqa: BLE001
                     pass
             try:
-                if getattr(self.cfg.cross_seed, "inject_racing_torrents_to_fuse", False):
+                if self.rt.acquire.inject_racing_torrents_to_fuse:
                     await self._re_inject_racing_torrents(ts)
             except Exception as e:  # noqa: BLE001
                 # Manual entry already seeds; a failed re-inject must not block
@@ -573,10 +566,9 @@ class AdmitMixin:
         # The blob decides the authoritative mount only after it is decoded.
         mounts: list[Path] = [target]
         try:
-            _fuse = self.cfg.rclone.fuse
             for _raw in (
-                getattr(_fuse, "mount", None),
-                getattr(_fuse, "mount_unsorted", None),
+                self.rt.seed.mount,
+                self.rt.seed.mount_unsorted,
             ):
                 if not isinstance(_raw, (str, Path)):
                     continue
@@ -675,7 +667,7 @@ class AdmitMixin:
         # Same pre-admission defaults the pick path sets (the row never
         # downloads, but QUEUED logic reads them).
         try:
-            ts.save_path = str(self.cfg.dest.save_path)
+            ts.save_path = str(self.rt.storage.save_path)
         except Exception:
             pass
         if int(ts.total_bytes or 0) <= 0:
@@ -699,14 +691,10 @@ class AdmitMixin:
     def _fuse_mounts_configured(self) -> bool:
         """True when at least one fuse mount is a real configured path."""
         try:
-            fuse = self.cfg.rclone.fuse
+            mounts = (self.rt.seed.mount, self.rt.seed.mount_unsorted)
         except Exception:
             return False
-        for _attr in ("mount", "mount_unsorted"):
-            try:
-                raw = getattr(fuse, _attr, None)
-            except Exception:
-                continue
+        for raw in mounts:
             if isinstance(raw, (str, Path)) and str(raw).strip():
                 return True
         return False
@@ -714,15 +702,11 @@ class AdmitMixin:
     def _manual_move_wait_limits(self) -> tuple[float, float]:
         """(check_seconds, timeout_seconds); timeout 0 disables the wait."""
         try:
-            _fuse_cfg = self.cfg.rclone.fuse
-        except Exception:
-            _fuse_cfg = None
-        try:
-            timeout_s = float(getattr(_fuse_cfg, "manual_move_timeout_seconds", 43200))
+            timeout_s = float(self.rt.seed.manual_move_timeout_seconds)
         except (TypeError, ValueError):
             timeout_s = 43200.0
         try:
-            check_s = float(getattr(_fuse_cfg, "manual_move_check_seconds", 1800))
+            check_s = float(self.rt.seed.manual_move_check_seconds)
         except (TypeError, ValueError):
             check_s = 1800.0
         return check_s, timeout_s
@@ -1084,14 +1068,12 @@ class AdmitMixin:
         any doubt returns False and the row keeps retrying / fails as before.
         """
         try:
-            if not getattr(getattr(self, "cfg", None), "cross_seed", None):
-                return False
-            if not self.cfg.cross_seed.fallback_to_racing_torrent_on_prowlarr_timeout:
+            if not self.rt.acquire.fallback_to_racing_torrent:
                 return False
             first = ts.indexer_first_queried_at
             if first is None:
                 return False
-            max_age = dt.timedelta(seconds=self.cfg.cross_seed.prowlarr_max_age_seconds)
+            max_age = dt.timedelta(seconds=self.rt.acquire.prowlarr_max_age_seconds)
             return (dt.datetime.now(dt.UTC) - first) >= max_age
         except Exception:
             return False
@@ -1171,19 +1153,11 @@ class AdmitMixin:
             ts.indexer_first_queried_at = now
         ts.indexer_attempts += 1
         try:
-            _retry_gap = float(
-                getattr(
-                    getattr(self.cfg, "cross_seed", None), "prowlarr_retry_interval_seconds", 1800
-                )
-                or 1800
-            )
+            _retry_gap = float(self.rt.acquire.prowlarr_retry_interval_seconds or 1800)
         except (TypeError, ValueError):
             _retry_gap = 1800.0
         try:
-            _max_age_s = float(
-                getattr(getattr(self.cfg, "cross_seed", None), "prowlarr_max_age_seconds", 86400)
-                or 86400
-            )
+            _max_age_s = float(self.rt.acquire.prowlarr_max_age_seconds or 86400)
         except (TypeError, ValueError):
             _max_age_s = 86400.0
         next_retry = self._schedule_retry(ts, "indexer", _retry_gap)
@@ -1247,7 +1221,7 @@ class AdmitMixin:
         cannot spin here forever. Attempts are counted for observability.
         """
         try:
-            interval = max(60.0, float(self.cfg.cross_seed.public_export_retry_interval_seconds))
+            interval = max(60.0, float(self.rt.acquire.public_export_retry_interval_seconds))
         except (TypeError, ValueError, AttributeError):
             interval = 1800.0
         now = dt.datetime.now(dt.UTC)
@@ -1462,12 +1436,12 @@ class AdmitMixin:
         when the row is gone (no upsert-resurrect).
         """
         try:
-            _interval = max(60.0, float(self.cfg.cross_seed.prowlarr_retry_interval_seconds))
+            _interval = max(60.0, float(self.rt.acquire.prowlarr_retry_interval_seconds))
         except (TypeError, ValueError):
             _interval = 1800.0
         try:
             _public_interval = max(
-                60.0, float(self.cfg.cross_seed.public_export_retry_interval_seconds)
+                60.0, float(self.rt.acquire.public_export_retry_interval_seconds)
             )
         except (TypeError, ValueError, AttributeError):
             _public_interval = 1800.0
@@ -1602,7 +1576,7 @@ class AdmitMixin:
                 return
         elif _ssd_any is not None:
             try:
-                _interval = max(60.0, float(self.cfg.cross_seed.prowlarr_retry_interval_seconds))
+                _interval = max(60.0, float(self.rt.acquire.prowlarr_retry_interval_seconds))
             except (TypeError, ValueError):
                 _interval = 1800.0
             log.info(
@@ -1622,7 +1596,7 @@ class AdmitMixin:
                 if ts.public_export_next_retry_at and not ts.indexer_next_retry_at:
                     try:
                         _public_interval = max(
-                            60.0, float(self.cfg.cross_seed.public_export_retry_interval_seconds)
+                            60.0, float(self.rt.acquire.public_export_retry_interval_seconds)
                         )
                     except (TypeError, ValueError, AttributeError):
                         _public_interval = 1800.0
@@ -2544,8 +2518,8 @@ class AdmitMixin:
         )
         if existing:
             fuse_mounts = [
-                str(self.cfg.rclone.fuse.mount).rstrip("/\\").replace("\\", "/"),
-                str(self.cfg.rclone.fuse.mount_unsorted).rstrip("/\\").replace("\\", "/"),
+                str(self.rt.seed.mount).rstrip("/\\").replace("\\", "/"),
+                str(self.rt.seed.mount_unsorted).rstrip("/\\").replace("\\", "/"),
             ]
 
             # Prefer fuse-complete > SSD-complete > first-listed: adopting
@@ -2701,7 +2675,7 @@ class AdmitMixin:
                         self.store.upsert(ts)
                     except Exception:  # noqa: BLE001
                         pass
-                if self.cfg.cross_seed.inject_racing_torrents_to_fuse:
+                if self.rt.acquire.inject_racing_torrents_to_fuse:
                     if self._is_watch_row(ts):
                         # Mirror RE_ADDING step 1: inject every persisted
                         # watch blob (dropped + sacrificial + discovered),
@@ -3261,7 +3235,7 @@ class AdmitMixin:
         except Exception:
             pass
         try:
-            if any(self.cfg.prowlarr.is_download_indexer(u) for u in urls):
+            if any(self.rt.indexers.is_download_indexer(u) for u in urls):
                 return None, (f"{name} is already from a download indexer — proceeding on its own")
         except Exception:
             pass
@@ -3438,13 +3412,13 @@ class AdmitMixin:
                 )
                 return
 
-        ts.save_path = str(self.cfg.dest.save_path)
+        ts.save_path = str(self.rt.storage.save_path)
         tracker_list = [u for u in ts.source_announce_url.split(",") if u] or (
             [ts.source_tracker] if ts.source_tracker else []
         )
         is_public = _looks_public(tracker_list)
-        is_download_tracker = self.cfg.prowlarr.enabled and any(
-            self.cfg.prowlarr.is_download_indexer(u) for u in tracker_list
+        is_download_tracker = self.rt.indexers.enabled and any(
+            self.rt.indexers.is_download_indexer(u) for u in tracker_list
         )
         needs_sacrificial_copy = not is_download_tracker and not is_public
 
@@ -3456,7 +3430,7 @@ class AdmitMixin:
         # Prepare persistence directory for cross-seed torrents. The
         # infohash is hex-validated by the helper: untrusted values can
         # never escape the blob root via join/mkdir.
-        watch_cross_dir = _watch_cross_seed_dir(self.cfg.general.state_db, ts.source_infohash)
+        watch_cross_dir = _watch_cross_seed_dir(self.rt.paths.state_db, ts.source_infohash)
         if watch_cross_dir is not None:
             await asyncio.to_thread(watch_cross_dir.mkdir, parents=True, exist_ok=True)
             # Always persist the dropped .torrent so it can be seeded on FUSE.
@@ -3478,16 +3452,16 @@ class AdmitMixin:
 
         query_prowlarr = True
         prefer_prowlarr = True
-        if hasattr(self.cfg, "watch_dir") and self.cfg.watch_dir is not None:
-            qp = getattr(self.cfg.watch_dir, "query_prowlarr", True)
+        watch = self.rt.intake.watch
+        if watch is not None:
+            qp = watch.query_prowlarr
             if isinstance(qp, bool):
                 query_prowlarr = qp
-            pp = getattr(self.cfg.watch_dir, "prefer_prowlarr_result", True)
+            pp = watch.prefer_prowlarr_result
             if isinstance(pp, bool):
                 prefer_prowlarr = pp
-
         # If Prowlarr is enabled and not skipped, perform single parallel search
-        should_skip_prowlarr = self.cfg.prowlarr.should_skip_title(ts.source_name)
+        should_skip_prowlarr = self.rt.indexers.should_skip_title(ts.source_name)
         # Defaults for the skip/disabled branches below (which define
         # nothing): empty search scope, empty hits.
         indexers_to_query = []
@@ -3508,7 +3482,7 @@ class AdmitMixin:
                 "prowlarr: skipping search for watch-dir release %r (matches skip_query_substrings)",
                 ts.source_name,
             )
-        elif self.cfg.prowlarr.enabled and self.prowlarr is not None:
+        elif self.rt.indexers.enabled and self.prowlarr is not None:
             indexers_to_query = []
             # Download-target indexer names (lowercase), in priority order —
             # the sacrificial pick below tries them in this order.
@@ -3523,11 +3497,7 @@ class AdmitMixin:
             if _hold_candidate:
                 _search_due = False
                 try:
-                    _ri = getattr(
-                        getattr(self.cfg, "cross_seed", None),
-                        "prowlarr_retry_interval_seconds",
-                        1800,
-                    )
+                    _ri = self.rt.acquire.prowlarr_retry_interval_seconds
                     if isinstance(_ri, bool) or not isinstance(_ri, (int, float)):
                         raise TypeError
                     _interval = max(60.0, float(_ri))
@@ -3547,7 +3517,7 @@ class AdmitMixin:
 
                 # Add all private indexers from tracker_map
                 seen_names = set(download_idx_names)
-                for name in self.cfg.prowlarr.tracker_map.entries.values():
+                for name in self.rt.indexers.tracker_map_entries:
                     idx = self.prowlarr.get_indexer_by_name(name)
                     if idx and idx.name.lower() not in seen_names and idx.enable:
                         indexers_to_query.append(idx)
@@ -3944,7 +3914,7 @@ class AdmitMixin:
         if not items:
             return set()
         try:
-            mount = self._target_mount_for_kind(kind, Path(self.cfg.dest.save_path))
+            mount = self._target_mount_for_kind(kind, Path(self.rt.storage.save_path))
         except Exception:
             return set()
         try:
@@ -4502,16 +4472,12 @@ class AdmitMixin:
     ) -> None:
         if batch is None:
             return
-        save_path = ts.save_path or (
-            str(self.cfg.dest.save_path) if hasattr(self, "cfg") and self.cfg else "/tmp"
-        )
+        save_path = ts.save_path or str(self.rt.storage.save_path)
         src_dir = Path(save_path).resolve()
         remote = (
-            self.cfg.rclone.remote.default
-            if hasattr(self, "cfg") and self.cfg and route_kind_is_sorted(ts.classification_kind)
-            else (
-                self.cfg.rclone.remote.unsorted if hasattr(self, "cfg") and self.cfg else "remote:"
-            )
+            self.rt.transfer.remote_default
+            if route_kind_is_sorted(ts.classification_kind)
+            else self.rt.transfer.remote_unsorted
         )
         log.info(
             "moving completed batch %d/%d for %s",
@@ -4519,11 +4485,7 @@ class AdmitMixin:
             ts.batches_total,
             ts.source_name,
         )
-        extra_flags = (
-            self.cfg.rclone.batch_move_extra_flags
-            if hasattr(self, "cfg") and hasattr(self.cfg.rclone, "batch_move_extra_flags")
-            else None
-        )
+        extra_flags = self.rt.transfer.batch_extra_flags
         skip_norm = {(n or "").replace("\\", "/").strip("/") for n in (skip or set())}
         names = [n for n in batch.file_names() if n not in skip_norm]
         unsafe = [n for n in names if _safe_ssd_join(src_dir, n or "") is None]
@@ -4643,7 +4605,7 @@ class AdmitMixin:
         forever here — the move path verifies presence before moving).
         """
         try:
-            base = Path(ts.save_path) if ts.save_path else Path(self.cfg.dest.save_path)
+            base = Path(ts.save_path) if ts.save_path else Path(self.rt.storage.save_path)
         except Exception:
             return False
 
@@ -4701,7 +4663,7 @@ class AdmitMixin:
             except Exception:
                 _warned = set()
             try:
-                base = Path(ts.save_path) if ts.save_path else Path(self.cfg.dest.save_path)
+                base = Path(ts.save_path) if ts.save_path else Path(self.rt.storage.save_path)
             except Exception:
                 return
             others = [

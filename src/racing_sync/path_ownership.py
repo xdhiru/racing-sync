@@ -17,6 +17,7 @@ import enum
 from pathlib import Path
 
 from .coordinator_content import fold_path_case
+from .runtime import Runtime
 
 
 class PathOwner(str, enum.Enum):  # noqa: UP042  (str(Enum) is the contract here)
@@ -43,16 +44,16 @@ def _configured_roots(cfg: object) -> tuple[list[str], list[str]]:
     """(fuse mounts, SSD roots) from cfg; [] for anything unusable."""
     fuse: list[str] = []
     ssd: list[str] = []
+    rt = Runtime(cfg)
     try:
-        fcfg = getattr(getattr(cfg, "rclone", None), "fuse", None)
-        for raw in (getattr(fcfg, "mount", None), getattr(fcfg, "mount_unsorted", None)):
+        for raw in (rt.seed.mount, rt.seed.mount_unsorted):
             norm = _norm(raw)
             if norm and norm not in fuse:
                 fuse.append(norm)
     except Exception:
         pass
     try:
-        for raw in (getattr(cfg.dest, "save_path", None), getattr(cfg.ssd, "path", None)):
+        for raw in (rt.storage.save_path, rt.storage.path):
             norm = _norm(raw)
             if norm and norm not in ssd:
                 ssd.append(norm)

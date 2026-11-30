@@ -42,6 +42,7 @@ from .coordinator_errors import AbandonedError
 from .forget import forget_torrent
 from .rclone_ops import ssd_free_bytes
 from .recovery import reconcile
+from .runtime import Runtime
 from .state import State
 
 log = logging.getLogger(__name__)
@@ -409,6 +410,7 @@ def build_app(coord: Coordinator) -> FastAPI:
             "Install it via 'pip install racing-sync[api]'."
         )
     cfg = coord.cfg
+    rt = Runtime(cfg)
     # No unauthenticated docs/openapi endpoints: the control plane sits
     # behind token/nginx auth, its schema surface should too.
     app = FastAPI(
@@ -548,7 +550,7 @@ def build_app(coord: Coordinator) -> FastAPI:
                 checks[name] = False
         # Fuse mount present (the seeding lane depends on it).
         try:
-            _mount = getattr(getattr(getattr(cfg, "rclone", None), "fuse", None), "mount", None)
+            _mount = rt.seed.mount
             _mpath = os.fspath(_mount) if _mount is not None else ""
             # A stat against a wedged mount can block: keep it off the loop.
             checks["fuse_mount"] = bool(_mpath) and await asyncio.to_thread(os.path.isdir, _mpath)
@@ -556,7 +558,7 @@ def build_app(coord: Coordinator) -> FastAPI:
             checks["fuse_mount"] = False
         # SSD path writable with readable free space.
         try:
-            _spath = getattr(getattr(cfg, "ssd", None), "path", None)
+            _spath = rt.storage.path
             _spath_s = os.fspath(_spath) if _spath is not None else ""
             _writable = bool(_spath_s) and os.access(_spath_s, os.W_OK)
             _free = await asyncio.to_thread(ssd_free_bytes, cfg)
@@ -813,7 +815,7 @@ def build_app(coord: Coordinator) -> FastAPI:
             raise
         except Exception as e:  # noqa: BLE001
             raise HTTPException(503, f"ssd path unavailable: {e}") from e
-        return {"free_bytes": free_bytes, "path": str(cfg.ssd.path)}
+        return {"free_bytes": free_bytes, "path": str(rt.storage.path)}
 
     @app.post("/api/recover", dependencies=[Depends(auth)])
     async def recover() -> dict[str, Any]:

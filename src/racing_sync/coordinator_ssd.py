@@ -140,7 +140,7 @@ class SSDLedgerMixin:
         must not impose a 1-byte cap. Unconfigured means unlimited (legacy behavior).
         """
         try:
-            raw = getattr(self.cfg.ssd, "max_inflight_bytes", 0)
+            raw = self.rt.storage.max_inflight_bytes
             if isinstance(raw, bool):
                 return None
             if not isinstance(raw, (int, float)):

@@ -580,7 +580,7 @@ class FuseMixin:
         row needs no repair.
         """
         try:
-            inject_flag = bool(self.cfg.cross_seed.inject_racing_torrents_to_fuse)
+            inject_flag = bool(self.rt.acquire.inject_racing_torrents_to_fuse)
         except Exception:
             inject_flag = True
         if not inject_flag:
@@ -1151,7 +1151,7 @@ class FuseMixin:
     def _fuse_mount_strs(self) -> list[str]:
         """Normalized fuse mount strings; [] when unconfigured/broken."""
         try:
-            mounts = [self.cfg.rclone.fuse.mount, self.cfg.rclone.fuse.mount_unsorted]
+            mounts = [self.rt.seed.mount, self.rt.seed.mount_unsorted]
         except Exception:
             return []
         out: list[str] = []
@@ -1210,9 +1210,9 @@ class FuseMixin:
         """Fuse mount for a classification kind; fallback on error/unknown-cfg."""
         try:
             if route_kind_is_sorted(kind):
-                return Path(self.cfg.rclone.fuse.mount)
+                return Path(self.rt.seed.mount)
             if kind in ("episode", "unknown"):
-                return Path(self.cfg.rclone.fuse.mount_unsorted)
+                return Path(self.rt.seed.mount_unsorted)
         except Exception:
             pass
         return fallback
@@ -1559,5 +1559,5 @@ class FuseMixin:
     def _target_mount_for(self, ts: TorrentState) -> Path:
         """Where on the fuse mount should this torrent's data live?"""
         if route_kind_is_sorted(ts.classification_kind):
-            return Path(self.cfg.rclone.fuse.mount)
-        return Path(self.cfg.rclone.fuse.mount_unsorted)
+            return Path(self.rt.seed.mount)
+        return Path(self.rt.seed.mount_unsorted)

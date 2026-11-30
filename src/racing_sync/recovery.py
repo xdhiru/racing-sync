@@ -23,6 +23,7 @@ from .config import AppConfig
 from .content_keys import same_content
 from .coordinator_errors import AbandonedError
 from .io_bounds import bounded, chunked, offload, rpc
+from .runtime import Runtime
 from .state import State, StateStore, TorrentState
 
 log = logging.getLogger(__name__)
@@ -162,10 +163,11 @@ def _ssd_roots_known(cfg: AppConfig) -> bool:
     str/Path: placement membership is then unknowable, so callers must
     preserve their legacy fail-open behavior.
     """
+    rt = Runtime(cfg)
     try:
         return any(
             isinstance(raw, (str, Path)) and str(raw).strip()
-            for raw in (getattr(cfg.dest, "save_path", None), getattr(cfg.ssd, "path", None))
+            for raw in (rt.storage.save_path, rt.storage.path)
         )
     except Exception:
         return False
@@ -202,7 +204,8 @@ def find_content_on_ssd(cfg: AppConfig, expected: list[tuple[str, int]]) -> Path
         return None
     top = next(iter(tops))
     roots: list[Path] = []
-    for raw in (getattr(cfg.dest, "save_path", None), getattr(cfg.ssd, "path", None)):
+    rt = Runtime(cfg)
+    for raw in (rt.storage.save_path, rt.storage.path):
         try:
             p = raw if isinstance(raw, Path) else Path(str(raw))
         except Exception:
@@ -648,6 +651,7 @@ async def _reconcile_snapshot(
     failure. With verify=True this is today's full inline behavior.
     """
     rpt = RecoveryReport()
+    rt = Runtime(cfg)
 
     # 1. Snapshot reality — restrict to the racing category so we
     #    don't churn through 7000+ long-term seeds on every startup.
@@ -831,7 +835,7 @@ async def _reconcile_snapshot(
     # lazily only when we actually adopt, to avoid pulling MB blobs per row.
     fuse_mounts = [
         str(fm).rstrip("/\\").replace("\\", "/")
-        for fm in (cfg.rclone.fuse.mount, cfg.rclone.fuse.mount_unsorted)
+        for fm in (rt.seed.mount, rt.seed.mount_unsorted)
         if fm
     ]
     for h, t in actual_by_hash.items():
@@ -1073,6 +1077,7 @@ async def fix_orphan(
     Returns the new state value (string) after the fix.
     """
     h = ts.source_infohash
+    rt = Runtime(cfg)
 
     if ts.state in (State.DOWNLOADING, State.QUEUED):
         # The torrent disappeared from VPS2 but DB still expects SSD work.
@@ -1089,7 +1094,7 @@ async def fix_orphan(
         try:
             res = await dest.add_torrent(
                 torrent_files=[sftp_bytes],
-                save_path=ts.save_path or str(cfg.dest.save_path),
+                save_path=ts.save_path or str(rt.storage.save_path),
                 category="racing",
                 paused=True,
                 skip_check=False,
@@ -1112,7 +1117,7 @@ async def fix_orphan(
         if new_hash:
             ts.dest_infohash = new_hash
         if not ts.save_path:
-            ts.save_path = str(cfg.dest.save_path)
+            ts.save_path = str(rt.storage.save_path)
         if ts.state != State.DOWNLOADING:
             _force_state(store, ts, State.DOWNLOADING)
         else:
@@ -1133,7 +1138,7 @@ async def fix_orphan(
                 "orphan %s: move checkpoint %r present; leaving MOVING for replay", h, ts.move_stage
             )
             return State.MOVING.value
-        src_path = Path(ts.save_path) if ts.save_path else Path(cfg.dest.save_path)
+        src_path = Path(ts.save_path) if ts.save_path else Path(rt.storage.save_path)
         # Torrent display name often differs from the on-disk top folder, so
         # prefer the exact file list decoded from the stored .torrent bytes.
         expected_names: list[str] | None = None

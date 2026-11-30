@@ -576,12 +576,12 @@ class DownloadMixin:
         poll_n = 0
         flush_since: float | None = None
         stall_timeout = (
-            getattr(self.cfg.general, "download_stall_timeout_seconds", 0)
+            self.rt.limits.download_stall_timeout_seconds
             if hasattr(self, "cfg") and hasattr(self.cfg, "general")
             else 0
         )
         poll_interval = (
-            self.cfg.general.dest_poll_interval
+            self.rt.limits.dest_poll_interval
             if hasattr(self, "cfg") and hasattr(self.cfg, "general")
             else 2
         )
@@ -1140,7 +1140,7 @@ class DownloadMixin:
     ) -> Path | None:
         if not files:
             return None
-        base = Path(base_path).resolve() if base_path else Path(self.cfg.dest.save_path).resolve()
+        base = Path(base_path).resolve() if base_path else Path(self.rt.storage.save_path).resolve()
         # The top-most folder shared by all files. Derived from ALL files
         # (most common first component), not files[0] — qB file order is
         # not guaranteed and files[0] may be a root-level extra while the

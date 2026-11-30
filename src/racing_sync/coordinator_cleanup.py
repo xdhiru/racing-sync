@@ -59,7 +59,7 @@ class CleanupMixin:
         if sftp is None:
             return None
         try:
-            state_dir = self.cfg.source.deluge_sftp.state_dir  # type: ignore[union-attr]
+            state_dir = self.rt.intake.sftp_state_dir
             if state_dir is None:
                 return None
             path = state_dir.as_posix() if hasattr(state_dir, "as_posix") else str(state_dir)
@@ -136,7 +136,7 @@ class CleanupMixin:
         survive restarts). Times survive only as early as the oldest
         reading: memory, then meta, else 0 (run).
         """
-        cfg = getattr(getattr(self, "cfg", None), "cleanup", None)
+        cfg = getattr(self.rt.cleanup, "config", None)
         if cfg is None or not getattr(cfg, "enabled", False):
             return
         try:
@@ -235,7 +235,7 @@ class CleanupMixin:
             return
         try:
             src_torrents = await rpc(
-                self.source_client.list_torrents(category=self.cfg.source.category),
+                self.source_client.list_torrents(category=self.rt.intake.category),
                 getattr(self, "cfg", None),
                 "source cleanup list_torrents",
             )
@@ -401,7 +401,7 @@ class CleanupMixin:
     def _cleanup_protected(self, ts: TorrentState) -> bool:
         """True when the release matches a protected pattern (never delete)."""
         try:
-            patterns = list(getattr(self.cfg.cleanup, "protected_patterns", []) or [])
+            patterns = list(getattr(self.rt.cleanup.config, "protected_patterns", []) or [])
         except Exception:
             return False
         name = (ts.source_name or "").lower()
@@ -508,7 +508,7 @@ class CleanupMixin:
         Updates vps1_last_activity_at when swarm activity is observed (skipped
         in dry-run mode, which performs zero state mutations).
         """
-        cfg = self.cfg.cleanup
+        cfg = self.rt.cleanup.config
         # 1. Observe swarm activity first: any active member bumps the stamp
         #    and vetoes deletion this run (the race is still going).
         lively = [m for m in group if self._cleanup_member_active(m, cfg)]
@@ -842,7 +842,7 @@ class CleanupMixin:
         ]
         if not expected:
             return False
-        base = Path(ts.save_path) if ts.save_path else Path(self.cfg.dest.save_path)
+        base = Path(ts.save_path) if ts.save_path else Path(self.rt.storage.save_path)
         # SSD-root assert: a stale save_path pointing at the fuse mount
         # (or anywhere outside the SSD trees) must fail closed — proving
         # bytes there is not proving them on SSD. Resolves, joins, stats

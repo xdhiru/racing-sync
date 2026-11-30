@@ -67,7 +67,7 @@ class ReaddMixin:
     def _readd_heal_after_seconds(self) -> float:
         """Sustained-missing window before the RE_ADDING healer fires."""
         try:
-            raw = getattr(getattr(self, "cfg", None), "fuse_readd_heal_after_seconds", 7200)
+            raw = self.rt.seed.readd_heal_after_seconds
             if isinstance(raw, bool) or not isinstance(raw, (int, float)):
                 return 7200.0
             return float(raw)
@@ -275,7 +275,7 @@ class ReaddMixin:
         try:
             ssd_base = Path(ts.save_path) if ts.save_path else None
             if ssd_base is None or self._save_path_is_on_fuse(str(ssd_base)):
-                ssd_base = Path(self.cfg.dest.save_path)
+                ssd_base = Path(self.rt.storage.save_path)
         except Exception:
             return False
 
@@ -511,9 +511,9 @@ class ReaddMixin:
                 kind = "unknown"
             try:
                 remote = (
-                    self.cfg.rclone.remote.default
+                    self.rt.transfer.remote_default
                     if kind in ("movie", "season")
-                    else self.cfg.rclone.remote.unsorted
+                    else self.rt.transfer.remote_unsorted
                 )
             except Exception:
                 return False
@@ -766,7 +766,7 @@ class ReaddMixin:
             if store is not None:
                 store.upsert(ts)
 
-        delay = _readd_gap_seconds(getattr(self.cfg, "fuse_reinject_delay_seconds", 0), 0)
+        delay = _readd_gap_seconds(self.rt.seed.reinject_delay_seconds, 0)
         if delay > 0 and ts.readd_attempts == 0 and ts.readd_next_retry_at is None:
             # Timer-park, never sleep: the retry instant persists in the DB
             # across restarts; a sleep would lose it (and stall the worker).
@@ -784,18 +784,12 @@ class ReaddMixin:
             return
 
         max_age = dt.timedelta(
-            seconds=_readd_gap_seconds(
-                getattr(self.cfg, "fuse_reinject_max_age_seconds", 86400), 86400
-            )
+            seconds=_readd_gap_seconds(self.rt.seed.reinject_max_age_seconds, 86400)
         )
 
-        retry_gap = _readd_gap_seconds(
-            getattr(self.cfg, "fuse_reinject_retry_gap_seconds", 120), 120
-        )
+        retry_gap = _readd_gap_seconds(self.rt.seed.reinject_retry_gap_seconds, 120)
 
-        backoff_interval = _readd_gap_seconds(
-            getattr(self.cfg, "fuse_reinject_backoff_seconds", 1800), 1800
-        )
+        backoff_interval = _readd_gap_seconds(self.rt.seed.reinject_backoff_seconds, 1800)
 
         elapsed = now - ts.readd_first_attempted_at
         if elapsed >= max_age:
@@ -957,7 +951,7 @@ class ReaddMixin:
             # pointing at the fuse mount with skip_check=True (req #3).
             # Watch rows (any SSD flavour label) re-inject their
             # persisted blobs instead.
-            if self.cfg.cross_seed.inject_racing_torrents_to_fuse:
+            if self.rt.acquire.inject_racing_torrents_to_fuse:
                 if self._is_watch_row(ts):
                     await self._re_inject_watch_dir_torrents(ts)
                 else:
@@ -1108,7 +1102,7 @@ class ReaddMixin:
 
     async def _re_inject_watch_dir_torrents(self, ts: TorrentState) -> None:
         """Re-add every watch-dir dropped torrent and discovered cross-seeds onto FUSE."""
-        watch_cross_dir = _watch_cross_seed_dir(self.cfg.general.state_db, ts.source_infohash)
+        watch_cross_dir = _watch_cross_seed_dir(self.rt.paths.state_db, ts.source_infohash)
         if watch_cross_dir is None:
             log.warning(
                 "re-inject watch-dir torrents for %s: no blob dir "
@@ -1492,7 +1486,7 @@ class ReaddMixin:
             cfg_prowlarr = getattr(getattr(self, "cfg", None), "prowlarr", None)
             if cfg_prowlarr is None:
                 return
-            if not bool(getattr(self.cfg.cross_seed, "inject_racing_torrents_to_fuse", False)):
+            if not self.rt.acquire.inject_racing_torrents_to_fuse:
                 return
             tmap = getattr(cfg_prowlarr, "tracker_map", None)
             entries = getattr(tmap, "entries", None)

@@ -25,6 +25,7 @@ from pathlib import Path
 
 from .coordinator_content import watch_election_winner
 from .rclone_ops import wipe_local_tree
+from .runtime import Runtime
 from .safety import state_db_parent_refusal, validate_safe_delete_path
 from .state import State
 
@@ -93,7 +94,8 @@ def resolve_row(store, target: str):
 
 def _ssd_bases(cfg) -> list[Path]:
     bases: list[Path] = []
-    for raw in (getattr(cfg.ssd, "path", None), getattr(cfg.dest, "save_path", None)):
+    rt = Runtime(cfg)
+    for raw in (rt.storage.path, rt.storage.save_path):
         if isinstance(raw, Path):
             p: Path | None = raw
         elif isinstance(raw, str) and raw.strip():
@@ -112,8 +114,9 @@ def _watch_cross_seeds_dir(cfg, source_infohash: str) -> Path | None:
     """Cached .torrent dir for one row (sibling of state.db), if configured."""
     from .coordinator_paths import _watch_cross_seed_dir
 
+    rt = Runtime(cfg)
     try:
-        db = getattr(cfg.general, "state_db", "")
+        db = rt.paths.state_db
     except Exception:
         return None
     if not str(db):
@@ -268,6 +271,7 @@ async def _forget_one(
     hard: bool = False,
 ) -> dict:
     """Forget a single already-resolved row (no cascade)."""
+    rt = Runtime(cfg)
     known = sorted(_row_hashes(row))
     entries: dict[str, object] = {}
     discover_ok = True
@@ -400,7 +404,7 @@ async def _forget_one(
     if delete_files:
         bases = _ssd_bases(cfg)
         try:
-            state_parent = Path(getattr(cfg.general, "state_db", "")).parent
+            state_parent = Path(rt.paths.state_db).parent
         except Exception:
             state_parent = None
         for p in local_paths:
