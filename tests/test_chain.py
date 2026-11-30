@@ -180,3 +180,77 @@ def test_summary_reports_disabled_links(tmp_path: Path):
     assert shape["transfer"]["provider"] == "none"
     assert shape["seed"]["provider"] == "none"
     assert shape["cleanup"]["enabled"] is False
+
+
+_EXTERNAL = """
+[general]
+
+[client]
+type = "qbittorrent"
+host = "http://127.0.0.1:8080"
+
+[dest]
+host = "http://127.0.0.1:8080"
+
+[storage]
+path = "/downloads"
+save_path = "/downloads"
+max_inflight_bytes = 1000000000
+skip_movie_larger_than_bytes = 1000000000
+
+[acquire]
+provider = "external"
+
+[transfer]
+provider = "external"
+
+[seed]
+path = "/mnt/fuse"
+"""
+
+
+def test_external_acquisition_waits_for_the_operator(tmp_path: Path):
+    cfg = _load(tmp_path, _EXTERNAL)
+    chain = Chain.from_config(cfg)
+
+    assert chain.acquire == "external"
+    assert chain.stage is False
+    assert chain.downloads is False
+    assert chain.waits_for_copy is True
+    assert chain.transfer == "external"
+    assert chain.moves is False
+    assert chain.seeds is True
+    assert chain.after_move() is State.RE_ADDING
+
+
+def test_external_summary_reports_the_copy(tmp_path: Path):
+    from racing_sync.config_summary import summarize
+
+    path = tmp_path / "config.toml"
+    path.write_text(_EXTERNAL, encoding="utf-8")
+    cfg = AppConfig.from_toml(path)
+
+    shape = summarize(cfg, path)["shape"]
+
+    assert shape["acquire"] == ["external_copy"]
+    assert shape["transfer"]["provider"] == "external"
+    assert shape["seed"]["provider"] == "fuse"
+
+
+def test_external_needs_a_read_only_transfer(tmp_path: Path):
+    text = _EXTERNAL.replace('[transfer]\nprovider = "external"', '[transfer]\nprovider = "rclone"')
+    with pytest.raises(ValueError, match="operator copies"):
+        _load(tmp_path, text)
+
+
+def test_external_needs_a_seed_path_and_wait(tmp_path: Path):
+    no_seed = _EXTERNAL.replace('[seed]\npath = "/mnt/fuse"', "[seed]\nenabled = false")
+    with pytest.raises(ValueError, match="seed path"):
+        _load(tmp_path, no_seed)
+
+    no_wait = _EXTERNAL.replace(
+        '[seed]\npath = "/mnt/fuse"',
+        '[seed]\npath = "/mnt/fuse"\nmanual_move_timeout_seconds = 0',
+    )
+    with pytest.raises(ValueError, match="manual-move window"):
+        _load(tmp_path, no_wait)

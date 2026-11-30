@@ -1439,9 +1439,11 @@ class PipelineConfig(BaseModel):
     without it (see `racing_sync.chain`).
     """
 
-    acquire: bool = True
-    transfer: bool = True
-    seed: bool = True
+    #: Providers this release can run (files choose explicitly; `auto`
+    #: keeps the legacy cross-seed/direct-export preference).
+    acquire: Literal["auto", "external"] = "auto"
+    transfer: Literal["rclone", "none", "external"] = "rclone"
+    seed: Literal["path", "none"] = "path"
 
 
 class AppConfig(BaseModel):
@@ -1552,23 +1554,51 @@ class AppConfig(BaseModel):
 
     @model_validator(mode="after")
     def _links_need_their_config(self) -> AppConfig:
-        """Enabled links require the settings they run on (fail fast)."""
-        if self.pipeline.transfer and self.rclone.remote is None:
+        """Links require the settings they run on (fail fast)."""
+        link = self.pipeline
+        external_acquire = link.acquire == "external"
+        if external_acquire and link.transfer == "rclone":
+            raise ValueError(
+                "external acquisition means the operator copies the bytes — "
+                'set [transfer] enabled = false (or provider = "external") '
+                "so the daemon does not download and move them instead"
+            )
+        if link.transfer == "rclone" and self.rclone.remote is None:
             raise ValueError(
                 "the transfer link is enabled but [rclone.remote] is missing — "
                 "set [remote] path/unsorted, or disable the link"
             )
-        if self.pipeline.seed and self.rclone.fuse is None:
+        if link.seed == "path" and self.rclone.fuse is None:
             raise ValueError(
                 "the seed link is enabled but no seed path is configured — "
                 "set [seed] path, or disable the link"
             )
-        if self.pipeline.seed and not self.pipeline.transfer:
+        if link.seed == "path" and link.transfer == "none" and not external_acquire:
             raise ValueError(
-                "the seed link needs the transfer link in this release: bytes "
-                "cannot reach the seed path without a move. Disable both for a "
-                "download-only chain, or keep transfer on."
+                "the seed link needs the transfer link: bytes cannot reach the "
+                "seed path without a move. Disable both for a download-only "
+                "chain, or keep transfer on (external acquisition is the "
+                "exception: the operator copies the bytes)."
             )
+        if external_acquire and link.transfer == "rclone":
+            raise ValueError(
+                "external acquisition means the operator copies the bytes — "
+                'set [transfer] enabled = false (or provider = "external") '
+                "so the daemon does not download and move them instead"
+            )
+        if external_acquire and link.seed == "none":
+            raise ValueError(
+                "external acquisition needs a seed path to verify the copy "
+                'against — set [seed] path, or use [acquire] provider = "auto"'
+            )
+        if external_acquire and self.rclone.fuse is not None:
+            fuse = self.rclone.fuse
+            if int(getattr(fuse, "manual_move_timeout_seconds", 0) or 0) <= 0:
+                raise ValueError(
+                    "external acquisition waits for the operator's copy, so the "
+                    "manual-move window must be enabled "
+                    "(manual_move_timeout_seconds > 0)"
+                )
         return self
 
     @model_validator(mode="after")

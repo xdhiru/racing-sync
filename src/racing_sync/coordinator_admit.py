@@ -787,9 +787,20 @@ class AdmitMixin:
         Shared by `_do_new`, `_do_waiting_indexer` and `_do_new_watch_dir`
         so a wake wave re-checks fuse before querying indexers. With the
         wait disabled (timeout 0) this is a no-op: no probe, no stats.
+
+        External acquisition (`[acquire] provider = "external"`) reuses the
+        same window but never falls back to a download: an absent or
+        incomplete copy keeps waiting, and an expired window fails the row
+        with where the copy was expected.
         """
         _check_s, _timeout_s = self._manual_move_wait_limits()
+        external = self.rt.chain.waits_for_copy
         if _timeout_s <= 0:
+            if external:
+                self._fail_external_wait(
+                    ts, "the manual-copy wait is disabled (manual_move_timeout_seconds = 0)"
+                )
+                return True
             return False
         try:
             status, found, present, total = await self._fuse_content_evidence(ts, blob=blob)
@@ -801,6 +812,9 @@ class AdmitMixin:
         if status == "partial":
             if self._park_fuse_content_wait(ts, present=present, total=total):
                 return True
+            if external:
+                self._fail_external_wait(ts, "the copy is incomplete")
+                return True
             # Ceiling reached/disabled: fall through to the normal flow.
             return False
         # Absent: a wait already running (a copy seen earlier, or an
@@ -809,7 +823,35 @@ class AdmitMixin:
         if ts.fuse_wait_first_at is not None:
             if self._park_fuse_content_wait(ts, present=0, total=0):
                 return True
+            if external:
+                self._fail_external_wait(ts, "the copy never appeared")
+                return True
+            return False
+        if external:
+            # First miss: open the window and wait for the operator.
+            if self._park_fuse_content_wait(ts, present=0, total=0):
+                return True
+            self._fail_external_wait(ts, "the copy never appeared")
+            return True
         return False
+
+    def _fail_external_wait(self, ts: TorrentState, detail: str) -> None:
+        """External acquisition has no download fallback: fail with where we looked."""
+        try:
+            paths = ", ".join(str(path) for path in self.rt.seed.mounts()) or "<no seed path>"
+        except Exception:
+            paths = "<no seed path>"
+        message = f"external copy unavailable: {detail} (expected under {paths})"
+        try:
+            self.transition(ts, State.FAILED, error=message)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "could not fail %s after the external wait: %s",
+                (ts.source_infohash or "")[:10],
+                e,
+            )
+            return
+        log.warning("%s: %s", (ts.source_name or ts.source_infohash)[:60], message)
 
     async def _sweep_manual_fuse_adoptions(self) -> None:
         """Batch-adopt pre-SSD rows whose infohash already seeds from fuse.
