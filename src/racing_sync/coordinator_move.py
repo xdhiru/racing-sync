@@ -340,19 +340,11 @@ class MoveMixin:
         except (TypeError, ValueError):
             _prog = 0.0
         try:
-            _stall = float(
-                getattr(getattr(self.cfg, "general", None), "download_check_stall_seconds", 1800)
-                or 0
-            )
+            _stall = float(getattr(self.rt.limits, "download_check_stall_seconds", 1800) or 0)
         except (TypeError, ValueError):
             _stall = 1800.0
         try:
-            _abscap = float(
-                getattr(
-                    getattr(self.cfg, "general", None), "download_max_check_wait_seconds", 43200
-                )
-                or 0
-            )
+            _abscap = float(getattr(self.rt.limits, "download_max_check_wait_seconds", 43200) or 0)
         except (TypeError, ValueError):
             _abscap = 43200.0
         _ckey = (ts.source_infohash or "").lower()
@@ -458,10 +450,8 @@ class MoveMixin:
     def _configured_ssd_roots(self) -> list[Path]:
         roots: list[Path] = []
         for raw in (
-            getattr(getattr(self, "cfg", None), "ssd", None) is not None
-            and getattr(self.cfg.ssd, "path", None),
-            getattr(getattr(self, "cfg", None), "dest", None) is not None
-            and getattr(self.cfg.dest, "save_path", None),
+            getattr(self.rt.storage, "path", None),
+            getattr(self.rt.storage, "save_path", None),
         ):
             try:
                 if not raw:
@@ -477,7 +467,7 @@ class MoveMixin:
         """Resolve+validate the SSD root a persisted move plan refers to."""
         _raw = getattr(ts, "save_path", "") or ""
         if not _raw:
-            _raw = getattr(getattr(self.cfg, "dest", None), "save_path", "")
+            _raw = getattr(self.rt.storage, "save_path", "")
         try:
             root = Path(_raw).resolve()
         except (TypeError, ValueError, OSError) as e:
@@ -701,7 +691,7 @@ class MoveMixin:
 
                     await _coordinator.wipe_local_tree(
                         folder,
-                        base_dir=[self.cfg.ssd.path, Path(self.cfg.dest.save_path)],
+                        base_dir=[self.rt.storage.path, Path(self.rt.storage.save_path)],
                     )
             except OSError as e:
                 self._park_moving(
@@ -1028,7 +1018,7 @@ class MoveMixin:
         src_dir = (
             Path(ts.save_path).resolve()
             if ts.save_path
-            else Path(self.cfg.dest.save_path).resolve()
+            else Path(self.rt.storage.save_path).resolve()
         )
         folder = self._season_folder_for(cls_files, ts.source_name, base_path=src_dir)
 
@@ -1256,9 +1246,9 @@ class MoveMixin:
         # were moved under it, so the sweep must land beside them even if the
         # fresh file list classifies differently.
         if route_kind_is_sorted(pinned_kind):
-            remote = self.cfg.rclone.remote.default
+            remote = self.rt.transfer.remote_default
         else:
-            remote = self.cfg.rclone.remote.unsorted
+            remote = self.rt.transfer.remote_unsorted
 
         # 5. Move completed files via rclone
         # (per-file --files-from-raw lists preserve the top dir so the
@@ -2024,7 +2014,7 @@ class MoveMixin:
                     remote,
                     ts,
                     files_from=names,
-                    extra=self.cfg.rclone.batch_move_extra_flags,
+                    extra=self.rt.transfer.batch_extra_flags,
                 )
                 stuck = await asyncio.to_thread(left_on_disk_many, src_dir, names)
                 if stuck:

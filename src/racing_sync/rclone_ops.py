@@ -34,6 +34,7 @@ from pathlib import Path
 
 from .config import AppConfig
 from .logging_setup import sanitize_log_text
+from .runtime import Runtime
 
 log = logging.getLogger(__name__)
 
@@ -481,7 +482,7 @@ def _validate_rclone_binary(cfg: AppConfig) -> Path | None:
     Returns None (skips validation) for test doubles where binary is not a
     path-like (e.g. MagicMock with spec=AppConfig).
     """
-    raw = cfg.rclone.binary
+    raw = Runtime(cfg).transfer.binary
     if not isinstance(raw, (str, Path)):
         return None
     raw_s = str(raw)
@@ -511,8 +512,9 @@ def _validate_rclone_binary(cfg: AppConfig) -> Path | None:
 
 def _env(cfg: AppConfig) -> dict[str, str]:
     env = dict(os.environ)
-    if cfg.rclone.config_path:
-        cfg_path = str(cfg.rclone.config_path)
+    config_path = Runtime(cfg).transfer.config_path
+    if config_path:
+        cfg_path = str(config_path)
         if cfg_path.strip().startswith("-"):
             raise RcloneError(f"refusing rclone config_path starting with '-': {cfg_path!r}")
         env["RCLONE_CONFIG"] = cfg_path
@@ -586,15 +588,16 @@ def build_move_cmd(
         raise RcloneError("rclone move takes either include= or files_from=, not both")
     if files_from and files_from.startswith("-"):
         raise RcloneError(f"refusing rclone files-from list starting with '-': {files_from!r}")
-    _reject_hijack_flags(cfg.rclone.extra_move_flags, "extra_move_flags")
+    transfer = Runtime(cfg).transfer
+    _reject_hijack_flags(transfer.extra_flags, "extra_move_flags")
     _reject_hijack_flags(list(extra or []), "extra")
     # Flags first, `--` + positionals last: rclone parses everything after
     # `--` as positionals, so --config/extra flags placed there become
     # spurious "arguments" (rc=2). `--` still shields a `-`-leading source.
-    cmd = [str(cfg.rclone.binary), "move"]
-    if cfg.rclone.config_path:
-        cmd.extend(["--config", str(cfg.rclone.config_path)])
-    cmd.extend(cfg.rclone.extra_move_flags)
+    cmd = [str(transfer.binary), "move"]
+    if transfer.config_path:
+        cmd.extend(["--config", str(transfer.config_path)])
+    cmd.extend(transfer.extra_flags)
     if include:
         cmd.extend(include)
     if files_from:
@@ -1123,12 +1126,13 @@ def _total_margin_bytes(cfg: AppConfig) -> int:
         except (TypeError, ValueError):
             return 0
 
+    storage = Runtime(cfg).storage
     try:
-        general = _as_int(getattr(cfg.general, "disk_safety_margin_bytes", 0))
+        general = _as_int(storage.disk_safety_margin_bytes)
     except Exception:
         general = 0
     try:
-        specific = _as_int(getattr(cfg.ssd, "safety_margin_bytes", 0))
+        specific = _as_int(storage.safety_margin_bytes)
     except Exception:
         specific = 0
     return general + specific
@@ -1136,17 +1140,18 @@ def _total_margin_bytes(cfg: AppConfig) -> int:
 
 def ssd_has_room(cfg: AppConfig, extra_bytes: int = 0) -> bool:
     """True iff `ssd.path` has at least `extra_bytes + safety_margin` free."""
-    free = disk_free_bytes_at(cfg.ssd.path)
+    free = disk_free_bytes_at(Runtime(cfg).storage.path)
     needed = extra_bytes + _total_margin_bytes(cfg)
     return free >= needed
 
 
 def ssd_free_bytes(cfg: AppConfig) -> int:
-    return disk_free_bytes_at(cfg.ssd.path)
+    return disk_free_bytes_at(Runtime(cfg).storage.path)
 
 
 def ssd_max_inflight_bytes(cfg: AppConfig) -> int:
     """Batcher cap is the configured max, capped by actual free space - safety margin."""
-    free = disk_free_bytes_at(cfg.ssd.path)
+    storage = Runtime(cfg).storage
+    free = disk_free_bytes_at(storage.path)
     usable = max(0, free - _total_margin_bytes(cfg))
-    return min(cfg.ssd.max_inflight_bytes, usable)
+    return min(storage.max_inflight_bytes, usable)

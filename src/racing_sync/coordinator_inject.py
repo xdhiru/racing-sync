@@ -247,7 +247,7 @@ class InjectMixin:
         try:
             kind = self._classify_blob_kind(blob)
             try:
-                fallback = Path(self.cfg.rclone.fuse.mount_unsorted)
+                fallback = Path(self.rt.seed.mount_unsorted)
             except Exception:
                 fallback = Path(".")
             target = self._target_mount_for_kind(kind, fallback)
@@ -599,7 +599,7 @@ class InjectMixin:
         if not blob:
             raise LookupError("primary .torrent bytes missing; run again")
         try:
-            base = str(self.cfg.dest.save_path)
+            base = str(self.rt.storage.save_path)
         except Exception:
             base = ""
         ts = TorrentState(

@@ -1043,7 +1043,7 @@ async def test_auto_retry_skips_tracker_deleted_rows(tmp_path: Path):
 
     _client = AsyncMock()
     _client.start = AsyncMock()
-    with patch("racing_sync.coordinator.QBittorrentClient", return_value=_client):
+    with patch("racing_sync.composition.QBittorrentClient", return_value=_client):
         await coord.start()
 
     dead = store.get("dead1")

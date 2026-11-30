@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .runtime import Runtime
 from .state import State, TorrentState
 
 log = logging.getLogger(__name__)
@@ -381,8 +382,9 @@ def is_watch_row(row: TorrentState, cfg) -> bool:
         return False
     if not key_hash:
         return False
+    rt = Runtime(cfg)
     try:
-        base = Path(cfg.general.state_db).parent
+        base = Path(rt.paths.state_db).parent
     except Exception:
         return False
     try:
@@ -413,6 +415,7 @@ def watch_rank(row: TorrentState, cfg) -> int:
 
     Lower wins. Never raises (doubt ranks last).
     """
+    rt = Runtime(cfg)
     try:
         tracker_list = [u for u in (row.source_announce_url or "").split(",") if u] or (
             [row.source_tracker] if row.source_tracker else []
@@ -425,7 +428,7 @@ def watch_rank(row: TorrentState, cfg) -> int:
     except Exception:
         pass
     try:
-        if cfg.prowlarr.enabled and any(cfg.prowlarr.is_download_indexer(u) for u in tracker_list):
+        if rt.indexers.enabled and any(rt.indexers.is_download_indexer(u) for u in tracker_list):
             return 1
     except Exception:
         pass
