@@ -8,8 +8,14 @@ Everything below follows from that.
 
 ```
 src/racing_sync/
-  __main__.py         CLI: run [--reset|--full --yes], forget, unignore, check-config
+  __main__.py         CLI: run [--reset|--full --yes], forget, unignore, check-config, config summary
   config.py           Pydantic schema + cross-field validation
+  config_alias.py     New capability-chain spellings -> the internal schema
+  config_disposition.py  Every field's fate (keep/rename/deprecate) + path helpers
+  config_summary.py   Read-only, secret-free summary + digest of a config
+  runtime.py          Typed read-through capability views over AppConfig
+  composition.py      Builds the client/indexer/blob/watch graph for a config
+  capabilities.py     Protocols the orchestrator depends on
   state.py            SQLite state machine (one schema spec drives all views)
   classifier.py       movie / episode / season / mixed
   batcher.py          SSD-aware episode batching
@@ -219,11 +225,21 @@ static `X-API-Token`, or an nginx-injected `X-Authenticated-User` from
 ## Config and logging
 
 `config.example.toml` documents every key; `config.py` validates and
-cross-checks them. `[prowlarr.tracker_map]` maps announce-URL substrings to
-indexer names (supplementary fuse cross-seeds only — the SSD download search
-always walks `download_indexers` in priority order). Logs are rotating files
-plus JSONL (secrets scrubbed), an in-memory ring buffer, and an optional
-HTTPS sink; the state DB records transitions in `run_log`.
+cross-checks them. A new capability-chain spelling (`[client]`, `[storage]`,
+`[remote]`, `[transfer]`, `[seed]`, `[indexers]`, `[watch]`, `[acquire]`)
+is rewritten onto the same internal schema by `config_alias.py`, so old
+files keep working unchanged and both spellings resolve identically.
+`config summary` prints the resolved shape and a secret-free digest.
+
+Pipeline code never reads config sections: it asks a capability view
+(`rt.storage.path`, `rt.transfer.remote_for(episode=...)`,
+`rt.seed.manual_move_timeout_seconds`). `composition.py` is the only place
+that maps a config onto concrete clients, the indexer client, the blob
+source and the watch scanner. `[prowlarr.tracker_map]` maps announce-URL
+substrings to indexer names (supplementary fuse cross-seeds only — the SSD
+download search always walks `download_indexers` in priority order). Logs
+are rotating files plus JSONL (secrets scrubbed), an in-memory ring buffer,
+and an optional HTTPS sink; the state DB records transitions in `run_log`.
 
 ## Operational notes
 

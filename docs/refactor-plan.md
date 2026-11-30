@@ -1,8 +1,9 @@
 # Refactor plan — capability chain, explicit modules, smaller config
 
-Status: **phase 1 landed (2026-11-29); next: phase 2.** Phases 0–1 are in
-`dev`: the read-only `config summary` with its golden corpus, the field
-disposition registry, and the alias layer that accepts the new spellings.
+Status: **phase 2 landed (2026-11-30); next: phase 3.** Phases 0–2 are in
+`dev`: `config summary` + goldens, the disposition registry, the alias
+layer, and the composition root whose typed capability views every
+pipeline module now reads instead of config sections.
 
 ## Goal
 
@@ -130,6 +131,15 @@ exists for old configs; new files choose explicitly.
 A composition root resolves a module graph and injects capabilities (Protocols) —
 no more `hasattr(cfg, …)`.
 
+As landed in phase 2: `runtime.Runtime(cfg)` exposes typed read-through views
+(intake, storage, transfer, seed, indexers, acquire, limits, recovery, control,
+paths, cleanup); views hold the config and re-read on access, so nothing is
+copied and a swapped config is honoured. `composition.compose(cfg)` builds the
+concrete client/indexer/blob/watch graph without I/O; `Coordinator.start()`
+still owns start order and backoff. `capabilities.py` describes the blob,
+watch and indexer-policy surfaces; indexer search stays on the concrete client
+until the acquisition provider lands.
+
 | Module | Requires | Provides |
 |---|---|---|
 | core | — | store, scheduler, state table, locking |
@@ -168,7 +178,7 @@ cleanup (proof depends on the chain), and source identity in single-box mode.
 |---|---|---|
 | 0 ✅ | `config-summary` + golden configs + shape inventory | old configs resolve identically; no behavior change |
 | 1 ✅ | Config layer: module models, `enabled` tri-state, renames, legacy adapter, deprecations, exhaustive disposition registry | every old key accepted; one warning per retired key; `AppConfig` facade unchanged for callers |
-| 2 | Composition root + capability Protocols + factories | split/full behaves byte-identically; consumers no longer touch raw sections |
+| 2 ✅ | Composition root + capability Protocols + factories | split/full behaves byte-identically; consumers no longer touch raw sections |
 | 3 | Chain engine: derived transitions, checkpoint resolver, stranded-row drain, ledger, cleanup verifier, providers for today's behavior (`rclone`, `path`, `auto`, `none`) | shape matrix green for split/full/move-only/download-only |
 | 4 | New providers/shapes: `local` acquire, `local_move`, `external`, `seed.existing` | single-box, HDD/NAS, out-of-band and adopt-only shapes green |
 | 5 | UX: `config init/enable/disable/explain`, check-config chain report, docs/examples rewritten around the single-box default | a new user can go from zero to running with one screen of config |
@@ -229,3 +239,7 @@ editor, and throughput tuning (still separate from this refactor).
   `[seed].unsorted_path` defaults to `<path>/unsorted`. Disabling a link is
   refused until phase 3 can drain it. Deprecated: `general.max_active_downloads`,
   `general.max_concurrent_moves`, `rclone.reinject_delay_seconds` (warn once, still win).
+- Phase 2 (landed): capability views are live, not snapshots, so a config
+  swapped late (tests, pre-start edits) always answers. Services are built in
+  one root and started by the coordinator as before; `load_config`/`cli`
+  behaviour is untouched.
