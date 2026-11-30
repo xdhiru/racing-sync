@@ -158,3 +158,25 @@ def test_providers_report_the_chain():
         "seed": "path",
         "cleanup": "off",
     }
+
+
+@pytest.mark.parametrize("text", [_DOWNLOAD_ONLY, _MOVE_ONLY])
+def test_shortcut_edges_are_tolerated(tmp_path: Path, text: str):
+    from racing_sync.state import check_transition
+
+    for src, dst in Chain.from_config(_load(tmp_path, text)).shortcuts():
+        check_transition(src, dst)
+
+
+def test_summary_reports_disabled_links(tmp_path: Path):
+    from racing_sync.config_summary import summarize
+
+    path = tmp_path / "config.toml"
+    path.write_text(_DOWNLOAD_ONLY, encoding="utf-8")
+    cfg = AppConfig.from_toml(path)
+
+    shape = summarize(cfg, path)["shape"]
+
+    assert shape["transfer"]["provider"] == "none"
+    assert shape["seed"]["provider"] == "none"
+    assert shape["cleanup"]["enabled"] is False

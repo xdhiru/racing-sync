@@ -97,8 +97,11 @@ ALLOWED: dict[State, set[State]] = {
     # moved the bytes to the remote by hand, fuse verification passed, so the
     # SSD download is abandoned (dest entry removed, reservation released)
     # and the row goes fuse-gated RE_ADDING instead of finishing the download.
-    State.DOWNLOADING: {State.MOVING, State.QUEUED, State.FAILED, State.RE_ADDING},
-    State.MOVING: {State.RE_ADDING, State.DOWNLOADING, State.FAILED},
+    # DOWNLOADING -> DONE / MOVING -> DONE exist for shortened chains (no
+    # transfer, no seed). `chain.Chain` decides which edge a deployment
+    # actually takes; the table only tolerates them.
+    State.DOWNLOADING: {State.MOVING, State.DONE, State.QUEUED, State.FAILED, State.RE_ADDING},
+    State.MOVING: {State.RE_ADDING, State.DONE, State.DOWNLOADING, State.FAILED},
     State.RE_ADDING: {State.DONE, State.MOVING, State.FAILED},
     # DONE -> MOVING is the fresh-DB self-heal: recovery may have adopted an
     # SSD-complete torrent as DONE (e.g. stale DB, misclassified save_path);

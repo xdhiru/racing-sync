@@ -776,7 +776,7 @@ class MoveMixin:
             stage = _MOVE_STAGE_WIPED
         if stage == _MOVE_STAGE_WIPED:
             self._finish_moving_tracking(ts)
-            self.transition(ts, State.RE_ADDING)
+            self.transition(ts, self.rt.chain.after_move())
 
     async def _do_moving(self, ts: TorrentState) -> None:
         h = ts.dest_infohash or ts.source_infohash
