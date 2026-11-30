@@ -20,6 +20,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, SecretStr
 
+from .chain import provider_name
 from .config import AppConfig
 from .config_disposition import (
     Key,
@@ -148,18 +149,23 @@ def _shape(cfg: AppConfig) -> dict:
     cs = getattr(cfg, "cross_seed", None)
     prow = getattr(cfg, "prowlarr", None)
     acquire: list[str] = []
-    if _bool_attr(prow, "enabled") and _bool_attr(cs, "allow_prowlarr_cross_seed"):
+    _acq = getattr(getattr(cfg, "pipeline", None), "acquire", "auto")
+    external_copy = (_acq if isinstance(_acq, str) else "auto") == "external"
+    if external_copy:
+        acquire.append("external_copy")
+    elif _bool_attr(prow, "enabled") and _bool_attr(cs, "allow_prowlarr_cross_seed"):
         acquire.append("prowlarr_cross_seed")
-    if _bool_attr(cs, "refetch_public_via_prowlarr"):
+    if not external_copy and _bool_attr(cs, "refetch_public_via_prowlarr"):
         acquire.append("public_refetch")
     try:
         sftp = getattr(cfg.source, "deluge_sftp", None)
     except Exception:
         sftp = None
-    if _bool_attr(sftp, "enabled"):
-        acquire.append("sftp_export")
-    elif str(getattr(cfg.source, "type", "")).lower() == "qbittorrent":
-        acquire.append("client_export")
+    if not external_copy:
+        if _bool_attr(sftp, "enabled"):
+            acquire.append("sftp_export")
+        elif str(getattr(cfg.source, "type", "")).lower() == "qbittorrent":
+            acquire.append("client_export")
     if "watch" in observe:
         acquire.append("watch_dir")
 
@@ -203,12 +209,9 @@ def _shape(cfg: AppConfig) -> dict:
             "skip_single_file_bytes": int(getattr(cfg.ssd, "skip_movie_larger_than_bytes", 0) or 0),
         },
         "transfer": {
-            "provider": (
-                "rclone"
-                if getattr(cfg, "pipeline", None)
-                and cfg.pipeline.transfer
-                and getattr(cfg.rclone, "remote", None) is not None
-                else "none"
+            "provider": provider_name(
+                getattr(cfg.pipeline, "transfer", None) if hasattr(cfg, "pipeline") else None,
+                "rclone",
             ),
             "binary": _redact(getattr(cfg.rclone, "binary", "")),
             "remote_default": str(getattr(cfg.rclone.remote, "default", "")),
@@ -219,8 +222,11 @@ def _shape(cfg: AppConfig) -> dict:
         "seed": {
             "provider": (
                 "fuse"
-                if getattr(cfg, "pipeline", None)
-                and cfg.pipeline.seed
+                if provider_name(
+                    getattr(cfg.pipeline, "seed", None) if hasattr(cfg, "pipeline") else None,
+                    "path",
+                )
+                == "path"
                 and getattr(cfg.rclone, "fuse", None) is not None
                 else "none"
             ),

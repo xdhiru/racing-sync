@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .chain import Chain
+from .chain import Chain, provider_name
 from .config import AppConfig, CleanupConfig, DelugeSFTPConfig, WatchDirConfig
 
 
@@ -153,14 +153,14 @@ class TransferSettings:
         self._cfg = cfg
 
     @property
-    def enabled(self) -> bool:
+    def provider(self) -> str:
+        """rclone | none | external (the operator moves the bytes)."""
         pipeline = getattr(self._cfg, "pipeline", None)
-        on = getattr(pipeline, "transfer", True)
-        return bool(on) and getattr(self._cfg.rclone, "remote", None) is not None
+        return provider_name(getattr(pipeline, "transfer", None), "rclone")
 
     @property
-    def provider(self) -> str:
-        return "rclone" if self.enabled else "none"
+    def enabled(self) -> bool:
+        return self.provider == "rclone" and self._cfg.rclone.remote is not None
 
     @property
     def binary(self) -> Path:
@@ -207,14 +207,13 @@ class SeedSettings:
         self._cfg = cfg
 
     @property
-    def enabled(self) -> bool:
+    def provider(self) -> str:
         pipeline = getattr(self._cfg, "pipeline", None)
-        on = getattr(pipeline, "seed", True)
-        return bool(on) and getattr(self._cfg.rclone, "fuse", None) is not None
+        return provider_name(getattr(pipeline, "seed", None), "path")
 
     @property
-    def provider(self) -> str:
-        return "path" if self.enabled else "none"
+    def enabled(self) -> bool:
+        return self.provider == "path" and self._cfg.rclone.fuse is not None
 
     @property
     def mount(self) -> Path | None:
@@ -293,13 +292,14 @@ class AcquireSettings:
         self._cfg = cfg
 
     @property
-    def enabled(self) -> bool:
+    def provider(self) -> str:
+        """auto (daemon picks) | external (operator supplies the bytes)."""
         pipeline = getattr(self._cfg, "pipeline", None)
-        return bool(getattr(pipeline, "acquire", True))
+        return provider_name(getattr(pipeline, "acquire", None), "auto")
 
     @property
-    def provider(self) -> str:
-        return "auto" if self.enabled else "none"
+    def enabled(self) -> bool:
+        return self.provider != "none"
 
     @property
     def allow_prowlarr_cross_seed(self) -> bool:

@@ -147,7 +147,7 @@ def test_disabled_link_sets_the_pipeline_flag(link: str):
 
     data = normalize_config(raw).data
 
-    assert data["pipeline"][link] is False
+    assert data["pipeline"][link] == "none"
     if link == "seed":
         # Keys survive the switch: re-enabling is a flip, not a rewrite.
         assert data["rclone"]["fuse"]["mount"] == "/mnt/fuse"
@@ -160,7 +160,7 @@ def test_provider_none_disables_the_link(link: str):
 
     data = normalize_config(raw).data
 
-    assert data["pipeline"][link] is False
+    assert data["pipeline"][link] == "none"
 
 
 def test_disabling_acquire_is_refused_for_now():
