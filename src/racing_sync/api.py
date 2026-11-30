@@ -550,10 +550,15 @@ def build_app(coord: Coordinator) -> FastAPI:
                 checks[name] = False
         # Fuse mount present (the seeding lane depends on it).
         try:
-            _mount = rt.seed.mount
-            _mpath = os.fspath(_mount) if _mount is not None else ""
-            # A stat against a wedged mount can block: keep it off the loop.
-            checks["fuse_mount"] = bool(_mpath) and await asyncio.to_thread(os.path.isdir, _mpath)
+            if not rt.seed.enabled:
+                checks["fuse_mount"] = True
+            else:
+                _mount = rt.seed.mount
+                _mpath = os.fspath(_mount) if _mount is not None else ""
+                # A stat against a wedged mount can block: keep it off the loop.
+                checks["fuse_mount"] = bool(_mpath) and await asyncio.to_thread(
+                    os.path.isdir, _mpath
+                )
         except Exception:
             checks["fuse_mount"] = False
         # SSD path writable with readable free space.

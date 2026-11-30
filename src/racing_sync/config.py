@@ -574,8 +574,10 @@ class FuseConfig(BaseModel):
 class RcloneConfig(BaseModel):
     binary: Path = Path("/usr/local/bin/rclone")
     config_path: Path | None = None
-    remote: RemoteConfig
-    fuse: FuseConfig
+    #: None when the transfer link is disabled (no remote destination).
+    remote: RemoteConfig | None = None
+    #: None when the seed link is disabled (no fuse/plain seed path).
+    fuse: FuseConfig | None = None
     extra_move_flags: list[str] = Field(default_factory=list)
     batch_move_extra_flags: list[str] = Field(default_factory=list)
     # Maximum concurrent rclone move commands running simultaneously (default: 3)
@@ -1428,12 +1430,28 @@ class GeneralConfig(BaseModel):
     preferred_copy_grace_seconds: int = Field(default=3600, ge=0)
 
 
+class PipelineConfig(BaseModel):
+    """Which capability links this deployment runs.
+
+    Set by `config_alias` from the `[acquire]`/`[transfer]`/`[seed]`
+    switches; not part of the documented file surface yet. Disabling a
+    link is only accepted when the pipeline can reach its terminal state
+    without it (see `racing_sync.chain`).
+    """
+
+    acquire: bool = True
+    transfer: bool = True
+    seed: bool = True
+
+
 class AppConfig(BaseModel):
     general: GeneralConfig
     source: SourceConfig
     dest: DestConfig
     ssd: SSDConfig
-    rclone: RcloneConfig
+    rclone: RcloneConfig = RcloneConfig()
+    #: Capability links; internal, derived by the alias layer.
+    pipeline: PipelineConfig = PipelineConfig()
     classifier: ClassifierConfig = ClassifierConfig()
     telegram: TelegramConfig = TelegramConfig()
     logging_sink: LoggingSinkConfig = LoggingSinkConfig()
@@ -1506,31 +1524,52 @@ class AppConfig(BaseModel):
     def fuse_reinject_delay_seconds(self) -> int:
         if self.rclone.reinject_delay_seconds is not None:
             return self.rclone.reinject_delay_seconds
-        return self.rclone.fuse.reinject_delay_seconds
+        return self.rclone.fuse.reinject_delay_seconds if self.rclone.fuse else 30
 
     @property
     def fuse_reinject_retry_gap_seconds(self) -> int:
-        return self.rclone.fuse.reinject_retry_gap_seconds
+        return self.rclone.fuse.reinject_retry_gap_seconds if self.rclone.fuse else 120
 
     @property
     def fuse_reinject_backoff_seconds(self) -> int:
-        return self.rclone.fuse.reinject_backoff_seconds
+        return self.rclone.fuse.reinject_backoff_seconds if self.rclone.fuse else 1800
 
     @property
     def fuse_reinject_max_age_seconds(self) -> int:
-        return self.rclone.fuse.reinject_max_age_seconds
+        return self.rclone.fuse.reinject_max_age_seconds if self.rclone.fuse else 86400
 
     @property
     def fuse_readd_heal_after_seconds(self) -> int:
-        return self.rclone.fuse.readd_heal_missing_after_seconds
+        return self.rclone.fuse.readd_heal_missing_after_seconds if self.rclone.fuse else 7200
 
     @property
     def fuse_manual_move_check_seconds(self) -> int:
-        return self.rclone.fuse.manual_move_check_seconds
+        return self.rclone.fuse.manual_move_check_seconds if self.rclone.fuse else 1800
 
     @property
     def fuse_manual_move_timeout_seconds(self) -> int:
-        return self.rclone.fuse.manual_move_timeout_seconds
+        return self.rclone.fuse.manual_move_timeout_seconds if self.rclone.fuse else 43200
+
+    @model_validator(mode="after")
+    def _links_need_their_config(self) -> AppConfig:
+        """Enabled links require the settings they run on (fail fast)."""
+        if self.pipeline.transfer and self.rclone.remote is None:
+            raise ValueError(
+                "the transfer link is enabled but [rclone.remote] is missing — "
+                "set [remote] path/unsorted, or disable the link"
+            )
+        if self.pipeline.seed and self.rclone.fuse is None:
+            raise ValueError(
+                "the seed link is enabled but no seed path is configured — "
+                "set [seed] path, or disable the link"
+            )
+        if self.pipeline.seed and not self.pipeline.transfer:
+            raise ValueError(
+                "the seed link needs the transfer link in this release: bytes "
+                "cannot reach the seed path without a move. Disable both for a "
+                "download-only chain, or keep transfer on."
+            )
+        return self
 
     @model_validator(mode="after")
     def _warn_suspicious_combos(self) -> AppConfig:
@@ -1612,6 +1651,8 @@ class AppConfig(BaseModel):
         try:
             ssd_dirs = [_norm(self.ssd.path), _norm(self.dest.save_path)]
         except Exception:
+            return self
+        if self.rclone.fuse is None:
             return self
         try:
             fuse = [_norm(self.rclone.fuse.mount), _norm(self.rclone.fuse.mount_unsorted)]
