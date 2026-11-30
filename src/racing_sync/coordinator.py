@@ -26,13 +26,14 @@ import stat  # noqa: F401  (runtime use via coordinator_move lazy lookup + compa
 import time
 from dataclasses import dataclass, field
 
+from .capabilities import BlobSource, WatchIntake
 from .classifier import (
     classify,  # noqa: F401  (runtime use via coordinator_admit lazy lookup + compat)
 )
 from .clients.abstract import Torrent, TorrentClient
 from .clients.deluge import DelugeClient
 from .clients.http_base import AuthError
-from .clients.qbittorrent import QBittorrentClient
+from .composition import compose
 from .config import AppConfig
 from .content_keys import same_content as _same_content_key, same_release_name as _same_release_name
 from .coordinator_admit import AdmitMixin
@@ -79,9 +80,9 @@ from .rclone_ops import (
     ssd_max_inflight_bytes,  # noqa: F401  (runtime use via coordinator_ssd lazy lookup + compat)
     wipe_local_tree,  # noqa: F401  (runtime use via coordinator_move lazy lookup + compat)
 )
-from .sftp_source import SFTPExporter
+from .runtime import Runtime
 from .state import State, StateStore, TorrentState, UpsertResult
-from .watchdir import WatchDirScanner, WatchItem
+from .watchdir import WatchItem
 
 log = logging.getLogger(__name__)
 
@@ -357,8 +358,8 @@ class Coordinator(
     source_client: TorrentClient = field(init=False)
     dest_client: TorrentClient = field(init=False)
     prowlarr: ProwlarrClient | None = field(init=False, default=None)
-    sftp: SFTPExporter | None = field(init=False, default=None)
-    watch: WatchDirScanner | None = field(init=False, default=None)
+    sftp: BlobSource | None = field(init=False, default=None)
+    watch: WatchIntake | None = field(init=False, default=None)
     _stop: bool = field(default=False, init=False)
     # Operator intake pause (/pause): no NEW work starts until
     # resumed; in-flight rows drain normally. In-memory on purpose — a
@@ -446,15 +447,20 @@ class Coordinator(
     _state_budget_hits: dict[str, tuple[State, int]] = field(default_factory=dict, init=False)
 
     @property
+    def rt(self) -> Runtime:
+        """Typed capability views over the loaded config."""
+        return Runtime(self.cfg)
+
+    @property
     def download_sem(self) -> asyncio.Semaphore:
         if self._download_sem is None:
-            self._download_sem = asyncio.Semaphore(self.cfg.max_active_downloads)
+            self._download_sem = asyncio.Semaphore(self.rt.limits.max_active_downloads)
         return self._download_sem
 
     @property
     def move_sem(self) -> asyncio.Semaphore:
         if self._move_sem is None:
-            self._move_sem = asyncio.Semaphore(self.cfg.max_concurrent_moves)
+            self._move_sem = asyncio.Semaphore(self.rt.limits.max_concurrent_moves)
         return self._move_sem
 
     @property
@@ -469,7 +475,7 @@ class Coordinator(
     # ---- lifecycle ----
 
     def __post_init__(self) -> None:
-        self.store = StateStore(self.cfg.general.state_db)
+        self.store = StateStore(self.rt.paths.state_db)
 
     def _warn_if_storage_paths_overlap(self) -> None:
         """Warn when SSD dirs overlap fuse mounts (config footgun).
@@ -479,8 +485,8 @@ class Coordinator(
         silently misclassifies every torrent. Advisory only — never fatal.
         """
         try:
-            ssd_dirs = [str(self.cfg.dest.save_path), str(self.cfg.ssd.path)]
-            fuse = [str(self.cfg.rclone.fuse.mount), str(self.cfg.rclone.fuse.mount_unsorted)]
+            ssd_dirs = [str(self.rt.storage.save_path), str(self.rt.storage.path)]
+            fuse = [str(self.rt.seed.mount), str(self.rt.seed.mount_unsorted)]
         except Exception:
             return
 
@@ -509,11 +515,11 @@ class Coordinator(
         try:
             from pathlib import Path as _Path
 
-            log_dir = _Path(str(self.cfg.general.log_dir))
+            log_dir = _Path(str(self.rt.paths.log_dir))
             data_paths = [
-                _Path(str(self.cfg.general.state_db)).parent,
-                _Path(str(self.cfg.ssd.path)),
-                _Path(str(self.cfg.dest.save_path)),
+                _Path(str(self.rt.paths.state_db)).parent,
+                _Path(str(self.rt.storage.path)),
+                _Path(str(self.rt.storage.save_path)),
             ]
             try:
                 log_dev = log_dir.stat().st_dev if log_dir.exists() else None
@@ -547,37 +553,32 @@ class Coordinator(
         log.info("build ordering-guard v3 active (move-before-inject, DONE->MOVING demotion)")
         self._warn_if_storage_paths_overlap()
         self._warn_if_log_dir_on_data_mount()
-        self._download_sem = asyncio.Semaphore(self.cfg.max_active_downloads)
-        self._move_sem = asyncio.Semaphore(self.cfg.max_concurrent_moves)
+        self._download_sem = asyncio.Semaphore(self.rt.limits.max_active_downloads)
+        self._move_sem = asyncio.Semaphore(self.rt.limits.max_concurrent_moves)
         if self._ssd_lock is None:
             # Eager-init so concurrent admissions cannot race lazy creation
             # and install two different locks (split-brain budget).
             self._ssd_lock = asyncio.Lock()
         log.info(
             "concurrency limits: max_active_downloads=%d, max_concurrent_moves=%d",
-            self.cfg.max_active_downloads,
-            self.cfg.max_concurrent_moves,
+            self.rt.limits.max_active_downloads,
+            self.rt.limits.max_concurrent_moves,
         )
         try:
-            if self.cfg.source.type == "qbittorrent":
-                self.source_client = QBittorrentClient(self.cfg.source, label="source-qb")
-            else:
-                self.source_client = DelugeClient(self.cfg.source)
-            await self.source_client.start()
+            services = compose(self.cfg)
+            self.source_client = services.source
+            self.dest_client = services.dest
+            self.prowlarr = services.indexers
+            self.sftp = services.blobs
+            self.watch = services.watch
 
-            self.dest_client = QBittorrentClient(self.cfg.dest, label="dest-qb")
+            await self.source_client.start()
             await self.dest_client.start()
 
-            if self.cfg.prowlarr.enabled:
-                self.prowlarr = ProwlarrClient(self.cfg.prowlarr)
+            if self.prowlarr is not None:
                 await _start_with_backoff("prowlarr", self.prowlarr.start)
 
-            if (
-                self.cfg.source.type == "deluge"
-                and self.cfg.source.deluge_sftp
-                and self.cfg.source.deluge_sftp.enabled
-            ):
-                self.sftp = SFTPExporter(self.cfg.source.deluge_sftp)
+            if self.sftp is not None:
                 await _start_with_backoff("sftp", self.sftp.connect)
                 # Reuse the shared connection for Deluge .torrent fallback
                 # instead of a fresh handshake per get_torrent_files call.
@@ -587,15 +588,10 @@ class Coordinator(
                         wire(self.sftp)
                     except Exception:
                         pass
-            # NOTE: qBittorrent sources have no SFTP config (SourceConfig only
-            # defines deluge_sftp) — SFTP fallback for qB goes through the
-            # source client's export_torrent() endpoint instead. self.sftp
-            # stays None (set in __init__) for qB sources.
+            # NOTE: qBittorrent sources export through the source client's
+            # own endpoint instead; self.sftp stays None for them.
 
-            if self.cfg.watch_dir is not None:
-                self.watch = WatchDirScanner(self.cfg.watch_dir, self.prowlarr)
-
-            if self.cfg.recovery.run_on_startup:
+            if self.rt.recovery.run_on_startup:
                 from .recovery import _reconcile_snapshot
 
                 # Refactor (lazy recovery): fast snapshot only (no per-row
@@ -621,13 +617,13 @@ class Coordinator(
             # (e.g. Deluge RPC unavailable) get another chance with the
             # new code. This is the common path after the user upgrades
             # and re-runs.
-            if self.cfg.recovery.auto_retry_failed:
+            if self.rt.recovery.auto_retry_failed:
                 try:
                     _all_rows = await offload(self.store.all)
                 except Exception:
                     _all_rows = []
                 failed_rows = [ts for ts in (_all_rows or []) if ts.state == State.FAILED]
-                max_retries = getattr(self.cfg.recovery, "max_failed_retries", 3)
+                max_retries = self.rt.recovery.max_failed_retries
                 for ts in failed_rows:
                     if ts.failed_retries >= max_retries:
                         log.warning(
@@ -703,7 +699,7 @@ class Coordinator(
             except Exception:
                 pass
             self._tg = None
-            if self.cfg.telegram.enabled:
+            if self.rt.control.telegram:
                 from .telegram_bot import TelegramBot
 
                 self._tg = TelegramBot(self.cfg.telegram, self, self.store)
@@ -713,7 +709,7 @@ class Coordinator(
             from .api import serve
 
             self._api_task: asyncio.Task | None = None
-            if self.cfg.api.enabled:
+            if self.rt.control.api:
                 self._api_task = asyncio.create_task(serve(self), name="rs-api")
                 try:
                     self._api_task.add_done_callback(_log_api_task_done)
@@ -809,7 +805,7 @@ class Coordinator(
 
         try:
             all_torrents = await rpc(
-                self.source_client.list_torrents(category=self.cfg.source.category),
+                self.source_client.list_torrents(category=self.rt.intake.category),
                 getattr(self, "cfg", None),
                 "source list_torrents",
             )
@@ -851,7 +847,7 @@ class Coordinator(
                 e,
             )
             return list(_stale)
-        min_age = self.cfg.source.min_age_seconds
+        min_age = self.rt.intake.min_age_seconds
         if min_age <= 0:
             filtered = all_torrents
         else:
@@ -1321,7 +1317,7 @@ class Coordinator(
             # delete_after_pickup it is clutter — remove it like a fresh
             # ingest. Any other state keeps the file (the first drop's
             # pipeline may still need it, or the operator may inspect it).
-            if self.cfg.watch_dir and self.cfg.watch_dir.delete_after_pickup:
+            if self.rt.intake.watch and self.rt.intake.watch.delete_after_pickup:
                 if ingested:
                     await self.watch.delete_picked_up(item)
                 else:
@@ -1777,10 +1773,7 @@ class Coordinator(
                     await asyncio.to_thread(self.store.upsert, existing_ts)
                 except Exception:  # noqa: BLE001
                     pass
-            if (
-                existing_ts.state == State.DONE
-                and self.cfg.cross_seed.inject_racing_torrents_to_fuse
-            ):
+            if existing_ts.state == State.DONE and self.rt.acquire.inject_racing_torrents_to_fuse:
                 if not getattr(existing_ts, "skipped", 0):
                     await self._check_and_inject_late_cross_seeds(existing_ts, group)
             return None
@@ -1854,8 +1847,8 @@ class Coordinator(
             log.info(
                 "source poll: %d torrent(s) matching category=%r min_age=%ds",
                 len(src_torrents),
-                self.cfg.source.category,
-                self.cfg.source.min_age_seconds,
+                self.rt.intake.category,
+                self.rt.intake.min_age_seconds,
             )
             self._last_source_log_ts = now
         fresh_racing = await self._poll_source_racing(src_torrents)
@@ -1932,7 +1925,7 @@ class Coordinator(
         try:
             _max_workers = max(
                 12,
-                self.cfg.max_active_downloads * 2 + self.cfg.max_concurrent_moves * 2,
+                self.rt.limits.max_active_downloads * 2 + self.rt.limits.max_concurrent_moves * 2,
             )
         except (TypeError, ValueError, AttributeError):
             _max_workers = 12
@@ -2007,7 +2000,7 @@ class Coordinator(
         try:
             _max_workers = max(
                 12,
-                self.cfg.max_active_downloads * 2 + self.cfg.max_concurrent_moves * 2,
+                self.rt.limits.max_active_downloads * 2 + self.rt.limits.max_concurrent_moves * 2,
             )
         except (TypeError, ValueError, AttributeError):
             # Broken config must fail closed to a bounded burst, never to
@@ -2055,7 +2048,7 @@ class Coordinator(
         try:
             max_concurrent_workers = max(
                 12,
-                self.cfg.max_active_downloads * 2 + self.cfg.max_concurrent_moves * 2,
+                self.rt.limits.max_active_downloads * 2 + self.rt.limits.max_concurrent_moves * 2,
             )
         except (TypeError, ValueError, AttributeError):
             max_concurrent_workers = 12
@@ -2152,7 +2145,7 @@ class Coordinator(
             # (operator override; the worker still honors admission).
             if (
                 ts.state in (State.QUEUED, State.DOWNLOADING)
-                and active_downloads >= self.cfg.max_active_downloads
+                and active_downloads >= self.rt.limits.max_active_downloads
                 and not self._is_forced(_tkey)
             ):
                 continue
@@ -2160,7 +2153,7 @@ class Coordinator(
             # Limit concurrent active rclone move commands
             if (
                 ts.state == State.MOVING
-                and active_moves >= self.cfg.max_concurrent_moves
+                and active_moves >= self.rt.limits.max_concurrent_moves
                 and not self._is_forced(_tkey)
             ):
                 continue
@@ -2209,9 +2202,9 @@ class Coordinator(
                 "scheduled %d worker(s) (active downloads=%d/%d, moves=%d/%d)",
                 scheduled,
                 active_downloads,
-                self.cfg.max_active_downloads,
+                self.rt.limits.max_active_downloads,
                 active_moves,
-                self.cfg.max_concurrent_moves,
+                self.rt.limits.max_concurrent_moves,
             )
 
         # 4. Refresh live status (used by the Telegram bot). Isolated: a
@@ -2431,7 +2424,7 @@ class Coordinator(
             if self._stop:
                 break
             try:
-                await asyncio.sleep(max(1, int(float(self.cfg.general.source_poll_interval or 30))))
+                await asyncio.sleep(max(1, int(float(self.rt.limits.source_poll_interval or 30))))
             except (TypeError, ValueError):
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
@@ -2464,7 +2457,7 @@ class Coordinator(
             if self._stop:
                 break
             try:
-                await asyncio.sleep(max(1, int(float(self.cfg.general.dest_poll_interval or 30))))
+                await asyncio.sleep(max(1, int(float(self.rt.limits.dest_poll_interval or 30))))
             except (TypeError, ValueError):
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
@@ -3537,7 +3530,7 @@ class Coordinator(
                 _urls = []
             try:
                 _preferred = _looks_public(_urls) or any(
-                    self.cfg.prowlarr.is_download_indexer(u or "") for u in _urls
+                    self.rt.indexers.is_download_indexer(u or "") for u in _urls
                 )
             except Exception:
                 _preferred = False
