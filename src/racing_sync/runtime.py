@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .chain import Chain
 from .config import AppConfig, CleanupConfig, DelugeSFTPConfig, WatchDirConfig
 
 
@@ -68,6 +69,11 @@ class Runtime:
     @property
     def cleanup(self) -> CleanupSettings:
         return CleanupSettings(self._cfg)
+
+    @property
+    def chain(self) -> Chain:
+        """Which links run today and where each stage hands off."""
+        return Chain.from_config(self._cfg)
 
 
 class IntakeSettings:
@@ -147,8 +153,14 @@ class TransferSettings:
         self._cfg = cfg
 
     @property
+    def enabled(self) -> bool:
+        pipeline = getattr(self._cfg, "pipeline", None)
+        on = getattr(pipeline, "transfer", True)
+        return bool(on) and getattr(self._cfg.rclone, "remote", None) is not None
+
+    @property
     def provider(self) -> str:
-        return "rclone"
+        return "rclone" if self.enabled else "none"
 
     @property
     def binary(self) -> Path:
@@ -160,11 +172,13 @@ class TransferSettings:
 
     @property
     def remote_default(self) -> str:
-        return self._cfg.rclone.remote.default
+        remote = self._cfg.rclone.remote
+        return remote.default if remote is not None else ""
 
     @property
     def remote_unsorted(self) -> str:
-        return self._cfg.rclone.remote.unsorted
+        remote = self._cfg.rclone.remote
+        return remote.unsorted if remote is not None else ""
 
     def remote_for(self, *, episode: bool) -> str:
         return self.remote_unsorted if episode else self.remote_default
@@ -193,22 +207,30 @@ class SeedSettings:
         self._cfg = cfg
 
     @property
+    def enabled(self) -> bool:
+        pipeline = getattr(self._cfg, "pipeline", None)
+        on = getattr(pipeline, "seed", True)
+        return bool(on) and getattr(self._cfg.rclone, "fuse", None) is not None
+
+    @property
     def provider(self) -> str:
-        return "path"
+        return "path" if self.enabled else "none"
 
     @property
-    def mount(self) -> Path:
-        return self._cfg.rclone.fuse.mount
+    def mount(self) -> Path | None:
+        fuse = self._cfg.rclone.fuse
+        return fuse.mount if fuse is not None else None
 
     @property
-    def mount_unsorted(self) -> Path:
-        return self._cfg.rclone.fuse.mount_unsorted
+    def mount_unsorted(self) -> Path | None:
+        fuse = self._cfg.rclone.fuse
+        return fuse.mount_unsorted if fuse is not None else None
 
-    def path_for(self, *, episode: bool) -> Path:
+    def path_for(self, *, episode: bool) -> Path | None:
         return self.mount_unsorted if episode else self.mount
 
     def mounts(self) -> list[Path]:
-        return [self.mount, self.mount_unsorted]
+        return [path for path in (self.mount, self.mount_unsorted) if path is not None]
 
     @property
     def reinject_delay_seconds(self) -> int:
@@ -271,8 +293,13 @@ class AcquireSettings:
         self._cfg = cfg
 
     @property
+    def enabled(self) -> bool:
+        pipeline = getattr(self._cfg, "pipeline", None)
+        return bool(getattr(pipeline, "acquire", True))
+
+    @property
     def provider(self) -> str:
-        return "auto"
+        return "auto" if self.enabled else "none"
 
     @property
     def allow_prowlarr_cross_seed(self) -> bool:

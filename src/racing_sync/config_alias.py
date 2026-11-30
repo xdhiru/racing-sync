@@ -167,6 +167,13 @@ def _require_dest(data: dict[str, Any], aliases: tuple[str, ...]) -> None:
 
 
 def _resolve_links(data: dict[str, Any]) -> None:
+    """Resolve link switches/providers into the internal `pipeline` flags.
+
+    Acquire stays on: without it nothing can reach staging yet (external
+    acquisition lands with its own provider). Transfer/seed may be
+    disabled — the chain then terminates earlier (see `racing_sync.chain`).
+    """
+    pipeline: dict[str, bool] = {}
     for link in ("acquire", "transfer", "seed"):
         section = data.get(link)
         if section is None:
@@ -177,27 +184,47 @@ def _resolve_links(data: dict[str, Any]) -> None:
         provider = section.pop("provider", None)
         if enabled is not None and not isinstance(enabled, bool):
             raise ValueError(f"[{link}].enabled must be true or false")
-        if enabled is False:
+        if provider is not None and provider not in _PROVIDERS[link]:
             raise ValueError(
-                f"[{link}].enabled = false is not available yet — the pipeline still "
-                f"runs the {link} link. Remove the section (or leave enabled = true) "
-                "until the chain engine can drain it."
+                f"[{link}].provider = {provider!r} is not a known provider "
+                f"(choose one of: {', '.join(_PROVIDERS[link])})"
             )
-        if provider is not None:
-            allowed = _PROVIDERS[link]
-            if provider not in allowed:
+        if link == "acquire":
+            if enabled is False:
                 raise ValueError(
-                    f"[{link}].provider = {provider!r} is not a known provider "
-                    f"(choose one of: {', '.join(allowed)})"
+                    "[acquire].enabled = false is not available yet — external "
+                    "acquisition (bytes placed by the operator) lands with its "
+                    "own provider. Remove the section to keep today's pipeline."
                 )
-            current = _CURRENT_PROVIDER[link]
-            if provider != current:
+            if provider not in (None, "auto"):
                 raise ValueError(
-                    f"[{link}].provider = {provider!r} is not available yet — "
-                    f"this release runs provider = {current!r} for the {link} link"
+                    f"[acquire].provider = {provider!r} is not available yet — "
+                    "this release runs provider = 'auto'"
                 )
+            pipeline["acquire"] = True
+            continue
+
+        disabling = enabled is False or provider == "none"
+        if enabled is False and provider in ("rclone", "path"):
+            raise ValueError(
+                f"[{link}].enabled = false contradicts provider = {provider!r} — "
+                "drop the provider or set enabled = true"
+            )
+        if enabled is True and provider == "none":
+            raise ValueError(
+                f"[{link}].enabled = true contradicts provider = 'none' — "
+                "drop the provider or set enabled = false"
+            )
+        if not disabling and provider is not None and provider != _CURRENT_PROVIDER[link]:
+            raise ValueError(
+                f"[{link}].provider = {provider!r} is not available yet — "
+                f"this release runs provider = {_CURRENT_PROVIDER[link]!r}"
+            )
+        pipeline[link] = not disabling
         if link == "seed":
             _derive_seed_unsorted(section)
+    if pipeline:
+        data.setdefault("pipeline", {}).update(pipeline)
 
 
 def _derive_seed_unsorted(section: dict[str, Any]) -> None:
@@ -315,19 +342,21 @@ def _require_core(data: dict[str, Any], aliases: tuple[str, ...]) -> None:
             raise ValueError("[storage].path is required: the SSD staging directory")
         if not dest.get("save_path"):
             raise ValueError("[storage].save_path is required: where [dest] stages downloads")
-    if "seed" in aliases:
+    pipeline = data.get("pipeline") or {}
+    if "seed" in aliases and pipeline.get("seed", True):
         fuse = data.get("rclone", {}).get("fuse")
         if not isinstance(fuse, dict) or "mount" not in fuse:
             raise ValueError(
                 "[seed].path is required: where finished content is seeded from "
-                "(a fuse mount or a plain directory)"
+                "(a fuse mount or a plain directory), or set enabled = false"
             )
-    if "remote" in aliases:
+    if "remote" in aliases and pipeline.get("transfer", True):
         remote = data.get("rclone", {}).get("remote")
         if not isinstance(remote, dict) or "default" not in remote or "unsorted" not in remote:
             raise ValueError(
                 "[remote].path and [remote].unsorted are required "
-                "(rclone 'name:path/' destinations for folders and single episodes)"
+                "(rclone 'name:path/' destinations for folders and single episodes), "
+                "or set [transfer] enabled = false"
             )
 
 

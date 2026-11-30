@@ -2518,8 +2518,9 @@ class AdmitMixin:
         )
         if existing:
             fuse_mounts = [
-                str(self.rt.seed.mount).rstrip("/\\").replace("\\", "/"),
-                str(self.rt.seed.mount_unsorted).rstrip("/\\").replace("\\", "/"),
+                str(path).rstrip("/\\").replace("\\", "/")
+                for path in (self.rt.seed.mount, self.rt.seed.mount_unsorted)
+                if path is not None
             ]
 
             # Prefer fuse-complete > SSD-complete > first-listed: adopting

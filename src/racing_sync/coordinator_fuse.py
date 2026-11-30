@@ -1156,6 +1156,8 @@ class FuseMixin:
             return []
         out: list[str] = []
         for fm in mounts:
+            if fm is None:
+                continue
             try:
                 s = str(fm).rstrip("/\\").replace("\\", "/")
             except Exception:

@@ -41,6 +41,14 @@ _SECRET_NAME_HINTS = (
 
 _REDACTED = "***"
 
+#: Internal fields the alias layer sets; not part of the documented file
+#: surface, so they are left out of key counts and the digest.
+_INTERNAL_SECTIONS = frozenset({"pipeline"})
+
+
+def _public_leaves(model: type[BaseModel]) -> set[Key]:
+    return {path for path in model_leaves(model) if path[0] not in _INTERNAL_SECTIONS}
+
 
 def _is_secret_name(name: object) -> bool:
     try:
@@ -92,12 +100,15 @@ def _explicit_keys(path: Path) -> tuple[set[Key], list[str], set[Key]]:
         normalized = normalize_config(data)
     except Exception:
         return raw, [], raw
-    return flatten_leaves(normalized.data), list(normalized.unknown), raw
+    known_space = {
+        key for key in flatten_leaves(normalized.data) if key and key[0] not in _INTERNAL_SECTIONS
+    }
+    return known_space, list(normalized.unknown), raw
 
 
 def _classify_keys(explicit: set[Key], model: type[BaseModel]) -> tuple[set[Key], list[Key]]:
     """(known explicit keys, unknown explicit keys) — indices collapsed."""
-    known_paths = model_leaves(model)
+    known_paths = _public_leaves(model)
     extras = extras_prefixes(model)
     known: set[Key] = set()
     unknown: list[Key] = []
@@ -192,7 +203,13 @@ def _shape(cfg: AppConfig) -> dict:
             "skip_single_file_bytes": int(getattr(cfg.ssd, "skip_movie_larger_than_bytes", 0) or 0),
         },
         "transfer": {
-            "provider": "rclone",
+            "provider": (
+                "rclone"
+                if getattr(cfg, "pipeline", None)
+                and cfg.pipeline.transfer
+                and getattr(cfg.rclone, "remote", None) is not None
+                else "none"
+            ),
             "binary": _redact(getattr(cfg.rclone, "binary", "")),
             "remote_default": str(getattr(cfg.rclone.remote, "default", "")),
             "remote_unsorted": str(getattr(cfg.rclone.remote, "unsorted", "")),
@@ -200,7 +217,13 @@ def _shape(cfg: AppConfig) -> dict:
             "move_timeout_seconds": float(getattr(cfg.rclone, "move_timeout_seconds", 0) or 0),
         },
         "seed": {
-            "provider": "fuse",
+            "provider": (
+                "fuse"
+                if getattr(cfg, "pipeline", None)
+                and cfg.pipeline.seed
+                and getattr(cfg.rclone, "fuse", None) is not None
+                else "none"
+            ),
             "mount": _redact(getattr(cfg.rclone.fuse, "mount", "")),
             "mount_unsorted": _redact(getattr(cfg.rclone.fuse, "mount_unsorted", "")),
             "reinject_delay_seconds": int(getattr(cfg, "fuse_reinject_delay_seconds", 0) or 0),
@@ -225,13 +248,15 @@ def summarize(cfg: AppConfig, config_path: Path | str) -> dict:
     path = Path(str(config_path))
     explicit, alias_unknown, raw = _explicit_keys(path)
     known, unknown = _classify_keys(explicit, AppConfig)
-    model_fields = len(model_leaves(AppConfig))
+    model_fields = len(_public_leaves(AppConfig))
     by_section: dict[str, int] = {}
     for key in raw:
         if key:
             by_section[key[0]] = by_section.get(key[0], 0) + 1
     shape = _shape(cfg)
     resolved = _redact(cfg)
+    for name in _INTERNAL_SECTIONS:
+        resolved.pop(name, None)
     digest_src = json.dumps(
         {"shape": shape, "resolved": resolved},
         sort_keys=True,

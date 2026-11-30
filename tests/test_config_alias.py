@@ -137,15 +137,45 @@ def test_watch_without_path_is_refused(watch: dict):
         normalize_config(raw)
 
 
-@pytest.mark.parametrize("link", ["acquire", "transfer", "seed"])
-def test_disabled_link_is_refused(link: str):
+@pytest.mark.parametrize("link", ["transfer", "seed"])
+def test_disabled_link_sets_the_pipeline_flag(link: str):
     raw = _raw()
     section = {"enabled": False}
     if link == "seed":
         section["path"] = "/mnt/fuse"
     raw[link] = section
 
-    with pytest.raises(ValueError, match="not available yet"):
+    data = normalize_config(raw).data
+
+    assert data["pipeline"][link] is False
+    if link == "seed":
+        # Keys survive the switch: re-enabling is a flip, not a rewrite.
+        assert data["rclone"]["fuse"]["mount"] == "/mnt/fuse"
+
+
+@pytest.mark.parametrize("link", ["transfer", "seed"])
+def test_provider_none_disables_the_link(link: str):
+    raw = _raw()
+    raw.setdefault(link, {})["provider"] = "none"
+
+    data = normalize_config(raw).data
+
+    assert data["pipeline"][link] is False
+
+
+def test_disabling_acquire_is_refused_for_now():
+    raw = _raw()
+    raw["acquire"] = {"enabled": False}
+
+    with pytest.raises(ValueError, match=r"\[acquire\]"):
+        normalize_config(raw)
+
+
+def test_switch_and_provider_must_agree():
+    raw = _raw()
+    raw["transfer"] = {"enabled": False, "provider": "rclone"}
+
+    with pytest.raises(ValueError, match="contradicts provider"):
         normalize_config(raw)
 
 

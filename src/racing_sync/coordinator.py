@@ -486,7 +486,7 @@ class Coordinator(
         """
         try:
             ssd_dirs = [str(self.rt.storage.save_path), str(self.rt.storage.path)]
-            fuse = [str(self.rt.seed.mount), str(self.rt.seed.mount_unsorted)]
+            fuse = [str(path) for path in self.rt.seed.mounts()]
         except Exception:
             return
 

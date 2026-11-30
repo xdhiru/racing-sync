@@ -569,16 +569,17 @@ def _check_config_env(cfg: AppConfig, *, probe_writes: bool = True) -> list[str]
         except Exception:
             pass
     # rclone binary: absolute + exists + executable (PATH hijack / typo guard).
-    try:
-        b = Path(str(rt.transfer.binary))
-        if not b.is_absolute():
-            problems.append(f"rclone.binary must be absolute: {b}")
-        elif not b.exists():
-            problems.append(f"rclone.binary not found: {b}")
-        elif not os.access(str(b), os.X_OK):
-            problems.append(f"rclone.binary not executable: {b}")
-    except Exception as e:  # noqa: BLE001
-        problems.append(f"rclone.binary check failed: {e}")
+    if rt.transfer.enabled:
+        try:
+            b = Path(str(rt.transfer.binary))
+            if not b.is_absolute():
+                problems.append(f"rclone.binary must be absolute: {b}")
+            elif not b.exists():
+                problems.append(f"rclone.binary not found: {b}")
+            elif not os.access(str(b), os.X_OK):
+                problems.append(f"rclone.binary not executable: {b}")
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"rclone.binary check failed: {e}")
     # Cross-field advisories: fatal overlap is rejected by the AppConfig
     # validator; these stay check-config warnings (existing setups keep
     # running, new ones get told).
@@ -657,6 +658,8 @@ def _check_config_warnings(cfg: AppConfig) -> list[str]:
         ("rclone.fuse.mount", rt.seed.mount),
         ("rclone.fuse.mount_unsorted", rt.seed.mount_unsorted),
     ):
+        if val is None:
+            continue
         try:
             p = Path(str(val))
         except Exception:
