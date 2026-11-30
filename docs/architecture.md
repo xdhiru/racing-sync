@@ -13,6 +13,7 @@ src/racing_sync/
   config_alias.py     New capability-chain spellings -> the internal schema
   config_disposition.py  Every field's fate (keep/rename/deprecate) + path helpers
   config_summary.py   Read-only, secret-free summary + digest of a config
+  chain.py            The pipeline as links: stage handoffs, derived terminal edges
   runtime.py          Typed read-through capability views over AppConfig
   composition.py      Builds the client/indexer/blob/watch graph for a config
   capabilities.py     Protocols the orchestrator depends on
@@ -143,6 +144,17 @@ an optional timeout, used for the fuse probe and the SSD free-space probe.
 
 **Memory.** One throttled sweep (`_sweep_runtime_maps`) prunes expired memos
 and caps every per-hash map.
+
+## Chain
+
+The pipeline is a chain of links (`observe → acquire → stage → transfer →
+seed`), resolved by `chain.py` from the config. Today's deployment runs all
+of them; disabling `[transfer]` or `[seed]` ends the chain earlier. The
+download and move completion points ask the chain for the next state, and
+the state table tolerates the derived terminal edges (`DOWNLOADING → DONE`,
+`MOVING → DONE`). Startup drains rows left in a disabled link before the
+SSD ledger is rebuilt; cleanup is skipped while no seed path exists, since
+its content-secured proof follows that link.
 
 ## SSD budget and batching
 
