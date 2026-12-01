@@ -55,14 +55,20 @@ restart is the upgrade (re-run `pip install -r requirements.txt` only when
 dependencies change):
 
 ```bash
-cp config.example.toml config.toml
-# edit config.toml
-python3 run.py check-config --config config.toml
+python3 run.py config init --config config.toml   # one-screen single-box starter
+# edit the hosts and three paths
+python3 run.py check-config --config config.toml  # chain report + pre-flight
 python3 run.py run --config config.toml
 # Ctrl+C stops gracefully
 ```
 
 There is no config reload: restart the daemon after editing `config.toml`.
+`config.example.toml` remains the full reference for every key.
+
+Optional features are one flip away: `config enable indexers` (or `watch`,
+`telegram`, `api`, `cleanup`, `logging_sink`) appends its documented block,
+`config disable <feature>` turns it off and keeps the keys, and
+`config explain <feature>` prints the short version.
 
 `python3 run.py config summary --config config.toml` prints what the file
 resolves to — single-box or split topology, which capabilities are active,

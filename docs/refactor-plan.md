@@ -1,9 +1,9 @@
 # Refactor plan — capability chain, explicit modules, smaller config
 
-Status: **phase 4 landed (2026-12-01); next: phase 5.** Phases 0–4 are in
-`dev`: the config layer, the composition root, the chain engine, and the
-`external`/`local`/`local_move`/`seed.existing` providers with single-box
-ownership.
+Status: **phase 5 landed (2026-12-01); next: phase 6.** Phases 0–5 are in
+`dev`: the config layer, the composition root, the chain engine, the new
+providers with single-box ownership, and the config UX (starter, toggles,
+explain, chain report).
 
 ## Goal
 
@@ -201,7 +201,7 @@ content-secured verifier follows the seed link.
 | 2 ✅ | Composition root + capability Protocols + factories | split/full behaves byte-identically; consumers no longer touch raw sections |
 | 3 ✅ | Chain engine: derived transitions, checkpoint resolver, stranded-row drain, ledger, cleanup verifier, providers for today's behavior (`rclone`, `path`, `auto`, `none`) | shape matrix green for split/full/move-only/download-only |
 | 4 ✅ | New providers/shapes: `local` acquire, `local_move`, `external`, `seed.existing` | single-box, HDD/NAS, out-of-band and adopt-only shapes green |
-| 5 | UX: `config init/enable/disable/explain`, check-config chain report, docs/examples rewritten around the single-box default | a new user can go from zero to running with one screen of config |
+| 5 ✅ | UX: `config init/enable/disable/explain`, check-config chain report, docs/examples rewritten around the single-box default | a new user can go from zero to running with one screen of config |
 | 6 | Retirement: stop documenting duplicate precedence keys; adopt/seed-only; remove dead shims | docs match schema; adapters still accept old files |
 
 Ordering constraints (do not reorder): composition root and the single-client factory
@@ -263,6 +263,13 @@ editor, and throughput tuning (still separate from this refactor).
   swapped late (tests, pre-start edits) always answers. Services are built in
   one root and started by the coordinator as before; `load_config`/`cli`
   behaviour is untouched.
+- Phase 5 (landed): `config init` writes the single-box starter; `enable`
+  appends the documented block, `disable` flips in place and keeps keys.
+  `check-config` prints the chain (topology/providers/targets/disabled),
+  retired and unknown keys under their written names, and a stranded-row
+  pre-flight from a read-only DB look. `config explain` is the short form;
+  `config migrate` is not needed yet because both spellings load (the alias
+  layer covers renames), so phase 6 decides whether it ever ships.
 - Phase 4 (landed): `local_move` supports `files_from` and whole-tree moves;
   rclone `--include` patterns are refused (no caller uses them) until a pattern
   matcher lands. Its destinations must be absolute and disjoint from staging.
