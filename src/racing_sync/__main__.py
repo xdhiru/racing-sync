@@ -712,7 +712,7 @@ def _load_config(path: Path) -> AppConfig | None:
 
 
 def _cmd_config(args: argparse.Namespace) -> int:
-    """`config <action>` — read-only inspection (scaffolding arrives later)."""
+    """`config <action>` — scaffold, inspect and flip features."""
     action = getattr(args, "config_cmd", None)
     if action == "summary":
         cfg = _load_config(args.config)
@@ -723,6 +723,48 @@ def _cmd_config(args: argparse.Namespace) -> int:
         data = summarize(cfg, args.config)
         print(summary_json(data) if getattr(args, "json", False) else format_summary(data))
         return 0
+
+    from .config_ux import ConfigUxError, explain, init_config, set_enabled
+
+    if action == "init":
+        try:
+            init_config(args.config, force=bool(getattr(args, "force", False)))
+        except ConfigUxError as e:
+            print(f"config init: {e}", file=sys.stderr)
+            return 2
+        print(f"wrote {args.config}")
+        print(f"edit the hosts/paths, then: check-config --config {args.config}")
+        return 0
+
+    if action in ("enable", "disable"):
+        try:
+            changed, missing = set_enabled(args.config, args.feature, action == "enable")
+        except ConfigUxError as e:
+            print(f"config {action}: {e}", file=sys.stderr)
+            return 2
+        if not changed:
+            print(f"{args.feature}: already disabled (no [{args.feature}] section)")
+            return 0
+        if action == "disable":
+            print(f"{args.feature}: disabled (keys kept — re-enabling is a flip)")
+            return 0
+        print(f"{args.feature}: enabled")
+        if missing:
+            print("set before starting: " + ", ".join(missing))
+            try:
+                AppConfig.from_toml(args.config)
+            except Exception as e:
+                print(f"note: the config does not load yet — {e}")
+        return 0
+
+    if action == "explain":
+        try:
+            print(explain(getattr(args, "section", None)))
+        except ConfigUxError as e:
+            print(f"config explain: {e}", file=sys.stderr)
+            return 2
+        return 0
+
     print(f"unknown config action: {action!r}", file=sys.stderr)
     return 2
 
@@ -821,6 +863,25 @@ def main(argv: list[str] | None = None) -> int:
     p_cfg_sum.add_argument("--config", type=Path, required=True)
     p_cfg_sum.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    p_cfg_init = cfg_sub.add_parser("init", help="Write a compact single-box starter")
+    p_cfg_init.add_argument("--config", type=Path, required=True)
+    p_cfg_init.add_argument("--force", action="store_true", help="Overwrite an existing file")
+
+    for _name, _help in (
+        ("enable", "Turn an optional feature on (appends its documented block)"),
+        ("disable", "Turn a feature off, keeping its keys"),
+    ):
+        _p = cfg_sub.add_parser(_name, help=_help)
+        _p.add_argument(
+            "feature",
+            help="One of: "
+            + ", ".join(__import__("racing_sync.config_ux", fromlist=["FEATURES"]).FEATURES),
+        )
+        _p.add_argument("--config", type=Path, required=True)
+
+    p_cfg_explain = cfg_sub.add_parser("explain", help="Explain a config section")
+    p_cfg_explain.add_argument("section", nargs="?")
+
     args = parser.parse_args(argv)
     if args.cmd == "config":
         # `config` actions own their loading (scaffolding must work without an
@@ -832,6 +893,10 @@ def main(argv: list[str] | None = None) -> int:
     rt = Runtime(cfg)
 
     if args.cmd == "check-config":
+        from .config_ux import check_report
+
+        for _line in check_report(cfg, args.config):
+            print(_line)
         problems = _check_config_env(cfg)
         for w in _check_config_warnings(cfg):
             print(f"config warning: {w}")
