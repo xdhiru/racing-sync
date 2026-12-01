@@ -150,18 +150,20 @@ def _shape(cfg: AppConfig) -> dict:
     prow = getattr(cfg, "prowlarr", None)
     acquire: list[str] = []
     _acq = getattr(getattr(cfg, "pipeline", None), "acquire", "auto")
-    external_copy = (_acq if isinstance(_acq, str) else "auto") == "external"
-    if external_copy:
-        acquire.append("external_copy")
-    elif _bool_attr(prow, "enabled") and _bool_attr(cs, "allow_prowlarr_cross_seed"):
-        acquire.append("prowlarr_cross_seed")
-    if not external_copy and _bool_attr(cs, "refetch_public_via_prowlarr"):
-        acquire.append("public_refetch")
+    _acq_provider = _acq if isinstance(_acq, str) else "auto"
     try:
         sftp = getattr(cfg.source, "deluge_sftp", None)
     except Exception:
         sftp = None
-    if not external_copy:
+    if _acq_provider == "external":
+        acquire.append("external_copy")
+    elif _acq_provider == "local":
+        acquire.append("local_client")
+    else:
+        if _bool_attr(prow, "enabled") and _bool_attr(cs, "allow_prowlarr_cross_seed"):
+            acquire.append("prowlarr_cross_seed")
+        if _bool_attr(cs, "refetch_public_via_prowlarr"):
+            acquire.append("public_refetch")
         if _bool_attr(sftp, "enabled"):
             acquire.append("sftp_export")
         elif str(getattr(cfg.source, "type", "")).lower() == "qbittorrent":

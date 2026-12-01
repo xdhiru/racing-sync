@@ -1441,7 +1441,7 @@ class PipelineConfig(BaseModel):
 
     #: Providers this release can run (files choose explicitly; `auto`
     #: keeps the legacy cross-seed/direct-export preference).
-    acquire: Literal["auto", "external"] = "auto"
+    acquire: Literal["auto", "local", "external"] = "auto"
     transfer: Literal["rclone", "none", "external"] = "rclone"
     seed: Literal["path", "none"] = "path"
 
@@ -1557,6 +1557,15 @@ class AppConfig(BaseModel):
         """Links require the settings they run on (fail fast)."""
         link = self.pipeline
         external_acquire = link.acquire == "external"
+        if link.acquire == "local":
+            from .chain import same_client
+
+            if not same_client(getattr(self.source, "host", ""), getattr(self.dest, "host", "")):
+                raise ValueError(
+                    "local acquisition needs [client] and [dest] on the same client "
+                    "(same host:port) — the racing copy IS the staged copy. Use "
+                    'provider = "auto" when the boxes are separate.'
+                )
         if external_acquire and link.transfer == "rclone":
             raise ValueError(
                 "external acquisition means the operator copies the bytes — "

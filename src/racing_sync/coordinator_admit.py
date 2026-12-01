@@ -1073,6 +1073,12 @@ class AdmitMixin:
         if await self._fuse_content_precheck(ts):
             return
 
+        # Single box: the racing client already holds the bytes. Adopt its
+        # own complete entry instead of searching an indexer for a copy.
+        if self.rt.chain.adopts_local:
+            await self._admit_local(ts)
+            return
+
         # Admit-time stop-duplicate (P8): a same-content sibling already
         # past admission owns the SSD bytes — defer to it (recorded, so
         # later windows skip the scan while it is live) instead of a
@@ -1568,6 +1574,37 @@ class AdmitMixin:
         except Exception:
             return False
 
+    async def _admit_local(self, ts: TorrentState) -> None:
+        """Single box: use the racing client's own complete copy as staging.
+
+        No indexer query and no second download. A missing or unfinished
+        copy parks on the retry clock; adoption needs the .torrent bytes,
+        which `_adopt_ssd_entry` tries from memory, the DB, then the live
+        client entry.
+        """
+        try:
+            entries = await self._dest_entries_for([ts.source_infohash])
+        except Exception:
+            entries = []
+        complete = None
+        for entry in entries or []:
+            try:
+                if bool(entry.is_complete()):
+                    complete = entry
+                    break
+            except Exception:
+                continue
+        if complete is not None and await self._adopt_ssd_entry(ts, complete):
+            return
+        self._park_for_indexer_retry(
+            ts,
+            reason=(
+                "local acquisition: the racing client has no complete copy yet"
+                if complete is None
+                else "local acquisition: could not adopt the racing copy yet"
+            ),
+        )
+
     async def _do_waiting_indexer(self, ts: TorrentState) -> None:
         """Wake up from WAITING_INDEXER and re-pick the SSD source.
 
@@ -1648,6 +1685,12 @@ class AdmitMixin:
                 self.store.upsert(ts)
             except Exception:
                 pass
+            return
+
+        # Single box: only the racing client's own complete copy counts;
+        # never fall through to an indexer query it was configured to skip.
+        if self.rt.chain.adopts_local:
+            await self._admit_local(ts)
             return
 
         # Watch rows (manual drops) carry their own bytes: the racing
