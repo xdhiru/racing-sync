@@ -57,7 +57,7 @@ _PROVIDERS: dict[str, tuple[str, ...]] = {
 _SUPPORTED: dict[str, tuple[str, ...]] = {
     "acquire": ("auto", "local", "external"),
     "transfer": ("rclone", "none", "external"),
-    "seed": ("path", "none"),
+    "seed": ("path", "existing", "none"),
 }
 
 #: What an unset provider means (legacy behaviour).

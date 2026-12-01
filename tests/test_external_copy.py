@@ -42,7 +42,7 @@ def _blob() -> bytes:
     )
 
 
-def _config(tmp_path: Path, *, timeout: int = 43200) -> AppConfig:
+def _config(tmp_path: Path, *, timeout: int = 43200, seed_provider: str = "path") -> AppConfig:
     fuse = tmp_path / "fuse"
     fuse_u = tmp_path / "fuse-unsorted"
     ssd = tmp_path / "ssd"
@@ -72,6 +72,7 @@ provider = "external"
 provider = "external"
 
 [seed]
+provider = "{seed_provider}"
 path = "{fuse.as_posix()}"
 unsorted_path = "{fuse_u.as_posix()}"
 manual_move_check_seconds = 1800
@@ -82,9 +83,17 @@ manual_move_timeout_seconds = {timeout}
     return AppConfig.from_toml(path)
 
 
-def _scaffold(tmp_path: Path, *, state=State.NEW, fuse_files=(), stamp=None, timeout=43200):
+def _scaffold(
+    tmp_path: Path,
+    *,
+    state=State.NEW,
+    fuse_files=(),
+    stamp=None,
+    timeout=43200,
+    seed_provider="path",
+):
     (tmp_path / "fuse").mkdir(exist_ok=True)
-    cfg = _config(tmp_path, timeout=timeout)
+    cfg = _config(tmp_path, timeout=timeout, seed_provider=seed_provider)
     for rel, size in fuse_files:
         target = Path(cfg.rclone.fuse.mount) / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -192,5 +201,42 @@ async def test_expired_incomplete_copy_fails_with_the_detail(tmp_path):
         row = store.get(H)
         assert row.state == State.FAILED
         assert "incomplete" in row.last_error
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_adopt_only_finishes_without_adding_an_entry(tmp_path):
+    coord, store = _scaffold(
+        tmp_path,
+        fuse_files=[(EP1, SIZE1), (EP2, SIZE2)],
+        seed_provider="existing",
+    )
+    try:
+        coord._admit_resolved = AsyncMock()
+        await coord._do_new(store.get(H))
+
+        coord._admit_resolved.assert_not_called()
+        coord._pick_and_admit.assert_not_called()
+        row = store.get(H)
+        assert row.state == State.DONE
+        assert row.cross_seed_source == "existing"
+    finally:
+        store.close()
+
+
+@pytest.mark.anyio
+async def test_adopt_only_disables_the_janitor(tmp_path):
+    coord, store = _scaffold(
+        tmp_path,
+        fuse_files=[(EP1, SIZE1), (EP2, SIZE2)],
+        seed_provider="existing",
+    )
+    try:
+        coord.source_client = AsyncMock()
+
+        await coord._maybe_cleanup_source()
+
+        coord.source_client.list_torrents.assert_not_called()
     finally:
         store.close()

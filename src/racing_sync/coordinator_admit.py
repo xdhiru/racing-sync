@@ -645,6 +645,38 @@ class AdmitMixin:
             )
             return "absent", None, 0, 0
 
+    def _admit_existing_library(self, ts: TorrentState, blob: bytes) -> None:
+        """Adopt-only: the content is already seeded at the seed path.
+
+        No client entry is added (the library already seeds it); the row is
+        done once its bytes are verified there.
+        """
+        ts.cross_seed_infohash = (ts.source_infohash or "").lower()
+        try:
+            if (ts.cross_seed_source or "") not in WATCH_ORIGIN_LABELS:
+                ts.cross_seed_source = "existing"
+        except Exception:
+            ts.cross_seed_source = "existing"
+        ts.cross_seed_blob = bytes(blob)
+        ts._blob = bytes(blob)
+        ts.fuse_wait_first_at = None
+        try:
+            ts.save_path = str(self.rt.seed.mount or "")
+        except Exception:
+            pass
+        if int(ts.total_bytes or 0) <= 0:
+            try:
+                ts.total_bytes = sum(
+                    int(_sz or 0) for _n, _sz in (self._expected_fuse_files(blob) or [])
+                )
+            except Exception:
+                pass
+        log.info(
+            "adopting existing library copy of %s (seed provider = existing); no entry added",
+            (ts.source_name or "")[:60],
+        )
+        self.transition(ts, State.DONE)
+
     async def _admit_fuse_existing(self, ts: TorrentState, blob: bytes) -> None:
         """Admit a row whose bytes are already verified on the fuse target.
 
@@ -807,7 +839,10 @@ class AdmitMixin:
         except Exception:
             status, found, present, total = "absent", None, 0, 0
         if status == "present" and found:
-            await self._admit_fuse_existing(ts, found)
+            if self.rt.chain.adds_seed_entry:
+                await self._admit_fuse_existing(ts, found)
+            else:
+                self._admit_existing_library(ts, found)
             return True
         if status == "partial":
             if self._park_fuse_content_wait(ts, present=present, total=total):

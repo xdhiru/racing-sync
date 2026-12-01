@@ -254,3 +254,25 @@ def test_external_needs_a_seed_path_and_wait(tmp_path: Path):
     )
     with pytest.raises(ValueError, match="manual-move window"):
         _load(tmp_path, no_wait)
+
+
+_EXISTING = _EXTERNAL.replace(
+    '[seed]\npath = "/mnt/fuse"',
+    '[seed]\nprovider = "existing"\npath = "/mnt/fuse"',
+)
+
+
+def test_existing_seed_is_adopt_only(tmp_path: Path):
+    cfg = _load(tmp_path, _EXISTING)
+    chain = Chain.from_config(cfg)
+
+    assert chain.seed == "existing"
+    assert chain.seeds is True
+    assert chain.adds_seed_entry is False
+    assert chain.after_move() is State.DONE
+
+
+def test_existing_seed_needs_external_acquisition(tmp_path: Path):
+    text = _EXISTING.replace('[acquire]\nprovider = "external"', '[acquire]\nprovider = "auto"')
+    with pytest.raises(ValueError, match="adopt-only"):
+        _load(tmp_path, text)

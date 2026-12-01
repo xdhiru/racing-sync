@@ -139,15 +139,15 @@ class CleanupMixin:
         cfg = getattr(self.rt.cleanup, "config", None)
         if cfg is None or not getattr(cfg, "enabled", False):
             return
-        if not self.rt.chain.seeds:
-            # The janitor deletes VPS1 only after proving the content is
-            # secured on the seed target. Without a seed link there is no
-            # such proof yet (a remote verifier is a later phase).
+        if not self.rt.chain.adds_seed_entry:
+            # The janitor proves the content is secured by re-verifying our
+            # own seed entry. Without that link (disabled or adopt-only)
+            # there is no such proof yet (a remote verifier is a later phase).
             if not getattr(self, "_cleanup_seed_skip_logged", False):
                 self._cleanup_seed_skip_logged = True
                 log.warning(
-                    "cleanup janitor skipped: the seed link is disabled — "
-                    "completed content cannot be verified on a seed path yet"
+                    "cleanup janitor skipped: no seeding entry is added by this "
+                    "chain — completed content cannot be verified yet"
                 )
             return
         try:

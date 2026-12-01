@@ -1443,7 +1443,7 @@ class PipelineConfig(BaseModel):
     #: keeps the legacy cross-seed/direct-export preference).
     acquire: Literal["auto", "local", "external"] = "auto"
     transfer: Literal["rclone", "none", "external"] = "rclone"
-    seed: Literal["path", "none"] = "path"
+    seed: Literal["path", "existing", "none"] = "path"
 
 
 class AppConfig(BaseModel):
@@ -1581,6 +1581,12 @@ class AppConfig(BaseModel):
             raise ValueError(
                 "the seed link is enabled but no seed path is configured — "
                 "set [seed] path, or disable the link"
+            )
+        if link.seed == "existing" and link.acquire != "external":
+            raise ValueError(
+                "seed provider 'existing' means the content is already at the "
+                'seed path — set [acquire] provider = "external" (adopt-only) '
+                "so nothing downloads a second copy"
             )
         if link.seed == "path" and link.transfer == "none" and not external_acquire:
             raise ValueError(

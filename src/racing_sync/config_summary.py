@@ -251,6 +251,15 @@ def _shape(cfg: AppConfig) -> dict:
     }
 
 
+def _seed_provider(cfg: AppConfig) -> str:
+    """fuse (shows as "fuse" for continuity) | existing | none."""
+    raw = getattr(cfg.pipeline, "seed", None) if hasattr(cfg, "pipeline") else None
+    provider = provider_name(raw, "path")
+    if getattr(cfg.rclone, "fuse", None) is None:
+        return "none"
+    return "fuse" if provider == "path" else ("existing" if provider == "existing" else "none")
+
+
 def summarize(cfg: AppConfig, config_path: Path | str) -> dict:
     """Canonical summary document for one loaded config."""
     path = Path(str(config_path))
