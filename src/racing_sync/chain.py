@@ -25,7 +25,7 @@ def provider_name(value: object, default: str) -> str:
     return value if isinstance(value, str) else default
 
 
-def _same_client(source_host: object, dest_host: object) -> bool:
+def same_client(source_host: object, dest_host: object) -> bool:
     """True when both WebUI origins address the same client instance."""
 
     def key(raw: object) -> tuple[str, int] | None:
@@ -71,11 +71,11 @@ class Chain:
         return cls(
             observe=("source", "dest", *(("watch",) if watch_on else ())),
             acquire=acquire,
-            stage=acquire == "auto",
+            stage=acquire in ("auto", "local"),
             transfer=transfer if has_remote or transfer != "rclone" else "none",
             seed=seed if has_fuse or seed != "path" else "none",
             cleanup=bool(cleanup),
-            single_box=_same_client(
+            single_box=same_client(
                 getattr(cfg.source, "host", "") if hasattr(cfg, "source") else "",
                 getattr(cfg.dest, "host", "") if hasattr(cfg, "dest") else "",
             ),
@@ -84,6 +84,11 @@ class Chain:
     @property
     def downloads(self) -> bool:
         return self.acquire == "auto" and self.stage
+
+    @property
+    def adopts_local(self) -> bool:
+        """The racing client's own complete entry is the staged copy."""
+        return self.acquire == "local"
 
     @property
     def waits_for_copy(self) -> bool:

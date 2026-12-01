@@ -55,7 +55,7 @@ _PROVIDERS: dict[str, tuple[str, ...]] = {
 
 #: Providers this release can actually run per link.
 _SUPPORTED: dict[str, tuple[str, ...]] = {
-    "acquire": ("auto", "external"),
+    "acquire": ("auto", "local", "external"),
     "transfer": ("rclone", "none", "external"),
     "seed": ("path", "none"),
 }
