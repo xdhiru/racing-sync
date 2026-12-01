@@ -148,13 +148,26 @@ and caps every per-hash map.
 ## Chain
 
 The pipeline is a chain of links (`observe → acquire → stage → transfer →
-seed`), resolved by `chain.py` from the config. Today's deployment runs all
-of them; disabling `[transfer]` or `[seed]` ends the chain earlier. The
-download and move completion points ask the chain for the next state, and
-the state table tolerates the derived terminal edges (`DOWNLOADING → DONE`,
-`MOVING → DONE`). Startup drains rows left in a disabled link before the
-SSD ledger is rebuilt; cleanup is skipped while no seed path exists, since
-its content-secured proof follows that link.
+seed`), resolved by `chain.py` from the config. Each link has providers:
+
+- acquire: `auto` (indexer/export pick), `local` (one box: the racing copy
+  is the staged copy), `external` (the operator copies; the daemon verifies
+  at the seed path and never downloads);
+- transfer: `rclone`, `none`, `external` (operator moves the bytes);
+- seed: `path` (re-add an entry at the seed path), `existing` (adopt an
+  already-seeded library, add nothing), `none`.
+
+Today's two-box deployment runs all of them; a shorter chain ends earlier.
+The download and move completion points ask the chain for the next state,
+and the state table tolerates the derived terminal edges (`DOWNLOADING →
+DONE`, `MOVING → DONE`). Startup drains rows left in a disabled link before
+the SSD ledger is rebuilt. Cleanup is skipped while the chain adds no seed
+entry of its own (disabled or adopt-only), since its content-secured proof
+follows that entry.
+
+On one box (source and dest origins equal) the seeded entries are excluded
+from intake and from cleanup grouping, so the janitor can only ever remove
+the racing copy.
 
 ## SSD budget and batching
 
