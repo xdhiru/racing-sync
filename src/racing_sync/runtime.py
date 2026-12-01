@@ -160,7 +160,19 @@ class TransferSettings:
 
     @property
     def enabled(self) -> bool:
+        if self.provider == "local_move":
+            return self.local_path is not None
         return self.provider == "rclone" and self._cfg.rclone.remote is not None
+
+    @property
+    def local_path(self) -> Path | None:
+        pipeline = getattr(self._cfg, "pipeline", None)
+        return getattr(pipeline, "local_path", None)
+
+    @property
+    def local_unsorted(self) -> Path | None:
+        pipeline = getattr(self._cfg, "pipeline", None)
+        return getattr(pipeline, "local_unsorted", None)
 
     @property
     def binary(self) -> Path:
@@ -172,11 +184,15 @@ class TransferSettings:
 
     @property
     def remote_default(self) -> str:
+        if self.provider == "local_move":
+            return str(self.local_path) if self.local_path is not None else ""
         remote = self._cfg.rclone.remote
         return remote.default if remote is not None else ""
 
     @property
     def remote_unsorted(self) -> str:
+        if self.provider == "local_move":
+            return str(self.local_unsorted) if self.local_unsorted is not None else ""
         remote = self._cfg.rclone.remote
         return remote.unsorted if remote is not None else ""
 

@@ -56,7 +56,7 @@ _PROVIDERS: dict[str, tuple[str, ...]] = {
 #: Providers this release can actually run per link.
 _SUPPORTED: dict[str, tuple[str, ...]] = {
     "acquire": ("auto", "local", "external"),
-    "transfer": ("rclone", "none", "external"),
+    "transfer": ("rclone", "local_move", "none", "external"),
     "seed": ("path", "existing", "none"),
 }
 
@@ -185,7 +185,7 @@ def _resolve_links(data: dict[str, Any]) -> None:
     Other names are recognised and refused with the phase that will add them,
     so a typo never reads as "unknown key, ignored".
     """
-    pipeline: dict[str, str] = {}
+    pipeline: dict[str, Any] = {}
     for link in ("acquire", "transfer", "seed"):
         section = data.get(link)
         if section is None:
@@ -211,6 +211,20 @@ def _resolve_links(data: dict[str, Any]) -> None:
                 f"[{link}].enabled = true contradicts provider = 'none' — "
                 "drop the provider or set enabled = false"
             )
+
+        if link == "transfer":
+            local_path = section.pop("path", None)
+            local_unsorted = section.pop("unsorted", None)
+            if (local_path is not None or local_unsorted is not None) and (
+                provider or _DEFAULT_PROVIDER["transfer"]
+            ) != "local_move":
+                raise ValueError(
+                    '[transfer].path/[transfer].unsorted only apply to provider = "local_move"'
+                )
+            if local_path is not None:
+                pipeline["local_path"] = local_path
+            if local_unsorted is not None:
+                pipeline["local_unsorted"] = local_unsorted
 
         if link == "acquire":
             if enabled is False:

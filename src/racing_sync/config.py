@@ -1442,8 +1442,39 @@ class PipelineConfig(BaseModel):
     #: Providers this release can run (files choose explicitly; `auto`
     #: keeps the legacy cross-seed/direct-export preference).
     acquire: Literal["auto", "local", "external"] = "auto"
-    transfer: Literal["rclone", "none", "external"] = "rclone"
+    transfer: Literal["rclone", "local_move", "none", "external"] = "rclone"
     seed: Literal["path", "existing", "none"] = "path"
+    #: local_move destination roots (absolute; disjoint from storage).
+    local_path: Path | None = None
+    local_unsorted: Path | None = None
+
+    @field_validator("local_path", "local_unsorted", mode="before")
+    @classmethod
+    def _empty_path_is_none(cls, v: object) -> object:
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    @model_validator(mode="after")
+    def _local_move_needs_a_destination(self) -> PipelineConfig:
+        if self.transfer != "local_move":
+            return self
+        if self.local_path is None:
+            raise ValueError(
+                '[transfer].path is required when provider = "local_move" '
+                "(the local/NAS directory finished content is moved to)"
+            )
+        if self.local_unsorted is None:
+            self.local_unsorted = Path(str(self.local_path).rstrip("/\\")) / "unsorted"
+        for label, raw in (("path", self.local_path), ("unsorted", self.local_unsorted)):
+            text = str(raw).replace("\\", "/")
+            try:
+                absolute = Path(str(raw)).is_absolute() or text.startswith("/")
+            except Exception:
+                absolute = False
+            if not absolute:
+                raise ValueError(f"[transfer].{label} must be an absolute local path, got: {raw}")
+        return self
 
 
 class AppConfig(BaseModel):
@@ -1693,10 +1724,25 @@ class AppConfig(BaseModel):
             except Exception:
                 return ""
 
+        def _nested(inner: str, outer: str) -> bool:
+            a, b = inner.replace("\\", "/"), outer.replace("\\", "/")
+            return bool(a and b and (a == b or a.startswith(b + "/")))
+
         try:
             ssd_dirs = [_norm(self.ssd.path), _norm(self.dest.save_path)]
         except Exception:
             return self
+        local_dirs = []
+        for raw in (self.pipeline.local_path, self.pipeline.local_unsorted):
+            if raw is not None:
+                local_dirs.append(_norm(raw))
+        for dest in local_dirs:
+            for s in ssd_dirs:
+                if _nested(dest, s) or _nested(s, dest):
+                    raise ValueError(
+                        f"storage overlap: local_move destination {dest!r} overlaps "
+                        f"SSD path {s!r} — use disjoint trees"
+                    )
         if self.rclone.fuse is None:
             return self
         try:
@@ -1705,7 +1751,7 @@ class AppConfig(BaseModel):
             return self
         for s in ssd_dirs:
             for fm in fuse:
-                if s and fm and (s == fm or s.startswith(fm + "/") or fm.startswith(s + "/")):
+                if _nested(s, fm) or _nested(fm, s):
                     raise ValueError(
                         f"storage overlap: SSD path {s!r} overlaps fuse mount "
                         f"{fm!r} — use disjoint paths ([ssd].path/[dest].save_path "
