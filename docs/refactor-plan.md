@@ -1,8 +1,9 @@
 # Refactor plan — capability chain, explicit modules, smaller config
 
-Status: **phase 4 in progress (2026-12-01).** Phases 0–3 are in `dev`, and
-phase 4 has landed `external` acquisition, `local` acquisition,
-`seed.existing` and single-box ownership; `local_move` remains.
+Status: **phase 4 landed (2026-12-01); next: phase 5.** Phases 0–4 are in
+`dev`: the config layer, the composition root, the chain engine, and the
+`external`/`local`/`local_move`/`seed.existing` providers with single-box
+ownership.
 
 ## Goal
 
@@ -177,8 +178,10 @@ acquisition adopts the racing client's own complete entry (one box, no second
 copy); `seed.existing` adopts an already-seeded library without adding an
 entry (and disables cleanup, which needs an entry of ours to re-verify).
 Single-box topology is derived from the client origins: seeded entries are
-excluded from intake and never grouped for deletion. `local_move` (a local
-directory/NAS instead of rclone) is the remaining provider.
+excluded from intake and never grouped for deletion. `local_move` moves staged
+bytes to a mounted local directory/NAS with copy-verify-rename-then-delete (a
+crash re-runs safely; a size conflict, escape or unmounted target fails with
+both copies intact), and its destinations must be disjoint from staging.
 
 As landed in phase 3: `chain.Chain` resolves the links from `[pipeline]` (set by
 the alias layer from `[transfer]`/`[seed]` switches). Download and move completion
@@ -197,7 +200,7 @@ content-secured verifier follows the seed link.
 | 1 ✅ | Config layer: module models, `enabled` tri-state, renames, legacy adapter, deprecations, exhaustive disposition registry | every old key accepted; one warning per retired key; `AppConfig` facade unchanged for callers |
 | 2 ✅ | Composition root + capability Protocols + factories | split/full behaves byte-identically; consumers no longer touch raw sections |
 | 3 ✅ | Chain engine: derived transitions, checkpoint resolver, stranded-row drain, ledger, cleanup verifier, providers for today's behavior (`rclone`, `path`, `auto`, `none`) | shape matrix green for split/full/move-only/download-only |
-| 4 ◐ | New providers/shapes: `local` acquire, `local_move`, `external`, `seed.existing` | single-box, out-of-band and adopt-only green; `local_move` (HDD/NAS) pending |
+| 4 ✅ | New providers/shapes: `local` acquire, `local_move`, `external`, `seed.existing` | single-box, HDD/NAS, out-of-band and adopt-only shapes green |
 | 5 | UX: `config init/enable/disable/explain`, check-config chain report, docs/examples rewritten around the single-box default | a new user can go from zero to running with one screen of config |
 | 6 | Retirement: stop documenting duplicate precedence keys; adopt/seed-only; remove dead shims | docs match schema; adapters still accept old files |
 
@@ -260,3 +263,8 @@ editor, and throughput tuning (still separate from this refactor).
   swapped late (tests, pre-start edits) always answers. Services are built in
   one root and started by the coordinator as before; `load_config`/`cli`
   behaviour is untouched.
+- Phase 4 (landed): `local_move` supports `files_from` and whole-tree moves;
+  rclone `--include` patterns are refused (no caller uses them) until a pattern
+  matcher lands. Its destinations must be absolute and disjoint from staging.
+  Cleanup is skipped whenever the chain adds no seed entry (disabled or
+  adopt-only) — a remote verifier is still a later phase.
