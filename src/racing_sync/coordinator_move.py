@@ -37,7 +37,9 @@ from .coordinator_errors import (
 )
 from .coordinator_paths import _safe_ssd_join, left_on_disk_many
 from .io_bounds import rpc
+from .local_transfer import LocalMoveError, LocalMoveTimeout, move_local_to_local
 from .rclone_ops import (
+    RcloneTimeoutError,
     _tree_key,
     move_local_to_remote,
     rclone_progress_map,
@@ -2441,7 +2443,7 @@ class MoveMixin:
             if files_from is not None:
                 preview = ", ".join(files_from[:3]) + ("…" if len(files_from) > 3 else "")
                 log.info(
-                    "rclone move %s -> %s (files=%d, e.g. %s)",
+                    "move %s -> %s (files=%d, e.g. %s)",
                     local,
                     remote,
                     len(files_from),
@@ -2449,7 +2451,7 @@ class MoveMixin:
                 )
             else:
                 log.info(
-                    "rclone move %s -> %s (include=%s, extra=%s)", local, remote, include, extra
+                    "move %s -> %s (include=%s, extra=%s)", local, remote, include, extra
                 )
             # RcloneTimeoutError propagates: the child is terminated and the
             # source tree intact, so callers park the row for retry (never
@@ -2484,15 +2486,31 @@ class MoveMixin:
                         _trees.pop(_k, None)
             except Exception:
                 pass
-            res = await move_local_to_remote(
-                self.cfg,
-                local,
-                remote,
-                include=include,
-                files_from=files_from,
-                extra=extra,
-                progress=True,
-            )
+            if self.rt.transfer.provider == "local_move":
+                if include:
+                    raise LocalMoveError(
+                        "local_move does not support include patterns yet; "
+                        'use provider = "rclone" for filtered moves'
+                    )
+                try:
+                    res = await move_local_to_local(
+                        local,
+                        Path(remote),
+                        files_from=files_from,
+                        timeout=self.rt.transfer.timeout_seconds,
+                    )
+                except LocalMoveTimeout as e:
+                    raise RcloneTimeoutError(str(e)) from None
+            else:
+                res = await move_local_to_remote(
+                    self.cfg,
+                    local,
+                    remote,
+                    include=include,
+                    files_from=files_from,
+                    extra=extra,
+                    progress=True,
+                )
             if not res.ok:
                 err = res.stderr.strip()
                 # Headline first: rclone puts the summary up top and the

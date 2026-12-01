@@ -200,7 +200,7 @@ def test_unknown_provider_is_refused(link: str, provider: str):
 
 @pytest.mark.parametrize(
     ("link", "provider"),
-    [("acquire", "cross_seed"), ("transfer", "local_move")],
+    [("acquire", "cross_seed")],
 )
 def test_known_but_unimplemented_provider_is_refused(link: str, provider: str):
     raw = _raw()

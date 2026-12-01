@@ -216,8 +216,8 @@ def _shape(cfg: AppConfig) -> dict:
                 "rclone",
             ),
             "binary": _redact(getattr(cfg.rclone, "binary", "")),
-            "remote_default": str(getattr(cfg.rclone.remote, "default", "")),
-            "remote_unsorted": str(getattr(cfg.rclone.remote, "unsorted", "")),
+            "remote_default": _transfer_targets(cfg)[0],
+            "remote_unsorted": _transfer_targets(cfg)[1],
             "max_concurrent_moves": int(getattr(cfg.rclone, "max_concurrent_moves", 0) or 0),
             "move_timeout_seconds": float(getattr(cfg.rclone, "move_timeout_seconds", 0) or 0),
         },
@@ -249,6 +249,24 @@ def _shape(cfg: AppConfig) -> dict:
             "logging_sink": _bool_attr(getattr(cfg, "logging_sink", None), "enabled"),
         },
     }
+
+
+def _transfer_targets(cfg: AppConfig) -> tuple[str, str]:
+    """(sorted, unsorted) destination strings for the configured provider."""
+    pipeline = getattr(cfg, "pipeline", None)
+    provider = provider_name(getattr(pipeline, "transfer", None) if pipeline else None, "rclone")
+    if provider == "local_move":
+        local = getattr(pipeline, "local_path", None) if pipeline else None
+        unsorted = getattr(pipeline, "local_unsorted", None) if pipeline else None
+        return (
+            str(local) if local is not None else "",
+            str(unsorted) if unsorted is not None else "",
+        )
+    remote = getattr(cfg.rclone, "remote", None)
+    return (
+        str(getattr(remote, "default", "") or "") if remote is not None else "",
+        str(getattr(remote, "unsorted", "") or "") if remote is not None else "",
+    )
 
 
 def _seed_provider(cfg: AppConfig) -> str:

@@ -569,7 +569,7 @@ def _check_config_env(cfg: AppConfig, *, probe_writes: bool = True) -> list[str]
         except Exception:
             pass
     # rclone binary: absolute + exists + executable (PATH hijack / typo guard).
-    if rt.transfer.enabled:
+    if rt.transfer.provider == "rclone":
         try:
             b = Path(str(rt.transfer.binary))
             if not b.is_absolute():
@@ -584,7 +584,10 @@ def _check_config_env(cfg: AppConfig, *, probe_writes: bool = True) -> list[str]
     # validator; these stay check-config warnings (existing setups keep
     # running, new ones get told).
     try:
-        if rt.transfer.remote_default == rt.transfer.remote_unsorted:
+        if (
+            rt.transfer.provider == "rclone"
+            and rt.transfer.remote_default == rt.transfer.remote_unsorted
+        ):
             problems.append(
                 "rclone.remote.default == rclone.remote.unsorted "
                 f"({rt.transfer.remote_default!r}): movies and unsorted "
