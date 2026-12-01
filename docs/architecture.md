@@ -39,6 +39,7 @@ src/racing_sync/
   recovery.py         Startup reconciler
   forget.py           Abandon-torrent off-switch
   rclone_ops.py       rclone subprocess wrapper (timeouts, kill/reap)
+  local_transfer.py   verified move to a mounted local dir/NAS (local_move)
   io_bounds.py        RPC/thread deadlines and chunking
   safety.py           Delete guards, daemon lock, reset refusals
   sftp_source.py      Pooled .torrent export over SFTP
@@ -153,7 +154,8 @@ seed`), resolved by `chain.py` from the config. Each link has providers:
 - acquire: `auto` (indexer/export pick), `local` (one box: the racing copy
   is the staged copy), `external` (the operator copies; the daemon verifies
   at the seed path and never downloads);
-- transfer: `rclone`, `none`, `external` (operator moves the bytes);
+- transfer: `rclone`, `local_move` (a mounted directory/NAS),
+  `none`, `external` (operator moves the bytes);
 - seed: `path` (re-add an entry at the seed path), `existing` (adopt an
   already-seeded library, add nothing), `none`.
 
