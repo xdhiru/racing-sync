@@ -258,6 +258,12 @@ is rewritten onto the same internal schema by `config_alias.py`, so old
 files keep working unchanged and both spellings resolve identically.
 `config summary` prints the resolved shape and a secret-free digest.
 
+`config init` writes the compact single-box starter; `config enable/disable`
+flip optional features without rewriting comments, and `config explain`
+prints the short form. `check-config` starts with the resolved chain
+(topology, providers, targets, disabled features) and warns before a
+disabled link strands rows.
+
 Pipeline code never reads config sections: it asks a capability view
 (`rt.storage.path`, `rt.transfer.remote_for(episode=...)`,
 `rt.seed.manual_move_timeout_seconds`). `composition.py` is the only place

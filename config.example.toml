@@ -1,6 +1,42 @@
 # ============================================================
-# racing-sync configuration
+# racing-sync configuration — full reference
 # ============================================================
+#
+# New here? `python3 run.py config init --config config.toml` writes a
+# one-screen single-box starter; `config explain <section>` prints the
+# short form of any optional feature.
+#
+# This file uses the original spelling ([source], [dest], [ssd], [rclone],
+# [prowlarr], [cross_seed], [watch_dir]); those keep working. The
+# capability-chain spelling is equivalent and is what `config init` emits:
+#
+#   [client]    = [source] (+ [client.nginx], [client.deluge_sftp])
+#   [dest]      = same, still the seeding client (split topology)
+#   [storage]   = [ssd] + [dest].save_path
+#   [remote]    = [rclone] destinations/binary (path, unsorted)
+#   [transfer]  = how bytes leave staging: rclone | local_move | none | external
+#   [seed]      = [rclone.fuse]: path (mount or plain dir), provider path | existing | none
+#   [indexers]  = [prowlarr]
+#   [acquire]   = [cross_seed]: provider auto | local | external
+#   [watch]     = [watch_dir]
+#
+# One-box example (race here, seed from the seed path):
+#
+#   [client]  type = "qbittorrent"
+#             host = "http://127.0.0.1:8080"
+#   [dest]    host = "http://127.0.0.1:8080"
+#   [storage] path = "/srv/qbittorrent/data"
+#             save_path = "/srv/qbittorrent/data"
+#             max_inflight_bytes = 42949672960
+#             skip_movie_larger_than_bytes = 42949672960
+#   [transfer] provider = "rclone"
+#   [remote]  path = "remote:qbittorrent/"
+#             unsorted = "remote:qbittorrent/unsorted/"
+#   [seed]    provider = "path"
+#             path = "/mnt/remote/qbittorrent"
+#
+# ============================================================
+
 
 [general]
 # Polling interval (seconds) for source client (VPS1). Higher = fewer
