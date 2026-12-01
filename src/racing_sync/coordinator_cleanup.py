@@ -406,8 +406,28 @@ class CleanupMixin:
                 allow_unknown=False,
             ):
                 continue
+            if self.rt.chain.single_box and self._cleanup_member_seeding(t):
+                # One client on both sides: this member IS the seed copy.
+                log.info(
+                    "cleanup: keeping %s — the entry seeds from the seed path",
+                    (t.name or "")[:60],
+                )
+                continue
             out.append(t)
         return out
+
+    def _cleanup_member_seeding(self, torrent: object) -> bool:
+        """True when this client entry's save_path is (or may be) the seed copy."""
+        try:
+            from .path_ownership import PathOwner, classify_save_path
+
+            save_path = str(getattr(torrent, "save_path", "") or "").strip()
+            if not save_path:
+                return False
+            return classify_save_path(self.cfg, save_path) is PathOwner.FUSE
+        except Exception:
+            # Unknowable ownership must never become a delete.
+            return True
 
     def _cleanup_protected(self, ts: TorrentState) -> bool:
         """True when the release matches a protected pattern (never delete)."""

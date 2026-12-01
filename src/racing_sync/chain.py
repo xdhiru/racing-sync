@@ -14,6 +14,7 @@ site hard-codes `RE_ADDING`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from .config import AppConfig
 from .state import State
@@ -22,6 +23,24 @@ from .state import State
 def provider_name(value: object, default: str) -> str:
     """Trust only real provider names; a partial config double keeps the default."""
     return value if isinstance(value, str) else default
+
+
+def _same_client(source_host: object, dest_host: object) -> bool:
+    """True when both WebUI origins address the same client instance."""
+
+    def key(raw: object) -> tuple[str, int] | None:
+        try:
+            parts = urlsplit(str(raw).strip())
+        except Exception:
+            return None
+        host = (parts.hostname or "").lower()
+        if not host:
+            return None
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        return host, int(port)
+
+    left, right = key(source_host), key(dest_host)
+    return bool(left is not None and left == right)
 
 
 @dataclass(frozen=True)
@@ -34,6 +53,8 @@ class Chain:
     transfer: str
     seed: str
     cleanup: bool
+    #: Source and dest point at the same client (one box).
+    single_box: bool = False
 
     @classmethod
     def from_config(cls, cfg: AppConfig) -> Chain:
@@ -54,6 +75,10 @@ class Chain:
             transfer=transfer if has_remote or transfer != "rclone" else "none",
             seed=seed if has_fuse or seed != "path" else "none",
             cleanup=bool(cleanup),
+            single_box=_same_client(
+                getattr(cfg.source, "host", "") if hasattr(cfg, "source") else "",
+                getattr(cfg.dest, "host", "") if hasattr(cfg, "dest") else "",
+            ),
         )
 
     @property
