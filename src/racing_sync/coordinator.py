@@ -588,6 +588,15 @@ class Coordinator(
         # Build marker: proves which ordering-guarantee build a log file ran.
         # Bump when the fresh-DB / late-seed ordering rules change.
         log.info("build ordering-guard v3 active (move-before-inject, DONE->MOVING demotion)")
+        try:
+            if self.rt.chain.single_box:
+                log.info(
+                    "single-box topology: source and dest are the same client; "
+                    "entries seeding from the seed path are excluded from intake "
+                    "and never deleted"
+                )
+        except Exception:
+            pass
         self._warn_if_storage_paths_overlap()
         self._warn_if_log_dir_on_data_mount()
         self._download_sem = asyncio.Semaphore(self.rt.limits.max_active_downloads)
@@ -838,6 +847,16 @@ class Coordinator(
             force_refresh=force_refresh, now_mono=now_mono
         )
 
+    def _seeded_entry(self, torrent: object) -> bool:
+        """True when a source entry's save_path lives on the seed target."""
+        try:
+            from .path_ownership import PathOwner, classify_save_path
+
+            save_path = str(getattr(torrent, "save_path", "") or "").strip()
+            return bool(save_path) and classify_save_path(self.cfg, save_path) is PathOwner.FUSE
+        except Exception:
+            return False
+
     async def _list_source_torrents_locked(
         self,
         *,
@@ -906,6 +925,16 @@ class Coordinator(
                 if (time_now - t.added_on) < min_age:
                     continue
                 filtered.append(t)
+        if self.rt.chain.single_box and self.rt.seed.enabled:
+            # Same client on both sides: the entries our own re-add points
+            # at the seed path are finished work, not fresh racing intake.
+            kept = [t for t in filtered if not self._seeded_entry(t)]
+            if len(kept) != len(filtered):
+                log.debug(
+                    "single-box: ignoring %d source entr(ies) seeding from the seed path",
+                    len(filtered) - len(kept),
+                )
+            filtered = kept
 
         self._source_torrents_cache = filtered
         self._source_torrents_cached_at = now_mono
