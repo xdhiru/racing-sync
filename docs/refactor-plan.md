@@ -1,9 +1,8 @@
 # Refactor plan — capability chain, explicit modules, smaller config
 
-Status: **phase 3 landed (2026-11-30); next: phase 4.** Phases 0–3 are in
-`dev`: `config summary` + goldens, the disposition registry, the alias
-layer, the composition root with typed capability views, and the chain
-engine (disabled links, derived edges, startup drain).
+Status: **phase 4 in progress (2026-12-01).** Phases 0–3 are in `dev`, and
+phase 4 has landed `external` acquisition, `local` acquisition,
+`seed.existing` and single-box ownership; `local_move` remains.
 
 ## Goal
 
@@ -172,6 +171,15 @@ cleanup (proof depends on the chain), and source identity in single-box mode.
   seed path; cleanup can then only delete the racing entry. One client instance
   serves both roles.
 
+As landed in phase 4: links carry provider names. `external` acquisition
+verifies an operator's copy at the seed path and never downloads; `local`
+acquisition adopts the racing client's own complete entry (one box, no second
+copy); `seed.existing` adopts an already-seeded library without adding an
+entry (and disables cleanup, which needs an entry of ours to re-verify).
+Single-box topology is derived from the client origins: seeded entries are
+excluded from intake and never grouped for deletion. `local_move` (a local
+directory/NAS instead of rclone) is the remaining provider.
+
 As landed in phase 3: `chain.Chain` resolves the links from `[pipeline]` (set by
 the alias layer from `[transfer]`/`[seed]` switches). Download and move completion
 ask `chain.after_download()` / `chain.after_move()`, and the state table tolerates
@@ -189,7 +197,7 @@ content-secured verifier follows the seed link.
 | 1 ✅ | Config layer: module models, `enabled` tri-state, renames, legacy adapter, deprecations, exhaustive disposition registry | every old key accepted; one warning per retired key; `AppConfig` facade unchanged for callers |
 | 2 ✅ | Composition root + capability Protocols + factories | split/full behaves byte-identically; consumers no longer touch raw sections |
 | 3 ✅ | Chain engine: derived transitions, checkpoint resolver, stranded-row drain, ledger, cleanup verifier, providers for today's behavior (`rclone`, `path`, `auto`, `none`) | shape matrix green for split/full/move-only/download-only |
-| 4 | New providers/shapes: `local` acquire, `local_move`, `external`, `seed.existing` | single-box, HDD/NAS, out-of-band and adopt-only shapes green |
+| 4 ◐ | New providers/shapes: `local` acquire, `local_move`, `external`, `seed.existing` | single-box, out-of-band and adopt-only green; `local_move` (HDD/NAS) pending |
 | 5 | UX: `config init/enable/disable/explain`, check-config chain report, docs/examples rewritten around the single-box default | a new user can go from zero to running with one screen of config |
 | 6 | Retirement: stop documenting duplicate precedence keys; adopt/seed-only; remove dead shims | docs match schema; adapters still accept old files |
 
