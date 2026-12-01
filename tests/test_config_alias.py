@@ -163,6 +163,13 @@ def test_provider_none_disables_the_link(link: str):
     assert data["pipeline"][link] == "none"
 
 
+def test_seed_existing_is_accepted():
+    raw = _raw()
+    raw["seed"]["provider"] = "existing"
+
+    assert normalize_config(raw).data["pipeline"]["seed"] == "existing"
+
+
 def test_disabling_acquire_is_refused_for_now():
     raw = _raw()
     raw["acquire"] = {"enabled": False}
@@ -193,7 +200,7 @@ def test_unknown_provider_is_refused(link: str, provider: str):
 
 @pytest.mark.parametrize(
     ("link", "provider"),
-    [("acquire", "cross_seed"), ("transfer", "local_move"), ("seed", "existing")],
+    [("acquire", "cross_seed"), ("transfer", "local_move")],
 )
 def test_known_but_unimplemented_provider_is_refused(link: str, provider: str):
     raw = _raw()

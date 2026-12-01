@@ -555,7 +555,7 @@ class Coordinator(
         so it fails loudly for the operator instead of claiming DONE.
         """
         chain = self.rt.chain
-        if chain.seeds and chain.moves:
+        if chain.adds_seed_entry and chain.moves:
             return
         try:
             rows = await offload(self.store.all)
@@ -565,7 +565,7 @@ class Coordinator(
         for ts in rows or []:
             name = (ts.source_name or ts.source_infohash or "")[:60]
             try:
-                if ts.state == State.RE_ADDING and not chain.seeds:
+                if ts.state == State.RE_ADDING and not chain.adds_seed_entry:
                     log.warning("draining %s: RE_ADDING -> DONE (seed link disabled)", name)
                     self.transition(ts, State.DONE)
                 elif ts.state == State.MOVING and not chain.moves:

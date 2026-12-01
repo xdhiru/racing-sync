@@ -103,13 +103,22 @@ class Chain:
     def seeds(self) -> bool:
         return self.seed != "none"
 
+    @property
+    def adds_seed_entry(self) -> bool:
+        """The seed link adds a client entry pointing at the seed path.
+
+        `existing` verifies an already-seeded library instead, so rows go
+        straight to DONE and cleanup has no entry of ours to prove against.
+        """
+        return self.seed == "path"
+
     def after_download(self) -> State:
         """Where a verified, completed SSD download goes."""
         return State.MOVING if self.moves else State.DONE
 
     def after_move(self) -> State:
         """Where a verified, completed transfer goes."""
-        return State.RE_ADDING if self.seeds else State.DONE
+        return State.RE_ADDING if self.adds_seed_entry else State.DONE
 
     def shortcuts(self) -> frozenset[tuple[State, State]]:
         """Tolerated edges that exist only because a link is absent."""
