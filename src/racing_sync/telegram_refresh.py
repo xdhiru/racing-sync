@@ -595,20 +595,44 @@ class RefreshMixin:
                     )
                     self._prev_active_msg_id = None
                 except (RetryAfter, TimedOut, NetworkError) as _prev_e:
-                    log.warning(
-                        "active-tasks previous message %s delete deferred "
-                        "(transient %s); keeping it, will retry next "
-                        "interval",
-                        _prev_id,
-                        _prev_e,
-                    )
-                    # Feed the orphan sweep too: if the retry path ever
-                    # stops firing, the sweep still retires this id.
-                    try:
-                        self._remember_orphan(_prev_id)
-                    except Exception:
-                        pass
-                    return
+                    # PTB's BadRequest subclasses NetworkError, so an
+                    # already-deleted message lands here as well: treat it
+                    # as gone (rights refusals as hopeless) instead of
+                    # retrying the same dead id every interval.
+                    _prev_msg = str(_prev_e).lower()
+                    if self._delete_gone(_prev_msg):
+                        log.debug(
+                            "active-tasks previous message %s already gone; resending",
+                            _prev_id,
+                        )
+                        self._prev_active_msg_id = None
+                    elif self._delete_hopeless(_prev_msg):
+                        log.warning(
+                            "active-tasks previous message %s delete refused "
+                            "(%s); abandoning it and resending",
+                            _prev_id,
+                            _prev_e,
+                        )
+                        self._prev_active_msg_id = None
+                        try:
+                            self._remember_orphan(_prev_id)
+                        except Exception:
+                            pass
+                    else:
+                        log.warning(
+                            "active-tasks previous message %s delete deferred "
+                            "(transient %s); keeping it, will retry next "
+                            "interval",
+                            _prev_id,
+                            _prev_e,
+                        )
+                        # Feed the orphan sweep too: if the retry path ever
+                        # stops firing, the sweep still retires this id.
+                        try:
+                            self._remember_orphan(_prev_id)
+                        except Exception:
+                            pass
+                        return
                 except TelegramError as _prev_e:
                     _prev_msg = str(_prev_e).lower()
                     if self._delete_gone(_prev_msg):
@@ -1028,17 +1052,35 @@ class RefreshMixin:
             # message and retries the send instead of stranding the chat.
             self._prev_active_msg_id = None
         except (RetryAfter, TimedOut, NetworkError) as e:
-            log.warning(
-                "active-tasks repost delete deferred "
-                "(transient %s); keeping old message, will retry next "
-                "interval",
-                e,
-            )
-            try:
-                self._remember_orphan(old_int)
-            except Exception:
-                pass
-            return
+            # Same BadRequest-as-NetworkError trap as the pending path: a
+            # message that is already gone must clear the pointer, not be
+            # retried as a transient failure.
+            _msg = str(e).lower()
+            if self._delete_gone(_msg):
+                log.debug("active-tasks repost: old message %s already gone; resending", old_int)
+                self._prev_active_msg_id = None
+            elif self._delete_hopeless(_msg):
+                log.warning(
+                    "active-tasks repost delete refused (%s); abandoning it and resending",
+                    e,
+                )
+                self._prev_active_msg_id = None
+                try:
+                    self._remember_orphan(old_int)
+                except Exception:
+                    pass
+            else:
+                log.warning(
+                    "active-tasks repost delete deferred "
+                    "(transient %s); keeping old message, will retry next "
+                    "interval",
+                    e,
+                )
+                try:
+                    self._remember_orphan(old_int)
+                except Exception:
+                    pass
+                return
         except TelegramError as e:
             msg = str(e).lower()
             if self._delete_gone(msg):
