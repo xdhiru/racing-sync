@@ -165,3 +165,45 @@ async def test_pin_failure_persists_without_mutating_cfg():
     bot._bot.pin_chat_message.reset_mock()
     await bot._reconcile_pinned()
     bot._bot.pin_chat_message.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_already_deleted_prev_message_resends_instead_of_retrying(caplog):
+    """BadRequest subclasses NetworkError: 'not found' must not defer forever."""
+    import logging
+    from unittest.mock import AsyncMock
+
+    from telegram.error import BadRequest
+
+    bot = _bot()
+    bot._prev_active_msg_id = 421
+    bot._bot.delete_message = AsyncMock(side_effect=BadRequest("Message to delete not found"))
+    bot._store.list_active_inflight.return_value = []
+
+    with caplog.at_level(logging.DEBUG):
+        await bot._refresh_active_message_inner()
+
+    # The stale id was dropped; the freshest send's id is the live pointer.
+    assert bot._prev_active_msg_id == 99
+    bot._bot.send_message.assert_awaited()
+    assert not [r for r in caplog.records if "delete deferred" in r.getMessage()]
+
+
+@pytest.mark.anyio
+async def test_repost_already_deleted_message_keeps_going(caplog):
+    import logging
+    from unittest.mock import AsyncMock
+
+    from telegram.error import BadRequest
+
+    bot = _bot()
+    bot._active_msg_id = 55
+    bot._bot.delete_message = AsyncMock(side_effect=BadRequest("Message to delete not found"))
+    bot._store.list_active_inflight.return_value = []
+
+    with caplog.at_level(logging.DEBUG):
+        await bot._repost_active_message("text", {}, None)
+
+    assert bot._prev_active_msg_id == 99
+    bot._bot.send_message.assert_awaited()
+    assert not [r for r in caplog.records if "delete deferred" in r.getMessage()]
