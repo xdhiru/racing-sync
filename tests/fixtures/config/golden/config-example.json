@@ -3,23 +3,25 @@
   "digest": "sha256:16dab52b9867b03e",
   "keys": {
     "by_section": {
+      "acquire": 9,
       "api": 8,
       "classifier": 1,
       "cleanup": 18,
-      "cross_seed": 8,
-      "dest": 9,
+      "client": 21,
+      "dest": 8,
       "general": 8,
+      "indexers": 11,
       "logging_sink": 5,
-      "prowlarr": 11,
-      "rclone": 23,
       "recovery": 5,
-      "source": 21,
-      "ssd": 4,
+      "remote": 3,
+      "seed": 10,
+      "storage": 5,
       "telegram": 9,
-      "watch_dir": 5
+      "transfer": 12,
+      "watch": 5
     },
     "defaulted": 19,
-    "explicit": 135,
+    "explicit": 138,
     "model": 144,
     "unknown": []
   },
