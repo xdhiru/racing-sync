@@ -1242,7 +1242,7 @@ async def test_pick_download_fetch_failure_parks_instead_of_failing():
 
 
 def test_example_config_prowlarr_keys_not_nested(example_config):
-    """Shipped example must keep [prowlarr] keys above [[download_indexers]].
+    """Shipped example must keep [indexers] keys above [[download_indexers]].
 
     Regression: the keys once sat after the table header, so TOML nested
     them into download_indexers[0] where extra='ignore' silently dropped
@@ -1251,7 +1251,7 @@ def test_example_config_prowlarr_keys_not_nested(example_config):
     import tomllib
 
     raw = tomllib.load(open(Path(__file__).parent.parent / "config.example.toml", "rb"))
-    top = raw["prowlarr"]
+    top = raw.get("indexers") or raw["prowlarr"]
     assert top["skip_query_substrings"] == ["dummysub"]
     assert top["timeout_seconds"] == 30.0
     assert top["max_results"] == 20

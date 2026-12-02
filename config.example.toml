@@ -6,37 +6,19 @@
 # one-screen single-box starter; `config explain <section>` prints the
 # short form of any optional feature.
 #
-# This file uses the original spelling ([source], [dest], [ssd], [rclone],
-# [prowlarr], [cross_seed], [watch_dir]); those keep working. The
-# capability-chain spelling is equivalent and is what `config init` emits:
+# This is the capability-chain spelling. The older names ([source],
+# [ssd], [rclone], [rclone.remote], [rclone.fuse], [prowlarr],
+# [cross_seed], [watch_dir]) still load unchanged.
 #
-#   [client]    = [source] (+ [client.nginx], [client.deluge_sftp])
-#   [dest]      = same, still the seeding client (split topology)
-#   [storage]   = [ssd] + [dest].save_path
-#   [remote]    = [rclone] destinations/binary (path, unsorted)
-#   [transfer]  = how bytes leave staging: rclone | local_move | none | external
-#   [seed]      = [rclone.fuse]: path (mount or plain dir), provider path | existing | none
-#   [indexers]  = [prowlarr]
-#   [acquire]   = [cross_seed]: provider auto | local | external
-#   [watch]     = [watch_dir]
-#
-# One-box example (race here, seed from the seed path):
-#
-#   [client]  type = "qbittorrent"
-#             host = "http://127.0.0.1:8080"
-#   [dest]    host = "http://127.0.0.1:8080"
-#   [storage] path = "/srv/qbittorrent/data"
-#             save_path = "/srv/qbittorrent/data"
-#             max_inflight_bytes = 42949672960
-#             skip_movie_larger_than_bytes = 42949672960
-#   [transfer] provider = "rclone"
-#   [remote]  path = "remote:qbittorrent/"
-#             unsorted = "remote:qbittorrent/unsorted/"
-#   [seed]    provider = "path"
-#             path = "/mnt/remote/qbittorrent"
+# Shapes this file can express:
+#   one box      [client] and [dest] on the same host (this file)
+#   two boxes    different [dest] host; [acquire] picks the SSD source
+#   NAS / HDD    [transfer] provider = "local_move" + path/unsorted
+#   adopt-only   [acquire] provider = "external",
+#                [transfer] provider = "none",
+#                [seed] provider = "existing"
 #
 # ============================================================
-
 
 [general]
 # Polling interval (seconds) for source client (VPS1). Higher = fewer
@@ -62,11 +44,10 @@ log_retention_days = 2
 # Example: 1 GiB. Prevents races between disk_usage() check and torrent fill.
 disk_safety_margin_bytes = 1073741824
 
-# Optional global overrides (all commented = use per-section values):
-#   max_active_downloads       overrides [dest].max_active_downloads
-#   max_concurrent_moves       overrides [rclone].max_concurrent_moves
-# max_active_downloads = 3
-# max_concurrent_moves = 3
+# Deprecated (still honoured, warned once per load):
+#   general.max_active_downloads  -> [dest].max_active_downloads
+#   general.max_concurrent_moves  -> [transfer].max_concurrent_moves
+#   rclone.reinject_delay_seconds -> [seed].reinject_delay_seconds
 # Stall timeout (seconds) for a VPS2 SSD download with zero progress.
 # Default 7200: a download with no byte of progress for 2h parks back in
 # DOWNLOADING for retry; 0 = wait forever (a tracker-deleted release then
@@ -95,7 +76,7 @@ preferred_copy_grace_seconds = 3600
 # Source (VPS1) — racing client
 # ============================================================
 
-[source]
+[client]
 # Type of client: "qbittorrent" or "deluge"
 type = "qbittorrent"
 
@@ -134,7 +115,7 @@ min_age_seconds = 0
 #   mode = "basic"   (default, most common)
 #     The proxy uses HTTP Basic auth (`auth_basic` directive in nginx).
 #     The client sends `Authorization: Basic ...` on every request
-#     using the credentials from [source].username and [source].password.
+#     using the credentials from [client].username and [client].password.
 #     This is the popup your browser shows when you visit the WebUI.
 #     `url` is ignored.
 #
@@ -149,8 +130,8 @@ min_age_seconds = 0
 #
 # For typical nginx `auth_basic` setups (which is what most people
 # use), you don't need to set anything here other than leaving the
-# defaults — credentials come from [source].username / password.
-[source.nginx]
+# defaults — credentials come from [client].username / password.
+[client.nginx]
 mode         = "off"
 url          = ""           # only used when mode="form_post"
 user_field   = "username"   # only used when mode="form_post"
@@ -158,7 +139,7 @@ pass_field   = "password"   # only used when mode="form_post"
 extra_fields = {}          # only used when mode="form_post"
 
 # --- Deluge-only: SFTP export of .torrent files from state dir ---
-[source.deluge_sftp]
+[client.deluge_sftp]
 enabled = false
 ssh_host = "127.0.0.1"
 ssh_port = 22
@@ -200,20 +181,15 @@ username = "admin"
 # startup refuses passwords like "change_me"/"CHANGE_ME".
 password = ""
 
-# Default save_path used for movies / season-root folders.
-# This MUST be on the local SSD (not the fuse mount) so qBittorrent
-# can hash-check normally.
-save_path = "/srv/qbittorrent/data"
-
 # Maximum concurrent torrents actively downloading on VPS2 SSD (default: 3).
 # Limits additions to qBittorrent on SSD so disk I/O and network aren't overloaded.
 max_active_downloads = 3
-# Network family for the WebUI session (see [source].use_ipv6).
+# Network family for the WebUI session (see [client].use_ipv6).
 # use_ipv6 = false
 
 # Optional nginx basic-auth in front of the qBittorrent WebUI on VPS2.
 # Optional nginx auth in front of the qBittorrent WebUI on VPS2.
-# Same semantics as [source.nginx]. mode="basic" is the common case
+# Same semantics as [client.nginx]. mode="basic" is the common case
 # (HTTP Basic auth via the Authorization header).
 [dest.nginx]
 mode         = "off"        # VPS2 typically has no nginx
@@ -223,12 +199,15 @@ pass_field   = "password"
 extra_fields = {}
 
 # ============================================================
-# SSD cap (VPS2 local storage)
+# Storage — SSD staging (VPS2)
 # ============================================================
 
-[ssd]
-# Path to check free space against (usually == dest.save_path)
+[storage]
+# SSD staging root: downloads land here and free space is checked here.
 path = "/srv/qbittorrent/data"
+# Where [dest] adds downloads (movies / season roots). This MUST be on
+# the local SSD (not the seed path) so qBittorrent can hash-check normally.
+save_path = "/srv/qbittorrent/data"
 # GLOBAL budget (bytes) shared by every concurrent download — not a
 # per-torrent cap. Each torrent reserves min(total, this) before admission
 # and parks in WAITING_DISK past it; batch footprints refine after
@@ -242,19 +221,32 @@ skip_movie_larger_than_bytes = 42949672960  # 40 GiB
 safety_margin_bytes = 0
 
 # ============================================================
-# rclone (VPS2)
+# Transfer — how bytes leave staging
 # ============================================================
 
-[rclone]
+[remote]
+# Destination for movies and full season roots (an rclone "name:path/").
 # Absolute path to the rclone binary (defaults to /usr/local/bin/rclone)
 binary = "/usr/local/bin/rclone"
 # Optional: path to a specific rclone.conf file. If omitted or left empty,
 # rclone uses the default user config (~/.config/rclone/rclone.conf).
 # Useful if you want a dedicated, separate rclone.conf for this app.
 # config_path = "/path/to/rclone.conf"
+
+# Default remote + path for movies and full season-root folders.
+# These are rclone REMOTE paths (not fuse mount paths).
+# They get passed to:   rclone move <local> <remote_path>
+# e.g. "remote:qbittorrent/"
+path = "remote:qbittorrent/"
+# Subfolder for individual TV episodes that are not part of a
+# completed full-season move (req #6, #8).
+unsorted = "remote:qbittorrent/unsorted/"
+
+[transfer]
+# How bytes leave staging: "rclone" | "local_move" | "none" | "external".
+provider = "rclone"
 # Maximum concurrent rclone move commands running simultaneously (default: 3).
 # Limits parallel moves from SSD to remote to prevent CPU/network saturation.
-# Can be overridden globally via [general].max_concurrent_moves.
 max_concurrent_moves = 3
 # Wall-clock ceiling per `rclone move` in seconds (default: 21600 / 6h).
 # A remote that stops responding (e.g. API flood-waits on Telegram-backed
@@ -262,13 +254,10 @@ max_concurrent_moves = 3
 # a move slot forever. Timeouts never fail the row (bytes stay on SSD).
 # Lower it on fast remotes (e.g. 1800) so stalls surface sooner.
 # move_timeout_seconds = 21600
-# Optional override for the fuse re-inject delay below (seconds).
-# Empty/unset = use [rclone.fuse].reinject_delay_seconds.
-# reinject_delay_seconds = 30
 
 # Extra rclone flags applied to every `rclone move`.
 # Defaults are sensible for slow remotes; tune as needed.
-extra_move_flags = [
+extra_flags = [
     "--transfers=4",
     "--checkers=8",
     "--bwlimit=0",          # 0 = no limit; set a number if you need to cap
@@ -284,28 +273,18 @@ extra_move_flags = [
 # --include patterns dynamically. These extra flags are appended
 # AFTER the auto-generated --include flags so they can still win
 # if needed.
-batch_move_extra_flags = [
+batch_extra_flags = [
     "--delete-after",       # not strictly needed; batch folder is wiped locally anyway
 ]
 
-# Default remote + path for movies and full season-root folders.
-# These are rclone REMOTE paths (not fuse mount paths).
-# They get passed to:   rclone move <local> <remote_path>
-[rclone.remote]
-# e.g. "remote:qbittorrent/"
-default = "remote:qbittorrent/"
-# Subfolder for individual TV episodes that are not part of a
-# completed full-season move (req #6, #8).
-unsorted = "remote:qbittorrent/unsorted/"
-
-# Fuse mount paths on the destination client.
-# These are what qBittorrent uses as save_path AFTER files have been
-# moved to the remote and we want to seed from the mount.
-[rclone.fuse]
+[seed]
+# Seed target: a fuse mount or any plain directory. provider = "path" |
+# "existing" (adopt an already-seeded library, no entry added) | "none".
+provider = "path"
 # Mount for movies + season roots
-mount = "/mnt/remote/qbittorrent"
+path = "/mnt/remote/qbittorrent"
 # Mount for individual episodes
-mount_unsorted = "/mnt/remote/qbittorrent/unsorted"
+unsorted_path = "/mnt/remote/qbittorrent/unsorted"
 # Delay (seconds) before re-injecting torrents to fuse after rclone move (default: 30).
 # Allows cloud fuse mounts time to refresh directory caches and index the new files.
 reinject_delay_seconds = 135
@@ -431,7 +410,8 @@ allow_plaintext = false
 # req #3
 # ============================================================
 
-[watch_dir]
+[watch]
+# Present = on. `enabled = false` disables it while keeping the keys.
 path = "/srv/qbittorrent/watch"
 glob = "*.torrent"
 delete_after_pickup = true
@@ -441,18 +421,18 @@ query_prowlarr = true
 prefer_prowlarr_result = true
 
 # ============================================================
-# Prowlarr — cross-seed lookups + indexer queries
+# Indexers — Prowlarr cross-seed lookups + queries
 # req #5 + #6
 # ============================================================
 
-[prowlarr]
+[indexers]
 enabled = false
 base_url = "http://127.0.0.1:9696"
 api_key = "CHANGE_ME"
 # Substrings in release titles to skip querying Prowlarr for (case-insensitive).
 # Useful for groups (like DummySub) whose complex titles/symbols never match Prowlarr indexers.
-# NOTE: these are [prowlarr]-level keys — they must stay above the
-# [[prowlarr.download_indexers]] tables or TOML nests them into the
+# NOTE: these are [indexers]-level keys — they must stay above the
+# [[indexers.download_indexers]] tables or TOML nests them into the
 # indexer (where they are silently ignored).
 skip_query_substrings = ["dummysub"]
 timeout_seconds = 30.0
@@ -465,14 +445,14 @@ max_results = 20
 # indexer (announce URL substring match), so they are used directly
 # instead of being re-searched. Add one table per indexer; a single
 # indexer is fine.
-[[prowlarr.download_indexers]]
+[[indexers.download_indexers]]
 name = "My Indexer (API)"
 announce_substrings = ["my-indexer"]
 # Example second indexer (commented out):
-# [[prowlarr.download_indexers]]
+# [[indexers.download_indexers]]
 # name = "Another Indexer (API)"
 # announce_substrings = ["another"]
-# Network family for the Prowlarr session (see [source].use_ipv6).
+# Network family for the Prowlarr session (see [client].use_ipv6).
 # use_ipv6 = false
 
 # Tracker announce URL substring → prowlarr indexer name.
@@ -485,7 +465,7 @@ announce_substrings = ["my-indexer"]
 # to search on.
 #
 # Examples — replace with whatever trackers YOU actually race on:
-[prowlarr.tracker_map]
+[indexers.tracker_map]
 "alpha.cc"      = "Alpha (API)"
 "beta"      = "Beta"
 "gamma.tv"  = "Gamma"
@@ -495,7 +475,11 @@ announce_substrings = ["my-indexer"]
 # req #1 + #2
 # ============================================================
 
-[cross_seed]
+[acquire]
+# Acquisition: "auto" (indexer/export pick; the flags below tune it) |
+# "local" (one box: the racing copy is the staged copy) |
+# "external" (the operator copies the bytes; the daemon verifies at [seed]).
+provider = "auto"
 # Policy summary (req #1 + #2):
 #   Public racing torrent exists on VPS1:
 #     SSD download   = use VPS1's existing public .torrent directly.
