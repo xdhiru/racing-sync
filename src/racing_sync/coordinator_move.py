@@ -2450,9 +2450,7 @@ class MoveMixin:
                     preview,
                 )
             else:
-                log.info(
-                    "move %s -> %s (include=%s, extra=%s)", local, remote, include, extra
-                )
+                log.info("move %s -> %s (include=%s, extra=%s)", local, remote, include, extra)
             # RcloneTimeoutError propagates: the child is terminated and the
             # source tree intact, so callers park the row for retry (never
             # fail — failing would loop: re-download, stall again, fail…).
