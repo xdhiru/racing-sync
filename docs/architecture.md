@@ -251,11 +251,11 @@ static `X-API-Token`, or an nginx-injected `X-Authenticated-User` from
 
 ## Config and logging
 
-`config.example.toml` documents every key; `config.py` validates and
-cross-checks them. A new capability-chain spelling (`[client]`, `[storage]`,
-`[remote]`, `[transfer]`, `[seed]`, `[indexers]`, `[watch]`, `[acquire]`)
-is rewritten onto the same internal schema by `config_alias.py`, so old
-files keep working unchanged and both spellings resolve identically.
+`config.example.toml` documents every key in the capability-chain spelling
+(`[client]`, `[storage]`, `[remote]`, `[transfer]`, `[seed]`, `[indexers]`,
+`[watch]`, `[acquire]`); `config.py` validates and cross-checks them. The
+older names are rewritten onto the same internal schema by `config_alias.py`,
+so old files keep working unchanged and both spellings resolve identically.
 `config summary` prints the resolved shape and a secret-free digest.
 
 `config init` writes the compact single-box starter; `config enable/disable`

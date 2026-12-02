@@ -1,9 +1,9 @@
 # Refactor plan — capability chain, explicit modules, smaller config
 
-Status: **phase 5 landed (2026-12-01); next: phase 6.** Phases 0–5 are in
-`dev`: the config layer, the composition root, the chain engine, the new
-providers with single-box ownership, and the config UX (starter, toggles,
-explain, chain report).
+Status: **phases 0–6 landed (2026-12-02) — the refactor is complete.** The
+config layer, composition root, chain engine, providers with single-box
+ownership, config UX and retirement are all in `dev`. Deferred items are
+listed at the end of this file.
 
 ## Goal
 
@@ -202,7 +202,7 @@ content-secured verifier follows the seed link.
 | 3 ✅ | Chain engine: derived transitions, checkpoint resolver, stranded-row drain, ledger, cleanup verifier, providers for today's behavior (`rclone`, `path`, `auto`, `none`) | shape matrix green for split/full/move-only/download-only |
 | 4 ✅ | New providers/shapes: `local` acquire, `local_move`, `external`, `seed.existing` | single-box, HDD/NAS, out-of-band and adopt-only shapes green |
 | 5 ✅ | UX: `config init/enable/disable/explain`, check-config chain report, docs/examples rewritten around the single-box default | a new user can go from zero to running with one screen of config |
-| 6 | Retirement: stop documenting duplicate precedence keys; adopt/seed-only; remove dead shims | docs match schema; adapters still accept old files |
+| 6 ✅ | Retirement: stop documenting duplicate precedence keys; adopt/seed-only; remove dead shims | docs match schema; adapters still accept old files |
 
 Ordering constraints (do not reorder): composition root and the single-client factory
 before ownership work; transition table and stranded-row drain before removing any
@@ -263,6 +263,12 @@ editor, and throughput tuning (still separate from this refactor).
   swapped late (tests, pre-start edits) always answers. Services are built in
   one root and started by the coordinator as before; `load_config`/`cli`
   behaviour is untouched.
+- Phase 6 (landed): `config.example.toml` is the canonical spelling (resolved
+  model and digest unchanged), documents the four shapes, and drops the
+  duplicate-precedence keys from its text; those keys still load and warn.
+  Editor hints point at canonical names. `config migrate` is deliberately not
+  shipped: the alias layer already accepts every old file, and a text
+  re-speller would add a second way to corrupt comments for no runtime gain.
 - Phase 5 (landed): `config init` writes the single-box starter; `enable`
   appends the documented block, `disable` flips in place and keeps keys.
   `check-config` prints the chain (topology/providers/targets/disabled),
