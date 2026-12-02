@@ -391,7 +391,12 @@ class _SFTPConnection:
 
                     if is_bencoded_torrent(data):
                         return data
-                    log.warning("sftp: %s does not look like a bencoded torrent", path_str)
+                    log.warning(
+                        "sftp: %s does not look like a bencoded torrent (%d bytes, head=%s)",
+                        path_str,
+                        len(data),
+                        data[:12].hex(),
+                    )
                 except FileNotFoundError:
                     continue
                 except OSError as e:
