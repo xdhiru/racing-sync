@@ -1433,10 +1433,10 @@ class GeneralConfig(BaseModel):
 class PipelineConfig(BaseModel):
     """Which capability links this deployment runs.
 
-    Set by `config_alias` from the `[acquire]`/`[transfer]`/`[seed]`
-    switches; not part of the documented file surface yet. Disabling a
-    link is only accepted when the pipeline can reach its terminal state
-    without it (see `racing_sync.chain`).
+    Derived by `config_alias` from the documented `[acquire]`/`[transfer]`/
+    `[seed]` provider keys; never written by hand. A provider is accepted
+    only when the chain can reach its terminal state with it (see
+    `racing_sync.chain`).
     """
 
     #: Providers this release can run (files choose explicitly; `auto`

@@ -64,8 +64,8 @@ RENAMES: dict[str, str] = {
 #: key per load). These are duplicate-precedence keys the new schema drops.
 DEPRECATED: dict[str, str] = {
     "general.max_active_downloads": "[dest].max_active_downloads",
-    "general.max_concurrent_moves": "[rclone].max_concurrent_moves",
-    "rclone.reinject_delay_seconds": "[rclone.fuse].reinject_delay_seconds",
+    "general.max_concurrent_moves": "[transfer].max_concurrent_moves",
+    "rclone.reinject_delay_seconds": "[seed].reinject_delay_seconds",
 }
 
 #: Refused at load with the hint as the message. Empty today.
@@ -75,13 +75,13 @@ REMOVED: dict[str, str] = {}
 NEW_ONLY: dict[str, str] = {
     "watch.enabled": "absent = on when the section is non-empty",
     "indexers.enabled": "absent = on when the section carries content",
-    "acquire.enabled": "must be true until the chain engine lands",
-    "acquire.provider": "auto | cross_seed | local | direct_export | external | none",
+    "acquire.enabled": 'false is refused — use provider = "external" for adopt-only',
+    "acquire.provider": "auto | local | external",
     "transfer.enabled": 'false is the same as provider = "none"',
     "transfer.provider": "rclone | local_move | none | external",
     "transfer.path": "local_move destination root (absolute)",
     "transfer.unsorted": "defaults to <path>/unsorted",
-    "seed.enabled": "must be true until the chain engine lands",
+    "seed.enabled": 'false is the same as provider = "none"',
     "seed.provider": "path | existing | none",
     "seed.unsorted_path": "defaults to <seed.path>/unsorted",
 }
