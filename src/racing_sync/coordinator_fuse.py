@@ -630,6 +630,7 @@ class FuseMixin:
                 source_low[:10],
             )
             self._failed_late_cross_seeds[source_low] = now_utc
+            self._note_seed_uninjectable(ts, source_low)
             return
         try:
             fallback = self._target_mount_for(ts)
@@ -697,6 +698,40 @@ class FuseMixin:
         _record_injected_hash(ts, source_low)
         self.store.upsert(ts)
         self._failed_late_cross_seeds.pop(source_low, None)
+        try:
+            self._late_seed_misses.pop(source_low, None)
+        except Exception:
+            pass
+
+    def _note_seed_uninjectable(self, ts: TorrentState, source_low: str) -> None:
+        """Escalate a seed that has had no .torrent bytes for ~12 hours.
+
+        The late-seed repair retries every 30 minutes forever, which is
+        right for a transient SFTP blip but wrong for a state file that is
+        empty/truncated: nothing inside the app can ever fetch it. One
+        ERROR per hash tells the operator to re-add the .torrent by hand
+        (or restore the file) instead of retrying silently.
+        """
+        try:
+            counts = getattr(self, "_late_seed_misses", None)
+            if not isinstance(counts, dict):
+                counts = {}
+                self._late_seed_misses = counts
+            n = int(counts.get(source_low, 0)) + 1
+            counts[source_low] = n
+            if len(counts) > 5000:
+                for key in list(counts)[: len(counts) - 5000]:
+                    counts.pop(key, None)
+        except Exception:
+            return
+        if n == 24:
+            log.error(
+                "late cross-seed: racing torrent %s (%s) has had no .torrent bytes "
+                "for ~12h (state file unreadable and the daemon has no export); "
+                "re-add its .torrent to VPS2 by hand or restore the VPS1 state file",
+                source_low[:10],
+                (ts.source_name or "")[:50],
+            )
 
     async def _dest_entries_for_hashes(self, hashes: set[str]) -> list | None:
         """Dest entries for recorded hashes (chunked, RPC-bounded).

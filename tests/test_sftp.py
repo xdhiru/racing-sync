@@ -818,3 +818,17 @@ def test_dial_failure_tears_down_late_connecting_member(monkeypatch):
 
     assert events[-1] == ("closed", id(late))
     assert ("installed", id(late)) in events
+
+
+def test_invalid_state_file_logs_its_size(caplog):
+    """An empty/truncated state file is diagnosable from the log alone."""
+    import logging
+
+    member = _live_member(_sftp_cfg(), payload=b"not-a-torrent")
+
+    with caplog.at_level(logging.WARNING):
+        assert member.fetch_torrent("a" * 40) is None
+
+    messages = [r.getMessage() for r in caplog.records if "bencoded" in r.getMessage()]
+    assert messages
+    assert "13 bytes" in messages[0]

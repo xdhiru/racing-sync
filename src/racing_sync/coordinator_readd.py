@@ -18,7 +18,7 @@ import stat
 import time
 from pathlib import Path
 
-from .content_keys import same_content as _same_content_key
+from .content_keys import same_content as _same_content_key, same_release_name as _same_release_name
 from .coordinator_content import _matches_release, _verified_cross_seed_blob
 from .coordinator_errors import (
     _NOT_VISIBLE_DETAIL,
@@ -1264,6 +1264,7 @@ class ReaddMixin:
             want_size = 0
 
         matches = []
+        unrelated = 0
         for t in racing or []:
             try:
                 t_size = int(getattr(t, "size_bytes", 0) or 0)
@@ -1273,7 +1274,16 @@ class ReaddMixin:
             # same-name torrent (repack, mislabel) must not ride this row's
             # injection. Unknown sizes (0) still match (single rule).
             if not _same_content_key(t.name or "", t_size, ts.source_name or "", want_size):
-                if want_size and t_size and t_size != want_size:
+                # Same release name with a different size is a real conflict
+                # (repack/mislabel) worth a line. Everything else is an
+                # unrelated title: counting them keeps the log readable on a
+                # box with hundreds of racing torrents.
+                if (
+                    want_size
+                    and t_size
+                    and t_size != want_size
+                    and _same_release_name(t.name or "", ts.source_name or "")
+                ):
                     log.info(
                         "re-inject: size mismatch for %s (%s: VPS1 %d != row %d); skipping",
                         (t.name or "")[:50],
@@ -1281,8 +1291,16 @@ class ReaddMixin:
                         t_size,
                         want_size,
                     )
+                else:
+                    unrelated += 1
                 continue
             matches.append(t)
+        if unrelated:
+            log.debug(
+                "re-inject: skipped %d unrelated racing torrent(s) for %s",
+                unrelated,
+                (ts.source_name or "")[:50],
+            )
 
         async def _load(t):
             """Fetch + gate one match (no state change)."""
