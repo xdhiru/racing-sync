@@ -11,7 +11,6 @@ import logging
 from pathlib import Path
 
 from racing_sync.config import AppConfig
-from racing_sync.config_summary import summarize
 
 EXAMPLE = Path(__file__).parent.parent / "config.example.toml"
 
@@ -51,10 +50,21 @@ def test_example_uses_the_canonical_spelling():
         assert header not in lines, header
 
 
-def test_example_digest_is_unchanged_by_the_spelling():
-    """The rewrite is a rename: the resolved deployment fingerprint must not move."""
-    data = summarize(AppConfig.from_toml(EXAMPLE), EXAMPLE)
-    assert data["digest"] == "sha256:16dab52b9867b03e"
+def test_example_carries_the_shared_daemon_defaults():
+    """The shipped example uses the relaxed cadence for a shared Deluge daemon."""
+    cfg = AppConfig.from_toml(EXAMPLE)
+
+    assert cfg.general.source_poll_interval == 120
+    assert cfg.cleanup.delete_stagger_seconds == 60
+
+
+def test_model_defaults_match_the_shared_daemon_values():
+    from racing_sync.config import CleanupConfig, GeneralConfig
+
+    general = GeneralConfig()
+    assert general.source_poll_interval == 120
+    assert general.dest_poll_interval == 30
+    assert CleanupConfig().delete_stagger_seconds == 60
 
 
 def test_example_documents_no_retired_keys(caplog):

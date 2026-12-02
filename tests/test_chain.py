@@ -18,7 +18,7 @@ from racing_sync.state import State
 
 FIXTURES = Path(__file__).parent / "fixtures" / "config"
 
-_FULL = "sha256:181342c45a9d9087"
+_FULL = "sha256:2d0d2bd1b96fc70a"
 
 _DOWNLOAD_ONLY = """
 [general]

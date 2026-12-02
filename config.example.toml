@@ -21,10 +21,11 @@
 # ============================================================
 
 [general]
-# Polling interval (seconds) for source client (VPS1). Higher = fewer
-# full Deluge scans (kinder to autobrr sharing the daemon), at the cost
-# of later racing-release discovery.
-source_poll_interval = 75
+# Polling interval (seconds) for source client (VPS1). Each tick is one
+# full get_torrents_status scan; on a Deluge daemon shared with autobrr a
+# slow scan stalls injections, so this is deliberately relaxed. Lower it
+# only when the racing client is not shared (faster release discovery).
+source_poll_interval = 120
 # Polling interval (seconds) for destination client (VPS2). Higher = less
 # worker-spawn churn and sparser progress polls; admissions, wakeups and
 # janitor run on their own schedules and are unaffected.
@@ -613,7 +614,7 @@ janitor_startup_delay_seconds = 300
 # Back-to-back remove_torrent(+data) calls spike daemon teardown and disk
 # unlinking, which has coincided with autobrr injection timeouts on the
 # same Deluge daemon. 0 = delete back-to-back (old behavior).
-delete_stagger_seconds = 25
+delete_stagger_seconds = 60
 
 # ============================================================
 # Control API (optional, FastAPI)

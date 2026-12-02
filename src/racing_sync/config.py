@@ -1270,7 +1270,7 @@ class CleanupConfig(BaseModel):
     # Back-to-back remove_torrent(+data) calls spike daemon teardown and
     # disk unlinking, which has coincided with autobrr injection timeouts
     # on the same Deluge daemon. 0 = delete back-to-back (old behavior).
-    delete_stagger_seconds: float = Field(default=25.0, ge=0)
+    delete_stagger_seconds: float = Field(default=60.0, ge=0)
     # Seconds between janitor runs.
     janitor_interval_seconds: int = Field(default=3600, ge=300)
     # Settle delay after (re)start before the first janitor run may delete.
@@ -1390,8 +1390,13 @@ class APIConfig(BaseModel):
 
 
 class GeneralConfig(BaseModel):
-    source_poll_interval: int = Field(default=30, ge=5)
-    dest_poll_interval: int = Field(default=15, ge=5)
+    # One full source scan per tick. On a Deluge daemon shared with autobrr
+    # a slow scan stalls injections, so the default is deliberately
+    # relaxed; lower it only when the racing client is not shared.
+    source_poll_interval: int = Field(default=120, ge=5)
+    # Destination progress polls are cheap; 30s keeps the RPC timeout
+    # below the tick without churning the client.
+    dest_poll_interval: int = Field(default=30, ge=5)
     # Per-RPC timeout budget (seconds) for client calls (qB/Deluge/fuse
     # stat, Prowlarr, SFTP): a hung peer degrades one operation into a
     # park-and-retry instead of wedging a worker or the tick forever.
