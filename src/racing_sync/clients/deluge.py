@@ -961,6 +961,27 @@ class DelugeClient(TorrentClient, HTTPClientBase):
             raise ValueError(f"deluge .torrent for {torrent_hash} is not bencoded data")
         return decoded
 
+    async def get_free_space(self, path: str) -> int | None:
+        """Free bytes on the daemon filesystem containing `path`.
+
+        Deluge 2 exposes `core.get_free_space`; the cleanup janitor uses it
+        so its probe never competes with SFTP .torrent fetches (and keeps
+        working while the SSH transport is wedged). None = unknown (old
+        daemon, RPC error, implausible value) — callers fall back.
+        """
+        try:
+            raw = await self._rpc("core.get_free_space", [str(path)])
+        except Exception as e:  # noqa: BLE001
+            log.debug("deluge get_free_space(%s) failed: %s", path, e)
+            return None
+        if isinstance(raw, bool):
+            return None
+        try:
+            free = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return free if free >= 0 else None
+
 
 def build_deluge(cfg: SourceConfig) -> DelugeClient:
     return DelugeClient(cfg)

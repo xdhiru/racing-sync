@@ -48,22 +48,44 @@ class CleanupMixin:
         except Exception:
             return 0.0
 
+    def _source_probe_path(self) -> str | None:
+        try:
+            raw = self.rt.intake.deluge_state_dir or self.rt.intake.sftp_state_dir
+        except Exception:
+            return None
+        if raw is None:
+            return None
+        try:
+            return raw.as_posix() if hasattr(raw, "as_posix") else str(raw)
+        except Exception:
+            return None
+
     async def _source_free_bytes(self) -> int | None:
         """Free bytes on the VPS1 racing filesystem, or None when unknown.
 
-        Measured over the existing SFTP channel (Deluge sources). Unknown
-        covers qBittorrent sources (no SSH channel), reconnect failures and
-        statvfs errors — callers degrade to time-only grace, never to zero.
+        Prefers the Deluge daemon's own `core.get_free_space`: it is one
+        RPC, needs no SSH channel, and does not compete with the SFTP pool
+        that .torrent fetches lease (a wedged transport used to blind the
+        janitor exactly when disk pressure made deletions urgent). The
+        SFTP statvfs/df probe stays as the fallback for daemons without
+        the method. Unknown covers qBittorrent sources, reconnect
+        failures and stat errors — callers degrade to time-only grace,
+        never to zero.
         """
+        path = self._source_probe_path()
+        if path is not None:
+            client = getattr(self, "source_client", None)
+            probe = getattr(client, "get_free_space", None)
+            if callable(probe):
+                try:
+                    free = await asyncio.wait_for(probe(path), timeout=15.0)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("cleanup: VPS1 free-space RPC probe failed: %r", e)
+                else:
+                    if isinstance(free, int) and not isinstance(free, bool) and free >= 0:
+                        return free
         sftp = getattr(self, "sftp", None)
-        if sftp is None:
-            return None
-        try:
-            state_dir = self.rt.intake.sftp_state_dir
-            if state_dir is None:
-                return None
-            path = state_dir.as_posix() if hasattr(state_dir, "as_posix") else str(state_dir)
-        except Exception:
+        if sftp is None or path is None:
             return None
         try:
             free = await asyncio.wait_for(
