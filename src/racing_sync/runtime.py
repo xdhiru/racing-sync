@@ -112,6 +112,19 @@ class IntakeSettings:
         sftp = self.blob_source
         return sftp.state_dir if sftp is not None else None
 
+    @property
+    def deluge_state_dir(self) -> Path | None:
+        """Deluge's state dir when configured, even with SFTP export off.
+
+        The cleanup free-space probe asks the daemon over RPC, so it does
+        not need an SSH channel; only a path on the daemon's filesystem.
+        """
+        if self._cfg.source.type != "deluge":
+            return None
+        sftp = getattr(self._cfg.source, "deluge_sftp", None)
+        state_dir = getattr(sftp, "state_dir", None) if sftp is not None else None
+        return state_dir if isinstance(state_dir, (str, Path)) else None
+
 
 class StorageSettings:
     """SSD staging: where downloads land and how much may be in flight."""
