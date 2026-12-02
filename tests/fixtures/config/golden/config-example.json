@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:16dab52b9867b03e",
+  "digest": "sha256:c254d85c057ebf7b",
   "keys": {
     "by_section": {
       "acquire": 9,
@@ -49,7 +49,7 @@
       "calm_arrivals_per_hour": 2.0,
       "critical_watermark_free_bytes": 8589934592,
       "delete_files": true,
-      "delete_stagger_seconds": 25.0,
+      "delete_stagger_seconds": 60.0,
       "dry_run": true,
       "enabled": false,
       "high_watermark_free_bytes": 42949672960,
@@ -103,7 +103,7 @@
       "max_active_downloads": null,
       "max_concurrent_moves": null,
       "preferred_copy_grace_seconds": 3600,
-      "source_poll_interval": 75,
+      "source_poll_interval": 120,
       "state_db": "/var/lib/racing-sync/state.db"
     },
     "logging_sink": {

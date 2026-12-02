@@ -86,6 +86,8 @@ port = 8765
         block="""[cleanup]
 enabled = true
 dry_run = true
+# Space out deletions: remove_torrent(+data) stalls a shared Deluge daemon.
+delete_stagger_seconds = 60
 """,
     ),
     "logging_sink": Feature(
@@ -111,7 +113,7 @@ STARTER = """\
 [general]
 state_db = "/var/lib/racing-sync/state.db"
 log_dir = "/var/log/racing-sync"
-source_poll_interval = 75
+source_poll_interval = 120
 dest_poll_interval = 60
 client_rpc_timeout_seconds = 30
 

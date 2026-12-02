@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "digest": "sha256:c487ae253300b719",
+  "digest": "sha256:1d900ed1edecec0b",
   "keys": {
     "by_section": {
       "api": 5,
@@ -44,7 +44,7 @@
       "calm_arrivals_per_hour": 2.0,
       "critical_watermark_free_bytes": 8589934592,
       "delete_files": true,
-      "delete_stagger_seconds": 25.0,
+      "delete_stagger_seconds": 60.0,
       "dry_run": true,
       "enabled": true,
       "high_watermark_free_bytes": 42949672960,
